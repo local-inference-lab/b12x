@@ -1032,6 +1032,7 @@ class W4A16GemmKernel:
             self.fused_sum_topk,
             self.cta_m_blocks,
             self.uses_m_block_8,
+            self.max_m_blocks,
             self.shared_words,
             # Launch bounds are part of the compiled kernel.  Keep binaries
             # planned for different residency targets out of the same cache
@@ -9322,6 +9323,7 @@ def pack_topk_routes_by_expert(
     block_expert_ids: torch.Tensor | None = None,
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
+    expert_counts: torch.Tensor | None = None,
     stream: cuda.CUstream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Group top-k routes by expert and pad each group to the GEMM M-block size."""
@@ -9341,6 +9343,7 @@ def pack_topk_routes_by_expert(
         block_expert_ids=block_expert_ids,
         packed_route_count=packed_route_count,
         expert_offsets=expert_offsets,
+        expert_counts=expert_counts,
     )
 
 
@@ -9613,6 +9616,7 @@ def run_w4a16_moe(
     block_expert_ids: torch.Tensor | None = None,
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
+    expert_counts: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     output_expert_map: torch.Tensor | None = None,
     activation_amax: torch.Tensor | None = None,
@@ -10033,6 +10037,7 @@ def run_w4a16_moe(
                 block_expert_ids=block_expert_ids,
                 packed_route_count=packed_route_count,
                 expert_offsets=expert_offsets,
+                expert_counts=expert_counts,
                 stream=stream,
             )
         )
@@ -10050,6 +10055,8 @@ def run_w4a16_moe(
         topk=topk,
         route_num_experts=route_num_experts,
         sms=sms,
+        full_rotation=full_rotation,
+        block_size_m=block_size_m,
     )
     intermediate_size = int(prepared.intermediate_size)
     fc1_cols = buffer_plan.fc1_cols
