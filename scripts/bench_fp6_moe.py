@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
+import sys
 
 import torch
 import torch.nn.functional as F
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from benchmarks.fp6_common import bf16_grouped_moe, unswizzled_ue8m0_grid
 from sparkinfer.moe import fused_moe
 from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
@@ -42,52 +47,6 @@ def _time_ms(fn, warmup: int, iters: int) -> float:
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
-
-
-def _bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n):
-    """Reference BF16 gated-SiLU MoE grouped by expert ([up; gate] row order).
-
-    Row order matches the fused kernel's ``w13_layout="w13"`` contract
-    (``_gated_row_slices``): FC1 rows ``[0:N]`` are the up projection and rows
-    ``[N:2N]`` are the gate, i.e. ``inter = silu(h[:, n:]) * h[:, :n]``.
-    """
-    m, k = x.shape
-    out = torch.zeros(m, k, device=x.device, dtype=torch.float32)
-    xf = x.float()
-    for e in range(w1_bf.shape[0]):
-        sel = topk_ids == e
-        if not bool(sel.any()):
-            continue
-        rows, cols = sel.nonzero(as_tuple=True)
-        xe = xf[rows]
-        h = xe @ w1_bf[e].float().T
-        up, gate = h[:, :n], h[:, n:]
-        inter = F.silu(gate) * up
-        down = inter @ w2_bf[e].float().T
-        out.index_add_(0, rows, down * topk_weights[rows, cols].float().unsqueeze(1))
-    return out
-
-
-def _unswizzled_ue8m0_grid(w_bf16: torch.Tensor) -> torch.Tensor:
-    """Per-K/32 UE8M0 scale bytes, unswizzled ``[E, rows, K//32]`` uint8.
-
-    Mirrors the offline quantizer's block-scale rule
-    (``_swizzled_block_scales`` minus the swizzle): the packed codes were
-    quantized against exactly these exponents, and ``prepare_weights``
-    applies the MMA swizzle itself.
-    """
-    from sparkinfer._lib.fp6 import (
-        FLOAT6_E2M3_MAX,
-        SF_VEC_SIZE_FP6,
-        _ue8m0_scale_from_block_max,
-    )
-
-    e, rows, cols = w_bf16.shape
-    blocks = cols // SF_VEC_SIZE_FP6
-    block_max = (
-        w_bf16.float().abs().view(e, rows, blocks, SF_VEC_SIZE_FP6).amax(dim=-1)
-    )
-    return _ue8m0_scale_from_block_max(block_max, FLOAT6_E2M3_MAX).contiguous()
 
 
 def main() -> None:
@@ -129,8 +88,8 @@ def main() -> None:
     w = quantize_moe_weights_to_fp6(w1_bf, w2_bf, source_format="mxfp6_e2m3")
     # prepare_weights wants UNswizzled UE8M0 grids (it swizzles internally);
     # the offline container's blockscales are already swizzled, so recompute.
-    w1_grid = _unswizzled_ue8m0_grid(w1_bf)
-    w2_grid = _unswizzled_ue8m0_grid(w2_bf)
+    w1_grid = unswizzled_ue8m0_grid(w1_bf)
+    w2_grid = unswizzled_ue8m0_grid(w2_bf)
 
     weight_plan = fused_moe.plan_weights(
         quant_modes="w6a8_mx",
@@ -207,7 +166,7 @@ def main() -> None:
         # Correctness gate first (also warms the compiled launch).
         got = _fp6()
         torch.cuda.synchronize()
-        ref = _bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n)
+        ref = bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n)
         diff = (got.float() - ref).abs()
         max_abs = diff.max().item()
         rmse = diff.square().mean().sqrt().item()
@@ -223,7 +182,7 @@ def main() -> None:
         speedup = float("nan")
         if not args.no_bf16:
             bf16_ms = _time_ms(
-                lambda: _bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n),
+                lambda: bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n),
                 args.warmup, args.iters,
             )
             speedup = bf16_ms / fp6_ms

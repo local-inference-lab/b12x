@@ -1,6 +1,7 @@
 """Phase 1.2: MSE-optimal per-block UE8M0 exponent (offline weights)."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sparkinfer.quantization.mxfp6.fp6_checkpoint import (
@@ -86,8 +87,5 @@ def test_build_config_records_block_scale_rule() -> None:
 
 def test_rejects_bad_block_scale_rule() -> None:
     w = torch.zeros(32, 32, dtype=torch.bfloat16)
-    try:
+    with pytest.raises(ValueError, match="block_scale_rule"):
         quantize_linear_to_fp6(w, use_gpu=False, block_scale_rule="round")
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "block_scale_rule" in str(e)

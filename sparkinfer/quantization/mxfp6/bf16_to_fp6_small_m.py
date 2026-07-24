@@ -44,7 +44,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from sparkinfer._lib.compiler import KernelCompileSpec, compile as sparkinfer_compile
 from sparkinfer._lib.intrinsics import (
@@ -317,17 +317,19 @@ class SmallMQuantKernel:
                     vals, bmax, gs_value
                 )
             # Byte-container row stride is the full K width (one byte per code).
-            byte_offset = row * k + col0
+            # Bounded by m<=16 today, but row*stride offsets stay Int64 per the
+            # coding guideline so the width is safe if the small-M cap grows.
+            byte_offset = Int64(row) * Int64(k) + Int64(col0)
             moe_mxfp6_store_bytes_u64_global(mCodes, byte_offset, q0, q1, q2, q3)
             # Swizzled blockscaled-SFA offset, identical to the TMA kernel with
             # mt == 0:  kt*512 + (row%32)*16 + (row//32)*4 + sf_block.
             kt = col0 // Int32(128)
             sf_block = (col0 % Int32(128)) // Int32(_FP6_BLOCK_ELEMS)
             sf_offset = (
-                kt * Int32(512)
-                + (row % Int32(32)) * Int32(16)
-                + (row // Int32(32)) * Int32(4)
-                + sf_block
+                Int64(kt) * Int64(512)
+                + Int64((row % Int32(32)) * Int32(16))
+                + Int64((row // Int32(32)) * Int32(4))
+                + Int64(sf_block)
             )
             st_global_u8(get_ptr_as_int64(mSFA, sf_offset), sbyte)
 

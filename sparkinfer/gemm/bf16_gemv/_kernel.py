@@ -35,6 +35,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
+from cutlass import Int64
 from cutlass.cutlass_dsl import Int32, Uint32
 
 from sparkinfer._lib.compiler import KernelCompileSpec
@@ -93,7 +94,9 @@ class SmallNGemvKernel:
         n = mW.shape[0]  # static (compile key)
         k = Int32(mX.shape[1])
         nvec = k // Int32(8)  # 8 bf16 per 128-bit load
-        w_base = bidx * k
+        # ID * stride offsets are computed in Int64 (coding guideline) so they
+        # cannot wrap before get_ptr_as_int64 widens them into the pointer.
+        w_base = Int64(bidx) * Int64(k)
 
         smem = cutlass.utils.SmemAllocator()
         red_buf = smem.allocate_tensor(
@@ -111,13 +114,13 @@ class SmallNGemvKernel:
         # shift (low half) / mask (high half) bitcast, exact by construction.
         i = Int32(tidx)
         while i < nvec:
-            col = i * Int32(8)
+            col = Int64(i * Int32(8))
             w0, w1, w2, w3 = ld_global_v4_u32(
                 get_ptr_as_int64(mW, w_base + col)
             )
             for r in cutlass.range_constexpr(m):
                 x0, x1, x2, x3 = ld_global_v4_u32(
-                    get_ptr_as_int64(mX, Int32(r) * k + col)
+                    get_ptr_as_int64(mX, Int64(r) * Int64(k) + col)
                 )
                 s = acc[r]
                 for wv, xv in ((w0, x0), (w1, x1), (w2, x2), (w3, x3)):

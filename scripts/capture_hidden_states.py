@@ -10,9 +10,10 @@ Feed the result to scripts/ablate_moe_act_quant.py or
 scripts/ablate_hadamard_fp6.py via ``--x-from`` so the ablation sees real
 outlier-channel structure instead of gaussian noise.
 
-Example:
+Example (Qwen3.6 ships custom modeling code, hence --trust-remote-code):
     python scripts/capture_hidden_states.py \
         --model /media/fmodels/Qwen/Qwen3.6-35B-A3B --layer 20 \
+        --trust-remote-code \
         --out /tmp/l20_hidden.safetensors
     python scripts/ablate_moe_act_quant.py \
         --model /media/fmodels/Qwen/Qwen3.6-35B-A3B --layer 20 \
@@ -47,11 +48,20 @@ def main() -> None:
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     parser.add_argument("--tokens", type=int, default=4096, help="tokens to capture")
     parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="allow the checkpoint's custom modeling code to run (required "
+        "for e.g. Qwen3.6; off by default so untrusted repos never execute "
+        "code without an explicit opt-in)",
+    )
     args = parser.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code
+    )
     if args.text_file:
         text = pathlib.Path(args.text_file).read_text(encoding="utf-8")
     else:
@@ -92,7 +102,10 @@ def main() -> None:
         move_after = torch.cuda.is_available()
     print(f"[capture] loading model (bf16, {extra or 'cpu->cuda'}) ...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, trust_remote_code=True, **extra
+        args.model,
+        dtype=torch.bfloat16,
+        trust_remote_code=args.trust_remote_code,
+        **extra,
     )
     if move_after:
         model = model.to("cuda")

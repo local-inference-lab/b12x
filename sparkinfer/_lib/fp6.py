@@ -16,7 +16,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
-from cutlass import Float32, Int32, Uint8, Uint32, Uint64
+from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -179,7 +179,7 @@ def fp6_unpack4_codes(
 @cute.jit
 def mxfp6_swizzled_scale_offset(
     row: Int32, block: Int32, cols_padded_div4: Int32
-) -> Int32:
+) -> Int64:
     """Flat byte offset (within one expert) of the UE8M0 scale for logical ``(row, block)``.
 
     Inverts the cutlass block-scale swizzle produced by ``swizzle_block_scale`` for
@@ -187,14 +187,21 @@ def mxfp6_swizzled_scale_offset(
     is ``align_up(num_blocks, 4) // 4``. Matches ``unswizzle_mxfp6_scales``:
 
         flat = ((((row//128)*cpd4 + block//4)*32 + row%32)*4 + (row%128)//32)*4 + block%4
+
+    Row-group * stride products are widened to Int64 before multiplication so
+    the flat offset cannot wrap for large scale arrays (coding guideline: ID *
+    stride arithmetic is Int64).
     """
-    r0 = row >> Int32(7)  # row // 128
-    r1 = (row >> Int32(5)) & Int32(3)  # (row % 128) // 32
-    r2 = row & Int32(31)  # row % 32
-    c0 = block >> Int32(2)  # block // 4
-    c1 = block & Int32(3)  # block % 4
+    r0 = Int64(row >> Int32(7))  # row // 128
+    r1 = Int64((row >> Int32(5)) & Int32(3))  # (row % 128) // 32
+    r2 = Int64(row & Int32(31))  # row % 32
+    c0 = Int64(block >> Int32(2))  # block // 4
+    c1 = Int64(block & Int32(3))  # block % 4
     return (
-        ((((r0 * cols_padded_div4 + c0) * Int32(32) + r2) * Int32(4) + r1) * Int32(4))
+        (
+            (((r0 * Int64(cols_padded_div4) + c0) * Int64(32) + r2) * Int64(4) + r1)
+            * Int64(4)
+        )
         + c1
     )
 

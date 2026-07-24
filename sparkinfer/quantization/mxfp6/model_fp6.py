@@ -502,7 +502,7 @@ def convert_dense_model_to_fp6(
     quantizer is GPU-only); ``dry_run`` works anywhere.
     """
     import json
-    from dataclasses import asdict
+    from dataclasses import fields
 
     from safetensors.torch import save_file
 
@@ -547,11 +547,14 @@ def convert_dense_model_to_fp6(
             w = model.get_tensor(key).to(device, torch.bfloat16)
             qw = quantize_dense_weight_to_fp6(w, source_format=source_format)
             scalars: dict[str, object] = {}
-            for k2, v in asdict(qw).items():
+            # fields()+getattr instead of asdict(): asdict deep-copies every
+            # field, cloning the on-GPU packed tensors before the .cpu() move.
+            for f2 in fields(qw):
+                v = getattr(qw, f2.name)
                 if isinstance(v, torch.Tensor):
-                    tensors[f"{key}::{k2}"] = v.detach().cpu().contiguous()
+                    tensors[f"{key}::{f2.name}"] = v.detach().cpu().contiguous()
                 else:
-                    scalars[k2] = v
+                    scalars[f2.name] = v
             metadata[key] = json.dumps(scalars)
             linear_keys.append(key)
             report.tensors_written += 1

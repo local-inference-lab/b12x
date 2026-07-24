@@ -21,33 +21,14 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.fp6_common import (
+    bf16_grouped_moe,
     capture_graph_replay,
+    check_outputs,
     fmt_us,
     make_l2_flush_fn,
     resolve_l2_flush_bytes,  # noqa: F401  (re-exported CLI helper)
+    unswizzled_ue8m0_grid,
 )
-
-
-def _unswizzled_ue8m0_grid(w_bf16: torch.Tensor) -> torch.Tensor:
-    """Per-K/32 UE8M0 scale bytes, unswizzled ``[E, rows, K//32]`` uint8.
-
-    ``prepare_weights`` (``prepare_w6a8_mxfp6_weights``) expects the
-    unswizzled grid and applies the MMA swizzle itself; the offline
-    quantizer's blockscale field is already swizzled, so recompute the grid
-    from the same block-max rule the codes were quantized against.
-    """
-    from sparkinfer._lib.fp6 import (
-        FLOAT6_E2M3_MAX,
-        SF_VEC_SIZE_FP6,
-        _ue8m0_scale_from_block_max,
-    )
-
-    e, rows, cols = w_bf16.shape
-    blocks = cols // SF_VEC_SIZE_FP6
-    block_max = (
-        w_bf16.float().abs().view(e, rows, blocks, SF_VEC_SIZE_FP6).amax(dim=-1)
-    )
-    return _ue8m0_scale_from_block_max(block_max, FLOAT6_E2M3_MAX).contiguous()
 
 
 def main() -> None:
@@ -88,9 +69,8 @@ def main() -> None:
     w1_bf = torch.randn(e, 2 * n, k, device=device, dtype=torch.bfloat16) * 0.15
     w2_bf = torch.randn(e, k, n, device=device, dtype=torch.bfloat16) * 0.15
     w = quantize_moe_weights_to_fp6(w1_bf, w2_bf, source_format="mxfp6_e2m3")
-    w1_grid = _unswizzled_ue8m0_grid(w1_bf)
-    w2_grid = _unswizzled_ue8m0_grid(w2_bf)
-    del w1_bf, w2_bf
+    w1_grid = unswizzled_ue8m0_grid(w1_bf)
+    w2_grid = unswizzled_ue8m0_grid(w2_bf)
 
     fused_moe.clear_caches()
     weight_plan = fused_moe.plan_weights(
@@ -145,6 +125,16 @@ def main() -> None:
     def launch() -> None:
         fused_moe.run(binding=binding)
 
+    # Correctness gate before any timing (coding guideline): a silently
+    # broken execution path must fail here, not report timings. Also warms
+    # the compiled launch. bf16_grouped_moe is the same reference/threshold
+    # approach scripts/bench_fp6_moe.py uses.
+    launch()
+    torch.cuda.synchronize()
+    ref = bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n)
+    check_outputs(out, ref, label="bf16 grouped MoE", cosine_threshold=0.99)
+    del w1_bf, w2_bf
+
     replay = capture_graph_replay(launch)
     l2_flush = make_l2_flush_fn(enabled=args.flush_l2, bytes_hint=args.l2_flush_bytes)
     for _ in range(args.warmup):
@@ -161,7 +151,7 @@ def main() -> None:
         replay()
         ends[i].record()
     torch.cuda.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    times = [s.elapsed_time(e) for s, e in zip(starts, ends, strict=True)]
     med = statistics.median(times)
     print(
         f"W6A8 MX-FP6 MoE synthetic m={m} k={k} n={n} E={e} topk={topk}: "

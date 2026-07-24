@@ -1,15 +1,17 @@
 #!/usr/bin/env python
-"""Decode-latency benchmark: MX-FP6 (W6A6) BS1 micro kernel vs static fused path.
+"""Decode-latency benchmark: MX-FP6 (W6A8) BS1 micro kernel vs dynamic fused path.
 
 Builds a synthetic routed-MoE layer, quantizes it to packed MX-FP6, then times
-the FP6 MoE launch (historically ``b12x_moe_fp6``; pending a
-``sparkinfer.moe.fused_moe`` rewrite) with ``SPARKINFER_ENABLE_FP6_MICRO`` off (static/dynamic fused path)
-and on (BS1 decode micro kernel). Reports per-call latency, speedup, and the
-cosine similarity between the two outputs so a regression in either is obvious.
+the ``sparkinfer.moe.fused_moe`` plan/bind/run flow with
+``SPARKINFER_ENABLE_FP6_MICRO`` off (dynamic fused path) and on (BS1 decode
+micro kernel). Reports per-call latency, speedup, and the cosine similarity
+between the two outputs so a regression in either is obvious.
 
-The micro path only engages for small ``m`` (decode) and shapes that pass
-``is_supported_mxfp6`` + the smem-fit guard; otherwise both runs hit the static
-path and the speedup is ~1.0 (still a useful correctness check).
+The micro path only engages for small ``m`` (decode) and shapes that pass its
+dispatch predicate; otherwise both runs hit the dynamic path and the speedup
+is ~1.0 (still a useful correctness check). The env var is consulted at
+dispatch time, so caches are cleared and the plan is rebuilt between the two
+timings.
 
 Examples
 --------
@@ -23,8 +25,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
+import sys
 
 import torch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from benchmarks.fp6_common import unswizzled_ue8m0_grid
 
 
 def _bench_once(fn, iters: int, warmup: int) -> float:
@@ -50,93 +58,126 @@ def main() -> None:
     p.add_argument("--m", type=int, nargs="+", default=[1, 2, 4], help="token counts")
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
-    p.add_argument("--source-format", type=str, default="mxfp6_default")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
 
-    # TODO(port): this benchmark drove the historical b12x.integration.tp_moe host
-    # API (allocate_tp_moe_workspace / b12x_moe_fp6 / clear_tp_moe_caches) and the
-    # FP6 BS1 decode micro kernel (b12x.moe.fused.micro_fp6), neither of which has
-    # an upstream sparkinfer equivalent yet. Rewrite the setup below against the
-    # sparkinfer.moe.fused_moe plan/bind/run flow once the w6a8_mx run path lands.
-    raise SystemExit("pending: rewrite against sparkinfer.moe.fused_moe")
-
-    # Import after arg parse so a --help works without CUDA libs loaded.
-    from b12x.integration.tp_moe import (  # historical b12x reference (see TODO above)
-        allocate_tp_moe_workspace,
-        b12x_moe_fp6,
-        clear_tp_moe_caches,
-    )
-    from b12x.moe.fused.micro_fp6 import (  # historical b12x reference (see TODO above)
-        fp6_micro_fits_smem,
-        fp6_micro_smem_bytes,
-    )
+    from sparkinfer.moe import fused_moe
     from sparkinfer.quantization.mxfp6 import quantize_moe_weights_to_fp6
 
-    device = torch.device("cuda")
+    # Fully-qualified device: the scratch binder compares device strings
+    # exactly, and tensors allocated on "cuda" report "cuda:0".
+    device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(args.seed)
     k, n, experts, topk = args.k, args.n, args.experts, args.topk
-    two_n = 2 * n
+    if k % 128 != 0 or n % 128 != 0:
+        raise SystemExit(
+            f"w6a8_mx requires K % 128 == 0 and N % 128 == 0, got K={k} N={n}"
+        )
 
     print(f"device       : {torch.cuda.get_device_name(device)}")
     print(f"shape        : k={k} n={n} experts={experts} topk={topk}")
-    print(f"micro smem   : {fp6_micro_smem_bytes(k, n)} bytes "
-          f"(fits={fp6_micro_fits_smem(k, n, device)})")
-    print(f"source_format: {args.source_format}")
 
-    w1 = (torch.randn(experts, two_n, k, device=device) * 0.1).to(torch.bfloat16)
-    w2 = (torch.randn(experts, k, n, device=device) * 0.1).to(torch.bfloat16)
-    weights = quantize_moe_weights_to_fp6(
-        w1, w2, source_format=args.source_format, activation="silu", use_gpu=True
+    w1_bf = (torch.randn(experts, 2 * n, k, device=device) * 0.1).to(torch.bfloat16)
+    w2_bf = (torch.randn(experts, k, n, device=device) * 0.1).to(torch.bfloat16)
+    w = quantize_moe_weights_to_fp6(w1_bf, w2_bf, source_format="mxfp6_e2m3")
+    # prepare_weights wants UNswizzled UE8M0 grids (it swizzles internally).
+    w1_grid = unswizzled_ue8m0_grid(w1_bf)
+    w2_grid = unswizzled_ue8m0_grid(w2_bf)
+    del w1_bf, w2_bf
+
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w6a8_mx",
+        source_format="mxfp6_e2m3",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=experts,
+        hidden_size=k,
+        intermediate_size=n,
+        w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        w1_fp4=w.w1_fp6,  # packed FP6 code bytes ride the fp4-named args
+        w1_blockscale=w1_grid,
+        w1_global_scale=w.w1_alphas,
+        a1_gscale=w.a1_gscale,
+        w2_fp4=w.w2_fp6,
+        w2_blockscale=w2_grid,
+        w2_global_scale=w.w2_alphas,
+        a2_gscale=w.a2_gscale,
+        params_dtype=torch.bfloat16,
     )
 
-    def make_runner(m: int):
-        x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
-        topk_ids = torch.randint(0, experts, (m, topk), device=device, dtype=torch.int32)
-        topk_weights = torch.softmax(torch.randn(m, topk, device=device), dim=-1).float()
-        ws = allocate_tp_moe_workspace(
-            x, weights.a1_gscale, weights.w1_fp6, weights.a2_gscale, weights.w2_fp6,
-            topk_ids, quant_mode="w6a6", input_scales_static=True,
+    def make_runner(m: int, x, topk_ids, topk_weights):
+        """(Re)plan + bind under the CURRENT env so dispatch re-decides."""
+        fused_moe.clear_caches()
+        plan = fused_moe.plan(
+            fused_moe.Caps(
+                max_tokens=m,
+                num_topk=topk,
+                device=device,
+                weight_plan=weight_plan,
+                core_token_counts=(m,),
+                route_num_experts=0,
+                quant_mode="w6a8_mx",
+            )
+        )
+        scratch = tuple(
+            torch.empty(shape, dtype=dtype, device=plan.scratch_specs()[i].device)
+            for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+        )
+        out = torch.zeros(m, k, device=device, dtype=torch.bfloat16)
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=out,
+            input_scales_static=True,
         )
 
         def run() -> torch.Tensor:
-            return b12x_moe_fp6(
-                x, weights.a1_gscale, weights.w1_fp6, weights.w1_blockscale,
-                weights.w1_alphas, weights.a2_gscale, weights.w2_fp6,
-                weights.w2_blockscale, weights.w2_alphas, topk_weights, topk_ids,
-                workspace=ws, input_scales_static=True,
-                source_format=args.source_format,
-            )
+            fused_moe.run(binding=binding)
+            return out
 
         return run
 
     print()
-    header = f"{'m':>4} {'static(ms)':>12} {'micro(ms)':>12} {'speedup':>9} {'cosine':>9}"
+    header = f"{'m':>4} {'dynamic(ms)':>12} {'micro(ms)':>12} {'speedup':>9} {'cosine':>9}"
     print(header)
     print("-" * len(header))
-    for m in args.m:
-        run = make_runner(m)
+    try:
+        for m in args.m:
+            x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
+            topk_ids = torch.randint(
+                0, experts, (m, topk), device=device, dtype=torch.int32
+            )
+            topk_weights = torch.softmax(
+                torch.randn(m, topk, device=device), dim=-1
+            ).float()
 
-        os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "0"
-        clear_tp_moe_caches()
-        static_out = run().clone()
-        t_static = _bench_once(run, args.iters, args.warmup)
+            os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "0"
+            run = make_runner(m, x, topk_ids, topk_weights)
+            dyn_out = run().clone()
+            t_dyn = _bench_once(run, args.iters, args.warmup)
 
-        os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "1"
-        clear_tp_moe_caches()
-        micro_out = run().clone()
-        t_micro = _bench_once(run, args.iters, args.warmup)
+            os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "1"
+            run = make_runner(m, x, topk_ids, topk_weights)
+            micro_out = run().clone()
+            t_micro = _bench_once(run, args.iters, args.warmup)
 
-        cos = torch.nn.functional.cosine_similarity(
-            micro_out.reshape(-1).float(), static_out.reshape(-1).float(), dim=0
-        ).item()
-        speedup = t_static / t_micro if t_micro > 0 else float("nan")
-        print(f"{m:>4} {t_static:>12.4f} {t_micro:>12.4f} {speedup:>9.2f} {cos:>9.4f}")
-
-    os.environ.pop("SPARKINFER_ENABLE_FP6_MICRO", None)
+            cos = torch.nn.functional.cosine_similarity(
+                micro_out.reshape(-1).float(), dyn_out.reshape(-1).float(), dim=0
+            ).item()
+            speedup = t_dyn / t_micro if t_micro > 0 else float("nan")
+            print(f"{m:>4} {t_dyn:>12.4f} {t_micro:>12.4f} {speedup:>9.2f} {cos:>9.4f}")
+    finally:
+        os.environ.pop("SPARKINFER_ENABLE_FP6_MICRO", None)
 
 
 if __name__ == "__main__":

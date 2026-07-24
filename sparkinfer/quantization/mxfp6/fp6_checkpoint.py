@@ -62,31 +62,56 @@ SCALE_DTYPE_TAG = "uint8_ue8m0"
 # Offline weight UE8M0 exponent selection (runtime activation quant stays ceil).
 _BLOCK_SCALE_RULES = frozenset({"ceil", "mse"})
 
+
+def _validate_block_scale_rule(rule: str) -> str:
+    """Normalize + validate ``block_scale_rule`` (shared by config + quantizer)."""
+    normalized = str(rule).lower().strip()
+    if normalized not in _BLOCK_SCALE_RULES:
+        raise ValueError(
+            f"block_scale_rule must be one of {sorted(_BLOCK_SCALE_RULES)}, got "
+            f"{rule!r}"
+        )
+    return normalized
+
 _TILE = 128
+
+
+_SOURCE_FORMATS_E3M2 = frozenset({"mxfp6_e3m2", "e3m2", "float6_e3m2fn"})
+_SOURCE_FORMATS_E2M3 = frozenset({"mxfp6_e2m3", "e2m3", "float6_e2m3fn"})
+_SOURCE_FORMATS_GENERIC = frozenset({"mxfp6_default", "mxfp6_mixed", "mxfp6_w6a8"})
+_SOURCE_FORMATS = _SOURCE_FORMATS_E3M2 | _SOURCE_FORMATS_E2M3 | _SOURCE_FORMATS_GENERIC
+
+
+def _validate_source_format(source_format: str) -> str:
+    """Normalize + validate ``source_format`` (fail fast on CLI typos)."""
+    sf = str(source_format).lower().strip()
+    if sf not in _SOURCE_FORMATS:
+        raise ValueError(
+            f"unsupported source_format {source_format!r}; expected one of "
+            f"{sorted(_SOURCE_FORMATS)}"
+        )
+    return sf
 
 
 def weight_format_for_source(source_format: str) -> str:
     """FP6 sub-format (``e2m3``/``e3m2``) for the *weight* operand."""
-    sf = source_format.lower()
-    if sf in ("mxfp6_e3m2", "e3m2", "float6_e3m2fn"):
+    sf = _validate_source_format(source_format)
+    if sf in _SOURCE_FORMATS_E3M2:
         return "e3m2"
-    if sf in ("mxfp6_e2m3", "e2m3", "float6_e2m3fn"):
-        return "e2m3"
-    # mxfp6_default / mxfp6_mixed / mxfp6_w6a8: E2M3 weights.
+    # mxfp6_e2m3 aliases and mxfp6_default / mxfp6_mixed / mxfp6_w6a8: E2M3.
     return "e2m3"
 
 
 def activation_format_for_source(source_format: str) -> str:
     """Activation operand sub-format (kernel quantizes these live)."""
-    sf = source_format.lower()
-    if sf in ("mxfp6_e2m3", "e2m3", "float6_e2m3fn"):
+    sf = _validate_source_format(source_format)
+    if sf in _SOURCE_FORMATS_E2M3:
         return "e2m3"
-    if sf in ("mxfp6_e3m2", "e3m2", "float6_e3m2fn"):
-        return "e3m2"
     if sf == "mxfp6_w6a8":
         # W6A8: FP8 E4M3 activations (same mxf8f6f4 MMA kind / UE8M0 scales).
         return "e4m3"
-    # mxfp6_default / mxfp6_mixed: E3M2 activations (more range for dynamic data).
+    # e3m2 aliases and mxfp6_default / mxfp6_mixed: E3M2 activations
+    # (more range for dynamic data).
     return "e3m2"
 
 
@@ -115,12 +140,7 @@ def build_quantization_config(
     (``mse`` = ceil vs ceil-1 per block; ``ceil`` = amax containment only).
     Runtime does not read this field; it is provenance for the checkpoint.
     """
-    rule = str(block_scale_rule).lower().strip()
-    if rule not in _BLOCK_SCALE_RULES:
-        raise ValueError(
-            f"block_scale_rule must be one of {sorted(_BLOCK_SCALE_RULES)}, got "
-            f"{block_scale_rule!r}"
-        )
+    rule = _validate_block_scale_rule(block_scale_rule)
     cfg: dict = {
         "quant_method": QUANT_METHOD,
         "quant_algo": QUANT_ALGO,
@@ -383,7 +403,14 @@ def _pack_codes_and_scales_mse(
     mse_hi = ((q_hi - v) ** 2).sum(dim=-1, keepdim=True)
     mse_lo = ((q_lo - v) ** 2).sum(dim=-1, keepdim=True)
     nonzero = amax > 0
-    use_lo = (mse_lo < mse_hi) & nonzero
+    # ue==0 is reserved as the "all-zero block" sentinel (see
+    # dequantize_linear_from_fp6), so the finer exponent is only eligible when
+    # e-1 still maps to ue >= 1 (e-1 >= -126). Gating the CANDIDATE (rather
+    # than clamping ue afterwards) keeps codes and stored scale consistent —
+    # a post-hoc ue clamp would pair e-1-encoded codes with an e-exponent
+    # scale and silently dequantize the block 2x too large.
+    lo_representable = e > -126.0
+    use_lo = (mse_lo < mse_hi) & nonzero & lo_representable
 
     codes = torch.where(use_lo, codes_lo, codes_hi)
     codes = torch.where(nonzero, codes, torch.zeros_like(codes))
@@ -417,12 +444,7 @@ def quantize_linear_to_fp6(
         raise ValueError(
             f"weight must be rank-2 (out, in), got {tuple(weight_bf16.shape)}"
         )
-    rule = str(block_scale_rule).lower().strip()
-    if rule not in _BLOCK_SCALE_RULES:
-        raise ValueError(
-            f"block_scale_rule must be one of {sorted(_BLOCK_SCALE_RULES)}, got "
-            f"{block_scale_rule!r}"
-        )
+    rule = _validate_block_scale_rule(block_scale_rule)
     out_features, in_features = weight_bf16.shape
     fmt = weight_format_for_source(source_format)
     w = weight_bf16.to(torch.bfloat16)

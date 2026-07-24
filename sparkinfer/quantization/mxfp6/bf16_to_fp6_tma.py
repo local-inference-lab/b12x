@@ -46,7 +46,7 @@ _FP6_BLOCK_ELEMS = 32
 @cute.jit
 def moe_mxfp6_store_packed_global(
     storage: cute.Tensor,
-    byte_offset: Int32,
+    byte_offset: Int64,
     lo: Uint64,
     mid: Uint64,
     hi: Uint64,
@@ -61,7 +61,7 @@ def moe_mxfp6_store_packed_global(
 @cute.jit
 def moe_mxfp6_store_bytes_u64_global(
     storage: cute.Tensor,
-    byte_offset: Int32,
+    byte_offset: Int64,
     q0: Uint64,
     q1: Uint64,
     q2: Uint64,
@@ -282,10 +282,12 @@ class TestKernel:
                             q0, q1, q2, q3, sbyte = quantize_block_fp6_e3m2_bytes(
                                 vals, bmax, gs_value
                             )
+                        # Row ID * stride in Int64 (coding guideline): the
+                        # bytes-mode offset is ~M*K and must not wrap.
                         byte_offset = (
-                            grow * Int32(128) * k_tiles
-                            + kt * Int32(128)
-                            + sf_block * Int32(32)
+                            Int64(grow) * Int64(128) * Int64(k_tiles)
+                            + Int64(kt * Int32(128))
+                            + Int64(sf_block * Int32(32))
                         )
                         moe_mxfp6_store_bytes_u64_global(
                             mOA, byte_offset, q0, q1, q2, q3
@@ -309,9 +311,9 @@ class TestKernel:
                         # rest. The flat byte offset stays 8-byte aligned (96 and 24 are
                         # multiples of 8), matching the three u64 lanes.
                         byte_offset = (
-                            grow * Int32(96) * k_tiles
-                            + kt * Int32(96)
-                            + sf_block * Int32(24)
+                            Int64(grow) * Int64(96) * Int64(k_tiles)
+                            + Int64(kt * Int32(96))
+                            + Int64(sf_block * Int32(24))
                         )
                         moe_mxfp6_store_packed_global(mOA, byte_offset, lo, mid, hi)
                     # Scale byte -> global, directly into the swizzled blockscaled SFA
@@ -321,10 +323,11 @@ class TestKernel:
                     outer_m_idx = row % Int32(32)
                     inner_m_idx = row // Int32(32)
                     sf_offset = (
-                        (mt * k_tiles + kt) * Int32(512)
-                        + outer_m_idx * Int32(16)
-                        + inner_m_idx * Int32(4)
-                        + sf_block
+                        Int64(mt) * Int64(k_tiles) * Int64(512)
+                        + Int64(kt * Int32(512))
+                        + Int64(outer_m_idx * Int32(16))
+                        + Int64(inner_m_idx * Int32(4))
+                        + Int64(sf_block)
                     )
                     st_global_u8(get_ptr_as_int64(mSFA, sf_offset), sbyte)
                     blk += Int32(self.num_mma_warps * 32)

@@ -22,7 +22,7 @@ are computed with the same per-32-block UE8M0 + cutlass swizzle the kernel reads
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, fields
 from typing import Optional
 
 import torch
@@ -241,11 +241,14 @@ def save_fp6_moe_weights(weights: FP6MoEWeights, path: str) -> None:
     tensors: dict[str, torch.Tensor] = {}
     # historical schema id; do not rename (existing artifacts carry it)
     metadata = {"__format__": "b12x_fp6_moe_weights_v1"}
-    for key, value in asdict(weights).items():
+    # fields()+getattr instead of asdict(): asdict deep-copies every field,
+    # cloning the (potentially on-GPU) packed tensors before the .cpu() move.
+    for f in fields(weights):
+        value = getattr(weights, f.name)
         if isinstance(value, torch.Tensor):
-            tensors[key] = value.detach().cpu().contiguous()
+            tensors[f.name] = value.detach().cpu().contiguous()
         else:
-            metadata[key] = json.dumps(value)
+            metadata[f.name] = json.dumps(value)
     save_file(tensors, path, metadata=metadata)
 
 

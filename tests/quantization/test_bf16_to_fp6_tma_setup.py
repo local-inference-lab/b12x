@@ -9,12 +9,14 @@ from sparkinfer.quantization.mxfp6 import (
     allocate_bf16_to_fp6_tma_outputs,
     compile_bf16_to_fp6_tma,
 )
-from sparkinfer.quantization.mxfp6.bf16_to_fp6_tma import TestKernel
+# Underscore alias: pytest tries to collect any module-level class named
+# Test* (PytestCollectionWarning — TestKernel has an __init__).
+from sparkinfer.quantization.mxfp6.bf16_to_fp6_tma import TestKernel as _TestKernel
 
 
 def test_bf16_to_fp6_tma_kernel_import() -> None:
-    assert TestKernel is not None
-    k = TestKernel()
+    assert _TestKernel is not None
+    k = _TestKernel()
     assert k.tile_shape_mnk == (128, 128, 128)
     assert k.threads_per_cta == 160
 

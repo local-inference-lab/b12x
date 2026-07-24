@@ -49,7 +49,10 @@ def main() -> None:
     )
     if rows_padded != m:
         inp[:m].copy_(bf16)
-    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=dev)
+    # The kernel is compiled for rows_padded rows and its launch closure
+    # reshapes the flat code buffer to (1, rows_padded, packed_k); allocate
+    # accordingly or any m % 128 != 0 raises a size-mismatch RuntimeError.
+    out = allocate_bf16_to_fp6_tma_outputs(rows_padded, k, device=dev)
     compiled = compile_bf16_to_fp6_tma(rows_padded, k)
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)
     l2_flush = make_l2_flush_fn(args.flush_l2, args.l2_flush_bytes)

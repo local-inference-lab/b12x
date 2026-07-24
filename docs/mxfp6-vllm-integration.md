@@ -29,13 +29,14 @@ flowchart LR
 A model is routed to sparkinfer FP6 when **both** are true:
 
 1. ``SPARKINFER_ENABLE_FP6=1`` (legacy ``B12X_ENABLE_FP6`` also accepted)
-2. ``config.json`` contains::
+2. ``config.json`` contains:
 
-       "quantization_config": {
-         "quant_method": "modelopt",
-         "quant_algo": "W6A6",
-         ...
-       }
+   ```json
+   "quantization_config": {
+     "quant_method": "modelopt",
+     "quant_algo": "W6A6"
+   }
+   ```
 
 The on-disk tensor layout mirrors ModelOpt NVFP4:
 
@@ -58,15 +59,20 @@ Produce checkpoints with ``scripts/quantize_model_fp6.py``.
 
 1. vLLM expert loader fills ``w13_weight`` / ``w2_weight`` and block scales.
 2. ``process_weights_after_loading`` reorders FC1 rows from vLLM's ``[gate; up]``
-   to the kernel's ``[up; gate]`` contract, then calls::
+   to the kernel's ``[up; gate]`` contract, then calls:
 
-       fused_moe.plan_weights(quant_modes="w6a8_mx", source_format="mxfp6_e2m3", ...)
-       fused_moe.prepare_weights(...)
-3. Each ``apply`` reuses a process-wide scratch cache keyed by ``(M, topk)``::
+   ```python
+   fused_moe.plan_weights(quant_modes="w6a8_mx", source_format="mxfp6_e2m3", ...)
+   fused_moe.prepare_weights(...)
+   ```
 
-       plan = fused_moe.plan(Caps(...))
-       binding = fused_moe.bind(plan, scratch=..., a=..., experts=..., output=...)
-       out = fused_moe.run(binding)
+3. Each ``apply`` reuses a process-wide scratch cache keyed by ``(M, topk)``:
+
+   ```python
+   plan = fused_moe.plan(Caps(...))
+   binding = fused_moe.bind(plan, scratch=..., a=..., experts=..., output=...)
+   out = fused_moe.run(binding)
+   ```
 
 Decode token counts are warm-run at load time so kernels compile and scratch
 buffers exist before CUDA-graph capture.
@@ -76,7 +82,7 @@ buffers exist before CUDA-graph capture.
 Copy (or symlink) these files into the private integration tree of a vLLM fork
 that already carries the FP4 glue:
 
-```
+```text
 sparkinfer/integration/vllm/fp6_serving.py
 sparkinfer/integration/vllm/plugin.py
 sparkinfer/integration/vllm/__init__.py

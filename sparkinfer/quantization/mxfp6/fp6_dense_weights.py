@@ -26,7 +26,7 @@ uses a bf16 global-scale that maps its amax into FP6 range, and
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, fields
 from typing import Optional
 
 import torch
@@ -285,7 +285,7 @@ class FP6DenseWeight:
 
     def __post_init__(self) -> None:
         # Cached 1-byte-per-code expansion of ``packed`` (the dense_gemm RHS).
-        # Not a dataclass field so it is excluded from ``asdict``/save and is
+        # Not a dataclass field so it is excluded from ``fields()``/save and is
         # rebuilt lazily after ``to()`` (which constructs a fresh instance).
         self._packed_expanded: Optional[torch.Tensor] = None
         if not self.act_fmt:
@@ -671,11 +671,14 @@ def save_fp6_dense_weight(weight: FP6DenseWeight, path: str) -> None:
     tensors: dict[str, torch.Tensor] = {}
     # historical schema id; do not rename (existing artifacts carry it)
     metadata = {"__format__": "b12x_fp6_dense_weight_v1"}
-    for key, value in asdict(weight).items():
+    # fields()+getattr instead of asdict(): asdict deep-copies every field,
+    # cloning the (potentially on-GPU) packed tensors before the .cpu() move.
+    for f in fields(weight):
+        value = getattr(weight, f.name)
         if isinstance(value, torch.Tensor):
-            tensors[key] = value.detach().cpu().contiguous()
+            tensors[f.name] = value.detach().cpu().contiguous()
         else:
-            metadata[key] = json.dumps(value)
+            metadata[f.name] = json.dumps(value)
     save_file(tensors, path, metadata=metadata)
 
 
