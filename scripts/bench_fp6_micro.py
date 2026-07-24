@@ -32,7 +32,11 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from benchmarks.fp6_common import unswizzled_ue8m0_grid
+from benchmarks.fp6_common import (
+    bf16_grouped_moe,
+    check_outputs,
+    unswizzled_ue8m0_grid,
+)
 
 
 def _bench_once(fn, iters: int, warmup: int) -> float:
@@ -86,7 +90,8 @@ def main() -> None:
     # prepare_weights wants UNswizzled UE8M0 grids (it swizzles internally).
     w1_grid = unswizzled_ue8m0_grid(w1_bf)
     w2_grid = unswizzled_ue8m0_grid(w2_bf)
-    del w1_bf, w2_bf
+    # w1_bf/w2_bf are kept alive: the correctness gates below need an
+    # independent BF16 ground truth, not just micro-vs-dynamic agreement.
 
     weight_plan = fused_moe.plan_weights(
         quant_modes="w6a8_mx",
@@ -164,11 +169,28 @@ def main() -> None:
             os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "0"
             run = make_runner(m, x, topk_ids, topk_weights)
             dyn_out = run().clone()
+
+            # Correctness gates before any timing (coding guideline). The
+            # dynamic path is checked against an independent BF16 ground
+            # truth (so a bug shared by both FP6 paths still fails), then
+            # micro against dynamic (same quantized math, different kernel,
+            # so the self-consistency bar is tighter). CorrectnessError
+            # aborts the run on divergence or non-finite output.
+            ref = bf16_grouped_moe(x, w1_bf, w2_bf, topk_ids, topk_weights, n)
+            check_outputs(
+                dyn_out, ref, label=f"bf16 ref (m={m})", cosine_threshold=0.99
+            )
             t_dyn = _bench_once(run, args.iters, args.warmup)
 
             os.environ["SPARKINFER_ENABLE_FP6_MICRO"] = "1"
             run = make_runner(m, x, topk_ids, topk_weights)
             micro_out = run().clone()
+            check_outputs(
+                micro_out,
+                dyn_out,
+                label=f"dynamic path (m={m})",
+                cosine_threshold=0.995,
+            )
             t_micro = _bench_once(run, args.iters, args.warmup)
 
             cos = torch.nn.functional.cosine_similarity(
