@@ -431,6 +431,10 @@ def test_cleanup_rebinds_the_configured_cuda_device(monkeypatch):
         ("free", 100),
     ]
 
+    operations.clear()
+    runtime.close()
+    assert operations == []
+
 
 def test_cuda_source_uses_int64_pool_scaled_offsets_and_no_domain_policy():
     module_path = (
@@ -450,6 +454,7 @@ def test_cuda_source_uses_int64_pool_scaled_offsets_and_no_domain_policy():
     assert "destination_ptr" in source
     assert "scatter_records_kernel<int32_t, uint4>" in source
     assert "scatter_records_kernel<int32_t, uint8_t>" in source
+    assert "__threadfence_system();" in source
     assert "barrier_all_peers_kernel" in source
     assert source.count("barrier_all_peers_kernel<<<") == 2
     assert "cudaMalloc" not in source

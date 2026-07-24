@@ -118,6 +118,10 @@ __global__ void scatter_records_kernel(
         destination_offset);
     *destination_ptr = *source;
   }
+
+  // Publish every peer payload store before the next kernel signals that the
+  // destination slab is ready to consume.
+  __threadfence_system();
 }
 
 void validate_tensor(
