@@ -93,6 +93,10 @@ def bench_one_fp6(
             ref,
             label="torch dequant matmul",
             cosine_threshold=0.95,
+            # L2 analog of the deliberately loose 0.95 cosine gate
+            # (rel ~= sqrt(2*(1-cos))); still fails hard on any power-of-two
+            # scale bug (rel >= 0.5).
+            rel_rmse_threshold=0.35,
         )
 
     return times

@@ -47,7 +47,20 @@ def check_outputs(
     *,
     label: str,
     cosine_threshold: float,
+    rel_rmse_threshold: float = 0.15,
 ) -> None:
+    """Correctness gate: finite values, direction (cosine), and scale (rel RMSE).
+
+    Cosine similarity alone is invariant to positive scaling, so a global
+    scale/dequant bug (e.g. a UE8M0 exponent off by one = exactly 2x) would
+    pass it with cos=1.0. ``rel_rmse`` closes that hole: it is the L2-relative
+    error ``||candidate - reference|| / ||reference||`` (normalized by the
+    reference RMS, not mean-abs, so it relates directly to cosine:
+    ``rel ~= sqrt(2 * (1 - cos))`` at matched scale). The 0.15 default is the
+    L2 analog of ``cosine_threshold=0.99`` plus scale headroom: known-good
+    W6A8-vs-BF16 comparisons measure ~0.065, while any realistic scale bug is
+    a power of two and lands at >= 0.5.
+    """
     cand_finite = bool(torch.isfinite(candidate).all().item())
     ref_finite = bool(torch.isfinite(reference).all().item())
     if not cand_finite or not ref_finite:
@@ -58,8 +71,17 @@ def check_outputs(
     diff = (candidate.float() - reference.float()).abs()
     max_abs = diff.max().item()
     rmse = diff.square().mean().sqrt().item()
+    ref_rms = reference.float().square().mean().sqrt().item()
+    if ref_rms > 0.0:
+        rel_rmse = rmse / ref_rms
+    else:
+        # All-zero reference: the candidate must also be (exactly) zero.
+        rel_rmse = 0.0 if rmse == 0.0 else math.inf
     cos = cosine_similarity(candidate, reference)
-    print(f"    check vs {label}: max_abs={max_abs:.8f} rmse={rmse:.8f} cos={cos:.10f}")
+    print(
+        f"    check vs {label}: max_abs={max_abs:.8f} rmse={rmse:.8f} "
+        f"rel_rmse={rel_rmse:.6f} cos={cos:.10f}"
+    )
     if not math.isfinite(cos):
         raise CorrectnessError(
             f"cosine similarity vs {label} is non-finite: "
@@ -69,6 +91,12 @@ def check_outputs(
         raise CorrectnessError(
             f"cosine similarity vs {label} fell below threshold "
             f"{cosine_threshold:.6f}: got {cos:.10f}"
+        )
+    if rel_rmse > rel_rmse_threshold:
+        raise CorrectnessError(
+            f"relative RMSE vs {label} exceeded threshold "
+            f"{rel_rmse_threshold:.4f}: got {rel_rmse:.6f} "
+            f"(rmse={rmse:.8f}, ref_rms={ref_rms:.8f})"
         )
 
 
