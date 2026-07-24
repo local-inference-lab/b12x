@@ -99,9 +99,15 @@ from sparkinfer._lib.intrinsics import (
 from sparkinfer._lib.smem import make_smem_memrange_alias
 from sparkinfer._lib.dense_gemm import (
     DenseGemmKernel,
+    _expand_packed_b_stage_smem,
     _reshape_acc_to_mn,
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
+)
+from sparkinfer.moe._shared.kernels.mxfp6_moe import (
+    moe_emit_mma_k_block,
+    moe_mxfp6_quantize_input_block_containers,
+    moe_mxfp6_store_expanded_global,
 )
 from sparkinfer._lib.intrinsics import (
     scatter_add_bf16x2,
@@ -684,9 +690,11 @@ class MoEDynamicKernelBackend:
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
     ):
         activation = normalize_moe_activation(activation)
-        if quant_recipe not in {"nvfp4", "w4a8_mx", "w4a8_nvfp4"}:
+        if quant_recipe not in {"nvfp4", "w4a8_mx", "w4a8_nvfp4", "w6a8_mx"}:
             raise ValueError(f"unsupported quant_recipe {quant_recipe!r}")
         if work_source not in _WORK_SOURCES:
             raise ValueError(
@@ -722,7 +730,52 @@ class MoEDynamicKernelBackend:
         self.work_source = work_source
         self.work_is_persistent_grid = work_source == _WORK_SOURCE_PERSISTENT_GRID
         self.work_is_streaming = work_source == _WORK_SOURCE_READY_QUEUE
-        self.is_w4a8 = quant_recipe != "nvfp4"
+        # w6a8_mx: MX-FP6 weights (3:4-packed bytes in gmem, expanded in-smem
+        # to Float8E4M3FN byte-containers) against MXFP8-E4M3 activations with
+        # UE8M0 K/32 block scales, computed on the inline ``mxf8f6f4``
+        # m16n8k32 MMA. It rides the nvfp4-shaped TMA route/pack/mainloop
+        # machinery (NOT the raw w4a8 path), so is_w4a8 stays False for it.
+        self.is_w6a8 = quant_recipe == "w6a8_mx"
+        if self.is_w6a8:
+            if mxfp6_fmt_a is None:
+                mxfp6_fmt_a = "e4m3"
+            if mxfp6_fmt_b is None:
+                mxfp6_fmt_b = "e2m3"
+            if mxfp6_fmt_a != "e4m3":
+                raise ValueError(
+                    f"w6a8_mx activations are MXFP8-E4M3; got mxfp6_fmt_a={mxfp6_fmt_a!r}"
+                )
+            if mxfp6_fmt_b not in {"e2m3", "e3m2"}:
+                raise ValueError(
+                    f"w6a8_mx weights must be FP6 e2m3/e3m2; got mxfp6_fmt_b={mxfp6_fmt_b!r}"
+                )
+            if sf_vec_size != 32:
+                raise ValueError(
+                    f"w6a8_mx requires sf_vec_size == 32 (MX K/32 blocks), got {sf_vec_size}"
+                )
+            if mma_tiler_mn != (128, 128):
+                raise ValueError(
+                    "w6a8_mx currently supports mma_tiler_mn == (128, 128) only"
+                )
+            if swap_ab:
+                raise ValueError("w6a8_mx does not support swap_ab")
+            if w4a8_repacked:
+                raise ValueError("w4a8_repacked does not apply to w6a8_mx")
+            if direct_routing:
+                raise ValueError("w6a8_mx does not support direct_routing yet")
+            if materialize_intermediate:
+                raise ValueError(
+                    "w6a8_mx does not support materialize_intermediate yet"
+                )
+            if share_input_across_experts:
+                raise ValueError(
+                    "w6a8_mx does not support share_input_across_experts yet"
+                )
+        elif mxfp6_fmt_a is not None or mxfp6_fmt_b is not None:
+            raise ValueError("mxfp6_fmt_a/mxfp6_fmt_b are only valid for w6a8_mx")
+        self.mxfp6_fmt_a = mxfp6_fmt_a
+        self.mxfp6_fmt_b = mxfp6_fmt_b
+        self.is_w4a8 = quant_recipe in ("w4a8_mx", "w4a8_nvfp4")
         self.w4a8_residual = quant_recipe == "w4a8_nvfp4"
         self.w4a8_repacked = bool(w4a8_repacked)
         self.direct_routing = bool(direct_routing)
@@ -831,7 +884,10 @@ class MoEDynamicKernelBackend:
         # offset+32 <= 128 always fits one 128-row SF atom; and tile_m=32 keeps
         # the base atom_shape (2,2,1)/4-warps, so FC1 and FC2 share warp count.
         self._fc1_int_tile = 32
-        tile_k = sf_vec_size * 8
+        # FP4 packs two elements per byte, so its K-tile is sf_vec_size*8 with
+        # a 64-byte SW atom; the FP6/FP8 byte-container path carries one
+        # element per byte, so the same 128-byte row is sf_vec_size*4 elements.
+        tile_k = sf_vec_size * 4 if self.is_w6a8 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         # Scale-factor tiles are 128-row atoms in hardware. For sub-128 MMA
         # tiles (e.g. tile_m=64) one SF atom backs several MMA tiles, so the
@@ -965,16 +1021,31 @@ class MoEDynamicKernelBackend:
     def _setup_attributes(self):
         import cutlass.utils.blackwell_helpers as sm120_utils
 
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            # FP6 codes live in Float8E4M3FN byte-containers; build tiled_mma
+            # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
+            # The mainloop emits the inline ``mxf8f6f4`` MMA instead of this
+            # atom's instruction (see moe_emit_mma_k_block).
+            mma_op = cute.nvgpu.warp.MmaMXF8Op(
+                cutlass.Float8E4M3FN,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+            use_perm_k = True
+            mma_k = 32
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+            use_perm_k = False
+            mma_k = 64
         atom_layout = cute.make_layout(self.atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
-            False,
+            use_perm_k,
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -982,10 +1053,23 @@ class MoEDynamicKernelBackend:
             permutation_mnk=permutation_mnk,
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
+        # Op descriptor kept for per-emission fresh-atom creation in the FP4
+        # MMA path (see moe_emit_fp4_mma) — avoids threading a single atom's
+        # SSA value across dynamic scf regions (MLIR dominance ICE).
+        self.mma_op = mma_op
+        # MMA dispatch selector: FP6/FP8 byte-containers are indistinguishable
+        # from FP8 by dtype, so pass the explicit sub-format string ("e4m3"/
+        # "e2m3"/"e3m2"); the native FP4 path keeps passing the operand dtype.
+        self._mma_fmt_a = (
+            self.mxfp6_fmt_a if self.mxfp6_fmt_a is not None else None
+        )
+        self._mma_fmt_b = (
+            self.mxfp6_fmt_b if self.mxfp6_fmt_b is not None else None
+        )
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
         self.num_m_tiles = self.tile_shape_mnk[0] // (16 * self.atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
-        self.num_k_blocks = self.tile_shape_mnk[2] // 64
+        self.num_k_blocks = self.tile_shape_mnk[2] // mma_k
 
         if cutlass.const_expr(self.swap_ab):
             # Swapped FC1: intermediate (self._fc1_int_tile wide) rides the MMA
@@ -1170,6 +1254,28 @@ class MoEDynamicKernelBackend:
         # tile_m>=128 (sa_tiles_per_block==1), so the 128 path is untouched.
         if cutlass.const_expr(self.sa_tiles_per_block > 1):
             self.a_smem_layout_staged = self._make_a_smem_layout(self.ab_stage)
+
+        # Plain (non-swizzled) k-major staging layout for the 3:4-packed FP6 B
+        # tile, ALIASED into the bottom of each sB / sB_up stage: TMA writes
+        # the 96 packed bytes/row there and the MMA warps expand IN PLACE into
+        # the full swizzled 128 B/row stage (two-phase, see dense_gemm's
+        # _expand_packed_b_stage_smem). The stage stride is sB's full stage
+        # size, NOT the packed tile size.
+        if cutlass.const_expr(self.is_w6a8):
+            self.b_packed_smem_layout_staged = cute.make_layout(
+                (
+                    self.tile_shape_mnk[1],
+                    self.tile_shape_mnk[2] * 3 // 4,
+                    self.ab_stage,
+                ),
+                stride=(
+                    self.tile_shape_mnk[2] * 3 // 4,
+                    1,
+                    self.tile_shape_mnk[1] * self.tile_shape_mnk[2],
+                ),
+            )
+        else:
+            self.b_packed_smem_layout_staged = None
 
         # The repacked small-W4A8 path never consumes ``sA`` through the
         # generic FP4 TMA layout.  It uses the region in two non-overlapping
@@ -1964,6 +2070,18 @@ class MoEDynamicKernelBackend:
     ):
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
+        if cutlass.const_expr(self.is_w6a8):
+            # w6a8_mx contract: packed_a is the MXFP8-E4M3 byte-container
+            # activation view [rows_padded, K, 1]; b_w13/b_down are the
+            # 3:4-packed FP6 code bytes viewed as Float8E4M3FN with K extent
+            # 3K/4 (expanded to one-code-per-byte containers in smem).
+            assert self.a_dtype == cutlass.Float8E4M3FN, (
+                "w6a8_mx requires packed_a as a Float8E4M3FN byte-container view"
+            )
+            assert self.b_dtype == cutlass.Float8E4M3FN, (
+                "w6a8_mx requires b_w13/b_down as Float8E4M3FN views of the "
+                "3:4-packed FP6 bytes"
+            )
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
         self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
@@ -1980,8 +2098,18 @@ class MoEDynamicKernelBackend:
 
         # Single SF tensor for FC1 weights. Gated activation packs [up, gate]
         # along the N dimension; relu2 uses a single FC1 pass.
+        # With packed FP6 B the gmem K extent is 3K/4 bytes, but scale-factor
+        # geometry follows the LOGICAL K (one UE8M0 per 32 codes).
+        if cutlass.const_expr(self.is_w6a8):
+            b_w13_sf_shape = (
+                cute.size(b_w13.shape[0]),
+                cute.size(b_w13.shape[1]) * 4 // 3,
+                cute.size(b_w13.shape[2]),
+            )
+        else:
+            b_w13_sf_shape = b_w13.shape
         sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13.shape, self.sf_vec_size
+            b_w13_sf_shape, self.sf_vec_size
         )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
 
@@ -2001,12 +2129,22 @@ class MoEDynamicKernelBackend:
         )
         # Single TMA descriptor over FC1 weights. Gated activation packs
         # [up, gate] across N; relu2 uses a single FC1 slice.
-        tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-            b_w13,
-            self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-            1,
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            # TMA loads the packed tile (tile_n, 3*tile_k/4 bytes) into the
+            # plain staging layout; the swizzled sB is filled in-kernel.
+            tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
+                b_w13,
+                self.b_packed_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                1,
+            )
+        else:
+            tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
+                b_w13,
+                self.b_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                1,
+            )
         tma_sfb_w13, gSFB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_w13_tensor,
             self.sfb_smem_layout_staged,
@@ -2015,16 +2153,32 @@ class MoEDynamicKernelBackend:
             internal_type=cutlass.Int16,
         )
         # B_down TMA
+        if cutlass.const_expr(self.is_w6a8):
+            b_down_sf_shape = (
+                cute.size(b_down.shape[0]),
+                cute.size(b_down.shape[1]) * 4 // 3,
+                cute.size(b_down.shape[2]),
+            )
+        else:
+            b_down_sf_shape = b_down.shape
         sfb_down_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_down.shape, self.sf_vec_size
+            b_down_sf_shape, self.sf_vec_size
         )
         sfb_down_tensor = cute.make_tensor(sfb_down_ptr, sfb_down_layout)
-        tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
-            b_down,
-            self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-            1,
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
+                b_down,
+                self.b_packed_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                1,
+            )
+        else:
+            tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
+                b_down,
+                self.b_smem_layout_staged,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+                1,
+            )
         tma_sfb_down, gSFB_down = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_down_tensor,
             self.sfb_smem_layout_staged,
@@ -2138,6 +2292,11 @@ class MoEDynamicKernelBackend:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
+            # Packed FP6 B staging layout (placeholder when not w6a8_mx; only
+            # traced under the const_expr is_w6a8 branches).
+            self.b_packed_smem_layout_staged
+            if self.is_w6a8
+            else self.sfa_smem_layout_staged,
             # swap_ab FC1 objects (placeholders when off; only used under the
             # const_expr swap branch). cute requires region-local values, so the
             # fc1 tiled_mma + SF layouts are passed as params, not via self.
@@ -2261,6 +2420,7 @@ class MoEDynamicKernelBackend:
         sfa_smem_staged: cute.Layout,
         sfb_smem_staged: cute.Layout,
         epi_smem_staged: cute.ComposedLayout,
+        b_packed_smem_staged: cute.Layout,
         fc1_tiled_mma: cute.TiledMma,
         fc1_sfa_smem_staged: cute.Layout,
         fc1_sfb_smem_staged: cute.Layout,
@@ -2312,15 +2472,23 @@ class MoEDynamicKernelBackend:
         b_smem_one = cute.slice_(b_smem_staged, (None, None, 0))
         sfa_smem_one = cute.slice_(sfa_smem_staged, (None, None, 0))
         sfb_smem_one = cute.slice_(sfb_smem_staged, (None, None, 0))
+        if cutlass.const_expr(self.is_w6a8):
+            # B's TMA transaction covers only the packed staging tile (96
+            # bytes/row); the expanded 128 B/row stage is filled in-kernel.
+            b_stage_tma_bytes = self.tile_shape_mnk[1] * (
+                self.tile_shape_mnk[2] * 3 // 4
+            )
+        else:
+            b_stage_tma_bytes = cute.size_in_bytes(self.b_dtype, b_smem_one)
         tma_copy_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_one)
-            + cute.size_in_bytes(self.b_dtype, b_smem_one)
+            + b_stage_tma_bytes
             + cute.size_in_bytes(self.sf_dtype, sfa_smem_one)
             + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
         )
-        phase2_tma_copy_bytes = cute.size_in_bytes(
-            self.b_dtype, b_smem_one
-        ) + cute.size_in_bytes(self.sf_dtype, sfb_smem_one)
+        phase2_tma_copy_bytes = b_stage_tma_bytes + cute.size_in_bytes(
+            self.sf_dtype, sfb_smem_one
+        )
         # swap_ab with a mid-atom gate base loads a second weight atom (atom-hi)
         # into sB_up/sSFB_up during the gate pass, so the gate mbarrier expects
         # those extra bytes; the up/phase2 pipelines are unchanged.
@@ -2442,6 +2610,26 @@ class MoEDynamicKernelBackend:
         sB_up = storage.sB_up.get_tensor(
             b_smem_staged.outer, swizzle=b_smem_staged.inner
         )
+        if cutlass.const_expr(self.is_w6a8):
+            # Packed FP6 TMA destinations ALIASED into sB / sB_up storage
+            # (bottom 96 B of each row span, stage stride = full sB stage): no
+            # separate buffer, expansion happens in place (see dense_gemm's
+            # _expand_packed_b_stage_smem). Raw u32 smem addresses are needed
+            # for the expansion (cute.recast_tensor strips sB's swizzle), and
+            # ``storage`` must not be referenced inside warp-dispatch branches,
+            # so only these Int32 addresses may cross into them.
+            sB_packed = cute.make_tensor(
+                storage.sB.data_ptr(), b_packed_smem_staged
+            )
+            sB_up_packed = cute.make_tensor(
+                storage.sB_up.data_ptr(), b_packed_smem_staged
+            )
+            sb_base_addr = shared_ptr_to_u32(storage.sB.data_ptr())
+            sb_up_base_addr = shared_ptr_to_u32(storage.sB_up.data_ptr())
+            # Raw sA base for the FC2 requant byte-container store (the
+            # swizzled Float8 A stage; upstream nvfp4 writes through the
+            # recast tensor, whose swizzle-free view only fits the FP4 math).
+            sa_base_addr = shared_ptr_to_u32(storage.sA.data_ptr())
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
         sSFB_up = storage.sSFB_up.get_tensor(sfb_smem_staged)
@@ -2505,10 +2693,23 @@ class MoEDynamicKernelBackend:
         row_counts = launch_params.row_counts
         num_experts = Int32(row_counts.shape[0])
         sf_blocks_per_row = cols // Int32(16)
+        quant_block_elems = Int32(16)
+        packed_bytes_per_sf_block = Int32(8)
+        if cutlass.const_expr(self.is_w6a8):
+            # MXFP8-E4M3 byte-container scratch: one code per byte (32 bytes
+            # per K/32 block, K bytes/row) so the Float8E4M3FN A TMA/ldmatrix
+            # path consumes it; UE8M0 scales per 32 elements in the swizzled
+            # 128-row SF atoms (one atom spans 4 blocks = 128 elements).
+            sf_blocks_per_row = cols // Int32(32)
+            quant_block_elems = Int32(32)
+            packed_bytes_per_sf_block = Int32(32)
         if cutlass.const_expr(self.is_w4a8):
             # E4M3 payload: one byte per element; UE8M0 scales per 32 elements.
             output_bytes_per_row = cols
             mx_blocks_per_row = cols // Int32(32)
+        elif cutlass.const_expr(self.is_w6a8):
+            output_bytes_per_row = cols
+            mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
         else:
             output_bytes_per_row = cols // Int32(2)
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
@@ -2518,7 +2719,12 @@ class MoEDynamicKernelBackend:
         num_topk = total_pairs // num_tokens
         flat_tid = Int32(bidz) * Int32(self.threads_per_cta) + Int32(tidx)
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
-        num_k_tiles = (cols + Int32(63)) // Int32(64)
+        # SF-atom K-tile count for the swizzled scale layout: one 512-byte
+        # atom spans 4 SF blocks = 64 elements at sf_vec 16, 128 at sf_vec 32.
+        if cutlass.const_expr(self.is_w6a8):
+            num_k_tiles = (cols + Int32(127)) // Int32(128)
+        else:
+            num_k_tiles = (cols + Int32(63)) // Int32(64)
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
         # Split materialized FC1 indexes deferred metadata as
@@ -3206,6 +3412,68 @@ class MoEDynamicKernelBackend:
                                         phys_row * mx_blocks_per_row + blk_idx
                                     ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                     blk_idx += Int32(32)
+                            elif cutlass.const_expr(self.is_w6a8):
+                                # w6a8_mx: MXFP8-E4M3 K/32 byte-container
+                                # payload (same encoding as w4a8's activation
+                                # side, but WITH the calibrated per-expert
+                                # global scale folded in at quantize time),
+                                # stored row-major for the A TMA; scale bytes
+                                # go to the swizzled 128-row SF atoms exactly
+                                # like nvfp4 (sf_idx now indexes K/32 blocks).
+                                sf_idx = lane_id
+                                while sf_idx < sf_blocks_per_row:
+                                    block_start = sf_idx * quant_block_elems
+                                    values = cute.make_rmem_tensor(
+                                        (32,), cutlass.Float32
+                                    )
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(32):
+                                        value = cutlass.Float32(
+                                            a_input[
+                                                token_idx, block_start + Int32(elem_idx)
+                                            ]
+                                        )
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
+                                    containers, scale_byte = (
+                                        moe_mxfp6_quantize_input_block_containers(
+                                            values,
+                                            block_max,
+                                            gs_value,
+                                            self.mxfp6_fmt_a,
+                                        )
+                                    )
+                                    output_offset = (
+                                        phys_tile * Int32(self.tile_shape_mnk[0])
+                                        + row % Int32(self.tile_shape_mnk[0])
+                                    ) * output_bytes_per_row + (
+                                        sf_idx * packed_bytes_per_sf_block
+                                    )
+                                    moe_mxfp6_store_expanded_global(
+                                        packed_a_storage,
+                                        output_offset,
+                                        containers,
+                                    )
+
+                                    k_tile_idx = sf_idx // Int32(4)
+                                    inner_k_idx = sf_idx % Int32(4)
+                                    # scale_storage uses 128-row SF atoms: index by
+                                    # the 128-atom + row-within-atom, not the MMA
+                                    # tile. Identity at tile_m==128.
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
+                                    sf_atom = phys_row >> Int32(7)
+                                    sf_row = phys_row & Int32(127)
+                                    scale_offset = (
+                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                                        + k_tile_idx * Int32(32 * 4 * 4)
+                                        + (sf_row % Int32(32)) * Int32(4 * 4)
+                                        + (sf_row // Int32(32)) * Int32(4)
+                                        + inner_k_idx
+                                    )
+                                    scale_storage[scale_offset] = scale_byte
+                                    sf_idx += Int32(32)
                             else:
                                 sf_idx = lane_id
                                 while sf_idx < sf_blocks_per_row:
@@ -3415,11 +3683,20 @@ class MoEDynamicKernelBackend:
         # W13 is packed as [up, gate] across the concatenated N dimension.
         # Up tiles: N-indices 0..gate_tile_cnt-1
         # Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
-        gB_w13_tiled = cute.local_tile(
-            mB_w13,
-            cute.slice_(self.tile_shape_mnk, (0, None, None)),
-            (None, None, None),
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            # Packed gmem extent: 96 bytes per 128-wide logical K-tile, same
+            # K-tile count as the A side ((3K/4)/96 == K/128).
+            gB_w13_tiled = cute.local_tile(
+                mB_w13,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                (None, None, None),
+            )
+        else:
+            gB_w13_tiled = cute.local_tile(
+                mB_w13,
+                cute.slice_(self.tile_shape_mnk, (0, None, None)),
+                (None, None, None),
+            )
         # SF tiles use the 128-row atom shape; for sub-128 MMA tiles one SF
         # block backs `sfa_tiles_per_block` MMA tiles (offset applied below).
         gSFA = cute.local_tile(mSFA, self.sfa_tile_shape_mk, (None, None, None))
@@ -3463,21 +3740,39 @@ class MoEDynamicKernelBackend:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # Single w13 TMA partition (gate+up concatenated)
-        tBsB_w13, tBgB_w13 = cpasync.tma_partition(
-            tma_b_w13,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB_w13_tiled, 0, 2),
-        )
-        tBsB_w13_up, _ = cpasync.tma_partition(
-            tma_b_w13,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB_up, 0, 2),
-            cute.group_modes(gB_w13_tiled, 0, 2),
-        )
+        # Single w13 TMA partition (gate+up concatenated). With packed FP6 the
+        # TMA destination is the plain packed staging tile aliased into the
+        # bottom of each sB / sB_up stage (expanded in place in the mainloop).
+        if cutlass.const_expr(self.is_w6a8):
+            tBsB_w13, tBgB_w13 = cpasync.tma_partition(
+                tma_b_w13,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_packed, 0, 2),
+                cute.group_modes(gB_w13_tiled, 0, 2),
+            )
+            tBsB_w13_up, _ = cpasync.tma_partition(
+                tma_b_w13,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_up_packed, 0, 2),
+                cute.group_modes(gB_w13_tiled, 0, 2),
+            )
+        else:
+            tBsB_w13, tBgB_w13 = cpasync.tma_partition(
+                tma_b_w13,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB_w13_tiled, 0, 2),
+            )
+            tBsB_w13_up, _ = cpasync.tma_partition(
+                tma_b_w13,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_up, 0, 2),
+                cute.group_modes(gB_w13_tiled, 0, 2),
+            )
         tBsSFB_w13, tBgSFB_w13 = cpasync.tma_partition(
             tma_sfb_w13,
             b_cta_crd,
@@ -3498,30 +3793,53 @@ class MoEDynamicKernelBackend:
         tBsSFB_w13_up = cute.filter_zeros(tBsSFB_w13_up)
 
         # B_down TMA partitions
-        gB_down = cute.local_tile(
-            mB_down,
-            cute.slice_(self.tile_shape_mnk, (0, None, None)),
-            (None, None, None),
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            gB_down = cute.local_tile(
+                mB_down,
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[2] * 3 // 4),
+                (None, None, None),
+            )
+        else:
+            gB_down = cute.local_tile(
+                mB_down,
+                cute.slice_(self.tile_shape_mnk, (0, None, None)),
+                (None, None, None),
+            )
         gSFB_down = cute.local_tile(
             mSFB_down,
             cute.slice_(self.tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
-        tBsB_down, tBgB_down = cpasync.tma_partition(
-            tma_b_down,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB_down, 0, 2),
-        )
-        tBsB_down_up, _ = cpasync.tma_partition(
-            tma_b_down,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB_up, 0, 2),
-            cute.group_modes(gB_down, 0, 2),
-        )
+        if cutlass.const_expr(self.is_w6a8):
+            tBsB_down, tBgB_down = cpasync.tma_partition(
+                tma_b_down,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_packed, 0, 2),
+                cute.group_modes(gB_down, 0, 2),
+            )
+            tBsB_down_up, _ = cpasync.tma_partition(
+                tma_b_down,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_up_packed, 0, 2),
+                cute.group_modes(gB_down, 0, 2),
+            )
+        else:
+            tBsB_down, tBgB_down = cpasync.tma_partition(
+                tma_b_down,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB_down, 0, 2),
+            )
+            tBsB_down_up, _ = cpasync.tma_partition(
+                tma_b_down,
+                b_cta_crd,
+                b_cta_layout,
+                cute.group_modes(sB_up, 0, 2),
+                cute.group_modes(gB_down, 0, 2),
+            )
         tBsSFB_down, tBgSFB_down = cpasync.tma_partition(
             tma_sfb_down,
             b_cta_crd,
@@ -5102,6 +5420,21 @@ class MoEDynamicKernelBackend:
                         cons_state.reset_count()
                         peek = ml_pipeline.consumer_try_wait(cons_state)
                         ml_pipeline.consumer_wait(cons_state, peek)
+                        if cutlass.const_expr(self.is_w6a8):
+                            # Expand the TMA-staged 3:4-packed FP6 B tile in
+                            # place into the swizzled byte-container sB stage
+                            # BEFORE any ldmatrix touches it (two-phase;
+                            # internal read/write barrier + trailing fence).
+                            _expand_packed_b_stage_smem(
+                                sb_base_addr,
+                                cons_state.index,
+                                Int32(tidx),
+                                self.tile_shape_mnk[1],
+                                self.tile_shape_mnk[2],
+                                self.num_mma_warps * self.num_threads_per_warp,
+                                self.epilog_sync_barrier,
+                            )
+                            self.epilog_sync_barrier.arrive_and_wait()
                         csA_p = csA[None, None, None, cons_state.index]
                         csB_p = csB[None, None, None, cons_state.index]
                         csSFA_p = csSFA[None, None, None, cons_state.index]
@@ -5138,23 +5471,53 @@ class MoEDynamicKernelBackend:
                                     fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                     fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                     ml_pipeline.consumer_wait(cons_state, peek)
+                                    if cutlass.const_expr(self.is_w6a8):
+                                        # The stage just became full (packed
+                                        # bytes only); expand before this
+                                        # stage's k_next=0 ldmatrix below.
+                                        _expand_packed_b_stage_smem(
+                                            sb_base_addr,
+                                            cons_state.index,
+                                            Int32(tidx),
+                                            self.tile_shape_mnk[1],
+                                            self.tile_shape_mnk[2],
+                                            self.num_mma_warps
+                                            * self.num_threads_per_warp,
+                                            self.epilog_sync_barrier,
+                                        )
+                                        self.epilog_sync_barrier.arrive_and_wait()
                                 for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                     for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                        mma_atom.set(
-                                            WarpField.SFA,
-                                            tCrSFA[None, _mt, k_block_idx].iterator,
-                                        )
-                                        mma_atom.set(
-                                            WarpField.SFB,
-                                            tCrSFB[None, _nt, k_block_idx].iterator,
-                                        )
-                                        cute.gemm(
-                                            mma_atom,
-                                            gate_acc[None, _mt, _nt],
-                                            tCrA[None, _mt, k_block_idx],
-                                            tCrB[None, _nt, k_block_idx],
-                                            gate_acc[None, _mt, _nt],
-                                        )
+                                        if cutlass.const_expr(self.is_w6a8):
+                                            moe_emit_mma_k_block(
+                                                self.mma_op,
+                                                gate_acc,
+                                                tCrA,
+                                                tCrB,
+                                                tCrSFA,
+                                                tCrSFB,
+                                                _mt,
+                                                _nt,
+                                                k_block_idx,
+                                                self._mma_fmt_a,
+                                                self._mma_fmt_b,
+                                            )
+                                        else:
+                                            mma_atom.set(
+                                                WarpField.SFA,
+                                                tCrSFA[None, _mt, k_block_idx].iterator,
+                                            )
+                                            mma_atom.set(
+                                                WarpField.SFB,
+                                                tCrSFB[None, _nt, k_block_idx].iterator,
+                                            )
+                                            cute.gemm(
+                                                mma_atom,
+                                                gate_acc[None, _mt, _nt],
+                                                tCrA[None, _mt, k_block_idx],
+                                                tCrB[None, _nt, k_block_idx],
+                                                gate_acc[None, _mt, _nt],
+                                            )
                                 cute.copy(
                                     smem_copy_A,
                                     csA_p[None, None, k_next],
@@ -5213,21 +5576,36 @@ class MoEDynamicKernelBackend:
                                 )
                             for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                 for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                    mma_atom.set(
-                                        WarpField.SFA,
-                                        tCrSFA[None, _mt, k_block_idx].iterator,
-                                    )
-                                    mma_atom.set(
-                                        WarpField.SFB,
-                                        tCrSFB[None, _nt, k_block_idx].iterator,
-                                    )
-                                    cute.gemm(
-                                        mma_atom,
-                                        gate_acc[None, _mt, _nt],
-                                        tCrA[None, _mt, k_block_idx],
-                                        tCrB[None, _nt, k_block_idx],
-                                        gate_acc[None, _mt, _nt],
-                                    )
+                                    if cutlass.const_expr(self.is_w6a8):
+                                        moe_emit_mma_k_block(
+                                            self.mma_op,
+                                            gate_acc,
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            tCrSFB,
+                                            _mt,
+                                            _nt,
+                                            k_block_idx,
+                                            self._mma_fmt_a,
+                                            self._mma_fmt_b,
+                                        )
+                                    else:
+                                        mma_atom.set(
+                                            WarpField.SFA,
+                                            tCrSFA[None, _mt, k_block_idx].iterator,
+                                        )
+                                        mma_atom.set(
+                                            WarpField.SFB,
+                                            tCrSFB[None, _nt, k_block_idx].iterator,
+                                        )
+                                        cute.gemm(
+                                            mma_atom,
+                                            gate_acc[None, _mt, _nt],
+                                            tCrA[None, _mt, k_block_idx],
+                                            tCrB[None, _nt, k_block_idx],
+                                            gate_acc[None, _mt, _nt],
+                                        )
                         # Signal FC1 gate/only completion before producer warps
                         # reuse the shared A/gate buffers for the next pass.
                         self.pass_gate_barrier.arrive_unaligned()
@@ -5238,6 +5616,17 @@ class MoEDynamicKernelBackend:
                             up_cons_state.reset_count()
                             peek = up_pipeline.consumer_try_wait(up_cons_state)
                             up_pipeline.consumer_wait(up_cons_state, peek)
+                            if cutlass.const_expr(self.is_w6a8):
+                                _expand_packed_b_stage_smem(
+                                    sb_up_base_addr,
+                                    up_cons_state.index,
+                                    Int32(tidx),
+                                    self.tile_shape_mnk[1],
+                                    self.tile_shape_mnk[2],
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
+                                self.epilog_sync_barrier.arrive_and_wait()
                             csA_p = csA[None, None, None, up_cons_state.index]
                             csB_p = csB_up[None, None, None, up_cons_state.index]
                             csSFA_p = csSFA[None, None, None, up_cons_state.index]
@@ -5290,23 +5679,54 @@ class MoEDynamicKernelBackend:
                                         fz_csSFA_p = cute.filter_zeros(csSFA_p)
                                         fz_csSFB_p = cute.filter_zeros(csSFB_p)
                                         up_pipeline.consumer_wait(up_cons_state, peek)
+                                        if cutlass.const_expr(self.is_w6a8):
+                                            _expand_packed_b_stage_smem(
+                                                sb_up_base_addr,
+                                                up_cons_state.index,
+                                                Int32(tidx),
+                                                self.tile_shape_mnk[1],
+                                                self.tile_shape_mnk[2],
+                                                self.num_mma_warps
+                                                * self.num_threads_per_warp,
+                                                self.epilog_sync_barrier,
+                                            )
+                                            self.epilog_sync_barrier.arrive_and_wait()
                                     for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                         for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                            mma_atom.set(
-                                                WarpField.SFA,
-                                                tCrSFA[None, _mt, k_block_idx].iterator,
-                                            )
-                                            mma_atom.set(
-                                                WarpField.SFB,
-                                                tCrSFB[None, _nt, k_block_idx].iterator,
-                                            )
-                                            cute.gemm(
-                                                mma_atom,
-                                                up_acc[None, _mt, _nt],
-                                                tCrA[None, _mt, k_block_idx],
-                                                tCrB[None, _nt, k_block_idx],
-                                                up_acc[None, _mt, _nt],
-                                            )
+                                            if cutlass.const_expr(self.is_w6a8):
+                                                moe_emit_mma_k_block(
+                                                    self.mma_op,
+                                                    up_acc,
+                                                    tCrA,
+                                                    tCrB,
+                                                    tCrSFA,
+                                                    tCrSFB,
+                                                    _mt,
+                                                    _nt,
+                                                    k_block_idx,
+                                                    self._mma_fmt_a,
+                                                    self._mma_fmt_b,
+                                                )
+                                            else:
+                                                mma_atom.set(
+                                                    WarpField.SFA,
+                                                    tCrSFA[
+                                                        None, _mt, k_block_idx
+                                                    ].iterator,
+                                                )
+                                                mma_atom.set(
+                                                    WarpField.SFB,
+                                                    tCrSFB[
+                                                        None, _nt, k_block_idx
+                                                    ].iterator,
+                                                )
+                                                cute.gemm(
+                                                    mma_atom,
+                                                    up_acc[None, _mt, _nt],
+                                                    tCrA[None, _mt, k_block_idx],
+                                                    tCrB[None, _nt, k_block_idx],
+                                                    up_acc[None, _mt, _nt],
+                                                )
                                     cute.copy(
                                         smem_copy_A,
                                         csA_p[None, None, k_next],
@@ -5359,25 +5779,48 @@ class MoEDynamicKernelBackend:
                                     )
                                 for _mt in cutlass.range_constexpr(fc1_m_tiles):
                                     for _nt in cutlass.range_constexpr(fc1_n_tiles):
-                                        mma_atom.set(
-                                            WarpField.SFA,
-                                            tCrSFA[None, _mt, k_block_idx].iterator,
-                                        )
-                                        mma_atom.set(
-                                            WarpField.SFB,
-                                            tCrSFB[None, _nt, k_block_idx].iterator,
-                                        )
-                                        cute.gemm(
-                                            mma_atom,
-                                            up_acc[None, _mt, _nt],
-                                            tCrA[None, _mt, k_block_idx],
-                                            tCrB[None, _nt, k_block_idx],
-                                            up_acc[None, _mt, _nt],
-                                        )
+                                        if cutlass.const_expr(self.is_w6a8):
+                                            moe_emit_mma_k_block(
+                                                self.mma_op,
+                                                up_acc,
+                                                tCrA,
+                                                tCrB,
+                                                tCrSFA,
+                                                tCrSFB,
+                                                _mt,
+                                                _nt,
+                                                k_block_idx,
+                                                self._mma_fmt_a,
+                                                self._mma_fmt_b,
+                                            )
+                                        else:
+                                            mma_atom.set(
+                                                WarpField.SFA,
+                                                tCrSFA[None, _mt, k_block_idx].iterator,
+                                            )
+                                            mma_atom.set(
+                                                WarpField.SFB,
+                                                tCrSFB[None, _nt, k_block_idx].iterator,
+                                            )
+                                            cute.gemm(
+                                                mma_atom,
+                                                up_acc[None, _mt, _nt],
+                                                tCrA[None, _mt, k_block_idx],
+                                                tCrB[None, _nt, k_block_idx],
+                                                up_acc[None, _mt, _nt],
+                                            )
                         # Activation + quant into sA
                         sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
-                        packed_cols = Int32(self.tile_shape_mnk[2] // 2)
-                        sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                        if cutlass.const_expr(self.is_w6a8):
+                            # Byte-container intermediate: one code per byte,
+                            # tile_k bytes per row; K/32 UE8M0 blocks.
+                            packed_cols = Int32(self.tile_shape_mnk[2])
+                            sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 32)
+                            fc2_quant_block_elems = Int32(32)
+                        else:
+                            packed_cols = Int32(self.tile_shape_mnk[2] // 2)
+                            sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
+                            fc2_quant_block_elems = Int32(16)
                         gs_value = global_scale[task_expert_idx].to(cutlass.Float32)
                         if cutlass.const_expr(self.dynamic_down_scale):
                             fc2_down_alpha_value = down_alpha_value
@@ -5437,17 +5880,56 @@ class MoEDynamicKernelBackend:
                                 epi_rows = Int32(self.epi_tile[0])
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
+                            if cutlass.const_expr(self.is_w6a8):
+                                # Zero the FP6/FP8 intermediate SFA + A-code
+                                # smem before the FC2 requant store. The store
+                                # only covers epi_rows*sf_blocks; any padding-
+                                # row slot the vec32 MMA reads but the store
+                                # misses would otherwise hold stale UE8M0
+                                # bytes -> 2^huge -> inf blowup (ue=0 =>
+                                # 2^-127 ~ 0 is benign). epi_rest_m == 1 at
+                                # the supported (128,128) tile, so this runs
+                                # once per slice and cannot wipe earlier
+                                # epi-buffer stores.
+                                zero_total = Int32(128) * sf_blocks_per_row
+                                zero_idx = Int32(tidx)
+                                while zero_idx < zero_total:
+                                    st_shared_u8(
+                                        sfa_base_addr + zero_idx, Uint8(0)
+                                    )
+                                    zero_idx += Int32(
+                                        self.num_mma_warps
+                                        * self.num_threads_per_warp
+                                    )
+                                self.epilog_sync_barrier.arrive_and_wait()
+                                zero_total_sa = Int32(128) * packed_cols
+                                zsa_idx = Int32(tidx)
+                                while zsa_idx < zero_total_sa:
+                                    st_shared_u8(
+                                        sa_base_addr + zsa_idx, Uint8(0)
+                                    )
+                                    zsa_idx += Int32(
+                                        self.num_mma_warps
+                                        * self.num_threads_per_warp
+                                    )
+                                self.epilog_sync_barrier.arrive_and_wait()
                             quant_gs_value = gs_value
                             if cutlass.const_expr(self.dynamic_down_scale):
                                 if epi_rows > Int32(0):
                                     local_max = cutlass.Float32(0.0)
                                     scan_idx = Int32(tidx)
                                     scan_total = (
-                                        epi_rows * sf_blocks_per_row * Int32(16)
+                                        epi_rows
+                                        * sf_blocks_per_row
+                                        * fc2_quant_block_elems
                                     )
                                     while scan_idx < scan_total:
-                                        sr = scan_idx // (sf_blocks_per_row * Int32(16))
-                                        sc = scan_idx % (sf_blocks_per_row * Int32(16))
+                                        sr = scan_idx // (
+                                            sf_blocks_per_row * fc2_quant_block_elems
+                                        )
+                                        sc = scan_idx % (
+                                            sf_blocks_per_row * fc2_quant_block_elems
+                                        )
                                         local_max = fmax_f32(
                                             local_max,
                                             fabs_f32(
@@ -5499,48 +5981,96 @@ class MoEDynamicKernelBackend:
                                 local_row = quant_idx // sf_blocks_per_row
                                 row = rows_offset + local_row
                                 sf_block = quant_idx - local_row * sf_blocks_per_row
-                                block_start = sf_block * Int32(16)
+                                block_start = sf_block * fc2_quant_block_elems
 
-                                values = cute.make_rmem_tensor((16,), cutlass.Float32)
-                                block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(16):
-                                    value = cutlass.Float32(
-                                        sC[
-                                            local_row,
-                                            block_start + elem_idx,
-                                            epi_buffer,
-                                        ]
+                                if cutlass.const_expr(self.is_w6a8):
+                                    values = cute.make_rmem_tensor(
+                                        (32,), cutlass.Float32
                                     )
-                                    values[elem_idx] = value
-                                    block_max = fmax_f32(block_max, fabs_f32(value))
-
-                                packed64 = Uint64(0)
-                                scale_byte = Uint8(0)
-                                if self.is_gated and self.fast_math:
-                                    packed64, scale_byte = quantize_block_fp4_fast(
-                                        values, block_max, quant_gs_value
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(32):
+                                        value = cutlass.Float32(
+                                            sC[
+                                                local_row,
+                                                block_start + elem_idx,
+                                                epi_buffer,
+                                            ]
+                                        )
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(
+                                            block_max, fabs_f32(value)
+                                        )
+                                    containers, scale_byte = (
+                                        moe_mxfp6_quantize_input_block_containers(
+                                            values,
+                                            block_max,
+                                            quant_gs_value,
+                                            self.mxfp6_fmt_a,
+                                        )
                                     )
+                                    # Byte-container swizzled store into the
+                                    # Float8 A smem (8-bit K-major SW128 atom
+                                    # Sw<3,4,3>): the physical offset is
+                                    # flat ^ ((row&7)<<4). Raw addressing —
+                                    # the recast sA_u8 view is un-swizzled and
+                                    # only correct at row 0 for this atom.
+                                    _row_sw = (row & Int32(7)) << Int32(4)
+                                    _row_flat = row * Int32(self.tile_shape_mnk[2])
+                                    for elem_idx in cutlass.range_constexpr(32):
+                                        _flat = (
+                                            _row_flat
+                                            + block_start
+                                            + Int32(elem_idx)
+                                        )
+                                        st_shared_u8(
+                                            sa_base_addr + (_flat ^ _row_sw),
+                                            containers[elem_idx],
+                                        )
                                 else:
-                                    packed64, scale_byte = quantize_block_fp4(
-                                        values, block_max, quant_gs_value
+                                    values = cute.make_rmem_tensor(
+                                        (16,), cutlass.Float32
                                     )
-                                packed_base = sf_block << Int32(3)
-                                dst_pcol = row & Int32(63)
-                                xor_bits = (
-                                    (dst_pcol >> Int32(1)) & Int32(0x3)
-                                ) << Int32(4)
-                                row_high = row >> Int32(6)
-                                for byte_idx in cutlass.range_constexpr(8):
-                                    src_pcol = packed_base + Int32(byte_idx)
-                                    dst_row = (
-                                        (src_pcol ^ xor_bits) << Int32(1)
-                                    ) + row_high
-                                    dst_flat = dst_row * packed_cols + dst_pcol
-                                    byte_val = Uint8(
-                                        (packed64 >> Uint64(byte_idx * 8))
-                                        & Uint64(0xFF)
-                                    )
-                                    sA_u8[dst_flat] = byte_val
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(16):
+                                        value = cutlass.Float32(
+                                            sC[
+                                                local_row,
+                                                block_start + elem_idx,
+                                                epi_buffer,
+                                            ]
+                                        )
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(
+                                            block_max, fabs_f32(value)
+                                        )
+
+                                    packed64 = Uint64(0)
+                                    scale_byte = Uint8(0)
+                                    if self.is_gated and self.fast_math:
+                                        packed64, scale_byte = quantize_block_fp4_fast(
+                                            values, block_max, quant_gs_value
+                                        )
+                                    else:
+                                        packed64, scale_byte = quantize_block_fp4(
+                                            values, block_max, quant_gs_value
+                                        )
+                                    packed_base = sf_block << Int32(3)
+                                    dst_pcol = row & Int32(63)
+                                    xor_bits = (
+                                        (dst_pcol >> Int32(1)) & Int32(0x3)
+                                    ) << Int32(4)
+                                    row_high = row >> Int32(6)
+                                    for byte_idx in cutlass.range_constexpr(8):
+                                        src_pcol = packed_base + Int32(byte_idx)
+                                        dst_row = (
+                                            (src_pcol ^ xor_bits) << Int32(1)
+                                        ) + row_high
+                                        dst_flat = dst_row * packed_cols + dst_pcol
+                                        byte_val = Uint8(
+                                            (packed64 >> Uint64(byte_idx * 8))
+                                            & Uint64(0xFF)
+                                        )
+                                        sA_u8[dst_flat] = byte_val
 
                                 outer_m_idx = row % Int32(32)
                                 inner_m_idx = row // Int32(32)
@@ -5723,6 +6253,19 @@ class MoEDynamicKernelBackend:
                             phase2_pipeline.consumer_wait(
                                 phase2_cons_state, phase2_peek
                             )
+                            if cutlass.const_expr(self.is_w6a8):
+                                # Expand the packed FP6 B_down stage in place
+                                # before this tile's ldmatrix reads.
+                                _expand_packed_b_stage_smem(
+                                    sb_base_addr,
+                                    phase2_cons_state.index,
+                                    Int32(tidx),
+                                    self.tile_shape_mnk[1],
+                                    self.tile_shape_mnk[2],
+                                    self.num_mma_warps * self.num_threads_per_warp,
+                                    self.epilog_sync_barrier,
+                                )
+                                self.epilog_sync_barrier.arrive_and_wait()
                             csB_phase2 = csB[None, None, None, phase2_cons_state.index]
                             csSFB_phase2 = csSFB[
                                 None, None, None, phase2_cons_state.index
@@ -6041,21 +6584,36 @@ class MoEDynamicKernelBackend:
                                     )
                                 for _mt in cutlass.range_constexpr(fc2_m_tiles):
                                     for _nt in cutlass.range_constexpr(fc2_n_tiles):
-                                        mma_atom.set(
-                                            WarpField.SFA,
-                                            tCrSFA[None, _mt, k_block_idx].iterator,
-                                        )
-                                        mma_atom.set(
-                                            WarpField.SFB,
-                                            tCrSFB[None, _nt, k_block_idx].iterator,
-                                        )
-                                        cute.gemm(
-                                            mma_atom,
-                                            down_acc[None, _mt, _nt],
-                                            tCrA[None, _mt, k_block_idx],
-                                            tCrB[None, _nt, k_block_idx],
-                                            down_acc[None, _mt, _nt],
-                                        )
+                                        if cutlass.const_expr(self.is_w6a8):
+                                            moe_emit_mma_k_block(
+                                                self.mma_op,
+                                                down_acc,
+                                                tCrA,
+                                                tCrB,
+                                                tCrSFA,
+                                                tCrSFB,
+                                                _mt,
+                                                _nt,
+                                                k_block_idx,
+                                                self._mma_fmt_a,
+                                                self._mma_fmt_b,
+                                            )
+                                        else:
+                                            mma_atom.set(
+                                                WarpField.SFA,
+                                                tCrSFA[None, _mt, k_block_idx].iterator,
+                                            )
+                                            mma_atom.set(
+                                                WarpField.SFB,
+                                                tCrSFB[None, _nt, k_block_idx].iterator,
+                                            )
+                                            cute.gemm(
+                                                mma_atom,
+                                                down_acc[None, _mt, _nt],
+                                                tCrA[None, _mt, k_block_idx],
+                                                tCrB[None, _nt, k_block_idx],
+                                                down_acc[None, _mt, _nt],
+                                            )
 
                         # Drain each compile-time FC2 output in the window.  In
                         # the paired W4A8 specialization both N128 accumulator

@@ -447,6 +447,24 @@ def ld_global_v4_u32(
     return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
 
 
+@dsl_user_op
+def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
+    """Bitcast a uint32 to float32 (mov.b32; no numeric conversion)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 # =============================================================================
 # PTX Intrinsics - Non-Coherent Global Loads
 # =============================================================================
@@ -598,6 +616,23 @@ def st_global_u8(base_ptr: Int64, value: Uint8, *, loc=None, ip=None):
             Uint8(value).ir_value(loc=loc, ip=ip),
         ],
         "st.global.u8 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_u16(base_ptr: Int64, value: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits of a u32 to global memory (st.global.u16)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.u16 [$0], t; }",
         "l,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -1179,6 +1214,24 @@ def st_shared_u8(smem_addr: Int32, value: Uint8, *, loc=None, ip=None):
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_shared_u8(smem_addr: Int32, *, loc=None, ip=None) -> Uint8:
+    """Load 8 bits from shared memory. smem_addr is a u32 shared-memory address."""
+    return Uint8(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u8 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -2072,6 +2125,60 @@ def scatter_add_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def store_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
+    """Non-atomic BF16x2 store: packs two f32 -> bf16x2, plain store.
+
+    Deterministic counterpart of :func:`scatter_add_bf16x2` for output slots
+    owned by exactly one thread (no cross-CTA accumulation)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            val0_f32.ir_value(loc=loc, ip=ip),
+            val1_f32.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 packed;"
+        " cvt.rn.satfinite.bf16x2.f32 packed, $2, $1;"
+        " st.global.b32 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def store_v4_bf16x2(addr: Int64, v0, v1, v2, v3, v4, v5, v6, v7, *, loc=None, ip=None):
+    """Non-atomic vectorized BF16x2 store: 8 bf16 values (16 bytes), plain store.
+
+    Deterministic counterpart of :func:`scatter_add_v4_bf16x2`."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            v0.ir_value(loc=loc, ip=ip),
+            v1.ir_value(loc=loc, ip=ip),
+            v2.ir_value(loc=loc, ip=ip),
+            v3.ir_value(loc=loc, ip=ip),
+            v4.ir_value(loc=loc, ip=ip),
+            v5.ir_value(loc=loc, ip=ip),
+            v6.ir_value(loc=loc, ip=ip),
+            v7.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 p0,p1,p2,p3;"
+        " cvt.rn.satfinite.bf16x2.f32 p0, $2, $1;"
+        " cvt.rn.satfinite.bf16x2.f32 p1, $4, $3;"
+        " cvt.rn.satfinite.bf16x2.f32 p2, $6, $5;"
+        " cvt.rn.satfinite.bf16x2.f32 p3, $8, $7;"
+        " st.global.v4.b32 [$0], {p0, p1, p2, p3}; }",
+        "l,f,f,f,f,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def scatter_add_bf16(addr: Int64, val_f32, *, loc=None, ip=None):
     """BF16 atomic reduction add to global memory.
 
@@ -2189,6 +2296,50 @@ def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "abs.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def div_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """IEEE round-to-nearest f32 division (div.rn.f32).
+
+    The DSL's ``/`` operator may lower to an approximate division; div.rn is
+    correctly rounded and therefore bit-identical to torch division /
+    ``torch.reciprocal`` on the same operands. Use this wherever a kernel
+    must reproduce a host-side f32 divide exactly.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_f32_to_bf16_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
+    """Round one float32 to bf16 (cvt.rn.bf16.f32, round-to-nearest-even) and
+    return its 16 raw bits zero-extended into a u32.
+
+    Bit-identical to ``torch.Tensor.to(torch.bfloat16)`` on finite values —
+    both are IEEE RN. Widen back to f32 with ``u32_as_f32(bits << 16)``
+    (bf16 -> f32 is exact).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b16 t; cvt.rn.bf16.f32 t, $1; cvt.u32.u16 $0, t; }",
+            "=r,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

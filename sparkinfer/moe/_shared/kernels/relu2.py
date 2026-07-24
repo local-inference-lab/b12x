@@ -72,6 +72,8 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
     ):
         super().__init__(
             sf_vec_size,
@@ -88,6 +90,8 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
+            mxfp6_fmt_a=mxfp6_fmt_a,
+            mxfp6_fmt_b=mxfp6_fmt_b,
         )
 
 

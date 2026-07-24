@@ -89,6 +89,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        mxfp6_fmt_a: str | None = None,
+        mxfp6_fmt_b: str | None = None,
     ):
         super().__init__(
             sf_vec_size,
@@ -108,6 +110,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            mxfp6_fmt_a=mxfp6_fmt_a,
+            mxfp6_fmt_b=mxfp6_fmt_b,
         )
 
 

@@ -38,6 +38,7 @@ class _StringEnum(str, Enum):
 class OperandEncoding(_StringEnum):
     BF16 = "bf16"
     FP4_E2M1 = "fp4_e2m1"
+    FP6_E2M3 = "fp6_e2m3"
     MXFP8_E4M3 = "mxfp8_e4m3"
 
 
@@ -89,6 +90,7 @@ class GemmEngine(_StringEnum):
     DIRECT_DOT = "direct_dot"
     NVFP4_MMA = "nvfp4_mma"
     MXFP8_QMMA = "mxfp8_qmma"
+    MXFP6_QMMA = "mxfp6_qmma"
     W4A16_MMA = "w4a16_mma"
 
 
@@ -115,6 +117,7 @@ class WeightPreparationTransform(_StringEnum):
     W4A16_NATIVE = "w4a16_native"
     W4A16_PACKED = "w4a16_packed"
     W4A8_QMMA = "w4a8_qmma"
+    W6A8_MXFP6 = "w6a8_mxfp6"
 
 
 class WeightStoragePolicy(_StringEnum):
@@ -141,17 +144,23 @@ class OutputReduction(_StringEnum):
     SEPARATE_TOPK_SUM = "separate_topk_sum"
 
 
-_QUANT_MODES = {"nvfp4", "w4a16", "w4a8_mx", "w4a8_nvfp4"}
+_QUANT_MODES = {"nvfp4", "w4a16", "w4a8_mx", "w4a8_nvfp4", "w6a8_mx"}
 _SOURCE_FORMATS = {
     "modelopt_nvfp4",
     "fp4_e8m0_k32",
     "compressed_tensors",
+    "mxfp6_e2m3",
 }
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_mx": frozenset({"fp4_e8m0_k32"}),
-    "w4a16": frozenset(_SOURCE_FORMATS),
+    # W4A16 deliberately keeps its historical FP4 source trio; the packed
+    # MX-FP6 source is exclusive to the w6a8_mx recipe.
+    "w4a16": frozenset(
+        {"modelopt_nvfp4", "fp4_e8m0_k32", "compressed_tensors"}
+    ),
+    "w6a8_mx": frozenset({"mxfp6_e2m3"}),
 }
 
 
@@ -381,6 +390,10 @@ class MoEWeightPreparationPlan:
             )
         if quant_mode == "w4a8_mx":
             return PreparedWeightLayout.QMMA_REPACKED
+        if quant_mode == "w6a8_mx":
+            # Packed MX-FP6 codes are consumed as-is; only scales are
+            # swizzled into a separate MMA_PACKED allocation.
+            return PreparedWeightLayout.SOURCE_NATIVE
         return None
 
     def supports(
@@ -499,7 +512,7 @@ def make_moe_spec(
 
     source_scale = (
         ScaleEncoding.E8M0_K32
-        if source_format == "fp4_e8m0_k32"
+        if source_format in ("fp4_e8m0_k32", "mxfp6_e2m3")
         else ScaleEncoding.E4M3_K16
     )
     if quant_mode == "w4a16":
@@ -510,7 +523,7 @@ def make_moe_spec(
         activation_encoding = OperandEncoding.FP4_E2M1
         activation_scale = ScaleEncoding.E4M3_K16
         weight_scale = ScaleEncoding.E4M3_K16
-    elif quant_mode == "w4a8_mx":
+    elif quant_mode in ("w4a8_mx", "w6a8_mx"):
         activation_encoding = OperandEncoding.MXFP8_E4M3
         activation_scale = ScaleEncoding.E8M0_K32
         weight_scale = ScaleEncoding.E8M0_K32
@@ -526,7 +539,11 @@ def make_moe_spec(
         io_dtype=str(io_dtype),
         activation_encoding=activation_encoding,
         activation_scale=activation_scale,
-        weight_encoding=OperandEncoding.FP4_E2M1,
+        weight_encoding=(
+            OperandEncoding.FP6_E2M3
+            if quant_mode == "w6a8_mx"
+            else OperandEncoding.FP4_E2M1
+        ),
         source_weight_scale=source_scale,
         weight_scale=weight_scale,
         w13_layout=str(w13_layout),
@@ -616,6 +633,29 @@ def plan_moe_weight_preparation(
             weight_layouts.add(PreparedWeightLayout.QMMA_REPACKED)
             scale_layouts.add(PreparedScaleLayout.QMMA_SFB)
             continue
+        if spec.quant_mode == "w6a8_mx":
+            if spec.activation != "silu":
+                raise ValueError("W6A8-MXFP6 preparation currently requires silu")
+            # The MX-FP6 kernel streams 128-wide K tiles of 3:4 packed codes;
+            # both GEMM K extents (hidden for FC1, intermediate for FC2) must
+            # be 128-aligned.
+            if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+                raise ValueError(
+                    "W6A8-MXFP6 preparation requires hidden_size % 128 == 0 "
+                    "and intermediate_size % 128 == 0"
+                )
+            # Packed FP6 codes stay source-native; UE8M0 scales are swizzled
+            # into the MMA layout and per-expert alphas are derived from the
+            # checkpoint's *_weight_scale_2 globals.
+            transforms.add(WeightPreparationTransform.W6A8_MXFP6)
+            weight_layouts.add(PreparedWeightLayout.SOURCE_NATIVE)
+            scale_layouts.update(
+                {
+                    PreparedScaleLayout.MMA_PACKED,
+                    PreparedScaleLayout.RUNTIME_ALPHA,
+                }
+            )
+            continue
         if spec.quant_mode == "w4a16":
             layout = requested_w4a16_layout
             if layout is None:
@@ -658,7 +698,13 @@ def plan_moe_weight_preparation(
     source_recipe_selected = bool(
         {"nvfp4", "w4a8_nvfp4"} & {spec.quant_mode for spec in normalized_specs}
     )
-    native_representation = WeightPreparationTransform.W4A16_NATIVE in transforms
+    native_representation = (
+        WeightPreparationTransform.W4A16_NATIVE in transforms
+        # W6A8-MXFP6 keeps the packed FP6 bytes unchanged and transfers
+        # ownership to the prepared representation (swizzled scales replace
+        # the source grids), mirroring the native W4A16 storage policy.
+        or WeightPreparationTransform.W6A8_MXFP6 in transforms
+    )
     if len(mutating) > 1:
         raise ValueError(
             "requested MoE recipes require multiple incompatible model-sized "
@@ -694,6 +740,9 @@ def _gemm_engine_for_spec(spec: MoESpec) -> GemmEngine:
     if spec.activation_encoding is OperandEncoding.BF16:
         return GemmEngine.W4A16_MMA
     if spec.activation_encoding is OperandEncoding.MXFP8_E4M3:
+        if spec.weight_encoding is OperandEncoding.FP6_E2M3:
+            # W6A8-MX: FP6 weights x FP8 activations on the mxf8f6f4 MMA.
+            return GemmEngine.MXFP6_QMMA
         return GemmEngine.MXFP8_QMMA
     return GemmEngine.NVFP4_MMA
 
@@ -778,11 +827,17 @@ def lower_moe_execution(
             if deterministic_output
             else OutputReduction.ATOMIC_SCATTER
         )
-        weight_layout = required_weight_layout or (
-            PreparedWeightLayout.QMMA_REPACKED
-            if spec.quant_mode == "w4a8_mx"
-            else PreparedWeightLayout.MMA_VIEW
-        )
+        if required_weight_layout is not None:
+            weight_layout = required_weight_layout
+        elif spec.quant_mode == "w4a8_mx":
+            weight_layout = PreparedWeightLayout.QMMA_REPACKED
+        elif spec.quant_mode == "w6a8_mx":
+            # Packed MX-FP6 codes are consumed source-native; the reduction
+            # regimes (atomic scatter, route-buffer top-k sum when
+            # deterministic) are shared with w4a8_mx above.
+            weight_layout = PreparedWeightLayout.SOURCE_NATIVE
+        else:
+            weight_layout = PreparedWeightLayout.MMA_VIEW
         return MoEExecutionPlan(
             regime=regime,
             route_layout=RouteLayout.APPEND_ONLY_EXPERT,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -56,6 +57,8 @@ from sparkinfer.moe._shared.kernels.activations import (
 
 
 _BLOCK_SIZE = 16
+# MX-FP6 block scales use 32 elements per vector (see sparkinfer._lib.fp6).
+MXFP6_BLOCK_SIZE = 32
 _FP8_E4M3_MAX = 448.0
 _FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
 _NUM_WARPS = 16
@@ -87,6 +90,57 @@ def _fc1_chunks_for_m(m: int, n: int) -> int:
             return chunks
         chunks -= 1
     return 1
+
+
+# --- MX-FP6 (w6a8_mx) decode micro path ------------------------------------
+# MX-FP6 weights use 32-element UE8M0 block scales (vs FP4's 16-element E4M3),
+# and are stored 3:4-packed (3 bytes per 4 codes). The decode micro path
+# mirrors the FP4 micro GEMV but resolves codes through the shared decode LUT
+# primitive (sparkinfer._lib.fp6) instead of the FP4 software dot.
+_MXFP6_ELEMS_PER_SEGMENT = 32 * MXFP6_BLOCK_SIZE  # 32 scale blocks per K segment
+
+
+def _fp6_micro_enabled() -> bool:
+    """Opt-in gate for the MX-FP6 decode micro path (default off).
+
+    Keeps the validated dynamic FP6 fused path as the only FP6 backend until
+    the micro kernel is wired into dispatch and numerically proven.
+    """
+    return os.environ.get(
+        "SPARKINFER_ENABLE_FP6_MICRO", "0"
+    ).strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _mxfp6_micro_k_segments_for_k(k: int) -> int:
+    return _align_up(k, _MXFP6_ELEMS_PER_SEGMENT) // _MXFP6_ELEMS_PER_SEGMENT
+
+
+def _mxfp6_micro_shapes_ok(
+    m: int, k: int, n: int, num_topk: int, weight_E: int
+) -> bool:
+    """Format-fundamental shape predicate for the MX-FP6 decode micro path.
+
+    Mirrors ``MoEMicroKernelBackend.is_supported`` but at the FP6 32-element
+    block granularity. FC1-chunk feasibility for a specific ``(m, n)`` is
+    validated by ``configure`` once the kernel geometry is built; this gate
+    covers the constraints that hold independent of the kernel inner-loop
+    tiling.
+    """
+    if m not in (1, 2, 4, 8):
+        return False
+    if k <= 0 or k % MXFP6_BLOCK_SIZE != 0 or k % 128 != 0:
+        return False
+    if _mxfp6_micro_k_segments_for_k(k) > _MAX_DIRECT_K_SEGMENTS:
+        return False
+    if n <= 0 or n % MXFP6_BLOCK_SIZE != 0:
+        return False
+    return 0 < num_topk <= 32 and weight_E > 0
 
 
 @dataclass(frozen=True)
@@ -611,6 +665,26 @@ class MoEMicroKernelBackend:
             and 0 < num_topk <= 32
             and weight_E > 0
         )
+
+    @classmethod
+    def is_supported_mxfp6(
+        cls,
+        m: int,
+        k: int,
+        n: int,
+        num_topk: int,
+        weight_E: int,
+    ) -> bool:
+        """MX-FP6 (w6a8_mx) decode micro path support.
+
+        Opt-in via ``SPARKINFER_ENABLE_FP6_MICRO`` (default off) so the
+        validated dynamic FP6 fused path stays the only FP6 backend until the
+        micro kernel is wired into dispatch and numerically proven. When
+        enabled, returns the format-fundamental shape predicate.
+        """
+        if not _fp6_micro_enabled():
+            return False
+        return _mxfp6_micro_shapes_ok(m, k, n, num_topk, weight_E)
 
     def configure(
         self,

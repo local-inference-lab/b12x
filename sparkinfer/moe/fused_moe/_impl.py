@@ -121,6 +121,9 @@ _FP4_SOURCE_FORMATS = {
     "modelopt_nvfp4": "modelopt_nvfp4",
     "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
+    # Packed MX-FP6 E2M3 codes with UE8M0 K/32 grids; exclusive to the
+    # w6a8_mx recipe (see _validate_fp4_source_format_for_quant_mode).
+    "mxfp6_e2m3": "mxfp6_e2m3",
 }
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
@@ -1181,6 +1184,10 @@ def default_moe_quant_mode() -> str:
 
 
 _W4A8_QUANT_MODES = {"w4a8_mx", "w4a8_nvfp4"}
+# W6A8 MX-FP6 (E2M3 weights x FP8 E4M3 activations on the mxf8f6f4 MMA) is a
+# distinct recipe family: it must NOT satisfy _is_w4a8_quant_mode, whose
+# predicates assume FP4 weight packing and the W4A8 repacked layouts.
+_W6A8_QUANT_MODES = {"w6a8_mx"}
 
 
 def _is_w4a8_quant_mode(quant_mode: str) -> bool:
@@ -1215,7 +1222,7 @@ def _normalize_quant_mode_requested(quant_mode: str | None) -> str:
     if quant_mode is None:
         return "nvfp4"
     normalized = str(quant_mode).lower()
-    if normalized not in {"nvfp4", "w4a16"} | _W4A8_QUANT_MODES:
+    if normalized not in {"nvfp4", "w4a16"} | _W4A8_QUANT_MODES | _W6A8_QUANT_MODES:
         raise ValueError(f"unsupported quant_mode {quant_mode!r}")
     return normalized
 
@@ -1236,7 +1243,7 @@ def _normalize_fp4_source_format(source_format: str) -> str:
     except KeyError as exc:
         raise ValueError(
             "source_format must be one of 'modelopt_nvfp4', "
-            "'fp4_e8m0_k32', or 'compressed_tensors', "
+            "'fp4_e8m0_k32', 'compressed_tensors', or 'mxfp6_e2m3', "
             f"got {source_format!r}"
         ) from exc
 
@@ -1336,6 +1343,16 @@ def _validate_fp4_source_format_for_quant_mode(
 
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_requested(quant_mode)
+    # The packed MX-FP6 source and the w6a8_mx recipe are mutually exclusive
+    # with every FP4 pairing (including w4a16, which keeps its FP4 trio).
+    if source_format == "mxfp6_e2m3" or quant_mode == "w6a8_mx":
+        if source_format == "mxfp6_e2m3" and quant_mode == "w6a8_mx":
+            return
+        raise ValueError(
+            f"source_format={source_format!r} with quant_mode={quant_mode!r} "
+            "is unsupported; quant_mode='w6a8_mx' requires "
+            "source_format='mxfp6_e2m3' and vice versa"
+        )
     if quant_mode == "w4a16":
         return
     if source_format == "modelopt_nvfp4":
@@ -1430,6 +1447,12 @@ def _select_dynamic_tile_mn(
         return ovr
     routed_rows = max(1, int(routed_rows))
     num_experts = max(1, int(num_experts))
+    if quant_mode in _W6A8_QUANT_MODES:
+        # The MX-FP6 dynamic kernel builds only the (128, 128) MMA tile (its
+        # ctor rejects everything else), so the M16-M64 ladder does not exist
+        # for w6a8_mx.  Every planner/scratch/kernel caller therefore selects
+        # the same fixed tile.
+        return (_LEVEL_TILE_M, _LEVEL_TILE_N)
     if _is_w4a8_quant_mode(quant_mode):
         if compute_capability is None:
             compute_capability = _current_compute_capability()
@@ -1937,7 +1960,15 @@ def _dynamic_rows_padded_limit(k: int, *, quant_mode: str = "nvfp4") -> int:
     tile_m = _dynamic_tile_m(quant_mode)
     cols_pad_k = align_up(k // _NVFP4_BLOCK_SIZE, 4)
     _qm = _normalize_quant_mode(quant_mode)
-    input_cols = k if (_qm == "w4a16" or _is_w4a8_quant_mode(_qm)) else k // 2
+    input_cols = (
+        k
+        if (
+            _qm == "w4a16"
+            or _is_w4a8_quant_mode(_qm)
+            or _qm in _W6A8_QUANT_MODES
+        )
+        else k // 2
+    )
     rows_padded_limit = min(
         _RUNTIME_MEMREF_LIMIT // max(1, input_cols),
         _RUNTIME_MEMREF_LIMIT // max(1, cols_pad_k),
@@ -2625,7 +2656,13 @@ def _plan_core_workspace(
     # physical storage through its full 128-row extent.  W4A8 uses a plain
     # row-major scale plane, for which the extra tail is harmless.
     dynamic_scale_rows = align_up(dynamic_rows_padded, 128)
-    packed_input_cols = k if _is_w4a8_quant_mode(quant_mode) else k // 2
+    # w4a8 and w6a8 both stage one E4M3 byte per activation element; nvfp4
+    # packs two FP4 elements per byte.
+    packed_input_cols = (
+        k
+        if (_is_w4a8_quant_mode(quant_mode) or quant_mode in _W6A8_QUANT_MODES)
+        else k // 2
+    )
     packed_input_shape = (1, dynamic_rows_padded, packed_input_cols)
     packed_input_dtype = torch.uint8
     # Atomic scatter writes directly into the caller-owned [M, K] output and
@@ -4030,6 +4067,100 @@ def _ensure_w13_kernel_order_inplace(
     _W13_NORMALIZED_STORAGES[reg_key] = (w1_fp4, w1_blockscale)
 
 
+def _get_w6a8_weight_views(
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    n: int,
+    k: int,
+    *,
+    activation_spec: _ActivationKernelSpec,
+) -> _WeightViews:
+    """Weight views for the prepared w6a8_mx (MX-FP6) expert layout.
+
+    Mirrors ``_get_weight_views`` structurally, but the operands are the
+    PreparedW6A8MXFP6Weights canonical tensors: packed FP6 code bytes
+    ``[E, N, 3K//4]`` and MMA-swizzled UE8M0 scale atoms
+    ``[E, pad128(N), pad4(K//32)]``.  The dynamic launch passes the permuted
+    code views through Float8E4M3FN gmem pointers and the swizzled scale bytes
+    through Float8E8M0FNU pointers (sf_vec_size 32).
+    """
+    global _LAST_WEIGHTS
+    w1_n = activation_spec.w1_rows(n)
+    w1_u8 = w1_fp4.view(torch.uint8)
+    w2_u8 = w2_fp4.view(torch.uint8)
+    if w1_u8.dim() != 3 or tuple(w1_u8.shape[1:]) != (w1_n, 3 * k // 4):
+        raise ValueError(
+            "w6a8_mx FC1 weights must be packed [E, w1_n, 3*k//4]; got "
+            f"{tuple(w1_u8.shape)} for w1_n={w1_n}, k={k}"
+        )
+    if w2_u8.dim() != 3 or tuple(w2_u8.shape[1:]) != (k, 3 * n // 4):
+        raise ValueError(
+            "w6a8_mx FC2 weights must be packed [E, k, 3*n//4]; got "
+            f"{tuple(w2_u8.shape)} for k={k}, n={n}"
+        )
+    if not w1_alphas.is_contiguous() or not w2_alphas.is_contiguous():
+        raise ValueError("w1_alphas and w2_alphas must be contiguous")
+    key = (
+        w1_u8.data_ptr(),
+        w1_blockscale.data_ptr(),
+        w2_u8.data_ptr(),
+        w2_blockscale.data_ptr(),
+        w1_alphas.data_ptr(),
+        w2_alphas.data_ptr(),
+        activation_spec.activation,
+        "w6a8_mx",
+    )
+    last_wkey, last_wval = _LAST_WEIGHTS
+    if last_wkey == key:
+        return last_wval
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is not None:
+        _LAST_WEIGHTS = (key, cached)
+        return cached
+
+    # Permute [E, rows, 3K//4] -> [rows, 3K//4, E] (view, no copy!) to match
+    # the kernel's k-major [N, K_packed, E] weight tensors.
+    w13 = w1_u8.permute(1, 2, 0)
+    down = w2_u8.permute(1, 2, 0)
+    w13_sf = w1_blockscale.view(torch.uint8)
+    down_sf = w2_blockscale.view(torch.uint8)
+    views = _WeightViews(
+        w13=w13,
+        down=down,
+        w13_sf=w13_sf,
+        down_sf=down_sf,
+        w1_alpha=w1_alphas,
+        w2_alpha=w2_alphas,
+        w1_storage=w1_u8,
+        w1_scale_storage=w13_sf,
+        w2_storage=w2_u8,
+        w2_scale_storage=down_sf,
+    )
+    # One FP6 code byte-triplet per four elements; the Float8E4M3FN element
+    # type is conveyed via _gptr / compile-time fakes, so keep uint8 views.
+    views.w13_fp4 = w13
+    views.down_fp4 = down
+    views.sfb_w13_ptr = make_ptr(
+        cutlass.Float8E8M0FNU,
+        w13_sf.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    views.sfb_down_ptr = make_ptr(
+        cutlass.Float8E8M0FNU,
+        down_sf.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    _WEIGHT_CACHE[key] = views
+    _LAST_WEIGHTS = (key, views)
+    return views
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -4053,6 +4184,26 @@ def _get_weight_views(
     """
     global _LAST_WEIGHTS
     quant_mode = _normalize_quant_mode(quant_mode)
+    if quant_mode == "w6a8_mx":
+        # PreparedW6A8MXFP6Weights canonical storage: w1_fp4/w2_fp4 carry the
+        # 3:4-packed FP6 code bytes ([E, N, 3K//4] uint8, already [up; gate])
+        # and the blockscales carry the MMA-swizzled UE8M0 K/32 atoms
+        # ([E, pad128(N), pad4(K//32)] uint8).  The dynamic kernel consumes
+        # the packed bytes as Float8E4M3FN views with gmem K extent 3K/4
+        # (expanded to byte-containers in smem) and rebuilds SF geometry from
+        # the LOGICAL K, so the views are plain [N, 3K//4, E] permutes; the
+        # FP4 K//2 view math and the in-place w31 flip below never apply.
+        return _get_w6a8_weight_views(
+            w1_fp4,
+            w1_blockscale,
+            w2_fp4,
+            w2_blockscale,
+            w1_alphas,
+            w2_alphas,
+            n,
+            k,
+            activation_spec=activation_spec,
+        )
     if quant_mode == "w4a8_mx" and w1_fp4.dim() != 3:
         # In-place N256/K128-repacked storage (tiny_decode band): view flat as the
         # source-native 3-D shape for pointer plumbing. The prep rotation
@@ -4346,6 +4497,65 @@ def _prepare_w4a8_from_e8m0_source(
     )
 
 
+def _prepare_w6a8_from_mxfp6_source(
+    *,
+    w1_fp6: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp6: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    activation: str,
+    source_format: str,
+    w13_layout: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+):
+    """Prepare packed MX-FP6 experts for the w6a8_mx dynamic-kernel port.
+
+    Weight codes stay source-native ([E, N, 3K//4] uint8); UE8M0 grids are
+    swizzled to the MMA layout and per-expert alphas come from the
+    ``*_weight_scale_2`` globals divided by the reciprocal activation global
+    scales.  Returns a
+    :class:`sparkinfer.moe._shared.kernels.w6a8.PreparedW6A8MXFP6Weights`.
+    """
+    from sparkinfer.moe._shared.kernels.w6a8 import prepare_w6a8_mxfp6_weights
+
+    source_format = _normalize_fp4_source_format(source_format)
+    if source_format != "mxfp6_e2m3":
+        raise ValueError(
+            "W6A8 preparation requires source_format='mxfp6_e2m3', "
+            f"got {source_format!r}"
+        )
+    activation = normalize_moe_activation(activation)
+    if activation != "silu":
+        raise ValueError(
+            f"W6A8 MX-FP6 preparation currently requires silu, got {activation!r}"
+        )
+    w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
+    if w13_layout != "w13":
+        raise NotImplementedError(
+            "w6a8_mx: gate-first ('w31') FC1 row rotation of packed FP6 "
+            "storage pending kernel port; fuse FC1 as [up; gate] ('w13')"
+        )
+    return prepare_w6a8_mxfp6_weights(
+        w13_packed=w1_fp6,
+        w13_scale=w1_blockscale,
+        w13_scale_2=w1_global_scale,
+        w2_packed=w2_fp6,
+        w2_scale=w2_blockscale,
+        w2_scale_2=w2_global_scale,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+
+
 def _prepare_modelopt_nvfp4_runtime_alphas(
     w1_global_scale: torch.Tensor,
     a1_gscale: torch.Tensor,
@@ -4560,6 +4770,34 @@ def prepare_sparkinfer_fp4_moe_weights(
             value=value,
         )
 
+    if WeightPreparationTransform.W6A8_MXFP6 in plan.transforms:
+        if representation is not None:
+            raise AssertionError("weight plan selected multiple prepared layouts")
+        # For the mxfp6_e2m3 source, the w1_fp4/w2_fp4 arguments carry the
+        # packed FP6 code bytes and the blockscales carry unswizzled UE8M0
+        # K/32 grids.
+        value = _prepare_w6a8_from_mxfp6_source(
+            w1_fp6=w1_fp4,
+            w1_blockscale=w1_blockscale,
+            w1_global_scale=w1_global_scale,
+            w2_fp6=w2_fp4,
+            w2_blockscale=w2_blockscale,
+            w2_global_scale=w2_global_scale,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            activation=plan.activation,
+            source_format=plan.source_format,
+            w13_layout=plan.w13_layout,
+            num_experts=plan.num_experts,
+            hidden_size=plan.hidden_size,
+            intermediate_size=plan.intermediate_size,
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode="w6a8_mx",
+            layout=PreparedWeightLayout.SOURCE_NATIVE,
+            value=value,
+        )
+
     canonical_w1 = w1_fp4
     canonical_s1 = w1_blockscale
     canonical_a1 = w1_runtime_alphas
@@ -4638,6 +4876,24 @@ def _resolve_workspace_layout(
     if _normalize_quant_mode(quant_mode) == "w4a16":
         return "w4a16", weight_E, max(1, routed_rows)
     normalized_quant_mode = _normalize_quant_mode(quant_mode)
+    if normalized_quant_mode == "w6a8_mx":
+        # w6a8_mx is dynamic-only: the MX-FP6 kernel has no micro, tiny-decode,
+        # direct-routing, or materialized-intermediate specialization (the
+        # backend ctor rejects them), so no decode-band candidates apply.
+        # Its dynamic workspace geometry matches w4a8_mx's: the packed-A
+        # staging is one MXFP8-E4M3 byte per element (packed_input_cols == k,
+        # see _plan_core_workspace) and the activation-scale plane reuses the
+        # common cols_pad_k allocation, which covers the swizzled UE8M0 K/32
+        # atoms (4 * ceil(k/128) <= align_up(k//16, 4) bytes per row).  The
+        # kernel builds only the (128, 128) tile, so tile_m is always 128.
+        tile_m, _ = _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=weight_E,
+            activation=activation,
+        )
+        return "dynamic", weight_E, align_up(routed_rows, tile_m)
     if _is_w4a8_quant_mode(normalized_quant_mode):
         # Native W4A8 serving prepares its weights in-place into the dynamic
         # kernel's N256/K128 representation.  Use one workspace family for all
@@ -6934,6 +7190,25 @@ class _DynamicMoELaunch:
         )
 
 
+class _DynamicMoEW6A8Launch(_DynamicMoELaunch):
+    """w6a8_mx variant of _DynamicMoELaunch (same kernel-call ABI, no repack
+    or residual operands).  Only the flat scratch extents differ: packed-A
+    stages one MXFP8-E4M3 byte-container per element (k bytes/row instead of
+    the FP4 k//2), and the activation-scale plane holds the swizzled UE8M0
+    K/32 atoms (4 bytes per 128 K elements per row).  ``packed_a`` keeps the
+    [rows_padded, k, 1] shape; its Float8E4M3FN element type comes from the
+    caller's pointer."""
+
+    def __init__(self, kernel, k, num_topk):
+        super().__init__(kernel, k, num_topk)
+        # One E4M3 byte per element (the FP4 recipes pack two per byte).
+        self._half_k = k
+        # Swizzled 128-row SF atoms: one UE8M0 byte per K/32 block, padded to
+        # the 4-block atom column -> align_up(k // 32, 4) bytes per row
+        # (the vec16 recipes use align_up(k // 16, 4)).
+        self._cols_pad_k = align_up(k // 32, 4)
+
+
 class _DynamicMoEW4A8Launch:
     """w4a8 variant of _DynamicMoELaunch: adds the plain UE8M0 weight-scale
     grids (and, for the NVFP4-source recipe, the E4M3 residual grids), and
@@ -7208,6 +7483,14 @@ def _get_dynamic_kernel(
     swiglu_beta: float | None = None,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
+    # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
+    # with quant_recipe="w6a8_mx": Float8E4M3FN views of the 3:4-packed FP6
+    # code bytes (gmem K extent 3K/4), MXFP8-E4M3 byte-container activation
+    # scratch, and UE8M0 K/32 scales (sf_vec_size 32).  The backend ctor
+    # rejects swap_ab, direct_routing, materialize_intermediate, and
+    # share_input_across_experts for this recipe; all of those resolve to
+    # False below via their existing quant-mode predicates.
+    is_w6a8 = quant_mode in _W6A8_QUANT_MODES
     share_input_across_experts = bool(
         share_input_across_experts
         and (quant_mode == "nvfp4" or (quant_mode == "w4a8_mx" and w4a8_repacked))
@@ -7219,7 +7502,9 @@ def _get_dynamic_kernel(
         swiglu_alpha,
         swiglu_beta,
     )
-    sf_vec_size = 16
+    # w6a8_mx quantizes per MX K/32 block (the ctor requires sf_vec_size 32);
+    # the FP4 recipes keep the NVFP4 vec16 scale granularity.
+    sf_vec_size = 32 if is_w6a8 else 16
     mac = mac_override if mac_override is not None else _get_impl_mac("dynamic")
     is_w4a8 = _is_w4a8_quant_mode(quant_mode)
     # w4a8 is self-ranging; the dynamic per-tile FC2 scale does not apply.
@@ -7257,7 +7542,8 @@ def _get_dynamic_kernel(
     _swap_env = os.environ.get("SPARKINFER_DYNAMIC_SWAP_AB")
     if _swap_env is not None:
         swap_ab = _swap_env != "0"
-    if is_w4a8:
+    if is_w4a8 or is_w6a8:
+        # Neither recipe builds the swapped FC1 (the w6a8_mx ctor rejects it).
         swap_ab = False
 
     global _LAST_KERNEL
@@ -7300,9 +7586,17 @@ def _get_dynamic_kernel(
             _LAST_KERNEL = (cache_key, cached)
             return cached, mac
 
-    weight_dtype = cutlass.Float4E2M1FN
-    a_scratch_dtype = weight_dtype
-    sf_dtype = cutlass.Float8E4M3FN
+    if is_w6a8:
+        # Packed FP6 code bytes are consumed as Float8E4M3FN byte views (one
+        # byte per gmem element, K extent 3K/4); the activation scratch is the
+        # MXFP8-E4M3 byte-container view and all block scales are UE8M0.
+        weight_dtype = cutlass.Float8E4M3FN
+        a_scratch_dtype = cutlass.Float8E4M3FN
+        sf_dtype = cutlass.Float8E8M0FNU
+    else:
+        weight_dtype = cutlass.Float4E2M1FN
+        a_scratch_dtype = weight_dtype
+        sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -7325,6 +7619,10 @@ def _get_dynamic_kernel(
     if is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
+    elif is_w6a8:
+        # mxfp6_fmt_a/mxfp6_fmt_b stay at the ctor defaults ("e4m3" MXFP8
+        # activations against "e2m3" FP6 weights).
+        kernel_kwargs["quant_recipe"] = quant_mode
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
@@ -7334,6 +7632,8 @@ def _get_dynamic_kernel(
             w1_n=activation_spec.w1_rows(n),
             num_topk=num_topk,
         )
+    elif is_w6a8:
+        launch = _DynamicMoEW6A8Launch(kernel, k=k, num_topk=num_topk)
     else:
         launch = _DynamicMoELaunch(kernel, k=k, num_topk=num_topk)
 
@@ -7425,16 +7725,19 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
     w1_n = activation_spec.w1_rows(n)
+    # w6a8_mx weight tensors are the 3:4-packed FP6 bytes, so their gmem K
+    # extent is 3K/4 one-byte elements (the kernel expands to full-K
+    # byte-containers in smem).
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_n, k, E),
+        (w1_n, 3 * k // 4 if is_w6a8 else k, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (k, n, E),
+        (k, 3 * n // 4 if is_w6a8 else n, E),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
@@ -7767,12 +8070,22 @@ def _launch_dynamic_flat(
 
     ids_cutlass_dtype = cutlass.Int32 if topk_ids_are_i32 else cutlass.Int64
     ids_align = 4 if topk_ids_are_i32 else 8
+    # w6a8_mx stages MXFP8-E4M3 byte-containers in packed_a and UE8M0 K/32
+    # block scales (weight SFBs included); the FP4 recipes keep the FP4x2
+    # packed view and E4M3 vec16 scale pointers.
+    is_w6a8 = quant_mode in _W6A8_QUANT_MODES
+    packed_a_cutlass_dtype = (
+        cutlass.Float8E4M3FN if is_w6a8 else cutlass.Float4E2M1FN
+    )
+    sf_cutlass_dtype = (
+        cutlass.Float8E8M0FNU if is_w6a8 else cutlass.Float8E4M3FN
+    )
     compiled(
         _gptr(cutlass.BFloat16, a),
         _gptr(ids_cutlass_dtype, flat_ids, ids_align),
         _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(cutlass.Float4E2M1FN, packed_a_view),
-        _gptr(cutlass.Float8E4M3FN, scale_flat),
+        _gptr(packed_a_cutlass_dtype, packed_a_view),
+        _gptr(sf_cutlass_dtype, scale_flat),
         _gptr(cutlass.Uint8, packed_a_flat),
         _gptr(cutlass.Uint8, scale_flat),
         _gptr(cutlass.Uint32, materialized_intermediate),
@@ -7791,9 +8104,9 @@ def _launch_dynamic_flat(
         _gptr(cutlass.Int32, task_valid_rows, 4),
         _gptr(cutlass.Int32, tile_write_count, 4),
         w13_fp4,
-        _gptr(cutlass.Float8E4M3FN, w13_sf),
+        _gptr(sf_cutlass_dtype, w13_sf),
         down_fp4,
-        _gptr(cutlass.Float8E4M3FN, down_sf),
+        _gptr(sf_cutlass_dtype, down_sf),
         *(
             (
                 _gptr(cutlass.Uint8, sfb_w13_mx),
@@ -9105,7 +9418,29 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
         assert isinstance(s, TPDynamicWorkspace)
-        if prepared_payload is not None and quant_mode == "w4a8_mx":
+        if quant_mode == "w6a8_mx":
+            # The prepared payload is a PreparedW6A8MXFP6Weights container
+            # (source-native packed FP6 codes, MMA-swizzled UE8M0 scales,
+            # per-expert alphas).  Build the dynamic-launch views from it
+            # directly, mirroring the prepared-W4A8 branch below; the FP4
+            # view builder must never touch packed FP6 bytes.
+            if prepared_payload is None:
+                raise RuntimeError(
+                    "the w6a8_mx weight plan did not materialize its "
+                    "prepared MX-FP6 representation"
+                )
+            wv = _get_w6a8_weight_views(
+                prepared_payload.w13_packed,
+                prepared_payload.w13_sf_swizzled,
+                prepared_payload.w2_packed,
+                prepared_payload.w2_sf_swizzled,
+                w1_alphas,
+                w2_alphas,
+                n,
+                k,
+                activation_spec=activation_spec,
+            )
+        elif prepared_payload is not None and quant_mode == "w4a8_mx":
             wv = _w4a8_prepared_weight_views(
                 prepared_payload,
                 w1_alphas,

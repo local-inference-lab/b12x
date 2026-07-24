@@ -31,6 +31,9 @@ dev = [
 requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "setuptools.build_meta"
 
+[project.entry-points."vllm.general_plugins"]
+sparkinfer_fp6 = "sparkinfer.integration.vllm.plugin:register_sparkinfer_fp6"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sparkinfer*"]
