@@ -85,6 +85,8 @@ def main() -> None:
     # imports _kernel, which registers the torch custom op.
     bf16_gemv.bf16_gemv_small_n  # noqa: B018
 
+    from sparkinfer.gemm.bf16_gemv._kernel import SMALL_M_MAX
+
     op = torch.ops.sparkinfer.bf16_gemv_small_n
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -100,12 +102,25 @@ def main() -> None:
         for m in args.ms:
             x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
             # Correctness spot check before timing.
-            torch.testing.assert_close(
-                op(x, w).float(),
-                x.float() @ w.float().t(),
-                rtol=1e-2,
-                atol=1e-2,
-            )
+            if m <= SMALL_M_MAX:
+                # Kernel path: f32-accumulated GEMV vs f32 reference.
+                torch.testing.assert_close(
+                    op(x, w).float(),
+                    x.float() @ w.float().t(),
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+            else:
+                # m > SMALL_M_MAX returns F.linear from inside the op, so the
+                # only contract to verify is the fallback wiring — bitwise.
+                # (Checking cuBLAS against an f32 reference here tests cuBLAS,
+                # not this repo: torch's default bf16 reduced-precision
+                # split-K reductions legitimately exceed 1% on
+                # cancellation-heavy elements at skinny shapes.)
+                if not torch.equal(op(x, w), torch.nn.functional.linear(x, w)):
+                    raise AssertionError(
+                        f"m={m} fallback output differs from F.linear"
+                    )
             ref_fn = lambda: torch.nn.functional.linear(x, w)  # noqa: E731
             gemv_fn = lambda: op(x, w)  # noqa: E731
             t_ref = _bench(ref_fn, args.iters, args.warmup)
