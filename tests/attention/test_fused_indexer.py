@@ -236,10 +236,12 @@ def _build_case(rows, heads, seqlen, topk, *, seed, device):
     return q_fp8, weights, k_fp8, k_scales, page_table, seqlens
 
 
-def _golden_topk(q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk):
+def _golden_topk(
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk, return_scores=False
+):
     rows, seqlen = int(q_fp8.shape[0]), int(seqlens[0])
     qf, kf = q_fp8.float(), k_fp8.float()
-    vals, idxs = [], []
+    vals, idxs, scores = [], [], []
     for r in range(rows):
         pages = page_table[r].long()
         kr = kf[pages].reshape(-1, 128)[:seqlen]
@@ -248,6 +250,9 @@ def _golden_topk(q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk):
         tk = torch.topk(logit, topk, largest=True, sorted=True)
         vals.append(tk.values)
         idxs.append(set(tk.indices.tolist()))
+        scores.append(logit)
+    if return_scores:
+        return torch.stack(vals), idxs, torch.stack(scores)
     return torch.stack(vals), idxs
 
 
@@ -586,7 +591,7 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
     )
     torch.cuda.synchronize(device)
 
-    gold_vals, gold_idx_sets = _golden_topk(
+    gold_vals, gold_idx_sets, gold_scores = _golden_topk(
         q_fp8,
         weights,
         k_quant.view(torch.float8_e4m3fn)[pid_lo : pid_lo + pages_used],
@@ -594,6 +599,7 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
         page_table - pid_lo,
         seqlens,
         topk,
+        return_scores=True,
     )
     assert torch.allclose(
         torch.sort(val, dim=1, descending=True).values,
@@ -603,3 +609,11 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
     )
     for row in range(rows):
         assert set(idx[row].tolist()) == gold_idx_sets[row]
+        # Value-to-index pairing. Comparing the sorted value list and the index set
+        # separately would still pass if correct values were emitted against the
+        # wrong indices, so gather the golden score for each index the kernel
+        # actually returned and compare position by position. Gathering by the
+        # returned index (rather than asserting an index order) keeps this robust
+        # to ties at the top-k boundary.
+        paired = gold_scores[row].index_select(0, idx[row].long())
+        assert torch.allclose(val[row].float(), paired.float(), atol=1e-2, rtol=0)
