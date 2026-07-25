@@ -148,34 +148,50 @@ def _worker(
             graph_candidate_indices, graph_candidate_scores = (
                 graph_owner.stage_candidates(graph_indices, graph_scores)
             )
+            # Force one owner per DCP group to remain in its consumer while
+            # faster peers are ready to replay and write its staging slab.
+            if dcp_rank == 0:
+                torch.cuda._sleep(20_000_000)
             consumed_indices.copy_(graph_candidate_indices)
             consumed_scores.copy_(graph_candidate_scores)
 
         # Queue several replays without host/device synchronization. Every
         # replay writes the capture-stable slab, then consumes it on the same
         # stream before the next replay can overwrite it.
-        final_replay_step = 23
-        for replay_step in range(20, final_replay_step + 1):
-            next_indices, next_scores = _inputs(replay_step, rank, graph_rows, device)
+        replay_steps = tuple(range(20, 24))
+        replay_inputs = [
+            _inputs(replay_step, rank, graph_rows, device)
+            for replay_step in replay_steps
+        ]
+        replayed_indices = [torch.empty_like(consumed_indices) for _ in replay_steps]
+        replayed_scores = [torch.empty_like(consumed_scores) for _ in replay_steps]
+        torch.cuda.synchronize(device)
+        for replay_idx in range(len(replay_steps)):
+            next_indices, next_scores = replay_inputs[replay_idx]
             graph_indices.copy_(next_indices)
             graph_scores.copy_(next_scores)
             graph.replay()
+            replayed_indices[replay_idx].copy_(consumed_indices)
+            replayed_scores[replay_idx].copy_(consumed_scores)
         torch.cuda.synchronize(device)
 
-        expected_rank_inputs = [
-            _inputs(final_replay_step, source, graph_rows, device)
-            for source in dcp_global_ranks
-        ]
-        expected_indices, expected_scores = owner_stage_reference(
-            torch.stack([item[0] for item in expected_rank_inputs]),
-            torch.stack([item[1] for item in expected_rank_inputs]),
-            dcp_rank,
-        )
-        torch.testing.assert_close(consumed_indices, expected_indices, rtol=0, atol=0)
-        assert torch.equal(
-            consumed_scores.view(torch.int32),
-            expected_scores.view(torch.int32),
-        )
+        for replay_idx, replay_step in enumerate(replay_steps):
+            expected_rank_inputs = [
+                _inputs(replay_step, source, graph_rows, device)
+                for source in dcp_global_ranks
+            ]
+            expected_indices, expected_scores = owner_stage_reference(
+                torch.stack([item[0] for item in expected_rank_inputs]),
+                torch.stack([item[1] for item in expected_rank_inputs]),
+                dcp_rank,
+            )
+            torch.testing.assert_close(
+                replayed_indices[replay_idx], expected_indices, rtol=0, atol=0
+            )
+            assert torch.equal(
+                replayed_scores[replay_idx].view(torch.int32),
+                expected_scores.view(torch.int32),
+            )
         dist.barrier()
         torch.cuda.synchronize(device)
     finally:

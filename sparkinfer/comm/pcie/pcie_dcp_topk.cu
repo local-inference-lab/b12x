@@ -100,13 +100,21 @@ __global__ void __launch_bounds__(512, 1) stage_owner_candidates_kernel(
     const int4 *__restrict__ local_indices,
     const int4 *__restrict__ local_scores, RankStaging staging,
     RankSignals signals, Signal *self, int rank, int rows, int topk,
-    int64_t candidate_plane_packs) {
+    int64_t candidate_plane_packs, bool wait_for_prior_consumer) {
   const int owner_rows = rows / world_size;
   const int packs_per_row = topk / 4;
   const int64_t owner_packs = int64_t(owner_rows) * packs_per_row;
   const int64_t output_row_packs = int64_t(world_size) * packs_per_row;
   int64_t begin, end;
   block_range(owner_packs, begin, end);
+
+  // A captured graph reuses one fixed staging address on every replay. Each
+  // rank reaches this kernel only after its previous same-stream owner
+  // consumer, so this group barrier prevents a faster peer from overwriting a
+  // slower owner's slab before that consumer retires.
+  if (wait_for_prior_consumer) {
+    block_pair_barrier<world_size>(signals, self, rank);
+  }
 
 #pragma unroll 1
   for (int step = 0; step < world_size; ++step) {
@@ -189,12 +197,17 @@ class PCIeDCPTopKOwnerExchange {
     const int slot = static_cast<int>(next_slot_);
     next_slot_ ^= uint32_t{1};
     const int64_t candidate_plane_packs = candidate_plane_elems_ / 4;
+    cudaStreamCaptureStatus capture_status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &capture_status));
+    const bool wait_for_prior_consumer =
+        capture_status != cudaStreamCaptureStatusNone;
 
 #define LAUNCH(world)                                                        \
   stage_owner_candidates_kernel<world><<<blocks, threads, 0, stream>>>(     \
       reinterpret_cast<const int4 *>(local_indices),                        \
       reinterpret_cast<const int4 *>(local_scores), candidates_[slot],      \
-      signals_, self_signal_, rank_, rows, topk_, candidate_plane_packs)
+      signals_, self_signal_, rank_, rows, topk_, candidate_plane_packs,     \
+      wait_for_prior_consumer)
     switch (world_size_) {
       case 2:
         LAUNCH(2);

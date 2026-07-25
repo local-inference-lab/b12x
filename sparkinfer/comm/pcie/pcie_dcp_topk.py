@@ -341,7 +341,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
 
         Consumers must be enqueued on this channel's stream before another
         stage call. CUDA graph replay deliberately reuses its capture-time
-        staging address; stream ordering retires the prior consumer first.
+        staging address; a group barrier at the next replay prevents peer
+        writers from racing a slower rank's prior same-stream consumer.
         """
         if self._closed:
             raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
