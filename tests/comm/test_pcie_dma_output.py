@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from sparkinfer.comm.pcie.pcie_dma import (
     OUTPUT_TAIL_PADDING,
+    PCIeDmaAllReduce,
     _align_up,
     _persistent_output_view,
 )
@@ -49,3 +52,23 @@ def test_persistent_output_view_rejects_wrong_storage() -> None:
 
     with pytest.raises(ValueError, match="uint8 on the input device"):
         _persistent_output_view(torch.empty(128), inp, 128)
+
+
+def test_close_releases_persistent_output_storage() -> None:
+    class FakeCudaRuntime:
+        def cudaIpcCloseMemHandle(self, _ptr: int) -> None:
+            pass
+
+        def cudaFree(self, _ptr: int) -> None:
+            pass
+
+    ring = object.__new__(PCIeDmaAllReduce)
+    ring._closed = False
+    ring._ipc = FakeCudaRuntime()
+    ring._slab = SimpleNamespace(remote_ptrs=(1, 2), local_ptr=3)
+    ring._output_storage = torch.empty(128, dtype=torch.uint8)
+
+    ring.close()
+
+    assert ring._closed
+    assert ring._output_storage is None
