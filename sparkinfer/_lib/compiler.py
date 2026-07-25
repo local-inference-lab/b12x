@@ -1448,31 +1448,65 @@ def _distribution_version(name: str) -> str:
         return ""
 
 
-_DEVICE_ARCH_KEY: tuple[object, ...] | None = None
+_DEVICE_ARCH_KEYS: dict[int, tuple[object, ...]] = {}
 
 
-def _device_arch_key() -> tuple[object, ...]:
-    """Compute capability of the device this process will compile for.
+def _current_device_ordinal() -> int | None:
+    """Ordinal of the device this process is currently compiling for."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.current_device())
+    except Exception:
+        return None
+
+
+def _device_arch_key(device_ordinal: int | None = None) -> tuple[object, ...]:
+    """Architecture identity of the device this process will compile for.
+
+    Memoized *per device ordinal* rather than once per process. Torch resolves
+    ``get_device_capability()`` / ``get_device_name()`` against the current
+    device when called without an argument, so a single process-wide cache
+    freezes whichever GPU happened to be current on the first call -- passing
+    ``current_device()`` explicitly is equivalent and does not change that. A
+    process that selects a different GPU afterwards would keep reusing the stale
+    identity. Keying the memo by ordinal binds every entry to the device it was
+    actually measured on, which is what makes the guarantee below hold on a
+    mixed-GPU process (e.g. Max-Q and non-Max-Q RTX PRO 6000 boards share
+    compute capability 12.0 but report different device names).
+
+    The returned key deliberately omits the ordinal: two GPUs with the same
+    capability and name yield the same key and therefore share compiled
+    artifacts, which is the desired behaviour on a homogeneous rig. Only the
+    lookup is per ordinal.
 
     Deliberately NOT lru_cached on failure: if CUDA is not initialized yet the
     query is retried on the next call, so an early call can never memoize a
     bogus "unknown" and let a cubin built for one architecture be served to
     another from the shared on-disk cache.
     """
-    global _DEVICE_ARCH_KEY
-    if _DEVICE_ARCH_KEY is not None:
-        return _DEVICE_ARCH_KEY
     try:
         import torch
 
         if not torch.cuda.is_available():
             return ("arch", "unavailable")
-        major, minor = torch.cuda.get_device_capability()
-        name = torch.cuda.get_device_name()
+        index = (
+            int(torch.cuda.current_device())
+            if device_ordinal is None
+            else int(device_ordinal)
+        )
+        cached = _DEVICE_ARCH_KEYS.get(index)
+        if cached is not None:
+            return cached
+        major, minor = torch.cuda.get_device_capability(index)
+        name = torch.cuda.get_device_name(index)
     except Exception:
         return ("arch", "unavailable")
-    _DEVICE_ARCH_KEY = ("arch", int(major), int(minor), str(name))
-    return _DEVICE_ARCH_KEY
+    key = ("arch", int(major), int(minor), str(name))
+    _DEVICE_ARCH_KEYS[index] = key
+    return key
 
 
 @lru_cache(maxsize=1)
@@ -1566,11 +1600,17 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
 
 
 @lru_cache(maxsize=16)
-def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
+def _static_compile_cache_context(
+    compile_callable: Any, device_ordinal: int | None = None
+) -> tuple[object, ...]:
+    # device_ordinal participates in the lru_cache key on purpose: without it
+    # this cache would pin the architecture identity to whichever GPU was
+    # current the first time a given compile_callable was seen, re-introducing
+    # the staleness that keying _device_arch_key per ordinal removes.
     return (
         _sparkinfer_package_fingerprint(),
         _runtime_toolchain_key(),
-        _device_arch_key(),
+        _device_arch_key(device_ordinal),
         _compile_options_cache_key(compile_callable),
         _compile_environment_key(),
     )
@@ -1885,7 +1925,7 @@ def _compile_disk_cache_payload(
         device_arch,
         compile_options,
         compile_environment,
-    ) = _static_compile_cache_context(compile_callable)
+    ) = _static_compile_cache_context(compile_callable, _current_device_ordinal())
     if compile_spec is not None:
         kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
