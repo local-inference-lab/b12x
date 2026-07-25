@@ -81,6 +81,14 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     try:
         assert ring._output_storage is None
+        explicit_inp = _make_input(8, hidden, torch.bfloat16, device, rank, 0)
+        explicit_ref = _reference(explicit_inp)
+        explicit_out = torch.empty_like(explicit_inp)
+        ring.all_reduce(explicit_inp, out=explicit_out)
+        torch.cuda.synchronize(device)
+        _assert_close(explicit_out, explicit_ref, world_size)
+        assert ring._output_storage is None
+
         default_output_ptr = None
         for dtype in (torch.bfloat16,):
             for rows in (8, 64, 256):
@@ -115,7 +123,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
     finally:
         ring.close()
+        output_storage_released = ring._output_storage is None
         dist.destroy_process_group()
+        assert output_storage_released
 
 
 def test_pcie_dma_all_reduce_eager_and_graph() -> None:

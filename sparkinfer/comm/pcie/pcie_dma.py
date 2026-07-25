@@ -377,10 +377,9 @@ class PCIeDmaAllReduce:
                 "input does not satisfy ring allreduce requirements "
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
-        output_storage = self._ensure_output_storage()
         if out is None:
             out = _persistent_output_view(
-                output_storage,
+                self._ensure_output_storage(),
                 inp,
                 self.max_bytes,
             )
@@ -836,6 +835,7 @@ class PCIeDmaAllReduce:
                 self._ipc.cudaIpcCloseMemHandle(ptr)
         with suppress(Exception):
             self._ipc.cudaFree(self._slab.local_ptr)
+        self._output_storage = None
 
     def __del__(self) -> None:
         with suppress(Exception):
