@@ -101,11 +101,13 @@ def _worker(
         topk=TOPK,
     )
     try:
+        eager_output_ptrs = []
         for step, rows in enumerate(test_rows):
             local_indices, local_scores = _inputs(step, rank, rows, device)
             candidate_indices, candidate_scores = owner.stage_candidates(
                 local_indices, local_scores
             )
+            eager_output_ptrs.append(candidate_indices.data_ptr())
             torch.cuda.synchronize(device)
 
             rank_inputs = [
@@ -123,39 +125,57 @@ def _worker(
                 candidate_scores.view(torch.int32),
                 expected_scores.view(torch.int32),
             )
+        assert eager_output_ptrs[0] != eager_output_ptrs[1]
+        assert eager_output_ptrs[0] == eager_output_ptrs[2]
+        assert eager_output_ptrs[1] == eager_output_ptrs[3]
         graph_rows = max_rows
         graph_indices, graph_scores = _inputs(10, rank, graph_rows, device)
+        graph_owner_rows = graph_rows // dcp_world_size
+        graph_candidate_width = dcp_world_size * TOPK
+        consumed_indices = torch.empty(
+            (graph_owner_rows, graph_candidate_width),
+            dtype=torch.int32,
+            device=device,
+        )
+        consumed_scores = torch.empty(
+            (graph_owner_rows, graph_candidate_width),
+            dtype=torch.float32,
+            device=device,
+        )
         graph = torch.cuda.CUDAGraph()
         dist.barrier()
         with torch.cuda.graph(graph):
             graph_candidate_indices, graph_candidate_scores = (
                 graph_owner.stage_candidates(graph_indices, graph_scores)
             )
+            consumed_indices.copy_(graph_candidate_indices)
+            consumed_scores.copy_(graph_candidate_scores)
 
-        for replay_step in (20, 21):
+        # Queue several replays without host/device synchronization. Every
+        # replay writes the capture-stable slab, then consumes it on the same
+        # stream before the next replay can overwrite it.
+        final_replay_step = 23
+        for replay_step in range(20, final_replay_step + 1):
             next_indices, next_scores = _inputs(replay_step, rank, graph_rows, device)
             graph_indices.copy_(next_indices)
             graph_scores.copy_(next_scores)
-            dist.barrier()
             graph.replay()
-            torch.cuda.synchronize(device)
+        torch.cuda.synchronize(device)
 
-            expected_rank_inputs = [
-                _inputs(replay_step, source, graph_rows, device)
-                for source in dcp_global_ranks
-            ]
-            expected_indices, expected_scores = owner_stage_reference(
-                torch.stack([item[0] for item in expected_rank_inputs]),
-                torch.stack([item[1] for item in expected_rank_inputs]),
-                dcp_rank,
-            )
-            torch.testing.assert_close(
-                graph_candidate_indices, expected_indices, rtol=0, atol=0
-            )
-            assert torch.equal(
-                graph_candidate_scores.view(torch.int32),
-                expected_scores.view(torch.int32),
-            )
+        expected_rank_inputs = [
+            _inputs(final_replay_step, source, graph_rows, device)
+            for source in dcp_global_ranks
+        ]
+        expected_indices, expected_scores = owner_stage_reference(
+            torch.stack([item[0] for item in expected_rank_inputs]),
+            torch.stack([item[1] for item in expected_rank_inputs]),
+            dcp_rank,
+        )
+        torch.testing.assert_close(consumed_indices, expected_indices, rtol=0, atol=0)
+        assert torch.equal(
+            consumed_scores.view(torch.int32),
+            expected_scores.view(torch.int32),
+        )
         dist.barrier()
         torch.cuda.synchronize(device)
     finally:

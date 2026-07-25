@@ -151,7 +151,7 @@ class PCIeDCPTopKOwnerExchange {
   RankSignals signals_{};
   Signal *self_signal_;
   RankStaging candidates_[2]{};
-  int slot_ = 0;
+  uint32_t next_slot_ = 0;
 
   PCIeDCPTopKOwnerExchange(
       Signal **signals,
@@ -181,7 +181,13 @@ class PCIeDCPTopKOwnerExchange {
     const int blocks = int(std::max<int64_t>(
         1, std::min<int64_t>(block_limit,
                              (owner_packs + threads - 1) / threads)));
-    const int slot = slot_++ % 2;
+    // Host-side slot selection executes once during CUDA graph capture. Graph
+    // replay intentionally reuses that capture-stable address: the channel is
+    // stream-affine and the owner consumer is ordered after this kernel in the
+    // same graph/stream. Eager calls toggle slabs without an overflowing
+    // counter so one call cannot overwrite the immediately preceding result.
+    const int slot = static_cast<int>(next_slot_);
+    next_slot_ ^= uint32_t{1};
     const int64_t candidate_plane_packs = candidate_plane_elems_ / 4;
 
 #define LAUNCH(world)                                                        \
