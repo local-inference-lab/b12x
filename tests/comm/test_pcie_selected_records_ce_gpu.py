@@ -793,8 +793,14 @@ def _worker(
 
 @pytest.mark.parametrize(
     ("world_size", "record_bytes"),
-    ((4, 368), (4, 432), (8, 368), (8, 656)),
-    ids=("dcp4-record368", "dcp4-record432", "dcp8-record368", "dcp8-record656"),
+    ((4, 368), (4, 432), (4, 656), (8, 368), (8, 656)),
+    ids=(
+        "dcp4-record368",
+        "dcp4-record432",
+        "dcp4-record656",
+        "dcp8-record368",
+        "dcp8-record656",
+    ),
 )
 def test_pcie_selected_record_ce_eager_graph_overflow_and_big_offset(
     world_size: int,
