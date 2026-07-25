@@ -12,6 +12,10 @@ from .pcie_dcp_a2a import (
 from .pcie_dcp_a2a import (
     lse_reduce_scatter_reference,
 )
+from .pcie_dcp_topk import (
+    PCIeDCPTopKOwnerExchange as DcpTopKOwnerExchange,
+    owner_stage_reference,
+)
 from .pcie_dma import (
     PCIeDmaAllReduce as DmaAllReduce,
 )
@@ -50,8 +54,10 @@ __all__ = [
     "TwoShotReduceScatter",
     "DcpAllToAll",
     "DcpAllToAllPool",
+    "DcpTopKOwnerExchange",
     "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",
+    "owner_stage_reference",
     "is_supported",
 ]
