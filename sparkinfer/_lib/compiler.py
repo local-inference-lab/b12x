@@ -1467,8 +1467,14 @@ def _device_arch_key() -> tuple[object, ...]:
 
         if not torch.cuda.is_available():
             return ("arch", "unavailable")
-        major, minor = torch.cuda.get_device_capability()
-        name = torch.cuda.get_device_name()
+        # Read the explicitly selected device rather than whatever is implicitly
+        # current. This key is memoized process-wide, so an implicit lookup made
+        # before the worker selects its GPU would pin the key to the wrong card.
+        # That is observable on mixed rigs: Max-Q and non-Max-Q RTX PRO 6000
+        # boards share compute capability 12.0 but report different device names.
+        index = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(index)
+        name = torch.cuda.get_device_name(index)
     except Exception:
         return ("arch", "unavailable")
     _DEVICE_ARCH_KEY = ("arch", int(major), int(minor), str(name))

@@ -1719,6 +1719,14 @@ def prepare_trellis256_moe_weights(
                 "trellis3_t256 W4A16 weights require a CUDA device, got "
                 f"{resolved_device}"
             )
+        if resolved_device.index is None:
+            # Pin an indexless "cuda" to a concrete ordinal so every downstream
+            # device check compares like with like. Without this the suh/svh
+            # tables are validated with strict equality (cuda:0 != cuda, so a
+            # correctly placed tensor is rejected) while dummy_scale is
+            # validated with an index-optional comparison that accepts a tensor
+            # from any ordinal. Normalising once keeps both strict and correct.
+            resolved_device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=resolved_device)
         generator.manual_seed(int(seed))
         if w13_layout == "trellis3_t256_proj":
@@ -1855,14 +1863,11 @@ def prepare_trellis256_moe_weights(
     if dummy_scale is None:
         dummy_scale = torch.zeros(4, dtype=torch.uint8, device=resolved_device)
     else:
-        dummy_device_matches = (
-            dummy_scale.device.type == resolved_device.type
-            and (
-                resolved_device.index is None
-                or dummy_scale.device.index == resolved_device.index
-            )
-        )
-        if not dummy_device_matches:
+        # resolved_device always carries a concrete ordinal by this point (the
+        # synthesize path pins an indexless "cuda" above, the native path takes it
+        # from w13), so use the same strict comparison as the suh/svh tables
+        # instead of accepting a tensor from an arbitrary ordinal.
+        if dummy_scale.device != resolved_device:
             raise ValueError(
                 "trellis3_t256 dummy_scale must share the weight device, got "
                 f"{dummy_scale.device} and {resolved_device}"

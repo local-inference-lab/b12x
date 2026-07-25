@@ -545,6 +545,14 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
     device = torch.device("cuda")
     record_bytes = 1_077_120
     pid_lo, pages_used = 2000, 64
+    # The whole point of this case is that the base page offset overflows Int32,
+    # which forces the i64 addressing path. Assert it instead of leaving it
+    # implicit in the constants: retuning record_bytes or pid_lo downward would
+    # otherwise leave a green test that no longer exercises the boundary at all.
+    assert pid_lo * record_bytes >= (1 << 31), (
+        f"page base offset {pid_lo * record_bytes} no longer crosses the Int32 "
+        "boundary; this test would silently stop covering i64 offsets"
+    )
     pool_pages = pid_lo + pages_used + 4
     need = pool_pages * record_bytes + (1 << 29)
     free, _ = torch.cuda.mem_get_info(device)
