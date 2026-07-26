@@ -41,10 +41,34 @@ _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
 _SUPPORTED_TOPK = (512, 1024, 2048)
 _RADIX = 256
+_SELECTION_POLICY_ENV = "SPARKINFER_NSA_TOPK_SELECTION_POLICY"
+_SELECTION_POLICY_EXACT = "exact"
+_SELECTION_POLICY_BOUNDED_COMPAT = "bounded_compat"
+_SELECTION_POLICIES = frozenset(
+    {
+        _SELECTION_POLICY_EXACT,
+        _SELECTION_POLICY_BOUNDED_COMPAT,
+    }
+)
+_SELECTION_POLICY = os.environ.get(
+    _SELECTION_POLICY_ENV, _SELECTION_POLICY_EXACT
+).strip().lower()
+if _SELECTION_POLICY not in _SELECTION_POLICIES:
+    raise ValueError(
+        f"{_SELECTION_POLICY_ENV} must be one of "
+        f"{sorted(_SELECTION_POLICIES)}, got {_SELECTION_POLICY!r}"
+    )
+_BOUNDED_COMPAT = _SELECTION_POLICY == _SELECTION_POLICY_BOUNDED_COMPAT
 # Use every SM120 CTA lane for the first histogram.  The four-times narrower
 # bucket keeps ordinary 32k/64k low-contrast rows on the buffered exact path;
 # truly degenerate buckets still use the rescan fallback below.
-_COARSE_RADIX_BITS = 10
+#
+# ``bounded_compat`` intentionally retains the historical 8-bit coarse bucket
+# and bounded 4096-candidate refinement.  This is an explicit model-compatibility
+# policy, not an accidental overflow: writes remain bounds checked, while
+# candidates beyond the deterministic buffer budget are omitted.  The default
+# remains exact.
+_COARSE_RADIX_BITS = 8 if _BOUNDED_COMPAT else 10
 _COARSE_RADIX_BINS = 1 << _COARSE_RADIX_BITS
 _HIST_SLOTS = _COARSE_RADIX_BINS + 128
 # A 1024-thread selector CTA is already limited to one resident block per SM on
@@ -52,7 +76,7 @@ _HIST_SLOTS = _COARSE_RADIX_BINS + 128
 # long-context overflow without reducing occupancy; the complete shared-memory
 # allocation remains below the 99 KiB opt-in block limit.  The exact rescan below
 # still covers wider or degenerate threshold buckets.
-_SMEM_CANDS = 8192
+_SMEM_CANDS = 4096 if _BOUNDED_COMPAT else 8192
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "SPARKINFER_NSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
@@ -539,6 +563,7 @@ class SparseNSATiledTopkKernel:
         # or the user's final output.
         self.is_first = bool(is_first)
         self.output_physical_slots = bool(output_physical_slots)
+        self.bounded_compat = bool(_BOUNDED_COMPAT)
 
     @cute.jit
     def __call__(
@@ -987,8 +1012,9 @@ class SparseNSATiledTopkKernel:
                 # buffer first: none of those intermediate outputs survive.  This is
                 # a CTA-uniform branch because every thread reads the same shared
                 # counter after the barrier above.
-                if bin_count > Int32(_SMEM_CANDS):
-                    topk = Int32(-1)
+                if not cutlass.const_expr(self.bounded_compat):
+                    if bin_count > Int32(_SMEM_CANDS):
+                        topk = Int32(-1)
 
                 # Stage 2: refine with 8-bit radix passes
                 for round_idx in cutlass.range_constexpr(4):
@@ -1140,33 +1166,34 @@ class SparseNSATiledTopkKernel:
                 # Exact overflow fallback: the buffered refine above dropped
                 # winners when more than _SMEM_CANDS candidates shared the coarse
                 # threshold bucket. Redo the selection exactly by re-scanning.
-                if bin_count > Int32(_SMEM_CANDS):
-                    _exact_overflow_fallback(
-                        tx,
-                        total_len,
-                        topk_static,
-                        s_hist0,
-                        s_hist1,
-                        s_out,
-                        h0,
-                        ctr,
-                        thr,
-                        ni0,
-                        ni1,
-                        lr,
-                        flat=False,
-                        flat_values=input_tensor,
-                        input_tensor=input_tensor,
-                        carry_values=carry_values,
-                        row_base=row_base,
-                        row_start=row_start,
-                        carry_base=out_base,
-                        chunk_len=length,
-                        block_q=self.block_q,
-                        block_k=self.block_k,
-                        is_tiled=self.is_tiled,
-                        is_first=self.is_first,
-                    )
+                if not cutlass.const_expr(self.bounded_compat):
+                    if bin_count > Int32(_SMEM_CANDS):
+                        _exact_overflow_fallback(
+                            tx,
+                            total_len,
+                            topk_static,
+                            s_hist0,
+                            s_hist1,
+                            s_out,
+                            h0,
+                            ctr,
+                            thr,
+                            ni0,
+                            ni1,
+                            lr,
+                            flat=False,
+                            flat_values=input_tensor,
+                            input_tensor=input_tensor,
+                            carry_values=carry_values,
+                            row_base=row_base,
+                            row_start=row_start,
+                            carry_base=out_base,
+                            chunk_len=length,
+                            block_q=self.block_q,
+                            block_k=self.block_k,
+                            is_tiled=self.is_tiled,
+                            is_first=self.is_first,
+                        )
 
             cute.arch.sync_threads()
             idx0 = Int32(tx)
@@ -1543,7 +1570,8 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v26_wide_coarse",
+            "tiled_topk_v27_selection_policy",
+            _SELECTION_POLICY,
             topk,
             block_q,
             block_k,
@@ -1713,7 +1741,8 @@ def run_row_topk(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
         (
-            "row_topk_v6",
+            "row_topk_v7_selection_policy",
+            _SELECTION_POLICY,
             topk,
             output_gather_table is not None,
         ),
