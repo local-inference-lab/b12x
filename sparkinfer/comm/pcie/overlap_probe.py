@@ -1186,15 +1186,30 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
     result: dict[str, Any] = {
         "config": asdict(config),
         "topology": topology,
+        "provenance": {
+            "command": os.getenv("SPARKINFER_PROBE_COMMAND", ""),
+            "source_revision": os.getenv("SPARKINFER_PROBE_SOURCE_REVISION", ""),
+            "source_worktree": os.getenv("SPARKINFER_PROBE_SOURCE_WORKTREE", ""),
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+        },
+        "correctness": {
+            "tp_dma_matches_nccl": False,
+            "tp_and_ckv_collectives": False,
+            "query_split_matches_replicated": False,
+        },
         "tp_allreduce": [],
         "contexts": [],
         "query_split": [],
     }
     try:
         probe.validate_tp_backends()
+        result["correctness"]["tp_dma_matches_nccl"] = True
         probe.validate_outputs(max(config.context_tokens))
+        result["correctness"]["tp_and_ckv_collectives"] = True
         for context_tokens in config.context_tokens:
             probe.validate_query_split(context_tokens)
+        result["correctness"]["query_split_matches_replicated"] = True
 
         backend_modes = ("nccl", "dma")
         backend_decisions: list[tuple[int, BackendDecision]] = []
@@ -1224,6 +1239,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                         "payload_bytes": payload_bytes,
                         "nccl": asdict(nccl),
                         "dma": asdict(dma),
+                        "samples_ms": backend_samples,
                         "decision": asdict(decision),
                     }
                 )
@@ -1290,6 +1306,10 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                             "ckv": asdict(tp_first_ckv),
                             "wall": asdict(tp_first_wall),
                         },
+                        "samples_ms": {
+                            mode: [list(values) for values in overlap_samples[mode]]
+                            for mode in modes
+                        },
                         "decision": asdict(decision),
                     }
                 )
@@ -1344,6 +1364,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                         },
                         "full": asdict(full),
                         "split": asdict(split),
+                        "samples_ms": query_samples,
                         "decision": asdict(query_decision),
                     }
                 )
