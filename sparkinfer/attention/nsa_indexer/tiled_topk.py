@@ -50,14 +50,21 @@ _SELECTION_POLICIES = frozenset(
         _SELECTION_POLICY_BOUNDED_COMPAT,
     }
 )
-_SELECTION_POLICY = os.environ.get(
-    _SELECTION_POLICY_ENV, _SELECTION_POLICY_EXACT
-).strip().lower()
-if _SELECTION_POLICY not in _SELECTION_POLICIES:
-    raise ValueError(
-        f"{_SELECTION_POLICY_ENV} must be one of "
-        f"{sorted(_SELECTION_POLICIES)}, got {_SELECTION_POLICY!r}"
-    )
+
+
+def _resolve_selection_policy(value: str | None) -> str:
+    policy = (value or _SELECTION_POLICY_EXACT).strip().lower()
+    if policy not in _SELECTION_POLICIES:
+        raise ValueError(
+            f"{_SELECTION_POLICY_ENV} must be one of "
+            f"{sorted(_SELECTION_POLICIES)}, got {policy!r}"
+        )
+    return policy
+
+
+_SELECTION_POLICY = _resolve_selection_policy(
+    os.environ.get(_SELECTION_POLICY_ENV)
+)
 _BOUNDED_COMPAT = _SELECTION_POLICY == _SELECTION_POLICY_BOUNDED_COMPAT
 # Use every SM120 CTA lane for the first histogram.  The four-times narrower
 # bucket keeps ordinary 32k/64k low-contrast rows on the buffered exact path;
@@ -65,9 +72,8 @@ _BOUNDED_COMPAT = _SELECTION_POLICY == _SELECTION_POLICY_BOUNDED_COMPAT
 #
 # ``bounded_compat`` intentionally retains the historical 8-bit coarse bucket
 # and bounded 4096-candidate refinement.  This is an explicit model-compatibility
-# policy, not an accidental overflow: writes remain bounds checked, while
-# candidates beyond the deterministic buffer budget are omitted.  The default
-# remains exact.
+# policy, not an unsafe overflow: writes remain bounds checked, while candidates
+# beyond the fixed buffer budget are omitted.  The default remains exact.
 _COARSE_RADIX_BITS = 8 if _BOUNDED_COMPAT else 10
 _COARSE_RADIX_BINS = 1 << _COARSE_RADIX_BITS
 _HIST_SLOTS = _COARSE_RADIX_BINS + 128
