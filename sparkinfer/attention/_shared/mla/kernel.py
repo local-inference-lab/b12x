@@ -390,6 +390,7 @@ class UnifiedDecodeKernel:
         valid_hpb=None,
         head_block_offset=0,
         per_token_len=False,
+        use_record_ptrs=False,
         native_glm_h8=False,
         native_dsv4_h8=False,
         native_dsv4_h16=False,
@@ -428,6 +429,7 @@ class UnifiedDecodeKernel:
         # launcher routes here ONLY for a genuinely-mixed-length multi-token batch
         # (a uniform batch collapses to the scalar path -> PTX byte-identical).
         self.per_token_len = bool(per_token_len)
+        self.use_record_ptrs = bool(use_record_ptrs)
         self.native_glm_h8 = bool(native_glm_h8)
         self.native_dsv4_h8 = bool(native_dsv4_h8)
         # Native H16: two independent 8-head H8 groups (4 math warps each)
@@ -578,6 +580,40 @@ class UnifiedDecodeKernel:
             q_all,
             kv_cache_u8,
             swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            topk_length,
+            stride_kv_block,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_record_ptrs_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        record_ptrs: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_record_ptrs_pertok(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            record_ptrs,
             mid_out,
             mid_lse,
             sm_scale_log2,
@@ -794,6 +830,7 @@ class UnifiedDecodeKernel:
                 )
                 io_issue_gather(
                     kv_cache_u8,
+                    topk_row,
                     topk_row,
                     kv_fp8_addr + buf * kv_fp8_buf,
                     kv_rope_addr + buf * kv_rope_buf,
@@ -1298,6 +1335,7 @@ class UnifiedDecodeKernel:
             q_all,
             kv_cache_u8,
             swa_indices,
+            swa_indices,
             mid_out,
             mid_lse,
             sm_scale_log2,
@@ -1338,6 +1376,43 @@ class UnifiedDecodeKernel:
             q_all,
             kv_cache_u8,
             swa_indices,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            Int32(0),
+            stride_kv_block,
+            kv_cache_u8,
+            swa_indices,
+            Int32(0),
+            Int32(0),
+            stride_kv_block,
+            topk_length,
+            swa_indices,
+            has_extra=False,
+            per_token_len=True,
+        )
+
+    @cute.kernel
+    def kernel_record_ptrs_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        record_ptrs: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+    ):
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            record_ptrs,
             mid_out,
             mid_lse,
             sm_scale_log2,
@@ -1381,6 +1456,7 @@ class UnifiedDecodeKernel:
             q_all,
             kv_cache_u8,
             swa_indices,
+            swa_indices,
             mid_out,
             mid_lse,
             sm_scale_log2,
@@ -1404,6 +1480,7 @@ class UnifiedDecodeKernel:
         q_all: cute.Tensor,
         kv_cache_u8: cute.Tensor,
         swa_indices: cute.Tensor,
+        record_ptrs: cute.Tensor,
         mid_out: cute.Tensor,
         mid_lse: cute.Tensor,
         sm_scale_log2: Float32,
@@ -1673,6 +1750,7 @@ class UnifiedDecodeKernel:
                         io_issue_gather(
                             extra_kv_cache_u8,
                             extra_row,
+                            extra_row,
                             kv_fp8_addr + buf * kv_fp8_buf,
                             kv_rope_addr + buf * kv_rope_buf,
                             kv_sc_addr + buf * kv_sc_buf,
@@ -1683,6 +1761,7 @@ class UnifiedDecodeKernel:
                             Int32(self.pbs_extra),
                             stride_extra_kv_block,
                             io_lane,
+                            use_record_ptrs=False,
                             **io_kw,
                         )
                     else:
@@ -1693,6 +1772,7 @@ class UnifiedDecodeKernel:
                         io_issue_gather(
                             kv_cache_u8,
                             topk_row,
+                            record_ptrs,
                             kv_fp8_addr + buf * kv_fp8_buf,
                             kv_rope_addr + buf * kv_rope_buf,
                             kv_sc_addr + buf * kv_sc_buf,
@@ -1703,6 +1783,7 @@ class UnifiedDecodeKernel:
                             Int32(self.page_block_size),
                             stride_kv_block,
                             io_lane,
+                            use_record_ptrs=self.use_record_ptrs,
                             **io_kw,
                         )
                 else:
@@ -1713,6 +1794,7 @@ class UnifiedDecodeKernel:
                     io_issue_gather(
                         kv_cache_u8,
                         topk_row,
+                        record_ptrs,
                         kv_fp8_addr + buf * kv_fp8_buf,
                         kv_rope_addr + buf * kv_rope_buf,
                         kv_sc_addr + buf * kv_sc_buf,
@@ -1723,6 +1805,7 @@ class UnifiedDecodeKernel:
                         Int32(self.page_block_size),
                         stride_kv_block,
                         io_lane,
+                        use_record_ptrs=self.use_record_ptrs,
                         **io_kw,
                     )
                 prod_idx += Int32(1)
@@ -2348,6 +2431,7 @@ def _sparse_mla_decode_grid_flat_launch(
     q_all: torch.Tensor,
     kv_flat: torch.Tensor,
     swa_indices: torch.Tensor,
+    record_ptrs: torch.Tensor,
     mid_out: torch.Tensor,
     mid_lse: torch.Tensor,
     swa_len_t: torch.Tensor,
@@ -2374,6 +2458,7 @@ def _sparse_mla_decode_grid_flat_launch(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    use_record_ptrs: bool,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
     rows = int(q_all.shape[0])
@@ -2431,10 +2516,16 @@ def _sparse_mla_decode_grid_flat_launch(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if per_token_len:
-        pertok_base = (
+        pertok_prefix = (
             _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
             _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
+        )
+        if use_record_ptrs:
+            pertok_prefix += (
+                _to_cute(record_ptrs, cutlass.Int64, align=8),
+            )
+        pertok_base = pertok_prefix + (
             _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
             _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
             Float32(float(sm_scale) * LOG2_E),
@@ -2500,6 +2591,7 @@ def _sparse_mla_decode_grid_flat_launch(
         valid_hpb=int(valid_hpb),
         head_block_offset=int(head_block_offset),
         per_token_len=bool(per_token_len),
+        use_record_ptrs=bool(use_record_ptrs),
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
         native_dsv4_h16=native_dsv4_h16,
@@ -2522,6 +2614,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("pbs_extra", int(pbs_extra)),
         key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         key_field("per_token_len", int(per_token_len)),
+        key_field("use_record_ptrs", int(use_record_ptrs)),
         key_field("native_glm_h8", int(native_glm_h8)),
         key_field("native_dsv4_h8", int(native_dsv4_h8)),
         key_field("native_dsv4_h16", int(native_dsv4_h16)),
@@ -2588,7 +2681,13 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("latent_scale_identity", int(float(latent_scale) == 1.0)),
         *spec_fields,
     )
-    if per_token_len:
+    if use_record_ptrs:
+        if has_extra or not per_token_len:
+            raise ValueError(
+                "selected-record pointers require single-cache per-token decode"
+            )
+        entry = kernel.call_record_ptrs_pertok
+    elif per_token_len:
         entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
     else:
         entry = kernel.call_extra if has_extra else kernel
@@ -2608,6 +2707,7 @@ def _sparse_mla_decode_grid_op(
     q_all: torch.Tensor,
     kv_flat: torch.Tensor,
     swa_indices: torch.Tensor,
+    record_ptrs: torch.Tensor,
     mid_out: torch.Tensor,
     mid_lse: torch.Tensor,
     swa_len_t: torch.Tensor,
@@ -2634,11 +2734,13 @@ def _sparse_mla_decode_grid_op(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    use_record_ptrs: bool,
 ) -> None:
     _sparse_mla_decode_grid_flat_launch(
         q_all,
         kv_flat,
         swa_indices,
+        record_ptrs,
         mid_out,
         mid_lse,
         swa_len_t,
@@ -2665,6 +2767,7 @@ def _sparse_mla_decode_grid_op(
         head_block_offset,
         has_extra,
         per_token_len,
+        use_record_ptrs,
     )
 
 
@@ -2673,6 +2776,7 @@ def _sparse_mla_decode_grid_fake(
     q_all: torch.Tensor,
     kv_flat: torch.Tensor,
     swa_indices: torch.Tensor,
+    record_ptrs: torch.Tensor,
     mid_out: torch.Tensor,
     mid_lse: torch.Tensor,
     swa_len_t: torch.Tensor,
@@ -2699,6 +2803,7 @@ def _sparse_mla_decode_grid_fake(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    use_record_ptrs: bool,
 ) -> None:
     return None
 
@@ -2709,6 +2814,7 @@ def run_unified_decode(
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_topk_lengths: torch.Tensor,
+    swa_record_ptrs: torch.Tensor | None = None,
     workspace,
     sm_scale: float,
     latent_scale: float = 1.0,
@@ -2750,6 +2856,24 @@ def run_unified_decode(
         or indexed_indices is not None
         or indexed_topk_lengths is not None
     )
+    use_record_ptrs = swa_record_ptrs is not None
+    if use_record_ptrs:
+        if has_extra:
+            raise ValueError(
+                "selected-record pointers do not support the extra-cache path"
+            )
+        if (
+            swa_record_ptrs.dtype != torch.int64
+            or swa_record_ptrs.ndim != 1
+            or not swa_record_ptrs.is_contiguous()
+        ):
+            raise ValueError(
+                "swa_record_ptrs must be a contiguous int64 vector"
+            )
+        if swa_record_ptrs.device != q_all.device:
+            raise ValueError(
+                "swa_record_ptrs must be on the same device as q_all"
+            )
     # Mapped extra page table is GENUINELY-UPSTREAM-UNSUPPORTED (upstream is
     # raw-slot-id only; no page-table indirection). RAISE, not fallback. Checked
     # BEFORE the has_extra branch so a mapped page table passed WITHOUT the extra
@@ -2830,6 +2954,8 @@ def run_unified_decode(
     model_type, compute_mode, scale_format = infer_model_type(
         q_head_dim, swa_k_cache.dtype
     )
+    if use_record_ptrs and int(model_type) != int(ModelType.GLM_NSA):
+        raise ValueError("selected-record pointers are currently GLM-only")
     if scale_format_override is not None:
         scale_format = int(scale_format_override)
     if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
@@ -3039,6 +3165,7 @@ def run_unified_decode(
         h_blocks=int(h_blocks),
         sm_count=(int(sm_count) if sm_count else None),
         per_token_len=bool(per_token_len),
+        use_record_ptrs=bool(use_record_ptrs),
     )
     # Workspace mid_out/mid_lse must hold num_splits partials per (token, head).
     if num_splits > max_chunks:
@@ -3106,6 +3233,11 @@ def run_unified_decode(
         output = workspace.output_buffer[:rows, :heads, :d_v]
 
     kv_flat = _cache_base_tensor(swa_k_cache)
+    record_ptrs_for_op = (
+        swa_record_ptrs
+        if swa_record_ptrs is not None
+        else kv_flat[:8].view(torch.int64)
+    )
     swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices
     extra_len_for_op = extra_len_t if extra_len_t is not None else swa_indices
 
@@ -3114,6 +3246,7 @@ def run_unified_decode(
             q_all,
             kv_flat,
             swa_indices,
+            record_ptrs_for_op,
             mid_out,
             mid_lse,
             swa_len_for_op,
@@ -3140,6 +3273,7 @@ def run_unified_decode(
             int(head_block_offset),
             bool(has_extra),
             bool(per_token_len),
+            bool(use_record_ptrs),
         )
 
     if h_blocks_full > 0:

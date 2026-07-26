@@ -12,6 +12,8 @@ import torch.multiprocessing as mp
 from sparkinfer.comm.pcie import pcie_dma as _pcie_dma
 from sparkinfer.comm.pcie.pcie_selected_records_ce import (
     PCIeSelectedRecordCopyExchange,
+    PCIeSelectedStoragePointerExchange,
+    _copy_exchange_layout,
     _load_extension,
 )
 
@@ -276,6 +278,227 @@ def _check_eager(
             record_bytes,
         ),
     )
+
+
+def _check_record_pointer_consumers(
+    exchange: PCIeSelectedRecordCopyExchange,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    record_bytes: int,
+) -> None:
+    for iteration, primary_mode in ((71, "ce"), (72, "peer")):
+        records = _local_records(
+            rank,
+            world_size,
+            device,
+            iteration,
+            record_bytes,
+        )
+        maps = _local_maps(
+            rank,
+            world_size,
+            MAX_RECORDS,
+            iteration,
+            device,
+        )
+        _assert_forced_overflow(exchange, maps)
+        record_ptrs = torch.empty(MAX_RECORDS, dtype=torch.int64, device=device)
+        checksums = torch.empty_like(record_ptrs)
+        exchange.prepare_record_ptrs(
+            records,
+            maps,
+            record_ptrs,
+            primary_mode=primary_mode,
+        )
+        exchange.consume_record_ptrs(record_ptrs, checksums)
+        exchange.release_record_ptrs()
+        torch.cuda.synchronize(device)
+
+        expected_records = _expected(
+            rank,
+            world_size,
+            MAX_RECORDS,
+            iteration,
+            device,
+            record_bytes,
+        )
+        expected = expected_records.sum(dim=1, dtype=torch.int64)
+        assert bool(torch.all(record_ptrs != 0).item())
+        assert torch.equal(checksums, expected)
+
+        contiguous_checksums = torch.empty_like(checksums)
+        exchange.consume_contiguous_records(
+            expected_records,
+            contiguous_checksums,
+        )
+        torch.cuda.synchronize(device)
+        assert torch.equal(contiguous_checksums, expected)
+
+
+def _check_storage_pointer_exchange(
+    exchange: PCIeSelectedStoragePointerExchange,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    record_bytes: int,
+) -> None:
+    offset = 17 + rank * 13
+    backing = torch.empty(
+        offset + POOL_RECORDS_PER_RANK * record_bytes + 29,
+        dtype=torch.uint8,
+        device=device,
+    )
+    records = backing[offset : offset + POOL_RECORDS_PER_RANK * record_bytes].view(
+        POOL_RECORDS_PER_RANK, record_bytes
+    )
+    assert records.storage_offset() == offset
+    assert not exchange.record_ptrs_require_release
+    assert (
+        exchange._packet_exchange._layout.slab_bytes
+        < _copy_exchange_layout(
+            world_size=world_size,
+            max_records=MAX_RECORDS,
+            record_bytes=record_bytes,
+            primary_capacity=PRIMARY_CAPACITY,
+        ).slab_bytes
+    )
+
+    stream = torch.cuda.Stream(device=device)
+    iteration = 810
+    records.copy_(_local_records(rank, world_size, device, iteration, record_bytes))
+    eager_maps = _local_maps(
+        rank,
+        world_size,
+        MAX_RECORDS,
+        iteration,
+        device,
+    )
+    eager_ptrs = torch.empty(MAX_RECORDS, dtype=torch.int64, device=device)
+    eager_checksums = torch.empty_like(eager_ptrs)
+    with torch.cuda.stream(stream):
+        exchange.prepare_record_ptrs(
+            records,
+            eager_maps,
+            eager_ptrs,
+            primary_mode="storage",
+        )
+        exchange.consume_record_ptrs(eager_ptrs, eager_checksums)
+    stream.synchronize()
+    eager_expected = _expected(
+        rank,
+        world_size,
+        MAX_RECORDS,
+        iteration,
+        device,
+        record_bytes,
+    ).sum(dim=1, dtype=torch.int64)
+    assert bool(torch.all(eager_ptrs != 0).item())
+    assert torch.equal(eager_checksums, eager_expected)
+
+    graph_counts = (13, MAX_RECORDS)
+    graph_maps = [
+        _local_maps(rank, world_size, count, 820 + index, device)
+        for index, count in enumerate(graph_counts)
+    ]
+    graph_ptrs = [
+        torch.empty(count, dtype=torch.int64, device=device) for count in graph_counts
+    ]
+    graph_checksums = [torch.empty_like(ptrs) for ptrs in graph_ptrs]
+    graphs: list[torch.cuda.CUDAGraph] = []
+    for maps, ptrs, checksums in zip(
+        graph_maps,
+        graph_ptrs,
+        graph_checksums,
+        strict=True,
+    ):
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            exchange.prepare_record_ptrs(
+                records,
+                maps,
+                ptrs,
+                primary_mode="storage",
+            )
+            exchange.consume_record_ptrs(ptrs, checksums)
+        graphs.append(graph)
+    dist.barrier()
+
+    replay_modes = (0, 1, 1, 0, 1, 0)
+    for replay, mode in enumerate(replay_modes):
+        current_iteration = 830 + replay
+        records.copy_(
+            _local_records(
+                rank,
+                world_size,
+                device,
+                current_iteration,
+                record_bytes,
+            )
+        )
+        graph_maps[mode].copy_(
+            _local_maps(
+                rank,
+                world_size,
+                graph_counts[mode],
+                current_iteration,
+                device,
+            )
+        )
+        stream.wait_stream(torch.cuda.current_stream(device))
+        dist.barrier()
+        graphs[mode].replay()
+        stream.synchronize()
+        expected = _expected(
+            rank,
+            world_size,
+            graph_counts[mode],
+            current_iteration,
+            device,
+            record_bytes,
+        ).sum(dim=1, dtype=torch.int64)
+        assert bool(torch.all(graph_ptrs[mode] != 0).item())
+        assert torch.equal(graph_checksums[mode], expected)
+
+    # Profiling and production KV caches have different backing allocations.
+    # Resetting stable mappings must preserve the packet ring and permit a new
+    # eager import before subsequent graph capture.
+    assert len(exchange._mappings) == 1
+    exchange.reset_storage_mappings()
+    assert exchange._mappings == {}
+    reset_iteration = 900
+    records.copy_(
+        _local_records(rank, world_size, device, reset_iteration, record_bytes)
+    )
+    reset_maps = _local_maps(
+        rank,
+        world_size,
+        MAX_RECORDS,
+        reset_iteration,
+        device,
+    )
+    reset_ptrs = torch.empty(MAX_RECORDS, dtype=torch.int64, device=device)
+    reset_checksums = torch.empty_like(reset_ptrs)
+    with torch.cuda.stream(stream):
+        exchange.prepare_record_ptrs(
+            records,
+            reset_maps,
+            reset_ptrs,
+            primary_mode="storage",
+        )
+        exchange.consume_record_ptrs(reset_ptrs, reset_checksums)
+    stream.synchronize()
+    reset_expected = _expected(
+        rank,
+        world_size,
+        MAX_RECORDS,
+        reset_iteration,
+        device,
+        record_bytes,
+    ).sum(dim=1, dtype=torch.int64)
+    assert torch.equal(reset_checksums, reset_expected)
+    assert len(exchange._mappings) == 1
 
 
 def _check_graph(
@@ -714,6 +937,13 @@ def _worker(
                 device,
                 record_bytes,
             )
+            _check_record_pointer_consumers(
+                eager_exchange,
+                rank,
+                world_size,
+                device,
+                record_bytes,
+            )
             _check_layers_eager(
                 eager_exchange,
                 rank,
@@ -791,6 +1021,43 @@ def _worker(
         dist.destroy_process_group()
 
 
+def _storage_pointer_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    record_bytes: int,
+) -> None:
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        exchange = PCIeSelectedStoragePointerExchange.from_process_group(
+            process_group=dist.group.WORLD,
+            device=device,
+            max_records=MAX_RECORDS,
+            source_record_bytes=record_bytes,
+        )
+        try:
+            _check_storage_pointer_exchange(
+                exchange,
+                rank,
+                world_size,
+                device,
+                record_bytes,
+            )
+            torch.cuda.synchronize(device)
+        finally:
+            exchange.close()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize(
     ("world_size", "record_bytes"),
     ((4, 368), (4, 432), (4, 656), (8, 368), (8, 656)),
@@ -825,6 +1092,27 @@ def test_pcie_selected_record_ce_eager_graph_overflow_and_big_offset(
     _pcie_dma._load_extension()
     mp.spawn(
         _worker,
+        args=(world_size, _free_port(), record_bytes),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("record_bytes", (368, 656), ids=("record368", "record656"))
+def test_pcie_selected_storage_pointer_eager_and_alternating_graphs(
+    record_bytes: int,
+) -> None:
+    world_size = int(os.getenv("SPARKINFER_SELECTED_STORAGE_POINTER_WORLD_SIZE", "2"))
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+        )
+    _load_extension()
+    _pcie_dma._load_extension()
+    mp.spawn(
+        _storage_pointer_worker,
         args=(world_size, _free_port(), record_bytes),
         nprocs=world_size,
         join=True,

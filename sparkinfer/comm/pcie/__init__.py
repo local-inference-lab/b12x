@@ -15,6 +15,8 @@ pools via ``<Class>Pool``.
   fixed-width records.
 - ``SelectedRecordCopyExchange``: compact, copy-engine transfer, and unpack
   for destination-selected fixed-width records.
+- ``SelectedStoragePointerExchange``: compact ordinal exchange producing
+  direct pointers into model-owned peer storage.
 
 Raw CUDA (not CuTe): each class JIT-builds its colocated ``.cu`` via
 torch.utils.cpp_extension, so nvcc must be available at runtime.
@@ -40,6 +42,7 @@ META = OpMeta(
         "SelectedRecordExchange",
         "SelectedRecordExchangeInitializationError",
         "SelectedRecordCopyExchange",
+        "SelectedStoragePointerExchange",
         "autotune_dma_crossovers",
         "parse_oneshot_max_size",
         "lse_reduce_scatter_reference",
@@ -67,6 +70,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         SelectedRecordExchange,
         SelectedRecordExchangeInitializationError,
         SelectedRecordCopyExchange,
+        SelectedStoragePointerExchange,
         TwoShotReduceScatter,
         autotune_dma_crossovers,
         is_supported,

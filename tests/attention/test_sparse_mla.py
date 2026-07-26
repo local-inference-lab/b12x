@@ -43,7 +43,16 @@ def _make_case(*, rows: int, heads: int, cache_tokens: int, width: int):
     return q_all, kv_cache, selected, cache_seqlens, active
 
 
-def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, width):
+def _run_public_decode(
+    q_all,
+    kv_cache,
+    selected,
+    cache_seqlens,
+    active,
+    *,
+    width,
+    record_ptrs=None,
+):
     rows, heads, _ = q_all.shape
     plan = sparse_mla.plan(
         sparse_mla.Caps(
@@ -68,6 +77,7 @@ def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, widt
     out = sparse_mla.run_decode(
         binding=binding,
         kv_cache=kv_cache,
+        record_ptrs=record_ptrs,
         sm_scale=sm_scale,
         v_head_dim=V_HEAD_DIM,
     )
@@ -100,6 +110,41 @@ def test_run_decode_matches_reference() -> None:
     q, kv, sel, lens, active = _make_case(rows=4, heads=16, cache_tokens=512, width=128)
     out, ref = _run_public_decode(q, kv, sel, lens, active, width=128)
     _assert_matches(out, ref)
+
+
+def test_run_decode_record_pointers_match_contiguous_cache() -> None:
+    require_sparkinfer()
+    q, kv, sel, lens, active = _make_case(
+        rows=4,
+        heads=16,
+        cache_tokens=512,
+        width=128,
+    )
+    contiguous, ref = _run_public_decode(
+        q,
+        kv,
+        sel,
+        lens,
+        active,
+        width=128,
+    )
+    contiguous = contiguous.clone()
+    record_bytes = int(kv.shape[-1])
+    record_ptrs = (
+        torch.arange(512, dtype=torch.int64, device=kv.device) * record_bytes
+        + kv.data_ptr()
+    )
+    indirect, _ = _run_public_decode(
+        q,
+        kv,
+        sel,
+        lens,
+        active,
+        width=128,
+        record_ptrs=record_ptrs,
+    )
+    _assert_matches(indirect, ref)
+    torch.testing.assert_close(indirect, contiguous, rtol=0, atol=0)
 
 
 def test_run_decode_masks_padded_selection() -> None:

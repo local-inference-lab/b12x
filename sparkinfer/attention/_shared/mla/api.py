@@ -376,6 +376,7 @@ def sparse_mla_decode_forward(
     page_table_1: torch.Tensor | None = None,
     cache_seqlens_int32: torch.Tensor | None = None,
     nsa_cache_seqlens_int32: torch.Tensor | None = None,
+    record_ptrs: torch.Tensor | None = None,
     binding=None,
     sm_scale: float,
     latent_scale: float = 1.0,
@@ -419,6 +420,7 @@ def sparse_mla_decode_forward(
         forced_num_splits=forced_num_splits,
         scale_format=scale_format,
         fp8_rope=fp8_rope,
+        record_ptrs=record_ptrs,
     )
 
 
@@ -492,6 +494,7 @@ def _run_sparse_mla(
     forced_num_splits: int | None = None,
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
+    record_ptrs: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -694,6 +697,7 @@ def _run_sparse_mla(
             swa_k_cache=kv_cache,
             swa_indices=selected_indices,
             swa_topk_lengths=active_token_counts,
+            swa_record_ptrs=record_ptrs,
             workspace=workspace,
             sm_scale=float(sm_scale),
             latent_scale=float(latent_scale),

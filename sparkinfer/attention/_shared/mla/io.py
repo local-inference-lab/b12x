@@ -91,6 +91,7 @@ _IO_THREADS = 32
 def io_issue_gather(
     kv_cache_u8: cute.Tensor,  # flat 1-D u8 view of the paged DSV4 KV cache
     topk_indices: cute.Tensor,  # 1-D int32 topk slice for this query token
+    record_ptrs: cute.Tensor,  # 1-D int64 selected-record addresses, or dummy
     kv_fp8_dst_addr: Int32,  # u32 smem addr of kv_fp8[buf] (BI x KV_SMEM_STRIDE)
     kv_rope_dst_addr: Int32,  # u32 smem addr of kv_rope[buf] (BI x D_ROPE bf16)
     kv_sc_dst_addr: Int32,  # u32 smem addr of kv_sc[buf] (BI x 8 footer)
@@ -114,6 +115,7 @@ def io_issue_gather(
     packed_dsv4: cutlass.Constexpr = False,
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
+    use_record_ptrs: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -187,10 +189,15 @@ def io_issue_gather(
         idx = idx_raw
         if idx < Int32(0):
             idx = Int32(0)
-        block_idx = idx // _section_pbs
-        local_idx = idx - block_idx * _section_pbs
-        data_base_off = Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
-        data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
+        if cutlass.const_expr(use_record_ptrs):
+            data_base_i64 = Int64(record_ptrs[idx])
+        else:
+            block_idx = idx // _section_pbs
+            local_idx = idx - block_idx * _section_pbs
+            data_base_off = (
+                Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
+            )
+            data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
 
         if cutlass.const_expr(packed_glm):
             cp_async_bulk_g2s_mbar(
@@ -232,12 +239,16 @@ def io_issue_gather(
                 idx = idx_raw
                 if idx < Int32(0):
                     idx = Int32(0)
-                block_idx = idx // _section_pbs
-                local_idx = idx - block_idx * _section_pbs
-                data_base_off = (
-                    Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
-                )
-                data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
+                if cutlass.const_expr(use_record_ptrs):
+                    data_base_i64 = Int64(record_ptrs[idx])
+                else:
+                    block_idx = idx // _section_pbs
+                    local_idx = idx - block_idx * _section_pbs
+                    data_base_off = (
+                        Int64(block_idx) * _section_stride
+                        + Int64(local_idx) * _IOS
+                    )
+                    data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
                 full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
 
                 if cutlass.const_expr(packed_glm):

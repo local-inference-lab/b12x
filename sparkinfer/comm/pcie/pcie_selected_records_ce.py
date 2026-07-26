@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -431,6 +431,8 @@ class PCIeSelectedRecordCopyExchange:
     retaining the normal exchange.
     """
 
+    record_ptrs_require_release = True
+
     def __init__(
         self,
         *,
@@ -491,6 +493,7 @@ class PCIeSelectedRecordCopyExchange:
         self._owner_stream_key: Optional[int] = None
         self._closed = False
         self._deferred_release_pending = False
+        self._pointer_table_active = False
 
         slab_ptrs = tuple(int(pointer) for pointer in peer_slab_ptrs)
         self._slab_ptrs = slab_ptrs
@@ -508,6 +511,27 @@ class PCIeSelectedRecordCopyExchange:
             dtype=torch.int64,
             device=self.device,
         )
+        self._local_receive_primary_ptrs = torch.tensor(
+            [
+                self._local_slab_ptr
+                + layout.receive_primary_base
+                + source * layout.primary_stride
+                for source in range(self.world_size)
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._peer_staging_primary_ptrs = torch.tensor(
+            [
+                slab_ptrs[source]
+                + layout.staging_primary_base
+                + self.rank * layout.primary_stride
+                for source in range(self.world_size)
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._peer_staging_overflow_ptrs = self._peer_overflow_ptrs[self.rank]
         self._peer_layer_overflow_ptrs = torch.tensor(
             [
                 [
@@ -875,6 +899,11 @@ class PCIeSelectedRecordCopyExchange:
         self._deferred_release_pending = True
 
     def _wait_for_deferred_release(self) -> None:
+        if self._pointer_table_active:
+            raise RuntimeError(
+                "selected-record pointer table is still active; enqueue its "
+                "consumer and call release_record_ptrs() before channel reuse"
+            )
         if not self._deferred_release_pending:
             return
         self._ext.wait_all_peers(
@@ -947,6 +976,8 @@ class PCIeSelectedRecordCopyExchange:
         out: torch.Tensor,
     ) -> torch.Tensor:
         """Pack owned records, copy them to peers, and reconstruct ``out``."""
+        if self._pointer_table_active:
+            raise RuntimeError("cannot exchange while a record pointer table is active")
         self._check_stream()
         self._require_eager_warmup_for_capture()
         active_records = self._validate(
@@ -1010,6 +1041,263 @@ class PCIeSelectedRecordCopyExchange:
         self._publish_deferred_release()
         return out
 
+    def prepare_record_ptrs(
+        self,
+        records: torch.Tensor,
+        local_indices_by_destination: torch.Tensor,
+        out_ptrs: torch.Tensor,
+        *,
+        primary_mode: str = "ce",
+    ) -> torch.Tensor:
+        """Build destination-order pointers without materializing output records.
+
+        ``primary_mode='ce'`` keeps the balanced copy-engine primary packet and
+        points only owner skew at peer memory. ``'peer'`` skips primary DMA and
+        points at every source's IPC staging packet. Enqueue all consumers on
+        this stream, then call :meth:`release_record_ptrs` before channel reuse.
+        """
+        if self._pointer_table_active:
+            raise RuntimeError("a selected-record pointer table is already active")
+        if primary_mode not in {"ce", "peer"}:
+            raise ValueError("primary_mode must be 'ce' or 'peer'")
+        if self._closed:
+            raise RuntimeError("PCIeSelectedRecordCopyExchange is closed")
+        if records.device != self.device:
+            raise ValueError("records must be on the exchange device")
+        if local_indices_by_destination.device != self.device:
+            raise ValueError("local indices must be on the exchange device")
+        if out_ptrs.device != self.device:
+            raise ValueError("output pointers must be on the exchange device")
+        if records.dtype != torch.uint8 or not records.is_contiguous():
+            raise ValueError("records must be contiguous uint8")
+        if records.ndim < 2 or records.shape[-1] != self.record_bytes:
+            raise ValueError(
+                f"records must end in the configured {self.record_bytes}-byte width"
+            )
+        if local_indices_by_destination.dtype not in (torch.int32, torch.int64):
+            raise ValueError("local indices must be int32 or int64")
+        if not local_indices_by_destination.is_contiguous():
+            raise ValueError("local indices must be contiguous")
+        if (
+            local_indices_by_destination.ndim < 2
+            or local_indices_by_destination.shape[0] != self.world_size
+        ):
+            raise ValueError(
+                "local indices must have shape [world_size, ...selected records]"
+            )
+        active_records = local_indices_by_destination.numel() // self.world_size
+        if not 0 < active_records <= self.max_records:
+            raise ValueError(
+                f"selected record count {active_records} is outside "
+                f"[1, {self.max_records}]"
+            )
+        if (
+            out_ptrs.dtype != torch.int64
+            or not out_ptrs.is_contiguous()
+            or out_ptrs.ndim != 1
+            or out_ptrs.numel() != active_records
+        ):
+            raise ValueError(
+                "out_ptrs must be a contiguous int64 vector with one entry "
+                "per selected record"
+            )
+
+        self._check_stream()
+        self._require_eager_warmup_for_capture()
+        self._wait_for_deferred_release()
+        active_primary = self._active_primary_capacity(active_records)
+        primary_copy_bytes = _align_up(
+            self._layout.primary_records_offset + active_primary * self.record_bytes,
+            16,
+        )
+        for destination_phase in range(self.world_size):
+            destination = (self.rank + destination_phase) % self.world_size
+            self._ext.pack_compact_records(
+                records,
+                local_indices_by_destination[destination],
+                self._local_staging_primary_ptr(destination),
+                self._local_staging_overflow_ptr(destination),
+                self.record_bytes,
+                active_primary,
+                self._layout.primary_positions_offset,
+                self._layout.primary_records_offset,
+                self._layout.overflow_positions_offset,
+                self._layout.overflow_records_offset,
+            )
+        if primary_mode == "ce":
+            for destination_phase in range(self.world_size):
+                destination = (self.rank + destination_phase) % self.world_size
+                self._dma_ext.dma_copy(
+                    self._receive_primary_ptr(destination, self.rank),
+                    self._local_staging_primary_ptr(destination),
+                    primary_copy_bytes,
+                )
+
+        self._barrier(0)
+        primary_ptrs = (
+            self._local_receive_primary_ptrs
+            if primary_mode == "ce"
+            else self._peer_staging_primary_ptrs
+        )
+        self._ext.build_compact_record_ptrs(
+            primary_ptrs,
+            self._peer_staging_overflow_ptrs,
+            out_ptrs,
+            self.record_bytes,
+            active_primary,
+            self._layout.primary_positions_offset,
+            self._layout.primary_records_offset,
+            self._layout.overflow_positions_offset,
+            self._layout.overflow_records_offset,
+        )
+        self._pointer_table_active = True
+        return out_ptrs
+
+    def prepare_storage_record_ptrs(
+        self,
+        local_indices_by_destination: torch.Tensor,
+        peer_record_base_ptrs: torch.Tensor,
+        out_ptrs: torch.Tensor,
+        *,
+        source_record_bytes: int,
+    ) -> torch.Tensor:
+        """Build stable pointers into model-owned peer storage.
+
+        This channel must be configured for eight-byte ordinal records.  Only
+        ``(selected position, source-local ordinal)`` metadata crosses PCIe;
+        the resulting pointers target the original model KV allocation, so the
+        compact packet can be retired immediately after pointer construction.
+        """
+        if self.record_bytes != _POSITION_BYTES:
+            raise RuntimeError(
+                "storage-pointer channels require eight-byte ordinal packets"
+            )
+        if self._pointer_table_active:
+            raise RuntimeError("a packet-backed pointer table is still active")
+        if self._closed:
+            raise RuntimeError("PCIeSelectedRecordCopyExchange is closed")
+        if local_indices_by_destination.device != self.device:
+            raise ValueError("local indices must be on the exchange device")
+        if local_indices_by_destination.dtype not in (torch.int32, torch.int64):
+            raise ValueError("local indices must be int32 or int64")
+        if not local_indices_by_destination.is_contiguous():
+            raise ValueError("local indices must be contiguous")
+        if (
+            local_indices_by_destination.ndim < 2
+            or local_indices_by_destination.shape[0] != self.world_size
+        ):
+            raise ValueError(
+                "local indices must have shape [world_size, ...selected records]"
+            )
+        active_records = local_indices_by_destination.numel() // self.world_size
+        if not 0 < active_records <= self.max_records:
+            raise ValueError(
+                f"selected record count {active_records} is outside "
+                f"[1, {self.max_records}]"
+            )
+        if (
+            peer_record_base_ptrs.device != self.device
+            or peer_record_base_ptrs.dtype != torch.int64
+            or not peer_record_base_ptrs.is_contiguous()
+            or peer_record_base_ptrs.ndim != 1
+            or peer_record_base_ptrs.numel() != self.world_size
+        ):
+            raise ValueError(
+                "peer_record_base_ptrs must be a contiguous int64 vector with "
+                "one entry per source rank"
+            )
+        if (
+            out_ptrs.device != self.device
+            or out_ptrs.dtype != torch.int64
+            or not out_ptrs.is_contiguous()
+            or out_ptrs.ndim != 1
+            or out_ptrs.numel() != active_records
+        ):
+            raise ValueError(
+                "out_ptrs must be a contiguous int64 vector with one entry "
+                "per selected record"
+            )
+        source_record_bytes = int(source_record_bytes)
+        if source_record_bytes <= 0:
+            raise ValueError("source_record_bytes must be positive")
+
+        self._check_stream()
+        self._require_eager_warmup_for_capture()
+        self._wait_for_deferred_release()
+        active_primary = self._active_primary_capacity(active_records)
+        primary_copy_bytes = _align_up(
+            self._layout.primary_records_offset + active_primary * self.record_bytes,
+            16,
+        )
+        for destination_phase in range(self.world_size):
+            destination = (self.rank + destination_phase) % self.world_size
+            self._ext.pack_compact_indices(
+                local_indices_by_destination[destination],
+                self._local_staging_primary_ptr(destination),
+                self._local_staging_overflow_ptr(destination),
+                active_primary,
+                self._layout.primary_positions_offset,
+                self._layout.primary_records_offset,
+                self._layout.overflow_positions_offset,
+                self._layout.overflow_records_offset,
+            )
+        for destination_phase in range(self.world_size):
+            destination = (self.rank + destination_phase) % self.world_size
+            self._dma_ext.dma_copy(
+                self._receive_primary_ptr(destination, self.rank),
+                self._local_staging_primary_ptr(destination),
+                primary_copy_bytes,
+            )
+
+        self._barrier(0)
+        self._ext.build_storage_record_ptrs(
+            self._local_receive_primary_ptrs,
+            self._peer_staging_overflow_ptrs,
+            peer_record_base_ptrs,
+            out_ptrs,
+            source_record_bytes,
+            active_primary,
+            self._layout.primary_positions_offset,
+            self._layout.primary_records_offset,
+            self._layout.overflow_positions_offset,
+            self._layout.overflow_records_offset,
+        )
+        # The output points into model storage rather than this packet.  Packet
+        # reuse may therefore be published immediately on the same stream.
+        self._publish_deferred_release()
+        return out_ptrs
+
+    def consume_record_ptrs(
+        self,
+        record_ptrs: torch.Tensor,
+        checksums: torch.Tensor,
+    ) -> torch.Tensor:
+        """POC consumer that reads every byte through ``record_ptrs``."""
+        if not self._pointer_table_active:
+            raise RuntimeError("no selected-record pointer table is active")
+        self._ext.consume_record_ptrs(record_ptrs, checksums, self.record_bytes)
+        return checksums
+
+    def consume_contiguous_records(
+        self,
+        records: torch.Tensor,
+        checksums: torch.Tensor,
+    ) -> torch.Tensor:
+        """POC baseline consumer with the same work but no indirection."""
+        if records.shape != (checksums.numel(), self.record_bytes):
+            raise ValueError(
+                f"records must have shape ({checksums.numel()}, {self.record_bytes})"
+            )
+        self._ext.consume_contiguous_records(records, checksums)
+        return checksums
+
+    def release_record_ptrs(self) -> None:
+        """Publish packet reuse after all pointer consumers are enqueued."""
+        if not self._pointer_table_active:
+            raise RuntimeError("no selected-record pointer table is active")
+        self._publish_deferred_release()
+        self._pointer_table_active = False
+
     def exchange_layers(
         self,
         records_by_layer: Sequence[torch.Tensor],
@@ -1023,6 +1311,8 @@ class PCIeSelectedRecordCopyExchange:
         release generation without waiting; the matching wait is issued only
         before this channel reuses staging for its next exchange.
         """
+        if self._pointer_table_active:
+            raise RuntimeError("cannot exchange while a record pointer table is active")
         self._check_stream()
         self._require_eager_warmup_for_capture()
         active_records = self._validate_layers(
@@ -1099,6 +1389,8 @@ class PCIeSelectedRecordCopyExchange:
         return outputs
 
     def _finish_deferred_release_for_close(self) -> None:
+        if self._pointer_table_active:
+            self.release_record_ptrs()
         if not self._deferred_release_pending:
             return
         if self.device.type == "cuda":
@@ -1142,7 +1434,279 @@ class PCIeSelectedRecordCopyExchange:
             self.close()
 
 
+@dataclass
+class _TorchStorageRecordMapping:
+    peer_record_base_ptrs: torch.Tensor
+    storages: tuple[torch.UntypedStorage, ...]
+
+
+class PCIeSelectedStoragePointerExchange:
+    """Exchange compact ordinals and point directly into peer tensor storage.
+
+    PyTorch's CUDA IPC tuple supplies the allocator base and storage offset for
+    tensors living inside caching-allocator segments.  The format-aware PyTorch
+    importer is retained for the mapping lifetime so both cudaMalloc and VMM
+    expandable-segment allocations remain valid without copying record payloads.
+    """
+
+    record_ptrs_require_release = False
+
+    def __init__(
+        self,
+        *,
+        packet_exchange: PCIeSelectedRecordCopyExchange,
+        process_group: ProcessGroup,
+        source_record_bytes: int,
+    ) -> None:
+        if packet_exchange.record_bytes != _POSITION_BYTES:
+            raise ValueError("storage-pointer metadata packets must be eight bytes")
+        if source_record_bytes <= 0:
+            raise ValueError("source_record_bytes must be positive")
+        self._packet_exchange = packet_exchange
+        self.process_group = process_group
+        self.rank = packet_exchange.rank
+        self.world_size = packet_exchange.world_size
+        self.device = packet_exchange.device
+        self.max_records = packet_exchange.max_records
+        self.record_bytes = int(source_record_bytes)
+        if packet_exchange._ipc is None:
+            raise ValueError("storage-pointer exchange requires CUDA IPC")
+        self._mappings: dict[tuple[int, ...], _TorchStorageRecordMapping] = {}
+        self._closed = False
+
+    @classmethod
+    def from_process_group(
+        cls,
+        *,
+        process_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_records: int,
+        source_record_bytes: int,
+        barrier_timeout_cycles: int = DEFAULT_BARRIER_TIMEOUT_CYCLES,
+        ext_module=None,
+        dma_ext_module=None,
+        stream_affine: bool = True,
+    ) -> "PCIeSelectedStoragePointerExchange":
+        packet_exchange = PCIeSelectedRecordCopyExchange.from_process_group(
+            process_group=process_group,
+            device=device,
+            max_records=max_records,
+            record_bytes=_POSITION_BYTES,
+            barrier_timeout_cycles=barrier_timeout_cycles,
+            ext_module=ext_module,
+            dma_ext_module=dma_ext_module,
+            stream_affine=stream_affine,
+        )
+        return cls(
+            packet_exchange=packet_exchange,
+            process_group=process_group,
+            source_record_bytes=source_record_bytes,
+        )
+
+    @staticmethod
+    def _mapping_key(records: torch.Tensor) -> tuple[int, ...]:
+        return (
+            int(records.untyped_storage().data_ptr()),
+            int(records.data_ptr()),
+            int(records.storage_offset()),
+            int(records.numel()),
+            int(records.element_size()),
+        )
+
+    @staticmethod
+    def _release_receiver_ref(shared: Sequence[Any]) -> None:
+        torch.UntypedStorage._release_ipc_counter(
+            shared[4],
+            shared[5],
+            device=shared[0],
+        )
+
+    def _map_records(self, records: torch.Tensor) -> _TorchStorageRecordMapping:
+        if self._closed:
+            raise RuntimeError("PCIeSelectedStoragePointerExchange is closed")
+        if records.device != self.device:
+            raise ValueError("records must be on the exchange device")
+        if records.dtype != torch.uint8 or not records.is_contiguous():
+            raise ValueError("records must be contiguous uint8")
+        if records.ndim < 2 or records.shape[-1] != self.record_bytes:
+            raise ValueError(
+                f"records must end in the configured {self.record_bytes}-byte width"
+            )
+        key = self._mapping_key(records)
+        cached = self._mappings.get(key)
+        if cached is not None:
+            return cached
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "model-storage CUDA IPC must be initialized by one eager "
+                "selected-record call before graph capture"
+            )
+
+        storage = records.untyped_storage()
+        tensor_byte_offset = int(records.storage_offset()) * int(records.element_size())
+        tensor_bytes = int(records.numel()) * int(records.element_size())
+        local_exports: list[tuple[tuple[Any, ...], int, int] | None] = []
+        try:
+            for destination in range(self.world_size):
+                local_exports.append(
+                    None
+                    if destination == self.rank
+                    else (storage._share_cuda_(), tensor_byte_offset, tensor_bytes)
+                )
+        except Exception:
+            for exported in local_exports:
+                if exported is not None:
+                    with suppress(Exception):
+                        self._release_receiver_ref(exported[0])
+            raise
+
+        gathered: list[list[tuple[tuple[Any, ...], int, int] | None] | None] = [
+            None
+        ] * self.world_size
+        try:
+            dist.all_gather_object(
+                gathered,
+                local_exports,
+                group=self.process_group,
+            )
+        except Exception:
+            for exported in local_exports:
+                if exported is not None:
+                    with suppress(Exception):
+                        self._release_receiver_ref(exported[0])
+            raise
+
+        remote_exports: list[tuple[int, tuple[Any, ...], int]] = []
+        try:
+            for source, source_exports in enumerate(gathered):
+                if source == self.rank:
+                    continue
+                if source_exports is None:
+                    raise RuntimeError("missing peer CUDA IPC export list")
+                exported = source_exports[self.rank]
+                if exported is None or len(exported) != 3:
+                    raise RuntimeError("missing receiver-specific CUDA IPC export")
+                shared, source_tensor_offset, source_tensor_bytes = exported
+                if len(shared) != 8:
+                    raise RuntimeError("invalid receiver-specific CUDA IPC tuple")
+                if (
+                    source_tensor_offset < 0
+                    or source_tensor_bytes < 0
+                    or source_tensor_offset + source_tensor_bytes > int(shared[2])
+                ):
+                    raise RuntimeError(
+                        "peer tensor exceeds its exported CUDA storage bounds"
+                    )
+                remote_exports.append((source, shared, int(source_tensor_offset)))
+        except Exception:
+            # all_gather_object completed, so this rank owns one receiver ref
+            # from every peer even when validation fails before import.
+            for source, source_exports in enumerate(gathered):
+                if source == self.rank or source_exports is None:
+                    continue
+                exported = source_exports[self.rank]
+                if exported is None or len(exported) != 3:
+                    continue
+                with suppress(Exception):
+                    self._release_receiver_ref(exported[0])
+            raise
+
+        device_index = (
+            torch.cuda.current_device()
+            if self.device.index is None
+            else int(self.device.index)
+        )
+        base_ptrs = [0] * self.world_size
+        base_ptrs[self.rank] = int(records.data_ptr())
+        retained_storages = [storage]
+        unconsumed = {source: shared for source, shared, _ in remote_exports}
+        try:
+            for source, shared, source_tensor_offset in remote_exports:
+                # _new_shared_cuda normally maps into shared[0] (the producer).
+                # Replacing only that field asks PyTorch's allocator-aware IPC
+                # importer to map the same storage in this consumer context.
+                imported = torch.UntypedStorage._new_shared_cuda(
+                    device_index,
+                    *shared[1:],
+                )
+                unconsumed.pop(source)
+                retained_storages.append(imported)
+                base_ptrs[source] = imported.data_ptr() + source_tensor_offset
+        except Exception:
+            # Successful imports own and release their receiver refs through the
+            # retained storage deleter.  Only exports not consumed by PyTorch's
+            # importer still require an explicit decrement here.
+            retained_storages.clear()
+            for shared in unconsumed.values():
+                with suppress(Exception):
+                    self._release_receiver_ref(shared)
+            raise
+
+        mapping = _TorchStorageRecordMapping(
+            peer_record_base_ptrs=torch.tensor(
+                base_ptrs,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            storages=tuple(retained_storages),
+        )
+        self._mappings[key] = mapping
+        return mapping
+
+    def prepare_record_ptrs(
+        self,
+        records: torch.Tensor,
+        local_indices_by_destination: torch.Tensor,
+        out_ptrs: torch.Tensor,
+        *,
+        primary_mode: str = "storage",
+    ) -> torch.Tensor:
+        if primary_mode != "storage":
+            raise ValueError(
+                "storage-pointer transport requires primary_mode='storage'"
+            )
+        mapping = self._map_records(records)
+        return self._packet_exchange.prepare_storage_record_ptrs(
+            local_indices_by_destination,
+            mapping.peer_record_base_ptrs,
+            out_ptrs,
+            source_record_bytes=self.record_bytes,
+        )
+
+    def consume_record_ptrs(
+        self,
+        record_ptrs: torch.Tensor,
+        checksums: torch.Tensor,
+    ) -> torch.Tensor:
+        self._packet_exchange._ext.consume_record_ptrs(
+            record_ptrs,
+            checksums,
+            self.record_bytes,
+        )
+        return checksums
+
+    def reset_storage_mappings(self) -> None:
+        """Release mappings tied to a KV cache while keeping the packet ring."""
+        if self._closed:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._mappings.clear()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.reset_storage_mappings()
+        self._packet_exchange.close()
+        self._closed = True
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
+
+
 __all__ = [
     "PCIeSelectedRecordCopyExchange",
     "PCIeSelectedRecordExchangeInitializationError",
+    "PCIeSelectedStoragePointerExchange",
 ]

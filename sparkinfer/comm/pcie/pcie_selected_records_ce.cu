@@ -208,6 +208,42 @@ __global__ void pack_compact_records_kernel(
   }
 }
 
+template <typename index_t>
+__global__ void pack_compact_indices_kernel(
+    const index_t* __restrict__ local_indices,
+    uint8_t* __restrict__ primary,
+    uint8_t* __restrict__ overflow,
+    int64_t selected_records,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset) {
+  const int64_t first =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t selected = first; selected < selected_records; selected += stride) {
+    const int64_t local_record = static_cast<int64_t>(local_indices[selected]);
+    if (local_record < 0) {
+      continue;
+    }
+    const uint64_t ordinal = atomicAdd(
+        reinterpret_cast<unsigned long long*>(primary),
+        static_cast<unsigned long long>(1));
+    const bool use_primary = ordinal < static_cast<uint64_t>(primary_capacity);
+    const int64_t compact_index = use_primary
+        ? static_cast<int64_t>(ordinal)
+        : static_cast<int64_t>(ordinal) - primary_capacity;
+    uint8_t* payload = use_primary ? primary : overflow;
+    const int64_t positions_offset =
+        use_primary ? primary_positions_offset : overflow_positions_offset;
+    const int64_t records_offset =
+        use_primary ? primary_records_offset : overflow_records_offset;
+    reinterpret_cast<int64_t*>(payload + positions_offset)[compact_index] = selected;
+    reinterpret_cast<int64_t*>(payload + records_offset)[compact_index] = local_record;
+  }
+}
+
 template <typename copy_t>
 __global__ void unpack_compact_records_kernel(
     const uint8_t* __restrict__ primary_base,
@@ -268,6 +304,171 @@ __global__ void unpack_compact_records_kernel(
         output + record_byte_offset(selected, record_bytes));
     for (int64_t unit = lane; unit < units_per_record; unit += kWarpSize) {
       destination[unit] = source_record[unit];
+    }
+  }
+}
+
+__global__ void build_compact_record_ptrs_kernel(
+    const int64_t* __restrict__ primary_ptrs,
+    const int64_t* __restrict__ overflow_ptrs,
+    int64_t* __restrict__ output_ptrs,
+    int64_t selected_records,
+    int64_t record_bytes,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset,
+    int world_size) {
+  const int64_t first =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int64_t total_compact_records =
+      static_cast<int64_t>(world_size) * selected_records;
+
+  for (int64_t compact_record = first;
+       compact_record < total_compact_records;
+       compact_record += stride) {
+    const int source = static_cast<int>(compact_record / selected_records);
+    const int64_t ordinal = compact_record % selected_records;
+    const auto* primary = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(primary_ptrs[source]));
+    const uint64_t total_records =
+        *reinterpret_cast<const uint64_t*>(primary);
+    if (ordinal >= static_cast<int64_t>(total_records)) {
+      continue;
+    }
+
+    const bool use_primary = ordinal < primary_capacity;
+    const int64_t compact_index =
+        use_primary ? ordinal : ordinal - primary_capacity;
+    const auto* payload = use_primary
+        ? primary
+        : reinterpret_cast<const uint8_t*>(
+              static_cast<uintptr_t>(overflow_ptrs[source]));
+    const int64_t positions_offset =
+        use_primary ? primary_positions_offset : overflow_positions_offset;
+    const int64_t records_offset =
+        use_primary ? primary_records_offset : overflow_records_offset;
+    const int64_t selected =
+        reinterpret_cast<const int64_t*>(payload + positions_offset)[compact_index];
+    if (selected < 0 || selected >= selected_records) {
+      continue;
+    }
+    output_ptrs[selected] = reinterpret_cast<int64_t>(
+        payload + records_offset + record_byte_offset(compact_index, record_bytes));
+  }
+}
+
+__global__ void build_storage_record_ptrs_kernel(
+    const int64_t* __restrict__ primary_ptrs,
+    const int64_t* __restrict__ overflow_ptrs,
+    const int64_t* __restrict__ peer_record_base_ptrs,
+    int64_t* __restrict__ output_ptrs,
+    int64_t selected_records,
+    int64_t source_record_bytes,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset,
+    int world_size) {
+  const int64_t first =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int64_t total_compact_records =
+      static_cast<int64_t>(world_size) * selected_records;
+  for (int64_t compact_record = first;
+       compact_record < total_compact_records;
+       compact_record += stride) {
+    const int source = static_cast<int>(compact_record / selected_records);
+    const int64_t ordinal = compact_record % selected_records;
+    const auto* primary = reinterpret_cast<const uint8_t*>(
+        static_cast<uintptr_t>(primary_ptrs[source]));
+    const uint64_t total_records =
+        *reinterpret_cast<const uint64_t*>(primary);
+    if (ordinal >= static_cast<int64_t>(total_records)) {
+      continue;
+    }
+    const bool use_primary = ordinal < primary_capacity;
+    const int64_t compact_index =
+        use_primary ? ordinal : ordinal - primary_capacity;
+    const auto* payload = use_primary
+        ? primary
+        : reinterpret_cast<const uint8_t*>(
+              static_cast<uintptr_t>(overflow_ptrs[source]));
+    const int64_t positions_offset =
+        use_primary ? primary_positions_offset : overflow_positions_offset;
+    const int64_t records_offset =
+        use_primary ? primary_records_offset : overflow_records_offset;
+    const int64_t selected =
+        reinterpret_cast<const int64_t*>(payload + positions_offset)[compact_index];
+    const int64_t local_record =
+        reinterpret_cast<const int64_t*>(payload + records_offset)[compact_index];
+    if (selected < 0 || selected >= selected_records || local_record < 0) {
+      continue;
+    }
+    output_ptrs[selected] =
+        peer_record_base_ptrs[source] + local_record * source_record_bytes;
+  }
+}
+
+__global__ void consume_record_ptrs_kernel(
+    const int64_t* __restrict__ record_ptrs,
+    uint64_t* __restrict__ checksums,
+    int64_t selected_records,
+    int64_t record_bytes) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int64_t first_warp =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+      kWarpSize;
+  const int64_t warp_stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x / kWarpSize;
+  for (int64_t selected = first_warp; selected < selected_records;
+       selected += warp_stride) {
+    const auto address = static_cast<uintptr_t>(record_ptrs[selected]);
+    const auto* record = reinterpret_cast<const uint8_t*>(address);
+    uint64_t sum = 0;
+    if (address != 0) {
+      for (int64_t byte = lane; byte < record_bytes; byte += kWarpSize) {
+        sum += static_cast<uint64_t>(record[byte]);
+      }
+    }
+#pragma unroll
+    for (int delta = kWarpSize / 2; delta > 0; delta /= 2) {
+      sum += __shfl_down_sync(0xffffffff, sum, delta);
+    }
+    if (lane == 0) {
+      checksums[selected] = sum;
+    }
+  }
+}
+
+__global__ void consume_contiguous_records_kernel(
+    const uint8_t* __restrict__ records,
+    uint64_t* __restrict__ checksums,
+    int64_t selected_records,
+    int64_t record_bytes) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int64_t first_warp =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+      kWarpSize;
+  const int64_t warp_stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x / kWarpSize;
+  for (int64_t selected = first_warp; selected < selected_records;
+       selected += warp_stride) {
+    const auto* record =
+        records + record_byte_offset(selected, record_bytes);
+    uint64_t sum = 0;
+    for (int64_t byte = lane; byte < record_bytes; byte += kWarpSize) {
+      sum += static_cast<uint64_t>(record[byte]);
+    }
+#pragma unroll
+    for (int delta = kWarpSize / 2; delta > 0; delta /= 2) {
+      sum += __shfl_down_sync(0xffffffff, sum, delta);
+    }
+    if (lane == 0) {
+      checksums[selected] = sum;
     }
   }
 }
@@ -567,6 +768,92 @@ void pack_compact_records(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename index_t>
+void launch_pack_indices(
+    const torch::Tensor& local_indices,
+    int64_t primary_ptr,
+    int64_t overflow_ptr,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset,
+    cudaStream_t stream) {
+  const int64_t selected_records = local_indices.numel();
+  const int blocks = static_cast<int>(std::max<int64_t>(
+      1,
+      std::min<int64_t>(
+          (selected_records + kThreads - 1) / kThreads,
+          kMaxBlocks)));
+  pack_compact_indices_kernel<index_t><<<blocks, kThreads, 0, stream>>>(
+      local_indices.data_ptr<index_t>(),
+      reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(primary_ptr)),
+      reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(overflow_ptr)),
+      selected_records,
+      primary_capacity,
+      primary_positions_offset,
+      primary_records_offset,
+      overflow_positions_offset,
+      overflow_records_offset);
+}
+
+void pack_compact_indices(
+    torch::Tensor local_indices,
+    int64_t primary_ptr,
+    int64_t overflow_ptr,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_indices));
+  TORCH_CHECK(local_indices.is_cuda(), "local indices must be CUDA");
+  TORCH_CHECK(
+      local_indices.scalar_type() == torch::kInt32 ||
+          local_indices.scalar_type() == torch::kInt64,
+      "local indices must be int32 or int64");
+  TORCH_CHECK(local_indices.is_contiguous(), "local indices must be contiguous");
+  TORCH_CHECK(primary_ptr != 0, "primary pointer must be nonzero");
+  TORCH_CHECK(overflow_ptr != 0, "overflow pointer must be nonzero");
+  TORCH_CHECK(primary_capacity > 0, "primary capacity must be positive");
+  TORCH_CHECK(
+      primary_capacity <= local_indices.numel(),
+      "primary capacity cannot exceed selected records");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  AT_CUDA_CHECK(cudaMemsetAsync(
+      reinterpret_cast<void*>(static_cast<uintptr_t>(primary_ptr)),
+      0,
+      sizeof(uint64_t),
+      stream));
+  if (local_indices.numel() == 0) {
+    return;
+  }
+  if (local_indices.scalar_type() == torch::kInt32) {
+    launch_pack_indices<int32_t>(
+        local_indices,
+        primary_ptr,
+        overflow_ptr,
+        primary_capacity,
+        primary_positions_offset,
+        primary_records_offset,
+        overflow_positions_offset,
+        overflow_records_offset,
+        stream);
+  } else {
+    launch_pack_indices<int64_t>(
+        local_indices,
+        primary_ptr,
+        overflow_ptr,
+        primary_capacity,
+        primary_positions_offset,
+        primary_records_offset,
+        overflow_positions_offset,
+        overflow_records_offset,
+        stream);
+  }
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename index_t, typename copy_t>
 void launch_pack_layers(
     const torch::Tensor& records0,
@@ -846,6 +1133,174 @@ void unpack_compact_records(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
+void build_compact_record_ptrs(
+    torch::Tensor primary_ptrs,
+    torch::Tensor overflow_ptrs,
+    torch::Tensor output_ptrs,
+    int64_t record_bytes,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output_ptrs));
+  validate_tensor(primary_ptrs, "primary pointers", torch::kInt64);
+  validate_tensor(overflow_ptrs, "overflow pointers", torch::kInt64);
+  validate_tensor(output_ptrs, "output pointers", torch::kInt64);
+  TORCH_CHECK(
+      primary_ptrs.device() == output_ptrs.device() &&
+          overflow_ptrs.device() == output_ptrs.device(),
+      "packet and output pointers must use the same CUDA device");
+  TORCH_CHECK(
+      primary_ptrs.dim() == 1 && overflow_ptrs.dim() == 1 &&
+          primary_ptrs.numel() == overflow_ptrs.numel(),
+      "primary and overflow pointers must be equal-length vectors");
+  const int64_t world_size = primary_ptrs.numel();
+  TORCH_CHECK(
+      world_size >= 2 && world_size <= kMaxWorldSize,
+      "world size must be in [2, 32]");
+  TORCH_CHECK(output_ptrs.dim() == 1, "output pointers must be a vector");
+  TORCH_CHECK(output_ptrs.numel() > 0, "output pointers cannot be empty");
+  TORCH_CHECK(record_bytes > 0, "record_bytes must be positive");
+  TORCH_CHECK(primary_capacity > 0, "primary capacity must be positive");
+
+  const int64_t selected_records = output_ptrs.numel();
+  const int64_t total = world_size * selected_records;
+  const int blocks = static_cast<int>(std::max<int64_t>(
+      1, std::min<int64_t>((total + kThreads - 1) / kThreads, kMaxBlocks)));
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  AT_CUDA_CHECK(cudaMemsetAsync(
+      output_ptrs.data_ptr<int64_t>(),
+      0,
+      selected_records * sizeof(int64_t),
+      stream));
+  build_compact_record_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
+      primary_ptrs.data_ptr<int64_t>(),
+      overflow_ptrs.data_ptr<int64_t>(),
+      output_ptrs.data_ptr<int64_t>(),
+      selected_records,
+      record_bytes,
+      primary_capacity,
+      primary_positions_offset,
+      primary_records_offset,
+      overflow_positions_offset,
+      overflow_records_offset,
+      static_cast<int>(world_size));
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void build_storage_record_ptrs(
+    torch::Tensor primary_ptrs,
+    torch::Tensor overflow_ptrs,
+    torch::Tensor peer_record_base_ptrs,
+    torch::Tensor output_ptrs,
+    int64_t source_record_bytes,
+    int64_t primary_capacity,
+    int64_t primary_positions_offset,
+    int64_t primary_records_offset,
+    int64_t overflow_positions_offset,
+    int64_t overflow_records_offset) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output_ptrs));
+  validate_tensor(primary_ptrs, "primary pointers", torch::kInt64);
+  validate_tensor(overflow_ptrs, "overflow pointers", torch::kInt64);
+  validate_tensor(peer_record_base_ptrs, "peer record bases", torch::kInt64);
+  validate_tensor(output_ptrs, "output pointers", torch::kInt64);
+  TORCH_CHECK(
+      primary_ptrs.device() == output_ptrs.device() &&
+          overflow_ptrs.device() == output_ptrs.device() &&
+          peer_record_base_ptrs.device() == output_ptrs.device(),
+      "packet, record-base, and output pointers must use the same CUDA device");
+  TORCH_CHECK(
+      primary_ptrs.dim() == 1 && overflow_ptrs.dim() == 1 &&
+          peer_record_base_ptrs.dim() == 1 &&
+          primary_ptrs.numel() == overflow_ptrs.numel() &&
+          primary_ptrs.numel() == peer_record_base_ptrs.numel(),
+      "packet and record-base pointers must be equal-length vectors");
+  const int64_t world_size = primary_ptrs.numel();
+  TORCH_CHECK(
+      world_size >= 2 && world_size <= kMaxWorldSize,
+      "world size must be in [2, 32]");
+  TORCH_CHECK(output_ptrs.dim() == 1, "output pointers must be a vector");
+  TORCH_CHECK(output_ptrs.numel() > 0, "output pointers cannot be empty");
+  TORCH_CHECK(source_record_bytes > 0, "source record width must be positive");
+  TORCH_CHECK(primary_capacity > 0, "primary capacity must be positive");
+  const int64_t selected_records = output_ptrs.numel();
+  const int64_t total = world_size * selected_records;
+  const int blocks = static_cast<int>(std::max<int64_t>(
+      1, std::min<int64_t>((total + kThreads - 1) / kThreads, kMaxBlocks)));
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  AT_CUDA_CHECK(cudaMemsetAsync(
+      output_ptrs.data_ptr<int64_t>(),
+      0,
+      selected_records * sizeof(int64_t),
+      stream));
+  build_storage_record_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
+      primary_ptrs.data_ptr<int64_t>(),
+      overflow_ptrs.data_ptr<int64_t>(),
+      peer_record_base_ptrs.data_ptr<int64_t>(),
+      output_ptrs.data_ptr<int64_t>(),
+      selected_records,
+      source_record_bytes,
+      primary_capacity,
+      primary_positions_offset,
+      primary_records_offset,
+      overflow_positions_offset,
+      overflow_records_offset,
+      static_cast<int>(world_size));
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void consume_record_ptrs(
+    torch::Tensor record_ptrs,
+    torch::Tensor checksums,
+    int64_t record_bytes) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(record_ptrs));
+  validate_tensor(record_ptrs, "record pointers", torch::kInt64);
+  validate_tensor(checksums, "record checksums", torch::kInt64);
+  TORCH_CHECK(
+      record_ptrs.device() == checksums.device(),
+      "record pointers and checksums must use the same CUDA device");
+  TORCH_CHECK(
+      record_ptrs.dim() == 1 && checksums.dim() == 1 &&
+          record_ptrs.numel() == checksums.numel(),
+      "record pointers and checksums must be equal-length vectors");
+  TORCH_CHECK(record_ptrs.numel() > 0, "record pointers cannot be empty");
+  TORCH_CHECK(record_bytes > 0, "record_bytes must be positive");
+  const int blocks = launch_blocks_for_warps(record_ptrs.numel());
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  consume_record_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
+      record_ptrs.data_ptr<int64_t>(),
+      reinterpret_cast<uint64_t*>(checksums.data_ptr<int64_t>()),
+      record_ptrs.numel(),
+      record_bytes);
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void consume_contiguous_records(
+    torch::Tensor records,
+    torch::Tensor checksums) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(records));
+  validate_tensor(records, "records", torch::kUInt8);
+  validate_tensor(checksums, "record checksums", torch::kInt64);
+  TORCH_CHECK(
+      records.device() == checksums.device(),
+      "records and checksums must use the same CUDA device");
+  TORCH_CHECK(records.dim() == 2, "records must be a matrix");
+  TORCH_CHECK(
+      checksums.dim() == 1 && records.size(0) == checksums.numel(),
+      "checksums must contain one value per record");
+  TORCH_CHECK(records.size(0) > 0, "records cannot be empty");
+  TORCH_CHECK(records.size(1) > 0, "record width must be positive");
+  const int blocks = launch_blocks_for_warps(records.size(0));
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  consume_contiguous_records_kernel<<<blocks, kThreads, 0, stream>>>(
+      records.data_ptr<uint8_t>(),
+      reinterpret_cast<uint64_t*>(checksums.data_ptr<int64_t>()),
+      records.size(0),
+      records.size(1));
+  AT_CUDA_CHECK(cudaGetLastError());
+}
+
 template <typename copy_t>
 void launch_unpack_layers(
     int64_t primary_base_ptr,
@@ -1102,6 +1557,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &pack_compact_records,
       "Pack locally owned selected records into copy-engine staging packets");
   module.def(
+      "pack_compact_indices",
+      &pack_compact_indices,
+      "Pack selected local ordinals into compact copy-engine packets");
+  module.def(
       "pack_compact_record_layers",
       &pack_compact_record_layers,
       "Pack three record planes into one copy-engine staging packet");
@@ -1109,6 +1568,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "unpack_compact_records",
       &unpack_compact_records,
       "Unpack source packets into destination-selected record order");
+  module.def(
+      "build_compact_record_ptrs",
+      &build_compact_record_ptrs,
+      "Build destination-order pointers into compact selected-record packets");
+  module.def(
+      "build_storage_record_ptrs",
+      &build_storage_record_ptrs,
+      "Build destination-order pointers into peer model storage");
+  module.def(
+      "consume_record_ptrs",
+      &consume_record_ptrs,
+      "Checksum selected records through an address indirection table");
+  module.def(
+      "consume_contiguous_records",
+      &consume_contiguous_records,
+      "Checksum contiguous selected records with the pointer-consumer work");
   module.def(
       "unpack_compact_record_layers",
       &unpack_compact_record_layers,
