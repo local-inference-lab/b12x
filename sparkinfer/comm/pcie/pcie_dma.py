@@ -141,38 +141,12 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def _persistent_output_view(
-    storage: torch.Tensor,
-    inp: torch.Tensor,
-    max_bytes: int,
-) -> torch.Tensor:
-    """Return an input-shaped view over an exact-capacity byte workspace."""
-    size_bytes = inp.numel() * inp.element_size()
-    if size_bytes > max_bytes:
-        raise ValueError(
-            f"input needs {size_bytes} output bytes, capacity is {max_bytes}"
-        )
-    if (
-        storage.device != inp.device
-        or storage.dtype is not torch.uint8
-        or not storage.is_contiguous()
-    ):
-        raise ValueError("output storage must be contiguous uint8 on the input device")
-    if storage.numel() < max_bytes:
-        raise ValueError(
-            f"output storage has {storage.numel()} bytes, capacity is {max_bytes}"
-        )
-    return storage[:size_bytes].view(inp.dtype).view(inp.shape)
-
-
 class PCIeDmaAllReduce:
     """Single-channel ring allreduce over IPC scratch buffers.
 
     A channel is a single ordered stream context; concurrent use from
     multiple CUDA streams needs separate channels (same contract as the
-    oneshot runtime). When ``out`` is omitted, the returned tensor uses a
-    channel-owned workspace and remains valid until the next default-output
-    invocation on that channel.
+    oneshot runtime).
     """
 
     def __init__(
@@ -221,12 +195,6 @@ class PCIeDmaAllReduce:
         self._wait_counters = torch.zeros(
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
-        # The communicator exists before vLLM takes its initial memory
-        # snapshot. Allocate this exact-capacity workspace on the first DMA
-        # dispatch instead, so a profiling forward charges it to the KV-cache
-        # budget. Keeping it alive prevents a large first runtime dispatch from
-        # allocating after KV cache has consumed the remaining device memory.
-        self._output_storage: torch.Tensor | None = None
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
         # Separate CE/flag streams for the a2a broadcast phase so allgather
@@ -364,15 +332,6 @@ class PCIeDmaAllReduce:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
-    def _ensure_output_storage(self) -> torch.Tensor:
-        if self._output_storage is None:
-            self._output_storage = torch.empty(
-                self.max_bytes,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-        return self._output_storage
-
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -382,11 +341,15 @@ class PCIeDmaAllReduce:
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
         if out is None:
-            out = _persistent_output_view(
-                self._ensure_output_storage(),
-                inp,
-                self.max_bytes,
-            )
+            # Match normal out-of-place collective semantics: the result
+            # remains valid until its caller releases it.
+            #
+            # A transformer can retain one all-reduce result across the next
+            # collective. For example, the embedding all-reduce output becomes
+            # the layer-0 residual while the attention output projection issues
+            # another all-reduce. Reusing one communicator-owned output buffer
+            # silently overwrites that live residual.
+            out = torch.empty_like(inp)
         elif (
             out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous()
         ):
@@ -839,8 +802,6 @@ class PCIeDmaAllReduce:
                 self._ipc.cudaIpcCloseMemHandle(ptr)
         with suppress(Exception):
             self._ipc.cudaFree(self._slab.local_ptr)
-        self._output_storage = None
-
     def __del__(self) -> None:
         with suppress(Exception):
             self.close()
