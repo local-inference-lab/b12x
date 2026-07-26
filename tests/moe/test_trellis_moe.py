@@ -576,3 +576,110 @@ def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
             f"row {row} of an m={m} batch differs from its own m=1 run; a token's "
             "output must not depend on how many other tokens share the batch"
         )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("m", [1, 2, 3])
+def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
+    """CUDA-graph capture and replay at m strictly below plan capacity.
+
+    This is the surface vLLM #183 actually leaves untested. The existing capture
+    test captures at ``m == max_tokens``, and a small-m eager check does not cover
+    capture: ``bind`` runs inside the captured region, so the route-pack grid, the
+    ``kernel_workspace`` zero-fill and the active-m constants are all baked into
+    the graph. If any of those were captured for the wrong m, replay would produce
+    stale or mismatched results while eager execution stayed correct -- which is
+    exactly a "short prompts pass, long context corrupts" signature once an
+    MTP-N draft replays its captured graph.
+
+    Asserts replay matches the eager result for the same inputs bit-for-bit, and
+    that a second replay is stable (no dependence on scratch left over from the
+    capture pass).
+    """
+    torch.manual_seed(20260726)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, hidden, intermediate = 32, 1024, 1024
+    bits, topk, capacity = 3, 8, 32
+    tile_config = (64, 256, 64, 256)
+
+    w13 = torch.randint(
+        -32768, 32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16, device=device,
+    )
+    w2 = torch.randint(
+        -32768, 32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16, device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    weights = trellis_moe.prepare_weights(
+        w13,
+        w2,
+        gate_suh=scales((experts, hidden)).contiguous(),
+        up_suh=scales((experts, hidden)).contiguous(),
+        intermediate_rotations=scales((experts, 3 * intermediate)).contiguous(),
+        down_svh=scales((experts, hidden)).contiguous(),
+        codebook="mcg",
+        mcg=0xCBAC1FED,
+        tile_config=tile_config,
+    )
+    plan = trellis_moe.plan(
+        trellis_moe.Caps(
+            max_tokens=capacity,
+            num_topk=topk,
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            route_num_experts=experts,
+            block_size_m=8,
+            trellis_bits=bits,
+            tile_config=tile_config,
+            input_dtype=torch.bfloat16,
+            device=device,
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.stack(
+        [torch.randperm(experts, device=device)[:topk] for _ in range(m)]
+    ).to(torch.int32)
+    router_weights = torch.rand((m, topk), dtype=torch.float32, device=device)
+    router_weights /= router_weights.sum(dim=1, keepdim=True)
+
+    binding = trellis_moe.bind(
+        plan,
+        scratch=scratch,
+        a=x,
+        weights=weights,
+        topk_weights=router_weights,
+        topk_ids=ids,
+    )
+    eager = binding.run().clone()
+    torch.cuda.synchronize(device)
+    assert not torch.isnan(eager).any()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = binding.run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert not torch.isnan(captured).any(), (
+        f"NaN after graph replay at m={m} (capacity {capacity})"
+    )
+    assert torch.equal(captured, eager), (
+        f"graph replay at m={m} below capacity {capacity} disagrees with eager; "
+        "capture baked constants or a route-pack grid for the wrong m"
+    )
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, eager), (
+        f"second replay at m={m} drifted; replay depends on scratch state left "
+        "over from the capture pass"
+    )
