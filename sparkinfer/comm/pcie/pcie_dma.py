@@ -341,6 +341,8 @@ class PCIeDmaAllReduce:
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
         if out is None:
+            # Preserve normal out-of-place collective semantics. Callers can
+            # retain this result while a later collective is in flight.
             out = torch.empty_like(inp)
         elif (
             out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous()

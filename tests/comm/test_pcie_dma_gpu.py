@@ -76,6 +76,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_bytes=max_rows * hidden * 4,
     )
     try:
+        explicit_inp = _make_input(8, hidden, torch.bfloat16, device, rank, 0)
+        explicit_ref = _reference(explicit_inp)
+        explicit_out = torch.empty_like(explicit_inp)
+        ring.all_reduce(explicit_inp, out=explicit_out)
+        torch.cuda.synchronize(device)
+        _assert_close(explicit_out, explicit_ref, world_size)
+
+        retained_outputs: list[torch.Tensor] = []
+        retained_refs: list[torch.Tensor] = []
         for dtype in (torch.bfloat16,):
             for rows in (8, 64, 256):
                 inp = _make_input(rows, hidden, dtype, device, rank, 0)
@@ -83,8 +92,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 out = ring.all_reduce(inp)
                 torch.cuda.synchronize(device)
                 _assert_close(out, ref, world_size)
+                assert all(
+                    out.data_ptr() != prior.data_ptr() for prior in retained_outputs
+                )
+                retained_outputs.append(out)
+                retained_refs.append(ref)
+                for retained, retained_ref in zip(
+                    retained_outputs, retained_refs, strict=True
+                ):
+                    _assert_close(retained, retained_ref, world_size)
 
-        # Graph capture and replay with changing inputs.
+        # Captured callers provide stable output storage explicitly.
         rows = 256
         dtype = torch.bfloat16
         inp = _make_input(rows, hidden, dtype, device, rank, 0)
@@ -113,6 +131,7 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
+    _load_extension()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
@@ -143,6 +162,7 @@ def test_pcie_dma_all_reduce_compressed_wire(mode: str) -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
+    _load_extension()
     mp.spawn(
         _fp8_worker,
         args=(world_size, _free_port(), mode),
