@@ -62,15 +62,60 @@ placement, CPU/NUMA binding, PCIe generation caps, NCCL, or collective code.
 
 ## Validation snapshot
 
-The probe was validated on 8x RTX PRO 6000 Blackwell with TP8/DCP4:
+The probe was validated on 8x RTX PRO 6000 Blackwell with TP8/DCP4. All three
+correctness gates passed before timing: DMA matched NCCL exactly, the TP/CKV
+collectives matched their analytic patterns, and split top-k matched the
+replicated oracle at every context.
 
 | Topology | CKV overlap at 8k / 64k / 128k | Prefetch | Query split |
 | --- | ---: | ---: | ---: |
-| Adjacent GPU order | +2.1% / +3.7% / +3.6% | `1` | `1` |
-| Interleaved root complexes | -37.9% / -404.0% / -689.9% | `0` | `1` |
+| Adjacent GPU order | +3.1% / +3.1% / +3.8% | `1` | `1` |
+| Interleaved root complexes | -59.5% / -428.6% / -723.8% | `0` | `1` |
 
 On the adjacent topology, NCCL won through 6 MiB and lossless BF16 DMA won at
 24 MiB and 96 MiB, so the measured crossover was 24 MiB. The complete
-query-split phase was 52-61% faster and reduced per-rank top-k communication
-from 128 MiB to 72 MiB. The interleaved run reproduces the known CKV-prefetch
-collapse while correctly retaining the unrelated query-split optimization.
+query-split phase was 23% faster at 8k and 58-60% faster at 64k-128k. At 8k,
+each shard has only 1024 local candidates, so both exact paths move 64 MiB per
+rank; at 64k and above the owner path reduces per-rank top-k communication from
+128 MiB to 72 MiB. The interleaved run reproduces the CKV-prefetch collapse
+while correctly retaining the unrelated query-split optimization.
+
+The percentages above use `(serialized - concurrent) / serialized` for CKV
+overlap and `(full - split) / full` for query split, so positive values are
+faster. Decisions use the pessimistic median from both launch orders.
+
+### Reproducible evidence
+
+- Probe source: commit `f3fb62c8af5bf6759e28a067b4e6fc8732a9e497`, worktree
+  `/root/vllm/worktrees/sparkinfer-pcie-calibration-pr-20260726`.
+- Runtime: PyTorch `2.12.0+cu132`; CUDA `13.2`; nine measured samples after
+  three warmup iterations for every mode and point.
+- [Adjacent GPU 0-7 raw JSON](evidence/pcie_calibration/20260726-adjacent-tp8-dcp4.json)
+- [Interleaved even-GPU raw JSON](evidence/pcie_calibration/20260726-interleaved-tp8-dcp4.json)
+
+Adjacent command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --standalone --nproc-per-node=8 \
+  -m sparkinfer.comm.pcie.overlap_probe \
+  --tp-size 8 --dcp-size 4 \
+  --context-tokens 8192,65536,131072 \
+  --output adjacent-gpu0-7-f3fb62c.json
+```
+
+Interleaved command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,2,4,6,8,10,12,14 \
+torchrun --standalone --nproc-per-node=8 \
+  -m sparkinfer.comm.pcie.overlap_probe \
+  --tp-size 8 --dcp-size 4 \
+  --context-tokens 8192,65536,131072 \
+  --output interleaved-gpu-even-f3fb62c.json
+```
+
+The linked artifacts contain physical rank-to-PCI mappings, all raw timing
+samples, medians and extrema, exact commands, source identity, correctness
+results, byte counts, and final policy. This is the audit source for the table;
+the console rendering is only a summary.

@@ -86,10 +86,32 @@ class ProbeConfig:
             raise ValueError("indexer_shards must divide both dcp_size and tp_size")
         if self.tp_rows % self.query_split_size:
             raise ValueError("tp_rows must divide evenly across query-split ranks")
+        if self.tp_rows % self.tp_size:
+            raise ValueError(
+                "tp_rows must divide evenly across tp_size for owner merge"
+            )
+        if self.query_split_rows % self.indexer_shards:
+            raise ValueError(
+                "query_split_rows must divide evenly across indexer_shards"
+            )
         if self.indexer_stride <= 0 or self.indexer_heads <= 0:
             raise ValueError("indexer_stride and indexer_heads must be positive")
         if self.indexer_topk <= 0:
             raise ValueError("indexer_topk must be positive")
+        for context_tokens in self.context_tokens:
+            local_tokens = self.indexer_local_tokens(context_tokens)
+            local_topk = self.indexer_local_topk(context_tokens)
+            if self.indexer_topk > local_tokens * self.indexer_shards:
+                raise ValueError(
+                    f"indexer_topk={self.indexer_topk} exceeds the "
+                    f"{local_tokens * self.indexer_shards} global candidates "
+                    f"available at context_tokens={context_tokens}"
+                )
+            if local_topk not in (512, 1024, 2048):
+                raise ValueError(
+                    f"context_tokens={context_tokens} requires unsupported local "
+                    f"indexer top-k {local_topk}; supported values are 512, 1024, 2048"
+                )
         if not 0.0 <= self.minimum_overlap_gain < 1.0:
             raise ValueError("minimum_overlap_gain must be in [0, 1)")
         if not 0.0 <= self.minimum_backend_gain < 1.0:
@@ -131,6 +153,9 @@ class ProbeConfig:
         index_tokens = math.ceil(context_tokens / self.indexer_stride)
         return math.ceil(index_tokens / self.indexer_shards)
 
+    def indexer_local_topk(self, context_tokens: int) -> int:
+        return min(self.indexer_topk, self.indexer_local_tokens(context_tokens))
+
     def query_split_final_wire_bytes_per_rank(self) -> int:
         return (
             (self.query_split_rows // self.indexer_shards)
@@ -139,28 +164,28 @@ class ProbeConfig:
             * (self.tp_size - 1)
         )
 
-    def baseline_candidate_wire_bytes_per_rank(self) -> int:
+    def baseline_candidate_wire_bytes_per_rank(self, context_tokens: int) -> int:
         return (
             self.tp_rows
             * 2
-            * self.indexer_topk
+            * self.indexer_local_topk(context_tokens)
             * torch.int32.itemsize
             * (self.indexer_shards - 1)
         )
 
-    def owner_candidate_wire_bytes_per_rank(self) -> int:
+    def owner_candidate_wire_bytes_per_rank(self, context_tokens: int) -> int:
         return (
             self.query_split_rows
             * 2
-            * self.indexer_topk
+            * self.indexer_local_topk(context_tokens)
             * torch.int32.itemsize
             * (self.indexer_shards - 1)
             // self.indexer_shards
         )
 
-    def query_split_wire_bytes_per_rank(self) -> int:
+    def query_split_wire_bytes_per_rank(self, context_tokens: int) -> int:
         return (
-            self.owner_candidate_wire_bytes_per_rank()
+            self.owner_candidate_wire_bytes_per_rank(context_tokens)
             + self.query_split_final_wire_bytes_per_rank()
         )
 
@@ -210,6 +235,30 @@ class QuerySplitDecision:
     split_ms: float
     split_gain: float
     wire_bytes_per_rank: int
+
+
+@dataclass(frozen=True)
+class QueryBuffers:
+    """Contiguous views over shared storage for one context's local top-k."""
+
+    local_topk: int
+    candidate_width: int
+    full_indices: torch.Tensor
+    full_scores: torch.Tensor
+    full_global_indices: torch.Tensor
+    full_candidates: torch.Tensor
+    full_gathered_candidates: torch.Tensor
+    full_candidate_indices: torch.Tensor
+    full_candidate_scores: torch.Tensor
+    full_candidate_lengths: torch.Tensor
+    local_indices: torch.Tensor
+    local_scores: torch.Tensor
+    local_global_indices: torch.Tensor
+    owner_candidates: torch.Tensor
+    owner_received_candidates: torch.Tensor
+    owner_candidate_indices: torch.Tensor
+    owner_candidate_scores: torch.Tensor
+    owner_candidate_lengths: torch.Tensor
 
 
 def summarize(values: Sequence[float]) -> TimingSummary:
@@ -377,6 +426,18 @@ def recommend_prefetch_depth(
     return int(beneficial and not harmful)
 
 
+def maximum_contiguous_enabled_context(
+    points: Sequence[tuple[int, bool]],
+) -> int:
+    """Return the end of the enabled prefix in ascending context order."""
+    maximum_safe = 0
+    for context_tokens, enabled in sorted(points):
+        if not enabled:
+            break
+        maximum_safe = context_tokens
+    return maximum_safe
+
+
 def _global_max(values: Sequence[float]) -> tuple[float, ...]:
     tensor = torch.tensor(tuple(values), dtype=torch.float64, device="cpu")
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
@@ -502,6 +563,7 @@ class CollectiveOverlapProbe:
         )
         self.main_stream = torch.cuda.current_stream(self.device)
         self.side_stream = torch.cuda.Stream(device=self.device)
+        self.release_stream = torch.cuda.Stream(device=self.device)
         self.dma = DmaAllReduce(
             exchange_group=self.tp_group,
             device=self.device,
@@ -680,6 +742,8 @@ class CollectiveOverlapProbe:
             ]
             return plan, scratch
 
+        # Context bindings share each plan's scratch. Probe phases are strictly
+        # sequential, so exactly one binding may be active at a time.
         full_plan, full_scratch = make_plan(config.tp_rows)
         split_plan, split_scratch = make_plan(config.query_split_rows)
         self.query_bindings: dict[int, tuple[Any, Any]] = {}
@@ -696,7 +760,13 @@ class CollectiveOverlapProbe:
                 active_pages, dtype=torch.int32, device=self.device
             )
 
-            def make_binding(plan, scratch, rows: int):
+            def make_binding(
+                plan,
+                scratch,
+                rows: int,
+                base_page_table: torch.Tensor = base_page_table,
+                local_tokens: int = local_tokens,
+            ):
                 page_table = base_page_table.expand(rows, -1)
                 seqlens = torch.full(
                     (rows,), local_tokens, dtype=torch.int32, device=self.device
@@ -720,6 +790,74 @@ class CollectiveOverlapProbe:
                 make_binding(full_plan, full_scratch, config.tp_rows),
                 make_binding(split_plan, split_scratch, config.query_split_rows),
             )
+
+    @staticmethod
+    def _storage_view(storage: torch.Tensor, *shape: int) -> torch.Tensor:
+        elements = math.prod(shape)
+        if elements > storage.numel():
+            raise RuntimeError(
+                f"query buffer requires {elements} elements, storage has "
+                f"{storage.numel()}"
+            )
+        return storage.view(-1)[:elements].view(*shape)
+
+    def _query_buffers(self, context_tokens: int) -> QueryBuffers:
+        config = self.config
+        local_topk = config.indexer_local_topk(context_tokens)
+        candidate_width = config.indexer_shards * local_topk
+        rows = config.tp_rows
+        local_rows = config.query_split_rows
+        owner_rows = self.owner_rows
+
+        full_lengths = self._storage_view(self.full_candidate_lengths, rows)
+        owner_lengths = self._storage_view(self.owner_candidate_lengths, owner_rows)
+        full_lengths.fill_(candidate_width)
+        owner_lengths.fill_(candidate_width)
+        return QueryBuffers(
+            local_topk=local_topk,
+            candidate_width=candidate_width,
+            full_indices=self._storage_view(self.full_indices, rows, local_topk),
+            full_scores=self._storage_view(self.full_scores, rows, local_topk),
+            full_global_indices=self._storage_view(
+                self.full_global_indices, rows, local_topk
+            ),
+            full_candidates=self._storage_view(
+                self.full_candidates, rows, 2, local_topk
+            ),
+            full_gathered_candidates=self._storage_view(
+                self.full_gathered_candidates,
+                rows * config.indexer_shards,
+                2,
+                local_topk,
+            ),
+            full_candidate_indices=self._storage_view(
+                self.full_candidate_indices, rows, candidate_width
+            ),
+            full_candidate_scores=self._storage_view(
+                self.full_candidate_scores, rows, candidate_width
+            ),
+            full_candidate_lengths=full_lengths,
+            local_indices=self._storage_view(
+                self.local_indices, local_rows, local_topk
+            ),
+            local_scores=self._storage_view(self.local_scores, local_rows, local_topk),
+            local_global_indices=self._storage_view(
+                self.local_global_indices, local_rows, local_topk
+            ),
+            owner_candidates=self._storage_view(
+                self.owner_candidates, local_rows, 2, local_topk
+            ),
+            owner_received_candidates=self._storage_view(
+                self.owner_received_candidates, local_rows, 2, local_topk
+            ),
+            owner_candidate_indices=self._storage_view(
+                self.owner_candidate_indices, owner_rows, candidate_width
+            ),
+            owner_candidate_scores=self._storage_view(
+                self.owner_candidate_scores, owner_rows, candidate_width
+            ),
+            owner_candidate_lengths=owner_lengths,
+        )
 
     def _prepare(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -780,18 +918,19 @@ class CollectiveOverlapProbe:
     def _run_query_indexer(self, context_tokens: int, *, split: bool) -> None:
         full_binding, split_binding = self.query_bindings[context_tokens]
         config = self.config
+        buffers = self._query_buffers(context_tokens)
         if not split:
             self._index_topk_fp8(
                 q_fp8=self.index_q,
                 weights=self.index_weights,
                 index_k_cache=self.index_k_cache,
                 binding=full_binding,
-                topk=config.indexer_topk,
+                topk=buffers.local_topk,
                 expected_num_q_heads=config.indexer_heads,
-                out_indices=self.full_indices,
-                out_scores=self.full_scores,
+                out_indices=buffers.full_indices,
+                out_scores=buffers.full_scores,
             )
-            self._merge_replicated_candidates()
+            self._merge_replicated_candidates(buffers)
             return
 
         start = self.query_split_rank * config.query_split_rows
@@ -801,12 +940,12 @@ class CollectiveOverlapProbe:
             weights=self.index_weights[start:end].contiguous(),
             index_k_cache=self.index_k_cache,
             binding=split_binding,
-            topk=config.indexer_topk,
+            topk=buffers.local_topk,
             expected_num_q_heads=config.indexer_heads,
-            out_indices=self.local_indices,
-            out_scores=self.local_scores,
+            out_indices=buffers.local_indices,
+            out_scores=buffers.local_scores,
         )
-        self._merge_owner_candidates()
+        self._merge_owner_candidates(buffers)
 
     def _globalize_candidate_indices(
         self, local_indices: torch.Tensor, global_indices: torch.Tensor
@@ -826,69 +965,76 @@ class CollectiveOverlapProbe:
         candidate_scores: torch.Tensor,
         *,
         rows: int,
+        local_topk: int,
     ) -> None:
         config = self.config
         rank_major = gathered.view(
             config.indexer_shards,
             rows,
             2,
-            config.indexer_topk,
+            local_topk,
         )
-        candidate_indices.view(rows, config.indexer_shards, config.indexer_topk).copy_(
+        candidate_indices.view(rows, config.indexer_shards, local_topk).copy_(
             rank_major[:, :, 0, :].permute(1, 0, 2)
         )
         candidate_scores.view(torch.int32).view(
-            rows, config.indexer_shards, config.indexer_topk
+            rows, config.indexer_shards, local_topk
         ).copy_(rank_major[:, :, 1, :].permute(1, 0, 2))
 
-    def _merge_replicated_candidates(self) -> None:
+    def _merge_replicated_candidates(self, buffers: QueryBuffers) -> None:
         config = self.config
-        self._globalize_candidate_indices(self.full_indices, self.full_global_indices)
-        self.full_candidates[:, 0, :].copy_(self.full_global_indices)
-        self.full_candidates[:, 1, :].copy_(self.full_scores.view(torch.int32))
+        self._globalize_candidate_indices(
+            buffers.full_indices, buffers.full_global_indices
+        )
+        buffers.full_candidates[:, 0, :].copy_(buffers.full_global_indices)
+        buffers.full_candidates[:, 1, :].copy_(buffers.full_scores.view(torch.int32))
         dist.all_gather_into_tensor(
-            self.full_gathered_candidates,
-            self.full_candidates,
+            buffers.full_gathered_candidates,
+            buffers.full_candidates,
             group=self.indexer_group,
         )
         self._unpack_rank_major_candidates(
-            self.full_gathered_candidates,
-            self.full_candidate_indices,
-            self.full_candidate_scores,
+            buffers.full_gathered_candidates,
+            buffers.full_candidate_indices,
+            buffers.full_candidate_scores,
             rows=config.tp_rows,
+            local_topk=buffers.local_topk,
         )
         self._run_row_topk(
-            row_logits=self.full_candidate_scores,
-            lengths=self.full_candidate_lengths,
+            row_logits=buffers.full_candidate_scores,
+            lengths=buffers.full_candidate_lengths,
             topk=config.indexer_topk,
             output_values=self.full_merged_values,
             output_indices=self.full_merged_indices,
-            output_gather_table=self.full_candidate_indices,
+            output_gather_table=buffers.full_candidate_indices,
         )
 
-    def _merge_owner_candidates(self) -> None:
+    def _merge_owner_candidates(self, buffers: QueryBuffers) -> None:
         config = self.config
-        self._globalize_candidate_indices(self.local_indices, self.local_global_indices)
-        self.owner_candidates[:, 0, :].copy_(self.local_global_indices)
-        self.owner_candidates[:, 1, :].copy_(self.local_scores.view(torch.int32))
+        self._globalize_candidate_indices(
+            buffers.local_indices, buffers.local_global_indices
+        )
+        buffers.owner_candidates[:, 0, :].copy_(buffers.local_global_indices)
+        buffers.owner_candidates[:, 1, :].copy_(buffers.local_scores.view(torch.int32))
         dist.all_to_all_single(
-            self.owner_received_candidates,
-            self.owner_candidates,
+            buffers.owner_received_candidates,
+            buffers.owner_candidates,
             group=self.indexer_group,
         )
         self._unpack_rank_major_candidates(
-            self.owner_received_candidates,
-            self.owner_candidate_indices,
-            self.owner_candidate_scores,
+            buffers.owner_received_candidates,
+            buffers.owner_candidate_indices,
+            buffers.owner_candidate_scores,
             rows=self.owner_rows,
+            local_topk=buffers.local_topk,
         )
         self._run_row_topk(
-            row_logits=self.owner_candidate_scores,
-            lengths=self.owner_candidate_lengths,
+            row_logits=buffers.owner_candidate_scores,
+            lengths=buffers.owner_candidate_lengths,
             topk=config.indexer_topk,
             output_values=self.owner_merged_values,
             output_indices=self.owner_merged_indices,
-            output_gather_table=self.owner_candidate_indices,
+            output_gather_table=buffers.owner_candidate_indices,
         )
         dist.all_gather_into_tensor(
             self.gathered_indices,
@@ -924,10 +1070,19 @@ class CollectiveOverlapProbe:
         self, context_tokens: int, *, side_first: bool
     ) -> tuple[float, ...]:
         self._prepare()
+        release = torch.cuda.Event(enable_timing=True)
         tp_start = torch.cuda.Event(enable_timing=True)
         tp_end = torch.cuda.Event(enable_timing=True)
         ckv_start = torch.cuda.Event(enable_timing=True)
         ckv_end = torch.cuda.Event(enable_timing=True)
+
+        # Keep both worker streams behind one short GPU-side gate while the host
+        # queues their collectives. The gate is outside the measured interval.
+        with torch.cuda.stream(self.release_stream):
+            torch.cuda._sleep(2_000_000)
+            release.record()
+        self.main_stream.wait_event(release)
+        self.side_stream.wait_event(release)
 
         def launch_tp() -> None:
             with torch.cuda.stream(self.main_stream):
@@ -943,11 +1098,10 @@ class CollectiveOverlapProbe:
 
         first: Callable[[], None]
         second: Callable[[], None]
-        first_start: torch.cuda.Event
         if side_first:
-            first, second, first_start = launch_ckv, launch_tp, ckv_start
+            first, second = launch_ckv, launch_tp
         else:
-            first, second, first_start = launch_tp, launch_ckv, tp_start
+            first, second = launch_tp, launch_ckv
         first()
         second()
         tp_end.synchronize()
@@ -956,8 +1110,8 @@ class CollectiveOverlapProbe:
         tp_ms = self._elapsed(tp_start, tp_end)
         ckv_ms = self._elapsed(ckv_start, ckv_end)
         wall_ms = max(
-            self._elapsed(first_start, tp_end),
-            self._elapsed(first_start, ckv_end),
+            self._elapsed(release, tp_end),
+            self._elapsed(release, ckv_end),
         )
         return _global_max((tp_ms, ckv_ms, wall_ms))
 
@@ -978,10 +1132,11 @@ class CollectiveOverlapProbe:
             ).item()
         )
         local_bytes = self.config.ckv_local_bytes(context_tokens)
-        ckv_ok = all(
-            int(self.ckv_output[offset * local_bytes].item()) == offset + 1
-            for offset in range(self.config.dcp_size)
-        )
+        ckv_ok = True
+        for offset in range(self.config.dcp_size):
+            start = offset * local_bytes
+            chunk = self.ckv_output[start : start + local_bytes]
+            ckv_ok = ckv_ok and bool(torch.all(chunk == offset + 1).item())
         status = torch.tensor(
             [int(not tp_ok or not ckv_ok)], dtype=torch.int32, device="cpu"
         )
@@ -1031,28 +1186,45 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
     result: dict[str, Any] = {
         "config": asdict(config),
         "topology": topology,
+        "provenance": {
+            "command": os.getenv("SPARKINFER_PROBE_COMMAND", ""),
+            "source_revision": os.getenv("SPARKINFER_PROBE_SOURCE_REVISION", ""),
+            "source_worktree": os.getenv("SPARKINFER_PROBE_SOURCE_WORKTREE", ""),
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+        },
+        "correctness": {
+            "tp_dma_matches_nccl": False,
+            "tp_and_ckv_collectives": False,
+            "query_split_matches_replicated": False,
+        },
         "tp_allreduce": [],
         "contexts": [],
         "query_split": [],
     }
     try:
         probe.validate_tp_backends()
+        result["correctness"]["tp_dma_matches_nccl"] = True
         probe.validate_outputs(max(config.context_tokens))
+        result["correctness"]["tp_and_ckv_collectives"] = True
         for context_tokens in config.context_tokens:
             probe.validate_query_split(context_tokens)
+        result["correctness"]["query_split_matches_replicated"] = True
 
         backend_modes = ("nccl", "dma")
         backend_decisions: list[tuple[int, BackendDecision]] = []
         for row_index, rows in enumerate(config.allreduce_rows):
-            samples: dict[str, list[float]] = {mode: [] for mode in backend_modes}
+            backend_samples: dict[str, list[float]] = {
+                mode: [] for mode in backend_modes
+            }
             total_iterations = config.warmup_iterations + config.active_iterations
             for iteration in range(total_iterations):
                 for mode in _rotate(backend_modes, row_index + iteration):
                     value = probe.measure_tp_backend(rows, backend=mode)[0]
                     if iteration >= config.warmup_iterations:
-                        samples[mode].append(value)
-            nccl = summarize(samples["nccl"])
-            dma = summarize(samples["dma"])
+                        backend_samples[mode].append(value)
+            nccl = summarize(backend_samples["nccl"])
+            dma = summarize(backend_samples["dma"])
             payload_bytes = config.allreduce_payload_bytes(rows)
             decision = decide_tp_backend(
                 nccl_ms=nccl.median_ms,
@@ -1067,12 +1239,15 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                         "payload_bytes": payload_bytes,
                         "nccl": asdict(nccl),
                         "dma": asdict(dma),
+                        "samples_ms": backend_samples,
                         "decision": asdict(decision),
                     }
                 )
 
         for context_index, context_tokens in enumerate(config.context_tokens):
-            samples: dict[str, list[tuple[float, ...]]] = {mode: [] for mode in modes}
+            overlap_samples: dict[str, list[tuple[float, ...]]] = {
+                mode: [] for mode in modes
+            }
             total_iterations = config.warmup_iterations + config.active_iterations
             for iteration in range(total_iterations):
                 for mode in _rotate(modes, context_index + iteration):
@@ -1085,23 +1260,27 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                             context_tokens, side_first=mode == "side_first"
                         )
                     if iteration >= config.warmup_iterations:
-                        samples[mode].append(values)
+                        overlap_samples[mode].append(values)
 
-            tp = summarize([value[0] for value in samples["tp"]])
-            ckv = summarize([value[0] for value in samples["ckv"]])
-            side_tp = summarize([value[0] for value in samples["side_first"]])
-            side_ckv = summarize([value[1] for value in samples["side_first"]])
-            side_wall = summarize([value[2] for value in samples["side_first"]])
-            tp_first_tp = summarize([value[0] for value in samples["tp_first"]])
-            tp_first_ckv = summarize([value[1] for value in samples["tp_first"]])
-            tp_first_wall = summarize([value[2] for value in samples["tp_first"]])
+            tp = summarize([value[0] for value in overlap_samples["tp"]])
+            ckv = summarize([value[0] for value in overlap_samples["ckv"]])
+            side_tp = summarize([value[0] for value in overlap_samples["side_first"]])
+            side_ckv = summarize([value[1] for value in overlap_samples["side_first"]])
+            side_wall = summarize([value[2] for value in overlap_samples["side_first"]])
+            tp_first_tp = summarize([value[0] for value in overlap_samples["tp_first"]])
+            tp_first_ckv = summarize(
+                [value[1] for value in overlap_samples["tp_first"]]
+            )
+            tp_first_wall = summarize(
+                [value[2] for value in overlap_samples["tp_first"]]
+            )
 
             decision = decide_overlap(
                 tp_isolated_ms=tp.median_ms,
                 ckv_isolated_ms=ckv.median_ms,
-                concurrent_tp_ms=side_tp.median_ms,
-                concurrent_ckv_ms=side_ckv.median_ms,
-                concurrent_wall_ms=side_wall.median_ms,
+                concurrent_tp_ms=max(side_tp.median_ms, tp_first_tp.median_ms),
+                concurrent_ckv_ms=max(side_ckv.median_ms, tp_first_ckv.median_ms),
+                concurrent_wall_ms=max(side_wall.median_ms, tp_first_wall.median_ms),
                 ckv_wire_bytes_per_rank=config.ckv_wire_bytes_per_rank(context_tokens),
                 minimum_overlap_gain=config.minimum_overlap_gain,
                 maximum_collective_slowdown=config.maximum_collective_slowdown,
@@ -1127,6 +1306,10 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                             "ckv": asdict(tp_first_ckv),
                             "wall": asdict(tp_first_wall),
                         },
+                        "samples_ms": {
+                            mode: [list(values) for values in overlap_samples[mode]]
+                            for mode in modes
+                        },
                         "decision": asdict(decision),
                     }
                 )
@@ -1145,7 +1328,9 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
             query_decision = decide_query_split(
                 full_ms=full.median_ms,
                 split_ms=split.median_ms,
-                wire_bytes_per_rank=config.query_split_wire_bytes_per_rank(),
+                wire_bytes_per_rank=config.query_split_wire_bytes_per_rank(
+                    context_tokens
+                ),
                 minimum_query_split_gain=config.minimum_query_split_gain,
             )
             if rank == 0:
@@ -1155,18 +1340,23 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                         "indexer_local_tokens": config.indexer_local_tokens(
                             context_tokens
                         ),
+                        "indexer_local_topk": config.indexer_local_topk(context_tokens),
                         "query_split_size": config.query_split_size,
                         "full_rows": config.tp_rows,
                         "local_rows": config.query_split_rows,
                         "wire_bytes_per_rank": (
-                            config.query_split_wire_bytes_per_rank()
+                            config.query_split_wire_bytes_per_rank(context_tokens)
                         ),
                         "wire_breakdown_bytes_per_rank": {
                             "baseline_candidate_allgather": (
-                                config.baseline_candidate_wire_bytes_per_rank()
+                                config.baseline_candidate_wire_bytes_per_rank(
+                                    context_tokens
+                                )
                             ),
                             "owner_candidate_exchange": (
-                                config.owner_candidate_wire_bytes_per_rank()
+                                config.owner_candidate_wire_bytes_per_rank(
+                                    context_tokens
+                                )
                             ),
                             "final_topk_allgather": (
                                 config.query_split_final_wire_bytes_per_rank()
@@ -1174,6 +1364,7 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
                         },
                         "full": asdict(full),
                         "split": asdict(split),
+                        "samples_ms": query_samples,
                         "decision": asdict(query_decision),
                     }
                 )
@@ -1182,16 +1373,19 @@ def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
             overlap_decisions = [
                 ContextDecision(**row["decision"]) for row in result["contexts"]
             ]
-            enabled = [
-                row["context_tokens"]
-                for row in result["contexts"]
-                if row["decision"]["enable_overlap"]
-            ]
             result["recommended_prefetch_depth"] = recommend_prefetch_depth(
                 overlap_decisions,
                 maximum_overlap_regression=config.maximum_overlap_regression,
             )
-            result["maximum_safe_context_tokens"] = max(enabled, default=0)
+            result["maximum_safe_context_tokens"] = maximum_contiguous_enabled_context(
+                [
+                    (
+                        row["context_tokens"],
+                        row["decision"]["enable_overlap"],
+                    )
+                    for row in result["contexts"]
+                ]
+            )
             query_crossover = query_split_crossover_tokens(
                 [
                     (
@@ -1230,36 +1424,59 @@ def _parse_positive_ints(value: str) -> tuple[int, ...]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    defaults = ProbeConfig()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tp-size", type=int, default=8)
-    parser.add_argument("--dcp-size", type=int, default=4)
-    parser.add_argument("--hidden-size", type=int, default=6144)
-    parser.add_argument("--tp-rows", type=int, default=8192)
+    parser.add_argument("--tp-size", type=int, default=defaults.tp_size)
+    parser.add_argument("--dcp-size", type=int, default=defaults.dcp_size)
+    parser.add_argument("--hidden-size", type=int, default=defaults.hidden_size)
+    parser.add_argument("--tp-rows", type=int, default=defaults.tp_rows)
     parser.add_argument(
         "--allreduce-rows",
         type=_parse_positive_ints,
-        default=(1, 8, 32, 128, 512, 2048, 8192),
+        default=defaults.allreduce_rows,
     )
-    parser.add_argument("--ckv-record-bytes", type=int, default=656)
+    parser.add_argument(
+        "--ckv-record-bytes", type=int, default=defaults.ckv_record_bytes
+    )
     parser.add_argument(
         "--context-tokens",
         type=_parse_positive_ints,
-        default=(8192, 65536, 131072),
+        default=defaults.context_tokens,
     )
-    parser.add_argument("--indexer-shards", type=int, default=2)
-    parser.add_argument("--indexer-stride", type=int, default=4)
-    parser.add_argument("--indexer-heads", type=int, default=32)
-    parser.add_argument("--indexer-topk", type=int, default=2048)
-    parser.add_argument("--warmup-iterations", type=int, default=3)
-    parser.add_argument("--active-iterations", type=int, default=9)
-    parser.add_argument("--minimum-overlap-gain", type=float, default=0.02)
-    parser.add_argument("--minimum-backend-gain", type=float, default=0.02)
-    parser.add_argument("--minimum-query-split-gain", type=float, default=0.02)
-    parser.add_argument("--maximum-overlap-regression", type=float, default=0.01)
-    parser.add_argument("--maximum-collective-slowdown", type=float, default=4.0)
+    parser.add_argument("--indexer-shards", type=int, default=defaults.indexer_shards)
+    parser.add_argument("--indexer-stride", type=int, default=defaults.indexer_stride)
+    parser.add_argument("--indexer-heads", type=int, default=defaults.indexer_heads)
+    parser.add_argument("--indexer-topk", type=int, default=defaults.indexer_topk)
+    parser.add_argument(
+        "--warmup-iterations", type=int, default=defaults.warmup_iterations
+    )
+    parser.add_argument(
+        "--active-iterations", type=int, default=defaults.active_iterations
+    )
+    parser.add_argument(
+        "--minimum-overlap-gain", type=float, default=defaults.minimum_overlap_gain
+    )
+    parser.add_argument(
+        "--minimum-backend-gain", type=float, default=defaults.minimum_backend_gain
+    )
+    parser.add_argument(
+        "--minimum-query-split-gain",
+        type=float,
+        default=defaults.minimum_query_split_gain,
+    )
+    parser.add_argument(
+        "--maximum-overlap-regression",
+        type=float,
+        default=defaults.maximum_overlap_regression,
+    )
+    parser.add_argument(
+        "--maximum-collective-slowdown",
+        type=float,
+        default=defaults.maximum_collective_slowdown,
+    )
     parser.add_argument(
         "--dma-wire-mode",
-        default="0",
+        default=defaults.dma_wire_mode,
         help="automatic policy accepts only lossless BF16 mode 0",
     )
     parser.add_argument("--output", type=Path)
@@ -1289,7 +1506,7 @@ def _print_summary(result: dict[str, Any]) -> None:
             f"{row['context_tokens']:>7}  "
             f"{row['tp_isolated']['median_ms']:>6.2f}  "
             f"{row['ckv_isolated']['median_ms']:>7.2f}  "
-            f"{row['side_first']['wall']['median_ms']:>9.2f}  "
+            f"{decision['concurrent_wall_ms']:>9.2f}  "
             f"{decision['overlap_gain']:>6.1%}  "
             f"{decision['tp_slowdown']:>4.2f}  "
             f"{decision['ckv_slowdown']:>5.2f}  "
@@ -1321,12 +1538,6 @@ def _print_summary(result: dict[str, Any]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    if "RANK" not in os.environ:
-        print(
-            "This probe must run under torchrun; see --help for an example.",
-            file=sys.stderr,
-        )
-        return 2
     args = _build_parser().parse_args(argv)
     config = ProbeConfig(
         tp_size=args.tp_size,
@@ -1349,6 +1560,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         maximum_collective_slowdown=args.maximum_collective_slowdown,
         dma_wire_mode=args.dma_wire_mode,
     )
+    try:
+        config.validate()
+    except ValueError as exc:
+        print(f"invalid probe configuration: {exc}", file=sys.stderr)
+        return 2
+    if "RANK" not in os.environ:
+        print(
+            "This probe must run under torchrun; see --help for an example.",
+            file=sys.stderr,
+        )
+        return 2
     result = run_probe(config)
     if result is not None:
         _print_summary(result)

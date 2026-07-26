@@ -1,0 +1,1256 @@
+{
+  "config": {
+    "active_iterations": 9,
+    "allreduce_rows": [
+      1,
+      8,
+      32,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "ckv_record_bytes": 656,
+    "context_tokens": [
+      8192,
+      65536,
+      131072
+    ],
+    "dcp_size": 4,
+    "dma_wire_mode": "0",
+    "hidden_size": 6144,
+    "indexer_heads": 32,
+    "indexer_shards": 2,
+    "indexer_stride": 4,
+    "indexer_topk": 2048,
+    "maximum_collective_slowdown": 4.0,
+    "maximum_overlap_regression": 0.01,
+    "minimum_backend_gain": 0.02,
+    "minimum_overlap_gain": 0.02,
+    "minimum_query_split_gain": 0.02,
+    "tp_rows": 8192,
+    "tp_size": 8,
+    "warmup_iterations": 3
+  },
+  "contexts": [
+    {
+      "ckv_isolated": {
+        "maximum_ms": 0.18403199315071106,
+        "median_ms": 0.1685439944267273,
+        "minimum_ms": 0.1432960033416748
+      },
+      "ckv_local_bytes": 1343488,
+      "ckv_local_tokens": 2048,
+      "ckv_wire_bytes_per_rank": 4030464,
+      "context_tokens": 8192,
+      "decision": {
+        "ckv_effective_wire_gbps": 1.6205242426962776,
+        "ckv_slowdown": 14.756597502067935,
+        "concurrent_wall_ms": 5.559807777404785,
+        "enable_overlap": false,
+        "overlap_gain": -0.5953280562037611,
+        "reason": "insufficient-overlap-gain",
+        "serialized_ms": 3.4850561022758484,
+        "tp_slowdown": 1.675784553494277
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            0.1706240028142929
+          ],
+          [
+            0.1725119948387146
+          ],
+          [
+            0.14857600629329681
+          ],
+          [
+            0.1432960033416748
+          ],
+          [
+            0.17907199263572693
+          ],
+          [
+            0.1685439944267273
+          ],
+          [
+            0.1570879966020584
+          ],
+          [
+            0.14431999623775482
+          ],
+          [
+            0.18403199315071106
+          ]
+        ],
+        "side_first": [
+          [
+            5.584383964538574,
+            2.5055360794067383,
+            5.586463928222656
+          ],
+          [
+            5.557759761810303,
+            2.4824960231781006,
+            5.559807777404785
+          ],
+          [
+            5.549536228179932,
+            2.4822399616241455,
+            5.551583766937256
+          ],
+          [
+            5.587456226348877,
+            2.531680107116699,
+            5.589503765106201
+          ],
+          [
+            5.547520160675049,
+            2.476576089859009,
+            5.549439907073975
+          ],
+          [
+            5.5731201171875,
+            2.4863040447235107,
+            5.575168132781982
+          ],
+          [
+            5.541376113891602,
+            2.480288028717041,
+            5.543424129486084
+          ],
+          [
+            5.567999839782715,
+            2.5087039470672607,
+            5.570015907287598
+          ],
+          [
+            5.557568073272705,
+            2.4854719638824463,
+            5.559807777404785
+          ]
+        ],
+        "tp": [
+          [
+            3.276063919067383
+          ],
+          [
+            3.285792112350464
+          ],
+          [
+            3.2982399463653564
+          ],
+          [
+            3.328320026397705
+          ],
+          [
+            3.331712007522583
+          ],
+          [
+            3.341248035430908
+          ],
+          [
+            3.3029119968414307
+          ],
+          [
+            3.316512107849121
+          ],
+          [
+            3.4668478965759277
+          ]
+        ],
+        "tp_first": [
+          [
+            5.556735992431641,
+            2.4835519790649414,
+            5.558784008026123
+          ],
+          [
+            5.552639961242676,
+            2.4943039417266846,
+            5.554687976837158
+          ],
+          [
+            5.671296119689941,
+            2.5023679733276367,
+            5.673471927642822
+          ],
+          [
+            5.566976070404053,
+            2.48854398727417,
+            5.569056034088135
+          ],
+          [
+            5.554687976837158,
+            2.487135887145996,
+            5.55676794052124
+          ],
+          [
+            5.542399883270264,
+            2.487135887145996,
+            5.544447898864746
+          ],
+          [
+            5.561855792999268,
+            2.4933760166168213,
+            5.56390380859375
+          ],
+          [
+            5.556704044342041,
+            2.4845759868621826,
+            5.558752059936523
+          ],
+          [
+            5.699071884155273,
+            2.480832099914551,
+            5.7011518478393555
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 2.531680107116699,
+          "median_ms": 2.4854719638824463,
+          "minimum_ms": 2.476576089859009
+        },
+        "tp": {
+          "maximum_ms": 5.587456226348877,
+          "median_ms": 5.557759761810303,
+          "minimum_ms": 5.541376113891602
+        },
+        "wall": {
+          "maximum_ms": 5.589503765106201,
+          "median_ms": 5.559807777404785,
+          "minimum_ms": 5.543424129486084
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 2.5023679733276367,
+          "median_ms": 2.487135887145996,
+          "minimum_ms": 2.480832099914551
+        },
+        "tp": {
+          "maximum_ms": 5.699071884155273,
+          "median_ms": 5.556735992431641,
+          "minimum_ms": 5.542399883270264
+        },
+        "wall": {
+          "maximum_ms": 5.7011518478393555,
+          "median_ms": 5.558784008026123,
+          "minimum_ms": 5.544447898864746
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 3.4668478965759277,
+        "median_ms": 3.316512107849121,
+        "minimum_ms": 3.276063919067383
+      }
+    },
+    {
+      "ckv_isolated": {
+        "maximum_ms": 0.8194239735603333,
+        "median_ms": 0.7903040051460266,
+        "minimum_ms": 0.7679359912872314
+      },
+      "ckv_local_bytes": 10747904,
+      "ckv_local_tokens": 16384,
+      "ckv_wire_bytes_per_rank": 32243712,
+      "context_tokens": 65536,
+      "decision": {
+        "ckv_effective_wire_gbps": 1.6493987498961866,
+        "ckv_slowdown": 24.73575606671976,
+        "concurrent_wall_ms": 21.649919509887695,
+        "enable_overlap": false,
+        "overlap_gain": -4.285624860037861,
+        "reason": "insufficient-overlap-gain",
+        "serialized_ms": 4.096000015735626,
+        "tp_slowdown": 6.548658090597871
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            0.7770559787750244
+          ],
+          [
+            0.7821760177612305
+          ],
+          [
+            0.7679359912872314
+          ],
+          [
+            0.8095359802246094
+          ],
+          [
+            0.798911988735199
+          ],
+          [
+            0.8194239735603333
+          ],
+          [
+            0.7903040051460266
+          ],
+          [
+            0.8163520097732544
+          ],
+          [
+            0.7892799973487854
+          ]
+        ],
+        "side_first": [
+          [
+            21.635583877563477,
+            19.528383255004883,
+            21.637664794921875
+          ],
+          [
+            21.78099250793457,
+            19.679840087890625,
+            21.783039093017578
+          ],
+          [
+            21.627391815185547,
+            19.529983520507812,
+            21.629472732543945
+          ],
+          [
+            21.647872924804688,
+            19.542943954467773,
+            21.649919509887695
+          ],
+          [
+            21.641727447509766,
+            19.54876708984375,
+            21.643808364868164
+          ],
+          [
+            21.723615646362305,
+            19.61235237121582,
+            21.725536346435547
+          ],
+          [
+            21.651872634887695,
+            19.562847137451172,
+            21.65398406982422
+          ],
+          [
+            21.650911331176758,
+            19.554079055786133,
+            21.65283203125
+          ],
+          [
+            21.609983444213867,
+            19.51535987854004,
+            21.612031936645508
+          ]
+        ],
+        "tp": [
+          [
+            3.28604793548584
+          ],
+          [
+            3.3056960105895996
+          ],
+          [
+            3.3090879917144775
+          ],
+          [
+            3.297919988632202
+          ],
+          [
+            3.3022398948669434
+          ],
+          [
+            3.2989120483398438
+          ],
+          [
+            3.309727907180786
+          ],
+          [
+            3.3271679878234863
+          ],
+          [
+            3.3182079792022705
+          ]
+        ],
+        "tp_first": [
+          [
+            21.61916732788086,
+            19.52422332763672,
+            21.621248245239258
+          ],
+          [
+            21.630464553833008,
+            19.534975051879883,
+            21.632511138916016
+          ],
+          [
+            21.601791381835938,
+            19.505184173583984,
+            21.60380744934082
+          ],
+          [
+            21.77894401550293,
+            19.676639556884766,
+            21.78099250793457
+          ],
+          [
+            21.292543411254883,
+            19.166048049926758,
+            21.294591903686523
+          ],
+          [
+            21.643775939941406,
+            19.545888900756836,
+            21.64579200744629
+          ],
+          [
+            21.814783096313477,
+            19.7073917388916,
+            21.816831588745117
+          ],
+          [
+            21.723648071289062,
+            19.632736206054688,
+            21.725696563720703
+          ],
+          [
+            21.637632369995117,
+            19.539104461669922,
+            21.639680862426758
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 19.679840087890625,
+          "median_ms": 19.54876708984375,
+          "minimum_ms": 19.51535987854004
+        },
+        "tp": {
+          "maximum_ms": 21.78099250793457,
+          "median_ms": 21.647872924804688,
+          "minimum_ms": 21.609983444213867
+        },
+        "wall": {
+          "maximum_ms": 21.783039093017578,
+          "median_ms": 21.649919509887695,
+          "minimum_ms": 21.612031936645508
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 19.7073917388916,
+          "median_ms": 19.539104461669922,
+          "minimum_ms": 19.166048049926758
+        },
+        "tp": {
+          "maximum_ms": 21.814783096313477,
+          "median_ms": 21.637632369995117,
+          "minimum_ms": 21.292543411254883
+        },
+        "wall": {
+          "maximum_ms": 21.816831588745117,
+          "median_ms": 21.639680862426758,
+          "minimum_ms": 21.294591903686523
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 3.3271679878234863,
+        "median_ms": 3.3056960105895996,
+        "minimum_ms": 3.28604793548584
+      }
+    },
+    {
+      "ckv_isolated": {
+        "maximum_ms": 1.5275520086288452,
+        "median_ms": 1.5053759813308716,
+        "minimum_ms": 1.4924479722976685
+      },
+      "ckv_local_bytes": 21495808,
+      "ckv_local_tokens": 32768,
+      "ckv_wire_bytes_per_rank": 64487424,
+      "context_tokens": 131072,
+      "decision": {
+        "ckv_effective_wire_gbps": 1.6601261241879077,
+        "ckv_slowdown": 25.804114647051644,
+        "concurrent_wall_ms": 39.843326568603516,
+        "enable_overlap": false,
+        "overlap_gain": -7.238410489595382,
+        "reason": "insufficient-overlap-gain",
+        "serialized_ms": 4.836288094520569,
+        "tp_slowdown": 11.961072684297557
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            1.5030720233917236
+          ],
+          [
+            1.4924479722976685
+          ],
+          [
+            1.5275520086288452
+          ],
+          [
+            1.5236480236053467
+          ],
+          [
+            1.5049599409103394
+          ],
+          [
+            1.521888017654419
+          ],
+          [
+            1.5053759813308716
+          ],
+          [
+            1.4985599517822266
+          ],
+          [
+            1.5193599462509155
+          ]
+        ],
+        "side_first": [
+          [
+            38.703617095947266,
+            37.674495697021484,
+            38.705665588378906
+          ],
+          [
+            39.909854888916016,
+            38.895423889160156,
+            39.911903381347656
+          ],
+          [
+            39.83705520629883,
+            38.83763122558594,
+            39.839134216308594
+          ],
+          [
+            39.90460968017578,
+            38.89753723144531,
+            39.90681457519531
+          ],
+          [
+            39.84128189086914,
+            38.84489440917969,
+            39.843326568603516
+          ],
+          [
+            39.87507247924805,
+            38.87238311767578,
+            39.87712097167969
+          ],
+          [
+            39.75116729736328,
+            38.7655029296875,
+            39.75321578979492
+          ],
+          [
+            39.84022521972656,
+            38.82601547241211,
+            39.84233474731445
+          ],
+          [
+            39.85142517089844,
+            38.85353469848633,
+            39.853599548339844
+          ]
+        ],
+        "tp": [
+          [
+            3.3309121131896973
+          ],
+          [
+            3.421056032180786
+          ],
+          [
+            3.3365440368652344
+          ],
+          [
+            5.282495975494385
+          ],
+          [
+            3.306720018386841
+          ],
+          [
+            3.511647939682007
+          ],
+          [
+            3.3228800296783447
+          ],
+          [
+            3.3207039833068848
+          ],
+          [
+            3.2858879566192627
+          ]
+        ],
+        "tp_first": [
+          [
+            39.86073684692383,
+            38.87065505981445,
+            39.86278533935547
+          ],
+          [
+            39.892478942871094,
+            38.89433670043945,
+            39.894527435302734
+          ],
+          [
+            39.756256103515625,
+            38.741310119628906,
+            39.75836944580078
+          ],
+          [
+            39.887359619140625,
+            38.87507247924805,
+            39.889408111572266
+          ],
+          [
+            37.249534606933594,
+            36.25094223022461,
+            37.251583099365234
+          ],
+          [
+            39.82182312011719,
+            38.818241119384766,
+            39.82387161254883
+          ],
+          [
+            38.324737548828125,
+            37.32115173339844,
+            38.3267822265625
+          ],
+          [
+            37.02732849121094,
+            36.02649688720703,
+            37.02937698364258
+          ],
+          [
+            40.01331329345703,
+            39.0195198059082,
+            40.01536178588867
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 38.89753723144531,
+          "median_ms": 38.84489440917969,
+          "minimum_ms": 37.674495697021484
+        },
+        "tp": {
+          "maximum_ms": 39.909854888916016,
+          "median_ms": 39.84128189086914,
+          "minimum_ms": 38.703617095947266
+        },
+        "wall": {
+          "maximum_ms": 39.911903381347656,
+          "median_ms": 39.843326568603516,
+          "minimum_ms": 38.705665588378906
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 39.0195198059082,
+          "median_ms": 38.818241119384766,
+          "minimum_ms": 36.02649688720703
+        },
+        "tp": {
+          "maximum_ms": 40.01331329345703,
+          "median_ms": 39.82182312011719,
+          "minimum_ms": 37.02732849121094
+        },
+        "wall": {
+          "maximum_ms": 40.01536178588867,
+          "median_ms": 39.82387161254883,
+          "minimum_ms": 37.02937698364258
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 5.282495975494385,
+        "median_ms": 3.3309121131896973,
+        "minimum_ms": 3.2858879566192627
+      }
+    }
+  ],
+  "correctness": {
+    "query_split_matches_replicated": true,
+    "tp_and_ckv_collectives": true,
+    "tp_dma_matches_nccl": true
+  },
+  "maximum_safe_context_tokens": 0,
+  "policy": {
+    "compressed_dma_requires_explicit_opt_in": true,
+    "dcp_ckv_prefetch_depth": 0,
+    "dcp_query_split": 1,
+    "dcp_query_split_min_context_tokens": 8192,
+    "numeric_contract": "lossless-only",
+    "tp_allreduce": {
+      "dma_min_bytes": 25165824,
+      "dma_wire_mode": "bf16",
+      "fallback": "nccl"
+    }
+  },
+  "provenance": {
+    "command": "CUDA_VISIBLE_DEVICES=0,2,4,6,8,10,12,14 torchrun --standalone --nproc-per-node=8 -m sparkinfer.comm.pcie.overlap_probe --tp-size 8 --dcp-size 4 --context-tokens 8192,65536,131072 --output interleaved-gpu-even-f3fb62c.json",
+    "cuda_version": "13.2",
+    "source_revision": "f3fb62c8af5bf6759e28a067b4e6fc8732a9e497",
+    "source_worktree": "/root/vllm/worktrees/sparkinfer-pcie-calibration-pr-20260726",
+    "torch_version": "2.12.0+cu132"
+  },
+  "query_split": [
+    {
+      "context_tokens": 8192,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 2.6943039894104004,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.2314928327639011,
+        "split_ms": 2.070591926574707,
+        "wire_bytes_per_rank": 67108864
+      },
+      "full": {
+        "maximum_ms": 2.749216079711914,
+        "median_ms": 2.6943039894104004,
+        "minimum_ms": 2.6824960708618164
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 1024,
+      "indexer_local_topk": 1024,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          2.6931519508361816,
+          2.6893439292907715,
+          2.749216079711914,
+          2.7446401119232178,
+          2.6824960708618164,
+          2.69814395904541,
+          2.6943039894104004,
+          2.6989760398864746,
+          2.691103935241699
+        ],
+        "split": [
+          2.070591926574707,
+          2.066943883895874,
+          2.079967975616455,
+          2.0713601112365723,
+          2.063744068145752,
+          2.0637760162353516,
+          2.0432639122009277,
+          2.09500789642334,
+          2.0974719524383545
+        ]
+      },
+      "split": {
+        "maximum_ms": 2.0974719524383545,
+        "median_ms": 2.070591926574707,
+        "minimum_ms": 2.0432639122009277
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 67108864,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 8388608
+      },
+      "wire_bytes_per_rank": 67108864
+    },
+    {
+      "context_tokens": 65536,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 5.860544204711914,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.5782889840015648,
+        "split_ms": 2.4714560508728027,
+        "wire_bytes_per_rank": 75497472
+      },
+      "full": {
+        "maximum_ms": 5.910175800323486,
+        "median_ms": 5.860544204711914,
+        "minimum_ms": 5.839424133300781
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 8192,
+      "indexer_local_topk": 2048,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          5.850143909454346,
+          5.868768215179443,
+          5.860544204711914,
+          5.841599941253662,
+          5.853312015533447,
+          5.8787841796875,
+          5.839424133300781,
+          5.910175800323486,
+          5.907264232635498
+        ],
+        "split": [
+          2.512255907058716,
+          3.2150399684906006,
+          2.4671359062194824,
+          2.4598400592803955,
+          2.460479974746704,
+          2.4684479236602783,
+          2.4714560508728027,
+          2.4799039363861084,
+          2.500159978866577
+        ]
+      },
+      "split": {
+        "maximum_ms": 3.2150399684906006,
+        "median_ms": 2.4714560508728027,
+        "minimum_ms": 2.4598400592803955
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 134217728,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 16777216
+      },
+      "wire_bytes_per_rank": 75497472
+    },
+    {
+      "context_tokens": 131072,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 6.77180814743042,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.6011794801271498,
+        "split_ms": 2.7007360458374023,
+        "wire_bytes_per_rank": 75497472
+      },
+      "full": {
+        "maximum_ms": 6.791967868804932,
+        "median_ms": 6.77180814743042,
+        "minimum_ms": 6.738495826721191
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 16384,
+      "indexer_local_topk": 2048,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          6.7788801193237305,
+          6.738495826721191,
+          6.774335861206055,
+          6.742847919464111,
+          6.77180814743042,
+          6.791967868804932,
+          6.7678399085998535,
+          6.765952110290527,
+          6.77564811706543
+        ],
+        "split": [
+          2.7007360458374023,
+          2.7064640522003174,
+          2.7269439697265625,
+          2.6981120109558105,
+          2.7017600536346436,
+          2.688960075378418,
+          2.783967971801758,
+          2.6925439834594727,
+          2.697824001312256
+        ]
+      },
+      "split": {
+        "maximum_ms": 2.783967971801758,
+        "median_ms": 2.7007360458374023,
+        "minimum_ms": 2.688960075378418
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 134217728,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 16777216
+      },
+      "wire_bytes_per_rank": 75497472
+    }
+  ],
+  "recommended_prefetch_depth": 0,
+  "topology": {
+    "cuda_visible_devices": "0,2,4,6,8,10,12,14",
+    "gpu_inventory": "0, 00000000:03:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n1, 00000000:04:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n2, 00000000:23:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n3, 00000000:24:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n4, 00000000:43:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n5, 00000000:44:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n6, 00000000:63:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n7, 00000000:64:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n8, 00000000:83:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n9, 00000000:84:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n10, 00000000:A3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n11, 00000000:A4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n12, 00000000:C3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n13, 00000000:C4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n14, 00000000:E3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n15, 00000000:E4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "nvidia_visible_devices": "all",
+    "rank_devices": [
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:03:00.0",
+        "rank": 0,
+        "uuid": "d8438b2d-f000-a617-5dcc-0197ce0365a3",
+        "visible_ordinal": 0
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:23:00.0",
+        "rank": 1,
+        "uuid": "167fbc3f-fd06-7f08-9e06-ee02946d041c",
+        "visible_ordinal": 1
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:43:00.0",
+        "rank": 2,
+        "uuid": "8800cf0c-1ba5-7136-d796-2a91f9e9586e",
+        "visible_ordinal": 2
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:63:00.0",
+        "rank": 3,
+        "uuid": "1a0323f7-8113-a1e1-c68b-f23fecf77171",
+        "visible_ordinal": 3
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:83:00.0",
+        "rank": 4,
+        "uuid": "2a2cd7c3-b91f-092c-309d-cda7e408f659",
+        "visible_ordinal": 4
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:a3:00.0",
+        "rank": 5,
+        "uuid": "6171baff-cc22-608e-4029-507f67c392ff",
+        "visible_ordinal": 5
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:c3:00.0",
+        "rank": 6,
+        "uuid": "3304d777-8f0e-2767-419a-d72ffa553141",
+        "visible_ordinal": 6
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:e3:00.0",
+        "rank": 7,
+        "uuid": "a2f726b2-60db-8102-abef-abf76c457fe0",
+        "visible_ordinal": 7
+      }
+    ],
+    "topology_matrix": "\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tGPU8\tGPU9\tGPU10\tGPU11\tGPU12\tGPU13\tGPU14\tGPU15\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU1\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU2\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU3\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU4\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU5\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU6\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU7\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU8\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU9\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU10\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU11\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU12\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU13\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\t0-127\t0\t\tN/A\nGPU14\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\t0-127\t0\t\tN/A\nGPU15\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \t0-127\t0\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks"
+  },
+  "tp_allreduce": [
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -4.874932292410932,
+        "dma_ms": 0.3487359881401062,
+        "nccl_ms": 0.05936000123620033,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.4039359986782074,
+        "median_ms": 0.3487359881401062,
+        "minimum_ms": 0.33087998628616333
+      },
+      "nccl": {
+        "maximum_ms": 0.07862400263547897,
+        "median_ms": 0.05936000123620033,
+        "minimum_ms": 0.05283199995756149
+      },
+      "payload_bytes": 12288,
+      "rows": 1,
+      "samples_ms": {
+        "dma": [
+          0.39212799072265625,
+          0.3487359881401062,
+          0.33132800459861755,
+          0.3463680148124695,
+          0.33087998628616333,
+          0.3540799915790558,
+          0.3417600095272064,
+          0.37248000502586365,
+          0.4039359986782074
+        ],
+        "nccl": [
+          0.07862400263547897,
+          0.05484800040721893,
+          0.05936000123620033,
+          0.07321599870920181,
+          0.05283199995756149,
+          0.05756799876689911,
+          0.06185600161552429,
+          0.05503999814391136,
+          0.07395199686288834
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -3.85752836191238,
+        "dma_ms": 0.3458560109138489,
+        "nccl_ms": 0.07119999825954437,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.8400319814682007,
+        "median_ms": 0.3458560109138489,
+        "minimum_ms": 0.3307519853115082
+      },
+      "nccl": {
+        "maximum_ms": 0.07900799810886383,
+        "median_ms": 0.07119999825954437,
+        "minimum_ms": 0.04732799902558327
+      },
+      "payload_bytes": 98304,
+      "rows": 8,
+      "samples_ms": {
+        "dma": [
+          0.36588799953460693,
+          0.33395200967788696,
+          0.3503359854221344,
+          0.3418239951133728,
+          0.3458560109138489,
+          0.3307519853115082,
+          0.818880021572113,
+          0.3315199911594391,
+          0.8400319814682007
+        ],
+        "nccl": [
+          0.07846400141716003,
+          0.07900799810886383,
+          0.07119999825954437,
+          0.04732799902558327,
+          0.07430399954319,
+          0.06137600168585777,
+          0.06531199812889099,
+          0.048767998814582825,
+          0.07827199995517731
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -3.631370797514482,
+        "dma_ms": 0.3373120129108429,
+        "nccl_ms": 0.07283200323581696,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.3500159978866577,
+        "median_ms": 0.3373120129108429,
+        "minimum_ms": 0.3240320086479187
+      },
+      "nccl": {
+        "maximum_ms": 0.09254399687051773,
+        "median_ms": 0.07283200323581696,
+        "minimum_ms": 0.06835199892520905
+      },
+      "payload_bytes": 393216,
+      "rows": 32,
+      "samples_ms": {
+        "dma": [
+          0.3240320086479187,
+          0.33686399459838867,
+          0.33612799644470215,
+          0.33849599957466125,
+          0.3386879861354828,
+          0.3383040130138397,
+          0.3272640109062195,
+          0.3373120129108429,
+          0.3500159978866577
+        ],
+        "nccl": [
+          0.07785599678754807,
+          0.07231999933719635,
+          0.08848000317811966,
+          0.08656000345945358,
+          0.06835199892520905,
+          0.06880000233650208,
+          0.07283200323581696,
+          0.07235199958086014,
+          0.09254399687051773
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -2.0536075863794276,
+        "dma_ms": 0.33721598982810974,
+        "nccl_ms": 0.11043199896812439,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.3617599904537201,
+        "median_ms": 0.33721598982810974,
+        "minimum_ms": 0.32473599910736084
+      },
+      "nccl": {
+        "maximum_ms": 0.12777599692344666,
+        "median_ms": 0.11043199896812439,
+        "minimum_ms": 0.09676799923181534
+      },
+      "payload_bytes": 1572864,
+      "rows": 128,
+      "samples_ms": {
+        "dma": [
+          0.35443198680877686,
+          0.33420801162719727,
+          0.3373759984970093,
+          0.32473599910736084,
+          0.3617599904537201,
+          0.3327679932117462,
+          0.32793599367141724,
+          0.3479039967060089,
+          0.33721598982810974
+        ],
+        "nccl": [
+          0.11459200084209442,
+          0.10512000322341919,
+          0.09676799923181534,
+          0.11043199896812439,
+          0.10329599678516388,
+          0.11727999895811081,
+          0.12531200051307678,
+          0.12777599692344666,
+          0.09676799923181534
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -0.3840532341060324,
+        "dma_ms": 0.4060479998588562,
+        "nccl_ms": 0.29337599873542786,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.41923201084136963,
+        "median_ms": 0.4060479998588562,
+        "minimum_ms": 0.37487998604774475
+      },
+      "nccl": {
+        "maximum_ms": 0.31244799494743347,
+        "median_ms": 0.29337599873542786,
+        "minimum_ms": 0.28467199206352234
+      },
+      "payload_bytes": 6291456,
+      "rows": 512,
+      "samples_ms": {
+        "dma": [
+          0.4119360148906708,
+          0.40355199575424194,
+          0.4069119989871979,
+          0.39212799072265625,
+          0.40460801124572754,
+          0.4060479998588562,
+          0.40780800580978394,
+          0.41923201084136963,
+          0.37487998604774475
+        ],
+        "nccl": [
+          0.2908799946308136,
+          0.2952960133552551,
+          0.28512001037597656,
+          0.29052799940109253,
+          0.31244799494743347,
+          0.29337599873542786,
+          0.28467199206352234,
+          0.30480000376701355,
+          0.30320000648498535
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "sparkinfer-dma",
+        "dma_gain": 0.06526114363858038,
+        "dma_ms": 0.876800000667572,
+        "nccl_ms": 0.9380159974098206,
+        "reason": "measured-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.9141119718551636,
+        "median_ms": 0.876800000667572,
+        "minimum_ms": 0.8632000088691711
+      },
+      "nccl": {
+        "maximum_ms": 0.954367995262146,
+        "median_ms": 0.9380159974098206,
+        "minimum_ms": 0.92876797914505
+      },
+      "payload_bytes": 25165824,
+      "rows": 2048,
+      "samples_ms": {
+        "dma": [
+          0.8696960210800171,
+          0.8665599822998047,
+          0.901856005191803,
+          0.8632000088691711,
+          0.8680639863014221,
+          0.876800000667572,
+          0.8827840089797974,
+          0.8917120099067688,
+          0.9141119718551636
+        ],
+        "nccl": [
+          0.9339200258255005,
+          0.944159984588623,
+          0.92876797914505,
+          0.9461759924888611,
+          0.954367995262146,
+          0.942080020904541,
+          0.9380159974098206,
+          0.9339200258255005,
+          0.9349439740180969
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "sparkinfer-dma",
+        "dma_gain": 0.09518204220551163,
+        "dma_ms": 3.295680046081543,
+        "nccl_ms": 3.6423680782318115,
+        "reason": "measured-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 3.454047918319702,
+        "median_ms": 3.295680046081543,
+        "minimum_ms": 3.277343988418579
+      },
+      "nccl": {
+        "maximum_ms": 3.714047908782959,
+        "median_ms": 3.6423680782318115,
+        "minimum_ms": 3.6382720470428467
+      },
+      "payload_bytes": 100663296,
+      "rows": 8192,
+      "samples_ms": {
+        "dma": [
+          3.277343988418579,
+          3.454047918319702,
+          3.2932159900665283,
+          3.290656089782715,
+          3.4518399238586426,
+          3.295680046081543,
+          3.4420480728149414,
+          3.2829439640045166,
+          3.3941121101379395
+        ],
+        "nccl": [
+          3.6382720470428467,
+          3.6382720470428467,
+          3.654655933380127,
+          3.6382720470428467,
+          3.6474881172180176,
+          3.6464641094207764,
+          3.6423680782318115,
+          3.640320062637329,
+          3.714047908782959
+        ]
+      }
+    }
+  ]
+}

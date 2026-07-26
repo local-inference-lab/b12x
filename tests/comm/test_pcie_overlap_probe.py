@@ -9,6 +9,7 @@ from sparkinfer.comm.pcie.overlap_probe import (
     decide_overlap,
     decide_tp_backend,
     dma_crossover_bytes,
+    maximum_contiguous_enabled_context,
     query_split_crossover_tokens,
     recommend_prefetch_depth,
     summarize,
@@ -24,11 +25,16 @@ def test_glm52_payload_geometry() -> None:
     assert config.ckv_wire_bytes_per_rank(65_536) == 32_243_712
     assert config.query_split_size == 4
     assert config.query_split_rows == 2048
+    assert config.indexer_local_topk(8192) == 1024
+    assert config.indexer_local_topk(65_536) == 2048
     assert config.indexer_local_tokens(65_536) == 8192
-    assert config.baseline_candidate_wire_bytes_per_rank() == 134_217_728
-    assert config.owner_candidate_wire_bytes_per_rank() == 16_777_216
+    assert config.baseline_candidate_wire_bytes_per_rank(65_536) == 134_217_728
+    assert config.owner_candidate_wire_bytes_per_rank(65_536) == 16_777_216
     assert config.query_split_final_wire_bytes_per_rank() == 58_720_256
-    assert config.query_split_wire_bytes_per_rank() == 75_497_472
+    assert config.query_split_wire_bytes_per_rank(65_536) == 75_497_472
+    assert config.baseline_candidate_wire_bytes_per_rank(8192) == 67_108_864
+    assert config.owner_candidate_wire_bytes_per_rank(8192) == 8_388_608
+    assert config.query_split_wire_bytes_per_rank(8192) == 67_108_864
 
 
 def test_config_rejects_non_divisible_dcp() -> None:
@@ -47,6 +53,16 @@ def test_config_accepts_dcp1_for_tp_and_query_calibration() -> None:
 def test_config_rejects_automatic_lossy_dma() -> None:
     with pytest.raises(ValueError, match="lossless BF16 DMA"):
         ProbeConfig(dma_wire_mode="ring").validate()
+
+
+def test_config_rejects_invalid_owner_merge_geometry() -> None:
+    with pytest.raises(ValueError, match="tp_size for owner merge"):
+        ProbeConfig(tp_rows=12, allreduce_rows=(1,)).validate()
+
+
+def test_config_rejects_too_few_global_index_candidates() -> None:
+    with pytest.raises(ValueError, match="global candidates"):
+        ProbeConfig(context_tokens=(4096,)).validate()
 
 
 def test_summarize_uses_median_and_extrema() -> None:
@@ -148,6 +164,16 @@ def test_prefetch_policy_accepts_small_context_noise_but_rejects_collapse() -> N
     )
 
 
+def test_maximum_safe_context_requires_contiguous_enabled_prefix() -> None:
+    assert (
+        maximum_contiguous_enabled_context(
+            [(131_072, True), (8192, True), (65_536, False)]
+        )
+        == 8192
+    )
+    assert maximum_contiguous_enabled_context([(8192, False), (65_536, True)]) == 0
+
+
 def test_tp_backend_requires_material_dma_gain() -> None:
     win = decide_tp_backend(
         nccl_ms=10.0,
@@ -182,7 +208,7 @@ def test_dma_crossover_requires_winning_tail() -> None:
         (4096, _backend("sparkinfer-dma")),
         (8192, _backend("sparkinfer-dma")),
     ]
-    late_loss = points + [(16384, _backend("nccl"))]
+    late_loss = [*points, (16384, _backend("nccl"))]
 
     assert dma_crossover_bytes(points) == 2048
     assert dma_crossover_bytes(late_loss) == 0
