@@ -469,3 +469,110 @@ def test_planned_full_rotation_matches_reference_and_captures(
     torch.cuda.synchronize(device)
     assert captured_output.data_ptr() == external_output.data_ptr()
     assert torch.allclose(captured_output, mapped_eager, rtol=2.0e-3, atol=2.0e-3)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8])
+def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
+    """Small-m coverage at production geometry, with m < plan capacity.
+
+    Motivated by vLLM issue #183, which reported that widening the Trellis window
+    (VLLM_EXL3_TRELLIS_MIN_M=1) so an MTP-N draft's m=1..N GEMMs stay on the fused
+    path silently corrupts output. m < moe_block_size means the route packer emits
+    mostly-padding blocks (at m=3, topk=8 roughly 1-3 real rows of 8), so padding
+    masking is load-bearing and was previously untested: the only numerical test on
+    this path ran m == max_tokens == 2 with topk=2 and a non-production tile.
+
+    Three oracles:
+      * per-token bitwise equality against an m=1 run of the same token. A token's
+        output depends only on its own routes, so batching must not change a bit.
+      * the scratch arena pre-filled with 0xFF (NaN in fp32/fp16) before every
+        bind, so any read of a padding/uninitialised slot surfaces as NaN.
+      * plan capacity 32 vs m, i.e. the window-widening regime itself.
+    """
+    torch.manual_seed(20260726)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, hidden, intermediate = 32, 1024, 1024
+    bits, topk, capacity = 3, 8, 32
+    tile_config = (64, 256, 64, 256)
+
+    w13 = torch.randint(
+        -32768, 32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16, device=device,
+    )
+    w2 = torch.randint(
+        -32768, 32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16, device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    weights = trellis_moe.prepare_weights(
+        w13,
+        w2,
+        gate_suh=scales((experts, hidden)).contiguous(),
+        up_suh=scales((experts, hidden)).contiguous(),
+        intermediate_rotations=scales((experts, 3 * intermediate)).contiguous(),
+        down_svh=scales((experts, hidden)).contiguous(),
+        codebook="mcg",
+        mcg=0xCBAC1FED,
+        tile_config=tile_config,
+    )
+    plan = trellis_moe.plan(
+        trellis_moe.Caps(
+            max_tokens=capacity,
+            num_topk=topk,
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            route_num_experts=experts,
+            block_size_m=8,
+            trellis_bits=bits,
+            tile_config=tile_config,
+            input_dtype=torch.bfloat16,
+            device=device,
+        )
+    )
+    assert plan.fused_launch.moe_block_size == 8
+    assert plan.fused_launch.full_rotation
+
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.stack(
+        [torch.randperm(experts, device=device)[:topk] for _ in range(m)]
+    ).to(torch.int32)
+    router_weights = torch.rand((m, topk), dtype=torch.float32, device=device)
+    router_weights /= router_weights.sum(dim=1, keepdim=True)
+
+    def _run(rows: slice) -> torch.Tensor:
+        # NaN-poison the arena so a padding-slot read cannot pass silently.
+        scratch.fill_(0xFF)
+        binding = trellis_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x[rows].contiguous(),
+            weights=weights,
+            topk_weights=router_weights[rows].contiguous(),
+            topk_ids=ids[rows].contiguous(),
+        )
+        out = trellis_moe.run(binding=binding)
+        torch.cuda.synchronize(device)
+        return out.clone()
+
+    batched = _run(slice(0, m))
+    assert not torch.isnan(batched).any(), (
+        f"NaN in fused output at m={m}: a padding or uninitialised arena slot was read"
+    )
+
+    for row in range(m):
+        single = _run(slice(row, row + 1))
+        assert not torch.isnan(single).any()
+        assert torch.equal(batched[row], single[0]), (
+            f"row {row} of an m={m} batch differs from its own m=1 run; a token's "
+            "output must not depend on how many other tokens share the batch"
+        )
