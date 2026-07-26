@@ -1,0 +1,1256 @@
+{
+  "config": {
+    "active_iterations": 9,
+    "allreduce_rows": [
+      1,
+      8,
+      32,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "ckv_record_bytes": 656,
+    "context_tokens": [
+      8192,
+      65536,
+      131072
+    ],
+    "dcp_size": 4,
+    "dma_wire_mode": "0",
+    "hidden_size": 6144,
+    "indexer_heads": 32,
+    "indexer_shards": 2,
+    "indexer_stride": 4,
+    "indexer_topk": 2048,
+    "maximum_collective_slowdown": 4.0,
+    "maximum_overlap_regression": 0.01,
+    "minimum_backend_gain": 0.02,
+    "minimum_overlap_gain": 0.02,
+    "minimum_query_split_gain": 0.02,
+    "tp_rows": 8192,
+    "tp_size": 8,
+    "warmup_iterations": 3
+  },
+  "contexts": [
+    {
+      "ckv_isolated": {
+        "maximum_ms": 0.18892799317836761,
+        "median_ms": 0.15503999590873718,
+        "minimum_ms": 0.14428800344467163
+      },
+      "ckv_local_bytes": 1343488,
+      "ckv_local_tokens": 2048,
+      "ckv_wire_bytes_per_rank": 4030464,
+      "context_tokens": 8192,
+      "decision": {
+        "ckv_effective_wire_gbps": 13.472243440142524,
+        "ckv_slowdown": 1.9296181538898625,
+        "concurrent_wall_ms": 3.3561599254608154,
+        "enable_overlap": true,
+        "overlap_gain": 0.0309346888643073,
+        "reason": "measured-overlap-benefit",
+        "serialized_ms": 3.4632959067821503,
+        "tp_slowdown": 1.0138610797436205
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            0.15503999590873718
+          ],
+          [
+            0.14707200229167938
+          ],
+          [
+            0.16448000073432922
+          ],
+          [
+            0.14428800344467163
+          ],
+          [
+            0.18892799317836761
+          ],
+          [
+            0.16780799627304077
+          ],
+          [
+            0.14867199957370758
+          ],
+          [
+            0.15721599757671356
+          ],
+          [
+            0.151296004652977
+          ]
+        ],
+        "side_first": [
+          [
+            3.356127977371216,
+            0.29926401376724243,
+            3.3581759929656982
+          ],
+          [
+            3.3274879455566406,
+            0.2690240144729614,
+            3.329535961151123
+          ],
+          [
+            3.3459200859069824,
+            0.28303998708724976,
+            3.3477439880371094
+          ],
+          [
+            3.354111909866333,
+            0.29120001196861267,
+            3.3561599254608154
+          ],
+          [
+            3.3407680988311768,
+            0.27059200406074524,
+            3.3427200317382812
+          ],
+          [
+            3.356127977371216,
+            0.2917119860649109,
+            3.3581759929656982
+          ],
+          [
+            3.339776039123535,
+            0.27663999795913696,
+            3.3418240547180176
+          ],
+          [
+            3.378688097000122,
+            0.3181439936161041,
+            3.380768060684204
+          ],
+          [
+            3.354111909866333,
+            0.2922239899635315,
+            3.3561599254608154
+          ]
+        ],
+        "tp": [
+          [
+            3.305056095123291
+          ],
+          [
+            3.333184003829956
+          ],
+          [
+            3.3131520748138428
+          ],
+          [
+            3.297919988632202
+          ],
+          [
+            3.319295883178711
+          ],
+          [
+            3.32857608795166
+          ],
+          [
+            3.308255910873413
+          ],
+          [
+            3.272128105163574
+          ],
+          [
+            3.2688000202178955
+          ]
+        ],
+        "tp_first": [
+          [
+            3.3520638942718506,
+            0.2869119942188263,
+            3.354111909866333
+          ],
+          [
+            3.3785600662231445,
+            0.3259519934654236,
+            3.3807361125946045
+          ],
+          [
+            3.376447916030884,
+            0.3203519880771637,
+            3.378688097000122
+          ],
+          [
+            3.359231948852539,
+            0.301503986120224,
+            3.3612799644470215
+          ],
+          [
+            3.3459200859069824,
+            0.27667200565338135,
+            3.3478078842163086
+          ],
+          [
+            3.339776039123535,
+            0.2845759987831116,
+            3.3416318893432617
+          ],
+          [
+            3.323359966278076,
+            0.2655999958515167,
+            3.3254079818725586
+          ],
+          [
+            3.363327980041504,
+            0.3083840012550354,
+            3.365216016769409
+          ],
+          [
+            3.346911907196045,
+            0.2991679906845093,
+            3.348992109298706
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 0.3181439936161041,
+          "median_ms": 0.29120001196861267,
+          "minimum_ms": 0.2690240144729614
+        },
+        "tp": {
+          "maximum_ms": 3.378688097000122,
+          "median_ms": 3.354111909866333,
+          "minimum_ms": 3.3274879455566406
+        },
+        "wall": {
+          "maximum_ms": 3.380768060684204,
+          "median_ms": 3.3561599254608154,
+          "minimum_ms": 3.329535961151123
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 0.3259519934654236,
+          "median_ms": 0.2991679906845093,
+          "minimum_ms": 0.2655999958515167
+        },
+        "tp": {
+          "maximum_ms": 3.3785600662231445,
+          "median_ms": 3.3520638942718506,
+          "minimum_ms": 3.323359966278076
+        },
+        "wall": {
+          "maximum_ms": 3.3807361125946045,
+          "median_ms": 3.354111909866333,
+          "minimum_ms": 3.3254079818725586
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 3.333184003829956,
+        "median_ms": 3.308255910873413,
+        "minimum_ms": 3.2688000202178955
+      }
+    },
+    {
+      "ckv_isolated": {
+        "maximum_ms": 0.8526399731636047,
+        "median_ms": 0.7663999795913696,
+        "minimum_ms": 0.7591040134429932
+      },
+      "ckv_local_bytes": 10747904,
+      "ckv_local_tokens": 16384,
+      "ckv_wire_bytes_per_rank": 32243712,
+      "context_tokens": 65536,
+      "decision": {
+        "ckv_effective_wire_gbps": 16.81854709844756,
+        "ckv_slowdown": 2.501503259667984,
+        "concurrent_wall_ms": 3.9285759925842285,
+        "enable_overlap": true,
+        "overlap_gain": 0.031064501205388888,
+        "reason": "measured-overlap-benefit",
+        "serialized_ms": 4.0545278787612915,
+        "tp_slowdown": 1.1939973786577847
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            0.7815679907798767
+          ],
+          [
+            0.7591040134429932
+          ],
+          [
+            0.7663999795913696
+          ],
+          [
+            0.7670080065727234
+          ],
+          [
+            0.7627840042114258
+          ],
+          [
+            0.8526399731636047
+          ],
+          [
+            0.7626240253448486
+          ],
+          [
+            0.7810879945755005
+          ],
+          [
+            0.7643839716911316
+          ]
+        ],
+        "side_first": [
+          [
+            3.906048059463501,
+            1.8980799913406372,
+            3.9080960750579834
+          ],
+          [
+            3.916287899017334,
+            1.9106559753417969,
+            3.9183359146118164
+          ],
+          [
+            3.910111904144287,
+            1.9097280502319336,
+            3.9121599197387695
+          ],
+          [
+            3.910111904144287,
+            1.910207986831665,
+            3.9121599197387695
+          ],
+          [
+            3.9060161113739014,
+            1.9100159406661987,
+            3.9080638885498047
+          ],
+          [
+            3.9367361068725586,
+            1.9567680358886719,
+            3.938783884048462
+          ],
+          [
+            3.918272018432617,
+            1.9136639833450317,
+            3.920383930206299
+          ],
+          [
+            3.898848056793213,
+            1.9083839654922485,
+            3.9008960723876953
+          ],
+          [
+            3.9060161113739014,
+            1.9090880155563354,
+            3.9080960750579834
+          ]
+        ],
+        "tp": [
+          [
+            3.275871992111206
+          ],
+          [
+            3.282815933227539
+          ],
+          [
+            3.302367925643921
+          ],
+          [
+            3.322495937347412
+          ],
+          [
+            3.2780160903930664
+          ],
+          [
+            3.2836480140686035
+          ],
+          [
+            3.440959930419922
+          ],
+          [
+            3.288127899169922
+          ],
+          [
+            3.3224639892578125
+          ]
+        ],
+        "tp_first": [
+          [
+            3.906048059463501,
+            1.9151359796524048,
+            3.9079360961914062
+          ],
+          [
+            3.9418880939483643,
+            1.9378559589385986,
+            3.9438400268554688
+          ],
+          [
+            3.9183359146118164,
+            1.9255679845809937,
+            3.920383930206299
+          ],
+          [
+            3.9285759925842285,
+            1.9171520471572876,
+            3.930624008178711
+          ],
+          [
+            3.9080960750579834,
+            1.9125440120697021,
+            3.910144090652466
+          ],
+          [
+            4.379839897155762,
+            1.9068479537963867,
+            4.382207870483398
+          ],
+          [
+            3.947999954223633,
+            1.9449280500411987,
+            3.949824094772339
+          ],
+          [
+            3.926016092300415,
+            1.924896001815796,
+            3.9285759925842285
+          ],
+          [
+            3.8978559970855713,
+            1.9080640077590942,
+            3.899456024169922
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 1.9567680358886719,
+          "median_ms": 1.9100159406661987,
+          "minimum_ms": 1.8980799913406372
+        },
+        "tp": {
+          "maximum_ms": 3.9367361068725586,
+          "median_ms": 3.910111904144287,
+          "minimum_ms": 3.898848056793213
+        },
+        "wall": {
+          "maximum_ms": 3.938783884048462,
+          "median_ms": 3.9121599197387695,
+          "minimum_ms": 3.9008960723876953
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 1.9449280500411987,
+          "median_ms": 1.9171520471572876,
+          "minimum_ms": 1.9068479537963867
+        },
+        "tp": {
+          "maximum_ms": 4.379839897155762,
+          "median_ms": 3.926016092300415,
+          "minimum_ms": 3.8978559970855713
+        },
+        "wall": {
+          "maximum_ms": 4.382207870483398,
+          "median_ms": 3.9285759925842285,
+          "minimum_ms": 3.899456024169922
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 3.440959930419922,
+        "median_ms": 3.288127899169922,
+        "minimum_ms": 3.275871992111206
+      }
+    },
+    {
+      "ckv_isolated": {
+        "maximum_ms": 1.507200002670288,
+        "median_ms": 1.4855040311813354,
+        "minimum_ms": 1.4758720397949219
+      },
+      "ckv_local_bytes": 21495808,
+      "ckv_local_tokens": 32768,
+      "ckv_wire_bytes_per_rank": 64487424,
+      "context_tokens": 131072,
+      "decision": {
+        "ckv_effective_wire_gbps": 16.949251068236123,
+        "ckv_slowdown": 2.5612423925540417,
+        "concurrent_wall_ms": 4.596223831176758,
+        "enable_overlap": true,
+        "overlap_gain": 0.03847266967110914,
+        "reason": "measured-overlap-benefit",
+        "serialized_ms": 4.780128121376038,
+        "tp_slowdown": 1.394436433936588
+      },
+      "samples_ms": {
+        "ckv": [
+          [
+            1.493888020515442
+          ],
+          [
+            1.4855040311813354
+          ],
+          [
+            1.481376051902771
+          ],
+          [
+            1.4883519411087036
+          ],
+          [
+            1.5033279657363892
+          ],
+          [
+            1.507200002670288
+          ],
+          [
+            1.4793599843978882
+          ],
+          [
+            1.4771840572357178
+          ],
+          [
+            1.4758720397949219
+          ]
+        ],
+        "side_first": [
+          [
+            4.6044158935546875,
+            3.8158719539642334,
+            4.60643196105957
+          ],
+          [
+            4.5960001945495605,
+            3.813920021057129,
+            4.59827184677124
+          ],
+          [
+            4.624864101409912,
+            3.826240062713623,
+            4.6269121170043945
+          ],
+          [
+            4.58076810836792,
+            3.80131196975708,
+            4.582911968231201
+          ],
+          [
+            4.680191993713379,
+            3.7963199615478516,
+            4.682208061218262
+          ],
+          [
+            4.56550407409668,
+            3.7973759174346924,
+            4.5675201416015625
+          ],
+          [
+            4.581888198852539,
+            3.8047358989715576,
+            4.5839362144470215
+          ],
+          [
+            4.5839362144470215,
+            3.807391881942749,
+            4.585824012756348
+          ],
+          [
+            4.56550407409668,
+            3.792543888092041,
+            4.567552089691162
+          ]
+        ],
+        "tp": [
+          [
+            3.287935972213745
+          ],
+          [
+            3.294624090194702
+          ],
+          [
+            3.302464008331299
+          ],
+          [
+            3.302112102508545
+          ],
+          [
+            3.3885440826416016
+          ],
+          [
+            3.281440019607544
+          ],
+          [
+            3.3570239543914795
+          ],
+          [
+            3.2844159603118896
+          ],
+          [
+            3.2884159088134766
+          ]
+        ],
+        "tp_first": [
+          [
+            4.612576007843018,
+            3.8067519664764404,
+            4.6146240234375
+          ],
+          [
+            4.601183891296387,
+            3.8171839714050293,
+            4.60316801071167
+          ],
+          [
+            4.581855773925781,
+            3.8015360832214355,
+            4.583744049072266
+          ],
+          [
+            4.5696001052856445,
+            3.788896083831787,
+            4.571584224700928
+          ],
+          [
+            4.595200061798096,
+            3.7983360290527344,
+            4.5972161293029785
+          ],
+          [
+            4.6187520027160645,
+            3.8175361156463623,
+            4.620800018310547
+          ],
+          [
+            4.594143867492676,
+            3.800640106201172,
+            4.596223831176758
+          ],
+          [
+            4.579808235168457,
+            3.7889599800109863,
+            4.581888198852539
+          ],
+          [
+            4.569568157196045,
+            3.803071975708008,
+            4.571616172790527
+          ]
+        ]
+      },
+      "side_first": {
+        "ckv": {
+          "maximum_ms": 3.826240062713623,
+          "median_ms": 3.8047358989715576,
+          "minimum_ms": 3.792543888092041
+        },
+        "tp": {
+          "maximum_ms": 4.680191993713379,
+          "median_ms": 4.5839362144470215,
+          "minimum_ms": 4.56550407409668
+        },
+        "wall": {
+          "maximum_ms": 4.682208061218262,
+          "median_ms": 4.585824012756348,
+          "minimum_ms": 4.5675201416015625
+        }
+      },
+      "tp_first": {
+        "ckv": {
+          "maximum_ms": 3.8175361156463623,
+          "median_ms": 3.8015360832214355,
+          "minimum_ms": 3.788896083831787
+        },
+        "tp": {
+          "maximum_ms": 4.6187520027160645,
+          "median_ms": 4.594143867492676,
+          "minimum_ms": 4.569568157196045
+        },
+        "wall": {
+          "maximum_ms": 4.620800018310547,
+          "median_ms": 4.596223831176758,
+          "minimum_ms": 4.571584224700928
+        }
+      },
+      "tp_isolated": {
+        "maximum_ms": 3.3885440826416016,
+        "median_ms": 3.294624090194702,
+        "minimum_ms": 3.281440019607544
+      }
+    }
+  ],
+  "correctness": {
+    "query_split_matches_replicated": true,
+    "tp_and_ckv_collectives": true,
+    "tp_dma_matches_nccl": true
+  },
+  "maximum_safe_context_tokens": 131072,
+  "policy": {
+    "compressed_dma_requires_explicit_opt_in": true,
+    "dcp_ckv_prefetch_depth": 1,
+    "dcp_query_split": 1,
+    "dcp_query_split_min_context_tokens": 8192,
+    "numeric_contract": "lossless-only",
+    "tp_allreduce": {
+      "dma_min_bytes": 25165824,
+      "dma_wire_mode": "bf16",
+      "fallback": "nccl"
+    }
+  },
+  "provenance": {
+    "command": "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc-per-node=8 -m sparkinfer.comm.pcie.overlap_probe --tp-size 8 --dcp-size 4 --context-tokens 8192,65536,131072 --output adjacent-gpu0-7-f3fb62c.json",
+    "cuda_version": "13.2",
+    "source_revision": "f3fb62c8af5bf6759e28a067b4e6fc8732a9e497",
+    "source_worktree": "/root/vllm/worktrees/sparkinfer-pcie-calibration-pr-20260726",
+    "torch_version": "2.12.0+cu132"
+  },
+  "query_split": [
+    {
+      "context_tokens": 8192,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 2.689631938934326,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.23408409119154155,
+        "split_ms": 2.0600318908691406,
+        "wire_bytes_per_rank": 67108864
+      },
+      "full": {
+        "maximum_ms": 2.717855930328369,
+        "median_ms": 2.689631938934326,
+        "minimum_ms": 2.6721279621124268
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 1024,
+      "indexer_local_topk": 1024,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          2.687488079071045,
+          2.689631938934326,
+          2.715712070465088,
+          2.71126389503479,
+          2.685663938522339,
+          2.6721279621124268,
+          2.6863040924072266,
+          2.717855930328369,
+          2.704511880874634
+        ],
+        "split": [
+          2.0600318908691406,
+          2.053056001663208,
+          2.0457921028137207,
+          2.0721280574798584,
+          2.0549440383911133,
+          2.068959951400757,
+          2.046623945236206,
+          2.1287999153137207,
+          2.5588159561157227
+        ]
+      },
+      "split": {
+        "maximum_ms": 2.5588159561157227,
+        "median_ms": 2.0600318908691406,
+        "minimum_ms": 2.0457921028137207
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 67108864,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 8388608
+      },
+      "wire_bytes_per_rank": 67108864
+    },
+    {
+      "context_tokens": 65536,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 5.838687896728516,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.5783216884874136,
+        "split_ms": 2.462048053741455,
+        "wire_bytes_per_rank": 75497472
+      },
+      "full": {
+        "maximum_ms": 8.941503524780273,
+        "median_ms": 5.838687896728516,
+        "minimum_ms": 5.807295799255371
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 8192,
+      "indexer_local_topk": 2048,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          5.81385612487793,
+          5.807295799255371,
+          5.838687896728516,
+          5.8144001960754395,
+          5.857823848724365,
+          5.867231845855713,
+          5.826079845428467,
+          8.941503524780273,
+          5.8448638916015625
+        ],
+        "split": [
+          2.4626240730285645,
+          2.466815948486328,
+          2.4560320377349854,
+          2.4774720668792725,
+          2.4562880992889404,
+          2.461440086364746,
+          2.482016086578369,
+          2.462048053741455,
+          2.4565439224243164
+        ]
+      },
+      "split": {
+        "maximum_ms": 2.482016086578369,
+        "median_ms": 2.462048053741455,
+        "minimum_ms": 2.4560320377349854
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 134217728,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 16777216
+      },
+      "wire_bytes_per_rank": 75497472
+    },
+    {
+      "context_tokens": 131072,
+      "decision": {
+        "enable_query_split": true,
+        "full_ms": 6.7182722091674805,
+        "reason": "measured-full-phase-benefit",
+        "split_gain": 0.6039172239123223,
+        "split_ms": 2.660991907119751,
+        "wire_bytes_per_rank": 75497472
+      },
+      "full": {
+        "maximum_ms": 6.768735885620117,
+        "median_ms": 6.7182722091674805,
+        "minimum_ms": 6.689216136932373
+      },
+      "full_rows": 8192,
+      "indexer_local_tokens": 16384,
+      "indexer_local_topk": 2048,
+      "local_rows": 2048,
+      "query_split_size": 4,
+      "samples_ms": {
+        "full": [
+          6.768735885620117,
+          6.7136640548706055,
+          6.742176055908203,
+          6.706528186798096,
+          6.708415985107422,
+          6.7182722091674805,
+          6.76361608505249,
+          6.734367847442627,
+          6.689216136932373
+        ],
+        "split": [
+          2.6619200706481934,
+          2.654304027557373,
+          2.6945600509643555,
+          2.65395188331604,
+          2.7003839015960693,
+          2.6898880004882812,
+          2.6571199893951416,
+          2.660991907119751,
+          2.6575679779052734
+        ]
+      },
+      "split": {
+        "maximum_ms": 2.7003839015960693,
+        "median_ms": 2.660991907119751,
+        "minimum_ms": 2.65395188331604
+      },
+      "wire_breakdown_bytes_per_rank": {
+        "baseline_candidate_allgather": 134217728,
+        "final_topk_allgather": 58720256,
+        "owner_candidate_exchange": 16777216
+      },
+      "wire_bytes_per_rank": 75497472
+    }
+  ],
+  "recommended_prefetch_depth": 1,
+  "topology": {
+    "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+    "gpu_inventory": "0, 00000000:03:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n1, 00000000:04:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n2, 00000000:23:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n3, 00000000:24:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n4, 00000000:43:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n5, 00000000:44:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n6, 00000000:63:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n7, 00000000:64:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n8, 00000000:83:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n9, 00000000:84:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n10, 00000000:A3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n11, 00000000:A4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n12, 00000000:C3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n13, 00000000:C4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n14, 00000000:E3:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition\n15, 00000000:E4:00.0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "nvidia_visible_devices": "all",
+    "rank_devices": [
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:03:00.0",
+        "rank": 0,
+        "uuid": "d8438b2d-f000-a617-5dcc-0197ce0365a3",
+        "visible_ordinal": 0
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:04:00.0",
+        "rank": 1,
+        "uuid": "3747d42a-c416-459c-cf88-bc2e84f471b1",
+        "visible_ordinal": 1
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:23:00.0",
+        "rank": 2,
+        "uuid": "167fbc3f-fd06-7f08-9e06-ee02946d041c",
+        "visible_ordinal": 2
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:24:00.0",
+        "rank": 3,
+        "uuid": "2a06548e-41c5-2a0e-240b-9ec8d85d6f60",
+        "visible_ordinal": 3
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:43:00.0",
+        "rank": 4,
+        "uuid": "8800cf0c-1ba5-7136-d796-2a91f9e9586e",
+        "visible_ordinal": 4
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:44:00.0",
+        "rank": 5,
+        "uuid": "4a0aa20b-8e36-2e05-4efb-8befbf1181d4",
+        "visible_ordinal": 5
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:63:00.0",
+        "rank": 6,
+        "uuid": "1a0323f7-8113-a1e1-c68b-f23fecf77171",
+        "visible_ordinal": 6
+      },
+      {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "pci_address": "00000000:64:00.0",
+        "rank": 7,
+        "uuid": "0027fc86-3322-ce2a-856c-f49eb61eb63e",
+        "visible_ordinal": 7
+      }
+    ],
+    "topology_matrix": "\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tGPU8\tGPU9\tGPU10\tGPU11\tGPU12\tGPU13\tGPU14\tGPU15\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU1\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU2\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU3\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU4\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU5\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU6\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU7\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU8\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU9\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU10\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU11\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU12\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\tNODE\tNODE\t0-127\t0\t\tN/A\nGPU13\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \tNODE\tNODE\t0-127\t0\t\tN/A\nGPU14\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\t X \tPIX\t0-127\t0\t\tN/A\nGPU15\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tNODE\tPIX\t X \t0-127\t0\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks"
+  },
+  "tp_allreduce": [
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -4.744235849826857,
+        "dma_ms": 0.34281599521636963,
+        "nccl_ms": 0.05967999994754791,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.3654080033302307,
+        "median_ms": 0.34281599521636963,
+        "minimum_ms": 0.33609598875045776
+      },
+      "nccl": {
+        "maximum_ms": 0.07302399724721909,
+        "median_ms": 0.05967999994754791,
+        "minimum_ms": 0.04755200073122978
+      },
+      "payload_bytes": 12288,
+      "rows": 1,
+      "samples_ms": {
+        "dma": [
+          0.34281599521636963,
+          0.3494400084018707,
+          0.33609598875045776,
+          0.35158398747444153,
+          0.3378239870071411,
+          0.34121599793434143,
+          0.3424000144004822,
+          0.3473599851131439,
+          0.3654080033302307
+        ],
+        "nccl": [
+          0.05967999994754791,
+          0.06323199719190598,
+          0.07302399724721909,
+          0.05129599943757057,
+          0.06204799935221672,
+          0.04755200073122978,
+          0.04867200180888176,
+          0.049056001007556915,
+          0.07267200201749802
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -4.6945455460283805,
+        "dma_ms": 0.3507840037345886,
+        "nccl_ms": 0.06159999966621399,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.8544319868087769,
+        "median_ms": 0.3507840037345886,
+        "minimum_ms": 0.3272320032119751
+      },
+      "nccl": {
+        "maximum_ms": 0.07043199986219406,
+        "median_ms": 0.06159999966621399,
+        "minimum_ms": 0.046560000628232956
+      },
+      "payload_bytes": 98304,
+      "rows": 8,
+      "samples_ms": {
+        "dma": [
+          0.3507840037345886,
+          0.3272320032119751,
+          0.35199999809265137,
+          0.3359360098838806,
+          0.34620800614356995,
+          0.33401599526405334,
+          0.819104015827179,
+          0.35206401348114014,
+          0.8544319868087769
+        ],
+        "nccl": [
+          0.061664000153541565,
+          0.06159999966621399,
+          0.04982399940490723,
+          0.06710399687290192,
+          0.05158400163054466,
+          0.06339199841022491,
+          0.04995200037956238,
+          0.07043199986219406,
+          0.046560000628232956
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -3.562900118728739,
+        "dma_ms": 0.3424000144004822,
+        "nccl_ms": 0.07503999769687653,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.37779200077056885,
+        "median_ms": 0.3424000144004822,
+        "minimum_ms": 0.33452799916267395
+      },
+      "nccl": {
+        "maximum_ms": 0.09203200042247772,
+        "median_ms": 0.07503999769687653,
+        "minimum_ms": 0.05318399891257286
+      },
+      "payload_bytes": 393216,
+      "rows": 32,
+      "samples_ms": {
+        "dma": [
+          0.37779200077056885,
+          0.34275200963020325,
+          0.3407039940357208,
+          0.3424000144004822,
+          0.3357760012149811,
+          0.3436799943447113,
+          0.3423680067062378,
+          0.344543993473053,
+          0.33452799916267395
+        ],
+        "nccl": [
+          0.09203200042247772,
+          0.07814399898052216,
+          0.06492800265550613,
+          0.05318399891257286,
+          0.06796800345182419,
+          0.07503999769687653,
+          0.0650240033864975,
+          0.07631999999284744,
+          0.07795199751853943
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -1.7815584098912747,
+        "dma_ms": 0.3426879942417145,
+        "nccl_ms": 0.12319999933242798,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.3537920117378235,
+        "median_ms": 0.3426879942417145,
+        "minimum_ms": 0.3386560082435608
+      },
+      "nccl": {
+        "maximum_ms": 0.1324159950017929,
+        "median_ms": 0.12319999933242798,
+        "minimum_ms": 0.10630399733781815
+      },
+      "payload_bytes": 1572864,
+      "rows": 128,
+      "samples_ms": {
+        "dma": [
+          0.34332799911499023,
+          0.3426879942417145,
+          0.3463680148124695,
+          0.3413439989089966,
+          0.3436799943447113,
+          0.33929601311683655,
+          0.3537920117378235,
+          0.33929601311683655,
+          0.3386560082435608
+        ],
+        "nccl": [
+          0.1281599998474121,
+          0.11849600076675415,
+          0.1324159950017929,
+          0.12319999933242798,
+          0.11913599818944931,
+          0.11657600104808807,
+          0.10630399733781815,
+          0.12950399518013,
+          0.12595200538635254
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "nccl",
+        "dma_gain": -0.3724318392654063,
+        "dma_ms": 0.40400001406669617,
+        "nccl_ms": 0.2943679988384247,
+        "reason": "no-material-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.42182400822639465,
+        "median_ms": 0.40400001406669617,
+        "minimum_ms": 0.3805440068244934
+      },
+      "nccl": {
+        "maximum_ms": 0.34780800342559814,
+        "median_ms": 0.2943679988384247,
+        "minimum_ms": 0.2771199941635132
+      },
+      "payload_bytes": 6291456,
+      "rows": 512,
+      "samples_ms": {
+        "dma": [
+          0.42182400822639465,
+          0.41600000858306885,
+          0.4028480052947998,
+          0.40137600898742676,
+          0.4106239974498749,
+          0.4084480106830597,
+          0.3805440068244934,
+          0.4023680090904236,
+          0.40400001406669617
+        ],
+        "nccl": [
+          0.3025600016117096,
+          0.2771199941635132,
+          0.2919040024280548,
+          0.29017600417137146,
+          0.27775999903678894,
+          0.34780800342559814,
+          0.3041599988937378,
+          0.2943679988384247,
+          0.2969920039176941
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "sparkinfer-dma",
+        "dma_gain": 0.06093374705179362,
+        "dma_ms": 0.8837440013885498,
+        "nccl_ms": 0.9410880208015442,
+        "reason": "measured-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 0.89164799451828,
+        "median_ms": 0.8837440013885498,
+        "minimum_ms": 0.872704029083252
+      },
+      "nccl": {
+        "maximum_ms": 0.9553920030593872,
+        "median_ms": 0.9410880208015442,
+        "minimum_ms": 0.9359359741210938
+      },
+      "payload_bytes": 25165824,
+      "rows": 2048,
+      "samples_ms": {
+        "dma": [
+          0.8880959749221802,
+          0.8740800023078918,
+          0.89164799451828,
+          0.8812800049781799,
+          0.872704029083252,
+          0.874176025390625,
+          0.8861439824104309,
+          0.8883839845657349,
+          0.8837440013885498
+        ],
+        "nccl": [
+          0.9544000029563904,
+          0.9380159974098206,
+          0.9513279795646667,
+          0.9359359741210938,
+          0.9553920030593872,
+          0.936959981918335,
+          0.9492480158805847,
+          0.9410880208015442,
+          0.9400320053100586
+        ]
+      }
+    },
+    {
+      "decision": {
+        "backend": "sparkinfer-dma",
+        "dma_gain": 0.10130182815466274,
+        "dma_ms": 3.2825920581817627,
+        "nccl_ms": 3.6526079177856445,
+        "reason": "measured-dma-benefit"
+      },
+      "dma": {
+        "maximum_ms": 3.298367977142334,
+        "median_ms": 3.2825920581817627,
+        "minimum_ms": 3.2688000202178955
+      },
+      "nccl": {
+        "maximum_ms": 3.668992042541504,
+        "median_ms": 3.6526079177856445,
+        "minimum_ms": 3.636255979537964
+      },
+      "payload_bytes": 100663296,
+      "rows": 8192,
+      "samples_ms": {
+        "dma": [
+          3.2745919227600098,
+          3.2856318950653076,
+          3.2811520099639893,
+          3.274303913116455,
+          3.2825920581817627,
+          3.2888638973236084,
+          3.2688000202178955,
+          3.298367977142334,
+          3.283263921737671
+        ],
+        "nccl": [
+          3.636255979537964,
+          3.6526079177856445,
+          3.638240098953247,
+          3.6485118865966797,
+          3.659775972366333,
+          3.668992042541504,
+          3.6577279567718506,
+          3.6382720470428467,
+          3.6526079177856445
+        ]
+      }
+    }
+  ]
+}
