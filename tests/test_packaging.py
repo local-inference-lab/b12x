@@ -12,6 +12,7 @@ ROOT = Path(__file__).parents[1]
 PCIE_PACKAGE = "sparkinfer.comm.pcie"
 RUNTIME_CUDA_SOURCES = {
     "pcie_dcp_a2a.cu",
+    "pcie_dcp_topk.cu",
     "pcie_dma.cu",
     "pcie_oneshot.cu",
     "pcie_twoshot.cu",

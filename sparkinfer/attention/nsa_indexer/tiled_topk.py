@@ -16,7 +16,7 @@ import os
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
@@ -180,6 +180,7 @@ def _load_value_virtual(
 def _emit_global_index_virtual(
     carry_indices,
     output_page_table,
+    output_page_table_row_stride: Int32,
     row_start: Int32,
     output_index_offset: Int32,
     carry_base: Int32,
@@ -210,7 +211,11 @@ def _emit_global_index_virtual(
         if gidx >= Int32(0):
             page_col = gidx // page_size
             page_offset = gidx - page_col * page_size
-            page_id = Int32(output_page_table[row_idx, page_col])
+            page_table_index = (
+                Int64(row_idx) * Int64(output_page_table_row_stride)
+                + Int64(page_col)
+            )
+            page_id = Int32(output_page_table[page_table_index])
             if page_id >= Int32(0):
                 physical_idx = page_id * page_size + page_offset
         gidx = physical_idx
@@ -551,6 +556,7 @@ class SparseNSATiledTopkKernel:
         carry_values,
         carry_indices,
         output_page_table,
+        output_page_table_row_stride,
         batch_size,
         input_stride,
         num_k_tiles,
@@ -575,6 +581,7 @@ class SparseNSATiledTopkKernel:
             carry_values,
             carry_indices,
             output_page_table,
+            output_page_table_row_stride,
             batch_size,
             input_stride,
             num_k_tiles,
@@ -605,6 +612,7 @@ class SparseNSATiledTopkKernel:
         carry_values: cute.Tensor,
         carry_indices: cute.Tensor,
         output_page_table: cute.Tensor,
+        output_page_table_row_stride: Int32,
         batch_size: Int32,
         input_stride: Int32,
         num_k_tiles: Int32,
@@ -767,6 +775,7 @@ class SparseNSATiledTopkKernel:
                     _emit_global_index_virtual(
                         carry_indices,
                         output_page_table,
+                        output_page_table_row_stride,
                         row_start,
                         output_index_offset,
                         out_base,
@@ -1188,6 +1197,7 @@ class SparseNSATiledTopkKernel:
                 indices[out_base + idx0] = _emit_global_index_virtual(
                     carry_indices,
                     output_page_table,
+                    output_page_table_row_stride,
                     row_start,
                     output_index_offset,
                     out_base,
@@ -1217,6 +1227,7 @@ class SparseNSATiledTopkKernel:
                 indices[out_base + idx1] = _emit_global_index_virtual(
                     carry_indices,
                     output_page_table,
+                    output_page_table_row_stride,
                     row_start,
                     output_index_offset,
                     out_base,
@@ -1377,11 +1388,18 @@ def run_tiled_topk(
             raise ValueError(
                 f"output_page_size must be positive, got {output_page_size}"
             )
-        output_page_table_for_kernel = output_page_table
+        output_page_table_row_stride = int(output_page_table.stride(0))
+        if output_page_table_row_stride == 0:
+            # A row-shared expanded table has no flattenable multi-row view.
+            # Pass its single physical row and retain stride 0 in the kernel.
+            output_page_table_for_kernel = output_page_table[0].reshape(-1)
+        else:
+            output_page_table_for_kernel = output_page_table.reshape(-1)
     else:
         # The physical mapping branch is constexpr-elided. Reuse row metadata as
         # its dummy tensor so ordinary tiled top-k remains allocation-free.
         output_page_table_for_kernel = lengths
+        output_page_table_row_stride = 0
         output_page_size = 1
     num_q_tiles = (num_q_rows + block_q - 1) // block_q
     tile_size = block_q * block_k
@@ -1505,6 +1523,7 @@ def run_tiled_topk(
         _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(output_page_table_for_kernel, cutlass.Int32, assumed_align=4),
+        Int32(output_page_table_row_stride),
         Int32(num_q_rows * extent_splits),
         input_stride,
         Int32(num_k_tiles),
@@ -1530,20 +1549,14 @@ def run_tiled_topk(
         _flat_tensor_compile_key(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
-        _tensor_compile_key(
-            "output_page_table",
-            output_page_table_key_tensor,
-            dynamic_dims=(0, 1),
-            # The kernel indexes output_page_table[row, page_col] at runtime
-            # (page_col = gidx // output_page_size); neither shape[1] (the live
-            # page-table width, which grows with KV-cache capacity) nor stride(0)
-            # (which is the same width for the contiguous view) is a compile-time
-            # input. Pinning either into the key re-links a fresh cubin on every
-            # capacity bump, per TP rank, on the first serving run.
-            dynamic_strides=(0,),
+        # The page table is passed as a flat pointer with an explicit runtime
+        # row stride. Keeping only its storage length dynamic lets one cubin
+        # serve changing KV capacities without baking a stale 2-D CuTe layout.
+        _flat_tensor_compile_key(
+            "output_page_table", output_page_table_key_tensor, dynamic=True
         ),
         (
-            "tiled_topk_v26_wide_coarse",
+            "tiled_topk_v27_runtime_page_stride",
             topk,
             block_q,
             block_k,
@@ -1664,6 +1677,11 @@ def run_row_topk(
             raise ValueError("output_gather_table must be contiguous")
         if output_gather_table.device != row_logits.device:
             raise ValueError("output_gather_table must be on the logits device")
+        output_gather_table_for_kernel = output_gather_table.reshape(-1)
+        output_gather_table_row_stride = width
+    else:
+        output_gather_table_for_kernel = lengths
+        output_gather_table_row_stride = 0
     carry_values = topk_values
     carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
@@ -1684,10 +1702,11 @@ def run_row_topk(
         _to_kernel_tensor(flat_carry_values, cutlass.Float32, assumed_align=4),
         _to_kernel_tensor(flat_carry_indices, cutlass.Int32, assumed_align=4),
         _to_kernel_tensor(
-            output_gather_table if output_gather_table is not None else lengths,
+            output_gather_table_for_kernel,
             cutlass.Int32,
             assumed_align=4,
         ),
+        Int32(output_gather_table_row_stride),
         Int32(num_q_rows),
         Int32(width),
         Int32(0),
@@ -1712,8 +1731,11 @@ def run_row_topk(
         _flat_tensor_compile_key(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
+        _flat_tensor_compile_key(
+            "output_gather_table", output_gather_table_for_kernel, dynamic=True
+        ),
         (
-            "row_topk_v6",
+            "row_topk_v7_runtime_page_stride",
             topk,
             output_gather_table is not None,
         ),
@@ -1729,6 +1751,7 @@ def run_row_topk(
             "topk_indices",
             "carry_values",
             "carry_indices",
+            "output_gather_table",
             "policy",
         ),
     )

@@ -76,16 +76,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_bytes=max_rows * hidden * 4,
     )
     try:
-        assert ring._output_storage is None
         explicit_inp = _make_input(8, hidden, torch.bfloat16, device, rank, 0)
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
         ring.all_reduce(explicit_inp, out=explicit_out)
         torch.cuda.synchronize(device)
         _assert_close(explicit_out, explicit_ref, world_size)
-        assert ring._output_storage is None
 
-        default_output_ptr = None
+        retained_outputs: list[torch.Tensor] = []
+        retained_refs: list[torch.Tensor] = []
         for dtype in (torch.bfloat16,):
             for rows in (8, 64, 256):
                 inp = _make_input(rows, hidden, dtype, device, rank, 0)
@@ -93,22 +92,24 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 out = ring.all_reduce(inp)
                 torch.cuda.synchronize(device)
                 _assert_close(out, ref, world_size)
-                if default_output_ptr is None:
-                    default_output_ptr = out.data_ptr()
-                else:
-                    assert out.data_ptr() == default_output_ptr
+                assert all(
+                    out.data_ptr() != prior.data_ptr() for prior in retained_outputs
+                )
+                retained_outputs.append(out)
+                retained_refs.append(ref)
+                for retained, retained_ref in zip(
+                    retained_outputs, retained_refs, strict=True
+                ):
+                    _assert_close(retained, retained_ref, world_size)
 
-        assert ring._output_storage is not None
-        assert ring._output_storage.numel() == ring.max_bytes
-
-        # Default-output graph capture and replay with changing inputs.
+        # Captured callers provide stable output storage explicitly.
         rows = 256
         dtype = torch.bfloat16
         inp = _make_input(rows, hidden, dtype, device, rank, 0)
+        out = torch.empty_like(inp)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = ring.all_reduce(inp)
-        assert out.data_ptr() == default_output_ptr
+            ring.all_reduce(inp, out=out)
         for iteration in range(1, 4):
             inp.copy_(_make_input(rows, hidden, dtype, device, rank, iteration))
             ref = _reference(inp)
@@ -119,9 +120,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
     finally:
         ring.close()
-        output_storage_released = ring._output_storage is None
         dist.destroy_process_group()
-        assert output_storage_released
 
 
 def test_pcie_dma_all_reduce_eager_and_graph() -> None:
@@ -132,9 +131,6 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    # Build once in the parent. Concurrent first-build imports from spawned
-    # ranks can observe the extension directory before its shared object is
-    # atomically installed.
     _load_extension()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
