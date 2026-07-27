@@ -36,15 +36,47 @@ from sparkinfer._lib.intrinsics import (
     st_shared_i32,
 )
 from sparkinfer._lib.utils import current_cuda_stream
+from sparkinfer.attention._shared.cute import ops as cute_ops
 
 _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048
 _SUPPORTED_TOPK = (512, 1024, 2048)
 _RADIX = 256
+_SELECTION_POLICY_ENV = "SPARKINFER_NSA_TOPK_SELECTION_POLICY"
+_SELECTION_POLICY_EXACT = "exact"
+_SELECTION_POLICY_OLDEST_BOUNDARY = "oldest_boundary"
+_SELECTION_POLICIES = frozenset(
+    {
+        _SELECTION_POLICY_EXACT,
+        _SELECTION_POLICY_OLDEST_BOUNDARY,
+    }
+)
+
+
+def _resolve_selection_policy(value: str | None) -> str:
+    policy = (value or _SELECTION_POLICY_EXACT).strip().lower()
+    if policy not in _SELECTION_POLICIES:
+        raise ValueError(
+            f"{_SELECTION_POLICY_ENV} must be one of "
+            f"{sorted(_SELECTION_POLICIES)}, got {policy!r}"
+        )
+    return policy
+
+
+_SELECTION_POLICY = _resolve_selection_policy(
+    os.environ.get(_SELECTION_POLICY_ENV)
+)
+_OLDEST_BOUNDARY = _SELECTION_POLICY == _SELECTION_POLICY_OLDEST_BOUNDARY
 # Use every SM120 CTA lane for the first histogram.  The four-times narrower
 # bucket keeps ordinary 32k/64k low-contrast rows on the buffered exact path;
 # truly degenerate buckets still use the rescan fallback below.
-_COARSE_RADIX_BITS = 10
+#
+# ``oldest_boundary`` gives the required positional behavior an explicit
+# contract: all candidates in strictly higher coarse buckets remain eligible,
+# while the threshold bucket is refined over its oldest 4096 virtual positions
+# in stable index order. No candidate write may cross the allocation. The
+# default remains exact.
+_COARSE_RADIX_BITS = 8 if _OLDEST_BOUNDARY else 10
 _COARSE_RADIX_BINS = 1 << _COARSE_RADIX_BITS
 _HIST_SLOTS = _COARSE_RADIX_BINS + 128
 # A 1024-thread selector CTA is already limited to one resident block per SM on
@@ -52,7 +84,7 @@ _HIST_SLOTS = _COARSE_RADIX_BINS + 128
 # long-context overflow without reducing occupancy; the complete shared-memory
 # allocation remains below the 99 KiB opt-in block limit.  The exact rescan below
 # still covers wider or degenerate threshold buckets.
-_SMEM_CANDS = 8192
+_SMEM_CANDS = 4096 if _OLDEST_BOUNDARY else 8192
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "SPARKINFER_NSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
@@ -539,6 +571,7 @@ class SparseNSATiledTopkKernel:
         # or the user's final output.
         self.is_first = bool(is_first)
         self.output_physical_slots = bool(output_physical_slots)
+        self.oldest_boundary = bool(_OLDEST_BOUNDARY)
 
     @cute.jit
     def __call__(
@@ -910,17 +943,106 @@ class SparseNSATiledTopkKernel:
             if topk != Int32(0):
                 cute.arch.sync_threads()
 
-                if tx < Int32(257):
-                    s_hist0[tx] = Int32(0)
-                cute.arch.sync_threads()
+                if cutlass.const_expr(self.oldest_boundary):
+                    # Stable-compaction reference for the threshold bucket.
+                    # Each 1024-position tile is compacted in logical index
+                    # order: warp-local inclusive scans feed a 32-warp prefix,
+                    # and the shared running count assigns a unique ordinal.
+                    # Only ordinals [0, _SMEM_CANDS) are materialized, but ni0
+                    # records the full bucket population. This turns the old
+                    # capacity/atomic-order accident into explicit,
+                    # deterministic oldest-history semantics.
+                    if tx == Int32(0):
+                        _smem_st(ni0, Int32(0), Int32(0))
+                    cute.arch.sync_threads()
 
-                idx_base = Int32(tx)
-                full_scan_limit = total_len - Int32(
-                    (_SCAN_UNROLL - 1) * _THREADS_PER_CTA
-                )
-                while idx_base < full_scan_limit:
-                    for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-                        idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                    lane_idx = tx - (tx // Int32(32)) * Int32(32)
+                    warp_idx = tx // Int32(32)
+                    warp_count_base = Int32(_COARSE_RADIX_BINS)
+                    tile_base = Int32(0)
+                    while tile_base < total_len:
+                        idx = tile_base + Int32(tx)
+                        is_boundary = Int32(0)
+                        if idx < total_len:
+                            raw_input = _load_value_virtual(
+                                input_tensor,
+                                carry_values,
+                                row_base,
+                                row_start,
+                                out_base,
+                                length,
+                                idx,
+                                self.block_q,
+                                self.block_k,
+                                self.is_tiled,
+                                self.is_first,
+                            )
+                            coarse_bin = _convert_to_coarse_bin(raw_input)
+                            if Int32(coarse_bin) > threshold_bin:
+                                pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                                s_out[pos] = idx
+                            else:
+                                if Int32(coarse_bin) == threshold_bin:
+                                    is_boundary = Int32(1)
+
+                        warp_prefix = cute_ops.warp_prefix_sum(
+                            is_boundary, lane_idx
+                        )
+                        if lane_idx == Int32(31):
+                            s_hist0[warp_count_base + warp_idx] = warp_prefix
+                        cute.arch.sync_threads()
+
+                        if warp_idx == Int32(0):
+                            warp_count = Int32(
+                                s_hist0[warp_count_base + lane_idx]
+                            )
+                            warp_cumulative = cute_ops.warp_prefix_sum(
+                                warp_count, lane_idx
+                            )
+                            s_hist1[warp_count_base + lane_idx] = warp_cumulative
+                        cute.arch.sync_threads()
+
+                        prior_total = Int32(_smem_ld(ni0, Int32(0)))
+                        prior_warps = Int32(0)
+                        if warp_idx > Int32(0):
+                            prior_warps = Int32(
+                                s_hist1[warp_count_base + warp_idx - Int32(1)]
+                            )
+                        if is_boundary != Int32(0):
+                            cand_pos = (
+                                prior_total
+                                + prior_warps
+                                + warp_prefix
+                                - Int32(1)
+                            )
+                            if cand_pos < Int32(_SMEM_CANDS):
+                                s_cand0[cand_pos] = idx
+                        cute.arch.sync_threads()
+
+                        if tx == Int32(0):
+                            tile_count = Int32(
+                                s_hist1[warp_count_base + Int32(31)]
+                            )
+                            _smem_st(
+                                ni0,
+                                Int32(0),
+                                prior_total + tile_count,
+                            )
+                        cute.arch.sync_threads()
+                        tile_base = tile_base + Int32(_THREADS_PER_CTA)
+
+                    bin_count = Int32(_smem_ld(ni0, Int32(0)))
+                    if tx < Int32(257):
+                        s_hist0[tx] = Int32(0)
+                    cute.arch.sync_threads()
+                    stable_count = (
+                        bin_count
+                        if bin_count < Int32(_SMEM_CANDS)
+                        else Int32(_SMEM_CANDS)
+                    )
+                    stable_i = Int32(tx)
+                    while stable_i < stable_count:
+                        c_idx = Int32(s_cand0[stable_i])
                         raw_input = _load_value_virtual(
                             input_tensor,
                             carry_values,
@@ -928,7 +1050,70 @@ class SparseNSATiledTopkKernel:
                             row_start,
                             out_base,
                             length,
-                            idx,
+                            c_idx,
+                            self.block_q,
+                            self.block_k,
+                            self.is_tiled,
+                            self.is_first,
+                        )
+                        key32 = _convert_to_uint32(raw_input)
+                        sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                        _smem_red_add(h0, Int32(sub_bin), Int32(1))
+                        stable_i = stable_i + Int32(_THREADS_PER_CTA)
+                    cute.arch.sync_threads()
+                else:
+                    if tx < Int32(257):
+                        s_hist0[tx] = Int32(0)
+                    cute.arch.sync_threads()
+
+                    idx_base = Int32(tx)
+                    full_scan_limit = total_len - Int32(
+                        (_SCAN_UNROLL - 1) * _THREADS_PER_CTA
+                    )
+                    while idx_base < full_scan_limit:
+                        for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
+                            idx = idx_base + Int32(scan_u * _THREADS_PER_CTA)
+                            raw_input = _load_value_virtual(
+                                input_tensor,
+                                carry_values,
+                                row_base,
+                                row_start,
+                                out_base,
+                                length,
+                                idx,
+                                self.block_q,
+                                self.block_k,
+                                self.is_tiled,
+                                self.is_first,
+                            )
+                            coarse_bin = _convert_to_coarse_bin(raw_input)
+                            if Int32(coarse_bin) > threshold_bin:
+                                pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                                s_out[pos] = idx
+                            else:
+                                if Int32(coarse_bin) == threshold_bin:
+                                    cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
+                                    if cand_pos < Int32(_SMEM_CANDS):
+                                        s_cand0[cand_pos] = idx
+                                        key32 = _convert_to_uint32(raw_input)
+                                        sub_bin = (
+                                            key32 >> Uint32(24)
+                                        ) & Uint32(0xFF)
+                                        _smem_red_add(
+                                            h0, Int32(sub_bin), Int32(1)
+                                        )
+                        idx_base = idx_base + Int32(
+                            _THREADS_PER_CTA * _SCAN_UNROLL
+                        )
+                    while idx_base < total_len:
+                        raw_input = _load_value_virtual(
+                            input_tensor,
+                            carry_values,
+                            row_base,
+                            row_start,
+                            out_base,
+                            length,
+                            idx_base,
                             self.block_q,
                             self.block_k,
                             self.is_tiled,
@@ -937,58 +1122,35 @@ class SparseNSATiledTopkKernel:
                         coarse_bin = _convert_to_coarse_bin(raw_input)
                         if Int32(coarse_bin) > threshold_bin:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
-                            s_out[pos] = idx
+                            s_out[pos] = idx_base
                         else:
                             if Int32(coarse_bin) == threshold_bin:
                                 cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
                                 if cand_pos < Int32(_SMEM_CANDS):
-                                    s_cand0[cand_pos] = idx
+                                    s_cand0[cand_pos] = idx_base
                                     key32 = _convert_to_uint32(raw_input)
-                                    sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
+                                    sub_bin = (
+                                        key32 >> Uint32(24)
+                                    ) & Uint32(0xFF)
                                     _smem_red_add(h0, Int32(sub_bin), Int32(1))
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
-                while idx_base < total_len:
-                    raw_input = _load_value_virtual(
-                        input_tensor,
-                        carry_values,
-                        row_base,
-                        row_start,
-                        out_base,
-                        length,
-                        idx_base,
-                        self.block_q,
-                        self.block_k,
-                        self.is_tiled,
-                        self.is_first,
-                    )
-                    coarse_bin = _convert_to_coarse_bin(raw_input)
-                    if Int32(coarse_bin) > threshold_bin:
-                        pos = _smem_xadd(ctr, Int32(0), Int32(1))
-                        s_out[pos] = idx_base
-                    else:
-                        if Int32(coarse_bin) == threshold_bin:
-                            cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
-                            if cand_pos < Int32(_SMEM_CANDS):
-                                s_cand0[cand_pos] = idx_base
-                                key32 = _convert_to_uint32(raw_input)
-                                sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
-                                _smem_red_add(h0, Int32(sub_bin), Int32(1))
-                    idx_base = idx_base + Int32(_THREADS_PER_CTA)
+                        idx_base = idx_base + Int32(_THREADS_PER_CTA)
+
+                    cute.arch.sync_threads()
+                    # ni0 now holds the FULL threshold-bin candidate count: the
+                    # xadd ran for every bin-matching key, even past
+                    # _SMEM_CANDS.
+                    bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
                 cute.arch.sync_threads()
-                # ni0 now holds the FULL threshold-bin candidate count: the xadd
-                # ran for every bin-matching key, even past _SMEM_CANDS. Capture it
-                # before the round loop clobbers ni0, to detect when the threshold
-                # bucket overflowed the candidate buffer (winners dropped past the cap).
-                bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
                 # The exact fallback below rebuilds all top-k outputs from the full
                 # row.  Do not spend four radix rounds refining a truncated candidate
                 # buffer first: none of those intermediate outputs survive.  This is
                 # a CTA-uniform branch because every thread reads the same shared
                 # counter after the barrier above.
-                if bin_count > Int32(_SMEM_CANDS):
-                    topk = Int32(-1)
+                if not cutlass.const_expr(self.oldest_boundary):
+                    if bin_count > Int32(_SMEM_CANDS):
+                        topk = Int32(-1)
 
                 # Stage 2: refine with 8-bit radix passes
                 for round_idx in cutlass.range_constexpr(4):
@@ -1140,33 +1302,34 @@ class SparseNSATiledTopkKernel:
                 # Exact overflow fallback: the buffered refine above dropped
                 # winners when more than _SMEM_CANDS candidates shared the coarse
                 # threshold bucket. Redo the selection exactly by re-scanning.
-                if bin_count > Int32(_SMEM_CANDS):
-                    _exact_overflow_fallback(
-                        tx,
-                        total_len,
-                        topk_static,
-                        s_hist0,
-                        s_hist1,
-                        s_out,
-                        h0,
-                        ctr,
-                        thr,
-                        ni0,
-                        ni1,
-                        lr,
-                        flat=False,
-                        flat_values=input_tensor,
-                        input_tensor=input_tensor,
-                        carry_values=carry_values,
-                        row_base=row_base,
-                        row_start=row_start,
-                        carry_base=out_base,
-                        chunk_len=length,
-                        block_q=self.block_q,
-                        block_k=self.block_k,
-                        is_tiled=self.is_tiled,
-                        is_first=self.is_first,
-                    )
+                if not cutlass.const_expr(self.oldest_boundary):
+                    if bin_count > Int32(_SMEM_CANDS):
+                        _exact_overflow_fallback(
+                            tx,
+                            total_len,
+                            topk_static,
+                            s_hist0,
+                            s_hist1,
+                            s_out,
+                            h0,
+                            ctr,
+                            thr,
+                            ni0,
+                            ni1,
+                            lr,
+                            flat=False,
+                            flat_values=input_tensor,
+                            input_tensor=input_tensor,
+                            carry_values=carry_values,
+                            row_base=row_base,
+                            row_start=row_start,
+                            carry_base=out_base,
+                            chunk_len=length,
+                            block_q=self.block_q,
+                            block_k=self.block_k,
+                            is_tiled=self.is_tiled,
+                            is_first=self.is_first,
+                        )
 
             cute.arch.sync_threads()
             idx0 = Int32(tx)
@@ -1543,7 +1706,8 @@ def run_tiled_topk(
             dynamic_strides=(0,),
         ),
         (
-            "tiled_topk_v26_wide_coarse",
+            "tiled_topk_v27_selection_policy",
+            _SELECTION_POLICY,
             topk,
             block_q,
             block_k,
@@ -1713,7 +1877,8 @@ def run_row_topk(
             "carry_indices", carry_indices_key_tensor, dynamic=True
         ),
         (
-            "row_topk_v6",
+            "row_topk_v7_selection_policy",
+            _SELECTION_POLICY,
             topk,
             output_gather_table is not None,
         ),
