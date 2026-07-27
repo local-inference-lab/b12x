@@ -1587,6 +1587,49 @@ def test_row_topk_live_rows_do_not_resolve_new_kernel(
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for indexer compile-cache coverage",
+)
+def test_row_topk_gather_table_width_and_stride_are_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
+    clear_compile_cache()
+    clear_indexer_caches()
+
+    device = torch.device("cuda")
+    rows, topk = 17, 512
+
+    def select(width: int) -> None:
+        row_logits = torch.arange(
+            width, dtype=torch.float32, device=device
+        ).expand(rows, -1).contiguous()
+        lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+        gather_table = torch.arange(
+            rows * width, dtype=torch.int32, device=device
+        ).reshape(rows, width)
+        _, indices = run_row_topk(
+            row_logits=row_logits,
+            lengths=lengths,
+            topk=topk,
+            output_gather_table=gather_table,
+        )
+        torch.cuda.synchronize(device)
+        logical = torch.topk(
+            row_logits, k=topk, dim=1, largest=True, sorted=False
+        ).indices
+        expected = torch.gather(gather_table, 1, logical)
+        assert torch.equal(
+            torch.sort(indices, dim=1).values,
+            torch.sort(expected, dim=1).values,
+        )
+
+    select(512)
+    misses_after_narrow = compile_cache_info()["compile_misses"]
+    select(1024)
+    assert compile_cache_info()["compile_misses"] == misses_after_narrow
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for BK512 prefill coverage"
 )
 def test_contiguous_logits_cuda_prefill512_sampled_logits(monkeypatch) -> None:
