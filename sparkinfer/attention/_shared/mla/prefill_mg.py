@@ -816,8 +816,15 @@ def _nvfp4_pair_bfloat2_mg(
     latent_scale: Float32,
     *,
     kv_smem_stride: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ) -> Uint32:
-    """Dequant E2M1 * inline E4M3 * per-layer outer scale to bf16x2."""
+    """Dequant E2M1 * inline E4M3 * outer scale to bf16x2.
+
+    The outer scale is the per-layer launch scalar, or --
+    ``latent_scale_per_token`` -- the record's own fp32 second-level scale
+    ([292, 296)), staged per candidate into kv_sc by the MG IO gather.
+    """
     data_byte = _ld_u8_zext(
         kv_fp4_base_addr,
         entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
@@ -830,11 +837,15 @@ def _nvfp4_pair_bfloat2_mg(
         entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
     )
     scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
-    # Prefill QK has its own MG B-operand loader.  Restore s_l here, before
-    # BF16 packing/MMA, to match decode QK and the shared decode P.V helper.
+    outer = latent_scale
+    if cutlass.const_expr(latent_scale_per_token):
+        outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
+    # Prefill QK has its own MG B-operand loader.  Restore the outer scale
+    # here, before BF16 packing/MMA, to match decode QK and the shared decode
+    # P.V helper.
     return pack_f32x2_to_bfloat2(
-        (v0 * scale_f) * latent_scale,
-        (v1 * scale_f) * latent_scale,
+        (v0 * scale_f) * outer,
+        (v1 * scale_f) * outer,
     )
 
 
@@ -854,17 +865,24 @@ def s1_qk_nope_nvfp4_bf16_mg2(
     q_nope_bf16_stride: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ):
     """S1 (NVFP4): MG BF16 QK-NoPE with native E2M1/E4M3 in-register dequant.
 
     Same MMA packing as ``s1_qk_nope_bf16_mg2`` but the K/B operand comes from
     the packed 288-byte NVFP4 row (256B E2M1 + 32B E4M3 group-16 scales); the
-    same math path as the validated NVFP4 decode ``s1_qk_nope_nvfp4_bf16``."""
+    same math path as the validated NVFP4 decode ``s1_qk_nope_nvfp4_bf16``.
+
+    ``latent_scale_per_token``: this lane's candidate row is fixed, so its
+    record scale is hoisted once from kv_sc."""
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     kv_gid_row = warp_first_cand + gid
+    if cutlass.const_expr(latent_scale_per_token):
+        latent_scale = ld_shared_f32(kv_sc_base_addr + kv_gid_row * Int32(4))
 
     for blk in cutlass.range_constexpr(num_scales):
         for ks in cutlass.range_constexpr(quant_tile // 16):
@@ -2347,9 +2365,11 @@ class UnifiedPrefillMGKernel:
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
         reduce_addr = shared_ptr_to_u32(st.reduce.data_ptr())
         w_fp8_addr = shared_ptr_to_u32(st.w_fp8.data_ptr())
-        # GLM has no kv_sc footer (its fp32 scales are inline).  DSV4 stages
-        # XV-RoPE weights into the W_FP8 region after XV-NoPE consumes it.
-        if cutlass.const_expr(is_glm):
+        # GLM has no kv_sc footer (its fp32 scales are inline), EXCEPT the
+        # NVFP4 per-token latent-scale mode, which stages one fp32 per
+        # candidate.  DSV4 stages XV-RoPE weights into the W_FP8 region after
+        # XV-NoPE consumes it.
+        if cutlass.const_expr(is_glm and not t.latent_scale_per_token):
             kv_sc_addr = Int32(0)
         else:
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
@@ -2520,6 +2540,8 @@ class UnifiedPrefillMGKernel:
                         io_threads=_PREFILL_IO_THREADS,
                         scale_format=t.scale_format,
                         fp8_rope=t.fp8_rope,
+                        per_token_latent_scale=t.latent_scale_per_token,
+                        kv_sc_dst_addr=kv_sc_addr,
                     )
                 else:
                     io_issue_gather_dsv4_nope(
@@ -2618,6 +2640,8 @@ class UnifiedPrefillMGKernel:
                                 io_threads=_PREFILL_IO_THREADS,
                                 scale_format=t.scale_format,
                                 fp8_rope=t.fp8_rope,
+                                per_token_latent_scale=t.latent_scale_per_token,
+                                kv_sc_dst_addr=kv_sc_addr + buf * kv_sc_buf,
                             )
                         else:
                             io_issue_gather_dsv4_nope(
@@ -2914,6 +2938,8 @@ class UnifiedPrefillMGKernel:
                         q_nope_bf16_stride=L.q_nope_bf16_stride,
                         kv_smem_stride=L.kv_smem_stride,
                         n_hg=n_hg,
+                        latent_scale_per_token=t.latent_scale_per_token,
+                        kv_sc_base_addr=kv_sc_b,
                     )
                     qk0, qk1 = s2_qk_rope_regs_mg_glm(
                         qk0,
@@ -3226,6 +3252,7 @@ class UnifiedPrefillMGKernel:
                         barrier_id=3,
                         sm_p_full_addr=sm_p_g0,
                         sm_p_stride=L.sm_p_full_stride,
+                        latent_scale_per_token=t.latent_scale_per_token,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         acc1 = s6_xv_nope(
@@ -3253,6 +3280,7 @@ class UnifiedPrefillMGKernel:
                             barrier_id=3,
                             sm_p_full_addr=sm_p_g1,
                             sm_p_stride=L.sm_p_full_stride,
+                            latent_scale_per_token=t.latent_scale_per_token,
                         )
                 elif cutlass.const_expr(is_glm):
                     # GLM XV-NoPE: the per-group decode s6_xv_nope (raw-e4m3 V +
@@ -3680,9 +3708,14 @@ def _sparse_mla_prefill_mg_flat_launch(
     *,
     active_heads: int | None = None,
     head_offset: int = 0,
+    latent_scale_per_token: bool = False,
 ) -> None:
     traits = make_unified_traits(
-        int(model_type), compute_mode, int(scale_format), fp8_rope=bool(fp8_rope)
+        int(model_type),
+        compute_mode,
+        int(scale_format),
+        fp8_rope=bool(fp8_rope),
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
@@ -3783,6 +3816,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("compute_mode", int(compute_mode)),
         key_field("scale_format", int(scale_format)),
         key_field("fp8_rope", int(traits.fp8_rope)),
+        key_field("latent_scale_per_token", int(traits.latent_scale_per_token)),
         key_field("num_heads", total_heads),
         key_field("heads_per_cta", heads_per_cta),
         key_field("mg_n_hg", int(mg_n_hg)),
@@ -3843,8 +3877,14 @@ def _sparse_mla_prefill_mg_flat_launch(
         # v4: latent_scale == 1.0 is folded out at trace time, producing a
         # cubin without the outer-scale multiply; the identity and dynamic
         # variants must not share a cache entry.
-        4,
-        key_field("latent_scale_identity", int(float(latent_scale) == 1.0)),
+        # v5: latent_scale_per_token joins the key (per-candidate fp32 scale
+        # read from kv_sc smem). In that mode the launch scalar is dead, so the
+        # identity fold is forced ON -- no per-scalar variants get compiled.
+        5,
+        key_field(
+            "latent_scale_identity",
+            int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
+        ),
         *spec_fields,
     )
     entry = kernel.call_dual if has_extra else kernel
@@ -3875,6 +3915,7 @@ def _sparse_mla_prefill_mg_op(
     model_type: int,
     scale_format: int,
     fp8_rope: bool,
+    latent_scale_per_token: bool = False,
 ) -> None:
     # SINGLE-CACHE op (DSV4 main / DSV4-BF16 / GLM MG). It carries the new
     # latent_scale runtime scalar and passes has_extra=False with extra device
@@ -3908,6 +3949,7 @@ def _sparse_mla_prefill_mg_op(
         1,  # pbs_extra
         0,  # stride_extra_kv_block
         False,  # row_xor
+        latent_scale_per_token=latent_scale_per_token,
     )
 
 
@@ -3932,6 +3974,7 @@ def _sparse_mla_prefill_mg_fake(
     model_type: int,
     scale_format: int,
     fp8_rope: bool,
+    latent_scale_per_token: bool = False,
 ) -> None:
     return None
 
@@ -4053,6 +4096,7 @@ def run_unified_prefill_mg(
     scale_format: int | None = None,
     latent_scale: float = 1.0,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
     extra_kv_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_topk_length: torch.Tensor | None = None,
@@ -4120,8 +4164,25 @@ def run_unified_prefill_mg(
                 "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
                 f"got {record_bytes} bytes, expected {expected_record_bytes}"
             )
+    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+    # the NVFP4 fp8-rope 368-byte record ONLY.
+    if latent_scale_per_token:
+        if scale_format != ScaleFormat.NVFP4_E4M3:
+            raise ValueError(
+                "SM120 sparse MLA MG prefill latent_scale_per_token requires "
+                f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+            )
+        if not bool(fp8_rope):
+            raise ValueError(
+                "SM120 sparse MLA MG prefill latent_scale_per_token requires "
+                "the fp8-rope 368-byte NVFP4 record; got the 432-byte record"
+            )
     traits = make_unified_traits(
-        model_type, int(compute_mode), scale_format, fp8_rope=fp8_rope
+        model_type,
+        int(compute_mode),
+        scale_format,
+        fp8_rope=fp8_rope,
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1
     # covers a single-group launch, including 16-head tails and the heads==8
@@ -4280,6 +4341,7 @@ def run_unified_prefill_mg(
             model_type,
             scale_format,
             bool(traits.fp8_rope),
+            bool(latent_scale_per_token),
         )
     else:
         _sparse_mla_prefill_mg_flat_launch(
@@ -4313,5 +4375,6 @@ def run_unified_prefill_mg(
             False,  # row_xor
             active_heads=active_heads,
             head_offset=head_offset,
+            latent_scale_per_token=bool(latent_scale_per_token),
         )
     return output, lse_out

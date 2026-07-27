@@ -114,6 +114,7 @@ def io_issue_gather(
     packed_dsv4: cutlass.Constexpr = False,
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
+    per_token_latent_scale: cutlass.Constexpr = False,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -338,6 +339,26 @@ def io_issue_gather(
                 s_byte = entry * _FOOT
                 st_shared_u32(kv_sc_dst_addr + s_byte, f0)
                 st_shared_u32(kv_sc_dst_addr + s_byte + Int32(4), f1)
+            elif cutlass.const_expr(
+                scale_format == 2 and fp8_rope and per_token_latent_scale
+            ):
+                # NVFP4 two-level record: the per-token fp32 latent scale sits
+                # at [292, 296).  292 is not 8B-aligned, so load the 8-aligned
+                # pair at [288, 296) (rope scale, latent scale) and keep the
+                # second word -- same nc.v2 pattern as the DSV4 footer.
+                f1 = Uint32(0)
+                if idx_raw >= Int32(0):
+                    block_idx = idx_raw // _section_pbs
+                    local_idx = idx_raw - block_idx * _section_pbs
+                    scale_base_off = (
+                        Int64(block_idx) * _section_stride
+                        + Int64(local_idx) * _IOS
+                        + Int64(_NVFP4_FP8_ROPE_TAIL_SRC)
+                    )
+                    _, f1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(_section_kv, scale_base_off)
+                    )
+                st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
         eo += Int32(io_threads)
 
     # --- (2) CTA-scope fence: footer/index stores visible before release. ---

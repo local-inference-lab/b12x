@@ -77,6 +77,10 @@ class UnifiedMLATraits:
     rope_gmem_offset: int
     rope_payload_bytes: int
     rope_scale_offset: int
+    # NVFP4-only per-token second-level fp32 latent scale (record bytes
+    # [292, 296) of the 368-byte fp8-rope record). False keeps every existing
+    # specialization (and its smem layout / PTX) byte-identical.
+    latent_scale_per_token: bool = False
 
 
 def make_unified_traits(
@@ -84,6 +88,7 @@ def make_unified_traits(
     compute_mode: int,
     scale_format: int,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ) -> UnifiedMLATraits:
     """Build the trait bundle for one specialization tuple.
 
@@ -101,6 +106,15 @@ def make_unified_traits(
     # validated path today.
     if compute_mode not in (ComputeMode.FP8, ComputeMode.BF16):
         raise ValueError(f"unsupported compute_mode {compute_mode!r}")
+
+    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+    # the NVFP4 368-byte fp8-rope record ONLY. Any other (model, scale, rope)
+    # tuple has no such field, so the mode must never silently build there.
+    if latent_scale_per_token and scale_format != ScaleFormat.NVFP4_E4M3:
+        raise ValueError(
+            "latent_scale_per_token requires ScaleFormat.NVFP4_E4M3; "
+            f"got scale_format={scale_format!r}"
+        )
 
     if model_type == ModelType.DSV4:
         if scale_format != ScaleFormat.UE8M0_BYTE:
@@ -142,6 +156,11 @@ def make_unified_traits(
             # group-16 scales + 16B pad + 128B BF16 RoPE. Decode stages Q-NoPE
             # as BF16 and dequants FP4 K/V in-register for BF16 QK/PV MMAs.
             use_fp8_rope = fp8_rope_requested
+            if latent_scale_per_token and not use_fp8_rope:
+                raise ValueError(
+                    "latent_scale_per_token requires the NVFP4 fp8-rope "
+                    "368-byte record (fp8_rope=True); got the 432-byte record"
+                )
             return UnifiedMLATraits(
                 model_type=ModelType.GLM_NSA,
                 compute_mode=ComputeMode.BF16,
@@ -169,6 +188,7 @@ def make_unified_traits(
                 rope_gmem_offset=304,
                 rope_payload_bytes=64 if use_fp8_rope else 128,
                 rope_scale_offset=288 if use_fp8_rope else -1,
+                latent_scale_per_token=bool(latent_scale_per_token),
             )
         if scale_format != ScaleFormat.ARBITRARY_FP32:
             raise ValueError(

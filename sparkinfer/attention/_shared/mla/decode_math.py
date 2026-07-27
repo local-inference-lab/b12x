@@ -573,6 +573,7 @@ def s1_qk_nope_block_scaled(
     scale_bytes_per_token: cutlass.Constexpr,  # 8
     scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     valid_hpb: cutlass.Constexpr = 16,
+    latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -619,6 +620,8 @@ def s1_qk_nope_block_scaled(
             quant_tile=quant_tile,
             q_nope_bf16_stride=q_nope_stride,
             kv_smem_stride=kv_smem_stride,
+            latent_scale_per_token=latent_scale_per_token,
+            kv_sc_base_addr=kv_sc_base_addr,
         )
 
     gid = lane >> Int32(2)
@@ -743,18 +746,26 @@ def s1_qk_nope_nvfp4_bf16(
     quant_tile: cutlass.Constexpr,  # 64
     q_nope_bf16_stride: cutlass.Constexpr,  # 520 elems
     kv_smem_stride: cutlass.Constexpr,  # 288 bytes
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ):
     """S1 (NVFP4): BF16 QK-NoPE over in-register dequantized E2M1 K.
 
     Storage has 32 E4M3 scales per token (group-16). The outer loop keeps the
     logical FP4 K-step count at 512/64=8, and the inner loop feeds four BF16
     m16n8k16 MMAs per 64-dim step.
+
+    ``latent_scale_per_token``: this lane's candidate row is fixed
+    (``kv_gid_row``), so its record scale is hoisted once from kv_sc and fed
+    through the unchanged per-pair dequant path.
     """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     kv_gid_row = warp_first_cand + gid
+    if cutlass.const_expr(latent_scale_per_token):
+        latent_scale = ld_shared_f32(kv_sc_base_addr + kv_gid_row * Int32(4))
 
     for blk in cutlass.range_constexpr(num_scales):
         for ks in cutlass.range_constexpr(quant_tile // 16):
@@ -1297,8 +1308,16 @@ def _nvfp4_pair_bfloat2(
     latent_scale: Float32,
     *,
     kv_smem_stride: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ) -> Uint32:
-    """Dequant E2M1 * inline E4M3 * per-layer outer scale to bf16x2."""
+    """Dequant E2M1 * inline E4M3 * outer scale to bf16x2.
+
+    The outer scale is the per-layer launch scalar (``latent_scale``), or --
+    ``latent_scale_per_token`` -- the record's own fp32 second-level scale,
+    staged per candidate into the contiguous kv_sc buffer by the IO gather
+    (record bytes [292, 296)).
+    """
     data_byte = _ld_u8_zext(
         kv_fp4_base_addr,
         entry * Int32(kv_smem_stride) + (dim_even // Int32(2)),
@@ -1311,12 +1330,15 @@ def _nvfp4_pair_bfloat2(
         entry * Int32(kv_smem_stride) + Int32(_NVFP4_SCALE_OFFSET) + scale_group,
     )
     scale_f = cvt_e4m3_to_f32_via_f16(scale_byte)
+    outer = latent_scale
+    if cutlass.const_expr(latent_scale_per_token):
+        outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
     # This is the single NVFP4 decode dequant point shared by QK and P.V.
-    # Apply s_l before BF16 packing so both MMAs consume the same true-magnitude
-    # latent; the separate BF16 RoPE path never calls this helper.
+    # Apply the outer scale before BF16 packing so both MMAs consume the same
+    # true-magnitude latent; the separate RoPE path never calls this helper.
     return pack_f32x2_to_bfloat2(
-        (v0 * scale_f) * latent_scale,
-        (v1 * scale_f) * latent_scale,
+        (v0 * scale_f) * outer,
+        (v1 * scale_f) * outer,
     )
 
 
@@ -1328,6 +1350,8 @@ def _nvfp4_scalar_bf16_u16(
     latent_scale: Float32,
     *,
     kv_smem_stride: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ) -> Uint32:
     pair = _nvfp4_pair_bfloat2(
         kv_fp4_base_addr,
@@ -1335,6 +1359,8 @@ def _nvfp4_scalar_bf16_u16(
         dim & ~Int32(1),
         latent_scale,
         kv_smem_stride=kv_smem_stride,
+        latent_scale_per_token=latent_scale_per_token,
+        kv_sc_base_addr=kv_sc_base_addr,
     )
     return _bf16x2_extract_lane_u16(pair, dim & Int32(1))
 
@@ -1734,6 +1760,7 @@ def s6_xv_nope(
     pack_hilo_rows: cutlass.Constexpr = False,
     sm_p_full_addr: Int32 = None,  # NVFP4 BF16 PV only
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
+    latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -1787,6 +1814,8 @@ def s6_xv_nope(
             n_warps=n_warps,
             nt_per_warp_xv=nt_per_warp_xv,
             sm_p_stride=(sm_p_stride if sm_p_stride else bi),
+            latent_scale_per_token=latent_scale_per_token,
+            kv_sc_base_addr=kv_sc_base_addr,
         )
 
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -2085,6 +2114,8 @@ def s6_xv_nope_nvfp4_bf16(
     n_warps: cutlass.Constexpr,  # 8
     nt_per_warp_xv: cutlass.Constexpr,  # 1
     sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
 ):
     """S6 (NVFP4): BF16 P.V over in-register dequantized E2M1 V.
 
@@ -2120,6 +2151,8 @@ def s6_xv_nope_nvfp4_bf16(
                     col,
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
                 )
                 v1 = _nvfp4_scalar_bf16_u16(
                     kv_fp4_base_addr,
@@ -2127,6 +2160,8 @@ def s6_xv_nope_nvfp4_bf16(
                     col,
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
                 )
                 v8 = _nvfp4_scalar_bf16_u16(
                     kv_fp4_base_addr,
@@ -2134,6 +2169,8 @@ def s6_xv_nope_nvfp4_bf16(
                     col,
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
                 )
                 v9 = _nvfp4_scalar_bf16_u16(
                     kv_fp4_base_addr,
@@ -2141,6 +2178,8 @@ def s6_xv_nope_nvfp4_bf16(
                     col,
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
                 )
                 b0 = v0 | (v1 << Uint32(16))
                 b1 = v8 | (v9 << Uint32(16))
