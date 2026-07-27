@@ -16,7 +16,7 @@ import os
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.runtime import from_dlpack
@@ -211,11 +211,11 @@ def _emit_global_index_virtual(
         if gidx >= Int32(0):
             page_col = gidx // page_size
             page_offset = gidx - page_col * page_size
-            page_id = Int32(
-                output_page_table[
-                    row_idx * output_page_table_row_stride + page_col
-                ]
+            page_table_index = (
+                Int64(row_idx) * Int64(output_page_table_row_stride)
+                + Int64(page_col)
             )
+            page_id = Int32(output_page_table[page_table_index])
             if page_id >= Int32(0):
                 physical_idx = page_id * page_size + page_offset
         gidx = physical_idx
