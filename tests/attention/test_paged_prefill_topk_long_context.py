@@ -219,6 +219,18 @@ def test_paged_prefill_topk_logical_output_two_level_fold(monkeypatch) -> None:
     _assert_selects_true_topk(scene, selected, output_physical_slots=False)
 
 
+def test_paged_prefill_topk_logical_output_adaptive_carry(monkeypatch) -> None:
+    """A zero candidate budget selects the exact carry path for logical output."""
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
+    device = torch.device("cuda")
+    scene = _build_scene(device, 32768, "monotonic")
+    selected = _run_indexer(
+        monkeypatch, scene, supertile_k=8192, output_physical_slots=False
+    )
+    _assert_selects_true_topk(scene, selected, output_physical_slots=False)
+
+
 def test_paged_prefill_topk_carry_fold_overflow(monkeypatch) -> None:
     """supertile_k < context forces the multi-chunk carry fold (is_first=False path).
 
