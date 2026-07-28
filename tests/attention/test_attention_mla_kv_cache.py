@@ -216,6 +216,8 @@ def _make_exactly_quantizable_inputs(
 
 def _dequantize_records(
     records: torch.Tensor,
+    *,
+    per_token_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     packed = records[:, :_NOPE_BYTES]
     codes = torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).reshape(
@@ -232,6 +234,14 @@ def _dequantize_records(
         e2m1[codes.long()].reshape(records.shape[0], 32, 16)
         * group_scales.unsqueeze(-1)
     ).reshape(records.shape[0], _V_HEAD_DIM)
+    if per_token_scale:
+        latent_scales = (
+            records[:, _PAD_OFFSET : _PAD_OFFSET + 4]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(-1)
+        )
+        nope = nope * latent_scales.unsqueeze(-1)
 
     rope_scales = (
         records[:, _ROPE_SCALE_OFFSET:_PAD_OFFSET]
@@ -350,6 +360,7 @@ def _make_written_reader_case(
     topk: int,
     seed: int,
     device: torch.device,
+    per_token_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -376,7 +387,13 @@ def _make_written_reader_case(
         device=device,
     )
     slots = torch.arange(topk, dtype=torch.int64, device=device)
-    concat_and_cache_nvfp4_mla_fp8_rope(kv_c, k_pe, cache, slots)
+    concat_and_cache_nvfp4_mla_fp8_rope(
+        kv_c,
+        k_pe,
+        cache,
+        slots,
+        per_token_scale=per_token_scale,
+    )
     return q, cache, indices
 
 
@@ -387,8 +404,12 @@ def _reference_attention_from_records(
     indices: torch.Tensor,
     lengths: torch.Tensor,
     sm_scale: float,
+    per_token_scale: bool = False,
 ) -> torch.Tensor:
-    nope, _, rope, _ = _dequantize_records(cache.reshape(-1, _RECORD_BYTES))
+    nope, _, rope, _ = _dequantize_records(
+        cache.reshape(-1, _RECORD_BYTES),
+        per_token_scale=per_token_scale,
+    )
     keys = torch.cat((nope, rope), dim=-1)
     rows = []
     for row, length in enumerate(lengths.cpu().tolist()):
@@ -414,8 +435,15 @@ def _assert_reader_matches_dequantized_records(
     assert cosine > 0.999, f"cosine similarity {cosine:.8f} did not exceed 0.999"
 
 
+@pytest.mark.parametrize(
+    "per_token_scale",
+    [False, True],
+    ids=["static", "dynamic-token"],
+)
 @torch.inference_mode()
-def test_writer_records_feed_production_head_multisplit_decode() -> None:
+def test_writer_records_feed_production_head_multisplit_decode(
+    per_token_scale: bool,
+) -> None:
     device = require_sparkinfer()
     topk = 129
     q, cache, indices = _make_written_reader_case(
@@ -423,6 +451,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
         topk=topk,
         seed=1301,
         device=device,
+        per_token_scale=per_token_scale,
     )
     lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     sm_scale = _HEAD_DIM**-0.5
@@ -467,6 +496,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
         forced_num_splits=2,
         scale_format_override=ScaleFormat.NVFP4_E4M3,
         fp8_rope_override=None,
+        latent_scale_per_token=per_token_scale,
     )
     expected = _reference_attention_from_records(
         q=q,
@@ -474,13 +504,21 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
         indices=indices,
         lengths=lengths,
         sm_scale=sm_scale,
+        per_token_scale=per_token_scale,
     )
     torch.cuda.synchronize(device)
     _assert_reader_matches_dequantized_records(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "per_token_scale",
+    [False, True],
+    ids=["static", "dynamic-token"],
+)
 @torch.inference_mode()
-def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
+def test_writer_records_feed_production_head_multitile_prefill_mg(
+    per_token_scale: bool,
+) -> None:
     device = require_sparkinfer()
     topk = 129
     q, cache, indices = _make_written_reader_case(
@@ -488,6 +526,7 @@ def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
         topk=topk,
         seed=2302,
         device=device,
+        per_token_scale=per_token_scale,
     )
     lengths = torch.tensor([topk, 65], dtype=torch.int32, device=device)
     sm_scale = _HEAD_DIM**-0.5
@@ -504,6 +543,7 @@ def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
         model_type=ModelType.GLM_NSA,
         scale_format=ScaleFormat.NVFP4_E4M3,
         fp8_rope=True,
+        latent_scale_per_token=per_token_scale,
     )
     expected = _reference_attention_from_records(
         q=q,
@@ -511,6 +551,7 @@ def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
         indices=indices,
         lengths=lengths,
         sm_scale=sm_scale,
+        per_token_scale=per_token_scale,
     )
     torch.cuda.synchronize(device)
     _assert_reader_matches_dequantized_records(actual, expected)
