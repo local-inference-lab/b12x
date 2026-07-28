@@ -4,8 +4,9 @@
 bytes [292, 296) and encodes every group scale relative to it, so the largest
 group's E4M3 scale byte lands at the top of the E4M3 range by construction.
 These tests pin the record ABI, the positioning invariant that motivates the
-mode (no E4M3-subnormal group scales for small-magnitude tokens), and the
-accuracy win over the implicit-1.0 static writer at shallow-layer magnitudes.
+mode (the largest group scale is placed near the top of the E4M3 range), and
+the accuracy win over the implicit-1.0 static writer at shallow-layer
+magnitudes. Smaller groups within the same token can still be subnormal.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from sparkinfer.attention._shared.mla.kv_cache import (
     concat_and_cache_nvfp4_mla_fp8_rope,
 )
 
-from .._reference.helpers import E2M1_TO_FLOAT32
+from .._reference.helpers import dequantize_nvfp4_mla_nope
 from ..conftest import require_sparkinfer as require_sm120
 
 
@@ -68,46 +69,25 @@ def _write_records(
 
 def _dequantize_two_level(records: torch.Tensor) -> torch.Tensor:
     """Host reference: e2m1 * e4m3(group scale) * fp32 s_t at [292, 296)."""
-    packed = records[:, :_NOPE_BYTES]
-    codes = torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).reshape(
-        records.shape[0], _V_HEAD_DIM
+    values, _ = dequantize_nvfp4_mla_nope(
+        records,
+        nope_bytes=_NOPE_BYTES,
+        group_scales_offset=_GROUP_SCALES_OFFSET,
+        group_scales_end=_ROPE_SCALE_OFFSET,
+        latent_scale_offset=_LATENT_SCALE_OFFSET,
     )
-    e2m1 = torch.tensor(E2M1_TO_FLOAT32, dtype=torch.float32)
-    group_scales = (
-        records[:, _GROUP_SCALES_OFFSET:_ROPE_SCALE_OFFSET]
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .float()
-    )
-    latent_scales = (
-        records[:, _LATENT_SCALE_OFFSET:_PAD_OFFSET]
-        .contiguous()
-        .view(torch.float32)
-        .reshape(-1)
-    )
-    return (
-        e2m1[codes.long()].reshape(records.shape[0], 32, 16)
-        * group_scales.unsqueeze(-1)
-    ).reshape(records.shape[0], _V_HEAD_DIM) * latent_scales.unsqueeze(-1)
+    return values
 
 
 def _dequantize_static(records: torch.Tensor) -> torch.Tensor:
     """Host reference for the implicit-1.0 static writer (no second level)."""
-    packed = records[:, :_NOPE_BYTES]
-    codes = torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).reshape(
-        records.shape[0], _V_HEAD_DIM
+    values, _ = dequantize_nvfp4_mla_nope(
+        records,
+        nope_bytes=_NOPE_BYTES,
+        group_scales_offset=_GROUP_SCALES_OFFSET,
+        group_scales_end=_ROPE_SCALE_OFFSET,
     )
-    e2m1 = torch.tensor(E2M1_TO_FLOAT32, dtype=torch.float32)
-    group_scales = (
-        records[:, _GROUP_SCALES_OFFSET:_ROPE_SCALE_OFFSET]
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .float()
-    )
-    return (
-        e2m1[codes.long()].reshape(records.shape[0], 32, 16)
-        * group_scales.unsqueeze(-1)
-    ).reshape(records.shape[0], _V_HEAD_DIM)
+    return values
 
 
 def _layered_inputs(
@@ -123,9 +103,7 @@ def _layered_inputs(
     base = base / base.abs().amax(dim=-1, keepdim=True)
     mags = torch.tensor([0.02, 0.08, 0.35, 1.0, 2.6, 5.2]).unsqueeze(-1)
     kv_c = (base * mags).to(device=device, dtype=dtype)
-    k_pe = torch.randn((6, _PE_DIM), dtype=torch.float32).to(
-        device=device, dtype=dtype
-    )
+    k_pe = torch.randn((6, _PE_DIM), dtype=torch.float32).to(device=device, dtype=dtype)
     return kv_c, k_pe
 
 
@@ -160,14 +138,12 @@ def test_per_token_records_store_exact_scale_and_keep_abi(
         records[:, _ROPE_SCALE_OFFSET:_LATENT_SCALE_OFFSET],
         static_records[:, _ROPE_SCALE_OFFSET:_LATENT_SCALE_OFFSET],
     )
-    assert torch.equal(
-        records[:, _ROPE_OFFSET:], static_records[:, _ROPE_OFFSET:]
-    )
+    assert torch.equal(records[:, _ROPE_OFFSET:], static_records[:, _ROPE_OFFSET:])
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 @torch.inference_mode()
-def test_per_token_scale_positions_group_scales_out_of_subnormals(
+def test_per_token_scale_positions_largest_group_scale_near_e4m3_max(
     dtype: torch.dtype,
 ) -> None:
     device = require_sm120()
@@ -181,8 +157,8 @@ def test_per_token_scale_positions_group_scales_out_of_subnormals(
         .view(torch.float8_e4m3fn)
         .float()
     )
-    # Positioning invariant: every token's LARGEST group scale sits near the
-    # top of the E4M3 range (>= 256 given e4m3 rounding), never subnormal.
+    # Positioning invariant: every token's largest group scale sits near the
+    # top of the E4M3 range (>= 256 given e4m3 rounding).
     assert (group_scales.amax(dim=-1) >= 256.0).all()
 
     # The static writer's shallow-magnitude token (amax 0.02) demonstrates the
@@ -219,6 +195,4 @@ def test_zero_token_writes_zero_scale_and_zero_payload() -> None:
     records = _write_records(kv_c, k_pe, per_token_scale=True)
     assert (records[:, :_ROPE_SCALE_OFFSET] == 0).all()
     assert (records[:, _LATENT_SCALE_OFFSET:_PAD_OFFSET] == 0).all()
-    assert torch.equal(
-        _dequantize_two_level(records), torch.zeros((2, _V_HEAD_DIM))
-    )
+    assert torch.equal(_dequantize_two_level(records), torch.zeros((2, _V_HEAD_DIM)))

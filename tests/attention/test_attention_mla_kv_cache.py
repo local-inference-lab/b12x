@@ -10,16 +10,23 @@ from sparkinfer.attention._shared.mla.kv_cache import (
 )
 from sparkinfer.attention._shared.mla.prefill_mg import run_unified_prefill_mg
 from sparkinfer.attention._shared.mla.traits import ComputeMode, ModelType, ScaleFormat
-from sparkinfer.attention.sparse_mla._scratch import SPARKINFERSparseMLAScratchCaps, plan_sparse_mla_scratch
+from sparkinfer.attention.sparse_mla._scratch import (
+    SPARKINFERSparseMLAScratchCaps,
+    plan_sparse_mla_scratch,
+)
 
-from tests._reference.helpers import E2M1_TO_FLOAT32, require_sparkinfer
+from tests._reference.helpers import (
+    dequantize_nvfp4_mla_nope,
+    require_sparkinfer,
+)
 
 
 _RECORD_BYTES = 368
 _NOPE_BYTES = 256
 _GROUP_SCALES_OFFSET = 256
 _ROPE_SCALE_OFFSET = 288
-_PAD_OFFSET = 292
+_LATENT_SCALE_OFFSET = 292
+_PAD_OFFSET = 296
 _ROPE_OFFSET = 304
 _PAGE_SIZE = 64
 _HEADS = 64
@@ -219,32 +226,16 @@ def _dequantize_records(
     *,
     per_token_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    packed = records[:, :_NOPE_BYTES]
-    codes = torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).reshape(
-        records.shape[0], _V_HEAD_DIM
+    nope, group_scales = dequantize_nvfp4_mla_nope(
+        records,
+        nope_bytes=_NOPE_BYTES,
+        group_scales_offset=_GROUP_SCALES_OFFSET,
+        group_scales_end=_ROPE_SCALE_OFFSET,
+        latent_scale_offset=(_LATENT_SCALE_OFFSET if per_token_scale else None),
     )
-    e2m1 = torch.tensor(E2M1_TO_FLOAT32, dtype=torch.float32, device=records.device)
-    group_scales = (
-        records[:, _GROUP_SCALES_OFFSET:_ROPE_SCALE_OFFSET]
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .float()
-    )
-    nope = (
-        e2m1[codes.long()].reshape(records.shape[0], 32, 16)
-        * group_scales.unsqueeze(-1)
-    ).reshape(records.shape[0], _V_HEAD_DIM)
-    if per_token_scale:
-        latent_scales = (
-            records[:, _PAD_OFFSET : _PAD_OFFSET + 4]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1)
-        )
-        nope = nope * latent_scales.unsqueeze(-1)
 
     rope_scales = (
-        records[:, _ROPE_SCALE_OFFSET:_PAD_OFFSET]
+        records[:, _ROPE_SCALE_OFFSET:_LATENT_SCALE_OFFSET]
         .contiguous()
         .view(torch.float32)
         .reshape(-1)
@@ -325,7 +316,9 @@ def test_writer_preserves_skipped_slots_and_writes_the_record_abi(
     assert torch.equal(
         records[:, :_NOPE_BYTES], expected_packed.index_select(0, live_tokens)
     )
-    assert torch.count_nonzero(records[:, _PAD_OFFSET:_ROPE_OFFSET]).item() == 0
+    assert (
+        torch.count_nonzero(records[:, _LATENT_SCALE_OFFSET:_ROPE_OFFSET]).item() == 0
+    )
 
     nope, group_scales, rope, rope_scales = _dequantize_records(records)
     torch.testing.assert_close(

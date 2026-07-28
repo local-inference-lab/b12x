@@ -31,6 +31,46 @@ E2M1_TO_FLOAT32 = [
 ]
 
 
+def dequantize_nvfp4_mla_nope(
+    records: torch.Tensor,
+    *,
+    nope_bytes: int = 256,
+    group_scales_offset: int = 256,
+    group_scales_end: int = 288,
+    latent_scale_offset: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode the NoPE lane of compact NVFP4 MLA records.
+
+    ``latent_scale_offset=None`` models the implicit/static outer-scale
+    record. Passing an offset models a record carrying one inline fp32 outer
+    scale per token.
+    """
+    packed = records[:, :nope_bytes]
+    codes = torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).reshape(
+        records.shape[0], nope_bytes * 2
+    )
+    e2m1 = torch.tensor(E2M1_TO_FLOAT32, dtype=torch.float32, device=records.device)
+    group_scales = (
+        records[:, group_scales_offset:group_scales_end]
+        .contiguous()
+        .view(torch.float8_e4m3fn)
+        .float()
+    )
+    values = (
+        e2m1[codes.long()].reshape(records.shape[0], group_scales.shape[-1], -1)
+        * group_scales.unsqueeze(-1)
+    ).reshape(records.shape[0], nope_bytes * 2)
+    if latent_scale_offset is not None:
+        latent_scales = (
+            records[:, latent_scale_offset : latent_scale_offset + 4]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(-1)
+        )
+        values = values * latent_scales.unsqueeze(-1)
+    return values, group_scales
+
+
 def prepare_tp_moe_fp4_experts(
     *,
     a: torch.Tensor,

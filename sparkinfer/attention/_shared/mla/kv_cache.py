@@ -31,7 +31,7 @@ The RoPE lane stores ``scale = amax / 448.0`` as fp32 at [288, 292) and
 reconstruct ``e4m3_decode(byte) * scale``
 (``prefill_mg._ld_global_nvfp4_fp8_rope_bfloat2``).
 
-``per_token_scale=True`` selects the self-describing two-level variant: the
+``per_token_scale=True`` selects the inline-scale two-level variant: the
 NoPE lane derives its own per-token second-level scale instead of assuming
 the implicit global 1.0 (which parks small-magnitude tokens' group scales in
 E4M3 subnormals -- the defect the static per-layer
@@ -269,9 +269,7 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     token_amax = fmax_f32(token_amax, tmp)
                     latent_scale = token_amax * Float32(_TWO_LEVEL_RCP)
                     if tid == Int32(0):
-                        st_global_f32(
-                            dst + Int64(_LATENT_SCALE_OFFSET), latent_scale
-                        )
+                        st_global_f32(dst + Int64(_LATENT_SCALE_OFFSET), latent_scale)
                     scale_u32 = Uint32(0)
                     packed64 = Uint64(0)
                     if latent_scale != Float32(0.0):
@@ -314,9 +312,7 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
             if cutlass.const_expr(self.per_token_scale):
                 if tid < Int32(_PAD_BYTES - _LATENT_SCALE_BYTES):
                     st_global_u8(
-                        dst
-                        + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES)
-                        + tid.to(Int64),
+                        dst + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES) + tid.to(Int64),
                         cutlass.Uint8(0),
                     )
             else:
@@ -513,7 +509,7 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     :param scale: accepted for signature parity with the fp8 cache-op
         family; the nvfp4_ds_mla record has an implicit global scale of 1.0
         (group scales carry all magnitude), so it is unused.
-    :param per_token_scale: write self-describing two-level records: the
+    :param per_token_scale: write inline-scale two-level records: the
         per-token second-level scale ``token_amax/(6*448)`` is stored fp32 at
         record bytes [292, 296) and group scales are encoded relative to it.
         Readers must run in the matching ``latent_scale_per_token`` mode.
