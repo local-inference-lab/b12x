@@ -5,6 +5,7 @@ import torch
 
 from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
 from sparkinfer.attention.nsa_indexer.paged import (
+    _paged_indexer_chunk_geometry,
     _plan_two_level_fold,
     index_topk_fp8,
     pack_paged_index_k_cache_reference,
@@ -800,10 +801,12 @@ def test_two_level_fold_auto_respects_candidate_memory_boundary(
     above = _plan_two_level_fold(q_rows=64, **common)
 
     assert below.slices == ((1, 0), (1, 1), (1, 2), (1, 3))
+    assert below.total_slices == 4
     assert below.candidate_nbytes == 63 * (4 * 512 * 8 + 4)
     assert below.candidate_nbytes <= 1024 * 1024
     assert below.reason == "within memory budget"
     assert above.slices == ()
+    assert above.total_slices == 0
     assert above.candidate_nbytes == 64 * (4 * 512 * 8 + 4)
     assert above.candidate_nbytes > 1024 * 1024
     assert above.reason == "candidate slab exceeds the memory budget"
@@ -825,7 +828,23 @@ def test_two_level_fold_forced_mode_ignores_memory_boundary(
     )
 
     assert plan.slices == ((1, 0), (1, 1), (1, 2), (1, 3))
+    assert plan.total_slices == 4
     assert plan.reason == "forced"
+
+
+def test_paged_indexer_chunk_geometry_handles_partial_final_chunk() -> None:
+    chunk = _paged_indexer_chunk_geometry(
+        chunk_idx=4,
+        page_table_width=1025,
+        supertile_pages=256,
+        page_size=64,
+    )
+
+    assert chunk.page_begin == 1024
+    assert chunk.page_end == 1025
+    assert chunk.page_count == 1
+    assert chunk.token_begin == 65536
+    assert chunk.token_count == 64
 
 
 @pytest.mark.parametrize(
