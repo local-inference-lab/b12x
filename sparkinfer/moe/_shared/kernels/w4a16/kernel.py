@@ -9675,6 +9675,30 @@ def run_trellis256_dense(
         )
 
 
+def _resolve_route_block_size_m(
+    *,
+    m: int,
+    topk: int,
+    route_num_experts: int,
+    planned_block_size_m: int | None,
+    fused_launch: W4A16FusedMoeCompileResult | None,
+) -> int:
+    """Resolve one route geometry shared by scratch, packing, and GEMM."""
+    planned = None if planned_block_size_m is None else int(planned_block_size_m)
+    if planned is not None and planned not in _ALLOWED_ROUTED_SIZES:
+        raise ValueError(f"unsupported planned W4A16 moe_block_size={planned}")
+    if fused_launch is None:
+        return planned or select_route_block_size_m(m, topk, route_num_experts)
+
+    compiled = int(fused_launch.moe_block_size)
+    if planned is not None and compiled != planned:
+        raise RuntimeError(
+            "preplanned W4A16 route geometry does not match the fused launch: "
+            f"planned_block_size_m={planned}, launch_block_size_m={compiled}"
+        )
+    return compiled
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -9703,6 +9727,7 @@ def run_w4a16_moe(
     swiglu_beta: float | None = None,
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
+    route_block_size_m: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
     a_input_up: torch.Tensor | None = None,
     full_rotation: bool = False,
@@ -9918,10 +9943,13 @@ def run_w4a16_moe(
     route_num_experts = (
         int(expert_map.numel()) if expert_map is not None else int(prepared.num_experts)
     )
-    if fused_launch is None:
-        block_size_m = select_route_block_size_m(m, topk, route_num_experts)
-    else:
-        block_size_m = int(fused_launch.moe_block_size)
+    block_size_m = _resolve_route_block_size_m(
+        m=m,
+        topk=topk,
+        route_num_experts=route_num_experts,
+        planned_block_size_m=route_block_size_m,
+        fused_launch=fused_launch,
+    )
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 

@@ -330,6 +330,29 @@ def pack_topk_routes_by_expert(
     max_packed_routes = max(max_packed_routes, 1)
     max_route_blocks = max(max_route_blocks, 1)
 
+    provided_routes = (
+        None if packed_route_indices is None else int(packed_route_indices.numel())
+    )
+    provided_blocks = (
+        None if block_expert_ids is None else int(block_expert_ids.numel())
+    )
+    if (
+        provided_routes is not None
+        and provided_blocks is not None
+        and (
+            provided_routes < max_packed_routes
+            or provided_blocks < max_route_blocks
+        )
+    ):
+        raise ValueError(
+            "W4A16 route-packing workspace is too small: "
+            f"topk_shape={tuple(topk_ids.shape)}, live_routes={numel}, "
+            f"capacity_routes={numel_capacity}, block_size={int(block_size)}, "
+            f"num_experts={int(num_experts)}, "
+            f"packed_route_indices={provided_routes}/{max_packed_routes}, "
+            f"block_expert_ids={provided_blocks}/{max_route_blocks}"
+        )
+
     packed_route_indices = _workspace_slice(
         packed_route_indices,
         name="packed_route_indices",

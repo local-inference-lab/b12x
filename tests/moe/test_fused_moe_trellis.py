@@ -225,6 +225,38 @@ def test_low_level_buffer_plan_honors_explicit_block_m() -> None:
         )
 
 
+def test_planned_route_block_overrides_live_batch_heuristic() -> None:
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        _resolve_route_block_size_m,
+    )
+
+    # m=1024/topk=8/E=256 selects 48 heuristically. A caller-owned arena
+    # planned for 64 must retain 64 so route packing cannot outgrow its
+    # block-expert table.
+    assert _resolve_route_block_size_m(
+        m=1024,
+        topk=8,
+        route_num_experts=256,
+        planned_block_size_m=None,
+        fused_launch=None,
+    ) == 48
+    assert _resolve_route_block_size_m(
+        m=1024,
+        topk=8,
+        route_num_experts=256,
+        planned_block_size_m=64,
+        fused_launch=None,
+    ) == 64
+    with pytest.raises(RuntimeError, match="planned_block_size_m=64"):
+        _resolve_route_block_size_m(
+            m=1024,
+            topk=8,
+            route_num_experts=256,
+            planned_block_size_m=64,
+            fused_launch=SimpleNamespace(moe_block_size=48),
+        )
+
+
 def _cpu_weight_tensors() -> tuple[torch.Tensor, ...]:
     w13 = torch.zeros((2, 1, 8, 8, 48), dtype=torch.int16)
     w2 = torch.zeros((1, 8, 8, 48), dtype=torch.int16)
@@ -766,6 +798,7 @@ def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
             topk_weights=router_weights[rows].contiguous(),
             topk_ids=ids[rows].contiguous(),
         )
+        assert binding.route_block_size_m == plan.caps.w4a16_block_size_m
         out = fused_moe.run(binding=binding)
         torch.cuda.synchronize(device)
         return out.clone()
@@ -863,6 +896,7 @@ def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
         topk_weights=router_weights,
         topk_ids=ids,
     )
+    assert eager_binding.route_block_size_m == plan.caps.w4a16_block_size_m
     eager = eager_binding.run().clone()
     torch.cuda.synchronize(device)
     assert not torch.isnan(eager).any()

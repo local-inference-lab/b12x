@@ -39,6 +39,28 @@ def _expected_route_pack(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_route_pack_capacity_error_reports_live_contract() -> None:
+    topk_ids = torch.zeros((17, 8), dtype=torch.int32, device="cuda")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"topk_shape=\(17, 8\).*live_routes=136.*block_size=8.*"
+            r"num_experts=32.*packed_route_indices=1/.*block_expert_ids=1/"
+        ),
+    ):
+        pack_topk_routes_by_expert(
+            topk_ids,
+            8,
+            32,
+            packed_route_indices=torch.empty(1, dtype=torch.int32, device="cuda"),
+            block_expert_ids=torch.empty(1, dtype=torch.int32, device="cuda"),
+            packed_route_count=torch.empty(1, dtype=torch.int32, device="cuda"),
+            expert_offsets=torch.empty(33, dtype=torch.int32, device="cuda"),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("shape", [(1, 6), (23, 3), (128, 6), (160, 6), (512, 6)])
 @pytest.mark.parametrize("block_size", [8, 16, 32, 48, 64])

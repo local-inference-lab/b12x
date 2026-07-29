@@ -1026,6 +1026,10 @@ class TPMoEFP4Binding:
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
     kernel_workspace: torch.Tensor | None = None
+    # Preserve the route geometry selected by the caller-owned scratch plan.
+    # Re-running the live-batch heuristic here can select a smaller block than
+    # the arena was sized for (for example, planned 64 versus live 48).
+    route_block_size_m: int | None = None
     route_expert_map: torch.Tensor | None = None
     output_expert_map: torch.Tensor | None = None
     fused_launch: object | None = None
@@ -2378,6 +2382,7 @@ def _build_tp_moe_fp4_binding_from_views(
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=tensors.get("rotation_a_up"),
             kernel_workspace=tensors.get("kernel_workspace"),
+            route_block_size_m=plan.route_block_size_m,
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
         )
@@ -6963,6 +6968,7 @@ def build_tp_moe_fp4_binding(
             rotation_a_gate=workspace.rotation_a_gate,
             rotation_a_up=workspace.rotation_a_up,
             kernel_workspace=workspace.kernel_workspace,
+            route_block_size_m=workspace.route_block_size_m,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
         )
@@ -9780,6 +9786,7 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             swiglu_beta=swiglu_beta,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            route_block_size_m=binding.route_block_size_m,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None
             ),
