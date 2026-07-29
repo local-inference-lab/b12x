@@ -9,6 +9,7 @@ import torch
 pytest.importorskip("cutlass")
 
 from sparkinfer.moe import fused_moe
+from sparkinfer.moe.fused_moe import META as FUSED_MOE_META
 from sparkinfer.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from sparkinfer.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
@@ -69,6 +70,10 @@ def _caps(**overrides) -> fused_moe.Caps:
         quant_mode="w4a16",
         **values,
     )
+
+
+def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
+    assert {"bf16", "fp16"}.issubset(FUSED_MOE_META.dtypes)
 
 
 def test_caps_preserve_exact_block_m_and_input_dtypes() -> None:

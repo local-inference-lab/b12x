@@ -65,7 +65,7 @@ META = OpMeta(
         "is_supported",
         "clear_caches",
     ),
-    dtypes=("bf16",),
+    dtypes=("bf16", "fp16"),
     recipes=(
         "nvfp4",
         "mxfp4",
