@@ -372,7 +372,7 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
 # 0.5 is small enough to actually engage the SwiGLU clamp at these scales.
 @pytest.mark.parametrize("swiglu_limit", [None, 0.5])
 @pytest.mark.parametrize("m", [1, 2, 4, 8])
-@pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("activation", ["relu2", "silu", "situ"])
 def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
     activation: str,
     m: int,
@@ -398,9 +398,10 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         )
         assert e4m3.__cache_key__ != e8m0.__cache_key__
     experts, hidden_size, intermediate_size = 4, 128, 128
-    rows = intermediate_size * (2 if activation == "silu" else 1)
+    rows = intermediate_size * (2 if activation in {"silu", "situ"} else 1)
     topk = 2
-    torch.manual_seed(20260601 + (1000 if activation == "silu" else 0) + m)
+    activation_seed = {"relu2": 0, "silu": 1000, "situ": 2000}[activation]
+    torch.manual_seed(20260601 + activation_seed + m)
     w13 = torch.randint(
         0, 256, (experts, rows, hidden_size // 2), dtype=torch.uint8, device="cuda"
     )
@@ -512,6 +513,93 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         assert bool(torch.isfinite(buffers.output).all().item())
         assert torch.equal(buffers.output, eager)
         _assert_matches_oracle(buffers.output, expected, activation=activation)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_e8m0_native_micro_matches_kimi_k3_tp16_shape() -> None:
+    """Regression for K3's aligned seven-segment H=3584 direct decode path."""
+    experts, hidden_size, intermediate_size = 4, 3584, 192
+    m, topk = 1, 16
+    torch.manual_seed(20260729)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, 2 * intermediate_size, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, 2 * intermediate_size, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        activation="situ",
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    intermediate_cache2 = torch.zeros(
+        2 * m * 128 * topk, dtype=torch.bfloat16, device="cuda"
+    )
+    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = (torch.arange(topk, device="cuda") % experts).to(torch.int32)[None, :]
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation="situ",
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation="situ",
+        w13_layout="w31",
+    )
+    torch.cuda.synchronize()
+
+    assert bool(torch.isfinite(actual).all().item())
+    _assert_matches_oracle(actual, expected, activation="situ")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

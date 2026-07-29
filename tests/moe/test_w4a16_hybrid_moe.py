@@ -386,6 +386,6 @@ def test_tier_local_map_builder_rejects_bad_maps() -> None:
     table = build_w4a16_tier_local_map(_T0_GLOBAL_IDS, _T1_GLOBAL_IDS, map_slots=16)
     assert table.numel() == 16
     assert int(table[0]) == 0
-    assert int(table[1]) == (1 << 8) | 0
+    assert int(table[1]) == (1 << 16) | 0
     assert int(table[9]) == 3
     assert int(table[10]) == -1

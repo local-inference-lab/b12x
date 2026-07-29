@@ -47,6 +47,9 @@ from sparkinfer._lib.intrinsics import (
     warp_reduce,
 )
 from sparkinfer.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
@@ -421,6 +424,7 @@ class MoEMicroKernelBackend:
         del fast_math
         self.activation = activation
         self.is_gated = is_gated_moe_activation(activation)
+        self.is_situ = activation == SITU
         self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
@@ -444,6 +448,7 @@ class MoEMicroKernelBackend:
         return (
             self.sf_vec_size,
             self.activation,
+            self.is_situ,
             self.share_input_across_experts,
             self.share_expert_scales,
             self.single_token,
@@ -4262,7 +4267,16 @@ class MoEMicroKernelBackend:
                             gw1 = ld_global_nc_u32(
                                 gate_byte_addr + seg_byte_off + Int64(4)
                             )
-                            if cutlass.const_expr(self.w4a16_mode):
+                            if cutlass.const_expr(self.scale_format_e8m0_k32):
+                                sf_g = self._ld_e8m0_scale(
+                                    w1s_base_addr,
+                                    ebase_sf_packed,
+                                    scale_col >> Int32(1),
+                                    row_g,
+                                    Int32(cfg.two_n),
+                                    Int32(cfg.k_dim // 32),
+                                )
+                            elif cutlass.const_expr(self.w4a16_mode):
                                 sf_g = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
                                     ebase_sf_packed_e4m3,
@@ -4283,7 +4297,16 @@ class MoEMicroKernelBackend:
                                 uw1 = ld_global_nc_u32(
                                     up_byte_addr + seg_byte_off + Int64(4)
                                 )
-                                if cutlass.const_expr(self.w4a16_mode):
+                                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                                    sf_u = self._ld_e8m0_scale(
+                                        w1s_base_addr,
+                                        ebase_sf_packed,
+                                        scale_col >> Int32(1),
+                                        row_u,
+                                        Int32(cfg.two_n),
+                                        Int32(cfg.k_dim // 32),
+                                    )
+                                elif cutlass.const_expr(self.w4a16_mode):
                                     sf_u = self._ld_e4m3_packed_scale_col(
                                         w1s_base_addr,
                                         ebase_sf_packed_e4m3,
@@ -4495,7 +4518,24 @@ class MoEMicroKernelBackend:
                         sigmoid = Float32(1.0) / (
                             Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=False)
                         )
-                        activated = sigmoid * gate_red * up_term
+                        if cutlass.const_expr(self.is_situ):
+                            beta = Float32(SITU_DEFAULT_BETA)
+                            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+                            situ_gate = (
+                                beta
+                                * cute.math.tanh(
+                                    gate_red / beta,
+                                    fastmath=False,
+                                )
+                                * sigmoid
+                            )
+                            situ_up = linear_beta * cute.math.tanh(
+                                up_red / linear_beta,
+                                fastmath=False,
+                            )
+                            activated = situ_gate * situ_up
+                        else:
+                            activated = sigmoid * gate_red * up_term
                     else:
                         relu_val = fmax_f32(gate_red, Float32(0.0))
                         activated = relu_val * relu_val

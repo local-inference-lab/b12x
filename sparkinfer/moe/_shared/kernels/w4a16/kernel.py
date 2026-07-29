@@ -713,9 +713,7 @@ class W4A16GemmKernel:
                 raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
         elif weight_layout == "trellis3_t256":
             if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-                raise ValueError(
-                    f"unsupported trellis3_t256 w13_layout {w13_layout!r}"
-                )
+                raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
         else:
             w13_layout = "packed"
             source_n_rotation = 0
@@ -805,8 +803,7 @@ class W4A16GemmKernel:
         self.weight_layout_nf3 = weight_layout == "nf3_2p1"
         self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
         self.weight_layout_trellis256_proj = (
-            self.weight_layout_trellis256
-            and w13_layout == "trellis3_t256_proj"
+            self.weight_layout_trellis256 and w13_layout == "trellis3_t256_proj"
         )
         if self.weight_layout_trellis256_proj and (
             self.size_n % 2 != 0 or (self.size_n // 2) % self.tile_n != 0
@@ -815,9 +812,7 @@ class W4A16GemmKernel:
                 "trellis3_t256_proj requires each FC1 projection to contain "
                 "an integral number of CTA N tiles"
             )
-        self.b_region_variable = (
-            self.weight_layout_nf3 or self.weight_layout_trellis256
-        )
+        self.b_region_variable = self.weight_layout_nf3 or self.weight_layout_trellis256
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
         # k32 scale cadence (two K16 rows share one scale group). Shared by the
@@ -919,9 +914,7 @@ class W4A16GemmKernel:
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=(
-                max(4, self.trellis_bits)
-                if self.weight_layout_trellis256
-                else 4
+                max(4, self.trellis_bits) if self.weight_layout_trellis256 else 4
             ),
         )
 
@@ -945,7 +938,9 @@ class W4A16GemmKernel:
         self.b_unit_bytes = (
             4 * self.trellis_bits
             if self.weight_layout_trellis256
-            else 12 if self.weight_layout_nf3 else 16
+            else 12
+            if self.weight_layout_nf3
+            else 16
         )
         self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
         if self.b_region_variable:
@@ -1175,15 +1170,11 @@ class W4A16GemmKernel:
     ):
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
-            layout=cute.make_layout(
-                (active_m * Int32(self.size_k),), stride=(1,)
-            ),
+            layout=cute.make_layout((active_m * Int32(self.size_k),), stride=(1,)),
         )
         a_alt_bf16_flat = cute.make_tensor(
             a_alt_bf16_ptr,
-            layout=cute.make_layout(
-                (active_m * Int32(self.size_k),), stride=(1,)
-            ),
+            layout=cute.make_layout((active_m * Int32(self.size_k),), stride=(1,)),
         )
         c_bf16_flat = cute.make_tensor(
             c_bf16_ptr,
@@ -3075,14 +3066,12 @@ class W4A16GemmKernel:
         w_n = warp_id % Int32(self.tb_n_warps)
         kt_local = Int32(self.b_sh_wr_iters) * warp_row + kk
         b_region = (
-            smem_base
-            + Int32(self.sh_b_off * 16)
-            + pipe * Int32(self.b_sh_stage_bytes)
+            smem_base + Int32(self.sh_b_off * 16) + pipe * Int32(self.b_sh_stage_bytes)
         )
         tile_u32 = 8 * self.trellis_bits
-        base_u32 = (
-            kt_local * Int32(self.cta_n_blocks) + Int32(4) * w_n
-        ) * Int32(tile_u32)
+        base_u32 = (kt_local * Int32(self.cta_n_blocks) + Int32(4) * w_n) * Int32(
+            tile_u32
+        )
         wa = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
         wb = [Uint32(0), Uint32(0), Uint32(0), Uint32(0)]
         if cutlass.const_expr(self.trellis_bits <= 4):
@@ -3117,9 +3106,7 @@ class W4A16GemmKernel:
                 z2 = ld_shared_u32(b_region + (tbase + i2) * Int32(4))
                 stream64 = Uint64(0)
                 if delta == Int32(1):
-                    stream64 = (
-                        (Uint64(z0) << Uint64(32)) | Uint64(z2)
-                    ) >> Uint64(s2)
+                    stream64 = ((Uint64(z0) << Uint64(32)) | Uint64(z2)) >> Uint64(s2)
                 else:
                     lower64 = (Uint64(z1) << Uint64(32)) | Uint64(z2)
                     stream64 = (lower64 >> Uint64(s2)) | (
@@ -3462,9 +3449,7 @@ class W4A16GemmKernel:
                 # The selected source still lands in the one existing A SMEM
                 # stage, so this adds neither shared memory nor MMA work.
                 if output_n_tile >= Int32(self.n_tiles // 2):
-                    a_src = get_ptr_as_int64(
-                        a_alt_bf16_flat, a_int4 * Int32(8)
-                    )
+                    a_src = get_ptr_as_int64(a_alt_bf16_flat, a_int4 * Int32(8))
             if cutlass.const_expr(self.has_k_tile_tail):
                 a_k_int4 = tile_idx * Int32(self.a_gl_rd_delta_o) + a_gl_rd_col0
                 if row < block_valid_rows and a_k_int4 < a_gl_stride:
@@ -3500,12 +3485,8 @@ class W4A16GemmKernel:
                 if cutlass.const_expr(self.weight_layout_trellis256_proj):
                     t256_half_n16 = t256_n16 // 2
                     t256_out_n16 = output_n_tile * Int32(self.cta_n_blocks)
-                    t256_proj = (
-                        t256_out_n16 >= Int32(t256_half_n16)
-                    ).to(Int32)
-                    t256_local_n16 = (
-                        t256_out_n16 - t256_proj * Int32(t256_half_n16)
-                    )
+                    t256_proj = (t256_out_n16 >= Int32(t256_half_n16)).to(Int32)
+                    t256_local_n16 = t256_out_n16 - t256_proj * Int32(t256_half_n16)
                     t256_proj_expert_u32 = (
                         (self.size_k // 16) * t256_half_n16 * t256_tile_u32
                     )
@@ -3523,7 +3504,8 @@ class W4A16GemmKernel:
                         Int64(t256_expert_u32) * Int64(expert_idx)
                         + (Int64(tile_idx) * Int64(self.cta_k_blocks) + Int64(t256_kt))
                         * Int64(t256_n16 * t256_tile_u32)
-                        + Int64(output_n_tile) * Int64(self.cta_n_blocks * t256_tile_u32)
+                        + Int64(output_n_tile)
+                        * Int64(self.cta_n_blocks * t256_tile_u32)
                         + Int64(t256_in_kt) * Int64(4)
                     )
                 cp_async4_shared_global_pred(
@@ -4633,9 +4615,7 @@ class W4A16FusedMoeKernel:
                 raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
         elif weight_layout == "trellis3_t256":
             if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-                raise ValueError(
-                    f"unsupported trellis3_t256 w13_layout {w13_layout!r}"
-                )
+                raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
@@ -4708,9 +4688,7 @@ class W4A16FusedMoeKernel:
             if element_dtype != "fp16":
                 raise ValueError("full_rotation requires fp16 GEMM operands")
             if self.rotation_input_dtype not in {"bf16", "fp16"}:
-                raise ValueError(
-                    "full_rotation input dtype must be 'bf16' or 'fp16'"
-                )
+                raise ValueError("full_rotation input dtype must be 'bf16' or 'fp16'")
             if self.direct_topk_routes or self.tc_decode_fused_sum:
                 raise ValueError(
                     "full_rotation requires the route-packed non-TC-decode path"
@@ -4771,9 +4749,7 @@ class W4A16FusedMoeKernel:
             element_dtype=element_dtype,
             weight_layout=weight_layout,
             scale_format=scale_format,
-            w13_layout=(
-                "packed" if weight_layout == "trellis3_t256" else w13_layout
-            ),
+            w13_layout=("packed" if weight_layout == "trellis3_t256" else w13_layout),
             trellis_bits=self.trellis_bits,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
@@ -4889,21 +4865,15 @@ class W4A16FusedMoeKernel:
             a_rows = active_m * Int32(self.top_k)
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
-            layout=cute.make_layout(
-                (a_rows * Int32(self.hidden_size),), stride=(1,)
-            ),
+            layout=cute.make_layout((a_rows * Int32(self.hidden_size),), stride=(1,)),
         )
         a_alt_bf16_flat = cute.make_tensor(
             a_alt_bf16_ptr,
-            layout=cute.make_layout(
-                (a_rows * Int32(self.hidden_size),), stride=(1,)
-            ),
+            layout=cute.make_layout((a_rows * Int32(self.hidden_size),), stride=(1,)),
         )
         rotation_input_flat = cute.make_tensor(
             rotation_input_ptr,
-            layout=cute.make_layout(
-                (active_m * Int32(self.hidden_size),), stride=(1,)
-            ),
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -5280,9 +5250,7 @@ class W4A16FusedMoeKernel:
             route_pos = unit // nblk
             blk = unit - route_pos * nblk
             route = packed_route_indices[route_pos].to(Int32)
-            expert = block_expert_ids[
-                route_pos // Int32(self.moe_block_size)
-            ].to(Int32)
+            expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
             if route >= Int32(0) and route < live_routes and expert >= Int32(0):
                 token = route // Int32(self.top_k)
                 col0 = blk * Int32(128) + elem
@@ -5367,9 +5335,7 @@ class W4A16FusedMoeKernel:
             route_pos = unit // nblk
             blk = unit - route_pos * nblk
             row = packed_route_indices[route_pos].to(Int32)
-            expert = block_expert_ids[
-                route_pos // Int32(self.moe_block_size)
-            ].to(Int32)
+            expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
             if row >= Int32(0) and row < live_routes and expert >= Int32(0):
                 col0 = blk * Int32(128) + elem
                 g_base = row * fc1_cols + col0
@@ -5704,9 +5670,7 @@ class W4A16FusedMoeKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
-                sigmoid = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + exp_neg_gate
-                )
+                sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
                 silu = gate * sigmoid
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
@@ -5720,9 +5684,7 @@ class W4A16FusedMoeKernel:
                         up / linear_beta,
                         fastmath=self.fast_math,
                     )
-                    activated_bf16_flat[idx] = self._cast_elem(
-                        situ_gate * situ_up
-                    )
+                    activated_bf16_flat[idx] = self._cast_elem(situ_gate * situ_up)
                 elif cutlass.const_expr(self.activation_is_swigluoai):
                     activated_bf16_flat[idx] = self._cast_elem(silu * up_term)
                 else:
@@ -5750,12 +5712,15 @@ class W4A16FusedMoeHybridKernel:
 
     Route contract: the routes tensor carries GLOBAL expert ids (one per
     size_m*top_k slot, -1 for inactive). tier_local_map holds one int32
-    descriptor per global expert id: (tier << 8) | local_expert_id, negative
+    descriptor per global expert id: (tier << 16) | local_expert_id, negative
     for unmapped. Unmapped or out-of-range ids skip the tile, matching the
     -1-route behavior of the single-tier direct path.
     """
 
-    ABI_VERSION = 1
+    # v2 widens the tier-local descriptor from 8 to 16 local-id bits.  Keep
+    # this in the compile key so a persistent v1 artifact can never be reused
+    # for K3's >256-expert tiers.
+    ABI_VERSION = 2
 
     def __init__(
         self,
@@ -5844,9 +5809,9 @@ class W4A16FusedMoeHybridKernel:
             raise ValueError(
                 "hybrid W4A16 map_slots must cover both tiers' expert counts"
             )
-        if tier0.num_experts > 256 or tier1.num_experts > 256:
+        if tier0.num_experts > 65536 or tier1.num_experts > 65536:
             raise ValueError(
-                "hybrid W4A16 local expert ids must fit the 8-bit descriptor field"
+                "hybrid W4A16 local expert ids must fit the 16-bit descriptor field"
             )
         self.tier0 = tier0
         self.tier1 = tier1
@@ -5904,8 +5869,8 @@ class W4A16FusedMoeHybridKernel:
         if gid >= Int32(0) and gid < Int32(self.map_slots):
             descriptor = tier_local_map_i32_flat[gid].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(8)
-                local_expert = descriptor & Int32(0xFF)
+                tier = descriptor >> Int32(16)
+                local_expert = descriptor & Int32(0xFFFF)
                 if tier == Int32(0):
                     if local_expert < Int32(self.tier0.num_experts):
                         if cutlass.const_expr(is_fc1):
@@ -6330,9 +6295,7 @@ class W4A16ActivationKernel:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=True)
                 else:
                     exp_neg_gate = cute.math.exp(-sigmoid_arg, fastmath=False)
-                sigmoid = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + exp_neg_gate
-                )
+                sigmoid = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + exp_neg_gate)
                 silu = gate * sigmoid
                 if cutlass.const_expr(self.is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
@@ -6346,9 +6309,7 @@ class W4A16ActivationKernel:
                         up / linear_beta,
                         fastmath=self.fast_math,
                     )
-                    activated_flat[idx] = self._cast_elem(
-                        situ_gate * situ_up
-                    )
+                    activated_flat[idx] = self._cast_elem(situ_gate * situ_up)
                 elif cutlass.const_expr(self.is_swigluoai):
                     activated_flat[idx] = self._cast_elem(silu * up_term)
                 else:
@@ -6390,7 +6351,9 @@ class W4A16TopKSumKernel:
             if self.element_dtype != "fp16":
                 raise ValueError("full-rotation top-k sum requires fp16 route values")
             if self.hidden_size % 128 != 0:
-                raise ValueError("full-rotation top-k sum requires hidden_size % 128 == 0")
+                raise ValueError(
+                    "full-rotation top-k sum requires hidden_size % 128 == 0"
+                )
             if self.num_experts <= 0:
                 raise ValueError("full-rotation top-k sum requires num_experts > 0")
             if self.use_expert_map and self.route_num_experts <= 0:
@@ -6497,9 +6460,8 @@ class W4A16TopKSumKernel:
                     expert = raw_expert
                     if cutlass.const_expr(self.use_expert_map):
                         expert = Int32(-1)
-                        if (
-                            raw_expert >= Int32(0)
-                            and raw_expert < Int32(self.route_num_experts)
+                        if raw_expert >= Int32(0) and raw_expert < Int32(
+                            self.route_num_experts
                         ):
                             expert = expert_map_flat[raw_expert].to(Int32)
                     if expert >= Int32(0) and expert < Int32(self.num_experts):
@@ -6508,9 +6470,7 @@ class W4A16TopKSumKernel:
                         v1 = fc2_flat[base + Int32(1)].to(cutlass.Float32)
                         v2 = fc2_flat[base + Int32(2)].to(cutlass.Float32)
                         v3 = fc2_flat[base + Int32(3)].to(cutlass.Float32)
-                        h0, h1, h2, h3 = self._had128_quad(
-                            v0, v1, v2, v3, lane
-                        )
+                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
                         sbase = expert * Int32(self.hidden_size) + col0
                         s0 = svh_flat[sbase + Int32(0)].to(cutlass.Float32)
                         s1 = svh_flat[sbase + Int32(1)].to(cutlass.Float32)
@@ -7072,9 +7032,7 @@ def compile_w4a16_fused_moe(
             raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
     elif weight_layout == "trellis3_t256":
         if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-            raise ValueError(
-                f"unsupported trellis3_t256 w13_layout {w13_layout!r}"
-            )
+            raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
     else:
         w13_layout = "packed"
     direct_topk_routes = bool(direct_topk_routes)
@@ -7897,6 +7855,14 @@ def compile_w4a16_fused_moe_hybrid(
         device,
         kernel.__cache_key__,
     )
+    # The loaded callable is process/device-local, but the compiled cubin is
+    # architecture-specific, not ordinal-specific.  Excluding the CUDA device
+    # index from the persistent compile key lets a single-GPU prewarm serve all
+    # identical TP ranks instead of compiling the same K3 split 16 times.
+    persistent_compile_key = (
+        "w4a16_fused_moe_hybrid",
+        kernel.__cache_key__,
+    )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
         return replace(cached, size_m=size_m, max_m_blocks=max_m_blocks)
@@ -8008,7 +7974,7 @@ def compile_w4a16_fused_moe_hybrid(
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe_hybrid",
             W4A16FusedMoeHybridKernel.ABI_VERSION,
-            cache_key,
+            persistent_compile_key,
         ),
     )
     registers_per_thread = -1
@@ -8195,9 +8161,7 @@ def compile_w4a16_topk_sum(
     expert_map_fake = make_ptr(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    svh_fake = make_ptr(
-        cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16
-    )
+    svh_fake = make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16)
     kernel = W4A16TopKSumKernel(
         topk=topk,
         hidden_size=hidden_size,
@@ -9450,9 +9414,7 @@ def _run_trellis256_dense_current_device(
             f"output must be contiguous {x.dtype} with shape {(m, size_n)} on {x.device}"
         )
     if gemm_output is None:
-        gemm_output = torch.empty(
-            (m, size_n), dtype=compute_dtype, device=x.device
-        )
+        gemm_output = torch.empty((m, size_n), dtype=compute_dtype, device=x.device)
     elif (
         tuple(gemm_output.shape) != (m, size_n)
         or gemm_output.dtype != compute_dtype
@@ -9550,9 +9512,7 @@ def _run_trellis256_dense_current_device(
     )
 
     gemm_f16 = (
-        gemm_output
-        if compute_dtype == torch.float16
-        else gemm_output.to(torch.float16)
+        gemm_output if compute_dtype == torch.float16 else gemm_output.to(torch.float16)
     )
     if output.dtype == torch.float16:
         hadamard_128(gemm_f16, output, None, prepared_dense.svh, 1.0)
@@ -9660,7 +9620,9 @@ def run_w4a16_moe(
     else:
         element_dtype = rotation_input_dtype
         if output.dtype != a_input.dtype:
-            raise TypeError(f"output must have dtype {a_input.dtype}, got {output.dtype}")
+            raise TypeError(
+                f"output must have dtype {a_input.dtype}, got {output.dtype}"
+            )
         if prepared_dtype != a_input.dtype:
             raise TypeError(
                 f"prepared weights were built for {prepared_dtype}, but a_input has dtype {a_input.dtype}"
@@ -9704,9 +9666,7 @@ def run_w4a16_moe(
             raise ValueError(f"unsupported W4A16 w13_layout {w13_layout!r}")
     elif weight_layout == "trellis3_t256":
         if w13_layout not in _TRELLIS256_W13_LAYOUTS:
-            raise ValueError(
-                f"unsupported trellis3_t256 w13_layout {w13_layout!r}"
-            )
+            raise ValueError(f"unsupported trellis3_t256 w13_layout {w13_layout!r}")
     else:
         w13_layout = "packed"
     dual_a_required = bool(
@@ -9765,11 +9725,12 @@ def run_w4a16_moe(
         raise ValueError(f"output must have shape {(m, hidden_size)}")
     if expert_map is not None and int(expert_map.numel()) < int(prepared.num_experts):
         raise ValueError("expert_map cannot be shorter than the local expert count")
-    if (
-        output_expert_map is not None
-        and int(output_expert_map.numel()) < int(prepared.num_experts)
+    if output_expert_map is not None and int(output_expert_map.numel()) < int(
+        prepared.num_experts
     ):
-        raise ValueError("output_expert_map cannot be shorter than the local expert count")
+        raise ValueError(
+            "output_expert_map cannot be shorter than the local expert count"
+        )
     if full_rotation:
         if apply_router_weight_on_input:
             raise ValueError(
@@ -10346,38 +10307,106 @@ def run_w4a16_moe(
         # bitrate reaches compilation without widening the stable public op ABI.
         # Other production layouts keep the registered path byte-identical.
         (
-            _rc_a, _rc_w13, _rc_w2, _rc_fc1, _rc_act, _rc_fc2, _rc_w13s, _rc_w2s,
-            _rc_w13g, _rc_w2g, _rc_pri, _rc_bei, _rc_prc,
+            _rc_a,
+            _rc_w13,
+            _rc_w2,
+            _rc_fc1,
+            _rc_act,
+            _rc_fc2,
+            _rc_w13s,
+            _rc_w2s,
+            _rc_w13g,
+            _rc_w2g,
+            _rc_pri,
+            _rc_bei,
+            _rc_prc,
         ) = launch_common
         (
-            _lt_tw, _lt_fc1s, _lt_fc2s, _lt_ws, _lt_m, _lt_capm, _lt_h, _lt_i,
-            _lt_ne, _lt_tk, _lt_act, _lt_arwi, _lt_zfo, _lt_bsm, _lt_mmb,
-            _lt_edt, _lt_fm, _lt_sms, _lt_msm, _lt_hsl, _lt_slv, _lt_sa, _lt_sb,
-            _lt_wl, _lt_sf, _lt_w13l, _lt_fc1tk, _lt_fc1tn, _lt_fc2tk,
+            _lt_tw,
+            _lt_fc1s,
+            _lt_fc2s,
+            _lt_ws,
+            _lt_m,
+            _lt_capm,
+            _lt_h,
+            _lt_i,
+            _lt_ne,
+            _lt_tk,
+            _lt_act,
+            _lt_arwi,
+            _lt_zfo,
+            _lt_bsm,
+            _lt_mmb,
+            _lt_edt,
+            _lt_fm,
+            _lt_sms,
+            _lt_msm,
+            _lt_hsl,
+            _lt_slv,
+            _lt_sa,
+            _lt_sb,
+            _lt_wl,
+            _lt_sf,
+            _lt_w13l,
+            _lt_fc1tk,
+            _lt_fc1tn,
+            _lt_fc2tk,
             _lt_fc2tn,
         ) = launch_tail
         launch_a = rotation_a_gate if full_rotation else _rc_a
         launch_a_up = rotation_a_up if full_rotation else a_input_up
         assert launch_a is not None
         _w4a16_fused_moe_launch_flat(
-            a_input=launch_a, w13_arg=_rc_w13, w2_arg=_rc_w2, fc1_out=_rc_fc1,
-            activated=_rc_act, fc2_out=_rc_fc2, w13_scale_i32=_rc_w13s,
-            w2_scale_i32=_rc_w2s, w13_global_scale=_rc_w13g, w2_global_scale=_rc_w2g,
-            packed_route_indices=_rc_pri, block_expert_ids=_rc_bei,
-            packed_route_count=_rc_prc, activation_amax=None, layer_idx=0,
-            topk_weights=_lt_tw, fc1_scratch=_lt_fc1s, fc2_scratch=_lt_fc2s,
-            workspace=_lt_ws, m=_lt_m, size_m=_lt_capm, hidden_size=_lt_h,
-            intermediate_size=_lt_i, num_experts=_lt_ne, topk=_lt_tk,
-            activation=_lt_act, apply_router_weight_on_input=_lt_arwi,
-            zero_fc2_output=_lt_zfo, moe_block_size=_lt_bsm, max_m_blocks=_lt_mmb,
-            element_dtype=_lt_edt, fast_math=_lt_fm, sms=_lt_sms, max_shared_mem=_lt_msm,
-            has_swiglu_limit=_lt_hsl, swiglu_limit_value=_lt_slv, swiglu_alpha=_lt_sa,
-            swiglu_beta=_lt_sb, weight_layout=_lt_wl, scale_format=_lt_sf,
-            w13_layout=_lt_w13l, fc1_tile_k=_lt_fc1tk, fc1_tile_n=_lt_fc1tn,
-            fc2_tile_k=_lt_fc2tk, fc2_tile_n=_lt_fc2tn,
+            a_input=launch_a,
+            w13_arg=_rc_w13,
+            w2_arg=_rc_w2,
+            fc1_out=_rc_fc1,
+            activated=_rc_act,
+            fc2_out=_rc_fc2,
+            w13_scale_i32=_rc_w13s,
+            w2_scale_i32=_rc_w2s,
+            w13_global_scale=_rc_w13g,
+            w2_global_scale=_rc_w2g,
+            packed_route_indices=_rc_pri,
+            block_expert_ids=_rc_bei,
+            packed_route_count=_rc_prc,
+            activation_amax=None,
+            layer_idx=0,
+            topk_weights=_lt_tw,
+            fc1_scratch=_lt_fc1s,
+            fc2_scratch=_lt_fc2s,
+            workspace=_lt_ws,
+            m=_lt_m,
+            size_m=_lt_capm,
+            hidden_size=_lt_h,
+            intermediate_size=_lt_i,
+            num_experts=_lt_ne,
+            topk=_lt_tk,
+            activation=_lt_act,
+            apply_router_weight_on_input=_lt_arwi,
+            zero_fc2_output=_lt_zfo,
+            moe_block_size=_lt_bsm,
+            max_m_blocks=_lt_mmb,
+            element_dtype=_lt_edt,
+            fast_math=_lt_fm,
+            sms=_lt_sms,
+            max_shared_mem=_lt_msm,
+            has_swiglu_limit=_lt_hsl,
+            swiglu_limit_value=_lt_slv,
+            swiglu_alpha=_lt_sa,
+            swiglu_beta=_lt_sb,
+            weight_layout=_lt_wl,
+            scale_format=_lt_sf,
+            w13_layout=_lt_w13l,
+            fc1_tile_k=_lt_fc1tk,
+            fc1_tile_n=_lt_fc1tn,
+            fc2_tile_k=_lt_fc2tk,
+            fc2_tile_n=_lt_fc2tn,
             direct_topk_routes=bool(use_direct_topk_routes),
-            tc_decode_fused_sum=bool(use_tc_decode), collect_activation_amax=False,
-            stream_int=int(stream), rot_scales=rot_arg,
+            tc_decode_fused_sum=bool(use_tc_decode),
+            collect_activation_amax=False,
+            stream_int=int(stream),
+            rot_scales=rot_arg,
             intermediate_rotation=_intermediate_rotation,
             a_input_up=launch_a_up,
             trellis_bits=trellis_bits,
@@ -10463,7 +10492,7 @@ def build_w4a16_tier_local_map(
 ) -> torch.Tensor:
     """Build the int32 [map_slots] global-expert descriptor table.
 
-    Entry g = (tier << 8) | local_expert_id for a mapped global expert id g,
+    Entry g = (tier << 16) | local_expert_id for a mapped global expert id g,
     -1 for unmapped. tierN_global_ids[i] is the global id of that tier's local
     expert i, i.e. the order the tier's weights were packed in.
     """
@@ -10473,10 +10502,10 @@ def build_w4a16_tier_local_map(
     seen: set[int] = set()
     for tier, ids in ((0, tier0_global_ids), (1, tier1_global_ids)):
         ids_list = [int(v) for v in ids]
-        if len(ids_list) > 256:
+        if len(ids_list) > 65536:
             raise ValueError(
                 f"tier {tier} has {len(ids_list)} experts; the descriptor "
-                "local-id field is 8 bits"
+                "local-id field is 16 bits"
             )
         for local, gid in enumerate(ids_list):
             if gid < 0 or gid >= map_slots:
@@ -10487,7 +10516,7 @@ def build_w4a16_tier_local_map(
             if gid in seen:
                 raise ValueError(f"global expert id {gid} is mapped twice")
             seen.add(gid)
-            table[gid] = (tier << 8) | local
+            table[gid] = (tier << 16) | local
     if device is not None:
         table = table.to(device)
     return table.contiguous()
