@@ -146,6 +146,8 @@ def io_issue_gather_glm_mg(
     io_threads: cutlass.Constexpr = _IO_THREADS,
     scale_format: cutlass.Constexpr = 1,
     fp8_rope: cutlass.Constexpr = False,
+    per_token_latent_scale: cutlass.Constexpr = False,
+    kv_sc_dst_addr: Int32 = Int32(0),
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -168,6 +170,38 @@ def io_issue_gather_glm_mg(
     else:
         _ios = Int64(_GLM_IO_STRIDE)
         _nope = Int32(_GLM_NOPE_SCALE_BYTES)
+
+    if cutlass.const_expr(
+        scale_format == 2 and fp8_rope and per_token_latent_scale
+    ):
+        # NVFP4 two-level record: scalar-gather the per-token fp32 latent
+        # scale ([292, 296); loaded as the second word of the 8-aligned pair
+        # at [288, 296)) into the contiguous smem kv_sc buffer -- the MG
+        # analogue of the DSV4 footer gather above.  The fence orders these
+        # stores before the leader's arrive, exactly like the DSV4 path.
+        eo = Int32(0)
+        for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+            entry = eo + io_lane
+            if entry < Int32(bi):
+                cand_pos = g_start + entry
+                idx_raw = Int32(-1)
+                if cand_pos < g_end:
+                    idx_raw = Int32(topk_indices[cand_pos])
+                f1 = Uint32(0)
+                if idx_raw >= Int32(0):
+                    block_idx = idx_raw // page_block_size
+                    local_idx = idx_raw - block_idx * page_block_size
+                    scale_base_off = (
+                        Int64(block_idx) * stride_kv_block
+                        + Int64(local_idx) * _ios
+                        + Int64(288)
+                    )
+                    _, f1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(kv_cache_u8, scale_base_off)
+                    )
+                st_shared_u32(kv_sc_dst_addr + entry * Int32(4), f1)
+            eo += Int32(io_threads)
+        cute.arch.fence_acq_rel_cta()
 
     if io_lane == Int32(0):
         cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(bi) * _nope)

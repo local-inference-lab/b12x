@@ -700,7 +700,7 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        if cutlass.const_expr(t.has_extra_cache):
+        if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
         else:
             kv_sc_addr = Int32(0)
@@ -816,6 +816,7 @@ class UnifiedDecodeKernel:
                     fp8_rope=t.fp8_rope,
                     packed_glm=self.native_glm_h8,
                     packed_dsv4=self.native_dsv4_h8,
+                    per_token_latent_scale=t.latent_scale_per_token,
                 )
                 prod_idx += Int32(1)
                 if prod_idx == Int32(n_buf):
@@ -1067,6 +1068,7 @@ class UnifiedDecodeKernel:
                         kv_smem_stride=t.kv_smem_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
+                        latent_scale_per_token=t.latent_scale_per_token,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -1156,6 +1158,7 @@ class UnifiedDecodeKernel:
                         barrier_id=3,
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
+                        latent_scale_per_token=t.latent_scale_per_token,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -1514,7 +1517,7 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        if cutlass.const_expr(t.has_extra_cache):
+        if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
         else:
             kv_sc_addr = Int32(0)
@@ -1655,6 +1658,7 @@ class UnifiedDecodeKernel:
                     packed_glm=self.native_glm_h8,
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
+                    per_token_latent_scale=t.latent_scale_per_token,
                 )
                 # Per-chunk section dispatch (DSV4 dual-cache; FlashInfer
                 # decode_dsv4 :243-322). chunks [0, num_main_chunks) gather from the
@@ -2035,6 +2039,7 @@ class UnifiedDecodeKernel:
                         kv_smem_stride=t.kv_smem_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
+                        latent_scale_per_token=t.latent_scale_per_token,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -2151,6 +2156,7 @@ class UnifiedDecodeKernel:
                         barrier_id=3,
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
+                        latent_scale_per_token=t.latent_scale_per_token,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -2374,6 +2380,7 @@ def _sparse_mla_decode_grid_flat_launch(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    latent_scale_per_token: bool = False,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
     rows = int(q_all.shape[0])
@@ -2408,6 +2415,7 @@ def _sparse_mla_decode_grid_flat_launch(
         int(compute_mode),
         int(scale_format),
         fp8_rope=bool(fp8_rope),
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
     if native_h8:
         # Four warps cover 4*16 candidates in swapped QK.  PV keeps the same
@@ -2509,6 +2517,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
+        key_field("latent_scale_per_token", int(traits.latent_scale_per_token)),
         key_field("num_heads", heads),
         key_field("hpb", hpb),
         key_field("valid_hpb", int(valid_hpb)),
@@ -2584,8 +2593,14 @@ def _sparse_mla_decode_grid_flat_launch(
         # v18: latent_scale == 1.0 is folded out at trace time, producing a
         # cubin without the outer-scale multiply; the identity and dynamic
         # variants must not share a cache entry.
-        18,
-        key_field("latent_scale_identity", int(float(latent_scale) == 1.0)),
+        # v19: latent_scale_per_token joins the key (per-candidate fp32 scale
+        # read from kv_sc smem). In that mode the launch scalar is dead, so the
+        # identity fold is forced ON -- no per-scalar variants get compiled.
+        19,
+        key_field(
+            "latent_scale_identity",
+            int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
+        ),
         *spec_fields,
     )
     if per_token_len:
@@ -2634,6 +2649,7 @@ def _sparse_mla_decode_grid_op(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    latent_scale_per_token: bool = False,
 ) -> None:
     _sparse_mla_decode_grid_flat_launch(
         q_all,
@@ -2665,6 +2681,7 @@ def _sparse_mla_decode_grid_op(
         head_block_offset,
         has_extra,
         per_token_len,
+        latent_scale_per_token,
     )
 
 
@@ -2699,6 +2716,7 @@ def _sparse_mla_decode_grid_fake(
     head_block_offset: int,
     has_extra: bool,
     per_token_len: bool,
+    latent_scale_per_token: bool = False,
 ) -> None:
     return None
 
@@ -2725,6 +2743,7 @@ def run_unified_decode(
     out: torch.Tensor | None = None,
     scale_format_override: int | None = None,
     fp8_rope_override: bool | None = None,
+    latent_scale_per_token: bool = False,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2839,11 +2858,25 @@ def run_unified_decode(
                 f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
             )
         fp8_rope_override = record_bytes == 368
+    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+    # the NVFP4 fp8-rope 368-byte record ONLY.
+    if latent_scale_per_token:
+        if scale_format != ScaleFormat.NVFP4_E4M3:
+            raise ValueError(
+                "SM120 sparse MLA decode latent_scale_per_token requires "
+                f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+            )
+        if not bool(fp8_rope_override):
+            raise ValueError(
+                "SM120 sparse MLA decode latent_scale_per_token requires the "
+                "fp8-rope 368-byte NVFP4 record; got the 432-byte record"
+            )
     traits = make_unified_traits(
         model_type,
         compute_mode,
         scale_format,
         fp8_rope=fp8_rope_override,
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
     if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(
         traits.kv_gmem_stride
@@ -3140,6 +3173,7 @@ def run_unified_decode(
             int(head_block_offset),
             bool(has_extra),
             bool(per_token_len),
+            bool(latent_scale_per_token),
         )
 
     if h_blocks_full > 0:

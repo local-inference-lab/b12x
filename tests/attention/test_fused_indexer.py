@@ -236,10 +236,12 @@ def _build_case(rows, heads, seqlen, topk, *, seed, device):
     return q_fp8, weights, k_fp8, k_scales, page_table, seqlens
 
 
-def _golden_topk(q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk):
+def _golden_topk(
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk, return_scores=False
+):
     rows, seqlen = int(q_fp8.shape[0]), int(seqlens[0])
     qf, kf = q_fp8.float(), k_fp8.float()
-    vals, idxs = [], []
+    vals, idxs, scores = [], [], []
     for r in range(rows):
         pages = page_table[r].long()
         kr = kf[pages].reshape(-1, 128)[:seqlen]
@@ -248,6 +250,9 @@ def _golden_topk(q_fp8, weights, k_fp8, k_scales, page_table, seqlens, topk):
         tk = torch.topk(logit, topk, largest=True, sorted=True)
         vals.append(tk.values)
         idxs.append(set(tk.indices.tolist()))
+        scores.append(logit)
+    if return_scores:
+        return torch.stack(vals), idxs, torch.stack(scores)
     return torch.stack(vals), idxs
 
 
@@ -532,3 +537,91 @@ def test_fused_indexer_mla_matches_reference(rows):
         logit = (torch.relu(torch.einsum("hd,td->ht", qf[r], kf[a:b])) * weights[r].unsqueeze(1)).sum(0) * k_scales[a:b]
         gset = set((torch.topk(logit, topk).indices + a).tolist())  # absolute index
         assert set(idx[r].tolist()) == gset
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
+    """Direct-K addressing stays exact after the packed-page Int32 boundary."""
+    device = torch.device("cuda")
+    record_bytes = 1_077_120
+    pid_lo, pages_used = 2000, 64
+    # The whole point of this case is that the base page offset overflows Int32,
+    # which forces the i64 addressing path. Assert it instead of leaving it
+    # implicit in the constants: retuning record_bytes or pid_lo downward would
+    # otherwise leave a green test that no longer exercises the boundary at all.
+    assert pid_lo * record_bytes >= (1 << 31), (
+        f"page base offset {pid_lo * record_bytes} no longer crosses the Int32 "
+        "boundary; this test would silently stop covering i64 offsets"
+    )
+    pool_pages = pid_lo + pages_used + 4
+    need = pool_pages * record_bytes + (1 << 29)
+    free, _ = torch.cuda.mem_get_info(device)
+    if free < need:
+        pytest.skip(f"needs ~{need / 2**30:.1f} GiB free device memory")
+
+    rows, heads, topk = 4, 64, 512
+    seqlen = pages_used * _PS
+    g = torch.Generator(device="cpu").manual_seed(7)
+    pool = torch.zeros(pool_pages * record_bytes, dtype=torch.uint8, device=device)
+    k_quant = pool.as_strided((pool_pages, _PS, 128), (record_bytes, 128, 1))
+    k_scales = pool.view(torch.float32).as_strided(
+        (pool_pages, _PS), (record_bytes // 4, 1), storage_offset=2048
+    )
+    k_fp8 = (torch.randn((pages_used, _PS, 128), generator=g) / 3).to(
+        torch.float8_e4m3fn
+    )
+    k_quant[pid_lo : pid_lo + pages_used] = k_fp8.view(torch.uint8).to(device)
+    k_scales[pid_lo : pid_lo + pages_used] = (
+        torch.rand((pages_used, _PS), generator=g) + 0.1
+    ).to(device)
+
+    q_fp8 = (torch.randn((rows, heads, 128), generator=g) / 3).to(
+        torch.float8_e4m3fn
+    ).to(device)
+    weights = torch.randn((rows, heads), generator=g, dtype=torch.float32).to(device)
+    page_table = (
+        torch.arange(pid_lo, pid_lo + pages_used, dtype=torch.int32, device=device)
+        .repeat(rows, 1)
+        .contiguous()
+    )
+    seqlens = torch.full((rows,), seqlen, dtype=torch.int32, device=device)
+
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_quant,
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        ctas_per_group=8,
+    )
+    torch.cuda.synchronize(device)
+
+    gold_vals, gold_idx_sets, gold_scores = _golden_topk(
+        q_fp8,
+        weights,
+        k_quant.view(torch.float8_e4m3fn)[pid_lo : pid_lo + pages_used],
+        k_scales[pid_lo : pid_lo + pages_used],
+        page_table - pid_lo,
+        seqlens,
+        topk,
+        return_scores=True,
+    )
+    assert torch.allclose(
+        torch.sort(val, dim=1, descending=True).values,
+        gold_vals,
+        atol=1e-2,
+        rtol=0,
+    )
+    for row in range(rows):
+        assert set(idx[row].tolist()) == gold_idx_sets[row]
+        # Value-to-index pairing. Comparing the sorted value list and the index set
+        # separately would still pass if correct values were emitted against the
+        # wrong indices, so gather the golden score for each index the kernel
+        # actually returned and compare position by position. Gathering by the
+        # returned index (rather than asserting an index order) keeps this robust
+        # to ties at the top-k boundary.
+        paired = gold_scores[row].index_select(0, idx[row].long())
+        assert torch.allclose(val[row].float(), paired.float(), atol=1e-2, rtol=0)

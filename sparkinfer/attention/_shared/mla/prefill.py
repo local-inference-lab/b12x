@@ -118,6 +118,7 @@ def run_unified_prefill(
     scale_format: int | None = None,
     latent_scale: float = 1.0,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -195,8 +196,20 @@ def run_unified_prefill(
                 f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
                 f"override={int(scale_format)}"
             )
+    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+    # the NVFP4 fp8-rope 368-byte record ONLY (fp8_rope agreement is enforced
+    # by make_unified_traits and the MG record-width validation).
+    if latent_scale_per_token and scale_format != ScaleFormat.NVFP4_E4M3:
+        raise ValueError(
+            "SM120 sparse MLA prefill latent_scale_per_token requires "
+            f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+        )
     traits = make_unified_traits(
-        model_type, compute_mode, scale_format, fp8_rope=fp8_rope
+        model_type,
+        compute_mode,
+        scale_format,
+        fp8_rope=fp8_rope,
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
     d_v = int(traits.d_v)
 
@@ -284,6 +297,7 @@ def run_unified_prefill(
                 model_type=model_type,
                 scale_format=scale_format,
                 fp8_rope=bool(traits.fp8_rope),
+                latent_scale_per_token=bool(latent_scale_per_token),
             )
             if extra_kv_cache is not None:
                 kwargs.update(

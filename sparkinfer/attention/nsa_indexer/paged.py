@@ -35,6 +35,9 @@ from sparkinfer.attention.nsa_indexer.tiled_topk import (
 # row) at very long contexts.
 _TWO_LEVEL_SLICE_TOKENS = 16384
 _TWO_LEVEL_MAX_SLICES = 32
+_TWO_LEVEL_FOLD_MODE_ENV = "SPARKINFER_INDEXER_TWO_LEVEL_FOLD"
+_TWO_LEVEL_FOLD_MAX_MIB_ENV = "SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB"
+_TWO_LEVEL_FOLD_MAX_MIB_DEFAULT = 256
 from sparkinfer.attention.nsa_indexer.reference import (
     pack_index_k_cache_reference,
     paged_decode_logits_reference,
@@ -49,6 +52,163 @@ _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _PAGED_INDEX_TILE_BLOCK_Q = 32
 _PAGED_INDEX_TILE_BLOCK_K = 512
 _PAGED_INDEX_CACHE_DATA_BYTES = PAGED_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
+
+
+@dataclass(frozen=True)
+class _TwoLevelFoldPlan:
+    """Runtime choice between the parallel fold and exact streaming carry."""
+
+    slices: tuple[tuple[int, int], ...] = ()
+    total_slices: int = 0
+    candidate_nbytes: int = 0
+    budget_nbytes: int = 0
+    reason: str = "carry"
+
+
+@dataclass(frozen=True)
+class _PagedIndexerChunkGeometry:
+    page_begin: int
+    page_end: int
+    page_count: int
+    token_begin: int
+    token_count: int
+
+
+def _paged_indexer_chunk_geometry(
+    *,
+    chunk_idx: int,
+    page_table_width: int,
+    supertile_pages: int,
+    page_size: int,
+) -> _PagedIndexerChunkGeometry:
+    page_begin = chunk_idx * supertile_pages
+    page_end = min(page_begin + supertile_pages, page_table_width)
+    page_count = page_end - page_begin
+    return _PagedIndexerChunkGeometry(
+        page_begin=page_begin,
+        page_end=page_end,
+        page_count=page_count,
+        token_begin=page_begin * page_size,
+        token_count=page_count * page_size,
+    )
+
+
+def _read_two_level_fold_policy() -> tuple[str, int]:
+    raw_mode = os.getenv(_TWO_LEVEL_FOLD_MODE_ENV, "auto").strip().lower()
+    disabled_modes = {"0", "false", "off", "no"}
+    forced_modes = {"1", "true", "on", "yes"}
+    if raw_mode == "auto":
+        mode = "auto"
+    elif raw_mode in disabled_modes:
+        mode = "off"
+    elif raw_mode in forced_modes:
+        mode = "on"
+    else:
+        raise ValueError(
+            f"{_TWO_LEVEL_FOLD_MODE_ENV} must be auto, 0/false/off/no, or "
+            f"1/true/on/yes, got {raw_mode!r}"
+        )
+
+    raw_limit_mib = os.getenv(
+        _TWO_LEVEL_FOLD_MAX_MIB_ENV,
+        str(_TWO_LEVEL_FOLD_MAX_MIB_DEFAULT),
+    )
+    try:
+        limit_mib = int(raw_limit_mib)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TWO_LEVEL_FOLD_MAX_MIB_ENV} must be a non-negative integer, "
+            f"got {raw_limit_mib!r}"
+        ) from exc
+    if limit_mib < 0:
+        raise ValueError(
+            f"{_TWO_LEVEL_FOLD_MAX_MIB_ENV} must be a non-negative integer, "
+            f"got {raw_limit_mib!r}"
+        )
+    return mode, limit_mib * 1024 * 1024
+
+
+def _plan_two_level_fold(
+    *,
+    q_rows: int,
+    topk: int,
+    page_size: int,
+    page_table_width: int,
+    supertile_pages: int,
+    output_physical_slots: bool,
+) -> _TwoLevelFoldPlan:
+    """Use the parallel fold only while its transient candidate slab fits.
+
+    Both routes are exact. The two-level route exposes more parallelism but its
+    FP32-value/int32-index candidate slab scales with query rows. Streaming
+    carry uses the fixed scratch double-buffer when that slab exceeds the
+    configured runtime budget.
+    """
+
+    dimensions = {
+        "q_rows": q_rows,
+        "topk": topk,
+        "page_size": page_size,
+        "page_table_width": page_table_width,
+        "supertile_pages": supertile_pages,
+    }
+    invalid = {name: value for name, value in dimensions.items() if value < 1}
+    if invalid:
+        raise ValueError(f"two-level fold dimensions must be positive, got {invalid}")
+
+    mode, budget_nbytes = _read_two_level_fold_policy()
+    width_tokens = page_table_width * page_size
+    if output_physical_slots:
+        return _TwoLevelFoldPlan(
+            budget_nbytes=budget_nbytes,
+            reason="physical output requires streaming carry",
+        )
+    if width_tokens < 2 * _TWO_LEVEL_SLICE_TOKENS:
+        return _TwoLevelFoldPlan(
+            budget_nbytes=budget_nbytes,
+            reason="context is below the two-level threshold",
+        )
+    if mode == "off":
+        return _TwoLevelFoldPlan(
+            budget_nbytes=budget_nbytes,
+            reason="two-level fold is disabled",
+        )
+
+    slice_tokens = _TWO_LEVEL_SLICE_TOKENS
+    min_slice = -(-width_tokens // _TWO_LEVEL_MAX_SLICES)
+    if min_slice > slice_tokens:
+        slice_tokens = -(-min_slice // page_size) * page_size
+
+    num_chunks = -(-page_table_width // supertile_pages)
+    slices: list[tuple[int, int]] = []
+    total_slices = 0
+    for chunk_idx in range(num_chunks):
+        chunk = _paged_indexer_chunk_geometry(
+            chunk_idx=chunk_idx,
+            page_table_width=page_table_width,
+            supertile_pages=supertile_pages,
+            page_size=page_size,
+        )
+        chunk_slices = max(1, -(-chunk.token_count // slice_tokens))
+        slices.append((chunk_slices, total_slices))
+        total_slices += chunk_slices
+
+    # fold_values and fold_indices each use four bytes per candidate. The
+    # lengths vector contributes one int32 per query row.
+    candidate_nbytes = q_rows * (total_slices * topk * 8 + 4)
+    if mode == "auto" and candidate_nbytes > budget_nbytes:
+        return _TwoLevelFoldPlan(
+            candidate_nbytes=candidate_nbytes,
+            budget_nbytes=budget_nbytes,
+            reason="candidate slab exceeds the memory budget",
+        )
+    return _TwoLevelFoldPlan(
+        slices=tuple(slices),
+        total_slices=total_slices,
+        candidate_nbytes=candidate_nbytes,
+        budget_nbytes=budget_nbytes,
+        reason="forced" if mode == "on" else "within memory budget",
+    )
 
 
 @triton.jit(
@@ -779,27 +939,20 @@ def index_topk_fp8(
     # the last chunk. The per-chunk tile-logits scratch stays at the supertile
     # ceiling. Physical-slot output keeps the legacy carry chain (the fold
     # gather emits logical indices).
-    width_tokens = page_table_width * page_size
-    two_level_slices: list[tuple[int, int]] = []
-    total_slices = 0
+    fold_plan = _plan_two_level_fold(
+        q_rows=q_rows,
+        topk=topk,
+        page_size=page_size,
+        page_table_width=page_table_width,
+        supertile_pages=supertile_pages,
+        output_physical_slots=output_physical_slots,
+    )
+    two_level_slices = fold_plan.slices
+    total_slices = fold_plan.total_slices
     fold_values = None
     fold_indices = None
     fold_lengths = None
-    if not output_physical_slots and width_tokens >= 2 * _TWO_LEVEL_SLICE_TOKENS:
-        slice_tokens = _TWO_LEVEL_SLICE_TOKENS
-        min_slice = -(-width_tokens // _TWO_LEVEL_MAX_SLICES)
-        if min_slice > slice_tokens:
-            slice_tokens = -(-min_slice // page_size) * page_size
-        base = 0
-        for c in range(num_chunks):
-            c_pages = (
-                min((c + 1) * supertile_pages, page_table_width) - c * supertile_pages
-            )
-            c_tokens = c_pages * page_size
-            splits_c = max(1, -(-c_tokens // slice_tokens))
-            two_level_slices.append((splits_c, base))
-            base += splits_c
-        total_slices = base
+    if two_level_slices:
         fold_values = torch.empty(
             (q_rows * total_slices, topk), dtype=torch.float32, device=q_fp8.device
         )
@@ -868,11 +1021,16 @@ def index_topk_fp8(
             )
 
     for chunk_idx in range(num_chunks):
-        page_begin = chunk_idx * supertile_pages
-        page_end = min(page_begin + supertile_pages, page_table_width)
-        chunk_pages = page_end - page_begin
-        chunk_width_tokens = chunk_pages * page_size
-        chunk_start_token = page_begin * page_size
+        chunk = _paged_indexer_chunk_geometry(
+            chunk_idx=chunk_idx,
+            page_table_width=page_table_width,
+            supertile_pages=supertile_pages,
+            page_size=page_size,
+        )
+        page_begin = chunk.page_begin
+        chunk_pages = chunk.page_count
+        chunk_width_tokens = chunk.token_count
+        chunk_start_token = chunk.token_begin
         if not _env_indexer_stream_scorer_enabled() and uses_paged_mqa_schedule(
             q_rows=q_rows, max_pages=chunk_pages
         ):

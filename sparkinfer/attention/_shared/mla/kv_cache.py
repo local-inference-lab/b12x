@@ -30,6 +30,24 @@ The RoPE lane stores ``scale = amax / 448.0`` as fp32 at [288, 292) and
 ``cvt.rn.satfinite.e4m3x2(v / scale)`` bytes at [304, 368); the readers
 reconstruct ``e4m3_decode(byte) * scale``
 (``prefill_mg._ld_global_nvfp4_fp8_rope_bfloat2``).
+
+``per_token_scale=True`` selects the inline-scale two-level variant: the
+NoPE lane derives its own per-token second-level scale instead of assuming
+the implicit global 1.0 (which parks small-magnitude tokens' group scales in
+E4M3 subnormals -- the defect the static per-layer
+``VLLM_NVFP4_MLA_SCALES_FILE`` calibration papers over).  Warp 0 reduces the
+32 group amaxes to the token amax (butterfly shuffle), stores
+
+    s_t = token_amax / (6.0 * 448.0)
+
+as fp32 at [292, 296) (the first 4 bytes of the pad; [296, 304) stays zero),
+and every group scale byte is encoded relative to ``s_t`` so the largest
+group's E4M3 scale lands at the top of the E4M3 range by construction.  The
+readers reconstruct ``e2m1 * e4m3_decode(scale_byte) * s_t`` -- the same
+expression as the static path with ``latent_scale := s_t`` sourced from the
+record instead of the launch.  The record width, RoPE lane, and all offsets
+are unchanged; legacy records (zero at [292, 296)) are NOT readable in this
+mode, so the mode is server-static and joins the kernel compile identity.
 """
 
 from __future__ import annotations
@@ -84,6 +102,12 @@ _THREADS = 128
 # E4M3 rope scale: exact compile-time f32 constant (double 1/448 rounded to
 # f32 once), NOT a runtime rcp.approx -- torch references must mirror this.
 _E4M3_MAX_RCP = 1.0 / 448.0
+# Per-token second-level (NVFP4 two-level) scale: fp32 at [292, 296), value
+# token_amax / (E2M1_MAX * E4M3_MAX).  Same exact-constant contract as
+# _E4M3_MAX_RCP -- torch references must mirror this.
+_LATENT_SCALE_OFFSET = _PAD_OFFSET  # 292
+_LATENT_SCALE_BYTES = 4
+_TWO_LEVEL_RCP = 1.0 / (6.0 * 448.0)
 
 
 @dsl_user_op
@@ -142,9 +166,10 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
     32 quantizes the RoPE lane to E4M3 with one fp32 per-token scale.
     """
 
-    def __init__(self, block_size: int, is_bf16: bool):
+    def __init__(self, block_size: int, is_bf16: bool, per_token_scale: bool = False):
         self.block_size = int(block_size)
         self.is_bf16 = bool(is_bf16)
+        self.per_token_scale = bool(per_token_scale)
 
     @cute.jit
     def __call__(
@@ -223,31 +248,79 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                     vals[2 * i] = f0
                     vals[2 * i + 1] = f1
 
-                # NVFP4 block quant at global scale 1.0: scale byte =
-                # e4m3(amax/6); values scaled by rcp.approx.ftz of the
-                # hardware-exact decode of that byte (what the reader
-                # multiplies back), then satfinite E2M1.
                 group_amax = max_abs_16(vals)
-                scale_f32 = group_amax * rcp_approx_ftz(Float32(6.0))
-                scale_u32 = cvt_f32_to_e4m3(scale_f32)
-                decoded_scale = cvt_e4m3_to_f32_via_f16(scale_u32)
-                packed64 = Uint64(0)
-                if decoded_scale != Float32(0.0):
-                    packed64 = quantize_and_pack_16_fast(
-                        vals, rcp_approx_ftz(decoded_scale)
+                if cutlass.const_expr(self.per_token_scale):
+                    # Two-level NVFP4: warp-reduce the 32 group amaxes to the
+                    # token amax (threads 0-31 are exactly warp 0), derive
+                    # s_t = token_amax/(6*448) so the largest group's E4M3
+                    # scale byte encodes 448 (top of range, no subnormals),
+                    # and quantize every group relative to s_t.  Lane 0
+                    # stores s_t fp32 at [292, 296) for the readers.
+                    token_amax = group_amax
+                    tmp = cute.arch.shuffle_sync_bfly(token_amax, offset=1)
+                    token_amax = fmax_f32(token_amax, tmp)
+                    tmp = cute.arch.shuffle_sync_bfly(token_amax, offset=2)
+                    token_amax = fmax_f32(token_amax, tmp)
+                    tmp = cute.arch.shuffle_sync_bfly(token_amax, offset=4)
+                    token_amax = fmax_f32(token_amax, tmp)
+                    tmp = cute.arch.shuffle_sync_bfly(token_amax, offset=8)
+                    token_amax = fmax_f32(token_amax, tmp)
+                    tmp = cute.arch.shuffle_sync_bfly(token_amax, offset=16)
+                    token_amax = fmax_f32(token_amax, tmp)
+                    latent_scale = token_amax * Float32(_TWO_LEVEL_RCP)
+                    if tid == Int32(0):
+                        st_global_f32(dst + Int64(_LATENT_SCALE_OFFSET), latent_scale)
+                    scale_u32 = Uint32(0)
+                    packed64 = Uint64(0)
+                    if latent_scale != Float32(0.0):
+                        inv_latent = rcp_approx_ftz(latent_scale)
+                        scale_f32 = (group_amax * inv_latent) * rcp_approx_ftz(
+                            Float32(6.0)
+                        )
+                        scale_u32 = cvt_f32_to_e4m3(scale_f32)
+                        decoded_scale = cvt_e4m3_to_f32_via_f16(scale_u32)
+                        if decoded_scale != Float32(0.0):
+                            packed64 = quantize_and_pack_16_fast(
+                                vals, rcp_approx_ftz(decoded_scale) * inv_latent
+                            )
+                    st_global_u64(dst + (tid * Int32(8)).to(Int64), packed64)
+                    st_global_u8(
+                        dst + Int64(_NOPE_BYTES) + tid.to(Int64),
+                        cutlass.Uint8(scale_u32 & Uint32(0xFF)),
                     )
-                st_global_u64(dst + (tid * Int32(8)).to(Int64), packed64)
-                st_global_u8(
-                    dst + Int64(_NOPE_BYTES) + tid.to(Int64),
-                    cutlass.Uint8(scale_u32 & Uint32(0xFF)),
-                )
+                else:
+                    # NVFP4 block quant at global scale 1.0: scale byte =
+                    # e4m3(amax/6); values scaled by rcp.approx.ftz of the
+                    # hardware-exact decode of that byte (what the reader
+                    # multiplies back), then satfinite E2M1.
+                    scale_f32 = group_amax * rcp_approx_ftz(Float32(6.0))
+                    scale_u32 = cvt_f32_to_e4m3(scale_f32)
+                    decoded_scale = cvt_e4m3_to_f32_via_f16(scale_u32)
+                    packed64 = Uint64(0)
+                    if decoded_scale != Float32(0.0):
+                        packed64 = quantize_and_pack_16_fast(
+                            vals, rcp_approx_ftz(decoded_scale)
+                        )
+                    st_global_u64(dst + (tid * Int32(8)).to(Int64), packed64)
+                    st_global_u8(
+                        dst + Int64(_NOPE_BYTES) + tid.to(Int64),
+                        cutlass.Uint8(scale_u32 & Uint32(0xFF)),
+                    )
 
-            # --- Zero pad [292, 304).
-            if tid < Int32(_PAD_BYTES):
-                st_global_u8(
-                    dst + Int64(_PAD_OFFSET) + tid.to(Int64),
-                    cutlass.Uint8(0),
-                )
+            # --- Zero pad: [292, 304) in static mode; [296, 304) when the
+            # per-token latent scale occupies [292, 296).
+            if cutlass.const_expr(self.per_token_scale):
+                if tid < Int32(_PAD_BYTES - _LATENT_SCALE_BYTES):
+                    st_global_u8(
+                        dst + Int64(_PAD_OFFSET + _LATENT_SCALE_BYTES) + tid.to(Int64),
+                        cutlass.Uint8(0),
+                    )
+            else:
+                if tid < Int32(_PAD_BYTES):
+                    st_global_u8(
+                        dst + Int64(_PAD_OFFSET) + tid.to(Int64),
+                        cutlass.Uint8(0),
+                    )
 
             # --- RoPE lane: amax -> fp32 scale at [288, 292) -> satfinite
             # E4M3 bytes at [304, 368).
@@ -290,9 +363,9 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
 
 @lru_cache(maxsize=None)
 def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
-    block_size: int, is_bf16: bool
+    block_size: int, is_bf16: bool, per_token_scale: bool = False
 ) -> ConcatAndCacheNvfp4MlaFp8RopeKernel:
-    return ConcatAndCacheNvfp4MlaFp8RopeKernel(block_size, is_bf16)
+    return ConcatAndCacheNvfp4MlaFp8RopeKernel(block_size, is_bf16, per_token_scale)
 
 
 def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
@@ -327,6 +400,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    per_token_scale: bool = False,
 ) -> None:
     num_tokens = int(slot_mapping.shape[0])
     if num_tokens == 0:
@@ -334,7 +408,9 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     block_size = int(kv_cache.shape[1])
     slot_capacity = int(kv_cache.shape[0]) * block_size
     is_bf16 = kv_c.dtype == torch.bfloat16
-    kernel = _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(block_size, is_bf16)
+    kernel = _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
+        block_size, is_bf16, per_token_scale
+    )
 
     args = (
         _to_kernel_tensor(kv_c, assumed_align=4, leading_dim=1),
@@ -361,10 +437,13 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
         tensor_compile_fact("slot_mapping", slot_mapping, dynamic_dims=(0,)),
         str(kv_c.dtype),
         block_size,
+        bool(per_token_scale),
     )
+    # Version 3: per_token_scale joined the record semantics (fp32 second-level
+    # scale at [292, 296)); a v2 cubin must never run against v3 records.
     spec = KernelCompileSpec.from_key(
         "attention.mla.nvfp4_fp8_rope_kv_cache",
-        2,
+        3,
         cache_key,
         labels=(
             "kv_c",
@@ -373,6 +452,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
             "slot_mapping",
             "kv_dtype",
             "block_size",
+            "per_token_scale",
         ),
     )
     sparkinfer_launch(
@@ -392,8 +472,11 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_op(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    per_token_scale: bool = False,
 ) -> None:
-    _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(kv_c, k_pe, kv_cache, slot_mapping)
+    _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+        kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
+    )
 
 
 @_concat_and_cache_nvfp4_mla_fp8_rope_op.register_fake
@@ -402,6 +485,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_fake(
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    per_token_scale: bool = False,
 ) -> None:
     return None
 
@@ -412,6 +496,7 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     scale: torch.Tensor | None = None,
+    per_token_scale: bool = False,
 ) -> None:
     """Write ``num_tokens`` KV_FP8_ROPE=1 nvfp4_ds_mla records.
 
@@ -424,6 +509,10 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     :param scale: accepted for signature parity with the fp8 cache-op
         family; the nvfp4_ds_mla record has an implicit global scale of 1.0
         (group scales carry all magnitude), so it is unused.
+    :param per_token_scale: write inline-scale two-level records: the
+        per-token second-level scale ``token_amax/(6*448)`` is stored fp32 at
+        record bytes [292, 296) and group scales are encoded relative to it.
+        Readers must run in the matching ``latent_scale_per_token`` mode.
     """
     del scale
     if kv_c.ndim != 2 or int(kv_c.shape[1]) != _KV_LORA_RANK:
@@ -485,5 +574,5 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
         raise ValueError("all tensors must be on the same device")
 
     torch.ops.sparkinfer.concat_and_cache_nvfp4_mla_fp8_rope(
-        kv_c, k_pe, kv_cache, slot_mapping
+        kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
     )

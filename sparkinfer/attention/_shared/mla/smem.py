@@ -244,6 +244,13 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
         kv_sc_stride = 8  # SCALE_BYTES_PER_TOKEN
         kv_sc_buf_bytes = bi * kv_sc_stride
         off = kv_sc_off + kv_sc_buf_bytes * bufs
+    elif traits.latent_scale_per_token:
+        # NVFP4 per-token mode: one fp32 second-level latent scale per
+        # candidate ([292, 296) of the 368B record), scalar-gathered like the
+        # DSV4 footer into a double-buffered BI x 4 region.
+        kv_sc_stride = 4
+        kv_sc_buf_bytes = bi * kv_sc_stride
+        off = kv_sc_off + kv_sc_buf_bytes * bufs
     else:
         # GLM: scales are INLINE in the kv_fp8 KV_SMEM_STRIDE row (no footer buf).
         kv_sc_stride = 0
@@ -386,7 +393,7 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 int(layout.kv_sc_buf_bytes * layout.kv_bufs),
             ]
         }
-        if traits.has_extra_cache
+        if (traits.has_extra_cache or traits.latent_scale_per_token)
         else {}
     )
     w_head_sc2_field = (
@@ -472,8 +479,9 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "token_idx": layout.token_idx_off,
         "sm_p_full": layout.sm_p_full_off,
     }
-    if traits.has_extra_cache:
+    if traits.has_extra_cache or traits.latent_scale_per_token:
         expected_offsets["kv_sc"] = layout.kv_sc_off
+    if traits.has_extra_cache:
         expected_offsets["w_head_sc2"] = layout.w_head_sc2_off
     actual_offsets = dict(storage_cls._offsets)
     if actual_offsets != expected_offsets:

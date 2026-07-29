@@ -200,9 +200,17 @@ def make_smem_layout_mg(
 
     kv_sc_off = off
     if is_glm:
-        # GLM: scales are INLINE in the kv_fp8 KV_SMEM_STRIDE row (no footer buf).
-        kv_sc_stride = 0
-        kv_sc_buf_bytes = 0
+        if traits.latent_scale_per_token:
+            # NVFP4 per-token mode: one fp32 second-level latent scale per
+            # candidate ([292, 296) of the 368B record), scalar-gathered like
+            # the DSV4 footer into a double-buffered BI x 4 region.
+            kv_sc_stride = 4
+            kv_sc_buf_bytes = bi * kv_sc_stride
+            off = kv_sc_off + kv_sc_buf_bytes * bufs
+        else:
+            # GLM: scales are INLINE in the kv_fp8 row (no footer buf).
+            kv_sc_stride = 0
+            kv_sc_buf_bytes = 0
     else:
         kv_sc_stride = 8
         kv_sc_buf_bytes = bi * kv_sc_stride
@@ -339,7 +347,7 @@ def get_prefill_mg_shared_storage_cls(
     # reads rope from global/L2, so it allocates NEITHER kv_sc nor kv_rope. Each
     # model is its own compiled specialization, so the GLM struct cannot perturb
     # the DSV4 struct.
-    if is_glm:
+    if is_glm and not traits.latent_scale_per_token:
         kv_scale_field = {}
     else:
         kv_scale_field = {
@@ -417,7 +425,7 @@ def get_prefill_mg_shared_storage_cls(
             "q_sc": layout.q_sc_off,
         }
     expected_offsets["kv_fp8"] = layout.kv_fp8_off
-    if not is_glm:
+    if not is_glm or traits.latent_scale_per_token:
         expected_offsets["kv_sc"] = layout.kv_sc_off
     expected_offsets.update(
         {

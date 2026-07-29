@@ -4,7 +4,15 @@ import pytest
 import torch
 
 from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
-from sparkinfer.attention.nsa_indexer.paged import index_topk_fp8, pack_paged_index_k_cache_reference, paged_index_logits_reference, prepare_paged_indexer_metadata, resolve_replicated_num_q_heads
+from sparkinfer.attention.nsa_indexer.paged import (
+    _paged_indexer_chunk_geometry,
+    _plan_two_level_fold,
+    index_topk_fp8,
+    pack_paged_index_k_cache_reference,
+    paged_index_logits_reference,
+    prepare_paged_indexer_metadata,
+    resolve_replicated_num_q_heads,
+)
 from sparkinfer.attention.nsa_indexer.scratch import (
     SPARKINFERIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
@@ -774,6 +782,141 @@ def test_paged_index_supertile_plan_records_launch_contract() -> None:
     assert plan.layout.supertile_tokens == 512
     assert plan.layout.max_chunks == 2
     assert plan.layout.tile_logits_elements == 32 * 512
+
+
+def test_two_level_fold_auto_respects_candidate_memory_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "1")
+    common = {
+        "topk": 512,
+        "page_size": 64,
+        "page_table_width": 1024,
+        "supertile_pages": 256,
+        "output_physical_slots": False,
+    }
+
+    below = _plan_two_level_fold(q_rows=63, **common)
+    above = _plan_two_level_fold(q_rows=64, **common)
+
+    assert below.slices == ((1, 0), (1, 1), (1, 2), (1, 3))
+    assert below.total_slices == 4
+    assert below.candidate_nbytes == 63 * (4 * 512 * 8 + 4)
+    assert below.candidate_nbytes <= 1024 * 1024
+    assert below.reason == "within memory budget"
+    assert above.slices == ()
+    assert above.total_slices == 0
+    assert above.candidate_nbytes == 64 * (4 * 512 * 8 + 4)
+    assert above.candidate_nbytes > 1024 * 1024
+    assert above.reason == "candidate slab exceeds the memory budget"
+
+
+def test_two_level_fold_forced_mode_ignores_memory_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "on")
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
+
+    plan = _plan_two_level_fold(
+        q_rows=64,
+        topk=512,
+        page_size=64,
+        page_table_width=1024,
+        supertile_pages=256,
+        output_physical_slots=False,
+    )
+
+    assert plan.slices == ((1, 0), (1, 1), (1, 2), (1, 3))
+    assert plan.total_slices == 4
+    assert plan.reason == "forced"
+
+
+def test_paged_indexer_chunk_geometry_handles_partial_final_chunk() -> None:
+    chunk = _paged_indexer_chunk_geometry(
+        chunk_idx=4,
+        page_table_width=1025,
+        supertile_pages=256,
+        page_size=64,
+    )
+
+    assert chunk.page_begin == 1024
+    assert chunk.page_end == 1025
+    assert chunk.page_count == 1
+    assert chunk.token_begin == 65536
+    assert chunk.token_count == 64
+
+
+@pytest.mark.parametrize(
+    ("output_physical_slots", "width", "mode", "reason"),
+    [
+        (True, 1024, "auto", "physical output requires streaming carry"),
+        (False, 128, "auto", "context is below the two-level threshold"),
+        (False, 1024, "off", "two-level fold is disabled"),
+    ],
+)
+def test_two_level_fold_ineligible_routes_use_streaming_carry(
+    monkeypatch: pytest.MonkeyPatch,
+    output_physical_slots: bool,
+    width: int,
+    mode: str,
+    reason: str,
+) -> None:
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", mode)
+
+    plan = _plan_two_level_fold(
+        q_rows=16,
+        topk=512,
+        page_size=64,
+        page_table_width=width,
+        supertile_pages=256,
+        output_physical_slots=output_physical_slots,
+    )
+
+    assert plan.slices == ()
+    assert plan.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "sometimes"),
+        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "-1"),
+        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "many"),
+    ],
+)
+def test_two_level_fold_rejects_invalid_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError):
+        _plan_two_level_fold(
+            q_rows=1,
+            topk=512,
+            page_size=64,
+            page_table_width=1024,
+            supertile_pages=256,
+            output_physical_slots=False,
+        )
+
+
+def test_two_level_fold_rejects_invalid_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
+
+    with pytest.raises(ValueError, match="q_rows"):
+        _plan_two_level_fold(
+            q_rows=0,
+            topk=512,
+            page_size=64,
+            page_table_width=1024,
+            supertile_pages=256,
+            output_physical_slots=False,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

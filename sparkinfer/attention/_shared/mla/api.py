@@ -388,6 +388,7 @@ def sparse_mla_decode_forward(
     forced_num_splits: int | None = None,
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -419,6 +420,7 @@ def sparse_mla_decode_forward(
         forced_num_splits=forced_num_splits,
         scale_format=scale_format,
         fp8_rope=fp8_rope,
+        latent_scale_per_token=latent_scale_per_token,
     )
 
 
@@ -438,6 +440,7 @@ def sparse_mla_extend_forward(
     identity_page_table: bool = False,
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     (
         q_all,
@@ -470,6 +473,7 @@ def sparse_mla_extend_forward(
         identity_page_table=identity_page_table,
         scale_format=scale_format,
         fp8_rope=fp8_rope,
+        latent_scale_per_token=latent_scale_per_token,
     )
 
 
@@ -492,6 +496,7 @@ def _run_sparse_mla(
     forced_num_splits: int | None = None,
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
@@ -613,6 +618,19 @@ def _run_sparse_mla(
             raise NotImplementedError(
                 "NVFP4 sparse MLA requires the active SM120 kernel path"
             )
+    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
+    # the NVFP4 fp8-rope 368-byte record ONLY.
+    if latent_scale_per_token:
+        if int(scale_format_for_call or -1) != 2:
+            raise ValueError(
+                "sparse MLA latent_scale_per_token requires the NVFP4 cache "
+                f"(scale_format=2); got scale_format={scale_format_for_call!r}"
+            )
+        if int(kv_cache.shape[-1]) != 368:
+            raise ValueError(
+                "sparse MLA latent_scale_per_token requires the fp8-rope "
+                f"368-byte NVFP4 record; got {int(kv_cache.shape[-1])} bytes"
+            )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()
         if not _sm120_route:
@@ -686,6 +704,7 @@ def _run_sparse_mla(
                 lse_scale=lse_scale,
                 scale_format=scale_format_for_call,
                 fp8_rope=fp8_rope_for_call,
+                latent_scale_per_token=latent_scale_per_token,
             )
         from .kernel import run_unified_decode
 
@@ -704,6 +723,7 @@ def _run_sparse_mla(
             forced_num_splits=forced_num_splits,
             scale_format_override=scale_format_for_call,
             fp8_rope_override=fp8_rope_for_call,
+            latent_scale_per_token=latent_scale_per_token,
         )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(
@@ -749,6 +769,7 @@ def _run_sm120_prefill(
     lse_scale: Literal["base2", "natural"],
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
+    latent_scale_per_token: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a prefill-like call to the active SM120 single-pass prefill."""
     from .kernel import run_unified_prefill
@@ -770,6 +791,7 @@ def _run_sm120_prefill(
         output=output,
         scale_format=scale_format,
         fp8_rope=fp8_rope,
+        latent_scale_per_token=latent_scale_per_token,
     )
     if not return_lse:
         return output
