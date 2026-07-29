@@ -859,6 +859,11 @@ class TPMoEScratchPlan:
     _core_workspace_plan: _TPCoreWorkspacePlan
     _scratch_specs: tuple[ScratchBufferSpec, ...]
 
+    @property
+    def full_rotation(self) -> bool:
+        """Whether this plan owns the EXL3 full-rotation execution path."""
+        return self._core_workspace_plan.full_rotation
+
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
@@ -2278,6 +2283,12 @@ def _build_tp_moe_fp4_binding_from_views(
         raise ValueError(
             f"scratch plan routed-row capacity {plan.routed_rows} cannot bind "
             f"{m * num_topk} routed rows"
+        )
+    if not plan.full_rotation and (
+        route_expert_map is not None or output_expert_map is not None
+    ):
+        raise ValueError(
+            "route_expert_map/output_expert_map require a full-rotation Trellis plan"
         )
     if plan.full_rotation:
         if topk_weights.dtype != torch.float32:
@@ -4842,16 +4853,20 @@ def prepare_sparkinfer_fp4_moe_weights(
     if plan.source_format == "exl3_trellis_mcg":
         if plan.quant_modes != frozenset({"w4a16"}):
             raise ValueError("EXL3 Trellis weights support only quant_mode='w4a16'")
-        if trellis_mcg is not None:
-            marker = (
-                int(trellis_mcg.item())
-                if isinstance(trellis_mcg, torch.Tensor)
-                else int(trellis_mcg)
-            ) & 0xFFFFFFFF
-            if marker != 0xCBAC1FED:
-                raise ValueError(
-                    f"unexpected EXL3 MCG marker {marker:#010x}; expected 0xcbac1fed"
-                )
+        if trellis_mcg is None:
+            raise ValueError(
+                "EXL3 Trellis preparation requires the checkpoint's trellis_mcg "
+                "marker; the runtime decoder is MCG-only and must fail closed"
+            )
+        marker = (
+            int(trellis_mcg.item())
+            if isinstance(trellis_mcg, torch.Tensor)
+            else int(trellis_mcg)
+        ) & 0xFFFFFFFF
+        if marker != 0xCBAC1FED:
+            raise ValueError(
+                f"unexpected EXL3 MCG marker {marker:#010x}; expected 0xcbac1fed"
+            )
         if not all(
             value is not None
             for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
@@ -6235,6 +6250,7 @@ def _prewarm_w4a16_planned_launches(
     )
     from sparkinfer.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
+        _rot_scales_dummy,
         _TC_DECODE_MAX_M,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
@@ -6250,6 +6266,7 @@ def _prewarm_w4a16_planned_launches(
     t0 = time.perf_counter() if _SPARKINFER_TIMING else 0.0
     with torch.cuda.device(workspace.device):
         is_capturing = torch.cuda.is_current_stream_capturing()
+        _rot_scales_dummy(workspace.device)
         props = torch.cuda.get_device_properties(workspace.device)
         sms = int(props.multi_processor_count)
         max_shared_mem = int(

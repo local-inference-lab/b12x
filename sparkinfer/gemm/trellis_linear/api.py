@@ -51,15 +51,25 @@ def run(
     output: Optional[torch.Tensor] = None,
     gemm_output: Optional[torch.Tensor] = None,
     c_tmp: Optional[torch.Tensor] = None,
+    input_f16: Optional[torch.Tensor] = None,
+    rotated_f16: Optional[torch.Tensor] = None,
+    rotated_compute: Optional[torch.Tensor] = None,
+    gemm_output_f16: Optional[torch.Tensor] = None,
+    output_f16: Optional[torch.Tensor] = None,
     hadamard_128=None,
 ) -> torch.Tensor:
-    """Execute input rotation, native Trellis GEMM, and output rotation."""
+    """Execute Trellis GEMM, optionally reusing all capture-time storage."""
     return run_trellis256_dense(
         x,
         weight,
         output=output,
         gemm_output=gemm_output,
         c_tmp=c_tmp,
+        input_f16=input_f16,
+        rotated_f16=rotated_f16,
+        rotated_compute=rotated_compute,
+        gemm_output_f16=gemm_output_f16,
+        output_f16=output_f16,
         hadamard_128=hadamard_128,
     )
 

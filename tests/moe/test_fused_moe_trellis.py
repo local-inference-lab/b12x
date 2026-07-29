@@ -76,6 +76,36 @@ def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
     assert {"bf16", "fp16"}.issubset(FUSED_MOE_META.dtypes)
 
 
+def test_rotation_placeholder_must_be_materialized_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    device = torch.device("cuda:127")
+    w4a16_kernel._ROT_SCALES_DUMMY.pop(device, None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="prewarm the planned launch"):
+        w4a16_kernel._rot_scales_dummy(device)
+
+
+def test_dense_scratch_cannot_allocate_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="provide caller-owned storage"):
+        w4a16_kernel._trellis_dense_buffer(
+            "rotated_f16",
+            None,
+            shape=(2, 128),
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+        )
+
+
 def test_caps_preserve_exact_block_m_and_input_dtypes() -> None:
     bf16 = _caps(w4a16_block_size_m=8, input_dtype=torch.bfloat16)
     fp16 = _caps(w4a16_block_size_m=64, input_dtype=torch.float16)
@@ -104,7 +134,7 @@ def _prepare_weights(
     input_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
     codebook: str = "mcg",
-    mcg: torch.Tensor | int | None = None,
+    mcg: torch.Tensor | int | None = 0xCBAC1FED,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
 ) -> fused_moe.ExpertWeights:
     bits = int(w13.shape[-1]) // 16
@@ -216,7 +246,7 @@ def test_prepare_weights_rejects_non_mcg_before_cuda_work() -> None:
             codebook="mul1",
             tile_config=(64, 128, 64, 128),
         )
-    with pytest.raises(ValueError, match="unexpected .*MCG marker"):
+    with pytest.raises(ValueError, match=r"unexpected .*MCG marker"):
         _prepare_weights(
             w13,
             w2,
@@ -225,6 +255,17 @@ def test_prepare_weights_rejects_non_mcg_before_cuda_work() -> None:
             intermediate_rotations=intermediate,
             down_svh=down_svh,
             mcg=0x83DCD12D,
+            tile_config=(64, 128, 64, 128),
+        )
+    with pytest.raises(ValueError, match="requires the checkpoint's trellis_mcg"):
+        _prepare_weights(
+            w13,
+            w2,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate,
+            down_svh=down_svh,
+            mcg=None,
             tile_config=(64, 128, 64, 128),
         )
 
@@ -548,7 +589,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
         device=device,
     )
     assert plan.caps.w4a16_block_size_m == 8
-    assert plan._core_workspace_plan.full_rotation
+    assert plan.full_rotation
 
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -702,7 +743,7 @@ def test_planned_full_rotation_small_m_partial_blocks(m: int) -> None:
         device=device,
     )
     assert plan.caps.w4a16_block_size_m == 8
-    assert plan._core_workspace_plan.full_rotation
+    assert plan.full_rotation
 
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -814,7 +855,7 @@ def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
     router_weights = torch.rand((m, topk), dtype=torch.float32, device=device)
     router_weights /= router_weights.sum(dim=1, keepdim=True)
 
-    binding = fused_moe.bind(
+    eager_binding = fused_moe.bind(
         plan,
         scratch=scratch,
         a=x,
@@ -822,12 +863,20 @@ def test_planned_full_rotation_capture_below_capacity(m: int) -> None:
         topk_weights=router_weights,
         topk_ids=ids,
     )
-    eager = binding.run().clone()
+    eager = eager_binding.run().clone()
     torch.cuda.synchronize(device)
     assert not torch.isnan(eager).any()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=weights,
+            topk_weights=router_weights,
+            topk_ids=ids,
+        )
         captured = binding.run()
     graph.replay()
     torch.cuda.synchronize(device)

@@ -3429,9 +3429,9 @@ class W4A16GemmKernel:
                     smem_base + Int32(self.sh_rd_route_off * 16) + row * Int32(4)
                 )
             a_int4 = (
-                route_index * a_gl_stride
-                + tile_idx * Int32(self.a_gl_rd_delta_o)
-                + a_gl_rd_col0
+                Int64(route_index) * Int64(a_gl_stride)
+                + Int64(tile_idx) * Int64(self.a_gl_rd_delta_o)
+                + Int64(a_gl_rd_col0)
             )
             a_dst = self._int4_addr(
                 smem_base,
@@ -3441,7 +3441,7 @@ class W4A16GemmKernel:
                     Int32(i * self.a_sh_wr_delta) + a_sh_wr
                 ),
             )
-            a_src = get_ptr_as_int64(a_bf16_flat, a_int4 * Int32(8))
+            a_src = get_ptr_as_int64(a_bf16_flat, a_int4 * Int64(8))
             if cutlass.const_expr(self.dual_a):
                 # Projection-major FC1 validates that each CTA N tile is wholly
                 # gate or wholly up.  Select the matching pre-rotated A operand
@@ -3989,7 +3989,9 @@ class W4A16GemmKernel:
                 route_index = ld_shared_i32_relaxed(
                     smem_base + Int32(self.sh_route_off * 16) + row * Int32(4)
                 )
-                true_idx = route_index * c_gl_stride + (c_gl_wr % c_gl_stride)
+                true_idx = Int64(route_index) * Int64(c_gl_stride) + Int64(
+                    c_gl_wr % c_gl_stride
+                )
                 q0, q1, q2, q3 = ld_shared_v4_u32(
                     self._int4_addr(smem_base, Int32(self.sh_red_off) + c_sh_rd)
                 )
@@ -4013,15 +4015,17 @@ class W4A16GemmKernel:
                     # to token = route_index // top_k.  bf16x2 add lands two
                     # consecutive hidden lanes per word.
                     token_idx = route_index // Int32(self.fused_sum_topk)
-                    out_idx = token_idx * c_gl_stride + (c_gl_wr % c_gl_stride)
-                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int32(8))
+                    out_idx = Int64(token_idx) * Int64(c_gl_stride) + Int64(
+                        c_gl_wr % c_gl_stride
+                    )
+                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int64(8))
                     red_add_global_bf16x2(out_addr, q0)
                     red_add_global_bf16x2(out_addr + Int64(4), q1)
                     red_add_global_bf16x2(out_addr + Int64(8), q2)
                     red_add_global_bf16x2(out_addr + Int64(12), q3)
                 else:
                     st_global_v4_u32(
-                        get_ptr_as_int64(c_bf16_flat, true_idx * Int32(8)),
+                        get_ptr_as_int64(c_bf16_flat, true_idx * Int64(8)),
                         q0,
                         q1,
                         q2,
@@ -4052,7 +4056,7 @@ class W4A16GemmKernel:
                 route_index = ld_shared_i32_relaxed(
                     smem_base + Int32(self.sh_route_off * 16) + row * Int32(4)
                 )
-                true_idx = route_index * c_gl_stride + col_word
+                true_idx = Int64(route_index) * Int64(c_gl_stride) + Int64(col_word)
                 q0, q1, q2, q3 = ld_shared_v4_u32(
                     self._int4_addr(smem_base, Int32(self.sh_red_off) + c_sh_rd)
                 )
@@ -4071,15 +4075,15 @@ class W4A16GemmKernel:
                     q3 = self._relu2_elem2(q3)
                 if cutlass.const_expr(self.fused_topk_sum):
                     token_idx = route_index // Int32(self.fused_sum_topk)
-                    out_idx = token_idx * c_gl_stride + col_word
-                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int32(8))
+                    out_idx = Int64(token_idx) * Int64(c_gl_stride) + Int64(col_word)
+                    out_addr = get_ptr_as_int64(c_bf16_flat, out_idx * Int64(8))
                     red_add_global_bf16x2(out_addr, q0)
                     red_add_global_bf16x2(out_addr + Int64(4), q1)
                     red_add_global_bf16x2(out_addr + Int64(8), q2)
                     red_add_global_bf16x2(out_addr + Int64(12), q3)
                 else:
                     st_global_v4_u32(
-                        get_ptr_as_int64(c_bf16_flat, true_idx * Int32(8)),
+                        get_ptr_as_int64(c_bf16_flat, true_idx * Int64(8)),
                         q0,
                         q1,
                         q2,
@@ -4672,7 +4676,7 @@ class W4A16FusedMoeKernel:
                 )
             if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
                 raise ValueError(
-                    "intermediate_rotation requires plain gated silu "
+                    "intermediate_rotation requires unclamped gated silu or situ "
                     "(no swiglu limit/oai)"
                 )
             if int(intermediate_size) % 128 != 0:
@@ -4860,24 +4864,28 @@ class W4A16FusedMoeKernel:
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        a_rows = active_m
+        a_rows = Int64(active_m)
         if cutlass.const_expr(self.full_rotation):
-            a_rows = active_m * Int32(self.top_k)
+            a_rows = Int64(active_m) * Int64(self.top_k)
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
-            layout=cute.make_layout((a_rows * Int32(self.hidden_size),), stride=(1,)),
+            layout=cute.make_layout((a_rows * Int64(self.hidden_size),), stride=(1,)),
         )
         a_alt_bf16_flat = cute.make_tensor(
             a_alt_bf16_ptr,
-            layout=cute.make_layout((a_rows * Int32(self.hidden_size),), stride=(1,)),
+            layout=cute.make_layout((a_rows * Int64(self.hidden_size),), stride=(1,)),
         )
         rotation_input_flat = cute.make_tensor(
             rotation_input_ptr,
-            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+            layout=cute.make_layout(
+                (Int64(active_m) * Int64(self.hidden_size),), stride=(1,)
+            ),
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
-            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+            layout=cute.make_layout(
+                (Int64(active_m) * Int64(self.top_k),), stride=(1,)
+            ),
         )
         grid = (grid_x, 1, 1)
         self.kernel(
@@ -8413,6 +8421,11 @@ def _rot_scales_dummy(device: torch.device) -> torch.Tensor:
     const_expr-gated kernel; keeps one compiled signature across all layouts)."""
     t = _ROT_SCALES_DUMMY.get(device)
     if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "W4A16 rotation placeholder is not initialized for CUDA graph "
+                "capture; prewarm the planned launch before capturing"
+            )
         t = torch.zeros(1, dtype=torch.float16, device=device)
         _ROT_SCALES_DUMMY[device] = t
     return t
@@ -9260,7 +9273,7 @@ def _compile_w4a16_gemm_launch(
             tile_n=tile_n,
             tile_k=tile_k,
             cta_threads=cta_threads,
-            max_shared_mem=max_shared_mem,
+            max_shared_mem=max_shared_mem - 512,
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=planner_weight_bits,
@@ -9375,6 +9388,36 @@ def _resolve_exl3_hadamard_128(hadamard_128):
     return hadamard_128
 
 
+def _trellis_dense_buffer(
+    name: str,
+    buffer: torch.Tensor | None,
+    *,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validate caller-owned dense scratch or allocate it before capture."""
+    if buffer is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"Trellis dense {name} is not initialized for CUDA graph capture; "
+                "provide caller-owned storage"
+            )
+        return torch.empty(shape, dtype=dtype, device=device)
+    if (
+        tuple(buffer.shape) != shape
+        or buffer.dtype != dtype
+        or buffer.device != device
+        or not buffer.is_contiguous()
+        or int(buffer.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            f"{name} must be contiguous, 16-byte-aligned {dtype} with shape "
+            f"{shape} on {device}"
+        )
+    return buffer
+
+
 def _run_trellis256_dense_current_device(
     x: torch.Tensor,
     prepared_dense,
@@ -9382,6 +9425,11 @@ def _run_trellis256_dense_current_device(
     output: torch.Tensor | None = None,
     gemm_output: torch.Tensor | None = None,
     c_tmp: torch.Tensor | None = None,
+    input_f16: torch.Tensor | None = None,
+    rotated_f16: torch.Tensor | None = None,
+    rotated_compute: torch.Tensor | None = None,
+    gemm_output_f16: torch.Tensor | None = None,
+    output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
@@ -9431,42 +9479,55 @@ def _run_trellis256_dense_current_device(
         )
     if prepared_dense.trellis.device != x.device:
         raise ValueError("x and prepared dense weight must be on the same CUDA device")
-    if output is None:
-        output = torch.empty((m, size_n), dtype=x.dtype, device=x.device)
-    elif (
-        tuple(output.shape) != (m, size_n)
-        or output.dtype != x.dtype
-        or output.device != x.device
-        or not output.is_contiguous()
-    ):
-        raise ValueError(
-            f"output must be contiguous {x.dtype} with shape {(m, size_n)} on {x.device}"
-        )
-    if gemm_output is None:
-        gemm_output = torch.empty((m, size_n), dtype=compute_dtype, device=x.device)
-    elif (
-        tuple(gemm_output.shape) != (m, size_n)
-        or gemm_output.dtype != compute_dtype
-        or gemm_output.device != x.device
-        or not gemm_output.is_contiguous()
-        or int(gemm_output.data_ptr()) % 16 != 0
-    ):
-        raise ValueError(
-            f"gemm_output must be contiguous, 16-byte-aligned {compute_dtype} with shape "
-            f"{(m, size_n)} on {x.device}"
-        )
+    output = _trellis_dense_buffer(
+        "output",
+        output,
+        shape=(m, size_n),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    gemm_output = _trellis_dense_buffer(
+        "gemm_output",
+        gemm_output,
+        shape=(m, size_n),
+        dtype=compute_dtype,
+        device=x.device,
+    )
     if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
 
     hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
-    x_f16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-    rotated_f16 = torch.empty_like(x_f16)
-    hadamard_128(x_f16, rotated_f16, prepared_dense.suh, None, 1.0)
-    rotated_compute = (
-        rotated_f16
-        if compute_dtype == torch.float16
-        else rotated_f16.to(torch.bfloat16)
+    if x.dtype == torch.float16:
+        x_f16 = x
+    else:
+        input_f16 = _trellis_dense_buffer(
+            "input_f16",
+            input_f16,
+            shape=(m, size_k),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        input_f16.copy_(x)
+        x_f16 = input_f16
+    rotated_f16 = _trellis_dense_buffer(
+        "rotated_f16",
+        rotated_f16,
+        shape=(m, size_k),
+        dtype=torch.float16,
+        device=x.device,
     )
+    hadamard_128(x_f16, rotated_f16, prepared_dense.suh, None, 1.0)
+    if compute_dtype == torch.float16:
+        rotated_compute = rotated_f16
+    else:
+        rotated_compute = _trellis_dense_buffer(
+            "rotated_compute",
+            rotated_compute,
+            shape=(m, size_k),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        rotated_compute.copy_(rotated_f16)
 
     props = torch.cuda.get_device_properties(x.device)
     sms = int(props.multi_processor_count)
@@ -9540,13 +9601,28 @@ def _run_trellis256_dense_current_device(
         stream,
     )
 
-    gemm_f16 = (
-        gemm_output if compute_dtype == torch.float16 else gemm_output.to(torch.float16)
-    )
+    if compute_dtype == torch.float16:
+        gemm_f16 = gemm_output
+    else:
+        gemm_output_f16 = _trellis_dense_buffer(
+            "gemm_output_f16",
+            gemm_output_f16,
+            shape=(m, size_n),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        gemm_output_f16.copy_(gemm_output)
+        gemm_f16 = gemm_output_f16
     if output.dtype == torch.float16:
         hadamard_128(gemm_f16, output, None, prepared_dense.svh, 1.0)
     else:
-        output_f16 = torch.empty_like(gemm_f16)
+        output_f16 = _trellis_dense_buffer(
+            "output_f16",
+            output_f16,
+            shape=(m, size_n),
+            dtype=torch.float16,
+            device=x.device,
+        )
         hadamard_128(gemm_f16, output_f16, None, prepared_dense.svh, 1.0)
         output.copy_(output_f16)
     return output
@@ -9559,6 +9635,11 @@ def run_trellis256_dense(
     output: torch.Tensor | None = None,
     gemm_output: torch.Tensor | None = None,
     c_tmp: torch.Tensor | None = None,
+    input_f16: torch.Tensor | None = None,
+    rotated_f16: torch.Tensor | None = None,
+    rotated_compute: torch.Tensor | None = None,
+    gemm_output_f16: torch.Tensor | None = None,
+    output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
@@ -9584,6 +9665,11 @@ def run_trellis256_dense(
             output=output,
             gemm_output=gemm_output,
             c_tmp=c_tmp,
+            input_f16=input_f16,
+            rotated_f16=rotated_f16,
+            rotated_compute=rotated_compute,
+            gemm_output_f16=gemm_output_f16,
+            output_f16=output_f16,
             hadamard_128=hadamard_128,
             stream=None,
         )

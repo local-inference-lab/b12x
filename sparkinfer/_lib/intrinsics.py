@@ -2601,9 +2601,7 @@ def pack_f32x2_to_half2(x0: Float32, x1: Float32, *, loc=None, ip=None) -> Uint3
 
 
 @dsl_user_op
-def cvt_bf16x2_to_f16x2_via_f32(
-    packed: Uint32, *, loc=None, ip=None
-) -> Uint32:
+def cvt_bf16x2_to_f16x2_via_f32(packed: Uint32, *, loc=None, ip=None) -> Uint32:
     """Convert packed bf16x2 to packed f16x2 through exact FP32 values."""
     return Uint32(
         llvm.inline_asm(
@@ -6168,10 +6166,19 @@ def nf3_codebook_pools(codebook) -> tuple:
         hi[reg] |= ((bf16 >> 8) & 0xFF) << (8 * slot)
     return lo[0], lo[1], hi[0], hi[1]
 
+
 # ===== TRELLIS-3.0 (QTIP/EXL3 3INST cb=1) dequant — added for NF3->trellis swap =====
-_TRELLIS_MCG  = 0xCBAC1FED   # codebook.cuh:39  MCG multiplier (cb==1)
-_TRELLIS_MASK = 0x8FFF8FFF   # codebook.cuh:41  lop3 operand b
-_TRELLIS_OR   = 0x3B603B60   # codebook.cuh:41  lop3 operand c ; immLut 0x6a == (a & b) ^ c
+_TRELLIS_MCG = 0xCBAC1FED  # codebook.cuh:39  MCG multiplier (cb==1)
+_TRELLIS_MASK = 0x8FFF8FFF  # codebook.cuh:41  lop3 operand b
+_TRELLIS_OR = 0x3B603B60  # codebook.cuh:41  lop3 operand c; immLut 0x6a == (a & b) ^ c
+
+
+def _trellis_mcg_asm_constants(asm: str) -> str:
+    return (
+        asm.replace("__MCG__", f"{_TRELLIS_MCG:#010x}")
+        .replace("__MASK__", f"{_TRELLIS_MASK:#010x}")
+        .replace("__OR__", f"{_TRELLIS_OR:#010x}")
+    )
 
 
 @dsl_user_op
@@ -6197,7 +6204,7 @@ def packed_dequant_trellis_to_half2x4(
     asm = """
         {
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
-            mov.b32 M, 0xCBAC1FED;
+            mov.b32 M, __MCG__;
             and.b32 w7, $4, 0xffff;
             shr.u32 w6, $4, __B1__;  and.b32 w6, w6, 0xffff;
             shr.u32 w5, $4, __B2__;  and.b32 w5, w5, 0xffff;
@@ -6206,32 +6213,38 @@ def packed_dequant_trellis_to_half2x4(
             shr.u32 w2, $5, __B1__;  and.b32 w2, w2, 0xffff;
             shr.u32 w1, $5, __B2__;  and.b32 w1, w1, 0xffff;
             shr.u32 w0, $5, __B3__;  and.b32 w0, w0, 0xffff;
-            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, __MASK__, __OR__, 0x6a;
             prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
             prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
             prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
             prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 $3, lo, hi;
         }
         """
-    asm = (
+    asm = _trellis_mcg_asm_constants(
         asm.replace("__B1__", str(bits))
         .replace("__B2__", str(2 * bits))
         .replace("__B3__", str(3 * bits))
     )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Uint32(win_a).ir_value(loc=loc, ip=ip), Uint32(win_b).ir_value(loc=loc, ip=ip)],
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+        ],
         asm,
         "=r,=r,=r,=r,r,r",
-        has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
     o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
     o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
@@ -6256,7 +6269,7 @@ def packed_dequant_trellis_stream_to_half2x4(
     asm = """
         {
             .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
-            mov.b32 M, 0xCBAC1FED;
+            mov.b32 M, __MCG__;
             and.b32 w7, $4, 0xffff;
             __I6__
             __I5__
@@ -6265,14 +6278,14 @@ def packed_dequant_trellis_stream_to_half2x4(
             __I2__
             __I1__
             __I0__
-            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8fff8fff, 0x3b603b60, 0x6a;
-            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8fff8fff, 0x3b603b60, 0x6a;
+            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, __MASK__, __OR__, 0x6a;
+            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, __MASK__, __OR__, 0x6a;
             prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 $0, lo, hi;
             prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 $1, lo, hi;
             prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 $2, lo, hi;
@@ -6280,9 +6293,12 @@ def packed_dequant_trellis_stream_to_half2x4(
         }
         """
     for name, register, multiple in (
-        ("__I6__", "w6", 1), ("__I5__", "w5", 2),
-        ("__I4__", "w4", 3), ("__I3__", "w3", 4),
-        ("__I2__", "w2", 5), ("__I1__", "w1", 6),
+        ("__I6__", "w6", 1),
+        ("__I5__", "w5", 2),
+        ("__I4__", "w4", 3),
+        ("__I3__", "w3", 4),
+        ("__I2__", "w2", 5),
+        ("__I1__", "w1", 6),
         ("__I0__", "w0", 7),
     ):
         shift = multiple * bits
@@ -6297,6 +6313,7 @@ def packed_dequant_trellis_stream_to_half2x4(
                 f"and.b32 {register}, {register}, 0xffff;"
             )
         asm = asm.replace(name, instruction)
+    asm = _trellis_mcg_asm_constants(asm)
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
         [
@@ -6340,8 +6357,12 @@ def _f16x2_to_bf16x2(p, *, loc=None, ip=None):
             cvt.rn.bf16x2.f32 $0, fhi, flo;
         }
         """,
-        "=r,r", has_side_effects=False, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        "=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
     return Uint32(llvm.extractvalue(T.i32(), r, [0], loc=loc, ip=ip))
 
@@ -6359,8 +6380,12 @@ def packed_dequant_trellis_to_bfloat2x4(
     h0, h1, h2, h3 = packed_dequant_trellis_to_half2x4(
         win_a, win_b, bits, loc=loc, ip=ip
     )
-    return (_f16x2_to_bf16x2(h0, loc=loc, ip=ip), _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
-            _f16x2_to_bf16x2(h2, loc=loc, ip=ip), _f16x2_to_bf16x2(h3, loc=loc, ip=ip))
+    return (
+        _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h2, loc=loc, ip=ip),
+        _f16x2_to_bf16x2(h3, loc=loc, ip=ip),
+    )
 
 
 @dsl_user_op
@@ -6382,6 +6407,4 @@ def packed_dequant_trellis_stream_to_bfloat2x4(
 @dsl_user_op
 def packed_dequant_trellis3_to_bfloat2x4(win_a, win_b, *, loc=None, ip=None):
     """Compatibility wrapper for the former 3-bpw bf16 primitive."""
-    return packed_dequant_trellis_to_bfloat2x4(
-        win_a, win_b, 3, loc=loc, ip=ip
-    )
+    return packed_dequant_trellis_to_bfloat2x4(win_a, win_b, 3, loc=loc, ip=ip)

@@ -6,7 +6,18 @@ import pytest
 import torch
 
 import sparkinfer.moe.fused_moe._impl as tp_moe_impl
-from sparkinfer.moe.fused_moe._impl import SPARKINFERFP4ExpertWeights, TPMoEFP4Binding, TPMoERouteBinding, TPMoEScratchCaps, TPMoESparseFP4Binding, build_tp_moe_route_binding, build_tp_moe_sparse_fp4_binding, plan_sparkinfer_fp4_moe_weights, plan_tp_moe_scratch, prepare_sparkinfer_fp4_moe_weights
+from sparkinfer.moe.fused_moe._impl import (
+    SPARKINFERFP4ExpertWeights,
+    TPMoEFP4Binding,
+    TPMoERouteBinding,
+    TPMoEScratchCaps,
+    TPMoESparseFP4Binding,
+    build_tp_moe_route_binding,
+    build_tp_moe_sparse_fp4_binding,
+    plan_sparkinfer_fp4_moe_weights,
+    plan_tp_moe_scratch,
+    prepare_sparkinfer_fp4_moe_weights,
+)
 from sparkinfer.moe._shared.execution import PreparedWeightLayout
 from sparkinfer.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
 
@@ -347,9 +358,7 @@ def _experts(
     if representation is not None and weight_plan.discards_source_parameters:
         value = representation.value
         canonical_w1 = getattr(value, "w13_rp", getattr(value, "w13", None))
-        canonical_s1 = getattr(
-            value, "w13_sfb", getattr(value, "w13_scale", None)
-        )
+        canonical_s1 = getattr(value, "w13_sfb", getattr(value, "w13_scale", None))
         canonical_w2 = getattr(value, "w2_rp", getattr(value, "w2", None))
         canonical_s2 = getattr(value, "w2_sfb", getattr(value, "w2_scale", None))
     return SPARKINFERFP4ExpertWeights(
@@ -557,7 +566,12 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
     ) -> None:
         captured["collect_activation_amax"] = bool(collect_activation_amax)
         workspace.planned_fused_moe_launches = {
-            ("packed", "e4m3_k16", int(token_count), bool(collect_activation_amax)): fused
+            (
+                "packed",
+                "e4m3_k16",
+                int(token_count),
+                bool(collect_activation_amax),
+            ): fused
             for token_count in token_counts
         }
         workspace.planned_topk_sum_launches = {
@@ -610,9 +624,7 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
         "w4a16",
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    plan = plan_tp_moe_scratch(
-        _caps(weight_plan=weight_plan, route_num_experts=0)
-    )
+    plan = plan_tp_moe_scratch(_caps(weight_plan=weight_plan, route_num_experts=0))
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
     activation_amax = torch.zeros((3, 8, 2), dtype=torch.float32)
@@ -678,9 +690,26 @@ def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
 
     assert isinstance(binding, TPMoEFP4Binding)
     assert binding.row_counts is not None
-    assert binding.row_counts.untyped_storage().data_ptr() == scratch[0].untyped_storage().data_ptr()
+    assert (
+        binding.row_counts.untyped_storage().data_ptr()
+        == scratch[0].untyped_storage().data_ptr()
+    )
     assert binding.a is tensors["a"]
     assert binding.topk_ids is tensors["topk_ids"]
+
+
+def test_non_trellis_plan_rejects_expert_maps() -> None:
+    plan = plan_tp_moe_scratch(_caps())
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+    route_expert_map = torch.arange(8, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="require a full-rotation Trellis plan"):
+        plan.bind(
+            scratch=scratch,
+            **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
+            route_expert_map=route_expert_map,
+        )
 
 
 def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:
@@ -792,9 +821,7 @@ def test_tp_moe_scratch_plan_bind_does_not_materialize_workspace_pool(
         "w4a16",
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
     )
-    plan = plan_tp_moe_scratch(
-        _caps(weight_plan=weight_plan, route_num_experts=0)
-    )
+    plan = plan_tp_moe_scratch(_caps(weight_plan=weight_plan, route_num_experts=0))
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
 
@@ -911,7 +938,9 @@ def test_tp_moe_route_binding_run_uses_function_binding_argument(monkeypatch) ->
     assert calls["binding"] is binding
 
 
-def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(monkeypatch) -> None:
+def test_tp_moe_sparse_fp4_binding_run_uses_function_binding_argument(
+    monkeypatch,
+) -> None:
     scratch = tp_moe_impl.TPMoEWorkspacePool()
     tensors = _runtime_tensors()
     binding = build_tp_moe_sparse_fp4_binding(

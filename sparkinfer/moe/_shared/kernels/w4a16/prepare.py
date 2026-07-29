@@ -1562,8 +1562,8 @@ def _trellis256_flat_native_view(
     device: torch.device,
 ) -> torch.Tensor:
     trellis_bits = int(trellis_bits)
-    expected_i16_shape = expected_prefix_shape + (16 * trellis_bits,)
-    expected_i32_shape = expected_prefix_shape + (8 * trellis_bits,)
+    expected_i16_shape = (*expected_prefix_shape, 16 * trellis_bits)
+    expected_i32_shape = (*expected_prefix_shape, 8 * trellis_bits)
     if tensor.device != device:
         raise ValueError(
             f"trellis3_t256 {name} must be on {device}, got {tensor.device}"
