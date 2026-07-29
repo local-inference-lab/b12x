@@ -99,7 +99,14 @@ def test_w6a8_source_format_sets_act_fmt():
 )
 def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     """Phase 4.1: fused quant→GEMM must produce the same output as the
-    standalone-quant + GEMM path (bit-identical)."""
+    standalone-quant + GEMM path (bit-identical).
+
+    Two regimes. At m=1 the fused prologue really runs, and its single
+    per-tensor global scale is equivalent to per-row scaling because there is
+    only one row, so the arms must compile to different kernels and agree
+    bitwise. At m>1 the prologue must not engage at all; the assertions there
+    pin that inertness rather than tolerating a near-match.
+    """
     import sparkinfer._lib.dense_gemm as _dense_mod
     import sparkinfer.quantization.mxfp6.fp6_dense_weights as _wmod
     from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
@@ -114,6 +121,24 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     )
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.2
 
+    # Without this the test is vacuous. The fused-quant flag used to be read
+    # from a module global inside the kernel constructor while the compiled
+    # kernel was memoized on arguments that did not include it, so the fused
+    # arm hit the unfused arm's cache entry and this test compared the
+    # unfused path against itself - passing while never once executing the
+    # fused prologue. Record which kernel each arm resolves and require them
+    # to differ. Counting compiles instead would not work: m is not a compile
+    # key, so m=4 and m=8 share a policy and legitimately reuse one kernel.
+    resolved: list[object] = []
+    _resolve = _dense_mod._get_compiled_dense_gemm_mxfp6
+
+    def _spy(*args, **kwargs):
+        compiled = _resolve(*args, **kwargs)
+        resolved.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(_dense_mod, "_get_compiled_dense_gemm_mxfp6", _spy)
+
     monkeypatch.setattr(_dense_mod, "_DENSE_FUSED_QUANT", False)
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", False)
     y_unfused = dense_fp6_linear(x, fp6w)
@@ -122,17 +147,100 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
     monkeypatch.setattr(_wmod, "_DENSE_FUSED_QUANT", True)
     y_fused = dense_fp6_linear(x, fp6w)
 
+    assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
+    if m == 1:
+        assert resolved[0] is not resolved[1], (
+            "fused and unfused arms resolved the SAME compiled kernel; the "
+            "compile cache key is blind to the fused-quant flag, so this "
+            "comparison is vacuous"
+        )
+    else:
+        assert resolved[0] is resolved[1], (
+            f"the fused prologue must be inert at m={m}: it derives one "
+            "per-tensor global scale, so enabling it above m=1 would drop "
+            "per-row activation scaling and make a row's output depend on "
+            "which other rows share its launch"
+        )
+
     assert y_fused.shape == y_unfused.shape
     assert torch.isfinite(y_fused).all()
     cos = _cos(y_fused, y_unfused)
     if m == 1:
         # m=1: both paths use per-tensor scaling → bit-identical.
         assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
-        torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
     else:
-        # m>1: unfused uses per-row activation scaling (deterministic) while
-        # fused uses per-tensor; different quantization → close but not equal.
-        assert cos > 0.99, f"fused/unfused cosine sim {cos:.6f} < 0.99"
+        # m>1: the flag is inert, so this is the same kernel on the same
+        # per-row inputs. A cosine tolerance here would re-admit the
+        # per-tensor downgrade this parametrization exists to forbid.
+        assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
+    torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
+
+
+@cuda_required
+@pytest.mark.parametrize("sf_copy_mode", ["autovec", "recast32"])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 256, 256),
+        (16, 256, 256),
+        # Large enough to select the prefill tile and exercise a k-loop with
+        # several stages, which is where the vectorized copy actually pays.
+        (256, 5120, 5120),
+    ],
+)
+def test_sf_copy_mode_is_bit_identical(m, n, k, sf_copy_mode, monkeypatch):
+    """Vectorizing the scale-factor copy must not move a single bit.
+
+    Only the route from smem to register changes; the UE8M0 bytes and the MMA
+    that consumes them are untouched. Anything short of exact equality means
+    the wider access is landing bytes in the wrong lanes, which would corrupt
+    quantization scales in a way that a cosine-similarity check would happily
+    pass.
+
+    The rest of the FP6 suite cannot cover this: it validates each mode against
+    a reference independently, and would stay green if the modes disagreed with
+    each other inside the reference's tolerance.
+    """
+    import sparkinfer._lib.dense_gemm as _dense_mod
+    from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
+        dense_fp6_linear,
+        quantize_dense_weight_to_fp6,
+    )
+
+    torch.manual_seed(11)
+    fp6w = quantize_dense_weight_to_fp6(
+        torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.2,
+        source_format="mxfp6_w6a8",
+    )
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 0.2
+
+    # Same guard as the fused-quant test above, for the same reason: sf_copy_mode
+    # changes codegen, so if it ever falls out of the compile-cache key both arms
+    # collapse onto one kernel and this compares a path against itself.
+    resolved: list[object] = []
+    _resolve = _dense_mod._get_compiled_dense_gemm_mxfp6
+
+    def _spy(*args, **kwargs):
+        compiled = _resolve(*args, **kwargs)
+        resolved.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(_dense_mod, "_get_compiled_dense_gemm_mxfp6", _spy)
+
+    monkeypatch.setattr(_dense_mod, "_DENSE_SF_COPY_MODE", "off")
+    y_off = dense_fp6_linear(x, fp6w).clone()
+    monkeypatch.setattr(_dense_mod, "_DENSE_SF_COPY_MODE", sf_copy_mode)
+    y_vec = dense_fp6_linear(x, fp6w)
+
+    assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
+    assert resolved[0] is not resolved[1], (
+        f"'off' and '{sf_copy_mode}' resolved the SAME compiled kernel; "
+        "sf_copy_mode is missing from the compile cache key, so this "
+        "comparison is vacuous"
+    )
+
+    assert torch.isfinite(y_vec).all()
+    torch.testing.assert_close(y_vec, y_off, rtol=0.0, atol=0.0)
 
 
 @cuda_required

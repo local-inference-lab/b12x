@@ -117,7 +117,14 @@ is **not** a stock vLLM quant method — without the package installed,
 | `SPARKINFER_ENABLE_FP6=1` | Master gate. Unset/0 = the plugin stays inert and vLLM uses its native paths. |
 | `SPARKINFER_FP6_MODEL_DIR=<checkpoint dir>` | Where the plugin indexes FP6 tensors. Export **unconditionally** per launch: a stale value from a previous launch mis-classifies layers and trips loader shape asserts. |
 | `SPARKINFER_ENABLE_FP6_MICRO=0` | Keep the fast fused dense kernel (the BS1 micro kernel is slower for these workloads). |
-| `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode. |
+| `SPARKINFER_DENSE_PER_ROW_IN_KERNEL` | Default 1 (fused in-kernel per-row activation quant, both regimes: small-M fused kernel at decode, RowGsKernel + per-row TMA quantizer at prefill). `0` = host-chain A/B fallback, bit-identical but ~1.7 ms/token slower at decode and multi-second per 8k prefill chunk at 123B scale. |
+| `SPARKINFER_PACKED_B_EXPAND_LARGE_M` | Default 1: at M>16 a 3:4-packed weight is expanded per call into a shared scratch (~one largest-shard copy of VRAM, e.g. 176 MB at Behemoth TP=2) and the faster expanded-B GEMM runs; decode stays on the packed stream. `0` = always-packed (pre-fix behavior), bit-identical but 1.27-1.28x slower prefill GEMMs on wide-N layers. |
+| `SPARKINFER_FP6_LARGE_M_UNROLL` | Default 1: FP6 large-M GEMMs use the MXFP8 mainloop unroll (k-tile unroll 4). Numerics-neutral codegen pragma — output is bit-identical either way (`tests/gemm/test_fp6_large_m_unroll.py`). `0` = historical unroll=2 plan, for A/B timing only. Measured +3.2-3.4% GEMM throughput at prefill M on every Behemoth TP=2 shard. |
+| `SPARKINFER_DENSE_PERSISTENT_SCRATCH` | Default 1: decode quant buffers live in a persistent per-(device, stream, shape) cache, and CUDA-graph capture claims those eager buckets instead of allocating inside the graph (the old in-capture allocation baked ~704 zero-fill kernels per step into the Behemoth decode graphs). `0` = per-call allocation everywhere, for A/B only. |
+| `SPARKINFER_FP6_DECODE_TILE` | Forces a fixed decode-regime (M<=16, N>1536) MMA tile, `MxN` format (e.g. `16x128` restores the old pin), for A/B only. Unset (default) = measured wave-cliff heuristic: `16x64` (double N-parallelism; qkv −23%, gate_up −7% at M=1) unless `ceil(N/64)` leaves a tiny (<=16 CTA) tail wave past a whole number of waves, where `32x128` avoids the 1.4-1.6x cliff (o/down at N=12288 on 188 SMs). All tiles bit-identical. |
+| `SPARKINFER_FP6_LARGE_M_TILE` | Wide-N (N>1536) prefill-regime (M>16) MMA tile, `MxN` format. Default `128x128`, worth 17-19% on every Behemoth TP=2 shard at M=8192 and 9-15% end-to-end prefill (see `fp6-results.md` 3.6c). It was briefly `128x64`: the sweep that chose that could only see `128x128` starved to one mainloop stage by a full-tile epilogue. All tiles are bit-identical (`tests/gemm/test_fp6_large_m_tile.py`); `128x64` restores the previous default for A/B. |
+| `SPARKINFER_DENSE_EPI_TILE` | Epilogue staging tile, `MxN`, an upper bound per mode rather than an exact request (a serving process compiles several tile shapes). Unset by default, which lets `_choose_epilogue` take the largest epilogue that costs no mainloop stage. Setting it disables that policy — an A/B and escape hatch, not a tuning knob. |
+| `SPARKINFER_DENSE_EPI_STAGES` | Caps epilogue pipeline depth. Only meaningful alongside `EPI_TILE`: a smaller epilogue tile raises `epi_stage_max` by the same factor, so the footprint does not move until the depth is capped too. |
 
 Never leak KLD-scoring-only variables into serving: unset
 `TORCH_COMPILE_DISABLE` and `SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT`
@@ -246,7 +253,8 @@ export OMP_NUM_THREADS=8
 # Recent vLLM nightlies gate these endpoints on the --profiler-config CLI arg
 # (vllm/entrypoints/serve/profile/api_router.py); the old VLLM_TORCH_PROFILER_DIR
 # env var no longer registers them. PROFILE=1 enables; traces (.json.gz) land in
-# PROFILE_DIR; summarize with sparkinfer scripts/summarize_vllm_trace.py.
+# PROFILE_DIR; summarize with scripts/summarize_vllm_trace.py
+# (see docs/fp6-phase-a-evidence.md for the Behemoth Phase-A capture flow).
 PROFILE="${PROFILE:-0}"
 PROFILE_DIR="${PROFILE_DIR:-/tmp/vllm_prof}"
 if [[ "$PROFILE" == "1" ]]; then
@@ -838,23 +846,75 @@ execution, from the `vllm-kld` checkout with `venv-kld` active:
 
 ```bash
 export SPARKINFER_ENABLE_FP6=1
-export SPARKINFER_FP6_MODEL_DIR=/path/to/fp6-checkpoint
+export SPARKINFER_ENABLE_FP6_MICRO=0
+export SPARKINFER_FP6_MODEL_DIR=/media/fmodels/TheHouseOfTheDude/Qwen3.6-35B-A3B-FP6-P0
+export SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1   # mandatory for MoE, inert for dense
+export TORCH_COMPILE_DISABLE=1                     # mandatory for reproducible KLD
+export VLLM_USE_V2_MODEL_RUNNER=0                  # mandatory: score mode is V1-only
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export TORCH_COMPILE_DISABLE=1   # mandatory for reproducible KLD
 
 python examples/offline_inference/score_mode_kld.py \
   --model "$SPARKINFER_FP6_MODEL_DIR" \
-  --reference-logits /path/to/ref_logits_<base>_ctx2048_s512 \
+  --reference-logits /media/fmodels/kld-refs/ref_logits_Qwen3.6-35B-A3B_ctx2048_s512 \
   --dataset wikitext --dataset-config wikitext-2-raw-v1 \
   --context-length 2048 --stride 512 \
-  --gpu-memory-utilization 0.90
+  --tensor-parallel-size 1 --gpu-memory-utilization 0.90
 ```
+
+Also clear any A/B kill switches left over in the shell before scoring
+(`SPARKINFER_DENSE_EPI_TILE`, `SPARKINFER_FP6_LARGE_M_TILE`,
+`SPARKINFER_DENSE_ROW_SCALE_EPILOGUE`, `SPARKINFER_DENSE_SF_COPY_MODE`,
+`SPARKINFER_FP6_LARGE_M_UNROLL`, `SPARKINFER_DENSE_DECODE_STAGE3`,
+`SPARKINFER_PACKED_B_EXPAND_LARGE_M`, `SPARKINFER_PACKED_B_EXPAND_AHEAD`,
+`SPARKINFER_DENSE_PERSISTENT_SCRATCH`), or you will score a kernel you did not
+mean to ship.
 
 The mean KLD is bit-deterministic under this configuration: run it twice
 and expect the identical value (any difference is a bug). Reference values
 for the validated models are in `fp6-results.md`. `TORCH_COMPILE_DISABLE`
 is for scoring only — never leave it set when serving (the launch scripts
 unset it).
+
+`SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1` is mandatory for MoE checkpoints
+and harmless for dense ones. The default MoE combine is an atomic scatter-add,
+whose summation order is decided by the hardware, so KLD would not reproduce
+run to run. The deterministic `route_output` + ordered top-k sum costs 1.3-4.4x
+on the combine, which is why it is scoring-only and must be unset for serving.
+
+`VLLM_USE_V2_MODEL_RUNNER=0` is not optional. Score mode (`kld_mode` and
+`return_prompt_logits`) is implemented only in the V1 model runner; the V2
+runner constructs its `ModelRunnerOutput` without a `kld_result_dict`, so
+the scorer reads `None` for every window, falls back to a second forward
+pass that also returns nothing, and finally raises `ValueError: No valid
+positions for KLD calculation` — after running two full prefills per window
+for the whole dataset. Recent vLLM nightlies default the Mistral
+architectures to V2, so a Behemoth run that worked in the past can start
+failing this way with no local change. Confirm it took by checking that
+`Using V2 Model Runner` does *not* appear in the log.
+
+### 2.6b Benchmarking (prefix caching must be off)
+
+```bash
+# Launch with prefix caching disabled - the scripts default it ON.
+ENABLE_PREFIX_CACHING=0 CUDA_VISIBLE_DEVICES=0 MODEL_DIR=... ./qwen3.6-35b-a3b-fp6.sh <hash>
+
+# Three passes; discard pass 1 as warm-up and take the median of 2 and 3.
+./bench-32k-sweep.sh <hash> Qwen3.6-35B-A3B-FP6-W6A6 \
+  /media/fmodels/TheHouseOfTheDude/Qwen3.6-35B-A3B-FP6-P0 http://localhost:8001
+```
+
+`ENABLE_PREFIX_CACHING=0` is load-bearing for any prefill measurement. The
+launch scripts default it to `1` because it is the right choice for chat and
+agent workloads, but a repeated sweep re-sends the same prompts, so passes 2
+and 3 serve them from cache and report a prefill number that never happened.
+Measured on the 35B-A3B MoE with caching left on: pass 1 reported 20,098 tok/s
+at 32k and passes 2-3 reported 150,415 and 151,235 — a 7.5x jump between
+passes, growing with context length (1.0x at 1k, 2.8x at 8k, 7.5x at 32k),
+which is the fingerprint. With caching off the same three passes agree.
+
+Also unset `TORCH_COMPILE_DISABLE` before benchmarking. It is required for KLD
+and catastrophic for serving, and it is the single most likely leftover in a
+shell that just finished a scoring run.
 
 ### 2.7 Troubleshooting
 

@@ -57,10 +57,10 @@ def _gemm_operands(m: int, n: int, k: int, source_format: str):
 @pytest.mark.parametrize(
     "m,n,k,source_format",
     [
-        (1, 6144, 512, "e2m3"),  # (16,128) decode tile, 4 K-tiles
+        (1, 6144, 512, "e2m3"),  # decode tile (heuristic (16,64)), 4 K-tiles
         (1, 6144, 512, "e3m2"),  # same tile, other FP6 sub-format
         (3, 6144, 512, "e2m3"),  # MTP verify shape, same tile
-        (5, 6144, 512, "e2m3"),  # (64,128) small-M coarse tile
+        (5, 6144, 512, "e2m3"),  # small-M shape, same decode tile
         (128, 256, 256, "e2m3"),  # small square, 2 K-tiles
         (128, 6144, 512, "e2m3"),  # prefill-ish wide-N tile
     ],

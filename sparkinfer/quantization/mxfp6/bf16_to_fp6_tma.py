@@ -8,11 +8,12 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cuda.bindings.driver as cuda
-from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint64
+from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu import warp as _nvgpu_warp
 
 from sparkinfer._lib.intrinsics import (
+    cvt_f32_to_bf16_bits,
     fabs_f32,
     fmax_f32,
     get_ptr_as_int64,
@@ -20,6 +21,7 @@ from sparkinfer._lib.intrinsics import (
     st_global_u8,
     st_global_u64,
     st_shared_u8,
+    u32_as_f32,
 )
 from sparkinfer._lib.fp6 import (
     quantize_block_fp6_e2m3_bytes,
@@ -82,7 +84,7 @@ def moe_mxfp6_store_bytes_u64_global(
 
 
 class TestKernel:
-    def __init__(self, fmt: str = "e3m2", emit: str = "packed"):
+    def __init__(self, fmt: str = "e3m2", emit: str = "packed", per_row: bool = False):
         assert fmt in ("e3m2", "e2m3", "e4m3"), f"unsupported act/weight fmt: {fmt}"
         # "packed": 3:4-packed wire format (M, 3K/4) - weights/storage (FP6 only).
         # "bytes":  one code per byte (M, K) - the mxf8f6f4 GEMM operand layout,
@@ -91,8 +93,17 @@ class TestKernel:
         assert emit in ("packed", "bytes"), f"unsupported FP6 emit: {emit}"
         if fmt == "e4m3" and emit != "bytes":
             raise ValueError("e4m3 activations require emit='bytes' (no 3:4 pack)")
+        # per_row: large-M half of the fused per-row global-scale recipe (see
+        # fp6_row_gs). ``global_scale`` becomes the (M,) f32 per-row gs from
+        # RowGsKernel; each element is pre-scaled bf16(f32(x) * gs_row) in
+        # registers (cvt.rn.bf16.f32 — the exact host-chain rounding) and
+        # quantized with a UNIT gs, bit-identical to the host per-row path.
+        # Activations only, so bytes-emit only.
+        if per_row and emit != "bytes":
+            raise ValueError("per_row quantization requires emit='bytes'")
         self.fmt = fmt
         self.emit = emit
+        self.per_row = per_row
         self.tile_shape_mnk = (128, 128, 128)
         self.threads_per_cta = 160
         self.num_mma_warps = 4
@@ -204,7 +215,14 @@ class TestKernel:
 
         st = smem.allocate(S)
         sBF16 = st.sBF16.get_tensor(bf16_smem.outer, swizzle=bf16_smem.inner)
-        gs_value = global_scale[Int32(0)].to(cutlass.Float32)
+        if cutlass.const_expr(self.per_row):
+            # Per-row mode: values are pre-scaled per row below, so the
+            # quantizer's own global scale is exactly 1.0 (same collapse as
+            # the host chain, which quantizes the pre-scaled input with a
+            # unit gs — see fp6_dense_weights).
+            gs_value = cutlass.Float32(1.0)
+        else:
+            gs_value = global_scale[Int32(0)].to(cutlass.Float32)
 
         cta_layout = cute.make_layout(1)
         gI = cute.local_tile(mInput, (128, 128), (None, None))
@@ -259,10 +277,24 @@ class TestKernel:
                     # quantizer sources its data directly from the resident global input.
                     vals = cute.make_rmem_tensor((_FP6_BLOCK_ELEMS,), cutlass.Float32)
                     bmax = cutlass.Float32(0.0)
-                    for e in cutlass.range_constexpr(_FP6_BLOCK_ELEMS):
-                        v = cutlass.Float32(mRaw[grow, gcol0 + Int32(e)])
-                        vals[e] = v
-                        bmax = fmax_f32(bmax, fabs_f32(v))
+                    if cutlass.const_expr(self.per_row):
+                        # Per-row pre-scale with the SAME rounding chain as the
+                        # host: f32 multiply (RN), round through bf16 (RN),
+                        # widen back (exact) — identical to the small-M
+                        # per-row branch. global_scale is the (M,) f32 row
+                        # scales from RowGsKernel.
+                        gs_row = cutlass.Float32(global_scale[grow])
+                        for e in cutlass.range_constexpr(_FP6_BLOCK_ELEMS):
+                            v_raw = cutlass.Float32(mRaw[grow, gcol0 + Int32(e)])
+                            pre_bits = cvt_f32_to_bf16_bits(v_raw * gs_row)
+                            v = u32_as_f32(pre_bits << Uint32(16))
+                            vals[e] = v
+                            bmax = fmax_f32(bmax, fabs_f32(v))
+                    else:
+                        for e in cutlass.range_constexpr(_FP6_BLOCK_ELEMS):
+                            v = cutlass.Float32(mRaw[grow, gcol0 + Int32(e)])
+                            vals[e] = v
+                            bmax = fmax_f32(bmax, fabs_f32(v))
                     if cutlass.const_expr(self.emit == "bytes"):
                         # Byte-container output (M, K): one code per byte, the
                         # mxf8f6f4 GEMM operand layout. Same quantization math as

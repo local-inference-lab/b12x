@@ -55,8 +55,8 @@ def test_small_m_matches_padded_rows():
 
     Rows are independent in the GEMM, so y(x[:m])[i] must be bit-identical to
     y(x)[i]. The activation amax is pinned to row 0 so every slice quantizes
-    with the same global scale; m=1 hits the (16,128) decode tile, m=3 the MTP
-    verify shape, m=5 the >4 coarse-tile path with a non-tile-multiple m.
+    with the same global scale; m=1 hits the decode tile (heuristic (16,64) at
+    this N), m=3 the MTP verify shape, m=5 a non-tile-multiple m.
     """
     from sparkinfer.quantization.mxfp6.fp6_dense_weights import dense_fp6_linear
 

@@ -1,4 +1,27 @@
 #!/usr/bin/env python3
+"""Capture a vLLM native torch profile over a live decode or prefill window.
+
+``--mode decode``/``mtp`` streams a completion, waits for the first token so the
+window lands in steady decode rather than prefill, then brackets
+``--capture-seconds`` with ``POST /start_profile`` and ``/stop_profile``.
+
+``--mode prefill`` inverts that: profiling starts before the request is
+submitted and stops at the first streamed token, so the window IS the TTFT.
+Pair it with ``--max-tokens 1`` and a long ``--prompt-file`` to keep decode out
+of the trace.
+
+The server MUST have been launched with profiling enabled or ``/start_profile``
+returns 404::
+
+    PROFILE=1 PROFILE_DIR=/tmp/vllm_prof_<tag> \\
+    CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2 ./behemoth123b-r1-v2-fp6.sh "$API_KEY"
+
+Traces are written by the server into ``PROFILE_DIR`` (one per rank, plus a
+frontend ``async_llm`` trace); ``--out-dir`` here only collects the request
+body, stream log, and profile responses. Summarize with
+``scripts/summarize_vllm_trace.py "$PROFILE_DIR"``.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -126,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--base-url", required=True, help="Server base URL, for example http://127.0.0.1:8000")
-    parser.add_argument("--mode", choices=("decode", "mtp"), default="decode")
+    parser.add_argument("--mode", choices=("decode", "mtp", "prefill"), default="decode")
     parser.add_argument("--model", default=None, help="Model id. Auto-detected from /v1/models when omitted.")
     parser.add_argument("--prompt", default=None, help="Inline prompt. Ignored when --prompt-file is set.")
     parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file.")
@@ -185,6 +208,35 @@ def main() -> None:
         log_path=stream_log,
         error_path=error_log,
     )
+
+    def _start_profile() -> None:
+        status, body = http_json(
+            f"{base_url}/start_profile", headers=headers, payload={}
+        )
+        start_response.write_text(body, encoding="utf-8")
+        if status == 404:
+            stream.stop()
+            raise RuntimeError(
+                "/start_profile is not available on this server. "
+                "For vLLM this usually means the server was not launched with "
+                "--profiler-config."
+            )
+        if status != 200:
+            stream.stop()
+            raise RuntimeError(
+                f"/start_profile failed with status {status}: {body.strip()}"
+            )
+
+    # Prefill inverts the window. The decode modes deliberately wait PAST the
+    # first token so the capture lands in steady decode; prefill is the work
+    # that happens BEFORE it, so profiling has to be running when the request
+    # is submitted and must stop as soon as the first token appears. Anything
+    # captured after that is decode contaminating a prefill measurement.
+    prefill_mode = args.mode == "prefill"
+    if prefill_mode:
+        print("starting native profile before submitting the request...")
+        _start_profile()
+
     stream.start()
     started_at = time.time()
 
@@ -196,24 +248,19 @@ def main() -> None:
         raise RuntimeError(f"timed out waiting for the first streamed token.{detail}")
 
     first_token_at = time.time()
-    print("first streamed token observed; starting native profile...")
 
-    status, body = http_json(f"{base_url}/start_profile", headers=headers, payload={})
-    start_response.write_text(body, encoding="utf-8")
-    if status == 404:
-        stream.stop()
-        raise RuntimeError(
-            "/start_profile is not available on this server. "
-            "For vLLM this usually means the server was not launched with --profiler-config."
+    if not prefill_mode:
+        print("first streamed token observed; starting native profile...")
+        _start_profile()
+        deadline = time.time() + args.capture_seconds
+        while time.time() < deadline:
+            if stream.finished_event.wait(timeout=0.2):
+                break
+    else:
+        print(
+            "first streamed token observed after "
+            f"{first_token_at - started_at:.2f}s; stopping profile."
         )
-    if status != 200:
-        stream.stop()
-        raise RuntimeError(f"/start_profile failed with status {status}: {body.strip()}")
-
-    deadline = time.time() + args.capture_seconds
-    while time.time() < deadline:
-        if stream.finished_event.wait(timeout=0.2):
-            break
 
     print("stopping native profile...")
     status, body = http_json(f"{base_url}/stop_profile", headers=headers, payload={})
@@ -235,11 +282,23 @@ def main() -> None:
         "profile_stopped_at_epoch_s": finished_at,
         "capture_seconds": args.capture_seconds,
         "request_body": request_body,
-        "notes": [
-            "The background request was started before profiling and profiling began after the first streamed token.",
-            "vLLM native HTTP profiling is window-based and does not provide a stage filter over the server API.",
-            "For speculative servers, draft or verify regions should show up in the same trace window.",
-        ],
+        "ttft_s": first_token_at - started_at,
+        "notes": (
+            [
+                "Profiling was started BEFORE the request and stopped at the first "
+                "streamed token, so the window is prefill (TTFT) with at most one "
+                "decode step.",
+                "Use --max-tokens 1 to keep the tail decode step out of the trace.",
+                "vLLM native HTTP profiling is window-based and does not provide a "
+                "stage filter over the server API.",
+            ]
+            if prefill_mode
+            else [
+                "The background request was started before profiling and profiling began after the first streamed token.",
+                "vLLM native HTTP profiling is window-based and does not provide a stage filter over the server API.",
+                "For speculative servers, draft or verify regions should show up in the same trace window.",
+            ]
+        ),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 

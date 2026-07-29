@@ -83,12 +83,21 @@ def allocate_bf16_to_fp6_tma_outputs(
     )
 
 
-def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "packed"):
+def compile_bf16_to_fp6_tma(
+    M: int, K: int, fmt: str = "e3m2", emit: str = "packed", per_row: bool = False
+):
     """Compile the BF16→MX-FP6 TMA kernel for (M, K) in ``fmt`` (``e3m2``/``e2m3``).
 
     ``emit`` selects the code layout written: ``"packed"`` (3:4 wire format,
     ``3K/4`` bytes/row) or ``"bytes"`` (one code per byte, ``K`` bytes/row -
     directly consumable by the ``mxf8f6f4`` GEMM, no expansion step).
+
+    ``per_row=True`` (activations, ``emit="bytes"`` only) is the large-M half
+    of the fused per-row global-scale recipe: ``global_scale`` becomes the
+    ``(M,)`` f32 per-row scales from :func:`~sparkinfer.quantization.mxfp6.
+    fp6_row_gs.compile_fp6_row_gs`; the kernel pre-scales each element through
+    bf16 in-registers and quantizes with a unit gs, bit-identical to the host
+    per-row chain in ``fp6_dense_weights``.
 
     The callable signature is: ``launch(bf16_input, global_scale, packed_a_flat, scale_flat)``
     where packed_a_flat and scale_flat come from ``BF16ToFP6TMAOutputs``.
@@ -98,7 +107,9 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
     if fmt == "e4m3" and emit != "bytes":
         raise ValueError("e4m3 activations require emit='bytes'")
     assert emit in ("packed", "bytes"), f"unsupported FP6 emit: {emit}"
-    cache_key = (M, K, fmt, emit)
+    if per_row and emit != "bytes":
+        raise ValueError("per_row quantization requires emit='bytes'")
+    cache_key = (M, K, fmt, emit, per_row)
     cached = _KERNEL_CACHE_FP6.get(cache_key)
     if cached is not None:
         return cached
@@ -110,14 +121,14 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
         bf, (M, K), stride_order=(1, 0), assumed_align=16
     )
     gs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (1,), assumed_align=4
+        cutlass.Float32, (M,) if per_row else (1,), assumed_align=4
     )
     pa_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (M, packed_k_bytes, 1), stride_order=(1, 0, 2), assumed_align=16
     )
     sfa_fake = make_ptr(sf, 16, AddressSpace.gmem, assumed_align=16)
     mac = min(get_max_active_clusters(1), get_num_sm(torch.device("cuda")))
-    kernel = FP6TestKernel(fmt, emit=emit)
+    kernel = FP6TestKernel(fmt, emit=emit, per_row=per_row)
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=cache_key)
     raw = sparkinfer_compile(
         kernel,
@@ -127,9 +138,11 @@ def compile_bf16_to_fp6_tma(M: int, K: int, fmt: str = "e3m2", emit: str = "pack
         sfa_fake,
         mac,
         current_cuda_stream(),
+        # v2: per_row mode added (cache key gained the per_row field and the
+        # kernel source changed; per-tensor codegen is unchanged).
         compile_spec=KernelCompileSpec.from_key(
             "quantization.bf16_to_fp6_tma",
-            1,
+            2,
             cache_key,
         ),
     )
