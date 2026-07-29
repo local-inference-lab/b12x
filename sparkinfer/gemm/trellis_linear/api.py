@@ -1,0 +1,77 @@
+"""Public API for :mod:`sparkinfer.gemm.trellis_linear`."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from ..._lib.gating import default_is_supported
+from ...moe._shared.kernels.w4a16.kernel import (
+    clear_w4a16_kernel_cache,
+    run_trellis256_dense,
+)
+from ...moe._shared.kernels.w4a16.prepare import (
+    PreparedTrellis256DenseWeight,
+    prepare_trellis256_dense_weight,
+)
+from . import META
+
+PreparedWeight = PreparedTrellis256DenseWeight
+
+
+def prepare_weight(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    *,
+    mcg: Optional[torch.Tensor] = None,
+    mul1: Optional[torch.Tensor] = None,
+    codebook: Optional[str | int] = None,
+    params_dtype: torch.dtype = torch.float16,
+    dummy_scale: Optional[torch.Tensor] = None,
+) -> PreparedWeight:
+    """Validate one native EXL3 dense weight and retain zero-copy views."""
+    return prepare_trellis256_dense_weight(
+        trellis,
+        suh,
+        svh,
+        mcg=mcg,
+        mul1=mul1,
+        codebook=codebook,
+        params_dtype=params_dtype,
+        dummy_scale=dummy_scale,
+    )
+
+
+def run(
+    x: torch.Tensor,
+    weight: PreparedWeight,
+    *,
+    output: Optional[torch.Tensor] = None,
+    gemm_output: Optional[torch.Tensor] = None,
+    c_tmp: Optional[torch.Tensor] = None,
+    hadamard_128=None,
+) -> torch.Tensor:
+    """Execute input rotation, native Trellis GEMM, and output rotation."""
+    return run_trellis256_dense(
+        x,
+        weight,
+        output=output,
+        gemm_output=gemm_output,
+        c_tmp=c_tmp,
+        hadamard_128=hadamard_128,
+    )
+
+
+def is_supported(device=None) -> bool:
+    """True when the SM120/SM121 Trellis kernel stack is available."""
+    return default_is_supported(device, requires=META.requires)
+
+
+def clear_caches() -> None:
+    """Clear compiled W4A16 specializations shared with fused MoE."""
+    clear_w4a16_kernel_cache()
+
+
+__all__ = list(META.entry_points)

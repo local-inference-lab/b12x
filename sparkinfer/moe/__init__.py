@@ -1,7 +1,8 @@
 """MoE ops for sparkinfer.
 
 - ``fused_moe``: fused tensor-parallel routed-expert FFN (route -> FC1 ->
-  activation -> FC2 -> scatter); recipes nvfp4/mxfp4/w4a8_mx/w4a8_nvfp4/w4a16.
+  activation -> FC2 -> scatter); recipes nvfp4/mxfp4/w4a8_mx/w4a8_nvfp4/w4a16,
+  including the ``exl3_trellis_mcg`` W4A16 source format.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
 """

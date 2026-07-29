@@ -44,6 +44,7 @@ class OperandEncoding(_StringEnum):
 
 class ScaleEncoding(_StringEnum):
     E4M3_K16 = "e4m3_k16"
+    E4M3_K32 = "e4m3_k32"
     E8M0_K32 = "e8m0_k32"
     E8M0_K32_X_E4M3_K16_RESIDUAL = "e8m0_k32_x_e4m3_k16_residual"
 
@@ -96,6 +97,7 @@ class GemmEngine(_StringEnum):
 
 class PreparedWeightLayout(_StringEnum):
     SOURCE_NATIVE = "source_native"
+    TRELLIS_NATIVE = "trellis_native"
     MMA_VIEW = "mma_view"
     MMA_PACKED = "mma_packed"
     QMMA_REPACKED = "qmma_repacked"
@@ -116,6 +118,7 @@ class WeightPreparationTransform(_StringEnum):
     RUNTIME_ALPHAS = "runtime_alphas"
     W4A16_NATIVE = "w4a16_native"
     W4A16_PACKED = "w4a16_packed"
+    W4A16_TRELLIS = "w4a16_trellis"
     W4A8_QMMA = "w4a8_qmma"
     W6A8_MXFP6 = "w6a8_mxfp6"
 
@@ -150,6 +153,7 @@ _SOURCE_FORMATS = {
     "fp4_e8m0_k32",
     "compressed_tensors",
     "mxfp6_e2m3",
+    "exl3_trellis_mcg",
 }
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -158,7 +162,12 @@ _SOURCES_BY_QUANT_MODE = {
     # W4A16 deliberately keeps its historical FP4 source trio; the packed
     # MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
-        {"modelopt_nvfp4", "fp4_e8m0_k32", "compressed_tensors"}
+        {
+            "modelopt_nvfp4",
+            "fp4_e8m0_k32",
+            "compressed_tensors",
+            "exl3_trellis_mcg",
+        }
     ),
     "w6a8_mx": frozenset({"mxfp6_e2m3"}),
 }
@@ -260,6 +269,8 @@ class MoEWeightPreparationPlan:
     weight_layouts: frozenset[PreparedWeightLayout]
     scale_layouts: frozenset[PreparedScaleLayout]
     storage_policy: WeightStoragePolicy
+    trellis_bits: int | None = None
+    trellis_tile_config: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -287,6 +298,25 @@ class MoEWeightPreparationPlan:
         object.__setattr__(
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
+        if self.source_format == "exl3_trellis_mcg":
+            bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
+            if bits not in (3, 4, 5, 6):
+                raise ValueError(f"trellis_bits must be one of 3, 4, 5, 6; got {bits}")
+            tile_config = self.trellis_tile_config or (64, 256, 64, 256)
+            tile_config = tuple(int(value) for value in tile_config)
+            if len(tile_config) != 4 or any(
+                value <= 0 or value % 16 != 0 for value in tile_config
+            ):
+                raise ValueError(
+                    "trellis_tile_config must contain four positive multiples of 16"
+                )
+            object.__setattr__(self, "trellis_bits", bits)
+            object.__setattr__(self, "trellis_tile_config", tile_config)
+        elif self.trellis_bits is not None or self.trellis_tile_config is not None:
+            raise ValueError(
+                "trellis_bits/trellis_tile_config require "
+                "source_format='exl3_trellis_mcg'"
+            )
         for name in ("num_experts", "hidden_size", "intermediate_size"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -357,6 +387,8 @@ class MoEWeightPreparationPlan:
 
     @property
     def w4a16_weight_layout(self) -> str | None:
+        if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
+            return "trellis3_t256"
         if WeightPreparationTransform.W4A16_NATIVE in self.transforms:
             return "modelopt"
         if WeightPreparationTransform.W4A16_PACKED in self.transforms:
@@ -383,6 +415,8 @@ class MoEWeightPreparationPlan:
                 f"quant_mode={quant_mode!r} is absent from this preparation plan"
             )
         if quant_mode == "w4a16":
+            if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
+                return PreparedWeightLayout.TRELLIS_NATIVE
             return (
                 PreparedWeightLayout.SOURCE_NATIVE
                 if WeightPreparationTransform.W4A16_NATIVE in self.transforms
@@ -510,11 +544,14 @@ def make_moe_spec(
         quant_mode=quant_mode,
     )
 
-    source_scale = (
-        ScaleEncoding.E8M0_K32
-        if source_format in ("fp4_e8m0_k32", "mxfp6_e2m3")
-        else ScaleEncoding.E4M3_K16
-    )
+    if source_format == "exl3_trellis_mcg":
+        # Trellis stores codebook indices without a per-weight scale grid. The
+        # W4A16 ABI still carries a four-byte dummy E4M3 K/32 scale pointer.
+        source_scale = ScaleEncoding.E4M3_K32
+    elif source_format in ("fp4_e8m0_k32", "mxfp6_e2m3"):
+        source_scale = ScaleEncoding.E8M0_K32
+    else:
+        source_scale = ScaleEncoding.E4M3_K16
     if quant_mode == "w4a16":
         activation_encoding = OperandEncoding.BF16
         activation_scale = None
@@ -558,6 +595,8 @@ def plan_moe_weight_preparation(
     hidden_size: int,
     intermediate_size: int,
     w4a16_layout: PreparedWeightLayout | str | None = None,
+    trellis_bits: int | None = None,
+    trellis_tile_config: tuple[int, int, int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -593,9 +632,18 @@ def plan_moe_weight_preparation(
         None,
         PreparedWeightLayout.SOURCE_NATIVE,
         PreparedWeightLayout.MMA_PACKED,
+        PreparedWeightLayout.TRELLIS_NATIVE,
     }:
         raise ValueError(
-            "W4A16 preparation requires source_native or mma_packed layout"
+            "W4A16 preparation requires source_native, mma_packed, or "
+            "trellis_native layout"
+        )
+    if (
+        requested_w4a16_layout is PreparedWeightLayout.TRELLIS_NATIVE
+        and source_format != "exl3_trellis_mcg"
+    ):
+        raise ValueError(
+            "trellis_native layout requires source_format='exl3_trellis_mcg'"
         )
 
     transforms: set[WeightPreparationTransform] = set()
@@ -620,9 +668,7 @@ def plan_moe_weight_preparation(
             continue
         if spec.quant_mode == "w4a8_mx":
             if spec.activation not in {"silu", "situ"}:
-                raise ValueError(
-                    "W4A8-MX preparation currently requires silu or situ"
-                )
+                raise ValueError("W4A8-MX preparation currently requires silu or situ")
             # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
             # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
             # fine; consumers bound their reads by the logical sizes.
@@ -659,6 +705,22 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w4a16":
+            if source_format == "exl3_trellis_mcg":
+                if spec.activation not in {"silu", "situ"}:
+                    raise ValueError(
+                        "EXL3 Trellis W4A16 currently requires silu or situ"
+                    )
+                if requested_w4a16_layout not in {
+                    None,
+                    PreparedWeightLayout.TRELLIS_NATIVE,
+                }:
+                    raise ValueError(
+                        "EXL3 Trellis W4A16 requires trellis_native layout"
+                    )
+                transforms.add(WeightPreparationTransform.W4A16_TRELLIS)
+                weight_layouts.add(PreparedWeightLayout.TRELLIS_NATIVE)
+                scale_layouts.add(PreparedScaleLayout.SOURCE_NATIVE)
+                continue
             layout = requested_w4a16_layout
             if layout is None:
                 # The packed MMA kernels only have tile configs for
@@ -702,6 +764,7 @@ def plan_moe_weight_preparation(
     )
     native_representation = (
         WeightPreparationTransform.W4A16_NATIVE in transforms
+        or WeightPreparationTransform.W4A16_TRELLIS in transforms
         # W6A8-MXFP6 keeps the packed FP6 bytes unchanged and transfers
         # ownership to the prepared representation (swizzled scales replace
         # the source grids), mirroring the native W4A16 storage policy.
@@ -735,6 +798,8 @@ def plan_moe_weight_preparation(
         weight_layouts=frozenset(weight_layouts),
         scale_layouts=frozenset(scale_layouts),
         storage_policy=storage_policy,
+        trellis_bits=trellis_bits,
+        trellis_tile_config=trellis_tile_config,
     )
 
 

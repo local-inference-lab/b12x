@@ -2,8 +2,9 @@
 scatter, in one launch family.
 
 Recipes (``META.recipes``) are arguments, not separate ops: nvfp4, mxfp4,
-w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt/nf3_2p1).  Activations:
-silu, situ, relu2, swigluoai_uninterleave.  Kernel
+w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt/nf3_2p1 and the
+``exl3_trellis_mcg`` full-rotation source). Activations: silu, situ, relu2,
+swigluoai_uninterleave. Kernel
 regimes (micro / dynamic / tiny-decode / w4a16) are selected declaratively by
 ``plan_execution``.
 
@@ -65,7 +66,14 @@ META = OpMeta(
         "clear_caches",
     ),
     dtypes=("bf16",),
-    recipes=("nvfp4", "mxfp4", "w4a8_mx", "w4a8_nvfp4", "w4a16"),
+    recipes=(
+        "nvfp4",
+        "mxfp4",
+        "w4a8_mx",
+        "w4a8_nvfp4",
+        "w4a16",
+        "w4a16/exl3_trellis_mcg",
+    ),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/sparkinfer",
