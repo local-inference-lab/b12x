@@ -219,6 +219,20 @@ def select_route_block_size_m(m: int, topk: int, num_experts: int) -> int:
     return _W4A16_ALLOWED_ROUTED_SIZES[-1]
 
 
+def route_block_sizes_for_capacity(
+    max_tokens: int,
+    topk: int,
+    num_experts: int,
+) -> tuple[int, ...]:
+    """Conservative block-size set reachable within a token capacity."""
+    max_tokens = max(int(max_tokens), 1)
+    first = select_route_block_size_m(1, topk, num_experts)
+    last = select_route_block_size_m(max_tokens, topk, num_experts)
+    first_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(first)
+    last_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(last)
+    return _W4A16_ALLOWED_ROUTED_SIZES[first_idx : last_idx + 1]
+
+
 def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int:
     max_packed_routes = int(numel) + int(num_experts) * (int(block_size) - 1)
     if int(numel) < int(num_experts):
