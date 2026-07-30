@@ -395,25 +395,31 @@ def _check_graph(
         channel.all_gather_heads(odd_input, odd_output)
     stream.synchronize()
 
-    for replay in range(8):
-        step = 3000 + replay
-        odd_input.copy_(
-            _rank_query(step, rank, world_size, 1, torch.bfloat16, device)
-        )
-        expected = torch.cat(
-            [
-                _rank_query(
-                    step, source, world_size, 1, torch.bfloat16, device
-                )
-                for source in range(world_size)
-            ],
-            dim=1,
-        )
+    snapshots = [tuple(channel._ext._debug_staging_words(channel._ptr, 0))]
+    for value in (1.0, 2.0):
+        odd_input.fill_(value)
         stream.wait_stream(torch.cuda.current_stream(device))
         odd_graph.replay()
-        odd_graph.replay()
         stream.synchronize()
-        torch.testing.assert_close(odd_output, expected, rtol=0, atol=0)
+        snapshots.append(
+            tuple(channel._ext._debug_staging_words(channel._ptr, -1))
+        )
+        torch.testing.assert_close(
+            odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
+        )
+
+    changed_slots = [
+        {
+            slot
+            for slot, (before, after) in enumerate(
+                zip(snapshots[index], snapshots[index + 1], strict=True)
+            )
+            if before != after
+        }
+        for index in range(2)
+    ]
+    assert all(len(changed) == 1 for changed in changed_slots)
+    assert changed_slots[0] != changed_slots[1]
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:

@@ -658,6 +658,27 @@ static void all_gather_heads(fptr_t pointer, torch::Tensor &local_input,
   }
 }
 
+// Narrow synchronization hook for the multi-rank CUDA regression. It can
+// reset and observe the first local staging word in each slot.
+static std::vector<int64_t> debug_staging_words(fptr_t pointer, int64_t fill) {
+  auto *runtime = reinterpret_cast<pcie_dcp_a2a::PCIeDCPA2A *>(pointer);
+  TORCH_CHECK(fill >= -1 && fill <= 0xffff);
+  std::vector<int64_t> words(2);
+  for (int slot = 0; slot < 2; ++slot) {
+    auto *address = runtime->staging_.slots[slot].ptrs[runtime->rank_];
+    if (fill >= 0) {
+      const auto fill_word = static_cast<unsigned short>(fill);
+      CHECK_CUDA_SUCCESS(cudaMemcpy(address, &fill_word, sizeof(fill_word),
+                                    cudaMemcpyHostToDevice));
+    }
+    unsigned short word;
+    CHECK_CUDA_SUCCESS(
+        cudaMemcpy(&word, address, sizeof(word), cudaMemcpyDeviceToHost));
+    words[slot] = int64_t(word);
+  }
+  return words;
+}
+
 static void dispose(fptr_t pointer) {
   delete reinterpret_cast<pcie_dcp_a2a::PCIeDCPA2A *>(pointer);
 }
@@ -670,6 +691,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "fused PCIe DCP LSE reduce-scatter");
   module.def("all_gather_heads", &all_gather_heads,
              "PCIe DCP head-dimension all-gather");
+  module.def("_debug_staging_words", &debug_staging_words,
+             "test-only local staging words");
   module.def("dispose", &dispose, "dispose PCIe DCP A2A");
   module.def("meta_size", &meta_size, "signal metadata size");
 }
