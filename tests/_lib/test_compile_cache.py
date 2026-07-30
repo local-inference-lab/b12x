@@ -8,10 +8,17 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 compiler = importlib.import_module("sparkinfer._lib.compiler")
+kernel_resources = importlib.import_module(
+    "validation.cutlass_migration.evidence.kernel_resources"
+)
+ptx_capture = importlib.import_module(
+    "validation.cutlass_migration.acceptance.corpus.ptx_capture"
+)
 
 
 def test_package_root_is_the_sparkinfer_package():
@@ -53,15 +60,23 @@ def test_cache_dir_resolution_order(monkeypatch):
     assert compiler._cute_compile_cache_dir() == Path("/explicit")
 
 
-def test_disk_cache_key_includes_device_arch(monkeypatch):
+def test_disk_cache_key_includes_device_uuid_and_forwards_ordinal(monkeypatch):
     compile_callable = object()
+    seen = {"calls": 0}
+
+    def _fake_device_uuid_key(ordinal):
+        seen["calls"] += 1
+        seen["ordinal"] = ordinal
+        return ("device_uuid", "gpu-3")
+
+    monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 3)
+    monkeypatch.setattr(compiler, "_device_uuid_key", _fake_device_uuid_key)
     monkeypatch.setattr(
         compiler,
         "_static_compile_cache_context",
-        lambda _callable, _ordinal=None: (
+        lambda _callable: (
             "package",
             "toolchain",
-            ("arch", 12, 0, "gpu"),
             (),
             (),
         ),
@@ -69,66 +84,264 @@ def test_disk_cache_key_includes_device_arch(monkeypatch):
 
     payload = compiler._compile_disk_cache_payload(
         compile_callable,
-        test_disk_cache_key_includes_device_arch,
+        test_disk_cache_key_includes_device_uuid_and_forwards_ordinal,
+        (),
+        {},
+    )
+    repeated_payload = compiler._compile_disk_cache_payload(
+        compile_callable,
+        test_disk_cache_key_includes_device_uuid_and_forwards_ordinal,
         (),
         {},
     )
 
     assert payload[0] == "sparkinfer_cute_compile_cache_v3"
-    assert payload[4] == ("arch", 12, 0, "gpu")
+    assert payload[4] == ("device_uuid", "gpu-3")
+    assert repeated_payload == payload
+    assert seen["ordinal"] == 3
+    assert seen["calls"] == 1
 
 
-def test_device_arch_key_retries_after_unavailable(monkeypatch):
+def test_device_uuid_key_retries_after_unavailable(monkeypatch):
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(compiler, "_DEVICE_ARCH_KEYS", {})
+    monkeypatch.setattr(compiler, "_DEVICE_UUID_KEYS", {})
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert compiler._device_arch_key() == ("arch", "unavailable")
-    # An unavailable probe must not be memoized, or an early call would pin a
-    # bogus identity for the rest of the process.
-    assert compiler._DEVICE_ARCH_KEYS == {}
+    assert compiler._device_uuid_key() is None
+    assert compiler._DEVICE_UUID_KEYS == {}
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 1))
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "SM121")
-    assert compiler._device_arch_key() == ("arch", 12, 1, "SM121")
-    assert compiler._DEVICE_ARCH_KEYS == {0: ("arch", 12, 1, "SM121")}
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+    )
+    expected = (
+        "device_uuid",
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    assert compiler._device_uuid_key() == expected
+    assert {0: expected} == compiler._DEVICE_UUID_KEYS
 
 
-def test_device_arch_key_is_memoized_per_ordinal(monkeypatch):
-    """A second GPU must not inherit the first GPU's architecture identity.
-
-    torch resolves get_device_capability()/get_device_name() against the current
-    device when no argument is given, so a process-wide cache would freeze the
-    first device probed. Mixed rigs make this observable: two boards can share a
-    compute capability but report different device names.
-    """
+def test_device_uuid_key_is_memoized_per_ordinal(monkeypatch):
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(compiler, "_DEVICE_ARCH_KEYS", {})
+    monkeypatch.setattr(compiler, "_DEVICE_UUID_KEYS", {})
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-    boards = {0: (12, 0, "MAX-Q"), 1: (12, 0, "FULL")}
+    boards = {0: "gpu-zero", 1: "gpu-one"}
+    probes = {0: 0, 1: 0}
     current = {"index": 0}
     monkeypatch.setattr(torch.cuda, "current_device", lambda: current["index"])
+
+    def _properties(device):
+        probes[device] += 1
+        return SimpleNamespace(uuid=boards[device])
+
     monkeypatch.setattr(
         torch.cuda,
-        "get_device_capability",
-        lambda device=None: boards[current["index"] if device is None else device][:2],
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_name",
-        lambda device=None: boards[current["index"] if device is None else device][2],
+        "get_device_properties",
+        _properties,
     )
 
-    assert compiler._device_arch_key() == ("arch", 12, 0, "MAX-Q")
-    # Selecting a different board must re-probe rather than return the memoized
-    # identity of board 0.
+    assert compiler._device_uuid_key() == ("device_uuid", "gpu-zero")
     current["index"] = 1
-    assert compiler._device_arch_key() == ("arch", 12, 0, "FULL")
-    # Explicit ordinals resolve independently of whichever device is current.
-    assert compiler._device_arch_key(0) == ("arch", 12, 0, "MAX-Q")
-    assert compiler._DEVICE_ARCH_KEYS == {
-        0: ("arch", 12, 0, "MAX-Q"),
-        1: ("arch", 12, 0, "FULL"),
+    assert compiler._device_uuid_key() == ("device_uuid", "gpu-one")
+    assert compiler._device_uuid_key(0) == ("device_uuid", "gpu-zero")
+    assert compiler._DEVICE_UUID_KEYS == {
+        0: ("device_uuid", "gpu-zero"),
+        1: ("device_uuid", "gpu-one"),
     }
+    assert probes == {0: 1, 1: 1}
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: (_ for _ in ()).throw(AssertionError("cached UUID was re-probed")),
+    )
+    assert compiler._device_uuid_key(0) == ("device_uuid", "gpu-zero")
+
+
+def test_disk_payload_retries_uuid_probe_failure(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(compiler, "_DEVICE_UUID_KEYS", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        compiler,
+        "_static_compile_cache_context",
+        lambda _callable: ("package", "toolchain", (), ()),
+    )
+    attempts = {"count": 0}
+
+    def _properties(_device):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("transient CUDA probe failure")
+        return SimpleNamespace(uuid="gpu-zero")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", _properties)
+    compile_callable = object()
+
+    first = compiler._compile_disk_cache_payload(
+        compile_callable,
+        test_disk_payload_retries_uuid_probe_failure,
+        (),
+        {},
+    )
+    second = compiler._compile_disk_cache_payload(
+        compile_callable,
+        test_disk_payload_retries_uuid_probe_failure,
+        (),
+        {},
+    )
+    third = compiler._compile_disk_cache_payload(
+        compile_callable,
+        test_disk_payload_retries_uuid_probe_failure,
+        (),
+        {},
+    )
+
+    assert first[4] is None
+    assert second[4] == ("device_uuid", "gpu-zero")
+    assert third == second
+    assert attempts["count"] == 2
+
+
+def test_explicit_cache_payload_includes_device_uuid(monkeypatch):
+    compile_callable = object()
+    device_uuid = ("device_uuid", "gpu-seven")
+    compile_options = ("--opt-level=2",)
+    compile_environment = (("CUTE_DSL_ARCH", "sm_120"),)
+    monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 7)
+    monkeypatch.setattr(
+        compiler,
+        "_device_uuid_key",
+        lambda ordinal: device_uuid if ordinal == 7 else None,
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_static_compile_cache_context",
+        lambda _callable: (
+            "a" * 64,
+            (("python", "cpython", (3, 12, 0)),),
+            compile_options,
+            compile_environment,
+        ),
+    )
+    compile_spec = compiler.KernelCompileSpec.from_facts(
+        "test.uuid.cache",
+        1,
+        ("rows", 8),
+    )
+    kwargs = {"mode": "test"}
+    kwargs_json, kwargs_hash = compiler._compile_kwargs_json_key(kwargs)
+
+    payload = compiler._compile_disk_cache_payload(
+        compile_callable,
+        test_explicit_cache_payload_includes_device_uuid,
+        (),
+        kwargs,
+        compile_spec,
+    )
+
+    assert len(payload) == 11
+    assert payload[0] == "sparkinfer_cute_compile_cache_v6_explicit_spec"
+    assert payload[4] == device_uuid
+    assert payload[5:11] == (
+        compile_spec.hash_key,
+        compile_spec.json_key,
+        kwargs_hash,
+        kwargs_json,
+        compile_options,
+        compile_environment,
+    )
+
+
+def test_uuid_unavailable_disables_disk_cache(monkeypatch):
+    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "1")
+    payload = (
+        "sparkinfer_cute_compile_cache_v3",
+        ("function", "test", "kernel"),
+        "package",
+        "toolchain",
+        None,
+        (),
+        (),
+        (),
+        (),
+    )
+
+    assert not compiler._cute_compile_disk_cache_enabled_for_payload(payload)
+
+
+def test_explicit_memory_cache_hit_skips_disk_payload(monkeypatch):
+    cute = pytest.importorskip("cutlass.cute")
+    compile_callable = object()
+    compiled = object()
+    compile_spec = compiler.KernelCompileSpec.from_facts(
+        "test.uuid.hot_path",
+        1,
+        ("rows", 8),
+    )
+    monkeypatch.setattr(cute, "compile", compile_callable)
+    monkeypatch.setattr(
+        compiler,
+        "_device_uuid_key",
+        lambda _ordinal: (_ for _ in ()).throw(
+            AssertionError("memory hit probed the device UUID")
+        ),
+    )
+    monkeypatch.setattr(compiler, "_memory_cache_get", lambda key: compiled)
+    monkeypatch.setattr(
+        compiler,
+        "_compile_disk_cache_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("memory hit rebuilt the disk payload")
+        ),
+    )
+
+    assert (
+        compiler.compile(
+            test_explicit_memory_cache_hit_skips_disk_payload,
+            compile_spec=compile_spec,
+        )
+        is compiled
+    )
+
+
+def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
+    device_uuid = ("device_uuid", "gpu-contract")
+    monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 0)
+    monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: device_uuid)
+    monkeypatch.setattr(
+        compiler,
+        "_static_compile_cache_context",
+        lambda _callable: (
+            "a" * 64,
+            (("python", "cpython", (3, 12, 0)),),
+            ("--opt-level=2",),
+            (("CUTE_DSL_ARCH", "sm_120"),),
+        ),
+    )
+    compile_spec = compiler.KernelCompileSpec.from_facts(
+        "test.uuid.manifest",
+        1,
+        ("rows", 8),
+    )
+    payload = compiler._compile_disk_cache_payload(
+        object(),
+        test_v6_semantic_payload_matches_independent_validators,
+        (),
+        {"mode": "test"},
+        compile_spec,
+    )
+    serialized_payload = compiler._manifest_json_value(payload)
+    expected = compiler._semantic_compile_manifest_payload(payload)
+
+    assert (
+        ptx_capture._semantic_payload_from_cache_payload(serialized_payload) == expected
+    )
+    assert (
+        kernel_resources._semantic_payload_from_cache_payload(serialized_payload)
+        == expected
+    )

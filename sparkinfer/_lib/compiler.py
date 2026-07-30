@@ -657,6 +657,16 @@ def _cute_compile_disk_cache_enabled() -> bool:
     return raw.lower() not in {"0", "false", "no", ""}
 
 
+def _cute_compile_disk_cache_enabled_for_payload(
+    cache_payload: tuple[object, ...],
+) -> bool:
+    return (
+        _cute_compile_disk_cache_enabled()
+        and len(cache_payload) > 4
+        and cache_payload[4] is not None
+    )
+
+
 def _cute_compile_cache_dir() -> Path:
     root = os.environ.get("SPARKINFER_COMPILE_CACHE_DIR")
     if root:
@@ -1081,7 +1091,7 @@ def _compile_cache_payload_log_value(
             target_key,
             _sparkinfer_fingerprint,
             toolchain_key,
-            _device_arch,
+            _device_uuid,
             spec_hash,
             spec_json,
             kwargs_hash,
@@ -1157,7 +1167,7 @@ def _compile_cache_payload_log_value(
         target_key,
         _sparkinfer_fingerprint,
         toolchain_key,
-        _device_arch,
+        _device_uuid,
         args_key,
         kwargs_key,
         options_key,
@@ -1448,7 +1458,8 @@ def _distribution_version(name: str) -> str:
         return ""
 
 
-_DEVICE_ARCH_KEYS: dict[int, tuple[object, ...]] = {}
+_DEVICE_UUID_KEYS: dict[int, tuple[str, str]] = {}
+_DEVICE_COMPILE_CACHE_CONTEXTS: dict[tuple[Any, int], tuple[object, ...]] = {}
 
 
 def _current_device_ordinal() -> int | None:
@@ -1459,53 +1470,43 @@ def _current_device_ordinal() -> int | None:
         if not torch.cuda.is_available():
             return None
         return int(torch.cuda.current_device())
-    except Exception:
+    except Exception:  # noqa: BLE001 - cache identity probing must fail closed
         return None
 
 
-def _device_arch_key(device_ordinal: int | None = None) -> tuple[object, ...]:
-    """Architecture identity of the device this process will compile for.
+def _device_uuid_key(device_ordinal: int | None = None) -> tuple[str, str] | None:
+    """Return the physical CUDA device UUID, memoized by visible ordinal.
 
-    Memoized *per device ordinal* rather than once per process. Torch resolves
-    ``get_device_capability()`` / ``get_device_name()`` against the current
-    device when called without an argument, so a single process-wide cache
-    freezes whichever GPU happened to be current on the first call -- passing
-    ``current_device()`` explicitly is equivalent and does not change that. A
-    process that selects a different GPU afterwards would keep reusing the stale
-    identity. Keying the memo by ordinal binds every entry to the device it was
-    actually measured on, which is what makes the guarantee below hold on a
-    mixed-GPU process (e.g. Max-Q and non-Max-Q RTX PRO 6000 boards share
-    compute capability 12.0 but report different device names).
-
-    The returned key deliberately omits the ordinal: two GPUs with the same
-    capability and name yield the same key and therefore share compiled
-    artifacts, which is the desired behaviour on a homogeneous rig. Only the
-    lookup is per ordinal.
-
-    Deliberately NOT lru_cached on failure: if CUDA is not initialized yet the
-    query is retried on the next call, so an early call can never memoize a
-    bogus "unknown" and let a cubin built for one architecture be served to
-    another from the shared on-disk cache.
+    Ordinals and distributed ranks are process-local and can be remapped by
+    ``CUDA_VISIBLE_DEVICES``. The UUID is the persistent identity used by the
+    disk payload (and therefore by non-explicit memory keys). Explicit-spec
+    memory hits stay on their existing spec-only hot path. Probe failures return
+    ``None`` and are deliberately not memoized so callers can disable disk
+    reuse and retry on the next compile.
     """
+    index = None if device_ordinal is None else int(device_ordinal)
+    if index is not None:
+        cached = _DEVICE_UUID_KEYS.get(index)
+        if cached is not None:
+            return cached
     try:
         import torch
 
         if not torch.cuda.is_available():
-            return ("arch", "unavailable")
-        index = (
-            int(torch.cuda.current_device())
-            if device_ordinal is None
-            else int(device_ordinal)
-        )
-        cached = _DEVICE_ARCH_KEYS.get(index)
+            return None
+        if index is None:
+            index = int(torch.cuda.current_device())
+        cached = _DEVICE_UUID_KEYS.get(index)
         if cached is not None:
             return cached
-        major, minor = torch.cuda.get_device_capability(index)
-        name = torch.cuda.get_device_name(index)
-    except Exception:
-        return ("arch", "unavailable")
-    key = ("arch", int(major), int(minor), str(name))
-    _DEVICE_ARCH_KEYS[index] = key
+        raw_uuid = getattr(torch.cuda.get_device_properties(index), "uuid", None)
+        device_uuid = "" if raw_uuid is None else str(raw_uuid).strip()
+        if not device_uuid:
+            return None
+    except Exception:  # noqa: BLE001 - cache identity probing must fail closed
+        return None
+    key = ("device_uuid", device_uuid)
+    _DEVICE_UUID_KEYS[index] = key
     return key
 
 
@@ -1600,20 +1601,43 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
 
 
 @lru_cache(maxsize=16)
-def _static_compile_cache_context(
-    compile_callable: Any, device_ordinal: int | None = None
-) -> tuple[object, ...]:
-    # device_ordinal participates in the lru_cache key on purpose: without it
-    # this cache would pin the architecture identity to whichever GPU was
-    # current the first time a given compile_callable was seen, re-introducing
-    # the staleness that keying _device_arch_key per ordinal removes.
+def _static_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
     return (
         _sparkinfer_package_fingerprint(),
         _runtime_toolchain_key(),
-        _device_arch_key(device_ordinal),
         _compile_options_cache_key(compile_callable),
         _compile_environment_key(),
     )
+
+
+def _device_compile_cache_context(compile_callable: Any) -> tuple[object, ...]:
+    """Return the full static context, caching only successful UUID probes."""
+    device_ordinal = _current_device_ordinal()
+    context_key = (
+        None if device_ordinal is None else (compile_callable, int(device_ordinal))
+    )
+    if context_key is not None:
+        cached = _DEVICE_COMPILE_CACHE_CONTEXTS.get(context_key)
+        if cached is not None:
+            return cached
+
+    (
+        package_fingerprint,
+        runtime_toolchain,
+        compile_options,
+        compile_environment,
+    ) = _static_compile_cache_context(compile_callable)
+    device_uuid = _device_uuid_key(device_ordinal)
+    context = (
+        package_fingerprint,
+        runtime_toolchain,
+        device_uuid,
+        compile_options,
+        compile_environment,
+    )
+    if context_key is not None and device_uuid is not None:
+        _DEVICE_COMPILE_CACHE_CONTEXTS[context_key] = context
+    return context
 
 
 def _function_fingerprint(func: Any) -> tuple[str, str, str]:
@@ -1922,10 +1946,10 @@ def _compile_disk_cache_payload(
     (
         package_fingerprint,
         runtime_toolchain,
-        device_arch,
+        device_uuid,
         compile_options,
         compile_environment,
-    ) = _static_compile_cache_context(compile_callable, _current_device_ordinal())
+    ) = _device_compile_cache_context(compile_callable)
     if compile_spec is not None:
         kwargs_json_key, kwargs_hash_key = _compile_kwargs_json_key(kwargs)
         return (
@@ -1933,7 +1957,7 @@ def _compile_disk_cache_payload(
             _explicit_spec_compile_target(func),
             package_fingerprint,
             runtime_toolchain,
-            device_arch,
+            device_uuid,
             compile_spec.hash_key,
             compile_spec.json_key,
             kwargs_hash_key,
@@ -1946,7 +1970,7 @@ def _compile_disk_cache_payload(
         _normalize_compile_target(func, set()),
         package_fingerprint,
         runtime_toolchain,
-        device_arch,
+        device_uuid,
         _structural_cache_key(args),
         _structural_cache_key(kwargs),
         compile_options,
@@ -2083,11 +2107,10 @@ def _semantic_compile_manifest_payload(
     semantic: dict[str, Any] = {
         "cache_format": cache_format,
         "target": _semantic_target_key(cache_payload[1]),
-        # device_arch is cache_payload index 4 in both the v6_explicit_spec and
-        # v3 formats. Include it in the semantic identity so two payloads that
-        # differ only by GPU architecture hash to distinct semantic keys and the
-        # device-aware cache format cannot be aliased across architectures.
-        "device_arch": _manifest_json_value(cache_payload[4]),
+        # device_uuid is cache_payload index 4 in both the v6_explicit_spec and
+        # v3 formats. The persistent identity intentionally isolates artifacts
+        # by physical GPU rather than by process-local ordinal or rank.
+        "device_uuid": _manifest_json_value(cache_payload[4]),
     }
     if cache_format == "sparkinfer_cute_compile_cache_v6_explicit_spec":
         semantic["compile_spec_hash"] = cache_payload[5]
@@ -2483,7 +2506,9 @@ def _load_cute_compile_from_disk(cache_key: str):
         # CUTLASS may finalize or patch the ELF while loading it.  The cache
         # object is content-addressed and its digest is recorded in the compile
         # manifest, so never expose that canonical object to the loader.
-        with tempfile.TemporaryDirectory(prefix="sparkinfer-cute-cache-load-") as raw_stage:
+        with tempfile.TemporaryDirectory(
+            prefix="sparkinfer-cute-cache-load-"
+        ) as raw_stage:
             staged_object = Path(raw_stage) / object_path.name
             shutil.copy2(object_path, staged_object)
             module = ExternalBinaryModule(str(staged_object))
@@ -2551,6 +2576,8 @@ def clear_compile_cache() -> None:
     global _COMPILE_PROGRESS_TOTAL_SECONDS
     _compile_environment_key.cache_clear()
     _static_compile_cache_context.cache_clear()
+    _DEVICE_UUID_KEYS.clear()
+    _DEVICE_COMPILE_CACHE_CONTEXTS.clear()
     with _MEMORY_CACHE_LOCK:
         _MEMORY_CACHE.clear()
         _MEMORY_CACHE_HITS = 0
@@ -2627,8 +2654,9 @@ def compile(
         compile_callable, func, args, kwargs, compile_spec
     )
     cache_key = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
-    if _cute_compile_disk_cache_enabled():
+    if disk_cache_enabled:
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
             with suppress(Exception):
@@ -2722,7 +2750,11 @@ def compile(
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
     else:
-        cache_status = "disk-cache-disabled"
+        cache_status = (
+            "disk-cache-device-uuid-unavailable"
+            if _cute_compile_disk_cache_enabled()
+            else "disk-cache-disabled"
+        )
 
     if _cute_compile_log_enabled() or post_engine_start_log:
         with suppress(Exception):
@@ -2756,7 +2788,7 @@ def compile(
         compile_spec=compile_spec,
         cache_key=cache_key,
     )
-    if _cute_compile_disk_cache_enabled():
+    if disk_cache_enabled:
         with suppress(Exception):
             _store_cute_compile_to_disk(
                 cache_key,

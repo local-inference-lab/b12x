@@ -772,6 +772,7 @@ def _semantic_payload_from_cache_payload(cache_payload: list[Any]) -> dict[str, 
     semantic: dict[str, Any] = {
         "cache_format": cache_payload[0],
         "target": _semantic_target_key(cache_payload[1]),
+        "device_uuid": _manifest_json_value(cache_payload[4]),
         "compile_spec_hash": cache_payload[5],
     }
     semantic["compile_spec"] = _load_json_document(
