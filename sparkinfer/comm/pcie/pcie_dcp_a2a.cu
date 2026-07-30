@@ -370,6 +370,7 @@ public:
   int64_t lse_offset_;
   int64_t lse_capacity_;
 
+
   PCIeDCPA2A(Signal **signals,
              const std::vector<std::array<void *, 2>> &staging,
              int64_t output_capacity_elems, int64_t lse_offset,

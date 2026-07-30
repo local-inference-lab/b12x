@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "two_slot_selector.h"
+
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
     cudaError_t e = cmd;                                                \
@@ -566,7 +568,7 @@ class PCIeAllreduce {
   std::map<IPC_KEY, char*> ipc_handles_;
 
   bool dbuf_enabled_ = false;
-  int dbuf_slot_ = 0;
+  sparkinfer::pcie::TwoSlotSelector dbuf_slot_selector_;
   void* dbuf_raw_[2][kMaxRanks] = {};
   RankData* dbuf_rd_[2] = {};
 
@@ -626,7 +628,7 @@ class PCIeAllreduce {
     buffers_[ptrs0[rank_]] = dbuf_rd_[0];
     buffers_[ptrs1[rank_]] = dbuf_rd_[1];
     dbuf_enabled_ = true;
-    dbuf_slot_ = 0;
+    dbuf_slot_selector_ = sparkinfer::pcie::TwoSlotSelector{};
   }
 
   void register_buffer(void** ptrs) {
@@ -686,8 +688,7 @@ class PCIeAllreduce {
     if (dbuf_enabled_) {
       // The kernel stages the input into the eager slot itself; no host
       // staging memcpy is issued.
-      int slot = dbuf_slot_ % 2;
-      dbuf_slot_++;
+      const int slot = dbuf_slot_selector_.take();
       ptrs = dbuf_rd_[slot];
       staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
     } else if (status == cudaStreamCaptureStatusActive) {
@@ -764,8 +765,7 @@ class PCIeAllreduce {
     if (dbuf_enabled_) {
       // The kernel stages the input into the eager slot itself; no host
       // staging memcpy is issued.
-      int slot = dbuf_slot_ % 2;
-      dbuf_slot_++;
+      const int slot = dbuf_slot_selector_.take();
       ptrs = dbuf_rd_[slot];
       staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
     } else if (status == cudaStreamCaptureStatusActive) {
