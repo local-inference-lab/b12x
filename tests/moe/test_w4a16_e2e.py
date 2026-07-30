@@ -46,6 +46,35 @@ from tests._reference.helpers import (
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
+def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    monkeypatch.setattr(w4a16_kernel, "_FUSED_CACHE", {})
+    monkeypatch.setattr(w4a16_kernel.torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="W4A16 fused MoE launch is not resolved for CUDA graph capture",
+    ):
+        compile_w4a16_fused_moe(
+            size_m=16,
+            hidden_size=128,
+            intermediate_size=128,
+            num_experts=8,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=16,
+            sms=188,
+            max_shared_mem=_DEFAULT_MAX_SHARED_MEM,
+            _require_cached=True,
+        )
+
+
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 0.25 + 0.03125).to(torch.float8_e4m3fn)
 
