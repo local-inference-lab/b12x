@@ -557,7 +557,16 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     assert plan.layout.core_token_counts[0] == 3072
     assert 4096 not in plan.layout.core_token_counts
     assert plan.layout.route_workspace_nbytes == 0
-    assert 1000 * (1 << 20) < plan.layout.core_workspace_nbytes < 1060 * (1 << 20)
+    # This GLM-5.2 Trellis geometry currently needs 1054.16 MiB. Keep a small
+    # alignment margin while rejecting the much larger generic 4096-token
+    # bucket that this fixed-capacity path exists to avoid.
+    min_fixed_capacity_bytes = 1000 * (1 << 20)
+    max_fixed_capacity_bytes = 1060 * (1 << 20)
+    assert (
+        min_fixed_capacity_bytes
+        < plan.layout.core_workspace_nbytes
+        < max_fixed_capacity_bytes
+    )
     assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
 
 
