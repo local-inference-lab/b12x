@@ -6497,7 +6497,7 @@ def _prewarm_w4a16_planned_launches(
     collect_activation_amax = bool(collect_activation_amax)
 
     from sparkinfer.moe._shared.kernels.w4a16.host import (
-        max_packed_route_slots,
+        route_pack_capacity,
         select_route_block_size_m,
     )
     from sparkinfer.moe._shared.kernels.w4a16.kernel import (
@@ -6543,12 +6543,12 @@ def _prewarm_w4a16_planned_launches(
                 token_count, workspace.num_topk, workspace.route_E
             )
             routed_rows = int(token_count) * int(workspace.num_topk)
-            route_slots = max_packed_route_slots(
+            _, _, max_m_blocks = route_pack_capacity(
                 routed_rows,
                 block_size_m,
                 workspace.route_E,
+                topk=workspace.num_topk,
             )
-            max_m_blocks = (route_slots + block_size_m - 1) // block_size_m
             t_shape = time.perf_counter() if _SPARKINFER_TIMING else 0.0
             fused_key = (
                 weight_layout,

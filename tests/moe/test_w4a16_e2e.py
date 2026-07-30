@@ -19,10 +19,15 @@ from sparkinfer.moe._shared.kernels.reference import (
     moe_reference_w4a16_f32,
     moe_reference_w4a16_fp4_e8m0_k32,
 )
-from sparkinfer.moe._shared.kernels.w4a16.host import max_packed_route_slots, select_route_block_size_m
+from sparkinfer.moe._shared.kernels.w4a16.host import (
+    max_packed_route_slots,
+    route_pack_capacity,
+    select_route_block_size_m,
+)
 from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     MoEMicroKernelW4A16SmallMDirect,
+    _w4a16_stream_is_capturing,
     _small_m_direct_supported,
     compile_w4a16_fused_moe,
     compile_w4a16_topk_sum,
@@ -66,6 +71,159 @@ def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
             max_shared_mem=_DEFAULT_MAX_SHARED_MEM,
             _require_cached=True,
         )
+
+
+def test_w4a16_capture_guard_checks_selected_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    selected_stream = 22
+    queried: list[object] = []
+    monkeypatch.setattr(
+        w4a16_kernel.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        w4a16_kernel.cuda,
+        "cuStreamIsCapturing",
+        lambda stream: (
+            queried.append(stream) or w4a16_kernel.cuda.CUresult.CUDA_SUCCESS,
+            1,
+        ),
+    )
+
+    assert _w4a16_stream_is_capturing(selected_stream, current_stream=11)
+    assert queried == [selected_stream]
+
+
+def test_w4a16_capture_guard_preserves_current_stream_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    monkeypatch.setattr(
+        w4a16_kernel.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        w4a16_kernel.cuda,
+        "cuStreamIsCapturing",
+        lambda _stream: (_ for _ in ()).throw(
+            AssertionError("current-stream capture queried the selected stream")
+        ),
+    )
+
+    assert _w4a16_stream_is_capturing(22, current_stream=11)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "bucket_tokens"),
+    (
+        (1, 1),
+        (8, 8),
+        (9, 16),
+        (3072, 4096),
+        (4096, 4096),
+        (4097, 8192),
+    ),
+)
+def test_w4a16_planner_runtime_route_key_agrees_at_bucket_boundaries(
+    tokens: int,
+    bucket_tokens: int,
+) -> None:
+    topk = 8
+    block_size = 64
+    num_experts = 160
+    routed_capacity, packed_routes, max_m_blocks = route_pack_capacity(
+        tokens * topk,
+        block_size,
+        num_experts,
+        topk=topk,
+    )
+    expected_routes = bucket_tokens * topk
+    expected_packed = max_packed_route_slots(
+        expected_routes,
+        block_size,
+        num_experts,
+    )
+
+    assert routed_capacity == expected_routes
+    assert packed_routes == expected_packed
+    assert max_m_blocks == (expected_packed + block_size - 1) // block_size
+    if tokens == 3072:
+        assert max_m_blocks == 670
+
+
+def test_w4a16_capture_prewarm_uses_runtime_bucket_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from sparkinfer.moe.fused_moe import _impl as tp_moe_impl
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    workspace = SimpleNamespace(
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        full_rotation=False,
+        route_block_size_m=64,
+        num_topk=8,
+        route_E=160,
+        weight_E=160,
+        k=6144,
+        n=2048,
+        activation="silu",
+        trellis_bits=3,
+        trellis_tile_config=None,
+    )
+    fused_calls: list[dict[str, object]] = []
+    resolved_fused = object()
+    monkeypatch.setattr(tp_moe_impl.torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(
+        tp_moe_impl.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        tp_moe_impl.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            multi_processor_count=188,
+            shared_memory_per_block_optin=_DEFAULT_MAX_SHARED_MEM,
+        ),
+    )
+    monkeypatch.setattr(w4a16_kernel, "_rot_scales_dummy", lambda _device: None)
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "compile_w4a16_fused_moe",
+        lambda **kwargs: fused_calls.append(kwargs) or resolved_fused,
+    )
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "compile_w4a16_topk_sum",
+        lambda **_kwargs: object(),
+    )
+
+    tp_moe_impl._prewarm_w4a16_planned_launches(
+        workspace,
+        token_counts=(3072,),
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=1.0,
+        swiglu_beta=1.0,
+        collect_activation_amax=True,
+    )
+
+    assert len(fused_calls) == 1
+    assert fused_calls[0]["size_m"] == 3072
+    assert fused_calls[0]["max_m_blocks"] == 670
+    assert workspace.planned_fused_moe_launches[
+        ("packed", "e4m3_k16", 3072, True)
+    ] is resolved_fused
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:

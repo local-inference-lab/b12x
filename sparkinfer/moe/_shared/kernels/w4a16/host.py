@@ -240,6 +240,27 @@ def route_pack_token_capacity(tokens: int, topk: int) -> int:
     return 1 << (max(int(tokens), 1) - 1).bit_length()
 
 
+def route_pack_capacity(
+    numel: int,
+    block_size: int,
+    num_experts: int,
+    *,
+    topk: int = 1,
+    bucket_tokens: bool = True,
+) -> tuple[int, int, int]:
+    """Return the canonical routed-row, packed-slot, and block capacities."""
+    numel_capacity = (
+        route_pack_numel_capacity(numel, topk=topk)
+        if bucket_tokens
+        else max(int(numel), 1)
+    )
+    packed_routes = max_packed_route_slots(
+        numel_capacity, int(block_size), int(num_experts)
+    )
+    route_blocks = (packed_routes + int(block_size) - 1) // int(block_size)
+    return max(numel_capacity, 1), max(packed_routes, 1), max(route_blocks, 1)
+
+
 def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, int]:
     route_slots = 0
     route_blocks = 0
@@ -424,6 +445,7 @@ __all__ = [
     "plan_w4a16_buffers",
     "reorder_w13_to_gate_up",
     "route_pack_numel_capacity",
+    "route_pack_capacity",
     "route_pack_token_capacity",
     "select_route_block_size_m",
     "unswizzle_block_scale",
