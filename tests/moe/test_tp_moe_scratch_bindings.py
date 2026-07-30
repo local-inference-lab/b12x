@@ -525,6 +525,105 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
 
 
+def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trellis must not pay the generic W4A16 compile-bucket memory cost."""
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=512,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=3072,
+            core_token_counts=(3072,),
+            num_topk=8,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=64,
+        )
+    )
+
+    assert plan.layout.core_token_counts[0] == 3072
+    assert 4096 not in plan.layout.core_token_counts
+    assert plan.layout.route_workspace_nbytes == 0
+    assert plan.layout.core_workspace_nbytes < 1060 * (1 << 20)
+    assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
+
+
+def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fused_launches = tuple((tokens, object()) for tokens in range(1, 5))
+    sums = tuple(
+        (ids_dtype, mapped, object())
+        for ids_dtype in (torch.int32, torch.int64)
+        for mapped in (False, True)
+    )
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: (fused_launches, sums),
+    )
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+        )
+    )
+    tensors = _runtime_tensors(n=128)
+    captured = {}
+
+    def _capture_binding(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_build_tp_moe_fp4_binding_from_views",
+        _capture_binding,
+    )
+    output_expert_map = torch.arange(8, dtype=torch.int32)
+    plan.bind(
+        scratch=_scratch_for_plan(plan),
+        **_binding_args(tensors, _experts(tensors, weight_plan)),
+        output_expert_map=output_expert_map,
+    )
+
+    assert plan._prewarmed_fused_launches == fused_launches
+    assert plan._prewarmed_topk_sum_launches == sums
+    assert captured["fused_launch"] is None
+    assert captured["topk_sum_launch"] is None
+
+
 def test_w4a16_topk6_bucket_binds_with_planned_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

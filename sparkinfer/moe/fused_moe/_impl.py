@@ -858,6 +858,14 @@ class TPMoEScratchPlan:
     launch_plan: TPMoEPlan
     _core_workspace_plan: _TPCoreWorkspacePlan
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    _prewarmed_fused_launches: tuple[tuple[int, object], ...] = field(
+        default=(), repr=False
+    )
+    _prewarmed_topk_sum_launches: tuple[
+        tuple[torch.dtype, bool, object], ...
+    ] = field(
+        default=(), repr=False
+    )
 
     @property
     def full_rotation(self) -> bool:
@@ -946,6 +954,8 @@ class TPMoEScratchPlan:
             layer_idx=layer_idx,
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
+            fused_launch=None,
+            topk_sum_launch=None,
         )
 
 
@@ -1882,11 +1892,12 @@ def _arena_core_token_counts(
     num_topk: int,
     core_token_counts: tuple[int, ...] | None,
     quant_mode: str,
+    bucket_w4a16_tokens: bool = True,
 ) -> tuple[int, ...]:
     max_tokens = max(int(max_tokens), 1)
     num_topk = max(int(num_topk), 1)
     quant_mode = _normalize_quant_mode(quant_mode)
-    if quant_mode == "w4a16":
+    if quant_mode == "w4a16" and bucket_w4a16_tokens:
         from sparkinfer.moe._shared.kernels.w4a16.host import (
             route_pack_token_capacity,
         )
@@ -1898,7 +1909,7 @@ def _arena_core_token_counts(
         normalized = tuple(
             max(int(token_count), 1) for token_count in core_token_counts
         )
-        if quant_mode == "w4a16":
+        if quant_mode == "w4a16" and bucket_w4a16_tokens:
             normalized = tuple(
                 route_pack_token_capacity(token_count, num_topk)
                 for token_count in normalized
@@ -1910,7 +1921,7 @@ def _arena_core_token_counts(
     max_micro_tokens = micro_cutover_pairs // num_topk
     if max_micro_tokens >= 1:
         micro_boundary_tokens = min(max_tokens, max_micro_tokens)
-        if quant_mode == "w4a16":
+        if quant_mode == "w4a16" and bucket_w4a16_tokens:
             micro_boundary_tokens = route_pack_token_capacity(
                 micro_boundary_tokens,
                 num_topk,
@@ -2194,6 +2205,8 @@ def _build_tp_moe_fp4_binding_from_views(
     layer_idx: int | None = None,
     route_expert_map: torch.Tensor | None = None,
     output_expert_map: torch.Tensor | None = None,
+    fused_launch: object | None = None,
+    topk_sum_launch: object | None = None,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, SPARKINFERFP4ExpertWeights):
         raise TypeError("experts must come from prepare_sparkinfer_fp4_moe_weights")
@@ -2385,6 +2398,8 @@ def _build_tp_moe_fp4_binding_from_views(
             route_block_size_m=plan.route_block_size_m,
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
         )
 
     if plan.implementation == "micro":
@@ -6070,6 +6085,12 @@ def plan_tp_moe_arena_layout(
         num_topk=num_topk,
         core_token_counts=core_token_counts,
         quant_mode=quant_mode,
+        # Trellis plans one fixed caller-owned capacity and its route-pack
+        # wrapper already falls back to that exact capacity when the supplied
+        # buffers are smaller than the generic compile bucket. Rounding a
+        # 3072-token EXL3 plan to 4096 therefore reserves roughly 320 MiB of
+        # unreachable activation scratch without reducing launch variants.
+        bucket_w4a16_tokens=source_format != "exl3_trellis_mcg",
     )
     route_num_experts = int(
         route_num_experts if route_num_experts is not None else weight_E
@@ -6135,6 +6156,199 @@ def plan_tp_moe_arena_layout(
         total_nbytes=max(route_nbytes + core_nbytes, 1),
         core_token_counts=core_token_counts,
     )
+
+
+def _plan_full_rotation_w4a16_launches(
+    *,
+    caps: TPMoEScratchCaps,
+    core_plan: _TPCoreWorkspacePlan,
+    capacity_tokens: int,
+) -> tuple[
+    tuple[tuple[int, object], ...],
+    tuple[tuple[torch.dtype, bool, object], ...],
+]:
+    """Compile the fixed Trellis launches before serving memory profiling.
+
+    The caller-owned scratch path cannot use the mutable workspace prewarm
+    dictionaries.  Keeping the launch objects on the immutable scratch plan
+    preserves the old Trellis API contract and prevents first-use compilation
+    from being charged as peak activation memory by vLLM.
+    """
+    if not core_plan.full_rotation:
+        return (), ()
+    if caps.quant_mode != "w4a16":
+        raise RuntimeError("full-rotation TP MoE requires W4A16 execution")
+    if core_plan.device.type != "cuda":
+        return (), ()
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA must be available before planning Trellis MoE")
+
+    from sparkinfer.moe._shared.kernels.w4a16.host import (
+        max_packed_route_slots,
+        select_route_block_size_m,
+    )
+    from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        _DEFAULT_MAX_SHARED_MEM,
+        compile_w4a16_fused_moe,
+        compile_w4a16_topk_sum,
+        pack_topk_routes_by_expert,
+    )
+
+    capacity_tokens = max(int(capacity_tokens), 1)
+    block_size_m = core_plan.route_block_size_m or select_route_block_size_m(
+        capacity_tokens,
+        core_plan.num_topk,
+        core_plan.route_E,
+    )
+    capacity_route_slots = max_packed_route_slots(
+        capacity_tokens * core_plan.num_topk,
+        block_size_m,
+        core_plan.route_E,
+    )
+    capacity_m_blocks = (
+        capacity_route_slots + block_size_m - 1
+    ) // block_size_m
+    rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
+
+    with torch.cuda.device(core_plan.device):
+        props = torch.cuda.get_device_properties(core_plan.device)
+        sms = int(props.multi_processor_count)
+        max_shared_mem = int(
+            getattr(
+                props,
+                "shared_memory_per_block_optin",
+                _DEFAULT_MAX_SHARED_MEM,
+            )
+        )
+        # Decode plans are deliberately exact-M: the unified API's measured
+        # speedup over the retired Trellis wrapper comes from specializing the
+        # small live shapes instead of always launching its M=32 capacity
+        # kernel.  Large prefill plans retain one capacity launch.
+        fused_token_counts = (
+            tuple(range(1, capacity_tokens + 1))
+            if capacity_tokens <= 32
+            else (capacity_tokens,)
+        )
+
+        def compile_fused(token_count: int) -> object:
+            return compile_w4a16_fused_moe(
+                size_m=token_count,
+                hidden_size=core_plan.k,
+                intermediate_size=core_plan.n,
+                num_experts=core_plan.weight_E,
+                top_k=core_plan.num_topk,
+                activation=core_plan.activation,
+                apply_router_weight_on_input=caps.apply_router_weight_on_input,
+                zero_fc2_output=False,
+                moe_block_size=block_size_m,
+                # Match the lazy unified path: specialize the live M while
+                # retaining the caller-owned route arena's full grid capacity.
+                max_m_blocks=capacity_m_blocks,
+                element_dtype="fp16",
+                fast_math=caps.w4a16_fast_math,
+                sms=sms,
+                max_shared_mem=max_shared_mem,
+                swiglu_limit=core_plan.swiglu_limit,
+                swiglu_alpha=core_plan.swiglu_alpha,
+                swiglu_beta=core_plan.swiglu_beta,
+                weight_layout="trellis3_t256",
+                scale_format="e4m3_k32",
+                w13_layout="trellis3_t256_proj",
+                trellis_bits=core_plan.trellis_bits,
+                force_tile_config=core_plan.trellis_tile_config,
+                intermediate_rotation=True,
+                full_rotation=True,
+                rotation_input_dtype=rotation_input_dtype,
+            )
+
+        fused_launches = tuple(
+            (token_count, compile_fused(token_count))
+            for token_count in fused_token_counts
+        )
+        topk_sum_launches = tuple(
+            (
+                ids_dtype,
+                mapped,
+                compile_w4a16_topk_sum(
+                    m=capacity_tokens,
+                    topk=core_plan.num_topk,
+                    hidden_size=core_plan.k,
+                    element_dtype="fp16",
+                    full_rotation=True,
+                    num_experts=core_plan.weight_E,
+                    route_num_experts=(core_plan.route_E if mapped else 0),
+                    route_ids_dtype=ids_dtype,
+                    use_expert_map=mapped,
+                ),
+            )
+            for ids_dtype in (torch.int32, torch.int64)
+            for mapped in (False, True)
+        )
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Trellis route-pack prewarm cannot run during capture")
+        for mapped in (False, True):
+            route_pack_key = (
+                core_plan.device.type,
+                int(torch.cuda.current_device()),
+                capacity_tokens * core_plan.num_topk,
+                int(block_size_m),
+                int(core_plan.route_E),
+                mapped,
+            )
+            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                continue
+            dummy_topk_ids = torch.zeros(
+                capacity_tokens,
+                core_plan.num_topk,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            packed_route_indices = torch.empty(
+                capacity_route_slots,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            block_expert_ids = torch.empty(
+                capacity_m_blocks,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            packed_route_count = torch.empty(
+                1,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            expert_offsets = torch.empty(
+                core_plan.route_E + 1,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            expert_counts = torch.empty(
+                core_plan.route_E,
+                dtype=torch.int32,
+                device=core_plan.device,
+            )
+            expert_map = None
+            if mapped:
+                expert_map = torch.arange(
+                    core_plan.route_E,
+                    dtype=torch.int32,
+                    device=core_plan.device,
+                )
+            pack_topk_routes_by_expert(
+                dummy_topk_ids,
+                block_size_m,
+                core_plan.route_E,
+                expert_map=expert_map,
+                packed_route_indices=packed_route_indices,
+                block_expert_ids=block_expert_ids,
+                packed_route_count=packed_route_count,
+                expert_offsets=expert_offsets,
+                expert_counts=expert_counts,
+            )
+            torch.cuda.current_stream(core_plan.device).synchronize()
+            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
+    return fused_launches, topk_sum_launches
 
 
 def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
@@ -6203,6 +6417,11 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
     )
+    fused_launches, topk_sum_launches = _plan_full_rotation_w4a16_launches(
+        caps=caps,
+        core_plan=core_workspace_plan,
+        capacity_tokens=capacity_tokens,
+    )
     return TPMoEScratchPlan(
         caps=caps,
         layout=layout,
@@ -6215,6 +6434,12 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
                 device=torch.device(caps.device),
             ),
         ),
+        # Keep strong references to the launches primed in the module caches,
+        # but leave the runtime binding unresolved.  ``run_w4a16_moe`` uses a
+        # None launch as a dispatch signal and then gets these exact objects
+        # from its compile cache without doing first-use JIT work.
+        _prewarmed_fused_launches=fused_launches,
+        _prewarmed_topk_sum_launches=topk_sum_launches,
     )
 
 
