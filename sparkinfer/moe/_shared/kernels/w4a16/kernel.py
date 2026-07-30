@@ -7480,6 +7480,7 @@ def compile_w4a16_fused_moe(
     full_rotation: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    _require_cached: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
@@ -7866,6 +7867,13 @@ def compile_w4a16_fused_moe(
             num_experts=num_experts,
             max_m_blocks=max_m_blocks,
             blocks_per_sm=kernel.blocks_per_sm,
+        )
+    if _require_cached:
+        raise RuntimeError(
+            "W4A16 fused MoE launch is not resolved for CUDA graph capture "
+            f"(m={size_m}, moe_block_size={moe_block_size}, "
+            f"max_m_blocks={max_m_blocks}); run an eager warmup at this token "
+            "count before capturing"
         )
 
     if (not collect_activation_amax) and _small_m_direct_supported(
@@ -10744,6 +10752,7 @@ def run_w4a16_moe(
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
             rotation_input_dtype=rotation_input_dtype,
+            _require_cached=torch.cuda.is_current_stream_capturing(),
         )
     else:
         if int(fused_launch.size_m) < m:
