@@ -32,9 +32,9 @@ from sparkinfer.moe._shared.kernels.activations import (
     moe_activation_w1_rows,
 )
 from sparkinfer.moe._shared.kernels.w4a16.host import (
-    _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
+    route_block_sizes_for_capacity,
     route_pack_token_capacity,
 )
 
@@ -379,7 +379,12 @@ def plan_ep_moe_scratch(caps: EPMoEScratchCaps) -> EPMoEScratchPlan:
     route_blocks = 1
     fc1_tmp = 1
     fc2_tmp = 1
-    for block_size in _W4A16_ALLOWED_ROUTED_SIZES:
+    block_sizes = route_block_sizes_for_capacity(
+        caps.max_tokens,
+        caps.num_topk,
+        caps.global_num_experts,
+    )
+    for block_size in block_sizes:
         slots = max_packed_route_slots(
             route_capacity_rows,
             int(block_size),
