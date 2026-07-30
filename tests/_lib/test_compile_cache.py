@@ -274,7 +274,7 @@ def test_uuid_unavailable_disables_disk_cache(monkeypatch):
     assert not compiler._cute_compile_disk_cache_enabled_for_payload(payload)
 
 
-def test_explicit_memory_cache_hit_skips_disk_payload(monkeypatch):
+def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
     cute = pytest.importorskip("cutlass.cute")
     compile_callable = object()
     compiled = object()
@@ -299,14 +299,55 @@ def test_explicit_memory_cache_hit_skips_disk_payload(monkeypatch):
             AssertionError("memory hit rebuilt the disk payload")
         ),
     )
+    runtime_control = importlib.import_module("sparkinfer._lib.runtime_control")
 
-    assert (
-        compiler.compile(
-            test_explicit_memory_cache_hit_skips_disk_payload,
-            compile_spec=compile_spec,
+    runtime_control.freeze_kernel_resolution("cached compile remains launchable")
+    try:
+        assert (
+            compiler.compile(
+                test_explicit_memory_cache_hit_skips_freeze_and_disk_payload,
+                compile_spec=compile_spec,
+            )
+            is compiled
         )
-        is compiled
+    finally:
+        runtime_control.unfreeze_kernel_resolution()
+
+
+def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
+    cute = pytest.importorskip("cutlass.cute")
+    runtime_control = importlib.import_module("sparkinfer._lib.runtime_control")
+    compile_spec = compiler.KernelCompileSpec.from_facts(
+        "test.freeze.disk_hit",
+        1,
+        ("rows", 8),
     )
+    monkeypatch.setattr(cute, "compile", object())
+    monkeypatch.setattr(compiler, "_memory_cache_get", lambda _key: None)
+    monkeypatch.setattr(
+        compiler,
+        "_compile_disk_cache_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("frozen miss built a persistent-cache payload")
+        ),
+    )
+    monkeypatch.setattr(
+        compiler,
+        "_load_cute_compile_from_disk",
+        lambda _key: (_ for _ in ()).throw(
+            AssertionError("frozen miss loaded a persistent module")
+        ),
+    )
+
+    runtime_control.freeze_kernel_resolution("disk hits must not bypass freeze")
+    try:
+        with pytest.raises(runtime_control.KernelResolutionFrozenError):
+            compiler.compile(
+                test_frozen_memory_miss_rejects_before_disk_cache_load,
+                compile_spec=compile_spec,
+            )
+    finally:
+        runtime_control.unfreeze_kernel_resolution()
 
 
 def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
