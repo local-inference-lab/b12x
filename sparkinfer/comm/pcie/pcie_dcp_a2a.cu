@@ -343,7 +343,16 @@ public:
   int64_t output_capacity_elems_;
   int64_t lse_offset_;
   int64_t lse_capacity_;
-  int slot_ = 0;
+  uint32_t next_slot_ = 0;
+
+  int take_slot() {
+    // Host-side selection executes once during CUDA graph capture. Graph
+    // replay intentionally reuses that capture-stable address; eager calls
+    // toggle slabs without an overflowing counter.
+    const int slot = static_cast<int>(next_slot_);
+    next_slot_ ^= uint32_t{1};
+    return slot;
+  }
 
   PCIeDCPA2A(Signal **signals,
              const std::vector<std::array<void *, 2>> &staging,
@@ -396,7 +405,7 @@ public:
 
     // Staging happens inside the kernel (warp-per-row, before the start
     // barrier); no host staging memcpys are issued.
-    const int slot = slot_++ % 2;
+    const int slot = take_slot();
     const int heads_per_rank = total_heads / world_size_;
     const int rows = batch * heads_per_rank;
     const int warps_per_block = threads / 32;
@@ -457,7 +466,7 @@ public:
 
     // Staging happens inside the kernel (warp-per-row, before the start
     // barrier); no host staging memcpy is issued.
-    const int slot = slot_++ % 2;
+    const int slot = take_slot();
     const int rows = batch * total_heads;
     const int warps_per_block = threads / 32;
     const int blocks = std::max(
