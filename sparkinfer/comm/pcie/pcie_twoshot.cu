@@ -36,6 +36,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "two_slot_selector.h"
+
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
     cudaError_t e = cmd;                                                \
@@ -261,7 +263,9 @@ class PCIeTwoShot {
   int64_t scale_offset_;  // bytes
   int64_t scale_stride_;  // floats per src region
   int64_t max_shard_packs_;
-  int slot_ = 0;
+  sparkinfer::pcie::TwoSlotSelector slot_selector_;
+
+  int take_slot() { return slot_selector_.take(); }
 
   PCIeTwoShot(Signal** signals, const std::vector<std::array<void*, 2>>& staging,
               int64_t pack_stride, int64_t scale_offset, int64_t scale_stride, int rank,
@@ -312,8 +316,7 @@ class PCIeTwoShot {
       throw std::runtime_error("num_rows must be divisible by world size");
     const int64_t rows_per_rank = num_rows / world_size_;
     check_shard(rows_per_rank, row_elems);
-    const int s = slot_ % 2;
-    slot_++;
+    const int s = take_slot();
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
@@ -329,8 +332,7 @@ class PCIeTwoShot {
   void all_gather(cudaStream_t stream, const void* payload, const void* scale, void* out,
                   int64_t rows_per_rank, int64_t row_elems, int threads, int block_limit) {
     check_shard(rows_per_rank, row_elems);
-    const int s = slot_ % 2;
-    slot_++;
+    const int s = take_slot();
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));

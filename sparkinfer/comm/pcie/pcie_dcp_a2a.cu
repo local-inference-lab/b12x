@@ -26,6 +26,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "two_slot_selector.h"
+
 #define CHECK_CUDA_SUCCESS(cmd)                                                \
   do {                                                                         \
     cudaError_t e = cmd;                                                       \
@@ -343,15 +345,13 @@ public:
   int64_t output_capacity_elems_;
   int64_t lse_offset_;
   int64_t lse_capacity_;
-  uint32_t next_slot_ = 0;
+  sparkinfer::pcie::TwoSlotSelector slot_selector_;
 
   int take_slot() {
     // Host-side selection executes once during CUDA graph capture. Graph
     // replay intentionally reuses that capture-stable address; eager calls
     // toggle slabs without an overflowing counter.
-    const int slot = static_cast<int>(next_slot_);
-    next_slot_ ^= uint32_t{1};
-    return slot;
+    return slot_selector_.take();
   }
 
   PCIeDCPA2A(Signal **signals,
