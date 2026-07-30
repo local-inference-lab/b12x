@@ -7,7 +7,10 @@ import sparkinfer.moe.ep_moe._impl as ep_moe
 from sparkinfer._lib.intrinsics import swizzle_block_scale
 from sparkinfer.moe.ep_moe._impl import EPMoEScratchCaps, plan_ep_moe_scratch, prepare_ep_expert_map, sparkinfer_ep_moe_fp4
 from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
-from sparkinfer.moe._shared.kernels.w4a16.host import max_w4a16_route_capacity
+from sparkinfer.moe._shared.kernels.w4a16.host import (
+    max_packed_route_slots,
+    route_block_sizes_for_capacity,
+)
 from tests._reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
 
@@ -116,7 +119,20 @@ def test_ep_scratch_reserves_route_pack_power_of_two_capacity(
     )
 
     layout = {spec.name: spec for spec in plan._layout}
-    expected_slots, expected_blocks = max_w4a16_route_capacity(4 * 2, 10)
+    block_sizes = route_block_sizes_for_capacity(3, 2, 10)
+    expected_slots = max(
+        max_packed_route_slots(4 * 2, block_size, 10)
+        for block_size in block_sizes
+    )
+    expected_blocks = max(
+        (
+            max_packed_route_slots(4 * 2, block_size, 10)
+            + block_size
+            - 1
+        )
+        // block_size
+        for block_size in block_sizes
+    )
     assert layout["packed_route_indices"].elements == expected_slots
     assert layout["block_expert_ids"].elements == expected_blocks
     assert layout["intermediate_cache2"].elements == 3 * 2 * 128

@@ -6,6 +6,44 @@ import pytest
 import torch
 
 from sparkinfer.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
+from sparkinfer.moe._shared.kernels.w4a16.host import (
+    route_block_sizes_for_capacity,
+    select_route_block_size_m,
+)
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "topk", "num_experts"),
+    [
+        (1, 8, 160),
+        (64, 8, 160),
+        (144, 8, 160),
+        (1024, 8, 256),
+        (32, 64, 8),
+    ],
+)
+def test_capacity_block_sizes_cover_every_live_selection(
+    max_tokens: int,
+    topk: int,
+    num_experts: int,
+) -> None:
+    planned = route_block_sizes_for_capacity(max_tokens, topk, num_experts)
+    selected = {
+        select_route_block_size_m(m, topk, num_experts)
+        for m in range(1, max_tokens + 1)
+    }
+
+    assert selected.issubset(planned)
+    assert planned[0] == select_route_block_size_m(1, topk, num_experts)
+    assert planned[-1] == select_route_block_size_m(
+        max_tokens,
+        topk,
+        num_experts,
+    )
+
+
+def test_small_capacity_needs_only_block_8() -> None:
+    assert route_block_sizes_for_capacity(64, 8, 160) == (8,)
 
 
 def _expected_route_pack(

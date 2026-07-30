@@ -52,6 +52,9 @@ from ._impl import (
     plan_tp_moe_scratch as plan,
 )
 from ._impl import (
+    tp_moe_required_nbytes as required_nbytes,
+)
+from ._impl import (
     prepare_sparkinfer_fp4_moe_weights as prepare_weights,
 )
 from ._impl import (
@@ -91,6 +94,7 @@ __all__ = [
     "Routing",
     "WeightsPlan",
     "plan",
+    "required_nbytes",
     "plan_execution",
     "plan_weights",
     "prepare_weights",
