@@ -766,6 +766,7 @@ class PCIeDCPA2APool:
     @contextmanager
     def capture(self, stream: object = None):
         """Bind nested CUDA captures to the enclosing stream's channel."""
+        previous_channels: Optional[dict[int, PCIeDCPA2A]] = None
         if self.single_channel:
             channel = self.for_stream(stream)
         else:
@@ -774,6 +775,7 @@ class PCIeDCPA2APool:
                     "PCIe DCP A2A capture context must be entered before CUDA "
                     "graph capture starts"
                 )
+            previous_channels = dict(self._channels)
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
             # Keep a graph-owned channel even when CUDA recycles the enclosing
@@ -787,6 +789,19 @@ class PCIeDCPA2APool:
             popped = self._capture_channel_stack.pop()
             if popped is not channel:
                 raise RuntimeError("PCIe DCP A2A capture channel stack corrupted")
+            if previous_channels is not None:
+                # Captured graph nodes retain the channel through
+                # ``_all_channels``. Restore eager mappings and discard every
+                # nested capture-stream alias so a recycled stream key cannot
+                # hand this graph-owned channel to a later unwrapped capture.
+                for key, mapped in tuple(self._channels.items()):
+                    if mapped is not channel:
+                        continue
+                    previous = previous_channels.get(key)
+                    if previous is None:
+                        del self._channels[key]
+                    else:
+                        self._channels[key] = previous
 
     def close(self) -> None:
         if self._closed:

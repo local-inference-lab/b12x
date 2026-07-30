@@ -269,9 +269,15 @@ def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
         capturing[0] = False
 
     assert target_channel is not draft_channel
-    assert pool._channels[70] is target_channel
-    assert pool._channels[80] is draft_channel
+    assert pool._channels == {}
+    assert target_channel in pool._all_channels
+    assert draft_channel in pool._all_channels
     assert [entry[0] for entry in created] == [7, 8]
+
+    capturing[0] = True
+    current_stream[0] = 70
+    with pytest.raises(RuntimeError, match="no channel during CUDA graph capture"):
+        pool.for_stream()
 
 
 def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
@@ -317,8 +323,7 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
         capturing[0] = False
 
     assert target_channel is not draft_channel
-    assert pool._channels[7] is draft_channel
-    assert pool._channels[70] is draft_channel
+    assert pool._channels == {}
     assert target_channel in pool._all_channels
     assert draft_channel in pool._all_channels
     assert [entry[0] for entry in created] == [7, 7]
@@ -326,6 +331,41 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
     pool.close()
     assert target_channel._ext.dispose_calls == [1234]
     assert draft_channel._ext.dispose_calls == [1234]
+
+
+def test_pool_restores_eager_mapping_after_capture(monkeypatch):
+    current_stream = [7]
+    capturing = [False]
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    eager_channel = pool.for_stream()
+    with pool.capture(7) as graph_channel:
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is graph_channel
+        capturing[0] = False
+
+    assert graph_channel is not eager_channel
+    assert pool._channels == {7: eager_channel}
+    assert graph_channel in pool._all_channels
 
 
 def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
