@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from functools import partial
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
@@ -11405,14 +11406,1461 @@ def run_w4a16_moe_hybrid(
     return output
 
 
+class W4A16FusedMoeFullRotationHybridKernel:
+    """One-grid mixed-bitrate Trellis MoE with the exact full-rotation contract.
+
+    The existing hybrid kernel is the direct-topk/TC-decode path used by
+    packed NVFP4/NF3 mixtures.  EXL3 Trellis is different: routes must be
+    packed once by GLOBAL expert, gate/up inputs and the SwiGLU intermediate
+    use the checkpoint's H128 rotations, and router weights are applied only
+    by the final FP32 top-k reduction.
+
+    This kernel keeps that arithmetic byte-for-byte.  A single global packed
+    route list drives both phases.  For each packed expert block,
+    ``tier_local_map[global_expert]`` selects the K3 or K4 child decoder and
+    its tier-local expert index.  Input rotation, activation rotation, and the
+    final reduction continue to index global-order rotation tables, so mixed
+    storage never changes the model's mathematical expert identity.
+    """
+
+    ABI_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        tier0: W4A16FusedMoeKernel,
+        tier1: W4A16FusedMoeKernel,
+        map_slots: int,
+    ):
+        for name, moe in (("tier0", tier0), ("tier1", tier1)):
+            if moe.direct_topk_routes:
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} forbids direct_topk_routes"
+                )
+            if moe.tc_decode_fused_sum:
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} forbids TC fused sum"
+                )
+            if not moe.activation_is_gated:
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} requires gated activation"
+                )
+            if moe.collect_activation_amax:
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} forbids activation amax"
+                )
+            if not (moe.intermediate_rotation and moe.dual_a and moe.full_rotation):
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} requires the projection-"
+                    "major Trellis rotation path"
+                )
+            if moe.weight_layout != "trellis3_t256":
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} requires trellis3_t256"
+                )
+            if moe.element_dtype != "fp16":
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} requires fp16 operands"
+                )
+            if moe.apply_router_weight_on_input or moe.zero_fc2_output:
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 {name} has invalid reduction policy"
+                )
+        for attr in (
+            "size_m",
+            "hidden_size",
+            "intermediate_size",
+            "fc1_cols",
+            "top_k",
+            "moe_block_size",
+            "activation",
+            "activation_is_swigluoai",
+            "has_swiglu_limit",
+            "swiglu_limit",
+            "swiglu_alpha",
+            "swiglu_beta",
+            "element_dtype",
+            "is_fp16",
+            "fast_math",
+            "apply_router_weight_on_input",
+            "cta_threads",
+            "sms",
+            "blocks_per_sm",
+            "barrier_count_off",
+            "barrier_sense_off",
+            "schedule_whole_tiles",
+            "intermediate_rotation",
+            "dual_a",
+            "full_rotation",
+            "rotation_input_dtype",
+        ):
+            if getattr(tier0, attr) != getattr(tier1, attr):
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 tiers disagree on {attr}: "
+                    f"{getattr(tier0, attr)!r} != {getattr(tier1, attr)!r}"
+                )
+        for phase in ("fc1", "fc2"):
+            gemm0 = getattr(tier0, phase)
+            gemm1 = getattr(tier1, phase)
+            if (
+                gemm0.n_tiles,
+                gemm0.k_tiles,
+                gemm0.tile_n,
+                gemm0.tile_k,
+                gemm0.top_k,
+                gemm0.mul_topk_weights,
+                gemm0.fused_topk_sum,
+                gemm0.moe_block_size,
+                gemm0.cta_threads,
+                gemm0.schedule_whole_tiles,
+                gemm0.route_major_a,
+                gemm0.dual_a,
+            ) != (
+                gemm1.n_tiles,
+                gemm1.k_tiles,
+                gemm1.tile_n,
+                gemm1.tile_k,
+                gemm1.top_k,
+                gemm1.mul_topk_weights,
+                gemm1.fused_topk_sum,
+                gemm1.moe_block_size,
+                gemm1.cta_threads,
+                gemm1.schedule_whole_tiles,
+                gemm1.route_major_a,
+                gemm1.dual_a,
+            ):
+                raise ValueError(
+                    f"full-rotation hybrid W4A16 tiers disagree on {phase} geometry"
+                )
+        if int(map_slots) < tier0.num_experts + tier1.num_experts:
+            raise ValueError(
+                "full-rotation hybrid map_slots must cover both tier expert sets"
+            )
+        if tier0.num_experts > 256 or tier1.num_experts > 256:
+            raise ValueError(
+                "full-rotation hybrid local expert ids exceed descriptor capacity"
+            )
+        self.tier0 = tier0
+        self.tier1 = tier1
+        self.map_slots = int(map_slots)
+        self.size_m = tier0.size_m
+        self.hidden_size = tier0.hidden_size
+        self.intermediate_size = tier0.intermediate_size
+        self.top_k = tier0.top_k
+        self.element_dtype = tier0.element_dtype
+        self.rotation_input_dtype = tier0.rotation_input_dtype
+        self.cta_threads = tier0.cta_threads
+        self.sms = tier0.sms
+        self.blocks_per_sm = min(tier0.blocks_per_sm, tier1.blocks_per_sm)
+        self.shared_words = max(tier0.shared_words, tier1.shared_words)
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (
+            "w4a16_fused_moe_full_rotation_hybrid",
+            self.ABI_VERSION,
+            self.map_slots,
+            self.tier0.__cache_key__,
+            self.tier1.__cache_key__,
+            self.shared_words,
+        )
+
+    @cute.jit
+    def _emit_route_map_tile(
+        self,
+        is_fc1: cutlass.Constexpr,
+        a_fp16_flat: cute.Tensor,
+        a_alt_fp16_flat: cute.Tensor,
+        t0_b_i32_flat: cute.Tensor,
+        t0_scales_i32_flat: cute.Tensor,
+        t0_global_scale: cute.Tensor,
+        t1_b_i32_flat: cute.Tensor,
+        t1_scales_i32_flat: cute.Tensor,
+        t1_global_scale: cute.Tensor,
+        c_fp16_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        active_size_m: Int32,
+        route_block_idx: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+    ):
+        gid = block_expert_ids[route_block_idx].to(Int32)
+        if gid >= Int32(0) and gid < Int32(self.map_slots):
+            descriptor = tier_local_map_i32_flat[gid].to(Int32)
+            if descriptor >= Int32(0):
+                tier = descriptor >> Int32(8)
+                local_expert = descriptor & Int32(0xFF)
+                if tier == Int32(0):
+                    if local_expert < Int32(self.tier0.num_experts):
+                        if cutlass.const_expr(is_fc1):
+                            self.tier0.fc1._run_tile(
+                                a_fp16_flat,
+                                a_alt_fp16_flat,
+                                t0_b_i32_flat,
+                                c_fp16_flat,
+                                t0_scales_i32_flat,
+                                t0_global_scale,
+                                packed_route_indices,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+                        else:
+                            self.tier0.fc2._run_tile(
+                                a_fp16_flat,
+                                a_alt_fp16_flat,
+                                t0_b_i32_flat,
+                                c_fp16_flat,
+                                t0_scales_i32_flat,
+                                t0_global_scale,
+                                packed_route_indices,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+                elif tier == Int32(1):
+                    if local_expert < Int32(self.tier1.num_experts):
+                        if cutlass.const_expr(is_fc1):
+                            self.tier1.fc1._run_tile(
+                                a_fp16_flat,
+                                a_alt_fp16_flat,
+                                t1_b_i32_flat,
+                                c_fp16_flat,
+                                t1_scales_i32_flat,
+                                t1_global_scale,
+                                packed_route_indices,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+                        else:
+                            self.tier1.fc2._run_tile(
+                                a_fp16_flat,
+                                a_alt_fp16_flat,
+                                t1_b_i32_flat,
+                                c_fp16_flat,
+                                t1_scales_i32_flat,
+                                t1_global_scale,
+                                packed_route_indices,
+                                topk_weights_flat,
+                                c_tmp_f32_flat,
+                                locks_i32_flat,
+                                smem_base,
+                                tid,
+                                route_block_idx,
+                                local_expert,
+                                output_n_tile,
+                                reduce_k_tile,
+                                reduce_tile_count,
+                                reduce_slice_count,
+                                reduce_slice_idx,
+                                lock_slot,
+                                active_size_m,
+                            )
+
+    @cute.jit
+    def __call__(
+        self,
+        a_gate_fp16_ptr: cute.Pointer,
+        a_up_fp16_ptr: cute.Pointer,
+        rotation_input_ptr: cute.Pointer,
+        t0_w13_i32_flat: cute.Tensor,
+        t0_w2_i32_flat: cute.Tensor,
+        t0_w13_scales_i32_flat: cute.Tensor,
+        t0_w2_scales_i32_flat: cute.Tensor,
+        t0_w13_global_scale: cute.Tensor,
+        t0_w2_global_scale: cute.Tensor,
+        t1_w13_i32_flat: cute.Tensor,
+        t1_w2_i32_flat: cute.Tensor,
+        t1_w13_scales_i32_flat: cute.Tensor,
+        t1_w2_scales_i32_flat: cute.Tensor,
+        t1_w13_global_scale: cute.Tensor,
+        t1_w2_global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_fp16_flat: cute.Tensor,
+        activated_fp16_flat: cute.Tensor,
+        fc2_fp16_flat: cute.Tensor,
+        topk_weights_ptr: cute.Pointer,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        rot_scales_flat: cute.Tensor,
+        suh_gate_flat: cute.Tensor,
+        suh_up_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        routed_rows = active_m * Int32(self.top_k)
+        a_gate_fp16_flat = cute.make_tensor(
+            a_gate_fp16_ptr,
+            layout=cute.make_layout(
+                (routed_rows * Int32(self.hidden_size),), stride=(1,)
+            ),
+        )
+        a_up_fp16_flat = cute.make_tensor(
+            a_up_fp16_ptr,
+            layout=cute.make_layout(
+                (routed_rows * Int32(self.hidden_size),), stride=(1,)
+            ),
+        )
+        rotation_input_flat = cute.make_tensor(
+            rotation_input_ptr,
+            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+        )
+        topk_weights_flat = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((routed_rows,), stride=(1,)),
+        )
+        self.kernel(
+            a_gate_fp16_flat,
+            a_up_fp16_flat,
+            rotation_input_flat,
+            t0_w13_i32_flat,
+            t0_w2_i32_flat,
+            t0_w13_scales_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w13_global_scale,
+            t0_w2_global_scale,
+            t1_w13_i32_flat,
+            t1_w2_i32_flat,
+            t1_w13_scales_i32_flat,
+            t1_w2_scales_i32_flat,
+            t1_w13_global_scale,
+            t1_w2_global_scale,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            tier_local_map_i32_flat,
+            fc1_fp16_flat,
+            activated_fp16_flat,
+            fc2_fp16_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            rot_scales_flat,
+            suh_gate_flat,
+            suh_up_flat,
+            active_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm,
+            cooperative=True,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        a_gate_fp16_flat: cute.Tensor,
+        a_up_fp16_flat: cute.Tensor,
+        rotation_input_flat: cute.Tensor,
+        t0_w13_i32_flat: cute.Tensor,
+        t0_w2_i32_flat: cute.Tensor,
+        t0_w13_scales_i32_flat: cute.Tensor,
+        t0_w2_scales_i32_flat: cute.Tensor,
+        t0_w13_global_scale: cute.Tensor,
+        t0_w2_global_scale: cute.Tensor,
+        t1_w13_i32_flat: cute.Tensor,
+        t1_w2_i32_flat: cute.Tensor,
+        t1_w13_scales_i32_flat: cute.Tensor,
+        t1_w2_scales_i32_flat: cute.Tensor,
+        t1_w13_global_scale: cute.Tensor,
+        t1_w2_global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        tier_local_map_i32_flat: cute.Tensor,
+        fc1_fp16_flat: cute.Tensor,
+        activated_fp16_flat: cute.Tensor,
+        fc2_fp16_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        fc1_c_tmp_f32_flat: cute.Tensor,
+        fc2_c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        rot_scales_flat: cute.Tensor,
+        suh_gate_flat: cute.Tensor,
+        suh_up_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        fc1_emit_tile = partial(
+            self._emit_route_map_tile,
+            True,
+            a_gate_fp16_flat,
+            a_up_fp16_flat,
+            t0_w13_i32_flat,
+            t0_w13_scales_i32_flat,
+            t0_w13_global_scale,
+            t1_w13_i32_flat,
+            t1_w13_scales_i32_flat,
+            t1_w13_global_scale,
+            fc1_fp16_flat,
+            packed_route_indices,
+            block_expert_ids,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            active_m,
+        )
+        fc2_emit_tile = partial(
+            self._emit_route_map_tile,
+            False,
+            activated_fp16_flat,
+            activated_fp16_flat,
+            t0_w2_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w2_global_scale,
+            t1_w2_i32_flat,
+            t1_w2_scales_i32_flat,
+            t1_w2_global_scale,
+            fc2_fp16_flat,
+            packed_route_indices,
+            block_expert_ids,
+            tier_local_map_i32_flat,
+            topk_weights_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            active_m * Int32(self.top_k),
+        )
+        # Tier 0 supplies the shared full-rotation phase machinery. The emit
+        # hooks above own only the bitrate/local-expert weight selection.
+        self.tier0._moe_body(
+            a_gate_fp16_flat,
+            a_up_fp16_flat,
+            rotation_input_flat,
+            t0_w13_i32_flat,
+            t0_w2_i32_flat,
+            fc1_fp16_flat,
+            activated_fp16_flat,
+            fc2_fp16_flat,
+            t0_w13_scales_i32_flat,
+            t0_w2_scales_i32_flat,
+            t0_w13_global_scale,
+            t0_w2_global_scale,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            packed_route_count,
+            Int32(0),
+            topk_weights_flat,
+            fc1_c_tmp_f32_flat,
+            fc2_c_tmp_f32_flat,
+            locks_i32_flat,
+            rot_scales_flat,
+            suh_gate_flat,
+            suh_up_flat,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+            fc1_emit_tile,
+            fc2_emit_tile,
+        )
+
+
+class W4A16FusedMoeFullRotationHybridCompileResult:
+    compiled: object
+    size_m: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    activation: str
+    map_slots: int
+    tier0_num_experts: int
+    tier0_trellis_bits: int
+    tier1_num_experts: int
+    tier1_trellis_bits: int
+    fc1_tile_n: int
+    fc1_tile_k: int
+    fc2_tile_n: int
+    fc2_tile_k: int
+    moe_block_size: int
+    max_m_blocks: int
+    cta_threads: int
+    blocks_per_sm: int
+    shared_memory_bytes: int
+    rotation_input_dtype: str
+    registers_per_thread: int
+    local_memory_bytes: int
+
+
+def compile_w4a16_fused_moe_full_rotation_hybrid(
+    *,
+    size_m: int,
+    route_capacity_m_blocks: int | None = None,
+    hidden_size: int,
+    intermediate_size: int,
+    tier0_num_experts: int,
+    tier0_trellis_bits: int,
+    tier1_num_experts: int,
+    tier1_trellis_bits: int,
+    top_k: int,
+    activation: str,
+    map_slots: int,
+    moe_block_size: int,
+    rotation_input_dtype: str,
+    fast_math: bool,
+    sms: int,
+    max_shared_mem: int,
+    force_tile_config: tuple[int, int, int, int],
+) -> W4A16FusedMoeFullRotationHybridCompileResult:
+    """Compile the one-grid K3/K4 projection-major Trellis kernel.
+
+    Both tier decoders retain their own compile-time bitrate and weight
+    strides. The route scheduler, H128 transforms, activation, and final route
+    buffers are shared. This is deliberately a separate ABI from the
+    direct-topk NVFP4/NF3 hybrid so neither path can silently select the wrong
+    reduction contract.
+    """
+
+    activation = normalize_moe_activation(activation)
+    if not validate_activation(activation):
+        raise ValueError("full-rotation hybrid W4A16 requires gated activation")
+    if activation != "silu":
+        raise ValueError("full-rotation Trellis hybrid requires silu")
+    rotation_input_dtype = str(rotation_input_dtype)
+    if rotation_input_dtype not in {"bf16", "fp16"}:
+        raise ValueError("rotation_input_dtype must be 'bf16' or 'fp16'")
+    tier0_trellis_bits = int(tier0_trellis_bits)
+    tier1_trellis_bits = int(tier1_trellis_bits)
+    if tier0_trellis_bits not in _TRELLIS256_BITS:
+        raise ValueError(f"invalid tier0 Trellis bits {tier0_trellis_bits}")
+    if tier1_trellis_bits not in _TRELLIS256_BITS:
+        raise ValueError(f"invalid tier1 Trellis bits {tier1_trellis_bits}")
+    if tier0_trellis_bits == tier1_trellis_bits:
+        raise ValueError("full-rotation hybrid tiers must use distinct bitrates")
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
+        int(value) for value in force_tile_config
+    )
+    route_slots = max_packed_route_slots(
+        int(size_m) * int(top_k),
+        int(moe_block_size),
+        int(map_slots),
+    )
+    live_m_blocks = (int(route_slots) + int(moe_block_size) - 1) // int(moe_block_size)
+    max_m_blocks = (
+        live_m_blocks
+        if route_capacity_m_blocks is None
+        else int(route_capacity_m_blocks)
+    )
+    if max_m_blocks < live_m_blocks:
+        raise ValueError(
+            "full-rotation hybrid route capacity under-covers the exact-M "
+            f"launch: capacity_blocks={max_m_blocks}, "
+            f"required_blocks={live_m_blocks}"
+        )
+
+    def _tier_kernel(num_experts: int, trellis_bits: int) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=int(size_m),
+            hidden_size=int(hidden_size),
+            intermediate_size=int(intermediate_size),
+            num_experts=int(num_experts),
+            top_k=int(top_k),
+            activation=activation,
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=fc1_tile_n,
+            fc1_tile_k=fc1_tile_k,
+            fc2_tile_n=fc2_tile_n,
+            fc2_tile_k=fc2_tile_k,
+            moe_block_size=int(moe_block_size),
+            max_m_blocks=max_m_blocks,
+            element_dtype="fp16",
+            fast_math=bool(fast_math),
+            weight_layout="trellis3_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis3_t256_proj",
+            trellis_bits=int(trellis_bits),
+            direct_topk_routes=False,
+            tc_decode_fused_sum=False,
+            collect_activation_amax=False,
+            schedule_whole_tiles=True,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype=rotation_input_dtype,
+        )
+
+    kernel = W4A16FusedMoeFullRotationHybridKernel(
+        tier0=_tier_kernel(int(tier0_num_experts), tier0_trellis_bits),
+        tier1=_tier_kernel(int(tier1_num_experts), tier1_trellis_bits),
+        map_slots=int(map_slots),
+    )
+    if kernel.shared_words * 4 > int(max_shared_mem) - 512:
+        raise ValueError(
+            "full-rotation hybrid W4A16 shared memory exceeds device limit: "
+            f"{kernel.shared_words * 4} > {int(max_shared_mem) - 512}"
+        )
+
+    device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    cache_key = (
+        "w4a16_fused_moe_full_rotation_hybrid",
+        device,
+        kernel.__cache_key__,
+    )
+    cached = _FUSED_CACHE.get(cache_key)
+    if cached is not None:
+        return replace(cached, size_m=int(size_m), max_m_blocks=max_m_blocks)
+
+    compile_size_m = _fake_m_for_specialization(int(size_m))
+    compile_routed_rows = int(compile_size_m) * int(top_k)
+    compile_route_blocks = max(1, min(max_m_blocks, compile_routed_rows))
+    compile_route_slots = compile_route_blocks * int(moe_block_size)
+    fc1_cols = 2 * int(intermediate_size)
+
+    def _trellis_weight_fake(
+        num_experts: int,
+        size_n: int,
+        size_k: int,
+        trellis_bits: int,
+    ):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (
+                int(num_experts)
+                * (int(size_k) // 16)
+                * (int(size_n) // 16)
+                * (8 * int(trellis_bits)),
+            ),
+            assumed_align=16,
+        )
+
+    def _scales_fake(num_experts: int, size_n: int, size_k: int):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (
+                _scale_fake_int32_elements(
+                    num_experts=int(num_experts),
+                    size_k=int(size_k),
+                    size_n=int(size_n),
+                    scale_format="e4m3_k32",
+                ),
+            ),
+            assumed_align=16,
+        )
+
+    def _global_fake(num_experts: int):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (int(num_experts),), assumed_align=16
+        )
+
+    fp16_ptr = make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    rotation_input_ptr = make_ptr(
+        _cutlass_element_dtype(rotation_input_dtype),
+        16,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    topk_ptr = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    scratch_elements = max(
+        fc1_cols * compile_route_slots,
+        int(hidden_size) * compile_route_slots,
+        4 * 256 * int(moe_block_size) * 256,
+    )
+    t0_ne = int(tier0_num_experts)
+    t1_ne = int(tier1_num_experts)
+    compile_args = (
+        fp16_ptr,
+        fp16_ptr,
+        rotation_input_ptr,
+        _trellis_weight_fake(t0_ne, fc1_cols, hidden_size, tier0_trellis_bits),
+        _trellis_weight_fake(t0_ne, hidden_size, intermediate_size, tier0_trellis_bits),
+        _scales_fake(t0_ne, fc1_cols, hidden_size),
+        _scales_fake(t0_ne, hidden_size, intermediate_size),
+        _global_fake(t0_ne),
+        _global_fake(t0_ne),
+        _trellis_weight_fake(t1_ne, fc1_cols, hidden_size, tier1_trellis_bits),
+        _trellis_weight_fake(t1_ne, hidden_size, intermediate_size, tier1_trellis_bits),
+        _scales_fake(t1_ne, fc1_cols, hidden_size),
+        _scales_fake(t1_ne, hidden_size, intermediate_size),
+        _global_fake(t1_ne),
+        _global_fake(t1_ne),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (compile_route_slots,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (compile_route_blocks,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (int(map_slots),), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (compile_routed_rows * fc1_cols,),
+            assumed_align=16,
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (compile_routed_rows * int(intermediate_size),),
+            assumed_align=16,
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (compile_routed_rows * int(hidden_size),),
+            assumed_align=16,
+        ),
+        topk_ptr,
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (scratch_elements,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (scratch_elements,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (4 * 256 + 2,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (int(map_slots) * 3 * int(intermediate_size),),
+            assumed_align=16,
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (int(map_slots) * int(hidden_size),),
+            assumed_align=16,
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float16,
+            (int(map_slots) * int(hidden_size),),
+            assumed_align=16,
+        ),
+        1,
+        1,
+        current_cuda_stream(),
+    )
+
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = sparkinfer_compile(
+        kernel,
+        *compile_args,
+        compile_spec=KernelCompileSpec.from_key(
+            "moe.w4a16.fused_moe_full_rotation_hybrid",
+            W4A16FusedMoeFullRotationHybridKernel.ABI_VERSION,
+            cache_key,
+        ),
+        dsl_compile_options=OptLevel(2),
+    )
+    registers_per_thread = -1
+    local_memory_bytes = -1
+    resources = _query_w4a16_kernel_resources(compiled)
+    if resources is not None:
+        _, registers_per_thread, local_memory_bytes = resources
+        if local_memory_bytes != 0:
+            raise RuntimeError(
+                "full-rotation hybrid W4A16 codegen spills to local memory "
+                f"({local_memory_bytes} bytes/thread); refusing admission"
+            )
+
+    result = W4A16FusedMoeFullRotationHybridCompileResult(
+        compiled=compiled,
+        size_m=int(size_m),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        top_k=int(top_k),
+        activation=activation,
+        map_slots=int(map_slots),
+        tier0_num_experts=t0_ne,
+        tier0_trellis_bits=tier0_trellis_bits,
+        tier1_num_experts=t1_ne,
+        tier1_trellis_bits=tier1_trellis_bits,
+        fc1_tile_n=fc1_tile_n,
+        fc1_tile_k=fc1_tile_k,
+        fc2_tile_n=fc2_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        moe_block_size=int(moe_block_size),
+        max_m_blocks=max_m_blocks,
+        cta_threads=kernel.cta_threads,
+        blocks_per_sm=kernel.blocks_per_sm,
+        shared_memory_bytes=kernel.shared_words * 4,
+        rotation_input_dtype=rotation_input_dtype,
+        registers_per_thread=registers_per_thread,
+        local_memory_bytes=local_memory_bytes,
+    )
+    _FUSED_CACHE[cache_key] = result
+    return result
+
+
+def _run_w4a16_moe_full_rotation_hybrid_eager(
+    a_input: torch.Tensor,
+    prepared_tier0,
+    prepared_tier1,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    *,
+    activation: str,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_counts: torch.Tensor,
+    rotation_a_gate: torch.Tensor,
+    rotation_a_up: torch.Tensor,
+    global_intermediate_rotations: torch.Tensor,
+    global_suh_gate: torch.Tensor,
+    global_suh_up: torch.Tensor,
+    global_svh_down: torch.Tensor,
+    fused_launch: W4A16FusedMoeFullRotationHybridCompileResult,
+    topk_sum_launch: W4A16TopKSumCompileResult,
+    fast_math: bool = True,
+    stream: cuda.CUstream | None = None,
+) -> torch.Tensor:
+    """Run one globally packed mixed-K full-rotation Trellis MoE layer."""
+
+    activation = normalize_moe_activation(activation)
+    if activation != "silu":
+        raise ValueError("mixed-K full-rotation Trellis requires silu")
+    if a_input.ndim != 2 or not a_input.is_cuda or not a_input.is_contiguous():
+        raise ValueError("a_input must be a contiguous CUDA rank-2 tensor")
+    if a_input.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("a_input must be bf16 or fp16")
+    m, hidden_size = (int(a_input.shape[0]), int(a_input.shape[1]))
+    if m < 1 or m > int(fused_launch.size_m):
+        raise ValueError(
+            f"mixed-K launch requires 1 <= m <= {int(fused_launch.size_m)}, got {m}"
+        )
+    topk = int(topk_ids.shape[1])
+    if tuple(topk_ids.shape) != (m, topk):
+        raise ValueError("topk_ids must be rank-2 [m, topk]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must be int32 or int64")
+    if (
+        tuple(topk_weights.shape) != (m, topk)
+        or topk_weights.dtype != torch.float32
+        or not topk_weights.is_contiguous()
+    ):
+        raise ValueError("topk_weights must be contiguous float32 [m, topk]")
+    if not topk_ids.is_contiguous() or topk_ids.device != a_input.device:
+        raise ValueError("topk_ids must be contiguous on the input device")
+    if topk_weights.device != a_input.device:
+        raise ValueError("topk_weights must be on the input device")
+    if hidden_size != int(fused_launch.hidden_size) or topk != int(fused_launch.top_k):
+        raise ValueError("input/router geometry does not match fused launch")
+    if output.dtype != torch.float32 or tuple(output.shape) != (m, hidden_size):
+        raise ValueError("output must be contiguous float32 [m, hidden]")
+    if output.device != a_input.device or not output.is_contiguous():
+        raise ValueError("output must be contiguous on the input device")
+
+    map_slots = int(fused_launch.map_slots)
+    if (
+        tier_local_map.dtype != torch.int32
+        or tier_local_map.device != a_input.device
+        or tuple(tier_local_map.shape) != (map_slots,)
+        or not tier_local_map.is_contiguous()
+    ):
+        raise ValueError("tier_local_map must be contiguous int32 [map_slots]")
+    intermediate_size = int(fused_launch.intermediate_size)
+    expected_tiers = (
+        (
+            "tier0",
+            prepared_tier0,
+            int(fused_launch.tier0_num_experts),
+            int(fused_launch.tier0_trellis_bits),
+        ),
+        (
+            "tier1",
+            prepared_tier1,
+            int(fused_launch.tier1_num_experts),
+            int(fused_launch.tier1_trellis_bits),
+        ),
+    )
+    for name, prepared, experts, bits in expected_tiers:
+        actual = (
+            getattr(prepared, "weight_layout", None),
+            getattr(prepared, "trellis_codebook", None),
+            int(getattr(prepared, "trellis_bits", -1)),
+            int(getattr(prepared, "num_experts", -1)),
+            int(getattr(prepared, "hidden_size", -1)),
+            int(getattr(prepared, "intermediate_size", -1)),
+            getattr(prepared, "params_dtype", None),
+        )
+        wanted = (
+            "trellis3_t256",
+            "mcg",
+            bits,
+            experts,
+            hidden_size,
+            intermediate_size,
+            torch.float16,
+        )
+        if actual != wanted:
+            raise ValueError(
+                f"{name} prepared Trellis contract mismatch: {actual} != {wanted}"
+            )
+
+    capacity_m = int(fused_launch.size_m)
+    capacity_routed_rows = capacity_m * topk
+    fc1_cols = 2 * intermediate_size
+    cache13_need = capacity_routed_rows * max(fc1_cols, hidden_size)
+    cache2_need = capacity_routed_rows * intermediate_size
+    for name, tensor, need in (
+        ("intermediate_cache13", intermediate_cache13, cache13_need),
+        ("intermediate_cache2", intermediate_cache2, cache2_need),
+        ("rotation_a_gate", rotation_a_gate, capacity_routed_rows * hidden_size),
+        ("rotation_a_up", rotation_a_up, capacity_routed_rows * hidden_size),
+    ):
+        if (
+            tensor.dtype != torch.float16
+            or tensor.device != a_input.device
+            or not tensor.is_contiguous()
+            or int(tensor.numel()) < int(need)
+        ):
+            raise ValueError(
+                f"{name} must be contiguous fp16 on {a_input.device} with "
+                f"at least {int(need)} elements"
+            )
+    if rotation_a_gate.data_ptr() == rotation_a_up.data_ptr():
+        raise ValueError("rotation gate/up scratch must not alias")
+    for name, table, shape in (
+        ("global_suh_gate", global_suh_gate, (map_slots, hidden_size)),
+        ("global_suh_up", global_suh_up, (map_slots, hidden_size)),
+        ("global_svh_down", global_svh_down, (map_slots, hidden_size)),
+        (
+            "global_intermediate_rotations",
+            global_intermediate_rotations,
+            (map_slots, 3 * intermediate_size),
+        ),
+    ):
+        if (
+            table.dtype != torch.float16
+            or table.device != a_input.device
+            or tuple(table.shape) != shape
+            or not table.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous fp16 {shape} on {a_input.device}"
+            )
+
+    block_size_m = int(fused_launch.moe_block_size)
+    route_slots = max_packed_route_slots(capacity_m * topk, block_size_m, map_slots)
+    route_blocks = (route_slots + block_size_m - 1) // block_size_m
+    for name, tensor, dtype, need in (
+        ("packed_route_indices", packed_route_indices, torch.int32, route_slots),
+        ("block_expert_ids", block_expert_ids, torch.int32, route_blocks),
+        ("packed_route_count", packed_route_count, torch.int32, 1),
+        ("expert_offsets", expert_offsets, torch.int32, map_slots + 1),
+        ("expert_counts", expert_counts, torch.int32, map_slots),
+    ):
+        if (
+            tensor.dtype != dtype
+            or tensor.device != a_input.device
+            or not tensor.is_contiguous()
+            or int(tensor.numel()) < int(need)
+        ):
+            raise ValueError(f"{name} does not cover planned route capacity")
+    packed_route_indices = packed_route_indices[:route_slots]
+    block_expert_ids = block_expert_ids[:route_blocks]
+    expert_offsets = expert_offsets[: map_slots + 1]
+    expert_counts = expert_counts[:map_slots]
+
+    pack_topk_routes_by_expert(
+        topk_ids,
+        block_size_m,
+        map_slots,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        expert_offsets=expert_offsets,
+        expert_counts=expert_counts,
+    )
+
+    props = torch.cuda.get_device_properties(a_input.device)
+    sms = int(props.multi_processor_count)
+    fc1_scratch_elements = packed_gemm_scratch_elements(
+        size_n=fc1_cols,
+        route_slots=route_slots,
+        moe_block_size=block_size_m,
+        sms=sms,
+    )
+    fc2_scratch_elements = packed_gemm_scratch_elements(
+        size_n=hidden_size,
+        route_slots=route_slots,
+        moe_block_size=block_size_m,
+        sms=sms,
+    )
+    fc1_scratch = _get_c_tmp(
+        fc1_scratch_elements, device=a_input.device, scratch=fc1_c_tmp
+    )
+    fc2_scratch = _get_c_tmp(
+        fc2_scratch_elements, device=a_input.device, scratch=fc2_c_tmp
+    )
+    workspace = prepared_tier0.workspace
+    if int(workspace.numel()) < sms * 4 + 2:
+        raise ValueError("tier0 workspace is too small for cooperative barriers")
+
+    cache13_flat = intermediate_cache13.view(-1)
+    cache2_flat = intermediate_cache2.view(-1)
+    fc1_out = cache13_flat[: capacity_routed_rows * fc1_cols]
+    activated = cache2_flat[: capacity_routed_rows * intermediate_size]
+    fc2_out = cache13_flat[: capacity_routed_rows * hidden_size]
+    stream = current_cuda_stream() if stream is None else stream
+    grid_x = _w4a16_fused_persistent_grid_x(
+        fused=fused_launch,
+        m=m,
+        topk=topk,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        direct_topk_routes=False,
+        sms=sms,
+    )
+    compiled = fused_launch.compiled
+    compiled(
+        make_ptr(
+            cutlass.Float16,
+            rotation_a_gate.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float16,
+            rotation_a_up.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            _cutlass_element_dtype(_normalize_element_dtype(a_input.dtype)),
+            a_input.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        prepared_tier0.w13.view(torch.int32).view(-1),
+        prepared_tier0.w2.view(torch.int32).view(-1),
+        prepared_tier0.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier0.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier0.w13_global_scale,
+        prepared_tier0.w2_global_scale,
+        prepared_tier1.w13.view(torch.int32).view(-1),
+        prepared_tier1.w2.view(torch.int32).view(-1),
+        prepared_tier1.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier1.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
+        prepared_tier1.w13_global_scale,
+        prepared_tier1.w2_global_scale,
+        packed_route_indices,
+        block_expert_ids,
+        packed_route_count,
+        tier_local_map,
+        fc1_out,
+        activated,
+        fc2_out,
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        fc1_scratch,
+        fc2_scratch,
+        workspace,
+        global_intermediate_rotations.view(-1),
+        global_suh_gate.view(-1),
+        global_suh_up.view(-1),
+        m,
+        grid_x,
+        cuda.CUstream(int(stream)),
+    )
+
+    expected_sum = (
+        topk,
+        hidden_size,
+        True,
+        map_slots,
+        0,
+        topk_ids.dtype,
+        False,
+    )
+    actual_sum = (
+        int(topk_sum_launch.topk),
+        int(topk_sum_launch.hidden_size),
+        bool(topk_sum_launch.full_rotation),
+        int(topk_sum_launch.num_experts),
+        int(topk_sum_launch.route_num_experts),
+        topk_sum_launch.route_ids_dtype,
+        bool(topk_sum_launch.use_expert_map),
+    )
+    if actual_sum != expected_sum:
+        raise ValueError(
+            f"mixed-K top-k sum launch mismatch: {actual_sum} != {expected_sum}"
+        )
+    _w4a16_topk_sum_launch_flat(
+        fc2_out,
+        output,
+        m,
+        topk,
+        hidden_size,
+        "fp16",
+        int(stream),
+        full_rotation=True,
+        num_experts=map_slots,
+        topk_weights=topk_weights,
+        route_expert_ids=topk_ids,
+        expert_map=None,
+        svh_table=global_svh_down,
+    )
+    return output
+
+
+_FULL_ROTATION_HYBRID_OP_HANDLES: dict[
+    int,
+    tuple[
+        W4A16FusedMoeFullRotationHybridCompileResult,
+        W4A16TopKSumCompileResult,
+        bool,
+    ],
+] = {}
+
+
+_FULL_ROTATION_HYBRID_OP_KEYS: dict[tuple[int, int, bool], int] = {}
+
+
+_FULL_ROTATION_HYBRID_OP_NEXT_HANDLE = 1
+
+
+def _register_full_rotation_hybrid_op_handle(
+    fused_launch: W4A16FusedMoeFullRotationHybridCompileResult,
+    topk_sum_launch: W4A16TopKSumCompileResult,
+    fast_math: bool,
+) -> int:
+    """Retain opaque launch objects behind a Dynamo-safe scalar handle."""
+
+    global _FULL_ROTATION_HYBRID_OP_NEXT_HANDLE
+    key = (id(fused_launch), id(topk_sum_launch), bool(fast_math))
+    handle = _FULL_ROTATION_HYBRID_OP_KEYS.get(key)
+    if handle is not None:
+        return handle
+    handle = _FULL_ROTATION_HYBRID_OP_NEXT_HANDLE
+    _FULL_ROTATION_HYBRID_OP_NEXT_HANDLE += 1
+    _FULL_ROTATION_HYBRID_OP_KEYS[key] = handle
+    _FULL_ROTATION_HYBRID_OP_HANDLES[handle] = (
+        fused_launch,
+        topk_sum_launch,
+        bool(fast_math),
+    )
+    return handle
+
+
+def _w4a16_fused_moe_full_rotation_hybrid_launch_op(
+    a_input: torch.Tensor,
+    t0_w13: torch.Tensor,
+    t0_w2: torch.Tensor,
+    t0_w13_scale: torch.Tensor,
+    t0_w2_scale: torch.Tensor,
+    t0_w13_global: torch.Tensor,
+    t0_w2_global: torch.Tensor,
+    t1_w13: torch.Tensor,
+    t1_w2: torch.Tensor,
+    t1_w13_scale: torch.Tensor,
+    t1_w2_scale: torch.Tensor,
+    t1_w13_global: torch.Tensor,
+    t1_w2_global: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_counts: torch.Tensor,
+    rotation_a_gate: torch.Tensor,
+    rotation_a_up: torch.Tensor,
+    global_intermediate_rotations: torch.Tensor,
+    global_suh_gate: torch.Tensor,
+    global_suh_up: torch.Tensor,
+    global_svh_down: torch.Tensor,
+    launch_handle: int,
+) -> None:
+    try:
+        fused_launch, topk_sum_launch, fast_math = _FULL_ROTATION_HYBRID_OP_HANDLES[
+            int(launch_handle)
+        ]
+    except KeyError as exc:
+        raise RuntimeError(
+            "full-rotation hybrid launch handle is not registered in this process"
+        ) from exc
+
+    def prepared(
+        *,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w13_global: torch.Tensor,
+        w2_global: torch.Tensor,
+        num_experts: int,
+        trellis_bits: int,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            weight_layout="trellis3_t256",
+            trellis_codebook="mcg",
+            trellis_bits=int(trellis_bits),
+            num_experts=int(num_experts),
+            hidden_size=int(fused_launch.hidden_size),
+            intermediate_size=int(fused_launch.intermediate_size),
+            params_dtype=torch.float16,
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_global_scale=w13_global,
+            w2_global_scale=w2_global,
+            workspace=workspace,
+        )
+
+    tier0 = prepared(
+        w13=t0_w13,
+        w2=t0_w2,
+        w13_scale=t0_w13_scale,
+        w2_scale=t0_w2_scale,
+        w13_global=t0_w13_global,
+        w2_global=t0_w2_global,
+        num_experts=fused_launch.tier0_num_experts,
+        trellis_bits=fused_launch.tier0_trellis_bits,
+    )
+    tier1 = prepared(
+        w13=t1_w13,
+        w2=t1_w2,
+        w13_scale=t1_w13_scale,
+        w2_scale=t1_w2_scale,
+        w13_global=t1_w13_global,
+        w2_global=t1_w2_global,
+        num_experts=fused_launch.tier1_num_experts,
+        trellis_bits=fused_launch.tier1_trellis_bits,
+    )
+    _run_w4a16_moe_full_rotation_hybrid_eager(
+        a_input,
+        tier0,
+        tier1,
+        topk_weights,
+        topk_ids,
+        tier_local_map,
+        activation=fused_launch.activation,
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=output,
+        fc1_c_tmp=fc1_c_tmp,
+        fc2_c_tmp=fc2_c_tmp,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        expert_offsets=expert_offsets,
+        expert_counts=expert_counts,
+        rotation_a_gate=rotation_a_gate,
+        rotation_a_up=rotation_a_up,
+        global_intermediate_rotations=global_intermediate_rotations,
+        global_suh_gate=global_suh_gate,
+        global_suh_up=global_suh_up,
+        global_svh_down=global_svh_down,
+        fused_launch=fused_launch,
+        topk_sum_launch=topk_sum_launch,
+        fast_math=fast_math,
+    )
+
+
+def _w4a16_fused_moe_full_rotation_hybrid_launch_fake(
+    a_input: torch.Tensor,
+    t0_w13: torch.Tensor,
+    t0_w2: torch.Tensor,
+    t0_w13_scale: torch.Tensor,
+    t0_w2_scale: torch.Tensor,
+    t0_w13_global: torch.Tensor,
+    t0_w2_global: torch.Tensor,
+    t1_w13: torch.Tensor,
+    t1_w2: torch.Tensor,
+    t1_w13_scale: torch.Tensor,
+    t1_w2_scale: torch.Tensor,
+    t1_w13_global: torch.Tensor,
+    t1_w2_global: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    workspace: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_counts: torch.Tensor,
+    rotation_a_gate: torch.Tensor,
+    rotation_a_up: torch.Tensor,
+    global_intermediate_rotations: torch.Tensor,
+    global_suh_gate: torch.Tensor,
+    global_suh_up: torch.Tensor,
+    global_svh_down: torch.Tensor,
+    launch_handle: int,
+) -> None:
+    return None
+
+
+def run_w4a16_moe_full_rotation_hybrid(
+    a_input: torch.Tensor,
+    prepared_tier0,
+    prepared_tier1,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    tier_local_map: torch.Tensor,
+    *,
+    activation: str,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_counts: torch.Tensor,
+    rotation_a_gate: torch.Tensor,
+    rotation_a_up: torch.Tensor,
+    global_intermediate_rotations: torch.Tensor,
+    global_suh_gate: torch.Tensor,
+    global_suh_up: torch.Tensor,
+    global_svh_down: torch.Tensor,
+    fused_launch: W4A16FusedMoeFullRotationHybridCompileResult,
+    topk_sum_launch: W4A16TopKSumCompileResult,
+    fast_math: bool = True,
+    stream: cuda.CUstream | None = None,
+) -> torch.Tensor:
+    """Run mixed full-rotation Trellis without an opaque custom-op boundary.
+
+    The registered-op experiment changed full-model scheduling and materially
+    reduced sustained speculative acceptance.  vLLM records the underlying
+    CuTe launches correctly in its outer CUDA graph, so retain the direct
+    launch path used by the last coherent baseline.
+    """
+
+    return _run_w4a16_moe_full_rotation_hybrid_eager(
+        a_input,
+        prepared_tier0,
+        prepared_tier1,
+        topk_weights,
+        topk_ids,
+        tier_local_map,
+        activation=activation,
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=output,
+        fc1_c_tmp=fc1_c_tmp,
+        fc2_c_tmp=fc2_c_tmp,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        expert_offsets=expert_offsets,
+        expert_counts=expert_counts,
+        rotation_a_gate=rotation_a_gate,
+        rotation_a_up=rotation_a_up,
+        global_intermediate_rotations=global_intermediate_rotations,
+        global_suh_gate=global_suh_gate,
+        global_suh_up=global_suh_up,
+        global_svh_down=global_svh_down,
+        fused_launch=fused_launch,
+        topk_sum_launch=topk_sum_launch,
+        fast_math=fast_math,
+        stream=stream,
+    )
+
+
 __all__ = [
     "W4A16ActivationCompileResult",
     "W4A16FusedMoeCompileResult",
     "W4A16FusedMoeHybridCompileResult",
+    "W4A16FusedMoeFullRotationHybridCompileResult",
     "W4A16GemmCompileResult",
     "W4A16TopKSumCompileResult",
     "W4A16FusedMoeKernel",
     "W4A16FusedMoeHybridKernel",
+    "W4A16FusedMoeFullRotationHybridKernel",
     "W4A16ActivationKernel",
     "W4A16GemmKernel",
     "W4A16TopKSumKernel",
@@ -11421,10 +12869,12 @@ __all__ = [
     "compile_w4a16_activation",
     "compile_w4a16_fused_moe",
     "compile_w4a16_fused_moe_hybrid",
+    "compile_w4a16_fused_moe_full_rotation_hybrid",
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
     "pack_topk_routes_by_expert",
     "run_trellis256_dense",
     "run_w4a16_moe",
     "run_w4a16_moe_hybrid",
+    "run_w4a16_moe_full_rotation_hybrid",
 ]
