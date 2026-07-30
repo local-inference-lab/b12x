@@ -173,6 +173,73 @@ def _check_eager(
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def _check_eager_adjacency(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    channel = pool.for_stream()
+    first_query = _rank_query(
+        700, rank, world_size, MAX_BATCH, torch.bfloat16, device
+    )
+    second_query = _rank_query(
+        701, rank, world_size, MAX_BATCH, torch.bfloat16, device
+    )
+    partial_output, partial_lse = _rank_inputs(
+        702, rank, 1, torch.bfloat16, device
+    )
+    first_gather = torch.empty(
+        MAX_BATCH,
+        TOTAL_HEADS,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    second_gather = torch.empty_like(first_gather)
+    reduced = torch.empty(
+        1,
+        TOTAL_HEADS // world_size,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    # Issue large-grid AG -> small-grid RS -> large-grid AG without a host
+    # synchronization so adjacent eager executions exercise slot advancement.
+    channel.all_gather_heads(first_query, first_gather)
+    channel.lse_reduce_scatter(partial_output, partial_lse, reduced)
+    channel.all_gather_heads(second_query, second_gather)
+    torch.cuda.synchronize(device)
+
+    expected_first = torch.cat(
+        [
+            _rank_query(
+                700, source, world_size, MAX_BATCH, torch.bfloat16, device
+            )
+            for source in range(world_size)
+        ],
+        dim=1,
+    )
+    expected_second = torch.cat(
+        [
+            _rank_query(
+                701, source, world_size, MAX_BATCH, torch.bfloat16, device
+            )
+            for source in range(world_size)
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(first_gather, expected_first, rtol=0, atol=0)
+    torch.testing.assert_close(second_gather, expected_second, rtol=0, atol=0)
+    torch.testing.assert_close(
+        reduced,
+        _reference(702, rank, world_size, 1, torch.bfloat16, device),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
 def _check_graph(
     pool: PCIeDCPA2APool,
     rank: int,
@@ -302,6 +369,52 @@ def _check_graph(
         for out, reference in zip(gathered_queries, expected_queries, strict=True):
             torch.testing.assert_close(out, reference, rtol=0, atol=0)
 
+    # One captured operation has odd capture-time parity. Adjacent A -> A
+    # replays must advance the device-owned slot at execution time.
+    odd_input = torch.empty(
+        1,
+        TOTAL_HEADS // world_size,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    odd_output = torch.empty(
+        1,
+        TOTAL_HEADS,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    with torch.cuda.stream(stream):
+        channel.all_gather_heads(odd_input, odd_output)
+    stream.synchronize()
+    dist.barrier()
+
+    odd_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(odd_graph, stream=stream):
+        channel.all_gather_heads(odd_input, odd_output)
+    stream.synchronize()
+
+    for replay in range(8):
+        step = 3000 + replay
+        odd_input.copy_(
+            _rank_query(step, rank, world_size, 1, torch.bfloat16, device)
+        )
+        expected = torch.cat(
+            [
+                _rank_query(
+                    step, source, world_size, 1, torch.bfloat16, device
+                )
+                for source in range(world_size)
+            ],
+            dim=1,
+        )
+        stream.wait_stream(torch.cuda.current_stream(device))
+        odd_graph.replay()
+        odd_graph.replay()
+        stream.synchronize()
+        torch.testing.assert_close(odd_output, expected, rtol=0, atol=0)
+
 
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
@@ -322,6 +435,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     )
     try:
         _check_eager(pool, rank, world_size, device)
+        dist.barrier()
+        _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
         _check_graph(pool, rank, world_size, device)
         torch.cuda.synchronize(device)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -95,6 +97,25 @@ def _make_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
         lse_capacity=4 * 32,
         ext_module=ext or _FakeExt(),
     )
+
+
+def test_cuda_staging_slot_is_selected_from_execution_state():
+    source = (
+        Path(__file__).parents[2]
+        / "sparkinfer"
+        / "comm"
+        / "pcie"
+        / "pcie_dcp_a2a.cu"
+    ).read_text()
+
+    assert "int slot_" not in source
+    assert "slot_++" not in source
+    assert (
+        source.count("load_flag(&self->self_counter[blockIdx.x][0])") == 2
+    )
+    assert "select_staging_slot_kernel" not in source
+    assert source.count("DoubleStaging staging_options") == 2
+    assert source.count("__shared__ RankStaging staging;") == 2
 
 
 def test_staging_layout_has_aligned_disjoint_slots():
