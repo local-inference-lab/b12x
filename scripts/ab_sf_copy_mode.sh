@@ -32,10 +32,10 @@ SHAPES="${SHAPES:-gate_up qkv down o}"
 
 if [[ "$MODE" == "decode" ]]; then
   M="${M:-1}"
-  ARM_FLAGS="--no-expanded --no-fp8"
+  ARM_FLAGS=(--no-expanded --no-fp8)
 else
   M="${M:-8192}"
-  ARM_FLAGS="--no-packed --no-fp8"
+  ARM_FLAGS=(--no-packed --no-fp8)
 fi
 
 mkdir -p "$OUT_DIR"
@@ -53,12 +53,12 @@ for shape in $SHAPES; do
   echo "=== $shape  M=$M N=$n K=$k ==="
   for arm in $ARMS; do
     log="$OUT_DIR/${MODE}_${shape}_${arm}.log"
-    SPARKINFER_DENSE_SF_COPY_MODE="$arm" \
+    if ! SPARKINFER_DENSE_SF_COPY_MODE="$arm" \
       "$PYTHON" "$ROOT/benchmarks/benchmark_dense_gemm_fp6.py" \
-        --m "$M" --n "$n" --k "$k" $ARM_FLAGS \
+        --m "$M" --n "$n" --k "$k" "${ARM_FLAGS[@]}" \
         --warmup 20 --iters 200 \
       >"$log" 2>&1
-    if [[ $? -ne 0 ]]; then
+    then
       echo "  $arm: FAILED (see $log)"
       tail -n 20 "$log" >&2
       continue

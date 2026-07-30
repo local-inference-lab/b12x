@@ -43,10 +43,10 @@ SHAPES="${SHAPES:-gate_up qkv down o}"
 
 if [[ "$MODE" == "decode" ]]; then
   M="${M:-1}"
-  ARM_FLAGS="--no-expanded --no-fp8"
+  ARM_FLAGS=(--no-expanded --no-fp8)
 else
   M="${M:-8192}"
-  ARM_FLAGS="--no-packed --no-fp8"
+  ARM_FLAGS=(--no-packed --no-fp8)
 fi
 
 if ! command -v nvdisasm >/dev/null 2>&1; then
@@ -79,7 +79,7 @@ for shape in $SHAPES; do
   SPARKINFER_COMPILE_DISK_CACHE=1 \
   SPARKINFER_DENSE_SF_COPY_MODE="${SF_COPY:-autovec}" \
     "$PYTHON" "$ROOT/benchmarks/benchmark_dense_gemm_fp6.py" \
-      --m "$M" --n "$n" --k "$k" $ARM_FLAGS \
+      --m "$M" --n "$n" --k "$k" "${ARM_FLAGS[@]}" \
       --warmup 2 --iters 2 --no-check \
     >"$OUT_DIR/$tag.bench.log" 2>&1
   rc=$?
