@@ -6185,9 +6185,7 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from sparkinfer.moe._shared.kernels.w4a16.host import (
-        max_packed_route_slots,
-    )
+    from sparkinfer.moe._shared.kernels.w4a16.host import route_pack_capacity
     from sparkinfer.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         compile_w4a16_fused_moe,
@@ -6216,14 +6214,13 @@ def _plan_full_rotation_w4a16_launches(
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
     w13_layout = "trellis3_t256_proj"
-    capacity_route_slots = max_packed_route_slots(
+    _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
         core_plan.route_E,
+        topk=core_plan.num_topk,
+        bucket_tokens=False,
     )
-    capacity_m_blocks = (
-        capacity_route_slots + block_size_m - 1
-    ) // block_size_m
     rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
 
     with torch.cuda.device(core_plan.device):
@@ -6548,6 +6545,7 @@ def _prewarm_w4a16_planned_launches(
                 block_size_m,
                 workspace.route_E,
                 topk=workspace.num_topk,
+                bucket_tokens=not full_rotation,
             )
             t_shape = time.perf_counter() if _SPARKINFER_TIMING else 0.0
             fused_key = (

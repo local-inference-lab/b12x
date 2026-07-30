@@ -130,7 +130,7 @@ def test_w4a16_capture_guard_preserves_current_stream_capture(
         (4097, 8192),
     ),
 )
-def test_w4a16_planner_runtime_route_key_agrees_at_bucket_boundaries(
+def test_generic_w4a16_planner_runtime_key_agrees_at_bucket_boundaries(
     tokens: int,
     bucket_tokens: int,
 ) -> None:
@@ -157,7 +157,28 @@ def test_w4a16_planner_runtime_route_key_agrees_at_bucket_boundaries(
         assert max_m_blocks == 670
 
 
-def test_w4a16_capture_prewarm_uses_runtime_bucket_key(
+def test_trellis_w4a16_planner_runtime_key_preserves_exact_capacity() -> None:
+    topk = 8
+    block_size = 64
+    num_experts = 160
+    routed_capacity, packed_routes, max_m_blocks = route_pack_capacity(
+        3072 * topk,
+        block_size,
+        num_experts,
+        topk=topk,
+        bucket_tokens=False,
+    )
+
+    assert routed_capacity == 3072 * topk
+    assert packed_routes == max_packed_route_slots(
+        3072 * topk,
+        block_size,
+        num_experts,
+    )
+    assert max_m_blocks == 542
+
+
+def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from contextlib import nullcontext
@@ -169,7 +190,7 @@ def test_w4a16_capture_prewarm_uses_runtime_bucket_key(
     workspace = SimpleNamespace(
         device=torch.device("cuda"),
         dtype=torch.bfloat16,
-        full_rotation=False,
+        full_rotation=True,
         route_block_size_m=64,
         num_topk=8,
         route_E=160,
@@ -215,14 +236,17 @@ def test_w4a16_capture_prewarm_uses_runtime_bucket_key(
         swiglu_limit=None,
         swiglu_alpha=1.0,
         swiglu_beta=1.0,
-        collect_activation_amax=True,
+        scale_format="e4m3_k32",
+        weight_layout="trellis3_t256",
+        w13_layout="trellis3_t256_proj",
+        collect_activation_amax=False,
     )
 
-    assert len(fused_calls) == 1
-    assert fused_calls[0]["size_m"] == 3072
-    assert fused_calls[0]["max_m_blocks"] == 670
+    assert len(fused_calls) == 2
+    assert {call["size_m"] for call in fused_calls} == {3072}
+    assert {call["max_m_blocks"] for call in fused_calls} == {542}
     assert workspace.planned_fused_moe_launches[
-        ("packed", "e4m3_k16", 3072, True)
+        ("trellis3_t256", "e4m3_k32", 3072, False)
     ] is resolved_fused
 
 
