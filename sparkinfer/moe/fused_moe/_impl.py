@@ -6182,10 +6182,11 @@ def _plan_full_rotation_w4a16_launches(
         return (), ()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA must be available before planning Trellis MoE")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Trellis launch planning cannot run during capture")
 
     from sparkinfer.moe._shared.kernels.w4a16.host import (
         max_packed_route_slots,
-        select_route_block_size_m,
     )
     from sparkinfer.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
@@ -6195,11 +6196,26 @@ def _plan_full_rotation_w4a16_launches(
     )
 
     capacity_tokens = max(int(capacity_tokens), 1)
-    block_size_m = core_plan.route_block_size_m or select_route_block_size_m(
-        capacity_tokens,
-        core_plan.num_topk,
-        core_plan.route_E,
+    if not core_plan.route_block_size_m:
+        raise RuntimeError(
+            "Trellis launch planning requires the arena's route_block_size_m"
+        )
+    block_size_m = int(core_plan.route_block_size_m)
+    weight_layout = _normalize_w4a16_weight_layout(
+        caps.w4a16_weight_layout
+        or _w4a16_weight_layout_for_source(caps.source_format)
     )
+    scale_format = _normalize_w4a16_scale_format(
+        caps.w4a16_scale_format
+        or _w4a16_scale_format_for_source(caps.source_format)
+    )
+    if weight_layout != "trellis3_t256" or scale_format != "e4m3_k32":
+        raise RuntimeError(
+            "full-rotation Trellis launch planning requires "
+            "weight_layout='trellis3_t256' and scale_format='e4m3_k32'; "
+            f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
+        )
+    w13_layout = "trellis3_t256_proj"
     capacity_route_slots = max_packed_route_slots(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
@@ -6251,9 +6267,9 @@ def _plan_full_rotation_w4a16_launches(
                 swiglu_limit=core_plan.swiglu_limit,
                 swiglu_alpha=core_plan.swiglu_alpha,
                 swiglu_beta=core_plan.swiglu_beta,
-                weight_layout="trellis3_t256",
-                scale_format="e4m3_k32",
-                w13_layout="trellis3_t256_proj",
+                weight_layout=weight_layout,
+                scale_format=scale_format,
+                w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
@@ -6284,8 +6300,6 @@ def _plan_full_rotation_w4a16_launches(
             for ids_dtype in (torch.int32, torch.int64)
             for mapped in (False, True)
         )
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Trellis route-pack prewarm cannot run during capture")
         for mapped in (False, True):
             route_pack_key = (
                 core_plan.device.type,

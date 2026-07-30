@@ -557,8 +557,52 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     assert plan.layout.core_token_counts[0] == 3072
     assert 4096 not in plan.layout.core_token_counts
     assert plan.layout.route_workspace_nbytes == 0
-    assert plan.layout.core_workspace_nbytes < 1060 * (1 << 20)
+    assert 1000 * (1 << 20) < plan.layout.core_workspace_nbytes < 1060 * (1 << 20)
     assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
+    """The real planner must cover every fixed decode and route-pack variant."""
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=8,
+            device="cuda",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+        )
+    )
+
+    assert tuple(tokens for tokens, _launch in plan._prewarmed_fused_launches) == (
+        1,
+        2,
+        3,
+        4,
+    )
+    assert {
+        (ids_dtype, mapped)
+        for ids_dtype, mapped, _launch in plan._prewarmed_topk_sum_launches
+    } == {
+        (torch.int32, False),
+        (torch.int32, True),
+        (torch.int64, False),
+        (torch.int64, True),
+    }
 
 
 def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
