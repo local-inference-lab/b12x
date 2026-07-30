@@ -125,6 +125,47 @@ def test_scratch_reuse_and_growth(monkeypatch):
 
 
 @cuda_required
+def test_capture_claims_an_eager_buffer(monkeypatch):
+    """Capture reuses an eager buffer instead of allocating in the graph pool.
+
+    The scratch key carries the stream, so a capture stream can never match the
+    eager entry directly; without the claim it would allocate an unplanned
+    buffer into the graph's private pool on every capture.
+    """
+    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+
+    monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
+    fdw._EXPAND_SCRATCH.clear()
+    fdw._EXPAND_CAPTURE_ASSIGNED.clear()
+    fdw._EXPAND_CAPTURE_CLAIMED.clear()
+
+    device = torch.device("cuda")
+    eager = fdw._packed_expand_scratch(1 << 20, device)
+    assert len(fdw._EXPAND_SCRATCH) == 1
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    claimed = fdw._packed_expand_scratch(1 << 19, device)
+
+    assert claimed is eager
+    assert len(fdw._EXPAND_SCRATCH) == 1
+
+
+@cuda_required
+def test_capture_refuses_to_allocate_unplanned_scratch(monkeypatch):
+    """No eager buffer big enough: fail loudly rather than allocate in-graph."""
+    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+
+    monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
+    fdw._EXPAND_SCRATCH.clear()
+    fdw._EXPAND_CAPTURE_ASSIGNED.clear()
+    fdw._EXPAND_CAPTURE_CLAIMED.clear()
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="no eager buffer"):
+        fdw._packed_expand_scratch(1 << 20, torch.device("cuda"))
+
+
+@cuda_required
 def test_small_m_stays_packed(monkeypatch):
     """Decode-regime calls (m <= 16) must not touch the expansion scratch."""
     import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw

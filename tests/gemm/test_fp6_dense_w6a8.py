@@ -164,15 +164,13 @@ def test_fused_quant_matches_unfused(m, n, k, monkeypatch):
 
     assert y_fused.shape == y_unfused.shape
     assert torch.isfinite(y_fused).all()
+    # Both arms are bit-identical at every m: at m=1 the two paths derive the
+    # same per-tensor scale, and above m=1 the flag is inert. The cosine is a
+    # readable first failure message; assert_close at zero tolerance is the
+    # gate, and no m gets a tolerance — that would re-admit the per-tensor
+    # downgrade this parametrization exists to forbid.
     cos = _cos(y_fused, y_unfused)
-    if m == 1:
-        # m=1: both paths use per-tensor scaling → bit-identical.
-        assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
-    else:
-        # m>1: the flag is inert, so this is the same kernel on the same
-        # per-row inputs. A cosine tolerance here would re-admit the
-        # per-tensor downgrade this parametrization exists to forbid.
-        assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
+    assert cos > 0.999, f"fused/unfused cosine sim {cos:.6f} < 0.999"
     torch.testing.assert_close(y_fused, y_unfused, rtol=0, atol=0)
 
 

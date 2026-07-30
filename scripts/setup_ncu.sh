@@ -141,7 +141,9 @@ if ! "$PYTHON" -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() el
   say "  expose the knob, so a skip cannot be reported as ready."
 else
   TMP_OUT="$(mktemp)"
-  set +e
+  # No set -e restore here: this script runs under `set -uo pipefail`, so
+  # errexit was never on. Enabling it after the probe would abort before the
+  # diagnostics and the final readiness verdict get printed.
   "$NCU" --target-processes all --metrics sm__cycles_elapsed.avg \
     --kernel-name-base function --launch-count 1 \
     "$PYTHON" -c '
@@ -150,7 +152,6 @@ a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
 (a @ a).sum().item()
 ' >"$TMP_OUT" 2>&1
   rc=$?
-  set -e
   if grep -q 'ERR_NVGPUCTRPERM' "$TMP_OUT"; then
     fail "ERR_NVGPUCTRPERM - counters still admin-restricted (step 3 not applied or not rebooted)."
   elif [[ $rc -ne 0 ]]; then

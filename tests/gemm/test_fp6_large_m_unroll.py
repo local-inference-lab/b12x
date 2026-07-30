@@ -38,9 +38,27 @@ def test_fp6_large_m_unroll_bit_exact(weight_form, m, k, monkeypatch):
     else:
         weight = fp6w.expanded_weight()
 
+    # Same guard as test_sf_copy_mode_is_bit_identical: the unroll changes
+    # codegen, so if it ever falls out of the compile-cache key both arms
+    # collapse onto one kernel and this compares a path against itself.
+    resolved: list[object] = []
+    _resolve = dg._get_compiled_dense_gemm_mxfp6
+
+    def _spy(*spy_args, **spy_kwargs):
+        compiled = _resolve(*spy_args, **spy_kwargs)
+        resolved.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(dg, "_get_compiled_dense_gemm_mxfp6", _spy)
+
     monkeypatch.setattr(dg, "_SPARKINFER_FP6_LARGE_M_UNROLL", False)
     y_ref = fdw.dense_fp6_linear_expanded(x, weight, *args)
     monkeypatch.setattr(dg, "_SPARKINFER_FP6_LARGE_M_UNROLL", True)
     y_unrolled = fdw.dense_fp6_linear_expanded(x, weight, *args)
 
+    assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
+    assert resolved[0] is not resolved[1], (
+        "unroll=2 and unroll=4 resolved the SAME compiled kernel; the compile "
+        "cache key is blind to the unroll flag, so this comparison is vacuous"
+    )
     torch.testing.assert_close(y_unrolled, y_ref, rtol=0.0, atol=0.0)

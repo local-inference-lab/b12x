@@ -68,7 +68,11 @@ from benchmarks.fp6_common import (
     fmt_us,
 )
 from sparkinfer._lib.dense_gemm import dense_gemm
-from sparkinfer._lib.fp6 import SF_VEC_SIZE_FP6, as_grouped_mxfp6_scale_view
+from sparkinfer._lib.fp6 import (
+    SF_VEC_SIZE_FP6,
+    as_grouped_mxfp6_scale_view,
+    mx_gs_numerator,
+)
 from sparkinfer.quantization.mxfp6.fp6_dense_weights import (
     _TILE,
     _quantize_matrix_fp6_bytes,
@@ -87,6 +91,10 @@ BEHEMOTH_TP2_SHAPES: dict[str, tuple[int, int]] = {
 DEFAULT_M_SWEEP = (1, 2, 4, 8, 16, 2048, 4096, 8192)
 FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 FP8_BLOCK = 128
+# The FP8 arm reports under whichever kernel actually ran. Only a genuine
+# vLLM blockwise CUTLASS result carries the CUTLASS name.
+FP8_CUTLASS_ARM = "fp8_cutlass"
+FP8_CUBLASLT_ARM = "fp8_cublaslt_pertensor"
 
 
 @dataclass(frozen=True)
@@ -182,7 +190,7 @@ def _setup_w6a8_operands(m: int, n: int, k: int, *, seed: int):
     # Per-tensor activation GS (GEMM-only microbench; per-row host chain is
     # attributed separately in the serving-profile Phase-A arm).
     a_amax = torch.linalg.vector_norm(x, ord=float("inf")).to(torch.float32)
-    a_gs = (FLOAT8_E4M3_MAX * 28.0 / a_amax.clamp_min(1e-6)).reshape(1)
+    a_gs = (mx_gs_numerator("e4m3") / a_amax.clamp_min(1e-6)).reshape(1)
     m_pad = _pad_m(m)
     x_pad = torch.zeros(m_pad, k, dtype=torch.bfloat16, device=device)
     x_pad[:m].copy_(x)
@@ -392,23 +400,27 @@ def _run_fp8_cutlass_arm(
     l2_flush,
     check: bool,
 ) -> ArmResult:
+    # Renamed on the fallback path below: a cuBLASLt per-tensor result recorded
+    # under the CUTLASS label reads as vLLM's blockwise serving kernel when it
+    # is neither blockwise nor vLLM's, and one FP8 reference was misquoted that
+    # way already.
+    arm_name = FP8_CUTLASS_ARM
     cutlass_mm = _try_import_cutlass_scaled_mm()
     if cutlass_mm is None:
         return ArmResult(
-            name="fp8_cutlass",
+            name=arm_name,
             median_us=float("nan"),
             min_us=float("nan"),
             raw_ms=[],
             cosine=None,
             skipped="vLLM cutlass_scaled_mm not importable in this env",
         )
-    if m % FP8_BLOCK != 0 and m not in (1, 2, 4, 8, 16):
-        # Pad M up for blockwise scale layouts that require 128 alignment on A
-        # scales in some vLLM builds; decode Ms stay as-is and may still work.
-        pass
+    # Unaligned M is left alone: some vLLM builds want 128-aligned A scales for
+    # the blockwise layout, but decode Ms often work anyway, and a failure here
+    # is caught by the launch probe below rather than pre-empted.
     if k % FP8_BLOCK != 0 or n % FP8_BLOCK != 0:
         return ArmResult(
-            name="fp8_cutlass",
+            name=arm_name,
             median_us=float("nan"),
             min_us=float("nan"),
             raw_ms=[],
@@ -448,7 +460,7 @@ def _run_fp8_cutlass_arm(
             fallback = _make_torch_scaled_mm_launch(a_q, b_q, out)
             if fallback is None:
                 return ArmResult(
-                    name="fp8_cutlass",
+                    name=arm_name,
                     median_us=float("nan"),
                     min_us=float("nan"),
                     raw_ms=[],
@@ -458,14 +470,12 @@ def _run_fp8_cutlass_arm(
                         "; torch._scaled_mm fallback also unavailable"
                     ),
                 )
-            # Printed, not silent: the arm keeps its name so the ratio summary
-            # still resolves, so the log is the only place recording that these
-            # timings are cuBLASLt and not vLLM's kernel.
             print(
                 "fp8 arm: cutlass_scaled_mm rejected the call "
                 f"({type(exc).__name__}); using torch._scaled_mm (cuBLASLt) "
-                "with per-tensor scales instead"
+                f"with per-tensor scales instead, recorded as {FP8_CUBLASLT_ARM}"
             )
+            arm_name = FP8_CUBLASLT_ARM
             launch = fallback
             check = False
 
@@ -474,12 +484,12 @@ def _run_fp8_cutlass_arm(
         times = _bench_events(replay, warmup=warmup, iters=iters, l2_flush=l2_flush)
     except Exception as exc:
         return ArmResult(
-            name="fp8_cutlass",
+            name=arm_name,
             median_us=float("nan"),
             min_us=float("nan"),
             raw_ms=[],
             cosine=None,
-            skipped=f"cutlass replay failed: {type(exc).__name__}: {exc}",
+            skipped=f"{arm_name} replay failed: {type(exc).__name__}: {exc}",
         )
 
     cos: Optional[float] = None
@@ -487,7 +497,7 @@ def _run_fp8_cutlass_arm(
         cos = _cosine(out, oracle)
         if cos < 0.95:
             return ArmResult(
-                name="fp8_cutlass",
+                name=arm_name,
                 median_us=_med_us(times),
                 min_us=_min_us(times),
                 raw_ms=list(times),
@@ -495,7 +505,7 @@ def _run_fp8_cutlass_arm(
                 skipped=f"correctness gate failed: cos={cos:.5f} < 0.95",
             )
     return ArmResult(
-        name="fp8_cutlass",
+        name=arm_name,
         median_us=_med_us(times),
         min_us=_min_us(times),
         raw_ms=list(times),
@@ -607,6 +617,7 @@ def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
     )
 
     rows: list[dict] = []
+    mismatches: list[str] = []
     for label, n, k, m_list in shapes:
         for m in m_list:
             operands = _setup_w6a8_operands(m, n, k, seed=args.seed)
@@ -652,6 +663,8 @@ def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
                     bit = "ref"
                 else:
                     bit = "OK" if torch.equal(out, ref_out) else "DIFF"
+                    if bit == "DIFF":
+                        mismatches.append(f"{label} M={m} tile={tile_s}")
                 vs = (
                     f"{arm.median_us / ref_us:.2f}x"
                     if ref_us == ref_us and ref_us > 0
@@ -693,6 +706,15 @@ def _run_tile_sweep(args: argparse.Namespace, l2_flush, header: dict) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(f"\nWrote {out_path}")
+
+    # After the JSON so the evidence survives the failure. A tile only changes
+    # which CTA owns which output element, never accumulation order, so a DIFF
+    # is a kernel bug and the sweep timings below it are not comparable.
+    if mismatches:
+        raise SystemExit(
+            "tile sweep produced non-bit-identical output vs the first tile: "
+            + "; ".join(mismatches)
+        )
 
 
 def main() -> None:
@@ -898,7 +920,9 @@ def main() -> None:
     for (shape, m, _n, _k), arms_us in by_key.items():
         exp = arms_us.get("fp6_expanded")
         pk = arms_us.get("fp6_packed")
-        fp8 = arms_us.get("fp8_cutlass")
+        fp8 = arms_us.get(FP8_CUTLASS_ARM)
+        if fp8 is None:
+            fp8 = arms_us.get(FP8_CUBLASLT_ARM)
         def _r(a: Optional[float], b: Optional[float]) -> str:
             if a is None or b is None or b <= 0:
                 return "n/a"

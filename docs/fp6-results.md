@@ -53,9 +53,9 @@ the covered Linears.
 Kullback-Leibler divergence of the FP6 model's logits against the BF16
 reference model, wikitext-2-raw-v1, context 2048, stride 512, deterministic
 eager scoring (`TORCH_COMPILE_DISABLE=1` and `VLLM_USE_V2_MODEL_RUNNER=0`).
-Rows carry different dates; the MoE row is still the Jul 23 measurement and
-has not been re-checked against the current nightly, so it may carry the same
-drift the Qwen row just did.
+Both Qwen rows were re-baselined on Jul 29 against the current nightly; the
+Behemoth row is the Jul 28 value, reproduced exactly across the 3.6c epilogue
+change.
 
 | Model | Mean KLD | Determinism |
 |---|---|---|
@@ -100,6 +100,10 @@ Notes:
   activation path, which SparkInfer does not own. Not isolated further, since
   the shift is small, in the favourable direction, and outside our code.
   Behemoth is unaffected because its 0.009547 baseline was taken recently.
+* Jul 29 MoE re-baseline, 0.015388 -> 0.014908, same picture and not isolated
+  separately: two runs agree exactly, the shift is small and favourable, and
+  the epilogue work never reached the MoE kernels at all (3.6d), so it tracks
+  the same nightly drift as the dense row.
 * History: prior to Jul 23 the constants were 0.034423 (dense) and 0.011016
   (MoE), measured with torch's not-always-correctly-rounded CUDA f32
   division in the per-row scale chain. The chain now uses correctly rounded
@@ -130,8 +134,9 @@ the 7.5x phantom prefill it produces otherwise.
 
 **Two harnesses appear in this section and their columns are not
 interchangeable.** Sections 3.1-3.4 report TTFT and an amortized output tok/s;
-3.1b and 3.5 use the later true-prefill sweep script, which separates prefill
-throughput from decode. The older TTFT column is not a prefill measurement:
+3.1b, 3.3b and 3.5 use the later true-prefill sweep script shown above, which
+separates prefill throughput from decode. The older TTFT column is not a
+prefill measurement:
 3.1 records 449 ms for a 32k prefill, i.e. ~73k tok/s, which on a 27B dense
 model is about 3.9 PFLOP/s and therefore above what the card can deliver.
 Prefix caching was evidently on. Compare within a harness, never across.

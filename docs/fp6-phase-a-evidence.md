@@ -14,8 +14,10 @@ checklist; the Windows workspace only authors the tooling.
    summarized by [`scripts/summarize_vllm_trace.py`](../scripts/summarize_vllm_trace.py)
    into GEMM / act-quant / host GS / allreduce / attention budgets.
 
-Do **not** claim Phase-B wins until both artifacts exist with the evidence
-header (command, commit, GPU UUID/mode, raw timings, ratio direction).
+Do **not** claim Phase-B wins until both artifacts exist with the complete
+evidence header: command, commit, worktree, GPU UUID and mode, correctness
+state, raw timings, and ratio direction. A header missing any one of these is
+not evidence.
 
 ## 1. GEMM microbench
 
@@ -54,7 +56,8 @@ inside the vLLM serving venv (not a bare sparkinfer venv).
 ## 2. Serving profile (both quants)
 
 Launch both servers with profiler endpoints enabled (`PROFILE=1` is already
-wired in the PhaeDawg launch scripts):
+wired into the `behemoth123b-r1-v2-fp6.sh` and `behemoth123b-r1-v2-fp8.sh`
+launch scripts used below):
 
 ```bash
 # Terminal A — FP6

@@ -26,8 +26,8 @@ MODE="${MODE:-prefill}"
 ARMS="${ARMS:-off recast32}"
 OUT_DIR="${OUT_DIR:-/tmp/fp6_sfcopy_ab_$(date +%Y%m%d_%H%M%S)}"
 
-declare -A SHAPE_N=([qkv]=7168  [o]=12288 [gate_up]=28672 [down]=12288)
-declare -A SHAPE_K=([qkv]=12288 [o]=6144  [gate_up]=12288 [down]=14336)
+# shellcheck source=scripts/_behemoth_tp2_shapes.sh
+source "$ROOT/scripts/_behemoth_tp2_shapes.sh"
 SHAPES="${SHAPES:-gate_up qkv down o}"
 
 if [[ "$MODE" == "decode" ]]; then
@@ -44,9 +44,11 @@ echo "mode=$MODE  M=$M  arms='$ARMS'  out=$OUT_DIR"
 # Each arm is a separate PROCESS: the compiled-kernel cache is per-process and
 # sf_copy_mode is read once at import.
 for shape in $SHAPES; do
-  n="${SHAPE_N[$shape]}"
-  k="${SHAPE_K[$shape]}"
-  [[ -z "$n" ]] && { echo "unknown shape '$shape'" >&2; continue; }
+  # :- so an unknown shape reaches the guard below; set -u would otherwise
+  # abort the whole sweep on the missing key.
+  n="${SHAPE_N[$shape]:-}"
+  k="${SHAPE_K[$shape]:-}"
+  [[ -z "$n" || -z "$k" ]] && { echo "unknown shape '$shape'" >&2; continue; }
   echo ""
   echo "=== $shape  M=$M N=$n K=$k ==="
   for arm in $ARMS; do

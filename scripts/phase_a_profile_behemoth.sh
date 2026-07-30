@@ -7,9 +7,12 @@
 #     (PROFILE=1 is what registers /start_profile and /stop_profile; without it
 #      the capture aborts with a 404)
 #   - FP8 server already up on BASE_FP8 (default :8001), same PROFILE=1 rule
-#     with its own PROFILE_DIR
-#   - Export PROFILE_DIR here too so the traces get collected; they are written
-#     by the server into PROFILE_DIR, never into OUT_ROOT
+#     with its OWN, DIFFERENT PROFILE_DIR
+#   - Export PROFILE_DIR_FP6 and PROFILE_DIR_FP8 here, matching each server's
+#     PROFILE_DIR, so the traces get collected per arm; they are written by the
+#     server into its PROFILE_DIR, never into OUT_ROOT. A single shared
+#     PROFILE_DIR (the legacy PROFILE_DIR fallback) makes the two arms'
+#     traces indistinguishable and silently invalidates the comparison.
 #   - API key in VLLM_API_KEY or as $1
 #
 # Captures:
@@ -62,6 +65,9 @@ capture_one() {
   local tag="$1" base="$2" model="$3" mode="$4" max_tokens="$5" prompt_file="$6"
   local out="$OUT_ROOT/${tag}_${mode}"
   mkdir -p "$out"
+  # Per-arm profile dir, falling back to the legacy shared one.
+  local dir_var="PROFILE_DIR_${tag^^}"
+  local profile_dir="${!dir_var:-${PROFILE_DIR:-}}"
   echo "=== capture ${tag} ${mode} -> ${out} ==="
   "$PYTHON" "$ROOT/scripts/capture_vllm_native_profile.py" \
     --base-url "$base" \
@@ -71,11 +77,11 @@ capture_one() {
     --max-tokens "$max_tokens" \
     --capture-seconds "${CAPTURE_SECONDS:-8}" \
     --out-dir "$out" \
-    --mode decode
-  # Copy any traces the server wrote into PROFILE_DIR if the user exported one.
-  if [[ -n "${PROFILE_DIR:-}" && -d "$PROFILE_DIR" ]]; then
+    --mode "$mode"
+  # Copy any traces the server wrote into its profile dir, if one was exported.
+  if [[ -n "$profile_dir" && -d "$profile_dir" ]]; then
     mkdir -p "$out/traces"
-    find "$PROFILE_DIR" -type f \( -name '*.pt.trace.json.gz' -o -name '*.pt.trace.json' \) \
+    find "$profile_dir" -type f \( -name '*.pt.trace.json.gz' -o -name '*.pt.trace.json' \) \
       -newer "$out" -exec cp -t "$out/traces" {} + 2>/dev/null || true
   fi
 }
@@ -98,8 +104,10 @@ echo "=== summarizing traces under $OUT_ROOT ==="
 "$PYTHON" "$ROOT/scripts/summarize_vllm_trace.py" "$OUT_ROOT" \
   --json-out "$OUT_ROOT/attribution.json" || {
   echo "WARN: no traces found under $OUT_ROOT yet." >&2
-  echo "If the server used PROFILE_DIR, re-run summarize with that path:" >&2
-  echo "  $PYTHON $ROOT/scripts/summarize_vllm_trace.py \"\$PROFILE_DIR\" --json-out $OUT_ROOT/attribution.json" >&2
+  echo "If the servers wrote elsewhere, summarize each arm separately so the" >&2
+  echo "two are not pooled into one attribution:" >&2
+  echo "  $PYTHON $ROOT/scripts/summarize_vllm_trace.py \"\$PROFILE_DIR_FP6\" --json-out $OUT_ROOT/attribution_fp6.json" >&2
+  echo "  $PYTHON $ROOT/scripts/summarize_vllm_trace.py \"\$PROFILE_DIR_FP8\" --json-out $OUT_ROOT/attribution_fp8.json" >&2
 }
 
 # Evidence stub for the evidence notebook / PR comment.

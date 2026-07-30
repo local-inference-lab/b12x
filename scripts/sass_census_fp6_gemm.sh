@@ -37,8 +37,8 @@ PYTHON="${PYTHON:-python3}"
 MODE="${MODE:-prefill}"
 OUT_DIR="${OUT_DIR:-/tmp/fp6_sass_$(date +%Y%m%d_%H%M%S)}"
 
-declare -A SHAPE_N=([qkv]=7168  [o]=12288 [gate_up]=28672 [down]=12288)
-declare -A SHAPE_K=([qkv]=12288 [o]=6144  [gate_up]=12288 [down]=14336)
+# shellcheck source=scripts/_behemoth_tp2_shapes.sh
+source "$ROOT/scripts/_behemoth_tp2_shapes.sh"
 SHAPES="${SHAPES:-gate_up qkv down o}"
 
 if [[ "$MODE" == "decode" ]]; then
@@ -58,9 +58,11 @@ mkdir -p "$OUT_DIR"
 echo "mode=$MODE  M=$M  out=$OUT_DIR"
 
 for shape in $SHAPES; do
-  n="${SHAPE_N[$shape]}"
-  k="${SHAPE_K[$shape]}"
-  [[ -z "$n" ]] && { echo "unknown shape '$shape'" >&2; continue; }
+  # :- so an unknown shape reaches the guard below; set -u would otherwise
+  # abort the whole sweep on the missing key.
+  n="${SHAPE_N[$shape]:-}"
+  k="${SHAPE_K[$shape]:-}"
+  [[ -z "$n" || -z "$k" ]] && { echo "unknown shape '$shape'" >&2; continue; }
 
   tag="${MODE}_${shape}_m${M}"
   # One shape per cache directory. The census walks every object it is given,

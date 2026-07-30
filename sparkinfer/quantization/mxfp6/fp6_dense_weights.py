@@ -191,10 +191,22 @@ _PACKED_B_EXPAND_LARGE_M = os.getenv(
 # hits the largest shape before any capture, so growth after warmup is rare).
 _EXPAND_SCRATCH: dict[tuple, torch.Tensor] = {}
 _EXPAND_SCRATCH_RETIRED: list[torch.Tensor] = []
+# Capture-stream assignments, mirroring _CAPTURE_ASSIGNED above: capture runs
+# on its own stream, so the eager key can never match and a capture would
+# otherwise allocate a fresh unplanned buffer into the graph's private pool on
+# every pass. One eager buffer per capture stream, never shared between two.
+_EXPAND_CAPTURE_ASSIGNED: dict[tuple, torch.Tensor] = {}
+_EXPAND_CAPTURE_CLAIMED: dict[tuple, list[int]] = {}
 
 
 def _packed_expand_scratch(nbytes: int, device: torch.device) -> torch.Tensor:
-    """Grow-only per-(device, stream) uint8 scratch for large-M expansion."""
+    """Grow-only per-(device, stream) uint8 scratch for large-M expansion.
+
+    Under graph capture the buffer must already exist: capture CLAIMS an eager
+    buffer big enough for the request and fails loudly when none is, because
+    that means the workspace was never sized by a warm-up pass and the graph
+    would bake in an allocation whose capacity nothing planned.
+    """
     capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
     stream = (
         torch.cuda.current_stream(device).cuda_stream
@@ -202,6 +214,27 @@ def _packed_expand_scratch(nbytes: int, device: torch.device) -> torch.Tensor:
         else 0
     )
     key = (device.type, device.index or 0, stream)
+    dev_key = (device.type, device.index or 0)
+    if _PERSISTENT_SCRATCH and capturing:
+        assigned = _EXPAND_CAPTURE_ASSIGNED.get(key)
+        if assigned is not None and assigned.numel() >= nbytes:
+            return assigned
+        claimed = _EXPAND_CAPTURE_CLAIMED.setdefault(dev_key, [])
+        for (dev_type, dev_index, _s), cand in _EXPAND_SCRATCH.items():
+            if (
+                (dev_type, dev_index) == dev_key
+                and cand.numel() >= nbytes
+                and id(cand) not in claimed
+            ):
+                _EXPAND_CAPTURE_ASSIGNED[key] = cand
+                claimed.append(id(cand))
+                return cand
+        raise RuntimeError(
+            f"large-M packed expansion needs {nbytes} B of scratch during CUDA "
+            "graph capture, but no eager buffer that size exists to claim. Run "
+            "an eager forward at the largest prefill shape before capture, or "
+            "set SPARKINFER_PACKED_B_EXPAND_LARGE_M=0."
+        )
     buf = _EXPAND_SCRATCH.get(key)
     if buf is not None and buf.numel() >= nbytes:
         return buf

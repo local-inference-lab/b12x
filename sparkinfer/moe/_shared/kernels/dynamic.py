@@ -1183,27 +1183,6 @@ class MoEDynamicKernelBackend:
         # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
         while self.ab_stage > 1 and 32 % self.ab_stage != 0:
             self.ab_stage -= 1
-        # The resolved depth, not the one dense suggested: max_fit above may
-        # have cut it. A tile comparison that does not record this is not a
-        # tile comparison — three dense conclusions were wrong because a
-        # full-tile epilogue silently sized the pipeline and an unpipelined
-        # wide tile was measured against a pipelined narrow one.
-        logger.debug(
-            "dynamic stages: tile=%s gated=%s ab_stage=%d (dense suggested %d, "
-            "max_fit %d) epi_tile=%s epi_stage=%d per_stage=%d fixed=%d "
-            "(sC %d) capacity=%d",
-            self.tile_shape_mnk,
-            self.is_gated,
-            self.ab_stage,
-            dense_ab_stage,
-            max_fit,
-            self.epi_tile,
-            self.epi_stage,
-            per_stage,
-            fixed,
-            self.tile_shape_mnk[0] * self.tile_shape_mnk[1] * 2,
-            self.smem_capacity,
-        )
         self.w4a8_fc2_compute_width = 1
         if self.is_w4a8:
             # w4a8 repurposes the staging regions as fixed double buffers; a
@@ -1258,6 +1237,28 @@ class MoEDynamicKernelBackend:
                     "the small gated or split materialized kernel"
                 )
         self.epi_stage = 1
+        # Logged here, after the w4a8 cap and the epi_stage pin, because both
+        # rewrite what _compute_stages returned. A tile comparison that records
+        # a pre-override depth is not a tile comparison — three dense
+        # conclusions were wrong because a full-tile epilogue silently sized
+        # the pipeline and an unpipelined wide tile was measured against a
+        # pipelined narrow one.
+        logger.debug(
+            "dynamic stages: tile=%s gated=%s ab_stage=%d (dense suggested %d, "
+            "max_fit %d) epi_tile=%s epi_stage=%d per_stage=%d fixed=%d "
+            "(sC %d) capacity=%d",
+            self.tile_shape_mnk,
+            self.is_gated,
+            self.ab_stage,
+            dense_ab_stage,
+            max_fit,
+            self.epi_tile,
+            self.epi_stage,
+            per_stage,
+            fixed,
+            self.tile_shape_mnk[0] * self.tile_shape_mnk[1] * 2,
+            self.smem_capacity,
+        )
         (
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,

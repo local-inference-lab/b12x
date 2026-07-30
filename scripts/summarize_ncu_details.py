@@ -31,7 +31,7 @@ HEADLINE: tuple[tuple[str, str], ...] = (
     ("block", "Block Size"),
     ("waves/SM", "Waves Per SM"),
     ("regs", "Registers Per Thread"),
-    ("smem_KB", "Dynamic Shared Memory Per Block"),
+    ("smem_KB", "Dynamic Shared Memory Per Block [KB]"),
     ("lim_smem", "Block Limit Shared Mem"),
     ("lim_regs", "Block Limit Registers"),
     ("lim_warps", "Block Limit Warps"),
@@ -43,9 +43,10 @@ HEADLINE: tuple[tuple[str, str], ...] = (
 _STALL_PREFIX = "smsp__average_warps_issue_stalled_"
 _STALL_SUFFIX = "_per_issue_active.ratio"
 
-# (N, K) per Behemoth TP=2 shard, mirroring SHAPE_N/SHAPE_K in
-# scripts/ncu_profile_fp6_gemm.sh. Used only to turn a BYTES=1 capture into a
-# read-amplification ratio, which needs the shard's value count.
+# (N, K) per Behemoth TP=2 shard, mirroring scripts/_behemoth_tp2_shapes.sh
+# (which this file cannot source) and BEHEMOTH_TP2_SHAPES in the benchmark.
+# Used only to turn a BYTES=1 capture into a read-amplification ratio, which
+# needs the shard's value count.
 _SHARD_NK: dict[str, tuple[int, int]] = {
     "qkv": (7168, 12288),
     "o": (12288, 6144),
@@ -119,6 +120,22 @@ def _read(path: pathlib.Path) -> tuple[dict[str, str], list[tuple[str, float]]]:
                 if scale is not None:
                     try:
                         metrics["Duration [us]"] = (
+                            f"{float(value.replace(',', '')) * scale:.2f}"
+                        )
+                    except ValueError:
+                        pass
+            # And again for shared memory: ncu reports byte for a small kernel
+            # and Kbyte for a large one, so an unnormalized column labelled KB
+            # mixes magnitudes on exactly the comparison smem work depends on.
+            if name == "Dynamic Shared Memory Per Block":
+                scale = {
+                    "byte": 1.0 / 1024.0,
+                    "Kbyte": 1.0,
+                    "Mbyte": 1024.0,
+                }.get(unit)
+                if scale is not None:
+                    try:
+                        metrics["Dynamic Shared Memory Per Block [KB]"] = (
                             f"{float(value.replace(',', '')) * scale:.2f}"
                         )
                     except ValueError:
@@ -221,7 +238,7 @@ def main() -> None:
 
     labels = [lbl for lbl, _ in HEADLINE]
     width = max(len(f.name.replace(".details.csv", "")) for f in files)
-    print(f"{'report':{width}s} " + " ".join(f"{l:>10s}" for l in labels))
+    print(f"{'report':{width}s} " + " ".join(f"{lbl:>10s}" for lbl in labels))
     all_stalls: list[tuple[str, list[tuple[str, float]]]] = []
     for f in files:
         metrics, stalls = _read(f)

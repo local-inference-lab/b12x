@@ -49,9 +49,8 @@ NCU="${NCU:-$(command -v ncu || echo /usr/local/cuda/bin/ncu)}"
 MODE="${MODE:-decode}"
 OUT_DIR="${OUT_DIR:-/tmp/fp6_ncu_$(date +%Y%m%d_%H%M%S)}"
 
-# (N, K) per shard, mirroring BEHEMOTH_TP2_SHAPES in the benchmark.
-declare -A SHAPE_N=([qkv]=7168  [o]=12288 [gate_up]=28672 [down]=12288)
-declare -A SHAPE_K=([qkv]=12288 [o]=6144  [gate_up]=12288 [down]=14336)
+# shellcheck source=scripts/_behemoth_tp2_shapes.sh
+source "$ROOT/scripts/_behemoth_tp2_shapes.sh"
 # gate_up first: at 28672x12288 it is 275 MB of the 541 MB each layer streams,
 # so it dominates the 20.33 ms/step that the K=12288 pair costs.
 SHAPES="${SHAPES:-gate_up qkv down o}"
@@ -60,10 +59,10 @@ if [[ "$MODE" == "decode" ]]; then
   M="${M:-1}"
   # Decode streams packed-B; the expanded arm is the prefill path and would
   # profile a kernel that never runs at M=1.
-  ARM_FLAGS="--no-expanded --no-fp8"
+  ARM_FLAGS=(--no-expanded --no-fp8)
 else
   M="${M:-8192}"
-  ARM_FLAGS="--no-packed --no-fp8"
+  ARM_FLAGS=(--no-packed --no-fp8)
 fi
 
 ARM="${ARM:-fp6}"
@@ -72,7 +71,7 @@ ARM="${ARM:-fp6}"
 # tile; match the SM120 blockwise family broadly rather than pinning one mangled
 # name, and let --launch-count 1 keep the report to a single kernel.
 if [[ "$ARM" == "fp8" ]]; then
-  ARM_FLAGS="--no-packed --no-expanded"
+  ARM_FLAGS=(--no-packed --no-expanded)
   # Broad on purpose: the arm resolves to vLLM's CUTLASS instantiation when
   # cutlass_scaled_mm accepts the call and to a cuBLASLt kernel (nvjet_/xmma_
   # families on Blackwell) when it falls back, and neither symbol is stable
@@ -154,9 +153,11 @@ if [[ -n "$_EXTRA_METRICS" ]]; then
 fi
 
 for shape in $SHAPES; do
-  n="${SHAPE_N[$shape]}"
-  k="${SHAPE_K[$shape]}"
-  [[ -z "$n" ]] && { echo "unknown shape '$shape'" >&2; continue; }
+  # :- so an unknown shape reaches the guard below; set -u would otherwise
+  # abort the whole sweep on the missing key.
+  n="${SHAPE_N[$shape]:-}"
+  k="${SHAPE_K[$shape]:-}"
+  [[ -z "$n" || -z "$k" ]] && { echo "unknown shape '$shape'" >&2; continue; }
   rep="$OUT_DIR/${MODE}_${ARM}_${shape}_m${M}"
   echo ""
   echo "=== $shape  M=$M N=$n K=$k -> $rep.ncu-rep ==="
@@ -173,7 +174,7 @@ for shape in $SHAPES; do
     "${SECTIONS[@]}" \
     --export "$rep" --force-overwrite \
     "$PYTHON" "$ROOT/benchmarks/benchmark_dense_gemm_fp6.py" \
-      --m "$M" --n "$n" --k "$k" $ARM_FLAGS \
+      --m "$M" --n "$n" --k "$k" "${ARM_FLAGS[@]}" \
       --warmup 10 --iters 4 --no-check \
     >"$rep.log" 2>&1
   rc=$?
@@ -192,7 +193,9 @@ for shape in $SHAPES; do
   # cutlass_scaled_mm is missing or rejects the shape, and ncu reports that as a
   # clean run with zero profiled kernels. Say so instead of writing an empty CSV
   # that reads as a measurement.
-  if grep -qi 'skipped' "$rep.log" && ! grep -q 'DenseGemmKernel' "$rep.log"; then
+  # Uppercase on purpose: the benchmark prints SKIP as a result column, while
+  # ncu's own chatter says "skipping"/"--launch-skip" in lower case.
+  if grep -q 'SKIP' "$rep.log" && ! grep -q 'DenseGemmKernel' "$rep.log"; then
     echo "arm '$ARM' skipped this shape; see $rep.log" >&2
   fi
 

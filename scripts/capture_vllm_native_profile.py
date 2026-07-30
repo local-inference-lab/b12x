@@ -57,11 +57,13 @@ class StreamRequest:
         self.finished_event = threading.Event()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
         self._response = None
         self.error: Optional[str] = None
 
     def start(self) -> None:
         self._thread.start()
+        self._started = True
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -70,7 +72,11 @@ class StreamRequest:
                 self._response.close()
             except Exception:
                 pass
-        self._thread.join(timeout=5)
+        # In prefill mode /start_profile runs BEFORE the stream starts, so its
+        # 404 and non-200 paths call stop() on an unstarted thread. join()
+        # would raise there and bury the message explaining what went wrong.
+        if self._started:
+            self._thread.join(timeout=5)
 
     def wait_for_first_token(self, timeout_s: float) -> bool:
         return self.first_token_event.wait(timeout_s)
