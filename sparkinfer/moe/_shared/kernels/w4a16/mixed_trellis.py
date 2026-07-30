@@ -11,9 +11,9 @@ belong to the serving framework; SparkInfer owns only the prepared kernel path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
-from typing import Sequence
+from typing import Protocol, Sequence
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -89,6 +89,21 @@ class MixedTrellisBuffers:
     fc1_scratch: torch.Tensor
     fc2_scratch: torch.Tensor
     workspace: torch.Tensor
+
+
+class MixedTrellisTier(Protocol):
+    """Prepared Trellis tier fields consumed by the mixed launch."""
+
+    intermediate_rotations: torch.Tensor
+    gate_suh: torch.Tensor
+    up_suh: torch.Tensor
+    down_svh: torch.Tensor
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_global_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
 
 
 class W4A16MixedTrellisKernel:
@@ -300,11 +315,17 @@ class W4A16MixedTrellisKernel:
     ):
         rotation_input = cute.make_tensor(
             rotation_input_ptr,
-            layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+            layout=cute.make_layout(
+                (active_m.to(cutlass.Int64) * cutlass.Int64(self.hidden_size),),
+                stride=(1,),
+            ),
         )
         topk_weights = cute.make_tensor(
             topk_weights_ptr,
-            layout=cute.make_layout((active_m * Int32(self.top_k),), stride=(1,)),
+            layout=cute.make_layout(
+                (active_m.to(cutlass.Int64) * cutlass.Int64(self.top_k),),
+                stride=(1,),
+            ),
         )
         self.kernel(
             rotation_input,
@@ -508,6 +529,8 @@ def compile_mixed_trellis(
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
+    if int(size_m) * int(top_k) > torch.iinfo(torch.int32).max:
+        raise ValueError("mixed Trellis routed-row count must fit in int32")
     fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
         int(value) for value in force_tile_config
     )
@@ -560,10 +583,12 @@ def compile_mixed_trellis(
         device,
         kernel.__cache_key__,
         str(route_ids_dtype),
+        int(size_m),
+        int(max_m_blocks),
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
-        return replace(cached, size_m=size_m, max_m_blocks=max_m_blocks)
+        return cached
 
     compile_m = _fake_m_for_specialization(size_m)
     compile_rows = compile_m * top_k
@@ -698,6 +723,12 @@ def make_mixed_trellis_buffers(
         capacity_rows, launch.moe_block_size, total_experts
     )
     route_blocks = (route_slots + launch.moe_block_size - 1) // launch.moe_block_size
+    if route_blocks > launch.max_m_blocks:
+        raise ValueError(
+            "mixed Trellis route buffers require "
+            f"{route_blocks} blocks, but the launch was compiled for "
+            f"{launch.max_m_blocks}"
+        )
     fc1_cols = 2 * launch.intermediate_size
     # FC1 consumes rotation_gate before the grid-wide activation barrier. FC2
     # starts only after that barrier, so its output can safely reuse the same
@@ -745,7 +776,11 @@ def make_mixed_trellis_buffers(
             dtype=torch.float32,
             device=device,
         ),
-        workspace=torch.zeros(sms * 4 + 2, dtype=torch.int32, device=device),
+        workspace=torch.zeros(
+            max(sms * 4, launch.blocks_per_sm * sms) + 2,
+            dtype=torch.int32,
+            device=device,
+        ),
     )
 
 
@@ -797,7 +832,9 @@ def build_tiered_maps(
     return global_to_combined, descriptor
 
 
-def combine_trellis_rotations(tier0, tier1) -> MixedTrellisRotations:
+def combine_trellis_rotations(
+    tier0: MixedTrellisTier, tier1: MixedTrellisTier
+) -> MixedTrellisRotations:
     """Materialize one tier-ordered table set once during model preparation."""
     return MixedTrellisRotations(
         intermediate=torch.cat(
@@ -811,8 +848,8 @@ def combine_trellis_rotations(tier0, tier1) -> MixedTrellisRotations:
 
 def run_mixed_trellis(
     x: torch.Tensor,
-    tier0,
-    tier1,
+    tier0: MixedTrellisTier,
+    tier1: MixedTrellisTier,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     global_to_combined: torch.Tensor,
@@ -822,28 +859,49 @@ def run_mixed_trellis(
     buffers: MixedTrellisBuffers,
 ) -> torch.Tensor:
     m = int(x.shape[0])
-    if m <= 0 or m > launch.size_m:
+    if m <= 0:
+        raise ValueError(f"mixed Trellis requires at least one active row, got {m}")
+    if m > launch.size_m:
         raise ValueError(f"active rows {m} exceed launch capacity {launch.size_m}")
     expected_input_dtype = (
         torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
     )
-    if x.dtype != expected_input_dtype or not x.is_contiguous():
-        raise TypeError(
-            "mixed Trellis input must be contiguous "
-            f"{expected_input_dtype}, got {x.dtype}"
-        )
-    if topk_ids.dtype != launch.route_ids_dtype or not topk_ids.is_contiguous():
-        raise TypeError(
-            "mixed Trellis topk_ids must be contiguous "
-            f"{launch.route_ids_dtype}, got {topk_ids.dtype}"
-        )
-    if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
-        raise TypeError("mixed Trellis topk_weights must be contiguous fp32")
+    for name, tensor, expected_dtype in (
+        ("input", x, expected_input_dtype),
+        ("topk_ids", topk_ids, launch.route_ids_dtype),
+        ("topk_weights", topk_weights, torch.float32),
+    ):
+        if tensor.dtype != expected_dtype:
+            raise TypeError(
+                f"mixed Trellis {name} must be {expected_dtype}, got {tensor.dtype}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"mixed Trellis {name} must be contiguous")
     total_experts = launch.tier0_num_experts + launch.tier1_num_experts
     if int(global_to_combined.numel()) != total_experts:
         raise ValueError("global_to_combined must cover every routed expert")
     if int(descriptor_map.numel()) != total_experts:
         raise ValueError("descriptor_map must cover the combined namespace")
+    required_route_slots = max_packed_route_slots(
+        m * launch.top_k, launch.moe_block_size, total_experts
+    )
+    required_route_blocks = (
+        required_route_slots + launch.moe_block_size - 1
+    ) // launch.moe_block_size
+    if required_route_blocks > launch.max_m_blocks:
+        raise RuntimeError(
+            "mixed Trellis request requires "
+            f"{required_route_blocks} route blocks, but the launch supports "
+            f"{launch.max_m_blocks}"
+        )
+    if buffers.packed_route_indices.numel() < required_route_slots:
+        raise RuntimeError(
+            "mixed Trellis packed-route buffer is below request capacity"
+        )
+    if buffers.block_expert_ids.numel() < required_route_blocks:
+        raise RuntimeError(
+            "mixed Trellis block-expert buffer is below request capacity"
+        )
     packed, block_experts, packed_count = pack_topk_routes_by_expert(
         topk_ids,
         launch.moe_block_size,
@@ -855,9 +913,6 @@ def run_mixed_trellis(
         expert_offsets=buffers.expert_offsets,
         expert_counts=buffers.expert_counts,
     )
-    if int(block_experts.numel()) > launch.max_m_blocks:
-        raise RuntimeError("mixed Trellis route workspace exceeds compiled capacity")
-
     stream = current_cuda_stream()
     launch.compiled(
         make_ptr(

@@ -31,14 +31,14 @@ from sparkinfer.moe._shared.kernels.w4a16.prepare import (
 HIDDEN = 6144
 INTERMEDIATE = 512
 TOPK = 8
-DEFAULT_TILE_CONFIG = (64, 256, 64, 256)
+K3_EXPERTS = 192
+K4_EXPERTS = 64
+TOTAL_EXPERTS = K3_EXPERTS + K4_EXPERTS
+DEFAULT_TILE_CONFIG = (128, 128, 32, 512)
 
 
 def _key(layer: int, expert: int, projection: str, rank: int, field: str) -> str:
-    return (
-        f"model.layers.{layer}.mlp.experts.{expert}.{projection}."
-        f"rank{rank}.{field}"
-    )
+    return f"model.layers.{layer}.mlp.experts.{expert}.{projection}.rank{rank}.{field}"
 
 
 def _load_tier(
@@ -53,6 +53,7 @@ def _load_tier(
 ):
     shard = checkpoint / f"model-layer-{layer:03d}.safetensors"
     with safe_open(shard, framework="pt", device="cpu") as handle:
+
         def stack(projection: str, field: str) -> torch.Tensor:
             host = torch.stack(
                 [
@@ -73,9 +74,17 @@ def _load_tier(
         down_svh = stack("down_proj", "svh")
 
     expected_last = 16 * bits
-    expected_projection = (len(expert_ids), HIDDEN // 16, INTERMEDIATE // 16, expected_last)
+    expected_projection = (
+        len(expert_ids),
+        HIDDEN // 16,
+        INTERMEDIATE // 16,
+        expected_last,
+    )
     expected_down = (len(expert_ids), INTERMEDIATE // 16, HIDDEN // 16, expected_last)
-    if tuple(gate.shape) != expected_projection or tuple(up.shape) != expected_projection:
+    if (
+        tuple(gate.shape) != expected_projection
+        or tuple(up.shape) != expected_projection
+    ):
         raise ValueError(
             f"K{bits} FC1 geometry mismatch: gate={tuple(gate.shape)} up={tuple(up.shape)} "
             f"expected={expected_projection}"
@@ -200,6 +209,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     tile_config = tuple(int(value) for value in args.tile_config)
+    if tile_config[0] < 128:
+        parser.error("--tile-config FC1_K must be at least 128")
     capacity = args.m if args.capacity is None else int(args.capacity)
     if capacity < args.m:
         raise ValueError("capacity must cover m")
@@ -209,14 +220,14 @@ def main() -> None:
     bitrates = [int(bits) for bits in bitmap[str(args.layer)]["k"]]
     k3_ids = [expert for expert, bits in enumerate(bitrates) if bits == 3]
     k4_ids = [expert for expert, bits in enumerate(bitrates) if bits == 4]
-    if len(k3_ids) != 192 or len(k4_ids) != 64:
+    if len(k3_ids) != K3_EXPERTS or len(k4_ids) != K4_EXPERTS:
         raise ValueError(
-            f"expected 192 K3 and 64 K4 experts, got {len(k3_ids)} and {len(k4_ids)}"
+            f"expected {K3_EXPERTS} K3 and {K4_EXPERTS} K4 experts, "
+            f"got {len(k3_ids)} and {len(k4_ids)}"
         )
 
     print(
-        f"loading layer={args.layer} rank={args.rank} "
-        f"K3={len(k3_ids)} K4={len(k4_ids)}"
+        f"loading layer={args.layer} rank={args.rank} K3={len(k3_ids)} K4={len(k4_ids)}"
     )
     tier0 = _load_tier(
         args.checkpoint,
@@ -236,11 +247,9 @@ def main() -> None:
         tile_config=tile_config,
         device=device,
     )
-    global_to_combined, descriptor = build_tiered_maps(
-        k3_ids, k4_ids, device=device
-    )
-    map0 = torch.full((256,), -1, dtype=torch.int32, device=device)
-    map1 = torch.full((256,), -1, dtype=torch.int32, device=device)
+    global_to_combined, descriptor = build_tiered_maps(k3_ids, k4_ids, device=device)
+    map0 = torch.full((TOTAL_EXPERTS,), -1, dtype=torch.int32, device=device)
+    map1 = torch.full((TOTAL_EXPERTS,), -1, dtype=torch.int32, device=device)
     map0[torch.tensor(k3_ids, dtype=torch.long, device=device)] = torch.arange(
         len(k3_ids), dtype=torch.int32, device=device
     )
@@ -272,7 +281,7 @@ def main() -> None:
         )
 
     props = torch.cuda.get_device_properties(device)
-    route_slots = max_packed_route_slots(capacity * TOPK, 8, 256)
+    route_slots = max_packed_route_slots(capacity * TOPK, 8, TOTAL_EXPERTS)
     launch = compile_mixed_trellis(
         size_m=capacity,
         hidden_size=HIDDEN,

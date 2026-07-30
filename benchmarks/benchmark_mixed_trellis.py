@@ -261,7 +261,7 @@ def main() -> None:
     torch.manual_seed(20260730)
     materialized = int(args.materialized_experts)
     if materialized < 6 or materialized > K4_EXPERTS:
-        raise ValueError("materialized-experts must be in [6, 64]")
+        raise ValueError(f"materialized-experts must be in [6, {K4_EXPERTS}]")
     tier0 = _prepared(3, materialized, 301, device)
     tier1 = _prepared(4, materialized, 401, device)
     mixed_tier0 = mixed_tier1 = rotations = None
@@ -307,7 +307,15 @@ def main() -> None:
             if args.variant == "serial-overlap":
                 tier_streams = (torch.cuda.Stream(), torch.cuda.Stream())
 
-            def serial_fn():
+            def serial_fn(
+                state0=state0,
+                state1=state1,
+                serial_output=serial_output,
+                tier_streams=tier_streams,
+                x=x,
+                weights=weights,
+                ids=ids,
+            ):
                 assert state0 is not None and state1 is not None
                 assert serial_output is not None
                 if tier_streams is None:
@@ -354,7 +362,18 @@ def main() -> None:
             if args.separate_fc2:
                 mixed_buffers.fc2 = torch.empty_like(mixed_buffers.rotation_gate)
 
-            def mixed_fn():
+            def mixed_fn(
+                mixed_tier0=mixed_tier0,
+                mixed_tier1=mixed_tier1,
+                rotations=rotations,
+                launch=launch,
+                mixed_buffers=mixed_buffers,
+                x=x,
+                weights=weights,
+                ids=ids,
+                global_map=global_map,
+                descriptor=descriptor,
+            ):
                 assert mixed_tier0 is not None and mixed_tier1 is not None
                 assert rotations is not None and launch is not None
                 assert mixed_buffers is not None

@@ -142,9 +142,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
     # Global expert ids deliberately interleave K3 and K4 tiers. The combined
     # namespace remains tier ordered so weight and rotation tables stay dense.
-    topk_ids = torch.tensor(
-        [[0, 1], [3, 2]], dtype=route_ids_dtype, device=device
-    )
+    topk_ids = torch.tensor([[0, 1], [3, 2]], dtype=route_ids_dtype, device=device)
     topk_weights = torch.tensor(
         [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
     )
@@ -191,7 +189,8 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     torch.cuda.synchronize(device)
     eager = eager.clone()
     assert not torch.isnan(eager).any()
-    assert torch.allclose(eager, serial, rtol=3.0e-3, atol=3.0e-3)
+    relative = (eager - serial).norm() / serial.norm().clamp_min(1.0e-12)
+    assert float(relative) < 4.0e-3
 
     repeat = run_mixed_trellis(
         x,
@@ -228,11 +227,10 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
     # An unmapped global expert must contribute zero without changing any
     # mapped route. This is the contract needed by expert-parallel placement.
-    skipped_map0 = map0.clone()
     skipped_map1 = map1.clone()
     skipped_map1[3] = -1
     skipped_serial = _serial_tier(
-        x, tier0, topk_weights, topk_ids, skipped_map0
+        x, tier0, topk_weights, topk_ids, map0
     ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1)
     skipped_global_to_combined = global_to_combined.clone()
     skipped_global_to_combined[3] = -1
@@ -249,7 +247,10 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         buffers,
     )
     torch.cuda.synchronize(device)
-    assert torch.allclose(skipped, skipped_serial, rtol=3.0e-3, atol=3.0e-3)
+    skipped_relative = (
+        skipped - skipped_serial
+    ).norm() / skipped_serial.norm().clamp_min(1.0e-12)
+    assert float(skipped_relative) < 4.0e-3
 
 
 def test_build_tiered_maps_rejects_invalid_partitions() -> None:
@@ -325,6 +326,7 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=tile_config,
     )
+    assert launch.moe_block_size == 8
     global_to_combined, descriptor = build_tiered_maps(
         range(tier0_experts), range(tier0_experts, 256), device=device
     )
