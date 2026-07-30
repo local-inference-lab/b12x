@@ -89,7 +89,6 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
-    route_pack_capacity,
     select_route_block_size_m,
     validate_activation,
 )
@@ -10646,21 +10645,15 @@ def run_w4a16_moe(
         )
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
-    if use_direct_topk_routes:
-        required_m_blocks = int(m) * int(topk)
-    else:
-        _, _, required_m_blocks = route_pack_capacity(
-            int(m) * int(topk),
-            int(block_size_m),
-            route_num_experts,
-            topk=topk,
-        )
+    required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0
     if fused_launch is not None and not use_direct_topk_routes:
-        _, route_slots_capacity, route_blocks_capacity = route_pack_capacity(
+        route_slots_capacity = max_packed_route_slots(
             int(fused_launch.size_m) * int(topk),
             int(block_size_m),
             route_num_experts,
-            topk=topk,
+        )
+        route_blocks_capacity = (route_slots_capacity + int(block_size_m) - 1) // int(
+            block_size_m
         )
         if packed_route_indices is not None:
             if int(packed_route_indices.numel()) < route_slots_capacity:
@@ -10696,12 +10689,7 @@ def run_w4a16_moe(
             )
         )
         route_slots_for_scratch = int(packed_route_indices.numel())
-        if int(block_expert_ids.numel()) != int(required_m_blocks):
-            raise RuntimeError(
-                "W4A16 route packing did not produce the canonical launch capacity: "
-                f"runtime={int(block_expert_ids.numel())}, "
-                f"planned={int(required_m_blocks)}"
-            )
+        required_m_blocks = int(block_expert_ids.numel())
 
     props = torch.cuda.get_device_properties(a_input.device)
     sms = int(props.multi_processor_count)
