@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import socket
 
@@ -11,6 +12,7 @@ import torch.multiprocessing as mp
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2APool,
     _load_extension,
+    _staging_layout,
     lse_reduce_scatter_reference,
 )
 
@@ -98,6 +100,33 @@ def _reference(
         rank,
     )
 
+
+def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
+    assert channel._ipc is not None
+    assert len(channel._owned_buffers) == 1
+    layout = _staging_layout(
+        signal_bytes=int(channel._ext.meta_size()),
+        world_size=channel.world_size,
+        max_batch_size=channel.max_batch_size,
+        total_heads=channel.total_heads,
+        head_dim=channel.head_dim,
+        query_head_dim=channel.query_head_dim,
+    )
+    words = (ctypes.c_uint16(), ctypes.c_uint16())
+    local_ptr = channel._owned_buffers[0].local_ptr
+    for word, offset in zip(
+        words,
+        (layout.staging0_offset, layout.staging1_offset),
+        strict=True,
+    ):
+        channel._ipc.cudaMemcpyAsync(
+            ctypes.addressof(word),
+            local_ptr + offset,
+            ctypes.sizeof(word),
+            int(stream.cuda_stream),
+        )
+    stream.synchronize()
+    return words[0].value, words[1].value
 
 def _check_eager(
     pool: PCIeDCPA2APool,
@@ -395,15 +424,19 @@ def _check_graph(
         channel.all_gather_heads(odd_input, odd_output)
     stream.synchronize()
 
-    snapshots = [tuple(channel._ext._debug_staging_words(channel._ptr, 0))]
+    # Prime both slots after capture, then observe them read-only. A graph with
+    # a host-baked slot changes the same word on both replays; execution-owned
+    # parity changes alternate words.
+    with torch.cuda.stream(stream):
+        for value in (11.0, 12.0):
+            odd_input.fill_(value)
+            channel.all_gather_heads(odd_input, odd_output)
+    snapshots = [_local_staging_words(channel, stream)]
     for value in (1.0, 2.0):
-        odd_input.fill_(value)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        odd_graph.replay()
-        stream.synchronize()
-        snapshots.append(
-            tuple(channel._ext._debug_staging_words(channel._ptr, -1))
-        )
+        with torch.cuda.stream(stream):
+            odd_input.fill_(value)
+            odd_graph.replay()
+        snapshots.append(_local_staging_words(channel, stream))
         torch.testing.assert_close(
             odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
         )
