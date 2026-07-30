@@ -89,6 +89,7 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
+    route_pack_capacity,
     select_route_block_size_m,
     validate_activation,
 )
@@ -10197,6 +10198,23 @@ def _resolve_route_block_size_m(
     return compiled
 
 
+def _w4a16_stream_is_capturing(
+    stream: cuda.CUstream,
+    *,
+    current_stream: cuda.CUstream,
+) -> bool:
+    """Observe capture on either Torch's current stream or an explicit stream."""
+    current_capturing = torch.cuda.is_current_stream_capturing()
+    if current_capturing or int(stream) == int(current_stream):
+        return current_capturing
+    result, status = cuda.cuStreamIsCapturing(stream)
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"cuStreamIsCapturing failed for the selected W4A16 stream: {result}"
+        )
+    return int(status) != 0
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -10465,7 +10483,8 @@ def run_w4a16_moe(
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
-    stream = current_cuda_stream() if stream is None else stream
+    current_stream = current_cuda_stream()
+    stream = current_stream if stream is None else stream
     if (not collect_activation_amax) and _small_m_direct_supported(
         m=m,
         hidden_size=hidden_size,
@@ -10627,15 +10646,21 @@ def run_w4a16_moe(
         )
 
     route_slots_for_scratch = int(m) * int(topk) * int(block_size_m)
-    required_m_blocks = int(m) * int(topk) if use_direct_topk_routes else 0
+    if use_direct_topk_routes:
+        required_m_blocks = int(m) * int(topk)
+    else:
+        _, _, required_m_blocks = route_pack_capacity(
+            int(m) * int(topk),
+            int(block_size_m),
+            route_num_experts,
+            topk=topk,
+        )
     if fused_launch is not None and not use_direct_topk_routes:
-        route_slots_capacity = max_packed_route_slots(
+        _, route_slots_capacity, route_blocks_capacity = route_pack_capacity(
             int(fused_launch.size_m) * int(topk),
             int(block_size_m),
             route_num_experts,
-        )
-        route_blocks_capacity = (route_slots_capacity + int(block_size_m) - 1) // int(
-            block_size_m
+            topk=topk,
         )
         if packed_route_indices is not None:
             if int(packed_route_indices.numel()) < route_slots_capacity:
@@ -10671,7 +10696,12 @@ def run_w4a16_moe(
             )
         )
         route_slots_for_scratch = int(packed_route_indices.numel())
-        required_m_blocks = int(block_expert_ids.numel())
+        if int(block_expert_ids.numel()) != int(required_m_blocks):
+            raise RuntimeError(
+                "W4A16 route packing did not produce the canonical launch capacity: "
+                f"runtime={int(block_expert_ids.numel())}, "
+                f"planned={int(required_m_blocks)}"
+            )
 
     props = torch.cuda.get_device_properties(a_input.device)
     sms = int(props.multi_processor_count)
@@ -10752,7 +10782,10 @@ def run_w4a16_moe(
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
             rotation_input_dtype=rotation_input_dtype,
-            _require_cached=torch.cuda.is_current_stream_capturing(),
+            _require_cached=_w4a16_stream_is_capturing(
+                stream,
+                current_stream=current_stream,
+            ),
         )
     else:
         if int(fused_launch.size_m) < m:

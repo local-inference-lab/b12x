@@ -2648,6 +2648,15 @@ def compile(
     compiled = _memory_cache_get(memory_cache_key)
     if compiled is not None:
         return compiled
+    from sparkinfer._lib.runtime_control import (
+        raise_if_kernel_resolution_frozen,
+    )
+
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=func,
+        cache_key=compile_spec if compile_spec is not None else memory_cache_key,
+    )
 
     post_engine_start_log = _cute_compile_post_engine_start_log_enabled()
     payload = _compile_disk_cache_payload(
@@ -2720,15 +2729,6 @@ def compile(
 
             with _MEMORY_CACHE_LOCK:
                 _COMPILE_MISSES += 1
-            from sparkinfer._lib.runtime_control import (
-                raise_if_kernel_resolution_frozen,
-            )
-
-            raise_if_kernel_resolution_frozen(
-                "cute.compile",
-                target=func,
-                cache_key=compile_spec if compile_spec is not None else payload,
-            )
             call_kwargs = {
                 k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"
             }
@@ -2770,15 +2770,6 @@ def compile(
 
     with _MEMORY_CACHE_LOCK:
         _COMPILE_MISSES += 1
-    from sparkinfer._lib.runtime_control import (
-        raise_if_kernel_resolution_frozen,
-    )
-
-    raise_if_kernel_resolution_frozen(
-        "cute.compile",
-        target=func,
-        cache_key=compile_spec if compile_spec is not None else payload,
-    )
     call_kwargs = {k: v for k, v in kwargs.items() if k != "__dsl_compile_options_key"}
     compiled = _call_cute_compile(
         compile_callable,
