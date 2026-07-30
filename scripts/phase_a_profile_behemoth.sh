@@ -69,6 +69,12 @@ capture_one() {
   local dir_var="PROFILE_DIR_${tag^^}"
   local profile_dir="${!dir_var:-${PROFILE_DIR:-}}"
   echo "=== capture ${tag} ${mode} -> ${out} ==="
+  # Fixed reference for the trace sweep below. $out cannot serve as one: the
+  # capture writes its logs into $out and the traces/ mkdir touches it again,
+  # so $out always ends up NEWER than the traces and -newer "$out" matches
+  # nothing at all.
+  local marker="$out/.capture_started"
+  : >"$marker"
   "$PYTHON" "$ROOT/scripts/capture_vllm_native_profile.py" \
     --base-url "$base" \
     --model "$model" \
@@ -82,7 +88,12 @@ capture_one() {
   if [[ -n "$profile_dir" && -d "$profile_dir" ]]; then
     mkdir -p "$out/traces"
     find "$profile_dir" -type f \( -name '*.pt.trace.json.gz' -o -name '*.pt.trace.json' \) \
-      -newer "$out" -exec cp -t "$out/traces" {} + 2>/dev/null || true
+      -newer "$marker" -exec cp -t "$out/traces" {} + 2>/dev/null || true
+    if [[ -z "$(ls -A "$out/traces" 2>/dev/null)" ]]; then
+      echo "WARN: no new traces in $profile_dir for ${tag} ${mode}." >&2
+      echo "  The server writes them on /stop_profile; check it was launched" >&2
+      echo "  with PROFILE=1 and that PROFILE_DIR_${tag^^} points at its dir." >&2
+    fi
   fi
 }
 
