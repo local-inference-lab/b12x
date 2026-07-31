@@ -857,10 +857,38 @@ class MoEMicroKernelBackend:
             row_mode_32_1 = k_row1 & Int32(31)
 
             kk_off = Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr(cfg.n < 256):
+                # The 128-u32 swizzle block pads narrow intermediates to 256
+                # logical values. FC1 writes only n/8 lanes in each 32-lane
+                # plane. Mask the remaining lanes before the dot: their
+                # weights are zero, but stale NaN scratch would make 0*NaN
+                # contaminate the warp reduction.
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1508,10 +1536,36 @@ class MoEMicroKernelBackend:
             ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr(cfg.n < 256):
+                # Match the m==1 path above: the packed 128-u32 swizzle has
+                # unwritten padding whenever the logical intermediate is
+                # narrower than 256 values.
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
