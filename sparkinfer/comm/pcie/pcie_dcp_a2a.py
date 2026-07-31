@@ -1195,15 +1195,14 @@ class PCIeDCPA2APool:
         else:
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
-        if (
-            not self.single_channel
-            and _is_current_stream_capturing(self.device)
-            and self._capture_channel_stack
-        ):
-            # Independent graph managers may reuse a torch-owned nested stream
-            # key. The enclosing capture, not a stale key mapping, determines
-            # which IPC channel is safe for this graph.
+        if not self.single_channel and self._capture_channel_stack:
+            # The semantic capture scope also owns vLLM's eager pre-capture
+            # warmup. During actual CUDA capture torch may use an ephemeral
+            # nested stream key, which must remain only a temporary alias;
+            # outside CUDA capture retain the normal stream-affinity check.
             channel = self._capture_channel_stack[-1]
+            if not _is_current_stream_capturing(self.device):
+                channel._bind_stream_key(stream_key)
             self._channels[key] = channel
             return channel
         if self._channel_factory is None:

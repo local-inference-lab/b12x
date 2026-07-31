@@ -1675,6 +1675,41 @@ def test_collective_capture_preserves_same_id_convenience_allocation(monkeypatch
     assert pool._logical_channels == {"graph:target": channel}
 
 
+def test_collective_capture_routes_eager_warmup_to_graph_channel(monkeypatch):
+    eager = _make_runtime(eager=True)
+    target = _make_runtime(eager=True)
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    pool._logical_channels.update({"eager:model": eager, "graph:target": target})
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: 7 if stream is None else int(stream),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_state, group: [local_state, local_state],
+    )
+
+    with pool.capture(7, channel_id="graph:target") as captured:
+        assert captured is target
+        assert pool.for_stream(7, channel_id="eager:model") is target
+        with pytest.raises(RuntimeError, match="stream-affine"):
+            pool.for_stream(8, channel_id="eager:model")
+
+    assert pool.for_stream(7, channel_id="eager:model") is eager
+
+
 def test_collective_eager_channel_requires_id_and_rejects_duplicate_stream_owner(
     monkeypatch,
 ):

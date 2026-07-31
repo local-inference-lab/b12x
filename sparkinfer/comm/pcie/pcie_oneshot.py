@@ -2884,12 +2884,17 @@ class PCIeOneshotAllReducePool:
 
         stream_key = _current_stream_key(self.device, stream)
         channel_key = 0 if stream_key is None else int(stream_key)
-        if _is_current_stream_capturing(self.device) and self._capture_channel_stack:
-            # CUDA and torch/Inductor may recycle a nested capture stream key
-            # between independent target and draft graph managers. The active
-            # enclosing capture owns the channel even if that key still maps
-            # to a channel captured by an earlier manager.
+        if self._capture_channel_stack:
+            # The semantic capture scope starts before vLLM's eager graph
+            # warmup. Route that warmup through the graph-owned channel too,
+            # even though CUDA capture has not started yet. Once CUDA capture
+            # begins, torch/Inductor may replace the enclosing stream with an
+            # ephemeral nested capture stream; that key is deliberately not
+            # made the channel's permanent owner because graph replay runs on
+            # the enclosing stream.
             channel = self._capture_channel_stack[-1]
+            if not _is_current_stream_capturing(self.device):
+                channel._bind_stream_key(stream_key)
             self._channels[channel_key] = channel
             return channel
 

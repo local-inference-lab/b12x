@@ -456,6 +456,69 @@ def _check_graph(
     assert changed_slots[0] != changed_slots[1]
 
 
+def _check_semantic_capture_warmup(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Match vLLM's eager DCP warmup inside a graph-owner scope."""
+    stream = torch.cuda.Stream(device=device)
+    local_query = _rank_query(
+        900,
+        rank,
+        world_size,
+        1,
+        torch.bfloat16,
+        device,
+    )
+    gathered = torch.empty(
+        1,
+        TOTAL_HEADS,
+        QUERY_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    expected = torch.cat(
+        [
+            _rank_query(
+                900,
+                source,
+                world_size,
+                1,
+                torch.bfloat16,
+                device,
+            )
+            for source in range(world_size)
+        ],
+        dim=1,
+    )
+    pool.prepare_channels(("graph:warmup",))
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.stream(stream),
+        pool.capture(stream, channel_id="graph:warmup") as graph_channel,
+    ):
+        warmup_channel = pool.for_stream(stream, channel_id="eager:dcp")
+        assert warmup_channel is graph_channel
+        warmup_channel.all_gather_heads(local_query, gathered)
+        stream.synchronize()
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+
+        with torch.cuda.graph(graph, stream=stream):
+            graph_channel.all_gather_heads(local_query, gathered)
+
+    # The eager DCP channel was already bound to vLLM's default stream. Its
+    # original mapping must be usable again after the graph-owner scope exits.
+    eager_channel = pool.for_stream(channel_id="eager:dcp")
+    assert eager_channel is not graph_channel
+    with torch.cuda.stream(stream):
+        graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+
+
 def _check_teardown_retry(
     pool: PCIeDCPA2APool,
     rank: int,
@@ -520,6 +583,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
         _check_eager_adjacency(pool, rank, world_size, device)
+        dist.barrier()
+        _check_semantic_capture_warmup(pool, rank, world_size, device)
         dist.barrier()
         _check_graph(pool, rank, world_size, device)
         torch.cuda.synchronize(device)

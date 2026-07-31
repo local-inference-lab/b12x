@@ -128,6 +128,50 @@ def _capture_channel(
     return channel, graph
 
 
+def _run_capture_warmup_scope(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Match vLLM's eager warmup inside its semantic graph-owner scope."""
+    stream = torch.cuda.Stream(device=device)
+    inp = torch.full(
+        (NUMEL,),
+        float(4096 + rank),
+        dtype=torch.float32,
+        device=device,
+    )
+    out = torch.empty_like(inp)
+    pool.prepare_channels(("eager:warmup", "graph:warmup"))
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.stream(stream),
+        pool.capture(stream, channel_id="graph:warmup") as graph_channel,
+    ):
+        # CUDA capture has not begun. The active semantic scope must still
+        # override the call site's static eager id on this same owner stream.
+        warmup_channel = pool.for_stream(stream, channel_id="eager:warmup")
+        assert warmup_channel is graph_channel
+        warmup_channel.all_reduce(inp, out=out)
+        stream.synchronize()
+        _assert_reduced(out, 4096.0, world_size, device)
+
+        with torch.cuda.graph(graph, stream=stream):
+            graph_channel.all_reduce(inp, out=out)
+
+    # Leaving the semantic scope restores normal eager routing even though
+    # the graph-owned channel remains alive for replay on the same stream.
+    eager_channel = pool.for_stream(stream, channel_id="eager:warmup")
+    assert eager_channel is not graph_channel
+    with torch.cuda.stream(stream):
+        inp.fill_(8192.0 + rank)
+        graph.replay()
+    stream.synchronize()
+    _assert_reduced(out, 8192.0, world_size, device)
+
+
 def _run_graph_opposite_order(
     pool: PCIeOneshotAllReducePool,
     device: torch.device,
@@ -199,6 +243,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_concurrent_channels=2,
     )
     try:
+        _run_capture_warmup_scope(pool, device, rank, world_size)
+        dist.barrier()
         _run_eager_opposite_order(pool, device, rank, world_size)
         dist.barrier()
         _run_graph_opposite_order(pool, device, rank, world_size)
