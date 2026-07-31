@@ -822,7 +822,11 @@ class MoEDynamicKernelBackend:
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             num_topk=self.num_topk,
-            activation=self.activation,
+            # This helper is gated-only and is never launched unless the split
+            # materialized path is active.  Use a valid inert specialization for
+            # non-split activations (notably ReLU2) instead of rejecting them
+            # during otherwise valid monolithic-kernel construction.
+            activation=self.activation if self.w4a8_split_materialized else "silu",
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
