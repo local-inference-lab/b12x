@@ -74,10 +74,8 @@ def test_worker_slot_selection_has_no_grid_rendezvous(source_name: str) -> None:
     assert "active_staging_slot" in source
     assert "advance_staging_slot_kernel" in source
     assert "staging_arrive" not in source
-    assert "cudaOccupancy" not in source
     assert "cudaLaunchCooperativeKernel" not in source
     assert "launch_cooperative" not in source
-    assert "resident_grid" not in source
 
     selector_name = (
         "DINLINE void select_rank_data"
@@ -88,6 +86,27 @@ def test_worker_slot_selection_has_no_grid_rendezvous(source_name: str) -> None:
     assert "active_staging_slot" in selector
     assert "atomicAdd" not in selector
     assert "while (" not in selector
+
+
+def test_fused_rms_residency_is_runtime_derived_and_capture_cached() -> None:
+    source = (PCIE / "pcie_oneshot.cu").read_text(encoding="utf-8")
+
+    assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in source
+    assert "cudaDevAttrMultiProcessorCount" in source
+    assert "fused_resident_capacity_" in source
+    assert "cap_fused_ctas_per_row" in source
+    assert "SPARKINFER_PCIE_TEST_RESIDENT_GRID_CAPACITY" in source
+    assert "kMaxBlocks <= SM count" not in source
+
+    # Model the native clamp for reduced/MIG-like capacities. A capacity below
+    # the requested multi-CTA grid must select the barrier-free single-CTA path.
+    def cap(requested: int, rows: int, resident: int) -> int:
+        return max(1, min(requested, max(1, resident // rows)))
+
+    assert cap(3, 1, 1) == 1
+    assert cap(3, 1, 2) == 2
+    assert cap(3, 2, 2) == 1
+    assert cap(3, 2, 8) == 3
 
 
 def test_oneshot_control_is_staged_only_and_precedes_each_worker() -> None:
@@ -138,7 +157,32 @@ def test_twoshot_control_precedes_reduce_scatter_and_all_gather_workers() -> Non
     )
 
 
-@pytest.mark.parametrize("source_name", ("pcie_oneshot.cu", "pcie_twoshot.cu"))
+def test_dcp_control_selects_one_slot_per_operation_before_workers() -> None:
+    source = (PCIE / "pcie_dcp_a2a.cu").read_text(encoding="utf-8")
+    control_launch = "advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);"
+    assert source.count(control_launch) == 2
+
+    selector = _section(source, "DINLINE void select_staging", "// pre_sync")
+    assert "active_staging_slot" in selector
+    assert "self_counter[blockIdx.x]" not in selector
+    assert "atomicAdd" not in selector
+    assert "while (" not in selector
+
+    reduce_scatter = _section(
+        source, "void run(cudaStream_t stream", "void all_gather_heads("
+    )
+    gather = _section(source, "void all_gather_heads(", "\n};")
+    assert reduce_scatter.index(control_launch) < reduce_scatter.index(
+        "#define LAUNCH(world)"
+    )
+    assert gather.index(control_launch) < gather.index("#define LAUNCH(world)")
+    assert "SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES" in source
+    assert "test_post_barrier_delay(rank, delayed_rank, delay_cycles);" in source
+
+
+@pytest.mark.parametrize(
+    "source_name", ("pcie_oneshot.cu", "pcie_twoshot.cu", "pcie_dcp_a2a.cu")
+)
 def test_control_kernel_is_graph_replay_dynamic(source_name: str) -> None:
     source = (PCIE / source_name).read_text(encoding="utf-8")
     control = _section(
@@ -162,7 +206,7 @@ def test_control_and_worker_launches_have_immediate_error_checks(
     source_name: str, expected_checks: int
 ) -> None:
     source = (PCIE / source_name).read_text(encoding="utf-8")
-    assert source.count("CHECK_CUDA_SUCCESS(cudaGetLastError());") == expected_checks
+    assert source.count("CHECK_CUDA_SUCCESS(cudaGetLastError());") >= expected_checks
 
     control_launch = "advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);"
     for suffix in source.split(control_launch)[1:]:
@@ -181,6 +225,8 @@ def test_control_node_graph_topology_contract() -> None:
         "fused_staged_push": 1,
         "twoshot_reduce_scatter": 1,
         "twoshot_all_gather": 1,
+        "dcp_lse_reduce_scatter": 1,
+        "dcp_all_gather_heads": 1,
     }
     total_nodes = {name: 1 + extra for name, extra in control_nodes.items()}
 

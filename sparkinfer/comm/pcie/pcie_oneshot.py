@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -113,10 +113,17 @@ def _resolve_exchange_group(
 def _group_ranks(group: ProcessGroup) -> list[int]:
     world_size = dist.get_world_size(group=group)
     if hasattr(dist, "get_process_group_ranks"):
-        ranks = sorted(dist.get_process_group_ranks(group=group))
+        # Process-group rank is an index into the order returned here.  Sorting
+        # silently changes that mapping for non-monotonic groups and makes the
+        # handle in slot N belong to a different peer than group rank N.
+        ranks = list(dist.get_process_group_ranks(group=group))
         if len(ranks) != world_size:
             raise RuntimeError("process-group rank list does not match world size")
         return ranks
+    if hasattr(dist, "get_global_rank"):
+        return [
+            dist.get_global_rank(group, group_rank) for group_rank in range(world_size)
+        ]
     return list(range(world_size))
 
 
@@ -160,6 +167,179 @@ class _OwnedSharedBuffer:
     local_ptr: int
     peer_ptrs: tuple[int, ...]
     remote_ptrs: tuple[int, ...]
+
+
+def _format_setup_error(error: BaseException | None) -> tuple[str, ...]:
+    if error is None:
+        return ()
+    return (f"{type(error).__name__}: {error}",)
+
+
+def _exchange_setup_failures(
+    local_error: BaseException | None,
+    *,
+    exchange_group: ProcessGroup,
+    phase: str,
+) -> tuple[tuple[str, ...], ...]:
+    """Collect a setup verdict without allowing one rank to return early."""
+
+    try:
+        gathered = _broadcast_gather_object(
+            _format_setup_error(local_error), exchange_group
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to exchange peer {phase} status; CUDA IPC exports were retained"
+        ) from exc
+
+    statuses: list[tuple[str, ...]] = []
+    for group_rank, status in enumerate(gathered):
+        if not isinstance(status, (tuple, list)):
+            raise RuntimeError(
+                f"invalid peer {phase} status from group rank {group_rank}; "
+                "CUDA IPC exports were retained"
+            )
+        statuses.append(tuple(str(item) for item in status))
+    return tuple(statuses)
+
+
+def _setup_failure_message(
+    owner: str,
+    phase: str,
+    statuses: Sequence[Sequence[str]],
+    *,
+    exports_retained: bool,
+) -> str:
+    details = [
+        f"group rank {group_rank}: " + " | ".join(failures)
+        for group_rank, failures in enumerate(statuses)
+        if failures
+    ]
+    retention = "; CUDA IPC exports were retained" if exports_retained else ""
+    return f"{owner} {phase} failed{retention}: " + "; ".join(details)
+
+
+def _abort_collective_ipc_setup(
+    *,
+    owner: str,
+    setup_phase: str,
+    setup_statuses: Sequence[Sequence[str]],
+    exchange_group: ProcessGroup,
+    ipc: CudaRTLibrary,
+    local_ptr: int | None,
+    remote_ptrs: Sequence[int],
+    local_error: BaseException | None,
+    local_cleanup: Optional[Callable[[], None]] = None,
+) -> None:
+    """Undo a failed collective IPC setup without freeing a mapped export.
+
+    Every rank calls this function.  Each successfully opened import is closed
+    exactly once.  Export ownership is released only after every group rank
+    reports that all of its imports were unmapped; otherwise the raw CUDA
+    allocation is deliberately retained until context teardown.
+    """
+
+    unmap_failures: list[str] = []
+    if local_cleanup is not None:
+        try:
+            local_cleanup()
+        except Exception as exc:
+            unmap_failures.append(f"native runtime: {type(exc).__name__}: {exc}")
+    for ptr in remote_ptrs:
+        try:
+            ipc.cudaIpcCloseMemHandle(ptr)
+        except Exception as exc:
+            unmap_failures.append(f"CUDA IPC import {ptr}: {type(exc).__name__}: {exc}")
+
+    try:
+        unmap_statuses = _exchange_setup_failures(
+            RuntimeError(" | ".join(unmap_failures)) if unmap_failures else None,
+            exchange_group=exchange_group,
+            phase=f"{setup_phase} rollback unmap",
+        )
+    except Exception as exchange_error:
+        error = RuntimeError(
+            _setup_failure_message(
+                owner,
+                setup_phase,
+                setup_statuses,
+                exports_retained=True,
+            )
+        )
+        raise error from (local_error or exchange_error)
+
+    if any(unmap_statuses):
+        error = RuntimeError(
+            _setup_failure_message(
+                owner,
+                f"{setup_phase} rollback unmap",
+                unmap_statuses,
+                exports_retained=True,
+            )
+        )
+        raise error from local_error
+
+    free_error: BaseException | None = None
+    if local_ptr is not None:
+        try:
+            ipc.cudaFree(local_ptr)
+        except Exception as exc:
+            free_error = exc
+    free_statuses = _exchange_setup_failures(
+        free_error,
+        exchange_group=exchange_group,
+        phase=f"{setup_phase} rollback export free",
+    )
+    if any(free_statuses):
+        error = RuntimeError(
+            _setup_failure_message(
+                owner,
+                f"{setup_phase} rollback export free",
+                free_statuses,
+                exports_retained=False,
+            )
+        )
+        raise error from (local_error or free_error)
+
+    error = RuntimeError(
+        _setup_failure_message(
+            owner,
+            setup_phase,
+            setup_statuses,
+            exports_retained=False,
+        )
+    )
+    raise error from local_error
+
+
+def _finish_collective_runtime_setup(
+    *,
+    owner: str,
+    exchange_group: ProcessGroup,
+    ipc: CudaRTLibrary,
+    shared: _OwnedSharedBuffer,
+    local_error: BaseException | None,
+    local_cleanup: Optional[Callable[[], None]] = None,
+) -> None:
+    """Require every rank to construct its native runtime before returning."""
+
+    statuses = _exchange_setup_failures(
+        local_error,
+        exchange_group=exchange_group,
+        phase=f"{owner} native initialization",
+    )
+    if any(statuses):
+        _abort_collective_ipc_setup(
+            owner=owner,
+            setup_phase="native initialization",
+            setup_statuses=statuses,
+            exchange_group=exchange_group,
+            ipc=ipc,
+            local_ptr=shared.local_ptr,
+            remote_ptrs=shared.remote_ptrs,
+            local_error=local_error,
+            local_cleanup=local_cleanup,
+        )
 
 
 def _coordinated_close_channels(
@@ -538,17 +718,18 @@ class PCIeOneshotAllReduce:
         ipc.cudaSetDevice(device_obj.index or 0)
         ext = ext_module or _load_extension()
 
-        owned_buffers: list[_OwnedSharedBuffer] = []
+        channel_buffers = cls._allocate_eager_channel_buffers(
+            exchange_group,
+            signal_bytes=ext.meta_size(),
+            eager_buffer_bytes=eager_buffer_bytes,
+            ipc=ipc,
+        )
+        owned_buffers = [channel_buffers.owned_buffer]
+        runtime = object.__new__(cls)
+        init_error: BaseException | None = None
         try:
-            channel_buffers = cls._allocate_eager_channel_buffers(
-                exchange_group,
-                signal_bytes=ext.meta_size(),
-                eager_buffer_bytes=eager_buffer_bytes,
-                ipc=ipc,
-            )
-            owned_buffers.append(channel_buffers.owned_buffer)
-
-            return cls(
+            cls.__init__(
+                runtime,
                 rank=rank,
                 world_size=world_size,
                 device=device_obj,
@@ -563,14 +744,24 @@ class PCIeOneshotAllReduce:
                 ext_module=ext,
                 stream_affine=stream_affine,
             )
-        except Exception:
-            for shared in owned_buffers:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        ipc.cudaIpcCloseMemHandle(ptr)
-                with suppress(Exception):
-                    ipc.cudaFree(shared.local_ptr)
-            raise
+        except Exception as exc:
+            init_error = exc
+
+        def abort_native_runtime() -> None:
+            pointer = getattr(runtime, "_ptr", 0)
+            if pointer:
+                ext.dispose(pointer)
+                runtime._ptr = 0
+
+        _finish_collective_runtime_setup(
+            owner="PCIe oneshot",
+            exchange_group=exchange_group,
+            ipc=ipc,
+            shared=channel_buffers.owned_buffer,
+            local_error=init_error,
+            local_cleanup=abort_native_runtime,
+        )
+        return runtime
 
     @classmethod
     def from_process_group(
@@ -605,42 +796,114 @@ class PCIeOneshotAllReduce:
         zero_fill: bool,
         ipc: CudaRTLibrary,
     ) -> _OwnedSharedBuffer:
-        local_ptr = ipc.cudaMalloc(size_in_bytes)
-        peer_ptrs: list[int] = []
-        remote_ptrs: list[int] = []
+        local_ptr: int | None = None
+        local_handle: bytes | None = None
+        prepare_error: BaseException | None = None
         try:
+            local_ptr = ipc.cudaMalloc(size_in_bytes)
             if zero_fill:
                 ipc.cudaMemset(local_ptr, 0, size_in_bytes)
             local_handle = ipc.cudaIpcGetMemHandleBytes(local_ptr)
+        except Exception as exc:
+            prepare_error = exc
+
+        # A rank that cannot allocate or publish its export must not leave its
+        # peers blocked in the handle exchange.  No imports exist yet, so
+        # successful ranks can safely release their local allocation.
+        prepare_statuses = _exchange_setup_failures(
+            prepare_error,
+            exchange_group=exchange_group,
+            phase="CUDA IPC export preparation",
+        )
+        if any(prepare_statuses):
+            free_error: BaseException | None = None
+            if local_ptr is not None:
+                try:
+                    ipc.cudaFree(local_ptr)
+                except Exception as exc:
+                    free_error = exc
+            free_statuses = _exchange_setup_failures(
+                free_error,
+                exchange_group=exchange_group,
+                phase="CUDA IPC export preparation rollback",
+            )
+            if any(free_statuses):
+                raise RuntimeError(
+                    _setup_failure_message(
+                        "PCIe shared buffer",
+                        "export preparation rollback",
+                        free_statuses,
+                        exports_retained=False,
+                    )
+                ) from (prepare_error or free_error)
+            raise RuntimeError(
+                _setup_failure_message(
+                    "PCIe shared buffer",
+                    "export preparation",
+                    prepare_statuses,
+                    exports_retained=False,
+                )
+            ) from prepare_error
+
+        assert local_ptr is not None
+        assert local_handle is not None
+        peer_ptrs: list[int] = []
+        remote_ptrs: list[int] = []
+        try:
             world_size = dist.get_world_size(group=exchange_group)
             rank = dist.get_rank(group=exchange_group)
             handles = _broadcast_gather_object(local_handle, exchange_group)
-            for idx, handle in enumerate(handles):
-                if idx == rank:
-                    peer_ptrs.append(local_ptr)
-                else:
-                    try:
-                        remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"failed to open CUDA IPC handle for peer rank {idx}"
-                        ) from exc
-                    peer_ptrs.append(remote_ptr)
-                    remote_ptrs.append(remote_ptr)
-            if len(peer_ptrs) != world_size:
-                raise RuntimeError("failed to gather IPC handles for all ranks")
-            return _OwnedSharedBuffer(
-                local_ptr=local_ptr,
-                peer_ptrs=tuple(peer_ptrs),
-                remote_ptrs=tuple(remote_ptrs),
-            )
         except Exception:
-            for ptr in remote_ptrs:
-                with suppress(Exception):
-                    ipc.cudaIpcCloseMemHandle(ptr)
-            with suppress(Exception):
-                ipc.cudaFree(local_ptr)
+            # No rank has opened an import before handle exchange completes.
+            # Retain the allocation if collective progress is uncertain.
             raise
+
+        open_error: BaseException | None = None
+        for idx, handle in enumerate(handles):
+            if idx == rank:
+                peer_ptrs.append(local_ptr)
+                continue
+            try:
+                remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
+            except Exception as exc:
+                if open_error is None:
+                    open_error = RuntimeError(
+                        f"failed to open CUDA IPC handle for peer group rank {idx}"
+                    )
+                    open_error.__cause__ = exc
+                # Preserve group-rank indexing while every rank completes the
+                # same open loop and reaches the collective verdict.
+                peer_ptrs.append(0)
+            else:
+                peer_ptrs.append(remote_ptr)
+                remote_ptrs.append(remote_ptr)
+
+        if len(handles) != world_size or len(peer_ptrs) != world_size:
+            open_error = open_error or RuntimeError(
+                "failed to gather CUDA IPC handles for every group rank"
+            )
+        open_statuses = _exchange_setup_failures(
+            open_error,
+            exchange_group=exchange_group,
+            phase="CUDA IPC import open",
+        )
+        if any(open_statuses):
+            _abort_collective_ipc_setup(
+                owner="PCIe shared buffer",
+                setup_phase="CUDA IPC import open",
+                setup_statuses=open_statuses,
+                exchange_group=exchange_group,
+                ipc=ipc,
+                local_ptr=local_ptr,
+                remote_ptrs=remote_ptrs,
+                local_error=open_error,
+            )
+
+        return _OwnedSharedBuffer(
+            local_ptr=local_ptr,
+            peer_ptrs=tuple(peer_ptrs),
+            remote_ptrs=tuple(remote_ptrs),
+        )
 
     @classmethod
     def _allocate_eager_channel_buffers(
@@ -1186,10 +1449,11 @@ class PCIeOneshotAllReduce:
         )
 
     def __del__(self) -> None:
-        # Never enter a distributed barrier from GC/interpreter teardown.
-        # Explicit close() is required to free exported IPC allocations safely.
-        with suppress(Exception):
-            self._close_ipc_imports_best_effort()
+        # GC cannot prove that work queued on an arbitrary CUDA stream has
+        # completed, and it must not synchronize or enter a distributed
+        # barrier.  Retain both mappings and exports for CUDA context teardown;
+        # explicit close() is the only release path.
+        return
 
 
 def _is_current_stream_capturing(device: torch.device) -> bool:
@@ -1322,17 +1586,18 @@ class PCIeOneshotAllReducePool:
         if self.exchange_group is None or self._ipc is None or self._ext is None:
             raise RuntimeError("pool is not configured to allocate channels")
 
-        owned_buffers: list[_OwnedSharedBuffer] = []
+        channel_buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
+            self.exchange_group,
+            signal_bytes=self._ext.meta_size(),
+            eager_buffer_bytes=self.eager_buffer_bytes,
+            ipc=self._ipc,
+        )
+        owned_buffers = [channel_buffers.owned_buffer]
+        channel = object.__new__(PCIeOneshotAllReduce)
+        init_error: BaseException | None = None
         try:
-            channel_buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
-                self.exchange_group,
-                signal_bytes=self._ext.meta_size(),
-                eager_buffer_bytes=self.eager_buffer_bytes,
-                ipc=self._ipc,
-            )
-            owned_buffers.append(channel_buffers.owned_buffer)
-
-            channel = PCIeOneshotAllReduce(
+            PCIeOneshotAllReduce.__init__(
+                channel,
                 rank=self.rank,
                 world_size=self.world_size,
                 device=self.device,
@@ -1347,14 +1612,23 @@ class PCIeOneshotAllReducePool:
                 ext_module=self._ext,
                 stream_affine=not self.single_channel,
             )
-        except Exception:
-            for shared in owned_buffers:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
-                with suppress(Exception):
-                    self._ipc.cudaFree(shared.local_ptr)
-            raise
+        except Exception as exc:
+            init_error = exc
+
+        def abort_native_runtime() -> None:
+            pointer = getattr(channel, "_ptr", 0)
+            if pointer:
+                self._ext.dispose(pointer)
+                channel._ptr = 0
+
+        _finish_collective_runtime_setup(
+            owner="PCIe oneshot pool channel",
+            exchange_group=self.exchange_group,
+            ipc=self._ipc,
+            shared=channel_buffers.owned_buffer,
+            local_error=init_error,
+            local_cleanup=abort_native_runtime,
+        )
         channel._bind_stream_key(stream_key)
         self._all_channels.append(channel)
         return channel
@@ -1551,21 +1825,9 @@ class PCIeOneshotAllReducePool:
         self._channels.clear()
 
     def __del__(self) -> None:
-        # GC must stay nonblocking: unmap imports, but leave exported
-        # allocations to CUDA context teardown when explicit close was omitted.
-        with suppress(Exception):
-            seen: set[int] = set()
-            for channel in (*self._all_channels, *self._channels.values()):
-                if id(channel) not in seen:
-                    seen.add(id(channel))
-                    method = getattr(
-                        channel,
-                        "_close_ipc_imports_best_effort",
-                        None,
-                    )
-                    if method is None:
-                        method = channel._close_ipc_imports
-                    method()
+        # A pool may be collected while graph or stream work still references
+        # its channels.  Do not unmap, synchronize, or communicate from GC.
+        return
 
 
 __all__ = [

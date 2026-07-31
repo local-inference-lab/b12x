@@ -7,7 +7,9 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
+    _broadcast_gather_object,
     _compute_crossover_size,
+    _group_ranks,
     parse_pcie_oneshot_max_size,
 )
 
@@ -395,16 +397,77 @@ def test_allocate_shared_buffer_cleans_up_on_failed_peer_open(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+        lambda local_object, group: (
+            [local_object, (), ()]
+            if isinstance(local_object, tuple)
+            else [local_object, b"remote0", b"remote1"]
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="peer rank 2"):
+    with pytest.raises(RuntimeError, match="peer group rank 2"):
         PCIeOneshotAllReduce._allocate_shared_buffer(
             object(), 256, zero_fill=True, ipc=ipc
         )
 
     assert ipc.closed == [2000]
     assert ipc.freed == [1000]
+
+
+def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once(
+    monkeypatch,
+):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            return {b"remote0": 2000, b"remote1": 3000}[handle]
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    status_round = 0
+
+    def exchange(local_object, group):
+        nonlocal status_round
+        if not isinstance(local_object, tuple):
+            return [local_object, b"remote0", b"remote1"]
+        status_round += 1
+        if status_round == 1:  # export preparation
+            return [local_object, (), ()]
+        if status_round == 2:  # import-open verdict
+            return [local_object, ("peer open failed",), ()]
+        if status_round == 3:  # rollback-unmap verdict
+            return [local_object, ("peer unmap failed",), ()]
+        raise AssertionError(f"unexpected status round {status_round}")
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="retained.*peer unmap failed"):
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=ipc
+        )
+
+    assert ipc.closed == [2000, 3000]
+    assert ipc.freed == []
 
 
 def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
@@ -446,7 +509,11 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+        lambda local_object, group: (
+            [local_object, (), ()]
+            if isinstance(local_object, tuple)
+            else [local_object, b"remote0", b"remote1"]
+        ),
     )
 
     buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
@@ -504,7 +571,11 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: [local_object, b"remote0", b"remote1"],
+        lambda local_object, group: (
+            [local_object, (), ()]
+            if isinstance(local_object, tuple)
+            else [local_object, b"remote0", b"remote1"]
+        ),
     )
 
     with pytest.raises(RuntimeError, match="memset failed"):
@@ -547,6 +618,38 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     assert ext.register_graph_buffers_calls == [
         (12345, [[1, 2, 3], [9, 8, 7]], [[0, 64], [16, 80]])
     ]
+
+
+def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(
+    monkeypatch,
+):
+    group = object()
+    sources: list[int] = []
+    nonmonotonic_ranks = [7, 2, 9]
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 1)
+    monkeypatch.setattr(
+        "torch.distributed.get_process_group_ranks",
+        lambda group=None: list(nonmonotonic_ranks),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._object_broadcast_device",
+        lambda group: "cpu",
+    )
+
+    def fake_broadcast(object_list, src, group=None, device=None):
+        sources.append(src)
+        object_list[0] = f"from-{src}"
+
+    monkeypatch.setattr("torch.distributed.broadcast_object_list", fake_broadcast)
+
+    assert _group_ranks(group) == nonmonotonic_ranks
+    assert _broadcast_gather_object("local", group) == [
+        "from-7",
+        "from-2",
+        "from-9",
+    ]
+    assert sources == nonmonotonic_ranks
 
 
 def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatch):
@@ -859,7 +962,7 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     assert pool._channels == {3: retained}
 
 
-def test_channel_destructor_is_best_effort_without_freeing_exports_or_hiding_failures():
+def test_channel_destructor_retains_all_cuda_ownership_without_side_effects():
     events = []
 
     class FailingExt:
@@ -896,14 +999,9 @@ def test_channel_destructor_is_best_effort_without_freeing_exports_or_hiding_fai
 
     channel.__del__()
 
-    assert events == [
-        ("dispose_best_effort", 123),
-        ("close", 2000),
-        ("close", 3000),
-        ("close", 5000),
-    ]
-    assert channel._ptr == 0
-    assert channel._closed
+    assert events == []
+    assert channel._ptr == 123
+    assert not channel._closed
     assert not channel._ipc_imports_closed
     assert not channel._ipc_exports_freed
     assert [shared.local_ptr for shared in channel._owned_buffers] == [1000, 4000]

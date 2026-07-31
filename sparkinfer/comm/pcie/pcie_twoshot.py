@@ -11,7 +11,6 @@ a runtime instance must not be shared concurrently across CUDA streams.
 from __future__ import annotations
 
 import os
-from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
@@ -24,9 +23,10 @@ from torch.utils.cpp_extension import load
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
+    PCIeOneshotAllReduce,
+    _finish_collective_runtime_setup,
     _raise_local_cleanup_errors,
     _align_up,
-    _broadcast_gather_object,
     _coordinated_close_channels,
     _normalize_device,
     _OwnedSharedBuffer,
@@ -132,35 +132,20 @@ class PCIeTwoShotSP:
         signal_bytes = _align_up(int(ext.meta_size()), IPC_SLAB_ALIGNMENT)
         slab_bytes = signal_bytes + 2 * slot_bytes
 
-        local_ptr = ipc.cudaMalloc(slab_bytes)
-        owned: list[_OwnedSharedBuffer] = []
+        shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+            exchange_group,
+            slab_bytes,
+            zero_fill=True,
+            ipc=ipc,
+        )
+        peer_ptrs = list(shared.peer_ptrs)
+        signal_ptrs = peer_ptrs
+        staging0 = [p + signal_bytes for p in peer_ptrs]
+        staging1 = [p + signal_bytes + slot_bytes for p in peer_ptrs]
+
+        fptr = 0
+        init_error: BaseException | None = None
         try:
-            # Signals must start zeroed.
-            ipc.cudaMemset(local_ptr, 0, signal_bytes)
-            local_handle = ipc.cudaIpcGetMemHandleBytes(local_ptr)
-            handles = _broadcast_gather_object(local_handle, exchange_group)
-
-            peer_ptrs: list[int] = []
-            remote_ptrs: list[int] = []
-            for idx, handle in enumerate(handles):
-                if idx == rank:
-                    peer_ptrs.append(local_ptr)
-                else:
-                    remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
-                    peer_ptrs.append(remote_ptr)
-                    remote_ptrs.append(remote_ptr)
-            owned.append(
-                _OwnedSharedBuffer(
-                    local_ptr=local_ptr,
-                    peer_ptrs=tuple(peer_ptrs),
-                    remote_ptrs=tuple(remote_ptrs),
-                )
-            )
-
-            signal_ptrs = [p for p in peer_ptrs]
-            staging0 = [p + signal_bytes for p in peer_ptrs]
-            staging1 = [p + signal_bytes + slot_bytes for p in peer_ptrs]
-
             fptr = ext.init_twoshot(
                 signal_ptrs,
                 staging0,
@@ -170,26 +155,35 @@ class PCIeTwoShotSP:
                 scale_stride,
                 rank,
             )
-            return cls(
-                rank=rank,
-                world_size=world_size,
-                device=device_obj,
-                ext_module=ext,
-                fptr=fptr,
-                owned_buffers=owned,
-                ipc=ipc,
-                exchange_group=exchange_group,
-                max_rows=max_rows,
-                row_elems=row_elems,
-            )
-        except Exception:
-            for shared in owned:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        ipc.cudaIpcCloseMemHandle(ptr)
-            with suppress(Exception):
-                ipc.cudaFree(local_ptr)
-            raise
+        except Exception as exc:
+            init_error = exc
+
+        def abort_native_runtime() -> None:
+            nonlocal fptr
+            if fptr:
+                ext.dispose(fptr)
+                fptr = 0
+
+        _finish_collective_runtime_setup(
+            owner="PCIe twoshot",
+            exchange_group=exchange_group,
+            ipc=ipc,
+            shared=shared,
+            local_error=init_error,
+            local_cleanup=abort_native_runtime,
+        )
+        return cls(
+            rank=rank,
+            world_size=world_size,
+            device=device_obj,
+            ext_module=ext,
+            fptr=fptr,
+            owned_buffers=[shared],
+            ipc=ipc,
+            exchange_group=exchange_group,
+            max_rows=max_rows,
+            row_elems=row_elems,
+        )
 
     def _check(self, payload: torch.Tensor, scale: torch.Tensor, rows: int) -> None:
         if self._closed:
@@ -360,7 +354,6 @@ class PCIeTwoShotSP:
         )
 
     def __del__(self) -> None:
-        # Never block GC on a distributed barrier. CUDA context teardown owns
-        # any export left behind when the caller omitted explicit close().
-        with suppress(Exception):
-            self._close_ipc_imports_best_effort()
+        # GC cannot prove queued CUDA work is complete.  Explicit close() is the
+        # only path allowed to synchronize, unmap imports, and free exports.
+        return

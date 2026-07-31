@@ -362,9 +362,9 @@ constexpr int kModeStagePush = 2;
 // only. Otherwise each CTA publishes one fp32 square-sum partial, crosses a
 // sense-reversing per-row generation barrier, and normalizes its own columns
 // from registers, so no CTA re-reads the row it just wrote. All CTAs of a
-// row spin, which is safe for the same reason the cross-rank start barrier
-// is: the grid never exceeds kMaxBlocks <= SM count, so every block is
-// resident.
+// row spin. The host derives the concrete kernel's resident-grid capacity
+// from CUDA occupancy before capture and caps the multi-CTA grid to that
+// device-specific value; no SM-count or full-GPU assumption is baked in.
 template <typename T, int ngpus, bool single_cta, int mode>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kernel(
     DoubleRankData data_options,
@@ -595,6 +595,44 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
   }
 }
 
+template <typename T, int ngpus, int mode>
+int fused_resident_grid_capacity(int threads) {
+  int blocks_per_sm = 0;
+  CHECK_CUDA_SUCCESS(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_sm,
+      pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, false, mode>,
+      threads,
+      0));
+  int device = 0;
+  int sm_count = 0;
+  CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+  CHECK_CUDA_SUCCESS(
+      cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+  if (blocks_per_sm <= 0 || sm_count <= 0) {
+    throw std::runtime_error(
+        "CUDA reported no resident capacity for fused PCIe RMSNorm");
+  }
+  return blocks_per_sm * sm_count;
+}
+
+template <typename T, int ngpus>
+std::array<int, 3> fused_resident_capacities(int threads) {
+  return {
+      fused_resident_grid_capacity<T, ngpus, kModeRegistered>(threads),
+      fused_resident_grid_capacity<T, ngpus, kModeStagePull>(threads),
+      fused_resident_grid_capacity<T, ngpus, kModeStagePush>(threads),
+  };
+}
+
+static int cap_fused_ctas_per_row(int requested, int rows,
+                                  int resident_capacity) {
+  if (rows <= 0 || resident_capacity <= 0) {
+    throw std::runtime_error("invalid fused PCIe resident-grid capacity");
+  }
+  return std::max(
+      1, std::min(requested, std::max(1, resident_capacity / rows)));
+}
+
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 
 class PCIeAllreduce {
@@ -613,6 +651,10 @@ class PCIeAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   IPCHandles ipc_handles_;
 
+  // [float, half, bf16][registered, pull, push], queried once during native
+  // runtime construction (outside CUDA graph capture) and reused by captures.
+  std::array<std::array<int, 3>, 3> fused_resident_capacity_{};
+
   bool dbuf_enabled_ = false;
   DoubleRankData dbuf_data_ = {};
 
@@ -624,6 +666,46 @@ class PCIeAllreduce {
         d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)),
         ipc_handles_(&PCIeAllreduce::close_ipc_handle) {
     for (int i = 0; i < world_size_; i++) sg_.signals[i] = signals[i];
+    const int threads = fused_threads();
+#define CACHE_CAPACITY(ngpus)                                                   \
+    do {                                                                        \
+      fused_resident_capacity_[0] = fused_resident_capacities<float, ngpus>(threads); \
+      fused_resident_capacity_[1] = fused_resident_capacities<half, ngpus>(threads);  \
+      fused_resident_capacity_[2] =                                             \
+          fused_resident_capacities<nv_bfloat16, ngpus>(threads);               \
+    } while (0)
+    switch (world_size_) {
+      case 2: CACHE_CAPACITY(2); break;
+      case 4: CACHE_CAPACITY(4); break;
+      case 6: CACHE_CAPACITY(6); break;
+      case 8: CACHE_CAPACITY(8); break;
+      case 10: CACHE_CAPACITY(10); break;
+      default:
+        throw std::invalid_argument("unsupported PCIe allreduce world size");
+    }
+#undef CACHE_CAPACITY
+    // Deterministic reduced-capacity/MIG-like validation may lower (never
+    // raise) CUDA's measured capacity. This is a test-only safety override.
+    const int test_capacity =
+        env_int("SPARKINFER_PCIE_TEST_RESIDENT_GRID_CAPACITY", 0);
+    if (test_capacity > 0) {
+      for (auto& dtype_capacities : fused_resident_capacity_) {
+        for (int& capacity : dtype_capacities) {
+          capacity = std::min(capacity, test_capacity);
+        }
+      }
+    }
+  }
+
+  template <typename T>
+  int fused_resident_capacity(int mode) const {
+    constexpr int dtype_index = std::is_same<T, float>::value
+                                    ? 0
+                                    : (std::is_same<T, half>::value ? 1 : 2);
+    if (mode < kModeRegistered || mode > kModeStagePush) {
+      throw std::runtime_error("invalid fused PCIe transport mode");
+    }
+    return fused_resident_capacity_[dtype_index][mode];
   }
 
   static cudaError_t close_ipc_handle(char* ptr) noexcept {
@@ -881,6 +963,12 @@ class PCIeAllreduce {
     const int mode = !use_eager_staging   ? kModeRegistered
                      : oneshot_push_enabled() ? kModeStagePush
                                               : kModeStagePull;
+    const int resident_capacity = fused_resident_capacity<T>(mode);
+    // Multi-CTA row barriers can only be used when the complete grid is
+    // simultaneously resident. This also handles reduced/MIG-like devices;
+    // fall back to the barrier-free single-CTA path when capacity is tight.
+    ctas_per_row =
+        cap_fused_ctas_per_row(ctas_per_row, rows, resident_capacity);
     const int blocks = rows * ctas_per_row;
     const bool single = ctas_per_row == 1;
     const int shard_packs = size / pack_size;

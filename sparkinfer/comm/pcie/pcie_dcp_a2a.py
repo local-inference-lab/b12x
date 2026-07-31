@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -18,6 +18,8 @@ from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
+    _finish_collective_runtime_setup,
+    _raise_local_cleanup_errors,
     _align_up,
     _coordinated_close_channels,
     _current_stream_key,
@@ -223,6 +225,8 @@ class PCIeDCPA2A:
         self._closed = False
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
         self._ptr = self._ext.init_dcp_a2a(
             list(signal_ptrs),
             list(staging0_ptrs),
@@ -263,16 +267,17 @@ class PCIeDCPA2A:
             head_dim=head_dim,
             query_head_dim=query_head_dim,
         )
-        owned: list[_OwnedSharedBuffer] = []
+        slab = PCIeOneshotAllReduce._allocate_shared_buffer(
+            exchange_group,
+            layout.slab_bytes,
+            zero_fill=True,
+            ipc=ipc,
+        )
+        runtime = object.__new__(cls)
+        init_error: BaseException | None = None
         try:
-            slab = PCIeOneshotAllReduce._allocate_shared_buffer(
-                exchange_group,
-                layout.slab_bytes,
-                zero_fill=True,
-                ipc=ipc,
-            )
-            owned.append(slab)
-            return cls(
+            cls.__init__(
+                runtime,
                 rank=rank,
                 world_size=world_size,
                 device=device_obj,
@@ -292,18 +297,28 @@ class PCIeDCPA2A:
                 query_head_dim=query_head_dim,
                 exchange_group=exchange_group,
                 ipc=ipc,
-                owned_buffers=owned,
+                owned_buffers=[slab],
                 ext_module=ext,
                 stream_affine=stream_affine,
             )
-        except Exception:
-            for shared in owned:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        ipc.cudaIpcCloseMemHandle(ptr)
-                with suppress(Exception):
-                    ipc.cudaFree(shared.local_ptr)
-            raise
+        except Exception as exc:
+            init_error = exc
+
+        def abort_native_runtime() -> None:
+            pointer = getattr(runtime, "_ptr", 0)
+            if pointer:
+                ext.dispose(pointer)
+                runtime._ptr = 0
+
+        _finish_collective_runtime_setup(
+            owner="PCIe DCP A2A",
+            exchange_group=exchange_group,
+            ipc=ipc,
+            shared=slab,
+            local_error=init_error,
+            local_cleanup=abort_native_runtime,
+        )
+        return runtime
 
     @classmethod
     def from_process_group(
@@ -478,39 +493,104 @@ class PCIeDCPA2A:
         )
         return out
 
-    def _close_ipc_imports(self) -> None:
+    def _closed_import_indices(self) -> set[tuple[int, int]]:
+        closed = getattr(self, "_closed_ipc_import_indices", None)
+        if closed is None:
+            closed = set()
+            self._closed_ipc_import_indices = closed
+        return closed
+
+    def _all_python_ipc_imports_closed(self, closed: set[tuple[int, int]]) -> bool:
+        if self._ipc is None:
+            return not any(shared.remote_ptrs for shared in self._owned_buffers)
+        return all(
+            (buffer_index, remote_index) in closed
+            for buffer_index, shared in enumerate(self._owned_buffers)
+            for remote_index, _ in enumerate(shared.remote_ptrs)
+        )
+
+    def _close_ipc_imports_strict(self) -> None:
         if self._ipc_imports_closed:
             return
         self._closed = True
+        failures: list[tuple[str, Exception]] = []
         if getattr(self, "_ptr", 0):
-            with suppress(Exception):
+            try:
                 self._ext.dispose(self._ptr)
-            self._ptr = 0
-        if self._ipc is not None:
-            for shared in self._owned_buffers:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
-        self._ipc_imports_closed = True
+            except Exception as exc:
+                failures.append(("native runtime", exc))
+            else:
+                self._ptr = 0
 
-    def _free_ipc_exports(self) -> None:
+        closed = self._closed_import_indices()
+        if self._ipc is not None:
+            for buffer_index, shared in enumerate(self._owned_buffers):
+                for remote_index, ptr in enumerate(shared.remote_ptrs):
+                    key = (buffer_index, remote_index)
+                    if key in closed:
+                        continue
+                    try:
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                    except Exception as exc:
+                        failures.append((f"CUDA IPC import {ptr}", exc))
+                    else:
+                        closed.add(key)
+        elif any(shared.remote_ptrs for shared in self._owned_buffers):
+            failures.append(
+                (
+                    "CUDA IPC imports",
+                    RuntimeError("CUDA runtime is unavailable for IPC unmap"),
+                )
+            )
+
+        if (
+            not failures
+            and not getattr(self, "_ptr", 0)
+            and self._all_python_ipc_imports_closed(closed)
+        ):
+            self._ipc_imports_closed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe DCP A2A", "IPC import close", failures)
+
+    def _free_ipc_exports_strict(self) -> None:
         if self._ipc_exports_freed:
             return
-        self._close_ipc_imports()
+        self._close_ipc_imports_strict()
+        failures: list[tuple[str, Exception]] = []
+        remaining = []
         if self._ipc is not None:
             for shared in self._owned_buffers:
-                with suppress(Exception):
+                try:
                     self._ipc.cudaFree(shared.local_ptr)
-        self._owned_buffers.clear()
-        self._ipc_exports_freed = True
+                except Exception as exc:
+                    remaining.append(shared)
+                    failures.append((f"CUDA IPC export {shared.local_ptr}", exc))
+        elif self._owned_buffers:
+            remaining = list(self._owned_buffers)
+            failures.append(
+                (
+                    "CUDA IPC exports",
+                    RuntimeError("CUDA runtime is unavailable for export free"),
+                )
+            )
+        self._owned_buffers = remaining
+        if not remaining:
+            self._ipc_exports_freed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe DCP A2A", "IPC export free", failures)
 
     def close(self) -> None:
-        self._close_ipc_imports()
-        self._free_ipc_exports()
+        if getattr(self, "_coordinated_close_complete", False):
+            return
+        _coordinated_close_channels(
+            (self,),
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def __del__(self) -> None:
-        with suppress(Exception):
-            self.close()
+        # Never unmap potentially in-flight CUDA work from GC.
+        return
 
 
 class PCIeDCPA2APool:
@@ -648,8 +728,6 @@ class PCIeDCPA2APool:
         retained = self._all_channels[:all_channels_len]
         retained_ids = {id(channel) for channel in retained}
         transient = self._all_channels[all_channels_len:]
-        self._all_channels = retained
-        self._channels = dict(channels)
 
         channels_to_close = tuple(
             dict.fromkeys(
@@ -661,6 +739,10 @@ class PCIeDCPA2APool:
             exchange_group=self.exchange_group,
             device=self.device,
         )
+        # Ownership changes only after coordinated teardown succeeds.  A
+        # failed unmap/free remains reachable for an explicit retry.
+        self._all_channels = retained
+        self._channels = dict(channels)
 
     def for_stream(self, stream: object = None) -> PCIeDCPA2A:
         if self._closed:
@@ -804,18 +886,25 @@ class PCIeDCPA2APool:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         seen: set[int] = set()
+        channels = []
         for channel in (*self._all_channels, *self._channels.values()):
             if id(channel) not in seen:
                 seen.add(id(channel))
-                channel.close()
+                channels.append(channel)
+        _coordinated_close_channels(
+            channels,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
+        self._closed = True
         self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:
-        with suppress(Exception):
-            self.close()
+        # Graphs may retain these channels after Python ownership disappears.
+        # Explicit close() is required for synchronization and peer teardown.
+        return
 
 
 __all__ = [

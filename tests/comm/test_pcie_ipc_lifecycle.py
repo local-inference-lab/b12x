@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
 from sparkinfer.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
@@ -67,7 +68,7 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
     assert pool._channels == {}
 
 
-def test_pool_destructor_is_nonblocking_and_does_not_free_exports(
+def test_pool_destructor_is_nonblocking_and_does_not_touch_cuda_ownership(
     monkeypatch,
 ) -> None:
     events = []
@@ -88,7 +89,7 @@ def test_pool_destructor_is_nonblocking_and_does_not_free_exports(
 
     pool.__del__()
 
-    assert events == ["imports:a"]
+    assert events == []
 
 
 class _FakeExt:
@@ -172,6 +173,72 @@ def _fake_oneshot(events: list[object]) -> PCIeOneshotAllReduce:
     return runtime
 
 
+def _fake_dcp(events: list[object]) -> PCIeDCPA2A:
+    runtime = object.__new__(PCIeDCPA2A)
+    runtime.rank = 0
+    runtime.world_size = 2
+    runtime.device = torch.device("cpu")
+    runtime.exchange_group = None
+    runtime._ext = _FakeExt(events)
+    runtime._ptr = 123
+    runtime._owned_buffers = [_Shared(1000, (2000, 3000))]
+    runtime._ipc = _FakeIPC(events)
+    runtime._closed = False
+    runtime._ipc_imports_closed = False
+    runtime._ipc_exports_freed = False
+    runtime._coordinated_close_complete = False
+    runtime._closed_ipc_import_indices = set()
+    return runtime
+
+
+def test_dcp_explicit_close_retries_failed_unmap_before_export_free() -> None:
+    events: list[object] = []
+    runtime = _fake_dcp(events)
+    runtime._ipc = _FakeIPC(events, close_failures={2000: 1})
+
+    with pytest.raises(RuntimeError, match="failed during IPC unmap"):
+        runtime.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+    ]
+    assert runtime._ptr == 0
+    assert not runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+
+    runtime.close()
+    assert events[-2:] == [("close", 2000), ("free", 1000)]
+    assert runtime._ipc_imports_closed
+    assert runtime._ipc_exports_freed
+
+
+def test_dcp_pool_failed_rollback_retains_transient_channel() -> None:
+    retained = _fake_dcp([])
+    transient_events: list[object] = []
+    transient = _fake_dcp(transient_events)
+    transient._ipc = _FakeIPC(transient_events, close_failures={2000: 1})
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: retained,
+    )
+    pool._all_channels = [retained, transient]
+    pool._channels = {1: retained, 2: transient}
+
+    with pytest.raises(RuntimeError, match="failed during IPC unmap"):
+        pool.rollback_channels((1, {1: retained}))
+
+    assert pool._all_channels == [retained, transient]
+    assert pool._channels == {1: retained, 2: transient}
+    assert ("free", 1000) not in transient_events
+
+
 def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None:
     events: list[object] = []
     runtime = _fake_twoshot(events)
@@ -208,7 +275,7 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     assert runtime._ipc_exports_freed
 
 
-def test_twoshot_destructor_unmaps_without_barrier_or_export_free(
+def test_twoshot_destructor_retains_imports_and_exports_without_cuda_calls(
     monkeypatch,
 ) -> None:
     events: list[object] = []
@@ -220,11 +287,8 @@ def test_twoshot_destructor_unmaps_without_barrier_or_export_free(
 
     runtime.__del__()
 
-    assert events == [
-        ("dispose", 123),
-        ("close", 2000),
-        ("close", 3000),
-    ]
+    assert events == []
+    assert runtime._fptr == 123
     assert runtime._owned_buffers != []
     assert not runtime._ipc_exports_freed
 
@@ -480,7 +544,7 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
 
 
 @pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
-def test_best_effort_gc_failure_never_frees_exports_or_marks_imports_closed(
+def test_gc_never_attempts_native_dispose_or_ipc_unmap(
     runtime_factory,
 ) -> None:
     events: list[object] = []
@@ -489,46 +553,31 @@ def test_best_effort_gc_failure_never_frees_exports_or_marks_imports_closed(
 
     runtime.__del__()
 
-    expected_dispose = (
-        ("dispose_best_effort", 123)
-        if isinstance(runtime, PCIeOneshotAllReduce)
-        else ("dispose", 123)
-    )
-    assert events == [
-        expected_dispose,
-        ("close", 2000),
-        ("close", 3000),
-    ]
+    assert events == []
+    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
+    assert getattr(runtime, pointer_attr) == 123
     assert not runtime._ipc_imports_closed
     assert not runtime._ipc_exports_freed
     assert runtime._owned_buffers
 
 
-def test_native_best_effort_failure_permanently_blocks_export_free() -> None:
+def test_gc_retention_preserves_explicit_close_retry_path() -> None:
     events: list[object] = []
     runtime = _fake_oneshot(events)
 
-    class NativeCloseFailedExt(_FakeExt):
-        def dispose_best_effort(self, ptr: int) -> bool:
-            self.events.append(("dispose_best_effort", ptr))
-            return False
-
-    runtime._ext = NativeCloseFailedExt(events)
-
     runtime.__del__()
 
-    assert runtime._ptr == 0
-    assert runtime._native_ipc_import_close_failed
+    assert events == []
+    assert runtime._ptr == 123
     assert not runtime._ipc_imports_closed
-
-    with pytest.raises(
-        RuntimeError,
-        match="native IPC import failed during best-effort teardown",
-    ):
-        runtime.close()
-
-    assert ("free", 1000) not in events
-    assert not runtime._ipc_exports_freed
+    runtime.close()
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("free", 1000),
+    ]
+    assert runtime._ipc_exports_freed
 
 
 def test_failed_rollback_keeps_transient_channel_owned_for_retry() -> None:

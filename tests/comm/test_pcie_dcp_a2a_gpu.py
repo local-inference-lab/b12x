@@ -331,7 +331,10 @@ def _check_graph(
             channel.lse_reduce_scatter(inputs[layer], lses[layer], outputs[layer])
     stream.synchronize()
 
-    for replay in range(8):
+    replay_count = int(os.getenv("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS", "8"))
+    if replay_count <= 0:
+        raise ValueError("SPARKINFER_PCIE_DCP_GRAPH_REPLAYS must be positive")
+    for replay in range(replay_count):
         expected = []
         expected_queries = []
         for layer in range(layers):
@@ -446,6 +449,46 @@ def _check_graph(
     assert changed_slots[0] != changed_slots[1]
 
 
+def _check_teardown_retry(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    device: torch.device,
+) -> None:
+    """Inject one local unmap failure and prove every rank retries coherently."""
+
+    assert pool._all_channels
+    channel = pool._all_channels[0]
+    assert channel._ipc is not None
+    original_close = channel._ipc.cudaIpcCloseMemHandle
+    injected = False
+
+    if rank == 0:
+
+        def fail_once(ptr):
+            nonlocal injected
+            if not injected:
+                injected = True
+                raise RuntimeError("injected DCP IPC unmap failure")
+            return original_close(ptr)
+
+        channel._ipc.cudaIpcCloseMemHandle = fail_once
+
+    failed = False
+    try:
+        pool.close()
+    except RuntimeError as exc:
+        failed = "IPC unmap" in str(exc)
+    verdict = torch.tensor(int(failed), device=device, dtype=torch.int32)
+    dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
+    assert int(verdict.item()) == 1
+    assert not pool._closed
+
+    if rank == 0:
+        channel._ipc.cudaIpcCloseMemHandle = original_close
+    pool.close()
+    assert pool._closed
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -463,6 +506,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         head_dim=HEAD_DIM,
         query_head_dim=QUERY_HEAD_DIM,
     )
+    closed = False
     try:
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
@@ -470,8 +514,12 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
         _check_graph(pool, rank, world_size, device)
         torch.cuda.synchronize(device)
+        if os.getenv("SPARKINFER_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
+            _check_teardown_retry(pool, rank, device)
+            closed = True
     finally:
-        pool.close()
+        if not closed:
+            pool.close()
         dist.destroy_process_group()
 
 
