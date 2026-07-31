@@ -77,8 +77,8 @@ static bool oneshot_push_enabled() {
 }
 
 struct Signal {
-  alignas(128) FlagType staging_generation;
-  FlagType active_staging_slot;
+  alignas(128) FlagType staging_arrive;
+  FlagType staging_generation;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
   alignas(128) FlagType rms_arrive[kMaxBlocks];
@@ -184,25 +184,6 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   return flag;
 }
 
-__global__ void advance_staging_slot(Signal* self_sg) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const FlagType generation = self_sg->staging_generation;
-    self_sg->active_staging_slot = generation & FlagType{1};
-    self_sg->staging_generation = generation + FlagType{1};
-  }
-}
-
-template <int ngpus>
-DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
-  if (threadIdx.x == 0) {
-    const int slot = int(self_sg->active_staging_slot);
-    const RankData* source = options.slots[slot];
-#pragma unroll
-    for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = source->ptrs[peer];
-  }
-  __syncthreads();
-}
-
 static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
@@ -213,6 +194,29 @@ static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
   return flag;
+}
+
+template <int ngpus>
+DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    // Every supported staging grid fits concurrently on the target Blackwell
+    // GPU. The last arriving block publishes one launch-wide generation, so
+    // variable grid sizes cannot split a launch across two slabs.
+    const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
+    const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
+    if (prior == static_cast<FlagType>(gridDim.x - 1)) {
+      self_sg->staging_arrive = 0;
+      __threadfence();
+      atomicAdd(&self_sg->staging_generation, FlagType{1});
+    } else {
+      while (ld_flag_acquire_gpu(&self_sg->staging_generation) == generation) {
+      }
+    }
+    const RankData* source = options.slots[generation & FlagType{1}];
+#pragma unroll
+    for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = source->ptrs[peer];
+  }
+  __syncthreads();
 }
 
 template <int ngpus, bool is_start>
@@ -738,7 +742,6 @@ class PCIeAllreduce {
     size /= d;
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
     blocks = std::max(blocks, 1);
-    if (stage_input) advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
 
 #define KL(ngpus)                                                                                                     \
   do {                                                                                                               \
@@ -836,7 +839,6 @@ class PCIeAllreduce {
     const int mode = !use_eager_staging   ? kModeRegistered
                      : oneshot_push_enabled() ? kModeStagePush
                                               : kModeStagePull;
-    if (use_eager_staging) advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
 
 #define KL(ngpus, SINGLE, MODE)                                                                                       \
   pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE><<<blocks, threads, 0, stream>>>(                   \

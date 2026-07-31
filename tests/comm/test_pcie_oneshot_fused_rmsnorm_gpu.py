@@ -182,7 +182,7 @@ def _run_graph(
             out=out,
             residual_out=residual,
         )
-    assert _cuda_graph_kernel_count(graph) == 2
+    assert _cuda_graph_kernel_count(graph) == 1
     stream = torch.cuda.current_stream(device)
     offset = 0
     if os.getenv("SPARKINFER_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
