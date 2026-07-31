@@ -462,12 +462,16 @@ def _graph_kernel_structure(
             f"{expected_kernel_nodes}"
         )
 
-    result, _, _, num_edges = cudart.cudaGraphGetEdges(graph_handle)
-    if result != cudart.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"cudaGraphGetEdges(size) failed: {result}")
-    result, from_nodes, to_nodes, returned_edges = cudart.cudaGraphGetEdges(
-        graph_handle,
-        num_edges,
+    edge_query = cudart.cudaGraphGetEdges(graph_handle)
+    if edge_query[0] != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaGraphGetEdges(size) failed: {edge_query[0]}")
+    num_edges = int(edge_query[-1])
+    edges = cudart.cudaGraphGetEdges(graph_handle, num_edges)
+    result, from_nodes, to_nodes, returned_edges = (
+        edges[0],
+        edges[1],
+        edges[2],
+        edges[-1],
     )
     if result != cudart.cudaError_t.cudaSuccess or returned_edges != num_edges:
         raise RuntimeError(
@@ -490,6 +494,12 @@ def _graph_kernel_structure(
 
     def geometry(node: object) -> tuple[list[int], list[int]]:
         result, params = cudart.cudaGraphKernelNodeGetParams(node)
+        if (
+            result != cudart.cudaError_t.cudaSuccess
+            and hasattr(cudart, "cudaGraphNodeGetParams")
+        ):
+            result, node_params = cudart.cudaGraphNodeGetParams(node)
+            params = node_params.kernel
         if result != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(f"cudaGraphKernelNodeGetParams failed: {result}")
         return _dim3_list(params.gridDim), _dim3_list(params.blockDim)
