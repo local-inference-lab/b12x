@@ -53,6 +53,7 @@ def allocate_bf16_to_fp6_tma_outputs(
     *,
     device: torch.device = torch.device("cuda"),
     emit: str = "packed",
+    zero_init: bool = True,
 ) -> BF16ToFP6TMAOutputs:
     """Allocate uint8 FP6 activations and swizzled UE8M0 scales.
 
@@ -62,12 +63,27 @@ def allocate_bf16_to_fp6_tma_outputs(
     but padding rows (M..rows_pad-1) stay untouched and the GEMM's TMA tile may
     read them for m in 2..15. Zeroed padding guarantees cross-process
     reproducibility (torch.empty contents vary per CUDA context).
+
+    ``zero_init=False`` skips both fills, and is ONLY valid when the caller
+    guarantees ``M % 128 == 0`` and ``K % 128 == 0``: then ``rows_pad == M`` and
+    ``cols_pad_sf == K // 32`` exactly, so there is no padding row or column for
+    a reader to reach and the quantizer overwrites every allocated byte.
+    Reproducibility is preserved for the same reason - nothing uninitialized
+    survives the kernel. The fill is not free at prefill scale: ~96 MB per
+    linear per call on a Behemoth shard, against the HBM traffic the FP6 path
+    exists to reduce.
     """
     rows_pad = align_up(M, _TILE_M)
     cols_pad_sf = align_up(K // _SF_VEC_SIZE_FP6, 4)
     packed_k_bytes = K if emit == "bytes" else mxfp6_packed_k_bytes(K)
-    packed_a_storage = torch.zeros(1, M, packed_k_bytes, dtype=torch.uint8, device=device)
-    scale_storage = torch.zeros(rows_pad * cols_pad_sf, dtype=torch.uint8, device=device)
+    if not zero_init and (rows_pad != M or cols_pad_sf * _SF_VEC_SIZE_FP6 != K):
+        raise ValueError(
+            "zero_init=False requires M and K to be padding-aligned "
+            f"(M % {_TILE_M} == 0, K % 128 == 0); got M={M}, K={K}"
+        )
+    alloc = torch.empty if not zero_init else torch.zeros
+    packed_a_storage = alloc(1, M, packed_k_bytes, dtype=torch.uint8, device=device)
+    scale_storage = alloc(rows_pad * cols_pad_sf, dtype=torch.uint8, device=device)
     packed_a_view = packed_a_storage.permute(1, 2, 0)
     sfa_ptr = make_ptr(
         cutlass.Float8E8M0FNU,

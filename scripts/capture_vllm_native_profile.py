@@ -215,7 +215,12 @@ def main() -> None:
         error_path=error_log,
     )
 
+    # Set only while the server is known to be profiling, so the unwind path
+    # below can tell "never started" from "started and not yet stopped".
+    profile_active = False
+
     def _start_profile() -> None:
+        nonlocal profile_active
         status, body = http_json(
             f"{base_url}/start_profile", headers=headers, payload={}
         )
@@ -232,15 +237,19 @@ def main() -> None:
             raise RuntimeError(
                 f"/start_profile failed with status {status}: {body.strip()}"
             )
+        profile_active = True
 
     def _stop_profile_quietly() -> None:
         """Best-effort /stop_profile on an error path; never masks the cause."""
+        nonlocal profile_active
         try:
             status, body = http_json(
                 f"{base_url}/stop_profile", headers=headers, payload={}
             )
             stop_response.write_text(body, encoding="utf-8")
-            if status != 200:
+            if status == 200:
+                profile_active = False
+            else:
                 print(
                     f"warning: /stop_profile returned {status} while unwinding: "
                     f"{body.strip()}",
@@ -267,44 +276,46 @@ def main() -> None:
 
     try:
         if not stream.wait_for_first_token(args.first_token_timeout):
-            stream.stop()
             detail = ""
             if stream.error:
                 detail = f" request error: {stream.error}"
             raise RuntimeError(
                 f"timed out waiting for the first streamed token.{detail}"
             )
-    except BaseException:
-        # Prefill starts the profile before the request, so bailing out here
-        # would leave the server profiling forever and poison the next capture.
-        if prefill_mode:
-            _stop_profile_quietly()
-        raise
 
-    first_token_at = time.time()
+        first_token_at = time.time()
 
-    if not prefill_mode:
-        print("first streamed token observed; starting native profile...")
-        _start_profile()
-        deadline = time.time() + args.capture_seconds
-        while time.time() < deadline:
-            if stream.finished_event.wait(timeout=0.2):
-                break
-    else:
-        print(
-            "first streamed token observed after "
-            f"{first_token_at - started_at:.2f}s; stopping profile."
+        if not prefill_mode:
+            print("first streamed token observed; starting native profile...")
+            _start_profile()
+            deadline = time.time() + args.capture_seconds
+            while time.time() < deadline:
+                if stream.finished_event.wait(timeout=0.2):
+                    break
+        else:
+            print(
+                "first streamed token observed after "
+                f"{first_token_at - started_at:.2f}s; stopping profile."
+            )
+
+        print("stopping native profile...")
+        status, body = http_json(
+            f"{base_url}/stop_profile", headers=headers, payload={}
         )
-
-    print("stopping native profile...")
-    status, body = http_json(f"{base_url}/stop_profile", headers=headers, payload={})
-    stop_response.write_text(body, encoding="utf-8")
-    if status != 200:
+        stop_response.write_text(body, encoding="utf-8")
+        if status != 200:
+            raise RuntimeError(
+                f"/stop_profile failed with status {status}: {body.strip()}"
+            )
+        profile_active = False
+        finished_at = time.time()
+    finally:
+        # A timeout, transport error or interrupt anywhere above leaves the
+        # server profiling into the next capture; profile_active stays set
+        # until /stop_profile has actually returned 200.
+        if profile_active:
+            _stop_profile_quietly()
         stream.stop()
-        raise RuntimeError(f"/stop_profile failed with status {status}: {body.strip()}")
-
-    finished_at = time.time()
-    stream.stop()
 
     manifest = {
         "base_url": base_url,

@@ -353,7 +353,12 @@ def _quantize_matrix_fp6_bytes(
     )
 
     launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt, emit="bytes")
-    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=mat_bf16.device, emit="bytes")
+    # m and k are 128-aligned by the guard above, so the buffers have no padding
+    # row or column and the quantizer writes every byte: the zero-fill would be
+    # pure extra HBM traffic on the prefill path (see allocate_...'s zero_init).
+    out = allocate_bf16_to_fp6_tma_outputs(
+        m, k, device=mat_bf16.device, emit="bytes", zero_init=False
+    )
     launch(mat_bf16.contiguous(), global_scale, out.packed_a_flat, out.scale_flat)
     return out.packed_a_storage.view(m, k), out.scale_storage
 
@@ -403,7 +408,12 @@ def _quantize_matrix_fp6_bytes_per_row(
     alpha = torch.empty(1, dtype=torch.float32, device=device)
     gs_launch(x, w_global_scale, gs_pr, inv_gs, alpha)
     launch = compile_bf16_to_fp6_tma(m, k, fmt=fmt, emit="bytes", per_row=True)
-    out = allocate_bf16_to_fp6_tma_outputs(m, k, device=device, emit="bytes")
+    # Padding-aligned by the guard above: no untouched rows or scale columns, so
+    # the two zero-fills (~96 MB per linear per prefill call on a Behemoth
+    # shard) are redundant work against the FP6 HBM saving being measured.
+    out = allocate_bf16_to_fp6_tma_outputs(
+        m, k, device=device, emit="bytes", zero_init=False
+    )
     launch(x, gs_pr, out.packed_a_flat, out.scale_flat)
     return out.packed_a_storage.view(m, k), out.scale_storage, alpha, inv_gs
 

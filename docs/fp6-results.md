@@ -132,6 +132,20 @@ ENABLE_PREFIX_CACHING=0 CUDA_VISIBLE_DEVICES=0 MODEL_DIR=<fp6 checkpoint> ./<mod
 Prefix caching off is mandatory, not hygiene — see `fp6-user-guide.md` 2.6b for
 the 7.5x phantom prefill it produces otherwise.
 
+**Provenance of 3.1b, 3.3b and 3.5 is incomplete, and they are reported as
+measurements rather than as release evidence.** A benchmark record here owes
+seven fields: launch and sweep command, commit, worktree state, GPU mode,
+correctness state, raw timings, and ratio direction. These three sweeps carry
+the commands (above), the pass count and run-to-run spread per section, the
+prefix-caching state, correctness by way of the section-2 KLD constants for the
+same checkpoints, and ratio direction inline (higher tok/s and lower TTFT are
+both faster). They do **not** carry commit, worktree
+state, GPU clock/throttle mode, or per-pass raw timings: `bench-32k-sweep.sh`
+did not emit an evidence header when they were taken, so those fields were
+never captured and cannot be reconstructed after the fact. Treat any conclusion
+that has to survive review as pending a re-capture; the medians below are
+usable for shape-of-the-curve reasoning, not for a defended ratio.
+
 **Two harnesses appear in this section and their columns are not
 interchangeable.** Sections 3.1-3.4 report TTFT and an amortized output tok/s;
 3.1b, 3.3b and 3.5 use the later true-prefill sweep script shown above, which

@@ -36,6 +36,10 @@ def _isolate_scratch_registries():
         dict(fdw._CAPTURE_ASSIGNED),
         {key: list(value) for key, value in fdw._CAPTURE_CLAIMED.items()},
     )
+    # Snapshot AND clear: these tests assert on registry sizes and on whether a
+    # bucket was allocated, so a bucket left by a warm path or an earlier test
+    # changes the outcome.
+    _clear_registries(fdw)
     try:
         yield
     finally:

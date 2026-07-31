@@ -678,7 +678,8 @@ def main() -> None:
         default=0,
         help=(
             "Parallel worker processes (one per trace file). "
-            "0 = min(number of traces, CPU count). 1 = serial."
+            f"0 = min(number of traces, CPU count, {_MAX_AUTO_WORKERS}); the cap "
+            "is memory, not cores. 1 = serial."
         ),
     )
     parser.add_argument(
@@ -733,6 +734,10 @@ def main() -> None:
         return
     if not args.paths:
         parser.error("paths required unless --self-test")
+    if args.workers < 0:
+        # Negative fell through `args.workers or ...` as a truthy override and
+        # silently ran serial, which reads as the automatic mode having chosen it.
+        parser.error("--workers must be 0 (automatic) or a positive count")
 
     traces: list[pathlib.Path] = []
     for raw in args.paths:
