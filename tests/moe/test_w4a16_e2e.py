@@ -588,6 +588,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate_size", [128, 224])
 @pytest.mark.parametrize("w13_layout", ["w13", "w31"])
 # 0.5 is small enough to actually engage the SwiGLU clamp at these scales.
 @pytest.mark.parametrize("swiglu_limit", [None, 0.5])
@@ -598,6 +599,7 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
     m: int,
     swiglu_limit: float | None,
     w13_layout: str,
+    intermediate_size: int,
 ) -> None:
     """Small-M micro decode path with native MXFP4 (E8M0 K/32) scales."""
     if swiglu_limit is not None and activation != "silu":
@@ -617,7 +619,7 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
             scale_format="e8m0_k32", **common
         )
         assert e4m3.__cache_key__ != e8m0.__cache_key__
-    experts, hidden_size, intermediate_size = 4, 128, 128
+    experts, hidden_size = 4, 128
     rows = intermediate_size * (2 if activation == "silu" else 1)
     topk = 2
     torch.manual_seed(20260601 + (1000 if activation == "silu" else 0) + m)
