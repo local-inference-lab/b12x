@@ -33,14 +33,9 @@
 
 #include <algorithm>
 #include <array>
-#include <map>
 #include <sstream>
 #include <stdexcept>
-#include <tuple>
 #include <vector>
-
-#include "resident_grid.h"
-
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
@@ -63,8 +58,8 @@ using FlagType = uint32_t;
 constexpr int kFlagStride = 32;
 
 struct Signal {
-  alignas(128) FlagType staging_arrive;
-  FlagType staging_generation;
+  alignas(128) FlagType staging_generation;
+  FlagType active_staging_slot;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
 };
@@ -93,32 +88,27 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   return flag;
 }
 
-static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
+static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
   FlagType flag;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
   return flag;
+}
+
+__global__ void advance_staging_slot_kernel(Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    const FlagType generation = self_sg->staging_generation;
+    self_sg->active_staging_slot = generation & FlagType{1};
+    self_sg->staging_generation = generation + FlagType{1};
+  }
 }
 
 template <int ngpus>
 DINLINE void select_rank_ptrs(RankPtrs& selected, const DoubleRankPtrs& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
-    // The host clamps this launch to the exact kernel's simultaneous residency
-    // limit and launches cooperatively, so overlapping channels cannot each
-    // occupy only part of their rendezvous grid. Rendezvous before publishing
-    // the generation so every block selects one slab even when the preceding
-    // launch used a different grid size. A Signal and its slots remain
-    // single-stream-owned.
-    const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
-    const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
-    if (prior == static_cast<FlagType>(gridDim.x - 1)) {
-      self_sg->staging_arrive = 0;
-      __threadfence();
-      atomicAdd(&self_sg->staging_generation, FlagType{1});
-    } else {
-      while (ld_flag_acquire_gpu(&self_sg->staging_generation) == generation) {
-      }
-    }
-    const int slot = int(generation & FlagType{1});
+    // A one-CTA control kernel publishes the slot on this same stream before
+    // the worker launch. Kernel completion is the ordering edge, so every CTA
+    // observes one launch-wide slot without a grid rendezvous.
+    const int slot = int(ld_flag_relaxed_gpu(&self_sg->active_staging_slot) & FlagType{1});
 #pragma unroll
     for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = options.slots[slot].ptrs[peer];
   }
@@ -309,7 +299,6 @@ class PCIeTwoShot {
   int64_t scale_offset_;  // bytes
   int64_t scale_stride_;  // floats per src region
   int64_t max_shard_packs_;
-  std::map<std::tuple<const void*, int, int>, int> resident_grid_capacities_;
 
   PCIeTwoShot(Signal** signals, const std::vector<std::array<void*, 2>>& staging,
               int64_t pack_stride, int64_t scale_offset, int64_t scale_stride, int rank,
@@ -354,39 +343,6 @@ class PCIeTwoShot {
       throw std::runtime_error("pcie_twoshot scale capacity exceeded");
   }
 
-  template <typename Kernel>
-  int clamp_resident_blocks(Kernel kernel, int threads, int requested_blocks) {
-    int device = -1;
-    CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
-    const auto key =
-        std::make_tuple(reinterpret_cast<const void*>(kernel), threads, device);
-    auto cached = resident_grid_capacities_.find(key);
-    int capacity = 0;
-    if (cached != resident_grid_capacities_.end()) {
-      capacity = cached->second;
-    } else {
-      int active_blocks_per_sm = 0;
-      CHECK_CUDA_SUCCESS(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active_blocks_per_sm, kernel, threads, 0));
-      int sm_count = 0;
-      CHECK_CUDA_SUCCESS(
-          cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-      int cooperative_launch = 0;
-      CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(
-          &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
-      if (cooperative_launch == 0)
-        throw std::runtime_error(
-            "PCIe rendezvous kernels require cooperative-launch support");
-      capacity =
-          sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
-      if (capacity <= 0)
-        throw std::runtime_error(
-            "PCIe rendezvous kernel has no simultaneously resident grid capacity");
-      resident_grid_capacities_.emplace(key, capacity);
-    }
-    return std::min(requested_blocks, capacity);
-  }
-
   void reduce_scatter(cudaStream_t stream, const void* payload, const void* scale, void* out,
                       int64_t num_rows, int64_t row_elems, int threads, int block_limit) {
     if (num_rows % world_size_ != 0)
@@ -398,17 +354,16 @@ class PCIeTwoShot {
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
-      const int resident_blocks =
-          clamp_resident_blocks(rs_fp8_kernel<ngpus>, threads, blocks);
-      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(
-          rs_fp8_kernel<ngpus>, resident_blocks, threads, stream,
+      rs_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
           reinterpret_cast<const Fp8Pack*>(payload),
-          reinterpret_cast<const float*>(scale), staging_, pack_stride_,
-          scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank),
-          int(row_elems)));
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_, scale_offset_,
+          scale_stride_, sg_, self_sg_, reinterpret_cast<nv_bfloat16*>(out), rank_,
+          int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
     });
   }
 
@@ -420,17 +375,16 @@ class PCIeTwoShot {
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
-      const int resident_blocks =
-          clamp_resident_blocks(ag_fp8_kernel<ngpus>, threads, blocks);
-      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(
-          ag_fp8_kernel<ngpus>, resident_blocks, threads, stream,
+      ag_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
           reinterpret_cast<const Fp8Pack*>(payload),
-          reinterpret_cast<const float*>(scale), staging_, pack_stride_,
-          scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank),
-          int(row_elems)));
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_, scale_offset_,
+          scale_stride_, sg_, self_sg_, reinterpret_cast<nv_bfloat16*>(out), rank_,
+          int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
     });
   }
 };

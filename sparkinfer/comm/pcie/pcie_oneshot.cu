@@ -19,13 +19,9 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
-#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
-
-#include "resident_grid.h"
-
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
@@ -80,8 +76,8 @@ static bool oneshot_push_enabled() {
 }
 
 struct Signal {
-  alignas(128) FlagType staging_arrive;
-  FlagType staging_generation;
+  alignas(128) FlagType staging_generation;
+  FlagType active_staging_slot;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
   alignas(128) FlagType rms_arrive[kMaxBlocks];
@@ -193,32 +189,22 @@ static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
   return flag;
 }
 
-static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
-  FlagType flag;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
-  return flag;
+__global__ void advance_staging_slot_kernel(Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    const FlagType generation = self_sg->staging_generation;
+    self_sg->active_staging_slot = generation & FlagType{1};
+    self_sg->staging_generation = generation + FlagType{1};
+  }
 }
 
 template <int ngpus>
 DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
-    // The host clamps this launch to the exact kernel's simultaneous residency
-    // limit and launches cooperatively, so the scheduler atomically admits the
-    // entire grid even when other channels overlap. The last arriving block
-    // publishes one launch-wide generation, so variable grid sizes cannot split
-    // a launch across two slabs. A Signal and its staging slots remain
-    // single-stream-owned; concurrent streams require separate channels.
-    const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
-    const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
-    if (prior == static_cast<FlagType>(gridDim.x - 1)) {
-      self_sg->staging_arrive = 0;
-      __threadfence();
-      atomicAdd(&self_sg->staging_generation, FlagType{1});
-    } else {
-      while (ld_flag_acquire_gpu(&self_sg->staging_generation) == generation) {
-      }
-    }
-    const RankData* source = options.slots[generation & FlagType{1}];
+    // A one-CTA control kernel publishes the slot on this same stream before
+    // the worker launch. Kernel completion is the ordering edge, so every CTA
+    // observes one launch-wide slot without a grid rendezvous.
+    const int slot = int(ld_flag_relaxed_gpu(&self_sg->active_staging_slot) & FlagType{1});
+    const RankData* source = options.slots[slot];
 #pragma unroll
     for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = source->ptrs[peer];
   }
@@ -616,7 +602,6 @@ class PCIeAllreduce {
 
   bool dbuf_enabled_ = false;
   DoubleRankData dbuf_data_ = {};
-  std::map<std::tuple<const void*, int, int>, int> resident_grid_capacities_;
 
   PCIeAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
       : rank_(rank),
@@ -657,53 +642,6 @@ class PCIeAllreduce {
   void check_rank_data_capacity(size_t num = 1) {
     if (d_rank_data_base_ + num > d_rank_data_end_)
       throw std::runtime_error("Rank data buffer overflow");
-  }
-
-  template <typename Kernel>
-  int resident_grid_capacity(Kernel kernel, int threads) {
-    int device = -1;
-    CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
-    const auto key =
-        std::make_tuple(reinterpret_cast<const void*>(kernel), threads, device);
-    auto cached = resident_grid_capacities_.find(key);
-    if (cached != resident_grid_capacities_.end()) return cached->second;
-
-    int active_blocks_per_sm = 0;
-    CHECK_CUDA_SUCCESS(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks_per_sm, kernel, threads, 0));
-    int sm_count = 0;
-    CHECK_CUDA_SUCCESS(
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-    int cooperative_launch = 0;
-    CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(
-        &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
-    if (cooperative_launch == 0)
-      throw std::runtime_error(
-          "PCIe rendezvous kernels require cooperative-launch support");
-    const int capacity =
-        sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
-    if (capacity <= 0)
-      throw std::runtime_error(
-          "PCIe rendezvous kernel has no simultaneously resident grid capacity");
-    resident_grid_capacities_.emplace(key, capacity);
-    return capacity;
-  }
-
-  template <typename Kernel>
-  int clamp_resident_blocks(Kernel kernel, int threads, int requested_blocks) {
-    return std::min(requested_blocks, resident_grid_capacity(kernel, threads));
-  }
-
-  template <typename T, int ngpus, int mode>
-  int fused_resident_grid_capacity(int threads) {
-    // The clamp can change ctas_per_row from >1 to 1, which changes the kernel
-    // specialization. Use the lower exact occupancy so either dispatch remains
-    // safe after the clamp.
-    const int single = resident_grid_capacity(
-        pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, true, mode>, threads);
-    const int multi = resident_grid_capacity(
-        pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, false, mode>, threads);
-    return std::min(single, multi);
   }
 
   void register_pcie_buffers(void** ptrs0, void** ptrs1) {
@@ -776,7 +714,7 @@ class PCIeAllreduce {
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
 
     if (dbuf_enabled_) {
-      // A captured selector kernel advances the active eager slab on every
+      // A captured control kernel advances the active eager slab on every
       // execution, including CUDA graph replay.
       data_options = dbuf_data_;
       stage_input = true;
@@ -796,15 +734,16 @@ class PCIeAllreduce {
     size /= d;
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
     blocks = std::max(blocks, 1);
+    if (stage_input) {
+      advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
+    }
 
 #define KL(ngpus)                                                                                                     \
   do {                                                                                                               \
     if (stage_input) {                                                                                               \
-      const int resident_blocks = clamp_resident_blocks(                                                            \
-          pcie_allreduce_kernel<T, ngpus, true>, threads, blocks);                                                   \
-      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(                                                       \
-          pcie_allreduce_kernel<T, ngpus, true>, resident_blocks, threads, stream,                                  \
-          data_options, sg_, self_sg_, input, output, rank_, size));                                                 \
+      pcie_allreduce_kernel<T, ngpus, true>                                                                          \
+          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
     } else {                                                                                                         \
       pcie_allreduce_kernel<T, ngpus, false>                                                                         \
           <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
@@ -829,6 +768,7 @@ class PCIeAllreduce {
       default:
         throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
     }
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
 #undef KL
   }
 
@@ -856,7 +796,7 @@ class PCIeAllreduce {
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
     if (dbuf_enabled_) {
-      // A captured selector kernel advances the active eager slab on every
+      // A captured control kernel advances the active eager slab on every
       // execution, including CUDA graph replay.
       data_options = dbuf_data_;
       use_eager_staging = true;
@@ -893,55 +833,18 @@ class PCIeAllreduce {
     const int mode = !use_eager_staging   ? kModeRegistered
                      : oneshot_push_enabled() ? kModeStagePush
                                               : kModeStagePull;
-    int resident_capacity = 0;
-
-#define RESIDENT_MODE(ngpus)                                                                                         \
-  do {                                                                                                               \
-    if (mode == kModeStagePush) {                                                                                    \
-      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeStagePush>(threads);                          \
-    } else if (mode == kModeStagePull) {                                                                             \
-      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeStagePull>(threads);                          \
-    } else {                                                                                                         \
-      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeRegistered>(threads);                         \
-    }                                                                                                                \
-  } while (0)
-    switch (world_size_) {
-      case 2:
-        RESIDENT_MODE(2);
-        break;
-      case 4:
-        RESIDENT_MODE(4);
-        break;
-      case 6:
-        RESIDENT_MODE(6);
-        break;
-      case 8:
-        RESIDENT_MODE(8);
-        break;
-      case 10:
-        RESIDENT_MODE(10);
-        break;
-      default:
-        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " +
-                                 std::to_string(world_size_));
-    }
-#undef RESIDENT_MODE
-
-    if (rows > resident_capacity)
-      throw std::runtime_error(
-          "fused allreduce RMSNorm rows exceed the resident grid capacity (" +
-          std::to_string(rows) + " > " + std::to_string(resident_capacity) +
-          "); use fewer rows or a larger GPU partition");
-    ctas_per_row = std::min(ctas_per_row, resident_capacity / rows);
     const int blocks = rows * ctas_per_row;
     const bool single = ctas_per_row == 1;
     const int shard_packs = size / pack_size;
+    if (use_eager_staging) {
+      advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
+    }
 
 #define KL(ngpus, SINGLE, MODE)                                                                                       \
-  CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(                                                           \
-      pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE>, blocks, threads, stream,                    \
-      data_options, sg_, self_sg_, input, residual, weight, output, residual_output, rank_, hidden_packs,           \
-      ctas_per_row, shard_packs, epsilon));
+  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE>                                                    \
+      <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, residual, weight, output,                \
+                                       residual_output, rank_, hidden_packs, ctas_per_row, shard_packs, epsilon);
 #define DISPATCH_MODE(ngpus, SINGLE)                                                                                  \
   do {                                                                                                               \
     if (mode == kModeStagePush) {                                                                                    \
@@ -979,6 +882,7 @@ class PCIeAllreduce {
       default:
         throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
     }
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
 #undef DISPATCH
 #undef DISPATCH_MODE
 #undef KL
