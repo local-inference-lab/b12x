@@ -499,6 +499,16 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         params_dtype=torch.bfloat16,
         w13_layout=w13_layout,
     )
+    expected_w13_scale_rows = ((rows + 63) // 64) * 64
+    assert tuple(prepared.w13_scale.shape) == (
+        experts,
+        hidden_size // 32,
+        expected_w13_scale_rows,
+    )
+    assert prepared.micro_w13_scale is not None
+    assert int(prepared.micro_w13_scale.numel()) == (
+        experts * (hidden_size // 32) * expected_w13_scale_rows
+    )
     buffers = make_w4a16_buffers(
         prepared, m=m, topk=topk, dtype=torch.bfloat16, device=torch.device("cuda")
     )
