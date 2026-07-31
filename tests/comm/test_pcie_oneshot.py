@@ -885,6 +885,8 @@ def test_channel_teardown_completes_when_ipc_cleanup_raises():
     channel._closed = False
     channel._ipc_imports_closed = False
     channel._ipc_exports_freed = False
+    channel.exchange_group = None
+    channel.device = torch.device("cpu")
     channel._ptr = 123
     channel._ext = FailingExt()
     channel._ipc = FailingIPC()

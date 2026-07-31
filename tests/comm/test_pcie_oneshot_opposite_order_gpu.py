@@ -195,6 +195,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
         _run_graph_opposite_order(pool, device, rank, world_size)
         torch.cuda.synchronize(device)
+        dist.barrier()
     finally:
         pool.close()
         dist.destroy_process_group()

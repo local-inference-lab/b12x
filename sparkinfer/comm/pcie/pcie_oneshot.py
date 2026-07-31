@@ -170,20 +170,21 @@ def _coordinated_close_channels(
 ) -> None:
     """Release exported CUDA IPC allocations after every peer unmaps them."""
     unique_channels = tuple(dict.fromkeys(channels))
-    if exchange_group is None:
-        for channel in unique_channels:
-            channel.close()
+    if not unique_channels:
         return
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    dist.barrier(group=exchange_group)
+    if exchange_group is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dist.barrier(group=exchange_group)
     for channel in unique_channels:
         channel._close_ipc_imports()
-    dist.barrier(group=exchange_group)
+    if exchange_group is not None:
+        dist.barrier(group=exchange_group)
     for channel in unique_channels:
         channel._free_ipc_exports()
-    dist.barrier(group=exchange_group)
+    if exchange_group is not None:
+        dist.barrier(group=exchange_group)
 
 
 @dataclass(frozen=True)
@@ -924,12 +925,19 @@ class PCIeOneshotAllReduce:
         self._ipc_exports_freed = True
 
     def close(self) -> None:
-        self._close_ipc_imports()
-        self._free_ipc_exports()
+        if self._ipc_exports_freed:
+            return
+        _coordinated_close_channels(
+            (self,),
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
 
     def __del__(self) -> None:
+        # Never enter a distributed barrier from GC/interpreter teardown.
+        # Explicit close() is required to free exported IPC allocations safely.
         with suppress(Exception):
-            self.close()
+            self._close_ipc_imports()
 
 
 def _is_current_stream_capturing(device: torch.device) -> bool:
@@ -1275,18 +1283,30 @@ class PCIeOneshotAllReducePool:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         seen: set[int] = set()
+        channels = []
         for channel in (*self._all_channels, *self._channels.values()):
             if id(channel) not in seen:
                 seen.add(id(channel))
-                channel.close()
+                channels.append(channel)
+        _coordinated_close_channels(
+            channels,
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
+        self._closed = True
         self._all_channels.clear()
         self._channels.clear()
 
     def __del__(self) -> None:
+        # GC must stay nonblocking: unmap imports, but leave exported
+        # allocations to CUDA context teardown when explicit close was omitted.
         with suppress(Exception):
-            self.close()
+            seen: set[int] = set()
+            for channel in (*self._all_channels, *self._channels.values()):
+                if id(channel) not in seen:
+                    seen.add(id(channel))
+                    channel._close_ipc_imports()
 
 
 __all__ = [

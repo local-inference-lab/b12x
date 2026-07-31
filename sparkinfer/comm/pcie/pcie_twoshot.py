@@ -26,6 +26,7 @@ from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     _align_up,
     _broadcast_gather_object,
+    _coordinated_close_channels,
     _normalize_device,
     _OwnedSharedBuffer,
 )
@@ -69,6 +70,7 @@ class PCIeTwoShotSP:
         fptr: int,
         owned_buffers: Sequence[_OwnedSharedBuffer],
         ipc: CudaRTLibrary,
+        exchange_group: ProcessGroup,
         max_rows: int,
         row_elems: int,
     ) -> None:
@@ -79,9 +81,12 @@ class PCIeTwoShotSP:
         self._fptr = fptr
         self._owned_buffers = list(owned_buffers)
         self._ipc = ipc
+        self.exchange_group = exchange_group
         self.max_rows = max_rows
         self.row_elems = row_elems
         self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
 
     @classmethod
     def from_exchange_group(
@@ -170,6 +175,7 @@ class PCIeTwoShotSP:
                 fptr=fptr,
                 owned_buffers=owned,
                 ipc=ipc,
+                exchange_group=exchange_group,
                 max_rows=max_rows,
                 row_elems=row_elems,
             )
@@ -240,16 +246,41 @@ class PCIeTwoShotSP:
         self._ext.all_gather_fp8(self._fptr, payload, scale, out, threads, block_limit)
         return out
 
-    def close(self) -> None:
-        if self._closed:
+    def _close_ipc_imports(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
-        with suppress(Exception):
-            self._ext.dispose(self._fptr)
+        if self._fptr:
+            with suppress(Exception):
+                self._ext.dispose(self._fptr)
+            self._fptr = 0
         for shared in self._owned_buffers:
             for ptr in shared.remote_ptrs:
                 with suppress(Exception):
                     self._ipc.cudaIpcCloseMemHandle(ptr)
+        self._ipc_imports_closed = True
+
+    def _free_ipc_exports(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports()
+        for shared in self._owned_buffers:
             with suppress(Exception):
                 self._ipc.cudaFree(shared.local_ptr)
         self._owned_buffers.clear()
+        self._ipc_exports_freed = True
+
+    def close(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        _coordinated_close_channels(
+            (self,),
+            exchange_group=self.exchange_group,
+            device=self.device,
+        )
+
+    def __del__(self) -> None:
+        # Never block GC on a distributed barrier. CUDA context teardown owns
+        # any export left behind when the caller omitted explicit close().
+        with suppress(Exception):
+            self._close_ipc_imports()
