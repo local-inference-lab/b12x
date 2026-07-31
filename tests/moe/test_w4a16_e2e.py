@@ -1101,7 +1101,7 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
-@pytest.mark.parametrize("intermediate_size", [32, 128, 224])
+@pytest.mark.parametrize("intermediate_size", [32, 128, 144, 224, 352])
 def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     activation: str,
     m: int,
@@ -1198,6 +1198,11 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         experts=w4a16_experts,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        output=torch.empty(
+            (m, hidden_size),
+            dtype=x.dtype,
+            device=x.device,
+        ),
         quant_mode="w4a16",
     )
     expected = moe_reference_w4a16_f32(
@@ -1216,7 +1221,7 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         activation=activation,
     )
 
-    first = binding.run()
+    first = binding.run().clone()
     torch.cuda.synchronize()
     first_metrics = compare_to_reference(first, expected)
     assert bool(torch.isfinite(first).all().item())
@@ -1226,13 +1231,29 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     # swizzle block. Poison it all, then prove FC1 rewrites every logical lane
     # and FC2 ignores every inactive lane on the same-binding replay.
     binding.intermediate_cache2.fill_(float("nan"))
-    replay = binding.run()
+    replay = binding.run().clone()
     torch.cuda.synchronize()
     replay_metrics = compare_to_reference(replay, expected)
     assert bool(torch.isfinite(replay).all().item())
     assert replay_metrics.cos > 0.999, replay_metrics
-    assert direct_launches == [(m, intermediate_size), (m, intermediate_size)]
     torch.testing.assert_close(replay, first, atol=0.0, rtol=0.0)
+
+    # Capture the same direct path once, then repeatedly replay it after
+    # poisoning the arena tail. Graph replay does not re-enter the Python spy,
+    # so three launches prove two eager calls plus one captured custom-op node.
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        graph_output = binding.run()
+    for _ in range(16):
+        binding.intermediate_cache2.fill_(float("nan"))
+        graph.replay()
+    torch.cuda.synchronize()
+    graph_metrics = compare_to_reference(graph_output, expected)
+    assert bool(torch.isfinite(graph_output).all().item())
+    assert graph_metrics.cos > 0.999, graph_metrics
+    torch.testing.assert_close(graph_output, first, atol=0.0, rtol=0.0)
+    assert direct_launches == [(m, intermediate_size)] * 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
