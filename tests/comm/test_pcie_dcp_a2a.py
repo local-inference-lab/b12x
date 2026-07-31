@@ -368,6 +368,57 @@ def test_pool_restores_eager_mapping_after_capture(monkeypatch):
     assert graph_channel in pool._all_channels
 
 
+def test_pool_restores_nested_capture_mappings(monkeypatch):
+    current_stream = [7]
+    capturing = [False]
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    eager_channel = pool.for_stream()
+    with pool.capture(7) as outer_channel:
+        assert pool._channels == {7: outer_channel}
+
+        current_stream[0] = 8
+        with pool.capture() as inner_channel:
+            capturing[0] = True
+            current_stream[0] = 80
+            assert pool.for_stream() is inner_channel
+            assert pool._channels == {
+                7: outer_channel,
+                8: inner_channel,
+                80: inner_channel,
+            }
+            capturing[0] = False
+
+        assert pool._channels == {7: outer_channel}
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is outer_channel
+        capturing[0] = False
+
+    assert eager_channel is not outer_channel
+    assert outer_channel is not inner_channel
+    assert pool._channels == {7: eager_channel}
+    assert pool._capture_channel_stack == []
+
+
 def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
     created = []
 

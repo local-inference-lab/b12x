@@ -101,6 +101,21 @@ static DINLINE FlagType load_flag(FlagType *address) {
   return value;
 }
 
+template <int world_size>
+DINLINE void select_staging(RankStaging &staging,
+                            const DoubleStaging &staging_options,
+                            Signal *self) {
+  if (threadIdx.x == 0) {
+    const int slot =
+        int(load_flag(&self->self_counter[blockIdx.x][0]) & FlagType{1});
+#pragma unroll
+    for (int peer = 0; peer < world_size; ++peer) {
+      staging.ptrs[peer] = staging_options.slots[slot].ptrs[peer];
+    }
+  }
+  __syncthreads();
+}
+
 // pre_sync orders in-kernel staging stores (from every warp of the block)
 // before the flag post; without staging the flags can go out immediately.
 template <int world_size, bool pre_sync>
@@ -174,15 +189,7 @@ __global__ void __launch_bounds__(512, 1)
   auto *output_packs = reinterpret_cast<Pack<T> *>(output);
 
   __shared__ RankStaging staging;
-  if (threadIdx.x == 0) {
-    const int slot =
-        int(load_flag(&self->self_counter[blockIdx.x][0]) & FlagType{1});
-#pragma unroll
-    for (int peer = 0; peer < world_size; ++peer) {
-      staging.ptrs[peer] = staging_options.slots[slot].ptrs[peer];
-    }
-  }
-  __syncthreads();
+  select_staging<world_size>(staging, staging_options, self);
 
   auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
   auto *staging_lse = reinterpret_cast<float *>(
@@ -315,15 +322,7 @@ __global__ void __launch_bounds__(512, 1)
   const auto *local_packs = reinterpret_cast<const Pack<T> *>(local_input);
 
   __shared__ RankStaging staging;
-  if (threadIdx.x == 0) {
-    const int slot =
-        int(load_flag(&self->self_counter[blockIdx.x][0]) & FlagType{1});
-#pragma unroll
-    for (int peer = 0; peer < world_size; ++peer) {
-      staging.ptrs[peer] = staging_options.slots[slot].ptrs[peer];
-    }
-  }
-  __syncthreads();
+  select_staging<world_size>(staging, staging_options, self);
 
   auto *staging_out = reinterpret_cast<Pack<T> *>(staging.ptrs[rank]);
   for (int row = warp_first; row < rows; row += warp_stride) {
