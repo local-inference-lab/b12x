@@ -19,9 +19,12 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "resident_grid.h"
 
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
@@ -199,9 +202,11 @@ static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
 template <int ngpus>
 DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
-    // Every supported staging grid fits concurrently on the target Blackwell
-    // GPU. The last arriving block publishes one launch-wide generation, so
-    // variable grid sizes cannot split a launch across two slabs.
+    // The host clamps this launch to the exact kernel's simultaneous residency
+    // limit. The last arriving block publishes one launch-wide generation, so
+    // variable grid sizes cannot split a launch across two slabs. A Signal and
+    // its staging slots remain single-stream-owned; concurrent streams require
+    // separate channels.
     const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
     const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
     if (prior == static_cast<FlagType>(gridDim.x - 1)) {
@@ -610,6 +615,7 @@ class PCIeAllreduce {
 
   bool dbuf_enabled_ = false;
   DoubleRankData dbuf_data_ = {};
+  std::map<std::tuple<const void*, int, int>, int> resident_grid_capacities_;
 
   PCIeAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
       : rank_(rank),
@@ -650,6 +656,47 @@ class PCIeAllreduce {
   void check_rank_data_capacity(size_t num = 1) {
     if (d_rank_data_base_ + num > d_rank_data_end_)
       throw std::runtime_error("Rank data buffer overflow");
+  }
+
+  template <typename Kernel>
+  int resident_grid_capacity(Kernel kernel, int threads) {
+    int device = -1;
+    CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+    const auto key =
+        std::make_tuple(reinterpret_cast<const void*>(kernel), threads, device);
+    auto cached = resident_grid_capacities_.find(key);
+    if (cached != resident_grid_capacities_.end()) return cached->second;
+
+    int active_blocks_per_sm = 0;
+    CHECK_CUDA_SUCCESS(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm, kernel, threads, 0));
+    int sm_count = 0;
+    CHECK_CUDA_SUCCESS(
+        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+    const int capacity =
+        sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
+    if (capacity <= 0)
+      throw std::runtime_error(
+          "PCIe rendezvous kernel has no simultaneously resident grid capacity");
+    resident_grid_capacities_.emplace(key, capacity);
+    return capacity;
+  }
+
+  template <typename Kernel>
+  int clamp_resident_blocks(Kernel kernel, int threads, int requested_blocks) {
+    return std::min(requested_blocks, resident_grid_capacity(kernel, threads));
+  }
+
+  template <typename T, int ngpus, int mode>
+  int fused_resident_grid_capacity(int threads) {
+    // The clamp can change ctas_per_row from >1 to 1, which changes the kernel
+    // specialization. Use the lower exact occupancy so either dispatch remains
+    // safe after the clamp.
+    const int single = resident_grid_capacity(
+        pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, true, mode>, threads);
+    const int multi = resident_grid_capacity(
+        pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, false, mode>, threads);
+    return std::min(single, multi);
   }
 
   void register_pcie_buffers(void** ptrs0, void** ptrs1) {
@@ -746,11 +793,15 @@ class PCIeAllreduce {
 #define KL(ngpus)                                                                                                     \
   do {                                                                                                               \
     if (stage_input) {                                                                                               \
+      const int resident_blocks = clamp_resident_blocks(                                                            \
+          pcie_allreduce_kernel<T, ngpus, true>, threads, blocks);                                                   \
       pcie_allreduce_kernel<T, ngpus, true>                                                                          \
-          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
+          <<<resident_blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);        \
     } else {                                                                                                         \
+      const int resident_blocks = clamp_resident_blocks(                                                            \
+          pcie_allreduce_kernel<T, ngpus, false>, threads, blocks);                                                  \
       pcie_allreduce_kernel<T, ngpus, false>                                                                         \
-          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
+          <<<resident_blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);        \
     }                                                                                                                \
   } while (0)
     switch (world_size_) {
@@ -833,12 +884,52 @@ class PCIeAllreduce {
       ctas_per_row = std::max(std::max(1, 3 / rows), min_ctas);
     }
     ctas_per_row = std::max(1, std::min(ctas_per_row, kMaxBlocks / rows));
-    const int blocks = rows * ctas_per_row;
-    const bool single = ctas_per_row == 1;
-    const int shard_packs = size / pack_size;
     const int mode = !use_eager_staging   ? kModeRegistered
                      : oneshot_push_enabled() ? kModeStagePush
                                               : kModeStagePull;
+    int resident_capacity = 0;
+
+#define RESIDENT_MODE(ngpus)                                                                                         \
+  do {                                                                                                               \
+    if (mode == kModeStagePush) {                                                                                    \
+      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeStagePush>(threads);                          \
+    } else if (mode == kModeStagePull) {                                                                             \
+      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeStagePull>(threads);                          \
+    } else {                                                                                                         \
+      resident_capacity = fused_resident_grid_capacity<T, ngpus, kModeRegistered>(threads);                         \
+    }                                                                                                                \
+  } while (0)
+    switch (world_size_) {
+      case 2:
+        RESIDENT_MODE(2);
+        break;
+      case 4:
+        RESIDENT_MODE(4);
+        break;
+      case 6:
+        RESIDENT_MODE(6);
+        break;
+      case 8:
+        RESIDENT_MODE(8);
+        break;
+      case 10:
+        RESIDENT_MODE(10);
+        break;
+      default:
+        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " +
+                                 std::to_string(world_size_));
+    }
+#undef RESIDENT_MODE
+
+    if (rows > resident_capacity)
+      throw std::runtime_error(
+          "fused allreduce RMSNorm rows exceed the resident grid capacity (" +
+          std::to_string(rows) + " > " + std::to_string(resident_capacity) +
+          "); use fewer rows or a larger GPU partition");
+    ctas_per_row = std::min(ctas_per_row, resident_capacity / rows);
+    const int blocks = rows * ctas_per_row;
+    const bool single = ctas_per_row == 1;
+    const int shard_packs = size / pack_size;
 
 #define KL(ngpus, SINGLE, MODE)                                                                                       \
   pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE><<<blocks, threads, 0, stream>>>(                   \

@@ -17,13 +17,19 @@ RUNTIME_CUDA_SOURCES = {
     "pcie_oneshot.cu",
     "pcie_twoshot.cu",
 }
+RUNTIME_CUDA_HEADERS = {
+    "resident_grid.h",
+}
 
 
 def test_runtime_cuda_sources_are_in_package_data() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text())
     package_data = config["tool"]["setuptools"]["package-data"]
 
-    assert package_data[PCIE_PACKAGE] == ["*.cu"]
+    assert package_data[PCIE_PACKAGE] == ["*.cu", "*.h"]
     assert {
         path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.cu")
     } == RUNTIME_CUDA_SOURCES
+    assert {
+        path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.h")
+    } >= RUNTIME_CUDA_HEADERS

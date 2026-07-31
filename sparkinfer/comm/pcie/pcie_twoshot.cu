@@ -31,10 +31,15 @@
 #include <torch/all.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <array>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
+
+#include "resident_grid.h"
 
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
@@ -97,9 +102,10 @@ static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
 template <int ngpus>
 DINLINE void select_rank_ptrs(RankPtrs& selected, const DoubleRankPtrs& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
-    // kMaxBlocks fits concurrently on the target Blackwell GPU. Rendezvous
-    // before publishing the generation so every block in this launch selects
-    // one slab even when the preceding launch used a different grid size.
+    // The host clamps this launch to the exact kernel's simultaneous residency
+    // limit. Rendezvous before publishing the generation so every block in
+    // this launch selects one slab even when the preceding launch used a
+    // different grid size. A Signal and its slots remain single-stream-owned.
     const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
     const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
     if (prior == static_cast<FlagType>(gridDim.x - 1)) {
@@ -301,6 +307,7 @@ class PCIeTwoShot {
   int64_t scale_offset_;  // bytes
   int64_t scale_stride_;  // floats per src region
   int64_t max_shard_packs_;
+  std::map<std::tuple<const void*, int, int>, int> resident_grid_capacities_;
 
   PCIeTwoShot(Signal** signals, const std::vector<std::array<void*, 2>>& staging,
               int64_t pack_stride, int64_t scale_offset, int64_t scale_stride, int rank,
@@ -345,6 +352,33 @@ class PCIeTwoShot {
       throw std::runtime_error("pcie_twoshot scale capacity exceeded");
   }
 
+  template <typename Kernel>
+  int clamp_resident_blocks(Kernel kernel, int threads, int requested_blocks) {
+    int device = -1;
+    CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+    const auto key =
+        std::make_tuple(reinterpret_cast<const void*>(kernel), threads, device);
+    auto cached = resident_grid_capacities_.find(key);
+    int capacity = 0;
+    if (cached != resident_grid_capacities_.end()) {
+      capacity = cached->second;
+    } else {
+      int active_blocks_per_sm = 0;
+      CHECK_CUDA_SUCCESS(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &active_blocks_per_sm, kernel, threads, 0));
+      int sm_count = 0;
+      CHECK_CUDA_SUCCESS(
+          cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+      capacity =
+          sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
+      if (capacity <= 0)
+        throw std::runtime_error(
+            "PCIe rendezvous kernel has no simultaneously resident grid capacity");
+      resident_grid_capacities_.emplace(key, capacity);
+    }
+    return std::min(requested_blocks, capacity);
+  }
+
   void reduce_scatter(cudaStream_t stream, const void* payload, const void* scale, void* out,
                       int64_t num_rows, int64_t row_elems, int threads, int block_limit) {
     if (num_rows % world_size_ != 0)
@@ -358,7 +392,9 @@ class PCIeTwoShot {
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
-      rs_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
+      const int resident_blocks =
+          clamp_resident_blocks(rs_fp8_kernel<ngpus>, threads, blocks);
+      rs_fp8_kernel<ngpus><<<resident_blocks, threads, 0, stream>>>(
           reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
           staging_, pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
           reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
@@ -375,7 +411,9 @@ class PCIeTwoShot {
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
-      ag_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
+      const int resident_blocks =
+          clamp_resident_blocks(ag_fp8_kernel<ngpus>, threads, blocks);
+      ag_fp8_kernel<ngpus><<<resident_blocks, threads, 0, stream>>>(
           reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
           staging_, pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
           reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
