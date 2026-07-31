@@ -752,9 +752,7 @@ class MoEMicroKernelBackend:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
-        elif m == 1:
-            grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
-        elif m == 2:
+        elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
             grid_x = max(1, min(int(max_active_ctas), fc2_tasks))
@@ -815,7 +813,6 @@ class MoEMicroKernelBackend:
         k_row1 = k_row0 + Int32(1)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
@@ -1274,7 +1271,6 @@ class MoEMicroKernelBackend:
         k_row3 = k_row0 + Int32(3)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         token_inter_base = t * Int32(cfg.inter_u32)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
