@@ -125,11 +125,15 @@ def _cuda_graph_kernel_chain(
         f"one worker node, found {len(kernel_nodes)} kernel nodes"
     )
 
-    result, _, _, num_edges = cudart.cudaGraphGetEdges(graph_handle)
-    assert result == cudart.cudaError_t.cudaSuccess
-    result, from_nodes, to_nodes, returned_edges = cudart.cudaGraphGetEdges(
-        graph_handle,
-        num_edges,
+    edge_query = cudart.cudaGraphGetEdges(graph_handle)
+    assert edge_query[0] == cudart.cudaError_t.cudaSuccess
+    num_edges = int(edge_query[-1])
+    edges = cudart.cudaGraphGetEdges(graph_handle, num_edges)
+    result, from_nodes, to_nodes, returned_edges = (
+        edges[0],
+        edges[1],
+        edges[2],
+        edges[-1],
     )
     assert result == cudart.cudaError_t.cudaSuccess
     assert returned_edges == num_edges
