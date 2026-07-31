@@ -333,7 +333,9 @@ constexpr int kModeRegistered = 0;
 constexpr int kModeStagePull = 1;
 constexpr int kModeStagePush = 2;
 
-// Complete the allreduce, residual add, and RMSNorm in one launch.
+// Complete the allreduce, residual add, and RMSNorm in one worker launch.
+// Staged paths prepend one 1-CTA slot-control launch; the registered path
+// remains a single worker launch.
 //
 // Geometry is uniform: gridDim.x == rows * ctas_per_row and block b serves
 // row b / ctas_per_row, owning columns {(b % ctas_per_row) * blockDim.x +

@@ -89,7 +89,16 @@ def _local_eager_words(
     return words[0].value, words[1].value
 
 
-def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
+def _dim3_tuple(value) -> tuple[int, int, int]:
+    return int(value.x), int(value.y), int(value.z)
+
+
+def _cuda_graph_kernel_chain(
+    graph: torch.cuda.CUDAGraph,
+) -> tuple[
+    tuple[tuple[int, int, int], tuple[int, int, int]],
+    tuple[tuple[int, int, int], tuple[int, int, int]],
+]:
     graph_handle = graph.raw_cuda_graph()
     result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
     assert result == cudart.cudaError_t.cudaSuccess
@@ -100,12 +109,52 @@ def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
     assert result == cudart.cudaError_t.cudaSuccess
     assert returned_nodes == num_nodes
     kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
-    kernel_count = 0
+    kernel_nodes = []
     for node in nodes[:num_nodes]:
         result, node_type = cudart.cudaGraphNodeGetType(node)
         assert result == cudart.cudaError_t.cudaSuccess
-        kernel_count += node_type == kernel_type
-    return kernel_count
+        if node_type == kernel_type:
+            kernel_nodes.append(node)
+    assert len(kernel_nodes) == 2, (
+        "staged fused capture must contain one slot-control node followed by "
+        f"one worker node, found {len(kernel_nodes)} kernel nodes"
+    )
+
+    result, _, _, num_edges = cudart.cudaGraphGetEdges(graph_handle)
+    assert result == cudart.cudaError_t.cudaSuccess
+    result, from_nodes, to_nodes, returned_edges = cudart.cudaGraphGetEdges(
+        graph_handle,
+        num_edges,
+    )
+    assert result == cudart.cudaError_t.cudaSuccess
+    assert returned_edges == num_edges
+    kernel_edges = []
+    for source, destination in zip(
+        from_nodes[:num_edges],
+        to_nodes[:num_edges],
+        strict=True,
+    ):
+        result, source_type = cudart.cudaGraphNodeGetType(source)
+        assert result == cudart.cudaError_t.cudaSuccess
+        result, destination_type = cudart.cudaGraphNodeGetType(destination)
+        assert result == cudart.cudaError_t.cudaSuccess
+        if source_type == kernel_type and destination_type == kernel_type:
+            kernel_edges.append((source, destination))
+    assert len(kernel_edges) == 1, (
+        "staged fused capture must directly order its control node before its "
+        f"worker node, found {len(kernel_edges)} kernel-to-kernel edges"
+    )
+
+    def geometry(node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        result, params = cudart.cudaGraphKernelNodeGetParams(node)
+        assert result == cudart.cudaError_t.cudaSuccess
+        return _dim3_tuple(params.gridDim), _dim3_tuple(params.blockDim)
+
+    control, worker = map(geometry, kernel_edges[0])
+    assert control == ((1, 1, 1), (1, 1, 1))
+    assert worker[0][0] > 1
+    assert worker[1][0] >= 64
+    return control, worker
 
 
 def _run_eager(
@@ -182,7 +231,11 @@ def _run_graph(
             out=out,
             residual_out=residual,
         )
-    assert _cuda_graph_kernel_count(graph) == 1
+    # Staged capture is now control + worker, in that order. The registered
+    # path still launches only its worker, but public graph capture deliberately
+    # requires stable eager staging buffers and therefore exercises this
+    # two-node contract.
+    _cuda_graph_kernel_chain(graph)
     stream = torch.cuda.current_stream(device)
     offset = 0
     if os.getenv("SPARKINFER_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
