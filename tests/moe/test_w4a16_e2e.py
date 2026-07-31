@@ -35,7 +35,11 @@ from sparkinfer.moe._shared.kernels.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
 )
-from tests._reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
+from tests._reference.helpers import (
+    make_tp_moe_fp4_binding,
+    prepare_tp_moe_fp4_experts,
+    run_tp_moe_fp4,
+)
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
@@ -876,6 +880,94 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
             topk,
             ids_dtype,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
+    activation: str,
+) -> None:
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    m, topk = 3, 2
+    torch.manual_seed(20260730 + (1000 if activation == "silu" else 0))
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    w13_dense = torch.randn(experts, rows, hidden_size, device="cuda") * 0.12
+    w2_dense = (
+        torch.randn(experts, hidden_size, intermediate_size, device="cuda") * 0.12
+    )
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w13, w13_blockscale = _quantize_dense_moe_weight_storage(
+        w13_dense,
+        w13_global_scale,
+    )
+    w2, w2_blockscale = _quantize_dense_moe_weight_storage(
+        w2_dense,
+        w2_global_scale,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.5).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w4a16_experts = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a_gscale,
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_alphas=w13_global_scale,
+        a2_gscale=a_gscale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_global_scale,
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    prepared_w4a16 = w4a16_experts.representation_for("w4a16")
+    assert prepared_w4a16.weight_layout == "modelopt"
+    binding = make_tp_moe_fp4_binding(
+        a=x,
+        experts=w4a16_experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_mode="w4a16",
+    )
+    expected = moe_reference_w4a16_f32(
+        x,
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+    )
+
+    first = binding.run()
+    torch.cuda.synchronize()
+    first_metrics = compare_to_reference(first, expected)
+    assert bool(torch.isfinite(first).all().item())
+    assert first_metrics.cos > 0.999, first_metrics
+
+    # The arena legitimately preserves the padded half of each 128-u32
+    # swizzle block. Poison it all, then prove FC1 rewrites every logical lane
+    # and FC2 ignores every inactive lane on the same-binding replay.
+    binding.intermediate_cache2.fill_(float("nan"))
+    replay = binding.run()
+    torch.cuda.synchronize()
+    replay_metrics = compare_to_reference(replay, expected)
+    assert bool(torch.isfinite(replay).all().item())
+    assert replay_metrics.cos > 0.999, replay_metrics
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
