@@ -187,9 +187,7 @@ def test_runtime_validates_and_dispatches_to_extension():
 def test_runtime_accepts_head_major_input_and_output():
     ext = _FakeExt()
     runtime = _make_runtime(ext)
-    input_storage = torch.arange(
-        32 * 4 * 64, dtype=torch.bfloat16
-    ).reshape(32, 4, 64)
+    input_storage = torch.arange(32 * 4 * 64, dtype=torch.bfloat16).reshape(32, 4, 64)
     partial_output = input_storage.transpose(0, 1)[:2]
     partial_lse = torch.zeros(2, 32, dtype=torch.float32)
     output_storage = torch.empty(16, 2, 64, dtype=torch.bfloat16)

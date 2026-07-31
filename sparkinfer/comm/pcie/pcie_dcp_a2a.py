@@ -37,15 +37,15 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
         return False
     batch, heads, head_dim = (int(value) for value in tensor.shape)
     stride_batch, stride_head, _ = (int(value) for value in tensor.stride())
-    packed_token_major = (
-        stride_batch == heads * head_dim and stride_head == head_dim
-    )
+    packed_token_major = stride_batch == heads * head_dim and stride_head == head_dim
     capacity_strided_head_major = (
         stride_batch == head_dim
         and stride_head >= batch * head_dim
         and stride_head % 8 == 0
     )
     return packed_token_major or capacity_strided_head_major
+
+
 @dataclass(frozen=True)
 class _StagingLayout:
     signal_bytes: int
@@ -386,9 +386,7 @@ class PCIeDCPA2A:
                 f"output shape must be {expected_out}, got {tuple(out.shape)}"
             )
         if not _is_supported_bhd_layout(partial_output):
-            raise ValueError(
-                "partial_output must be packed token-major or head-major"
-            )
+            raise ValueError("partial_output must be packed token-major or head-major")
         if not partial_lse.is_contiguous():
             raise ValueError("partial_lse must be contiguous")
         if not _is_supported_bhd_layout(out):

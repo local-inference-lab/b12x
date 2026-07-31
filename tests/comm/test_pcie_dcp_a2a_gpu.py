@@ -128,6 +128,7 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
     stream.synchronize()
     return words[0].value, words[1].value
 
+
 def _check_eager(
     pool: PCIeDCPA2APool,
     rank: int,
@@ -209,15 +210,9 @@ def _check_eager_adjacency(
     device: torch.device,
 ) -> None:
     channel = pool.for_stream()
-    first_query = _rank_query(
-        700, rank, world_size, MAX_BATCH, torch.bfloat16, device
-    )
-    second_query = _rank_query(
-        701, rank, world_size, MAX_BATCH, torch.bfloat16, device
-    )
-    partial_output, partial_lse = _rank_inputs(
-        702, rank, 1, torch.bfloat16, device
-    )
+    first_query = _rank_query(700, rank, world_size, MAX_BATCH, torch.bfloat16, device)
+    second_query = _rank_query(701, rank, world_size, MAX_BATCH, torch.bfloat16, device)
+    partial_output, partial_lse = _rank_inputs(702, rank, 1, torch.bfloat16, device)
     first_gather = torch.empty(
         MAX_BATCH,
         TOTAL_HEADS,
@@ -243,18 +238,14 @@ def _check_eager_adjacency(
 
     expected_first = torch.cat(
         [
-            _rank_query(
-                700, source, world_size, MAX_BATCH, torch.bfloat16, device
-            )
+            _rank_query(700, source, world_size, MAX_BATCH, torch.bfloat16, device)
             for source in range(world_size)
         ],
         dim=1,
     )
     expected_second = torch.cat(
         [
-            _rank_query(
-                701, source, world_size, MAX_BATCH, torch.bfloat16, device
-            )
+            _rank_query(701, source, world_size, MAX_BATCH, torch.bfloat16, device)
             for source in range(world_size)
         ],
         dim=1,
