@@ -58,8 +58,8 @@ using FlagType = uint32_t;
 constexpr int kFlagStride = 32;
 
 struct Signal {
-  alignas(128) FlagType staging_generation;
-  FlagType active_staging_slot;
+  alignas(128) FlagType staging_arrive;
+  FlagType staging_generation;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
 };
@@ -88,18 +88,29 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   return flag;
 }
 
-__global__ void advance_staging_slot(Signal* self_sg) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const FlagType generation = self_sg->staging_generation;
-    self_sg->active_staging_slot = generation & FlagType{1};
-    self_sg->staging_generation = generation + FlagType{1};
-  }
+static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  return flag;
 }
 
 template <int ngpus>
 DINLINE void select_rank_ptrs(RankPtrs& selected, const DoubleRankPtrs& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
-    const int slot = int(self_sg->active_staging_slot);
+    // kMaxBlocks fits concurrently on the target Blackwell GPU. Rendezvous
+    // before publishing the generation so every block in this launch selects
+    // one slab even when the preceding launch used a different grid size.
+    const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
+    const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
+    if (prior == static_cast<FlagType>(gridDim.x - 1)) {
+      self_sg->staging_arrive = 0;
+      __threadfence();
+      atomicAdd(&self_sg->staging_generation, FlagType{1});
+    } else {
+      while (ld_flag_acquire_gpu(&self_sg->staging_generation) == generation) {
+      }
+    }
+    const int slot = int(generation & FlagType{1});
 #pragma unroll
     for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = options.slots[slot].ptrs[peer];
   }
@@ -340,10 +351,11 @@ class PCIeTwoShot {
       throw std::runtime_error("num_rows must be divisible by world size");
     const int64_t rows_per_rank = num_rows / world_size_;
     check_shard(rows_per_rank, row_elems);
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
-    advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
       rs_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
@@ -356,10 +368,11 @@ class PCIeTwoShot {
   void all_gather(cudaStream_t stream, const void* payload, const void* scale, void* out,
                   int64_t rows_per_rank, int64_t row_elems, int threads, int block_limit) {
     check_shard(rows_per_rank, row_elems);
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
-    advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
       ag_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
