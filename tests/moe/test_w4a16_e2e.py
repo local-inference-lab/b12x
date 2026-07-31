@@ -885,15 +885,36 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
+@pytest.mark.parametrize("intermediate_size", [32, 128, 224])
 def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     activation: str,
     m: int,
+    intermediate_size: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    experts, hidden_size, intermediate_size = 8, 128, 128
+    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    experts, hidden_size = 8, 128
     topk = 2
     monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
-    torch.manual_seed(20260730 + (1000 if activation == "silu" else 0) + m)
+    torch.manual_seed(
+        20260730
+        + (1000 if activation == "silu" else 0)
+        + m
+        + intermediate_size
+    )
+    real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
+    direct_launches: list[tuple[int, int]] = []
+
+    def spy_direct_launch(*args, **kwargs) -> None:
+        direct_launches.append((int(kwargs["m"]), int(kwargs["intermediate_size"])))
+        real_direct_launch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_w4a16_small_m_direct_launch_flat",
+        spy_direct_launch,
+    )
     rows = intermediate_size * (2 if activation == "silu" else 1)
     w13_dense = torch.randn(experts, rows, hidden_size, device="cuda") * 0.12
     w2_dense = (
@@ -988,6 +1009,8 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     replay_metrics = compare_to_reference(replay, expected)
     assert bool(torch.isfinite(replay).all().item())
     assert replay_metrics.cos > 0.999, replay_metrics
+    assert direct_launches == [(m, intermediate_size), (m, intermediate_size)]
+    torch.testing.assert_close(replay, first, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
