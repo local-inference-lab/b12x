@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import Callable, Optional, Sequence, TypeVar
+from typing import Callable, Iterable, Optional, Sequence, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -136,6 +136,65 @@ def _normalize_logical_channel_id(channel_id: str) -> str:
     if not normalized:
         raise ValueError("logical channel id must not be empty")
     return normalized
+
+
+def _collective_capture_needs_preparation(
+    *,
+    owner: str,
+    logical_id: str,
+    prepared_channel_ids: Iterable[str],
+    exchange_group: ProcessGroup,
+) -> bool:
+    """Decide whether capture may use the prepared catalog without allocation.
+
+    Once every rank has prepared the same complete graph catalog, ranks may
+    capture those graphs in different orders.  Allocation remains collective:
+    a same-id unknown channel may use the convenience preparation path, while
+    any differing request that includes an unknown id fails before allocation.
+    """
+
+    catalog = tuple(sorted(prepared_channel_ids))
+    local_state = (logical_id, catalog)
+    gathered = _broadcast_gather_object(local_state, exchange_group)
+    if not gathered:
+        raise RuntimeError(f"{owner} capture contract returned no rank states")
+
+    requested_ids: list[str] = []
+    for group_rank, state in enumerate(gathered):
+        if not isinstance(state, (tuple, list)) or len(state) != 2:
+            raise RuntimeError(
+                f"invalid {owner} capture contract from group rank {group_rank}"
+            )
+        requested_id, peer_catalog = state
+        if not isinstance(requested_id, str) or not isinstance(
+            peer_catalog, (tuple, list)
+        ):
+            raise RuntimeError(
+                f"invalid {owner} capture contract from group rank {group_rank}"
+            )
+        peer_catalog = tuple(peer_catalog)
+        if any(not isinstance(value, str) for value in peer_catalog):
+            raise RuntimeError(
+                f"invalid {owner} capture contract from group rank {group_rank}"
+            )
+        if peer_catalog != catalog:
+            raise RuntimeError(
+                f"{owner} prepared channel catalog differs across ranks: {gathered}"
+            )
+        requested_ids.append(requested_id)
+
+    if all(requested_id in catalog for requested_id in requested_ids):
+        # The canonical catalog already fixed allocation order.  Current graph
+        # capture order is process-local and need not agree across ranks.
+        return False
+    if all(requested_id == requested_ids[0] for requested_id in requested_ids):
+        # Preserve the collective same-id convenience allocation path.
+        return True
+    raise RuntimeError(
+        f"{owner} capture requested unprepared logical channels in differing "
+        f"rank order: requested={tuple(requested_ids)}, prepared={catalog}; call "
+        "prepare_channels() collectively with the complete graph set first"
+    )
 
 
 def _group_ranks(group: ProcessGroup) -> list[int]:
@@ -2941,7 +3000,10 @@ class PCIeOneshotAllReducePool:
         an unprepared explicit id is a collective convenience path: every rank
         must enter with the same id or all ranks fail closed. Production
         callers that know the full graph set should call prepare_channels()
-        once before capture.
+        once before capture; after that collective preparation, ranks may
+        capture members of the agreed catalog in different orders. Each graph
+        must still replay with its same-id peers using collectively compatible
+        kernel sequences and shapes.
 
         Distributed pools require this semantic id. A local capture ordinal or
         CUDA stream handle cannot distinguish target and draft graphs when
@@ -2980,9 +3042,14 @@ class PCIeOneshotAllReducePool:
                 exchange_group=self.exchange_group,
                 setup=validate_capture_id,
             )
-            # Always enter the collective preparation contract.  Branching on
-            # rank-local membership would strand a peer if pool state diverged.
-            self.prepare_channels((logical_id,))
+            needs_preparation = _collective_capture_needs_preparation(
+                owner="PCIe oneshot",
+                logical_id=logical_id,
+                prepared_channel_ids=self._logical_channels,
+                exchange_group=self.exchange_group,
+            )
+            if needs_preparation:
+                self.prepare_channels((logical_id,))
             previous_channels = dict(self._channels)
             stream_key = _current_stream_key(self.device, stream)
             channel_key = 0 if stream_key is None else int(stream_key)

@@ -24,6 +24,7 @@ from .pcie_oneshot import (
     _raise_local_cleanup_errors,
     _align_up,
     _broadcast_gather_object,
+    _collective_capture_needs_preparation,
     _coordinated_close_channels,
     _current_stream_key,
     _cuda_device_index,
@@ -1314,7 +1315,11 @@ class PCIeDCPA2APool:
 
         Explicit unknown ids are prepared collectively and fail closed when
         rank ids differ. Production callers should pre-prepare the full set of
-        independently replayable graph ids before entering any capture.
+        independently replayable graph ids before entering any capture; after
+        that collective preparation, ranks may capture members of the agreed
+        catalog in different orders. Each graph must still replay with its
+        same-id peers using collectively compatible kernel sequences and
+        shapes.
 
         Distributed pools require this semantic id. Local ordinals and stream
         handles cannot identify target versus draft graphs across ranks.
@@ -1352,7 +1357,14 @@ class PCIeDCPA2APool:
                 exchange_group=self.exchange_group,
                 setup=validate_capture_id,
             )
-            self.prepare_channels((logical_id,))
+            needs_preparation = _collective_capture_needs_preparation(
+                owner="PCIe DCP A2A",
+                logical_id=logical_id,
+                prepared_channel_ids=self._logical_channels,
+                exchange_group=self.exchange_group,
+            )
+            if needs_preparation:
+                self.prepare_channels((logical_id,))
             previous_channels = dict(self._channels)
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
