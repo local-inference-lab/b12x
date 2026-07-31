@@ -884,12 +884,16 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     activation: str,
+    m: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     experts, hidden_size, intermediate_size = 8, 128, 128
-    m, topk = 3, 2
-    torch.manual_seed(20260730 + (1000 if activation == "silu" else 0))
+    topk = 2
+    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    torch.manual_seed(20260730 + (1000 if activation == "silu" else 0) + m)
     rows = intermediate_size * (2 if activation == "silu" else 1)
     w13_dense = torch.randn(experts, rows, hidden_size, device="cuda") * 0.12
     w2_dense = (
@@ -930,6 +934,22 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     )
     prepared_w4a16 = w4a16_experts.representation_for("w4a16")
     assert prepared_w4a16.weight_layout == "modelopt"
+    assert _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout=prepared_w4a16.weight_layout,
+        w13_layout="w13",
+        scale_format="e4m3_k16",
+    )
     binding = make_tp_moe_fp4_binding(
         a=x,
         experts=w4a16_experts,
