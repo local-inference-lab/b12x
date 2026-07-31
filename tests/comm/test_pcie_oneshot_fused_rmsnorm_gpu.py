@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import socket
 
@@ -69,6 +70,23 @@ def _assert_close(
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def _local_eager_words(
+    channel, stream: torch.cuda.Stream, *, offset: int = 0
+) -> tuple[int, int]:
+    assert channel._ipc is not None
+    assert channel._eager_ptrs is not None
+    words = (ctypes.c_uint64(), ctypes.c_uint64())
+    for word, slot_ptrs in zip(words, channel._eager_ptrs, strict=True):
+        channel._ipc.cudaMemcpyAsync(
+            ctypes.addressof(word),
+            slot_ptrs[channel.rank] + offset,
+            ctypes.sizeof(word),
+            int(stream.cuda_stream),
+        )
+    stream.synchronize()
+    return words[0].value, words[1].value
 
 
 def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
@@ -155,7 +173,7 @@ def _run_graph(
     pool.for_stream()
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with pool.capture(), torch.cuda.graph(graph):
+    with pool.capture() as channel, torch.cuda.graph(graph):
         pool.all_reduce_fused_add_rms_norm(
             inp,
             residual,
@@ -164,7 +182,13 @@ def _run_graph(
             out=out,
             residual_out=residual,
         )
-    assert _cuda_graph_kernel_count(graph) == 1
+    assert _cuda_graph_kernel_count(graph) == 2
+    stream = torch.cuda.current_stream(device)
+    offset = 0
+    if os.getenv("SPARKINFER_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
+        remote_source = (rank + 1) % dist.get_world_size()
+        offset = remote_source * inp.numel() * inp.element_size()
+    snapshots = [_local_eager_words(channel, stream, offset=offset)]
 
     for iteration in range(3):
         next_inp, next_residual, _ = _make_inputs(
@@ -187,6 +211,23 @@ def _run_graph(
         torch.cuda.synchronize(device)
         _assert_close(out, expected_out, dtype)
         _assert_close(residual, expected_residual, dtype)
+        snapshots.append(_local_eager_words(channel, stream, offset=offset))
+
+    changed_slots = [
+        {
+            slot
+            for slot, (before, after) in enumerate(
+                zip(snapshots[index], snapshots[index + 1], strict=True)
+            )
+            if before != after
+        }
+        for index in range(3)
+    ]
+    assert all(len(changed) == 1 for changed in changed_slots)
+    assert all(
+        changed_slots[index] != changed_slots[index + 1]
+        for index in range(len(changed_slots) - 1)
+    )
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:

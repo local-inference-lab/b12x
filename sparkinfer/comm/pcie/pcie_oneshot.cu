@@ -23,7 +23,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "two_slot_selector.h"
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
@@ -78,6 +77,8 @@ static bool oneshot_push_enabled() {
 }
 
 struct Signal {
+  alignas(128) FlagType staging_generation;
+  FlagType active_staging_slot;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
   alignas(128) FlagType rms_arrive[kMaxBlocks];
@@ -87,6 +88,10 @@ struct Signal {
 
 struct __align__(16) RankData {
   const void* __restrict__ ptrs[kMaxRanks];
+};
+
+struct DoubleRankData {
+  RankData* slots[2];
 };
 
 struct __align__(16) RankSignals {
@@ -179,6 +184,25 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   return flag;
 }
 
+__global__ void advance_staging_slot(Signal* self_sg) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const FlagType generation = self_sg->staging_generation;
+    self_sg->active_staging_slot = generation & FlagType{1};
+    self_sg->staging_generation = generation + FlagType{1};
+  }
+}
+
+template <int ngpus>
+DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    const int slot = int(self_sg->active_staging_slot);
+    const RankData* source = options.slots[slot];
+#pragma unroll
+    for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = source->ptrs[peer];
+  }
+  __syncthreads();
+}
+
 static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
@@ -255,17 +279,23 @@ DINLINE float block_reduce_sum(float value, float* warp_sums) {
 // sufficient for staging visibility.
 template <typename T, int ngpus, bool stage_input>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
-    RankData* _dp,
+    DoubleRankData data_options,
     RankSignals sg,
     Signal* self_sg,
     const T* __restrict__ input,
     T* __restrict__ result,
-    T* __restrict__ self_staging,
     int rank,
     int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
-  auto dp = *_dp;
+  RankData dp;
+  if constexpr (stage_input) {
+    __shared__ RankData selected;
+    select_rank_data<ngpus>(selected, data_options, self_sg);
+    dp = selected;
+  } else {
+    dp = *data_options.slots[0];
+  }
   const P* rotated[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
@@ -273,7 +303,8 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   }
   if constexpr (stage_input) {
     const P* input_p = reinterpret_cast<const P*>(input);
-    P* staging_p = reinterpret_cast<P*>(self_staging);
+    P* staging_p =
+        reinterpret_cast<P*>(const_cast<void*>(dp.ptrs[rank]));
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
       staging_p[idx] = input_p[idx];
     }
@@ -330,7 +361,7 @@ constexpr int kModeStagePush = 2;
 // resident.
 template <typename T, int ngpus, bool single_cta, int mode>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kernel(
-    RankData* _dp,
+    DoubleRankData data_options,
     RankSignals sg,
     Signal* self_sg,
     const T* __restrict__ input,
@@ -338,7 +369,6 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
     const T* __restrict__ weight,
     T* __restrict__ output,
     T* __restrict__ residual_output,
-    T* __restrict__ self_staging,
     int rank,
     int hidden_packs,
     int ctas_per_row,
@@ -348,6 +378,14 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
   using A = typename packed_t<T>::A;
   __shared__ float warp_sums[32];
   __shared__ float s_inv_rms;
+  RankData dp;
+  if constexpr (mode == kModeRegistered) {
+    dp = *data_options.slots[0];
+  } else {
+    __shared__ RankData selected;
+    select_rank_data<ngpus>(selected, data_options, self_sg);
+    dp = selected;
+  }
 
   const int row = single_cta ? blockIdx.x : blockIdx.x / ctas_per_row;
   const int row_cta = single_cta ? 0 : blockIdx.x - row * ctas_per_row;
@@ -357,7 +395,6 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
   const int max_packs = (hidden_packs + col_stride - 1) / col_stride;
   const bool reg_norm = max_packs <= kRegPacks;
 
-  auto dp = *_dp;
   const P* rotated[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
@@ -369,7 +406,7 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_fused_add_rms_norm_kern
   const P* weight_p = reinterpret_cast<const P*>(weight);
   P* output_p = reinterpret_cast<P*>(output);
   P* residual_output_p = reinterpret_cast<P*>(residual_output);
-  P* staging_p = reinterpret_cast<P*>(self_staging);
+  P* staging_p = reinterpret_cast<P*>(const_cast<void*>(dp.ptrs[rank]));
 
   // Sense-reversing row barrier: latch the generation before arriving.
   // Launches are stream-serialized, so this read cannot race a peer CTA's
@@ -568,9 +605,7 @@ class PCIeAllreduce {
   std::map<IPC_KEY, char*> ipc_handles_;
 
   bool dbuf_enabled_ = false;
-  sparkinfer::pcie::TwoSlotSelector dbuf_slot_selector_;
-  void* dbuf_raw_[2][kMaxRanks] = {};
-  RankData* dbuf_rd_[2] = {};
+  DoubleRankData dbuf_data_ = {};
 
   PCIeAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
       : rank_(rank),
@@ -618,17 +653,14 @@ class PCIeAllreduce {
     for (int s = 0; s < 2; s++) {
       void** ptrs = s == 0 ? ptrs0 : ptrs1;
       RankData data;
-      for (int i = 0; i < world_size_; i++) {
-        data.ptrs[i] = ptrs[i];
-        dbuf_raw_[s][i] = ptrs[i];
-      }
-      dbuf_rd_[s] = d_rank_data_base_++;
-      CHECK_CUDA_SUCCESS(cudaMemcpy(dbuf_rd_[s], &data, sizeof(RankData), cudaMemcpyHostToDevice));
+      for (int i = 0; i < world_size_; i++) data.ptrs[i] = ptrs[i];
+      dbuf_data_.slots[s] = d_rank_data_base_++;
+      CHECK_CUDA_SUCCESS(
+          cudaMemcpy(dbuf_data_.slots[s], &data, sizeof(RankData), cudaMemcpyHostToDevice));
     }
-    buffers_[ptrs0[rank_]] = dbuf_rd_[0];
-    buffers_[ptrs1[rank_]] = dbuf_rd_[1];
+    buffers_[ptrs0[rank_]] = dbuf_data_.slots[0];
+    buffers_[ptrs1[rank_]] = dbuf_data_.slots[1];
     dbuf_enabled_ = true;
-    dbuf_slot_selector_ = sparkinfer::pcie::TwoSlotSelector{};
   }
 
   void register_buffer(void** ptrs) {
@@ -680,17 +712,16 @@ class PCIeAllreduce {
     if (block_limit > kMaxBlocks)
       throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks));
 
-    RankData* ptrs;
-    T* staging = nullptr;
+    DoubleRankData data_options = {};
+    bool stage_input = false;
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
 
     if (dbuf_enabled_) {
-      // The kernel stages the input into the eager slot itself; no host
-      // staging memcpy is issued.
-      const int slot = dbuf_slot_selector_.take();
-      ptrs = dbuf_rd_[slot];
-      staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
+      // A captured selector kernel advances the active eager slab on every
+      // execution, including CUDA graph replay.
+      data_options = dbuf_data_;
+      stage_input = true;
     } else if (status == cudaStreamCaptureStatusActive) {
       throw std::runtime_error(
           "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
@@ -700,22 +731,24 @@ class PCIeAllreduce {
       if (it == buffers_.end())
         throw std::runtime_error(
             "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
-      ptrs = it->second;
+      data_options.slots[0] = it->second;
+      data_options.slots[1] = it->second;
     }
 
     size /= d;
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
     blocks = std::max(blocks, 1);
+    if (stage_input) advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
 
 #define KL(ngpus)                                                                                                     \
   do {                                                                                                               \
-    if (staging != nullptr) {                                                                                        \
+    if (stage_input) {                                                                                               \
       pcie_allreduce_kernel<T, ngpus, true>                                                                          \
-          <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, output, staging, rank_, size);                \
+          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
     } else {                                                                                                         \
       pcie_allreduce_kernel<T, ngpus, false>                                                                         \
-          <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, output, staging, rank_, size);                \
-    }                                                                                                                 \
+          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
+    }                                                                                                                \
   } while (0)
     switch (world_size_) {
       case 2:
@@ -758,16 +791,15 @@ class PCIeAllreduce {
       throw std::runtime_error(
           "fused allreduce RMSNorm requires hidden size to be a multiple of " + std::to_string(pack_size));
 
-    RankData* ptrs;
-    T* staging = nullptr;
+    DoubleRankData data_options = {};
+    bool use_eager_staging = false;
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
     if (dbuf_enabled_) {
-      // The kernel stages the input into the eager slot itself; no host
-      // staging memcpy is issued.
-      const int slot = dbuf_slot_selector_.take();
-      ptrs = dbuf_rd_[slot];
-      staging = reinterpret_cast<T*>(dbuf_raw_[slot][rank_]);
+      // A captured selector kernel advances the active eager slab on every
+      // execution, including CUDA graph replay.
+      data_options = dbuf_data_;
+      use_eager_staging = true;
     } else if (status == cudaStreamCaptureStatusActive) {
       throw std::runtime_error(
           "PCIe oneshot graph capture requires eager IPC buffers; construct the runtime with eager buffers or use "
@@ -777,7 +809,8 @@ class PCIeAllreduce {
       if (it == buffers_.end())
         throw std::runtime_error(
             "buffer address " + std::to_string(reinterpret_cast<uint64_t>(input)) + " is not registered!");
-      ptrs = it->second;
+      data_options.slots[0] = it->second;
+      data_options.slots[1] = it->second;
     }
 
     int rows = size / hidden_size;
@@ -800,13 +833,14 @@ class PCIeAllreduce {
     const int blocks = rows * ctas_per_row;
     const bool single = ctas_per_row == 1;
     const int shard_packs = size / pack_size;
-    const int mode = staging == nullptr ? kModeRegistered
+    const int mode = !use_eager_staging   ? kModeRegistered
                      : oneshot_push_enabled() ? kModeStagePush
                                               : kModeStagePull;
+    if (use_eager_staging) advance_staging_slot<<<1, 1, 0, stream>>>(self_sg_);
 
 #define KL(ngpus, SINGLE, MODE)                                                                                       \
   pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE><<<blocks, threads, 0, stream>>>(                   \
-      ptrs, sg_, self_sg_, input, residual, weight, output, residual_output, staging, rank_, hidden_packs,            \
+      data_options, sg_, self_sg_, input, residual, weight, output, residual_output, rank_, hidden_packs,            \
       ctas_per_row, shard_packs, epsilon);
 #define DISPATCH_MODE(ngpus, SINGLE)                                                                                  \
   do {                                                                                                               \
