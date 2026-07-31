@@ -264,6 +264,54 @@ def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
     )
 
 
+@pytest.mark.parametrize("intermediate_size", [144, 352])
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("m", [1, 3])
+def test_w4a16_modelopt_direct_keeps_non64_intermediate_contract(
+    m: int,
+    activation: str,
+    intermediate_size: int,
+) -> None:
+    """Native ModelOpt decode supports every 16-aligned intermediate shape."""
+    assert _small_m_direct_supported(
+        m=m,
+        hidden_size=128,
+        intermediate_size=intermediate_size,
+        num_experts=1,
+        topk=1,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout="modelopt",
+        w13_layout="w13",
+        scale_format="e4m3_k16",
+    )
+    kernel = MoEMicroKernelW4A16SmallMDirect(
+        activation=activation,
+        fast_math=True,
+        share_input_across_experts=True,
+        share_expert_scales=True,
+        single_token=m == 1,
+    )
+    kernel.configure(
+        m=m,
+        k=128,
+        n=intermediate_size,
+        num_topk=1,
+        weight_E=1,
+        max_active_ctas=1,
+    )
+    assert kernel._cfg is not None
+    assert kernel._cfg.n % kernel._cfg.fc1_chunks == 0
+    assert kernel._cfg.i_chunk % 16 == 0
+    assert kernel._cfg.inter_blocks * 16 == kernel._cfg.i_chunk
+    if m > 1:
+        assert kernel._cfg.i_chunk <= 32
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
@@ -1017,6 +1065,136 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     assert replay_metrics.cos > 0.999, replay_metrics
     assert direct_launches == [(m, intermediate_size), (m, intermediate_size)]
     torch.testing.assert_close(replay, first, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate_size", [144, 352])
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("m", [1, 3])
+def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
+    m: int,
+    activation: str,
+    intermediate_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the exact native row tail under CUDA memcheck.
+
+    I=144 exercises the narrow one-chunk kernel: it has 18 logical packed-u32
+    values per W2 row while the ModelOpt scale grid pads its control geometry
+    to 24. I=352 exercises the wide two-chunk kernel, whose final chunk has
+    only 12 logical lanes. Selecting the only expert makes an unmasked tail
+    load on the final W2 row cross the tensor allocation instead of merely
+    reading the next expert. Run this test under compute-sanitizer with
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` to audit m==1/m>=2 and ungated/gated
+    direct-FC2 implementations.
+    """
+    experts, hidden_size, topk = 1, 128, 1
+    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    torch.manual_seed(
+        20260731
+        + m
+        + intermediate_size
+        + (1000 if activation == "silu" else 0)
+    )
+
+    rows = intermediate_size * (2 if activation == "silu" else 1)
+    w13_dense = (
+        torch.randn(
+            experts,
+            rows,
+            hidden_size,
+            device="cuda",
+        )
+        * 0.12
+    )
+    w2_dense = (
+        torch.randn(
+            experts,
+            hidden_size,
+            intermediate_size,
+            device="cuda",
+        )
+        * 0.12
+    )
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w13, w13_blockscale = _quantize_dense_moe_weight_storage(
+        w13_dense,
+        w13_global_scale,
+    )
+    w2, w2_blockscale = _quantize_dense_moe_weight_storage(
+        w2_dense,
+        w2_global_scale,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.5).to(torch.bfloat16)
+    topk_ids = torch.zeros((m, topk), device="cuda", dtype=torch.int32)
+    topk_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
+    a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+
+    experts_w4a16 = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a_gscale,
+        w1_fp4=w13,
+        w1_blockscale=w13_blockscale,
+        w1_alphas=w13_global_scale,
+        a2_gscale=a_gscale,
+        w2_fp4=w2,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_global_scale,
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    prepared = experts_w4a16.representation_for("w4a16")
+    assert prepared.weight_layout == "modelopt"
+    assert _small_m_direct_supported(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        element_dtype="bf16",
+        weight_layout=prepared.weight_layout,
+        w13_layout="w13",
+        scale_format="e4m3_k16",
+    )
+
+    binding = make_tp_moe_fp4_binding(
+        a=x,
+        experts=experts_w4a16,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_mode="w4a16",
+    )
+    expected = moe_reference_w4a16_f32(
+        x,
+        w13,
+        w13_blockscale,
+        w13_global_scale,
+        w2,
+        w2_blockscale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+    )
+
+    first = binding.run().clone()
+    binding.intermediate_cache2.fill_(float("nan"))
+    replay = binding.run().clone()
+    torch.cuda.synchronize()
+    for actual in (first, replay):
+        metrics = compare_to_reference(actual, expected)
+        assert bool(torch.isfinite(actual).all().item())
+        assert metrics.cos > 0.999, metrics
+    torch.testing.assert_close(first, replay, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
