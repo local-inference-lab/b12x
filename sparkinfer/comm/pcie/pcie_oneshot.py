@@ -230,15 +230,41 @@ class _RetryableIPCExport:
         if key not in _RETAINED_FAILED_IPC_EXPORTS:
             return
 
-        if self.state == "unmap":
-            failures: list[str] = []
+        if self.state == "native":
+            native_error: BaseException | None = None
             if self.local_cleanup is not None:
                 try:
                     self.local_cleanup()
                 except Exception as exc:
-                    failures.append(f"native runtime: {type(exc).__name__}: {exc}")
+                    native_error = exc
                 else:
                     self.local_cleanup = None
+
+            if self.exchange_group is None:
+                if native_error is not None:
+                    raise RuntimeError(
+                        f"{self.owner} {self.phase} retry native cleanup failed; "
+                        "CUDA IPC ownership remains retained"
+                    ) from native_error
+            else:
+                native_statuses = _exchange_setup_failures(
+                    native_error,
+                    exchange_group=self.exchange_group,
+                    phase=f"{self.phase} retry native cleanup",
+                )
+                if any(native_statuses):
+                    raise RuntimeError(
+                        _setup_failure_message(
+                            self.owner,
+                            f"{self.phase} retry native cleanup",
+                            native_statuses,
+                            exports_retained=True,
+                        )
+                    ) from native_error
+            self.state = "unmap"
+
+        if self.state == "unmap":
+            failures: list[str] = []
 
             remaining_remote_ptrs: list[int] = []
             for ptr in self.remote_ptrs:
@@ -636,15 +662,69 @@ def _abort_collective_ipc_setup(
     allocation is deliberately retained until context teardown.
     """
 
-    unmap_failures: list[str] = []
     retained_cleanup = local_cleanup
     if local_cleanup is not None:
+        native_error: BaseException | None = None
         try:
             local_cleanup()
         except Exception as exc:
-            unmap_failures.append(f"native runtime: {type(exc).__name__}: {exc}")
+            native_error = exc
         else:
             retained_cleanup = None
+        try:
+            native_statuses = _exchange_setup_failures(
+                native_error,
+                exchange_group=exchange_group,
+                phase=f"{setup_phase} rollback native cleanup",
+            )
+        except Exception as exchange_error:
+            assert local_ptr is not None
+            retained = _retain_failed_ipc_setup(
+                ipc=ipc,
+                local_ptr=local_ptr,
+                exchange_group=exchange_group,
+                owner=owner,
+                phase=setup_phase,
+                remote_ptrs=remote_ptrs,
+                local_cleanup=retained_cleanup,
+                state="native",
+            )
+            error = RuntimeError(
+                _setup_failure_message(
+                    owner,
+                    f"{setup_phase} rollback native cleanup status exchange",
+                    setup_statuses,
+                    exports_retained=True,
+                )
+            )
+            raise _attach_retryable_setup(error, retained) from (
+                native_error or local_error or exchange_error
+            )
+        if any(native_statuses):
+            assert local_ptr is not None
+            retained = _retain_failed_ipc_setup(
+                ipc=ipc,
+                local_ptr=local_ptr,
+                exchange_group=exchange_group,
+                owner=owner,
+                phase=setup_phase,
+                remote_ptrs=remote_ptrs,
+                local_cleanup=retained_cleanup,
+                state="native",
+            )
+            error = RuntimeError(
+                _setup_failure_message(
+                    owner,
+                    f"{setup_phase} rollback native cleanup",
+                    native_statuses,
+                    exports_retained=True,
+                )
+            )
+            raise _attach_retryable_setup(error, retained) from (
+                native_error or local_error
+            )
+
+    unmap_failures: list[str] = []
     remaining_remote_ptrs: list[int] = []
     for ptr in remote_ptrs:
         try:
@@ -806,7 +886,7 @@ def _finish_collective_runtime_setup(
             phase="native initialization status exchange",
             remote_ptrs=shared.remote_ptrs,
             local_cleanup=local_cleanup,
-            state="unmap",
+            state="native",
         )
         if detach_shared_ownership is not None:
             detach_shared_ownership()

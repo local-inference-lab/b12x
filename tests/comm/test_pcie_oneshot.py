@@ -856,7 +856,7 @@ def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypat
         lambda local_status, group: [local_status, ()],
     )
 
-    with pytest.raises(RuntimeError, match="rollback unmap") as exc:
+    with pytest.raises(RuntimeError, match="rollback native cleanup") as exc:
         _abort_collective_ipc_setup(
             owner="test runtime",
             setup_phase="native initialization",
@@ -871,12 +871,118 @@ def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypat
 
     retained = exc.value.retryable_setup
     assert cleanup_calls == 1
-    assert ipc.closed == [2000]
+    assert retained.state == "native"
+    assert ipc.closed == []
     assert ipc.freed == []
     retained.retry()
     assert cleanup_calls == 2
     assert ipc.closed == [2000]
     assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_peer_native_cleanup_failure_blocks_every_rank_from_unmapping(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    cleanup_calls = 0
+    status_round = 0
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    def exchange(local_status, group):
+        nonlocal status_round
+        status_round += 1
+        if status_round == 1:
+            return [local_status, ("peer native dispose failed",)]
+        return [local_status, ()]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="rollback native cleanup") as exc:
+        _abort_collective_ipc_setup(
+            owner="test runtime",
+            setup_phase="native initialization",
+            setup_statuses=(("peer init failed",), ()),
+            exchange_group=object(),
+            ipc=ipc,
+            local_ptr=1000,
+            remote_ptrs=(2000,),
+            local_error=RuntimeError("peer init failed"),
+            local_cleanup=cleanup,
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.state == "native"
+    assert retained.local_cleanup is None
+    assert cleanup_calls == 1
+    assert ipc.closed == []
+    assert ipc.freed == []
+
+    retained.retry()
+    assert cleanup_calls == 1
+    assert ipc.closed == [2000]
+    assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_native_cleanup_verdict_exchange_failure_retains_imports(monkeypatch):
+    events = []
+
+    class FakeIPC:
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append(("close", ptr))
+
+        def cudaFree(self, ptr):
+            events.append(("free", ptr))
+
+    ipc = FakeIPC()
+    status_round = 0
+
+    def exchange(local_status, group):
+        nonlocal status_round
+        status_round += 1
+        if status_round == 1:
+            raise RuntimeError("injected native cleanup verdict exchange failure")
+        return [local_status, ()]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup status exchange") as exc:
+        _abort_collective_ipc_setup(
+            owner="test runtime",
+            setup_phase="native initialization",
+            setup_statuses=(("peer init failed",), ()),
+            exchange_group=object(),
+            ipc=ipc,
+            local_ptr=1000,
+            remote_ptrs=(2000,),
+            local_error=RuntimeError("peer init failed"),
+            local_cleanup=lambda: events.append(("dispose", 3000)),
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.state == "native"
+    assert retained.local_cleanup is None
+    assert events == [("dispose", 3000)]
+
+    retained.retry()
+    assert events == [("dispose", 3000), ("close", 2000), ("free", 1000)]
     assert _RETAINED_FAILED_IPC_EXPORTS == {}
 
 
