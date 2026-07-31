@@ -716,7 +716,21 @@ class MoEMicroKernelBackend:
                 rows_per_warp_div = 4
             elif cfg.k_segments_aligned and cfg.k_segments == 12 and self.is_gated:
                 rows_per_warp_div = 1
-            num_fc1_chunks = min(num_fc1_chunks, n // (rows_per_warp_div * _BLOCK_SIZE))
+            num_fc1_chunks = min(
+                num_fc1_chunks,
+                max(1, n // (rows_per_warp_div * _BLOCK_SIZE)),
+            )
+            # The retile cap is a floor division, so it can choose a chunk
+            # count that no longer partitions a merely 16-aligned native
+            # ModelOpt intermediate (for example, n=144 caps 9 chunks at 4,
+            # yielding a truncated 36-value chunk). Walk down to the largest
+            # valid divisor so every FC1 chunk covers whole 16-value blocks.
+            # Aligned production shapes retain their existing geometry.
+            while num_fc1_chunks > 1 and (
+                n % num_fc1_chunks != 0
+                or (n // num_fc1_chunks) % _BLOCK_SIZE != 0
+            ):
+                num_fc1_chunks -= 1
         if self.w4a16_mode and m > 1:
             # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
             # the 512-thread launch register limit. The chunk count must still
