@@ -264,7 +264,10 @@ def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
     )
 
 
-@pytest.mark.parametrize("intermediate_size", [16, 144, 352, 496])
+@pytest.mark.parametrize(
+    "intermediate_size",
+    [16, 144, 352, 464, 480, 496, 512],
+)
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_keeps_non64_intermediate_contract(
@@ -945,7 +948,10 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
-@pytest.mark.parametrize("intermediate_size", [32, 128, 144, 224, 352, 496])
+@pytest.mark.parametrize(
+    "intermediate_size",
+    [32, 128, 144, 224, 352, 464, 480, 496, 512],
+)
 def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     activation: str,
     m: int,
@@ -1101,7 +1107,10 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("intermediate_size", [144, 352, 496])
+@pytest.mark.parametrize(
+    "intermediate_size",
+    [144, 352, 464, 480, 496, 512],
+)
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
