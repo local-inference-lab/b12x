@@ -562,7 +562,11 @@ class MoEMicroKernelBackend:
         col: Int32,
         n_cols: Int32,
     ) -> Float32:
-        addr = base_addr + ebase + Int64(kb16) * Int64(n_cols) + Int64(col)
+        # ModelOpt's E4M3 scale permutation is tiled in 64 output rows. Direct
+        # micro preparation retains the final padded tile so every permuted
+        # logical scale remains addressable.
+        packed_n_cols = (n_cols + Int32(63)) & ~Int32(63)
+        addr = base_addr + ebase + Int64(kb16) * Int64(packed_n_cols) + Int64(col)
         word = ld_global_nc_u32(addr & ~Int64(3))
         byte = (word >> Uint32((addr & Int64(3)) * Int64(8))) & Uint32(0xFF)
         return cvt_w4a16_packed_e4m3_scale_to_f32(byte)
@@ -2417,7 +2421,9 @@ class MoEMicroKernelBackend:
             ebase_w = Int64(eid) * Int64(cfg.two_n) * Int64(cfg.k_half)
             ebase_sf = Int64(eid) * Int64(cfg.w1_sf_rows * cfg.w1_sf_cols)
             ebase_sf_packed = Int64(eid) * Int64((cfg.k_dim // 32) * cfg.two_n)
-            ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.k_dim // 16) * cfg.two_n)
+            ebase_sf_packed_e4m3 = Int64(eid) * Int64(
+                (cfg.k_dim // 16) * _align_up(cfg.two_n, 64)
+            )
             thread_byte_off = Int64(lane) * Int64(cfg.k_half // 32)
             xh_buf_base = Int32(0)
             if cutlass.const_expr(cfg.k_segments == 2):
