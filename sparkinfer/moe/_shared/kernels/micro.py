@@ -1120,12 +1120,20 @@ class MoEMicroKernelBackend:
                 if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
                     packed_u32 = Int32(nc * 32) + lane
                     w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
-                # If the last 256-wide chunk overhangs a non-256-aligned n
-                # (e.g. n=384), lanes past num_cb index the uninitialized
-                # intermediate tail. The weight there is already masked to 0,
-                # but 0 * NaN = NaN, so mask the activation read too. Gated by
-                # constexpr so 256-aligned shapes emit no extra runtime work.
-                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                # If the last 256-value chunk overhangs logical n, lanes past
+                # the exact native row read an unwritten intermediate tail.
+                # The padded scale grid can look full at widths such as n=496,
+                # so its control-block count is not a valid activation bound.
+                # The weight is zero there, but 0 * NaN still poisons the sum.
+                # Preserve the legacy predicate for non-W4A16 modes and emit
+                # no extra work for 256-aligned native ModelOpt shapes.
+                if cutlass.const_expr(
+                    (self.w4a16_mode and cfg.n % 256 != 0)
+                    or (
+                        (not self.w4a16_mode)
+                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
+                    )
+                ):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -1936,9 +1944,15 @@ class MoEMicroKernelBackend:
                                 w2s_base_addr + next_ebase_sf + next_bsf_off3
                             )
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
-                # See _m1_fc2_rowpair_wide: mask the intermediate tail read for
-                # non-256-aligned n (0 weight * NaN tail = NaN). constexpr-gated.
-                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                # See _m1_fc2_rowpair_wide: logical n, not the padded scale
+                # grid, determines whether the native intermediate tail is live.
+                if cutlass.const_expr(
+                    (self.w4a16_mode and cfg.n % 256 != 0)
+                    or (
+                        (not self.w4a16_mode)
+                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
+                    )
+                ):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)

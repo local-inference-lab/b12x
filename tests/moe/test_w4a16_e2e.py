@@ -264,7 +264,7 @@ def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
     )
 
 
-@pytest.mark.parametrize("intermediate_size", [16, 144, 352])
+@pytest.mark.parametrize("intermediate_size", [16, 144, 352, 496])
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_keeps_non64_intermediate_contract(
@@ -945,7 +945,7 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
-@pytest.mark.parametrize("intermediate_size", [32, 128, 144, 224, 352])
+@pytest.mark.parametrize("intermediate_size", [32, 128, 144, 224, 352, 496])
 def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     activation: str,
     m: int,
@@ -1101,7 +1101,7 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("intermediate_size", [144, 352])
+@pytest.mark.parametrize("intermediate_size", [144, 352, 496])
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
@@ -1114,12 +1114,13 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
 
     I=144 exercises the narrow one-chunk kernel: it has 18 logical packed-u32
     values per W2 row while the ModelOpt scale grid pads its control geometry
-    to 24. I=352 exercises the wide two-chunk kernel, whose final chunk has
-    only 12 logical lanes. Selecting the only expert makes an unmasked tail
-    load on the final W2 row cross the tensor allocation instead of merely
-    reading the next expert. Run this test under compute-sanitizer with
-    ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` to audit m==1/m>=2 and ungated/gated
-    direct-FC2 implementations.
+    to 24. I=352 exercises a partial scale/control tail in the wide kernel.
+    I=496 is the boundary case where that padded control grid looks completely
+    full even though the final two activation lanes are unwritten. Selecting
+    the only expert makes an unmasked W2 tail load cross the tensor allocation
+    instead of merely reading the next expert. Run this test under
+    compute-sanitizer with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` to audit
+    m==1/m>=2 and ungated/gated direct-FC2 implementations.
     """
     import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
