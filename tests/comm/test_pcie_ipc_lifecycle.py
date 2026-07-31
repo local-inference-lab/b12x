@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from sparkinfer.comm.pcie.pcie_oneshot import (
+    PCIeOneshotAllReduce,
+    PCIeOneshotAllReducePool,
+)
 from sparkinfer.comm.pcie.pcie_twoshot import PCIeTwoShotSP
 
 
@@ -39,6 +43,10 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
     )
 
     pool.close()
@@ -84,22 +92,43 @@ def test_pool_destructor_is_nonblocking_and_does_not_free_exports(
 
 
 class _FakeExt:
-    def __init__(self, events: list[object]) -> None:
+    def __init__(self, events: list[object], *, dispose_failures: int = 0) -> None:
         self.events = events
+        self.dispose_failures = dispose_failures
 
     def dispose(self, ptr: int) -> None:
         self.events.append(("dispose", ptr))
+        if self.dispose_failures:
+            self.dispose_failures -= 1
+            raise RuntimeError("dispose failed")
+
+    def dispose_best_effort(self, ptr: int) -> None:
+        self.events.append(("dispose_best_effort", ptr))
 
 
 class _FakeIPC:
-    def __init__(self, events: list[object]) -> None:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        close_failures: dict[int, int] | None = None,
+        free_failures: dict[int, int] | None = None,
+    ) -> None:
         self.events = events
+        self.close_failures = dict(close_failures or {})
+        self.free_failures = dict(free_failures or {})
 
     def cudaIpcCloseMemHandle(self, ptr: int) -> None:
         self.events.append(("close", ptr))
+        if self.close_failures.get(ptr, 0):
+            self.close_failures[ptr] -= 1
+            raise RuntimeError(f"close {ptr} failed")
 
     def cudaFree(self, ptr: int) -> None:
         self.events.append(("free", ptr))
+        if self.free_failures.get(ptr, 0):
+            self.free_failures[ptr] -= 1
+            raise RuntimeError(f"free {ptr} failed")
 
 
 class _Shared:
@@ -126,6 +155,23 @@ def _fake_twoshot(events: list[object]) -> PCIeTwoShotSP:
     return runtime
 
 
+def _fake_oneshot(events: list[object]) -> PCIeOneshotAllReduce:
+    runtime = object.__new__(PCIeOneshotAllReduce)
+    runtime.rank = 0
+    runtime.world_size = 2
+    runtime.device = torch.device("cpu")
+    runtime.exchange_group = None
+    runtime._ext = _FakeExt(events)
+    runtime._ptr = 123
+    runtime._owned_buffers = [_Shared(1000, (2000, 3000))]
+    runtime._ipc = _FakeIPC(events)
+    runtime._registered_input_ptrs = {10: (20,)}
+    runtime._closed = False
+    runtime._ipc_imports_closed = False
+    runtime._ipc_exports_freed = False
+    return runtime
+
+
 def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None:
     events: list[object] = []
     runtime = _fake_twoshot(events)
@@ -137,6 +183,10 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
         lambda device: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
     )
 
     runtime.close()
@@ -177,3 +227,330 @@ def test_twoshot_destructor_unmaps_without_barrier_or_export_free(
     ]
     assert runtime._owned_buffers != []
     assert not runtime._ipc_exports_freed
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_failure(
+    runtime_factory,
+) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime.exchange_group = None
+    runtime._ipc = _FakeIPC(events, close_failures={2000: 1})
+
+    with pytest.raises(
+        RuntimeError,
+        match="coordinated PCIe close failed during IPC unmap.*not freed",
+    ):
+        runtime.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+    ]
+    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
+    assert getattr(runtime, pointer_attr) == 0
+    assert runtime._closed
+    assert not runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+    assert [shared.local_ptr for shared in runtime._owned_buffers] == [1000]
+
+    runtime.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("close", 2000),
+        ("free", 1000),
+    ]
+    assert runtime._ipc_imports_closed
+    assert runtime._ipc_exports_freed
+    assert runtime._owned_buffers == []
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+def test_strict_close_reports_native_dispose_failure_without_losing_pointer(
+    runtime_factory,
+) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime.exchange_group = None
+    runtime._ext = _FakeExt(events, dispose_failures=1)
+
+    with pytest.raises(RuntimeError, match="failed during IPC unmap"):
+        runtime.close()
+
+    pointer_attr = "_ptr" if isinstance(runtime, PCIeOneshotAllReduce) else "_fptr"
+    assert getattr(runtime, pointer_attr) == 123
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+    ]
+    assert not runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+
+    runtime.close()
+
+    assert getattr(runtime, pointer_attr) == 0
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("dispose", 123),
+        ("free", 1000),
+    ]
+    assert runtime._ipc_imports_closed
+    assert runtime._ipc_exports_freed
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+def test_strict_close_reports_free_failure_and_retains_only_failed_export(
+    runtime_factory,
+) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime.exchange_group = None
+    runtime._owned_buffers.append(_Shared(4000, (5000,)))
+    runtime._ipc = _FakeIPC(events, free_failures={1000: 1})
+
+    with pytest.raises(RuntimeError, match="failed during IPC export free"):
+        runtime.close()
+
+    assert events == [
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        ("close", 5000),
+        ("free", 1000),
+        ("free", 4000),
+    ]
+    assert runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+    assert [shared.local_ptr for shared in runtime._owned_buffers] == [1000]
+
+    runtime.close()
+
+    assert events[-1] == ("free", 1000)
+    assert runtime._ipc_exports_freed
+    assert runtime._owned_buffers == []
+
+
+def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
+    monkeypatch,
+) -> None:
+    events: list[object] = []
+    runtime = _fake_oneshot(events)
+    runtime.device = torch.device("cuda:0")
+    runtime.exchange_group = object()
+    peer_statuses = iter(
+        [
+            lambda local: [local, ("peer close failed",)],
+            lambda local: [local, ()],
+            lambda local: [local, ()],
+        ]
+    )
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        lambda device: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: next(peer_statuses)(local_status),
+    )
+
+    with pytest.raises(RuntimeError, match="group rank 1: peer close failed"):
+        runtime.close()
+
+    assert ("free", 1000) not in events
+    assert runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+
+    runtime.close()
+
+    assert events == [
+        "synchronize",
+        "barrier",
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        "synchronize",
+        "barrier",
+        "barrier",
+        ("free", 1000),
+        "barrier",
+    ]
+    assert runtime._ipc_exports_freed
+
+
+def test_status_exchange_failure_retains_local_exports(monkeypatch) -> None:
+    events: list[object] = []
+    runtime = _fake_oneshot(events)
+    runtime.exchange_group = object()
+
+    def fail_status_exchange(local_status, group):
+        raise RuntimeError("status exchange failed")
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        fail_status_exchange,
+    )
+
+    with pytest.raises(RuntimeError, match="failed to exchange peer IPC unmap"):
+        runtime.close()
+
+    assert events == [
+        "barrier",
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+    ]
+    assert runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+    assert runtime._owned_buffers
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
+    monkeypatch,
+    runtime_factory,
+) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime.device = torch.device("cuda:0")
+    runtime.exchange_group = object()
+    peer_statuses = iter(
+        [
+            lambda local: [local, ()],
+            lambda local: [local, ("peer export free failed",)],
+            lambda local: [local, ()],
+            lambda local: [local, ()],
+        ]
+    )
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.dist.barrier",
+        lambda *, group: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot.torch.cuda.synchronize",
+        lambda device: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: next(peer_statuses)(local_status),
+    )
+
+    with pytest.raises(RuntimeError, match="group rank 1: peer export free failed"):
+        runtime.close()
+
+    assert runtime._ipc_exports_freed
+    assert not getattr(runtime, "_coordinated_close_complete", False)
+
+    runtime.close()
+    events_after_success = list(events)
+    runtime.close()
+
+    assert events == events_after_success
+    assert events == [
+        "synchronize",
+        "barrier",
+        ("dispose", 123),
+        ("close", 2000),
+        ("close", 3000),
+        "barrier",
+        ("free", 1000),
+        "synchronize",
+        "barrier",
+        "barrier",
+        "barrier",
+    ]
+    assert runtime._coordinated_close_complete
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
+def test_best_effort_gc_failure_never_frees_exports_or_marks_imports_closed(
+    runtime_factory,
+) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime._ipc = _FakeIPC(events, close_failures={2000: 1})
+
+    runtime.__del__()
+
+    expected_dispose = (
+        ("dispose_best_effort", 123)
+        if isinstance(runtime, PCIeOneshotAllReduce)
+        else ("dispose", 123)
+    )
+    assert events == [
+        expected_dispose,
+        ("close", 2000),
+        ("close", 3000),
+    ]
+    assert not runtime._ipc_imports_closed
+    assert not runtime._ipc_exports_freed
+    assert runtime._owned_buffers
+
+
+def test_native_best_effort_failure_permanently_blocks_export_free() -> None:
+    events: list[object] = []
+    runtime = _fake_oneshot(events)
+
+    class NativeCloseFailedExt(_FakeExt):
+        def dispose_best_effort(self, ptr: int) -> bool:
+            self.events.append(("dispose_best_effort", ptr))
+            return False
+
+    runtime._ext = NativeCloseFailedExt(events)
+
+    runtime.__del__()
+
+    assert runtime._ptr == 0
+    assert runtime._native_ipc_import_close_failed
+    assert not runtime._ipc_imports_closed
+
+    with pytest.raises(
+        RuntimeError,
+        match="native IPC import failed during best-effort teardown",
+    ):
+        runtime.close()
+
+    assert ("free", 1000) not in events
+    assert not runtime._ipc_exports_freed
+
+
+def test_failed_rollback_keeps_transient_channel_owned_for_retry() -> None:
+    retained_events: list[object] = []
+    transient_events: list[object] = []
+    retained = _fake_oneshot(retained_events)
+    transient = _fake_oneshot(transient_events)
+    transient._ipc = _FakeIPC(transient_events, close_failures={2000: 1})
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: retained,
+    )
+    pool._all_channels = [retained, transient]
+    pool._channels = {1: retained, 2: transient}
+    checkpoint = (1, {1: retained})
+
+    with pytest.raises(RuntimeError, match="failed during IPC unmap"):
+        pool.rollback_channels(checkpoint)
+
+    assert pool._all_channels == [retained, transient]
+    assert pool._channels == {1: retained, 2: transient}
+    assert not pool._closed
+    assert ("free", 1000) not in transient_events

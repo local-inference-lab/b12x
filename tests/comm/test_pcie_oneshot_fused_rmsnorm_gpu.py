@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
+import time
+from datetime import timedelta
 
 import pytest
 import torch
@@ -19,6 +21,9 @@ pytestmark = pytest.mark.skipif(
         "set SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
         "RMSNorm GPU tests"
     ),
+)
+TEST_TIMEOUT_SECONDS = float(
+    os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
 )
 
 
@@ -291,6 +296,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=timedelta(seconds=TEST_TIMEOUT_SECONDS),
     )
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
@@ -318,4 +324,27 @@ def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+    context = mp.spawn(
+        _worker,
+        args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=False,
+    )
+    deadline = time.monotonic() + TEST_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if context.join(timeout=min(1.0, remaining), grace_period=5):
+            return
+    for process in context.processes:
+        if process.is_alive():
+            process.terminate()
+    for process in context.processes:
+        process.join(timeout=5)
+    for process in context.processes:
+        if process.is_alive():
+            process.kill()
+        process.join()
+    pytest.fail(
+        "PCIe oneshot fused RMSNorm test exceeded "
+        f"{TEST_TIMEOUT_SECONDS:.0f}s; probable collective deadlock"
+    )

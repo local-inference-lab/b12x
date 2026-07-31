@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ipc_handle_registry.h"
+
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
     cudaError_t e = cmd;                                                \
@@ -591,6 +593,9 @@ using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 
 class PCIeAllreduce {
  public:
+  using IPCHandles =
+      sparkinfer::pcie::IpcHandleRegistry<IPC_KEY, char*, cudaError_t, cudaSuccess>;
+
   int rank_;
   int world_size_;
 
@@ -600,7 +605,7 @@ class PCIeAllreduce {
 
   RankData *d_rank_data_base_, *d_rank_data_end_;
   std::vector<void*> graph_unreg_buffers_;
-  std::map<IPC_KEY, char*> ipc_handles_;
+  IPCHandles ipc_handles_;
 
   bool dbuf_enabled_ = false;
   DoubleRankData dbuf_data_ = {};
@@ -610,19 +615,54 @@ class PCIeAllreduce {
         world_size_(world_size),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
-        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
+        d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)),
+        ipc_handles_(&PCIeAllreduce::close_ipc_handle) {
     for (int i = 0; i < world_size_; i++) sg_.signals[i] = signals[i];
   }
 
+  static cudaError_t close_ipc_handle(char* ptr) noexcept {
+    return cudaIpcCloseMemHandle(ptr);
+  }
+
   char* open_ipc_handle(const void* ipc_handle) {
-    auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
-    if (new_handle) {
-      char* ipc_ptr;
-      CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle(
-          (void**)&ipc_ptr, *((const cudaIpcMemHandle_t*)ipc_handle), cudaIpcMemLazyEnablePeerAccess));
-      it->second = ipc_ptr;
+    const auto& key = *reinterpret_cast<const IPC_KEY*>(ipc_handle);
+    auto existing = ipc_handles_.find(key);
+    if (existing != ipc_handles_.end()) {
+      return existing->second;
     }
-    return it->second;
+
+    char* ipc_ptr;
+    CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle(
+        reinterpret_cast<void**>(&ipc_ptr),
+        *reinterpret_cast<const cudaIpcMemHandle_t*>(ipc_handle),
+        cudaIpcMemLazyEnablePeerAccess));
+    try {
+      auto [inserted, is_new] = ipc_handles_.emplace(key, ipc_ptr);
+      if (!is_new) {
+        // Defensively avoid double ownership if this insertion path changes.
+        (void)cudaIpcCloseMemHandle(ipc_ptr);
+        return inserted->second;
+      }
+      return inserted->second;
+    } catch (...) {
+      // Do not leak a successfully opened mapping if map allocation fails.
+      (void)cudaIpcCloseMemHandle(ipc_ptr);
+      throw;
+    }
+  }
+
+  cudaError_t close_ipc_handles_noexcept() noexcept {
+    return ipc_handles_.close_all_noexcept();
+  }
+
+  void close_ipc_handles_strict() {
+    const cudaError_t error = close_ipc_handles_noexcept();
+    if (error != cudaSuccess) {
+      const char* description = cudaGetErrorString(error);
+      throw std::runtime_error(
+          std::string("cudaIpcCloseMemHandle failed while disposing PCIe allreduce: ") +
+          (description == nullptr ? "unknown CUDA error" : description));
+    }
   }
 
   std::pair<std::string, std::vector<int64_t>> get_graph_buffer_ipc_meta() {
@@ -890,9 +930,7 @@ class PCIeAllreduce {
 #undef KL
   }
 
-  ~PCIeAllreduce() {
-    for (auto [_, ptr] : ipc_handles_) CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
-  }
+  ~PCIeAllreduce() noexcept = default;
 };
 
 }  // namespace pcie_allreduce
@@ -1035,7 +1073,18 @@ static void all_reduce_fused_add_rms_norm(
 }
 
 static void dispose(fptr_t _fa) {
-  delete reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  auto* fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  if (fa == nullptr) return;
+  fa->close_ipc_handles_strict();
+  delete fa;
+}
+
+static bool dispose_best_effort(fptr_t _fa) noexcept {
+  auto* fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  if (fa == nullptr) return true;
+  const cudaError_t error = fa->close_ipc_handles_noexcept();
+  delete fa;
+  return error == cudaSuccess;
 }
 
 static int64_t meta_size() {
@@ -1086,7 +1135,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "all_reduce_fused_add_rms_norm",
       &all_reduce_fused_add_rms_norm,
       "PCIe allreduce fused with residual add and RMSNorm");
-  m.def("dispose", &dispose, "dispose PCIe allreduce");
+  m.def(
+      "dispose",
+      &dispose,
+      "strictly dispose PCIe allreduce; retain it for retry if an IPC close fails");
+  m.def(
+      "dispose_best_effort",
+      &dispose_best_effort,
+      "nonthrowing PCIe allreduce dispose; return whether every native IPC import closed");
   m.def("meta_size", &meta_size, "signal metadata size");
   m.def("register_buffer", &register_buffer, "register IPC buffer");
   m.def("register_pcie_buffers", &register_pcie_buffers, "register double-buffered IPC buffers");

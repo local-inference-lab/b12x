@@ -168,7 +168,7 @@ def _coordinated_close_channels(
     exchange_group: Optional[ProcessGroup],
     device: torch.device,
 ) -> None:
-    """Release exported CUDA IPC allocations after every peer unmaps them."""
+    """Strictly release exports only after every peer reports successful unmap."""
     unique_channels = tuple(dict.fromkeys(channels))
     if not unique_channels:
         return
@@ -177,14 +177,150 @@ def _coordinated_close_channels(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         dist.barrier(group=exchange_group)
-    for channel in unique_channels:
-        channel._close_ipc_imports()
+
+    # Older DCP channels still expose the legacy best-effort protocol. Keep
+    # their existing ordering until they receive their own lifecycle migration;
+    # oneshot and twoshot opt into the strict peer-status protocol below.
+    uses_strict_protocol = any(
+        hasattr(channel, "_close_ipc_imports_strict") for channel in unique_channels
+    )
+    if not uses_strict_protocol:
+        for channel in unique_channels:
+            channel._close_ipc_imports()
+        if exchange_group is not None:
+            dist.barrier(group=exchange_group)
+        for channel in unique_channels:
+            channel._free_ipc_exports()
+        if exchange_group is not None:
+            dist.barrier(group=exchange_group)
+        return
+
+    unmap_errors = _run_close_phase(
+        unique_channels,
+        strict_method="_close_ipc_imports_strict",
+        legacy_method="_close_ipc_imports",
+    )
+    unmap_status = _exchange_close_failures(
+        tuple(_format_close_error(index, error) for index, error in unmap_errors),
+        exchange_group=exchange_group,
+        phase="IPC unmap",
+    )
+    if any(unmap_status):
+        _raise_coordinated_close_error(
+            "IPC unmap",
+            unmap_status,
+            local_errors=unmap_errors,
+            exports_retained=True,
+        )
+
+    if exchange_group is not None:
+        dist.barrier(group=exchange_group)
+
+    free_errors = _run_close_phase(
+        unique_channels,
+        strict_method="_free_ipc_exports_strict",
+        legacy_method="_free_ipc_exports",
+    )
+    free_status = _exchange_close_failures(
+        tuple(_format_close_error(index, error) for index, error in free_errors),
+        exchange_group=exchange_group,
+        phase="IPC export free",
+    )
+    if any(free_status):
+        _raise_coordinated_close_error(
+            "IPC export free",
+            free_status,
+            local_errors=free_errors,
+            exports_retained=False,
+        )
+
     if exchange_group is not None:
         dist.barrier(group=exchange_group)
     for channel in unique_channels:
-        channel._free_ipc_exports()
-    if exchange_group is not None:
-        dist.barrier(group=exchange_group)
+        if hasattr(channel, "_close_ipc_imports_strict"):
+            channel._coordinated_close_complete = True
+
+
+def _run_close_phase(
+    channels: Sequence[object],
+    *,
+    strict_method: str,
+    legacy_method: str,
+) -> list[tuple[int, Exception]]:
+    errors: list[tuple[int, Exception]] = []
+    for index, channel in enumerate(channels):
+        method = getattr(channel, strict_method, None)
+        if method is None:
+            method = getattr(channel, legacy_method)
+        try:
+            method()
+        except Exception as exc:
+            errors.append((index, exc))
+    return errors
+
+
+def _format_close_error(index: int, error: Exception) -> str:
+    return f"channel {index}: {type(error).__name__}: {error}"
+
+
+def _exchange_close_failures(
+    local_failures: tuple[str, ...],
+    *,
+    exchange_group: Optional[ProcessGroup],
+    phase: str,
+) -> tuple[tuple[str, ...], ...]:
+    if exchange_group is None:
+        return (local_failures,)
+    try:
+        gathered = _broadcast_gather_object(local_failures, exchange_group)
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to exchange peer {phase} status; exported IPC allocations "
+            "were not freed"
+        ) from exc
+
+    statuses: list[tuple[str, ...]] = []
+    for rank_index, status in enumerate(gathered):
+        if not isinstance(status, (tuple, list)):
+            raise RuntimeError(
+                f"invalid peer {phase} status from group rank {rank_index}; "
+                "exported IPC allocations were not freed"
+            )
+        statuses.append(tuple(str(item) for item in status))
+    return tuple(statuses)
+
+
+def _raise_coordinated_close_error(
+    phase: str,
+    statuses: Sequence[Sequence[str]],
+    *,
+    local_errors: Sequence[tuple[int, Exception]],
+    exports_retained: bool,
+) -> None:
+    peer_details = []
+    for rank_index, failures in enumerate(statuses):
+        if failures:
+            peer_details.append(f"group rank {rank_index}: " + " | ".join(failures))
+    retention = "; exported IPC allocations were not freed" if exports_retained else ""
+    error = RuntimeError(
+        f"coordinated PCIe close failed during {phase}{retention}: "
+        + "; ".join(peer_details)
+    )
+    if local_errors:
+        raise error from local_errors[0][1]
+    raise error
+
+
+def _raise_local_cleanup_errors(
+    owner: str,
+    phase: str,
+    failures: Sequence[tuple[str, Exception]],
+) -> None:
+    details = "; ".join(
+        f"{resource}: {type(error).__name__}: {error}" for resource, error in failures
+    )
+    error = RuntimeError(f"{owner} {phase} failed: {details}")
+    raise error from failures[0][1]
 
 
 @dataclass(frozen=True)
@@ -318,6 +454,9 @@ class PCIeOneshotAllReduce:
         self._closed = False
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._native_ipc_import_close_failed = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
         self._ext = ext_module or _load_extension()
 
         if ext_module is None and self.device.type != "cuda":
@@ -897,35 +1036,148 @@ class PCIeOneshotAllReduce:
             logger.info("\n".join(lines))
         return crossover
 
-    def _close_ipc_imports(self) -> None:
+    def _closed_import_indices(self) -> set[tuple[int, int]]:
+        closed = getattr(self, "_closed_ipc_import_indices", None)
+        if closed is None:
+            closed = set()
+            self._closed_ipc_import_indices = closed
+        return closed
+
+    def _all_python_ipc_imports_closed(self, closed: set[tuple[int, int]]) -> bool:
+        if self._ipc is None:
+            return not any(shared.remote_ptrs for shared in self._owned_buffers)
+        return all(
+            (buffer_index, remote_index) in closed
+            for buffer_index, shared in enumerate(self._owned_buffers)
+            for remote_index, _ in enumerate(shared.remote_ptrs)
+        )
+
+    def _close_ipc_imports_strict(self) -> None:
         if self._ipc_imports_closed:
             return
         self._closed = True
+        failures: list[tuple[str, Exception]] = []
+        if getattr(self, "_native_ipc_import_close_failed", False):
+            failures.append(
+                (
+                    "native runtime",
+                    RuntimeError(
+                        "a native IPC import failed during best-effort teardown "
+                        "and can no longer be retried"
+                    ),
+                )
+            )
         if getattr(self, "_ptr", 0):
-            with suppress(Exception):
+            try:
                 self._ext.dispose(self._ptr)
-            self._ptr = 0
-        if self._ipc is not None:
-            for shared in self._owned_buffers:
-                for ptr in shared.remote_ptrs:
-                    with suppress(Exception):
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
-        self._ipc_imports_closed = True
+            except Exception as exc:
+                failures.append(("native runtime", exc))
+            else:
+                self._ptr = 0
 
-    def _free_ipc_exports(self) -> None:
+        closed = self._closed_import_indices()
+        if self._ipc is not None:
+            for buffer_index, shared in enumerate(self._owned_buffers):
+                for remote_index, ptr in enumerate(shared.remote_ptrs):
+                    key = (buffer_index, remote_index)
+                    if key in closed:
+                        continue
+                    try:
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                    except Exception as exc:
+                        failures.append((f"CUDA IPC import {ptr}", exc))
+                    else:
+                        closed.add(key)
+        elif any(shared.remote_ptrs for shared in self._owned_buffers):
+            failures.append(
+                (
+                    "CUDA IPC imports",
+                    RuntimeError("CUDA runtime is unavailable for IPC unmap"),
+                )
+            )
+
+        if (
+            not failures
+            and not getattr(self, "_ptr", 0)
+            and self._all_python_ipc_imports_closed(closed)
+        ):
+            self._ipc_imports_closed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe oneshot", "IPC import close", failures)
+
+    def _close_ipc_imports_best_effort(self) -> None:
+        if self._ipc_imports_closed:
+            return
+        self._closed = True
+        native_imports_closed = not getattr(self, "_ptr", 0)
+        if getattr(self, "_ptr", 0):
+            dispose = getattr(self._ext, "dispose_best_effort", None)
+            if dispose is None:
+                dispose = self._ext.dispose
+            try:
+                result = dispose(self._ptr)
+            except Exception:
+                pass
+            else:
+                self._ptr = 0
+                # The native best-effort binding reports whether every graph
+                # import closed. Legacy/fake dispose methods return None and
+                # report failure by raising.
+                native_imports_closed = result is not False
+                if not native_imports_closed:
+                    self._native_ipc_import_close_failed = True
+
+        closed = self._closed_import_indices()
+        if self._ipc is not None:
+            for buffer_index, shared in enumerate(self._owned_buffers):
+                for remote_index, ptr in enumerate(shared.remote_ptrs):
+                    key = (buffer_index, remote_index)
+                    if key in closed:
+                        continue
+                    try:
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                    except Exception:
+                        pass
+                    else:
+                        closed.add(key)
+
+        if (
+            native_imports_closed
+            and not getattr(self, "_ptr", 0)
+            and self._all_python_ipc_imports_closed(closed)
+        ):
+            self._ipc_imports_closed = True
+
+    def _free_ipc_exports_strict(self) -> None:
         if self._ipc_exports_freed:
             return
-        self._close_ipc_imports()
+        self._close_ipc_imports_strict()
+        failures: list[tuple[str, Exception]] = []
+        remaining = []
         if self._ipc is not None:
             for shared in self._owned_buffers:
-                with suppress(Exception):
+                try:
                     self._ipc.cudaFree(shared.local_ptr)
-        self._owned_buffers.clear()
-        self._registered_input_ptrs.clear()
-        self._ipc_exports_freed = True
+                except Exception as exc:
+                    remaining.append(shared)
+                    failures.append((f"CUDA IPC export {shared.local_ptr}", exc))
+        elif self._owned_buffers:
+            remaining = list(self._owned_buffers)
+            failures.append(
+                (
+                    "CUDA IPC exports",
+                    RuntimeError("CUDA runtime is unavailable for export free"),
+                )
+            )
+        self._owned_buffers = remaining
+        if not remaining:
+            self._registered_input_ptrs.clear()
+            self._ipc_exports_freed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe oneshot", "IPC export free", failures)
 
     def close(self) -> None:
-        if self._ipc_exports_freed:
+        if getattr(self, "_coordinated_close_complete", False):
             return
         _coordinated_close_channels(
             (self,),
@@ -937,7 +1189,7 @@ class PCIeOneshotAllReduce:
         # Never enter a distributed barrier from GC/interpreter teardown.
         # Explicit close() is required to free exported IPC allocations safely.
         with suppress(Exception):
-            self._close_ipc_imports()
+            self._close_ipc_imports_best_effort()
 
 
 def _is_current_stream_capturing(device: torch.device) -> bool:
@@ -1137,8 +1389,6 @@ class PCIeOneshotAllReducePool:
         retained = self._all_channels[:all_channels_len]
         retained_ids = {id(channel) for channel in retained}
         transient = self._all_channels[all_channels_len:]
-        self._all_channels = retained
-        self._channels = dict(channels)
 
         channels_to_close = tuple(
             dict.fromkeys(
@@ -1150,6 +1400,8 @@ class PCIeOneshotAllReducePool:
             exchange_group=self.exchange_group,
             device=self.device,
         )
+        self._all_channels = retained
+        self._channels = dict(channels)
 
     def for_stream(self, stream: object = None) -> PCIeOneshotAllReduce:
         if self._closed:
@@ -1306,7 +1558,14 @@ class PCIeOneshotAllReducePool:
             for channel in (*self._all_channels, *self._channels.values()):
                 if id(channel) not in seen:
                     seen.add(id(channel))
-                    channel._close_ipc_imports()
+                    method = getattr(
+                        channel,
+                        "_close_ipc_imports_best_effort",
+                        None,
+                    )
+                    if method is None:
+                        method = channel._close_ipc_imports
+                    method()
 
 
 __all__ = [

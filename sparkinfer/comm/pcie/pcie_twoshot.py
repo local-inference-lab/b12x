@@ -24,6 +24,7 @@ from torch.utils.cpp_extension import load
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
+    _raise_local_cleanup_errors,
     _align_up,
     _broadcast_gather_object,
     _coordinated_close_channels,
@@ -87,6 +88,8 @@ class PCIeTwoShotSP:
         self._closed = False
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
 
     @classmethod
     def from_exchange_group(
@@ -246,32 +249,109 @@ class PCIeTwoShotSP:
         self._ext.all_gather_fp8(self._fptr, payload, scale, out, threads, block_limit)
         return out
 
-    def _close_ipc_imports(self) -> None:
+    def _closed_import_indices(self) -> set[tuple[int, int]]:
+        closed = getattr(self, "_closed_ipc_import_indices", None)
+        if closed is None:
+            closed = set()
+            self._closed_ipc_import_indices = closed
+        return closed
+
+    def _all_python_ipc_imports_closed(self, closed: set[tuple[int, int]]) -> bool:
+        return all(
+            (buffer_index, remote_index) in closed
+            for buffer_index, shared in enumerate(self._owned_buffers)
+            for remote_index, _ in enumerate(shared.remote_ptrs)
+        )
+
+    def _close_ipc_imports_strict(self) -> None:
         if self._ipc_imports_closed:
             return
         self._closed = True
+        failures: list[tuple[str, Exception]] = []
         if self._fptr:
-            with suppress(Exception):
+            try:
                 self._ext.dispose(self._fptr)
-            self._fptr = 0
-        for shared in self._owned_buffers:
-            for ptr in shared.remote_ptrs:
-                with suppress(Exception):
-                    self._ipc.cudaIpcCloseMemHandle(ptr)
-        self._ipc_imports_closed = True
+            except Exception as exc:
+                failures.append(("native runtime", exc))
+            else:
+                self._fptr = 0
 
-    def _free_ipc_exports(self) -> None:
+        closed = self._closed_import_indices()
+        for buffer_index, shared in enumerate(self._owned_buffers):
+            for remote_index, ptr in enumerate(shared.remote_ptrs):
+                key = (buffer_index, remote_index)
+                if key in closed:
+                    continue
+                try:
+                    self._ipc.cudaIpcCloseMemHandle(ptr)
+                except Exception as exc:
+                    failures.append((f"CUDA IPC import {ptr}", exc))
+                else:
+                    closed.add(key)
+
+        if (
+            not failures
+            and not self._fptr
+            and self._all_python_ipc_imports_closed(closed)
+        ):
+            self._ipc_imports_closed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe twoshot", "IPC import close", failures)
+
+    def _close_ipc_imports_best_effort(self) -> None:
+        if self._ipc_imports_closed:
+            return
+        self._closed = True
+        native_imports_closed = not self._fptr
+        if self._fptr:
+            try:
+                self._ext.dispose(self._fptr)
+            except Exception:
+                pass
+            else:
+                self._fptr = 0
+                native_imports_closed = True
+
+        closed = self._closed_import_indices()
+        for buffer_index, shared in enumerate(self._owned_buffers):
+            for remote_index, ptr in enumerate(shared.remote_ptrs):
+                key = (buffer_index, remote_index)
+                if key in closed:
+                    continue
+                try:
+                    self._ipc.cudaIpcCloseMemHandle(ptr)
+                except Exception:
+                    pass
+                else:
+                    closed.add(key)
+
+        if (
+            native_imports_closed
+            and not self._fptr
+            and self._all_python_ipc_imports_closed(closed)
+        ):
+            self._ipc_imports_closed = True
+
+    def _free_ipc_exports_strict(self) -> None:
         if self._ipc_exports_freed:
             return
-        self._close_ipc_imports()
+        self._close_ipc_imports_strict()
+        failures: list[tuple[str, Exception]] = []
+        remaining = []
         for shared in self._owned_buffers:
-            with suppress(Exception):
+            try:
                 self._ipc.cudaFree(shared.local_ptr)
-        self._owned_buffers.clear()
-        self._ipc_exports_freed = True
+            except Exception as exc:
+                remaining.append(shared)
+                failures.append((f"CUDA IPC export {shared.local_ptr}", exc))
+        self._owned_buffers = remaining
+        if not remaining:
+            self._ipc_exports_freed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe twoshot", "IPC export free", failures)
 
     def close(self) -> None:
-        if self._ipc_exports_freed:
+        if getattr(self, "_coordinated_close_complete", False):
             return
         _coordinated_close_channels(
             (self,),
@@ -283,4 +363,4 @@ class PCIeTwoShotSP:
         # Never block GC on a distributed barrier. CUDA context teardown owns
         # any export left behind when the caller omitted explicit close().
         with suppress(Exception):
-            self._close_ipc_imports()
+            self._close_ipc_imports_best_effort()

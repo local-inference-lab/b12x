@@ -859,13 +859,12 @@ def test_pool_coordinates_ipc_teardown_across_ranks(monkeypatch):
     assert pool._channels == {3: retained}
 
 
-def test_channel_teardown_completes_when_ipc_cleanup_raises():
+def test_channel_destructor_is_best_effort_without_freeing_exports_or_hiding_failures():
     events = []
 
     class FailingExt:
-        def dispose(self, ptr):
-            events.append(("dispose", ptr))
-            raise RuntimeError("dispose failed")
+        def dispose_best_effort(self, ptr):
+            events.append(("dispose_best_effort", ptr))
 
     class FailingIPC:
         def cudaIpcCloseMemHandle(self, ptr):
@@ -873,8 +872,7 @@ def test_channel_teardown_completes_when_ipc_cleanup_raises():
             raise RuntimeError("close failed")
 
         def cudaFree(self, ptr):
-            events.append(("free", ptr))
-            raise RuntimeError("free failed")
+            raise AssertionError("GC must not free exported IPC allocations")
 
     class SharedBuffer:
         def __init__(self, local_ptr, remote_ptrs):
@@ -896,23 +894,20 @@ def test_channel_teardown_completes_when_ipc_cleanup_raises():
     ]
     channel._registered_input_ptrs = {1: (2,)}
 
-    channel.close()
-    channel.close()
+    channel.__del__()
 
     assert events == [
-        ("dispose", 123),
+        ("dispose_best_effort", 123),
         ("close", 2000),
         ("close", 3000),
         ("close", 5000),
-        ("free", 1000),
-        ("free", 4000),
     ]
     assert channel._ptr == 0
     assert channel._closed
-    assert channel._ipc_imports_closed
-    assert channel._ipc_exports_freed
-    assert channel._owned_buffers == []
-    assert channel._registered_input_ptrs == {}
+    assert not channel._ipc_imports_closed
+    assert not channel._ipc_exports_freed
+    assert [shared.local_ptr for shared in channel._owned_buffers] == [1000, 4000]
+    assert channel._registered_input_ptrs == {1: (2,)}
 
 
 def test_pool_rejects_channel_rollback_during_capture():

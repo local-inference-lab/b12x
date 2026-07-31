@@ -169,9 +169,10 @@ def test_control_and_worker_launches_have_immediate_error_checks(
         assert suffix.lstrip().startswith("CHECK_CUDA_SUCCESS(cudaGetLastError());")
 
 
-def test_control_node_overhead_ab_contract() -> None:
-    # Relative to the folded-selector baseline, a staged operation has exactly
-    # one extra tiny control node. Registered paths remain one worker node.
+def test_control_node_graph_topology_contract() -> None:
+    # This is a node-topology contract, not a performance claim. Public-head
+    # A/B results compare net algorithms; only the staged plain one-shot 64 KiB
+    # path is covered by the dedicated timing harness.
     control_nodes = {
         "oneshot_registered": 0,
         "oneshot_staged_pull": 1,

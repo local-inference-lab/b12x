@@ -3,46 +3,65 @@
 Use ``run_pcie_oneshot_control_node_ab.py`` rather than comparing two ad-hoc
 JSON files. That external controller invokes this exact file for both source
 trees in an alternating AB/BA sequence and validates every recorded contract.
+
+This harness intentionally measures only the plain staged one-shot all-reduce
+at 64 KiB by default. A public-head comparison is a net algorithm comparison;
+it must not be described as isolated control-node launch overhead or generalized
+to fused RMSNorm / two-shot collectives without their own measurements.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import os
 import platform
 import socket
 import subprocess
+import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 import torch.distributed as dist
 from cuda.bindings import runtime as cudart
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
-
-
 SCHEMA_NAME = "sparkinfer.pcie_oneshot_control_node.run"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DTYPE_NAME = "bfloat16"
 TOP_LEVEL_KEYS = {
     "schema",
     "contract",
+    "scope",
     "identity",
+    "provenance",
     "software",
     "hardware",
     "environment",
-    "expected",
     "per_rank",
-    "slowest_rank",
+    "distributed_critical_path",
 }
-CONTRACT_KEYS = {"world_size", "numel", "dtype", "warmup", "iters"}
+CONTRACT_KEYS = {
+    "world_size",
+    "numel",
+    "dtype",
+    "warmup",
+    "iters",
+    "preflight_replays",
+}
+SCOPE_KEYS = {
+    "operation",
+    "staging",
+    "size_bytes",
+    "comparison_semantics",
+    "excluded_paths",
+}
 IDENTITY_KEYS = {
     "label",
     "variant",
@@ -51,9 +70,28 @@ IDENTITY_KEYS = {
     "implementation_git_sha",
     "implementation_git_dirty",
     "harness_sha256",
+    "controller_sha256",
+    "controller_argv_sha256",
+    "worker_argv",
+    "worker_argv_sha256",
     "started_at_utc",
 }
+PROVENANCE_KEYS = {
+    "module_path",
+    "module_sha256",
+    "cuda_source_path",
+    "cuda_source_sha256",
+    "extension_path",
+    "extension_sha256",
+    "extension_build_root",
+    "extension_build_manifest",
+    "extension_build_manifest_sha256",
+    "fresh_extension_cache",
+    "post_run_verified",
+}
 METRIC_KEYS = {"cold_us", "mean_us", "p50_us", "p95_us", "min_us", "max_us"}
+RANK_MODE_KEYS = METRIC_KEYS | {"samples_us"}
+CRITICAL_MODE_KEYS = METRIC_KEYS | {"samples_us"}
 SOFTWARE_KEYS = {
     "python",
     "platform",
@@ -61,6 +99,7 @@ SOFTWARE_KEYS = {
     "torch_cuda",
     "cuda_runtime_version",
     "cuda_driver_version",
+    "nvcc_version",
 }
 HARDWARE_KEYS = {
     "hostname",
@@ -70,7 +109,6 @@ HARDWARE_KEYS = {
     "nvidia_smi_samples",
     "nvidia_smi_topology",
 }
-EXPECTED_KEYS = {"staged_graph_kernel_nodes", "registered_graph_kernel_nodes"}
 DEVICE_KEYS = {
     "index",
     "name",
@@ -80,8 +118,16 @@ DEVICE_KEYS = {
     "multi_processor_count",
 }
 NVIDIA_QUERY_KEYS = {"fields", "returncode", "rows", "stderr"}
-NVIDIA_SAMPLE_KEYS = {"monotonic_ns", "query"}
+NVIDIA_SAMPLE_KEYS = {"monotonic_ns", "phase", "query"}
 NVIDIA_TOPOLOGY_KEYS = {"returncode", "stdout", "stderr"}
+GRAPH_STRUCTURE_KEYS = {
+    "kernel_nodes",
+    "direct_control_worker_edge",
+    "control_grid",
+    "control_block",
+    "worker_grid",
+    "worker_block",
+}
 NVIDIA_IDENTITY_FIELDS = ("index", "uuid", "name", "driver_version")
 NVIDIA_SMI_FIELDS = (
     "index",
@@ -95,6 +141,10 @@ NVIDIA_SMI_FIELDS = (
     "clocks.current.memory",
     "clocks.max.sm",
     "clocks.max.memory",
+    "utilization.gpu",
+    "utilization.memory",
+    "temperature.gpu",
+    "clocks_event_reasons.active",
 )
 EXPLICIT_ENV_KEYS = {
     "CUDA_DEVICE_ORDER",
@@ -123,12 +173,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--sampler-interval", type=float, default=0.2)
+    parser.add_argument("--preflight-replays", type=int, default=4)
+    parser.add_argument("--distributed-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--controller-sha256", required=True)
+    parser.add_argument("--controller-argv-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-dirty", action="store_true")
     return parser.parse_args()
 
 
-def _run_command(args: list[str], *, cwd: Path | None = None) -> str:
+def _run_command(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float = 30.0,
+) -> str:
     result = subprocess.run(
         args,
         cwd=cwd,
@@ -136,6 +195,7 @@ def _run_command(args: list[str], *, cwd: Path | None = None) -> str:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=timeout,
     )
     return result.stdout.strip()
 
@@ -154,6 +214,102 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _json_sha256(value: object) -> str:
+    rendered = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _extension_build_manifest(build_root: Path) -> list[dict[str, object]]:
+    """Hash every durable input/output in one fresh JIT extension directory."""
+
+    entries = []
+    for path in sorted(build_root.rglob("*")):
+        if not path.is_file() or path.name in {".ninja_deps", ".ninja_log", "lock"}:
+            continue
+        entries.append(
+            {
+                "path": str(path.relative_to(build_root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    if not entries:
+        raise RuntimeError(f"extension build manifest is empty: {build_root}")
+    return entries
+
+
+def _verified_implementation(
+    implementation_root: Path,
+) -> tuple[object, type, dict[str, object]]:
+    """Import, build, and bind the implementation to exact source/binary hashes."""
+
+    module = importlib.import_module("sparkinfer.comm.pcie.pcie_oneshot")
+    module_path = Path(module.__file__).resolve()
+    expected_module = (
+        implementation_root / "sparkinfer/comm/pcie/pcie_oneshot.py"
+    ).resolve()
+    if module_path != expected_module:
+        raise RuntimeError(
+            f"imported PCIe oneshot module {module_path} != {expected_module}"
+        )
+    cuda_source = module_path.with_suffix(".cu")
+    if not cuda_source.is_file():
+        raise RuntimeError(f"PCIe oneshot CUDA source is missing: {cuda_source}")
+
+    extension = module._load_extension()
+    extension_path = Path(extension.__file__).resolve()
+    build_root = extension_path.parent
+    expected_cache = Path(os.environ["TORCH_EXTENSIONS_DIR"]).resolve()
+    if not extension_path.is_relative_to(expected_cache):
+        raise RuntimeError(
+            f"loaded extension {extension_path} is outside fresh cache {expected_cache}"
+        )
+    manifest = _extension_build_manifest(build_root)
+    provenance = {
+        "module_path": str(module_path),
+        "module_sha256": _sha256(module_path),
+        "cuda_source_path": str(cuda_source),
+        "cuda_source_sha256": _sha256(cuda_source),
+        "extension_path": str(extension_path),
+        "extension_sha256": _sha256(extension_path),
+        "extension_build_root": str(build_root),
+        "extension_build_manifest": manifest,
+        "extension_build_manifest_sha256": _json_sha256(manifest),
+        "fresh_extension_cache": True,
+        "post_run_verified": False,
+    }
+    return module, module.PCIeOneshotAllReducePool, provenance
+
+
+def _verify_post_run_provenance(
+    provenance: dict[str, object],
+    *,
+    implementation_root: Path,
+    expected_git_sha: str,
+) -> None:
+    git_sha, git_dirty = _git_identity(implementation_root)
+    if git_sha != expected_git_sha or git_dirty:
+        raise RuntimeError("implementation Git identity changed during benchmark")
+    checks = (
+        ("module_path", "module_sha256"),
+        ("cuda_source_path", "cuda_source_sha256"),
+        ("extension_path", "extension_sha256"),
+    )
+    for path_key, digest_key in checks:
+        if _sha256(Path(provenance[path_key])) != provenance[digest_key]:
+            raise RuntimeError(f"{path_key} changed during benchmark")
+    manifest = _extension_build_manifest(Path(provenance["extension_build_root"]))
+    if manifest != provenance["extension_build_manifest"]:
+        raise RuntimeError("extension build manifest changed during benchmark")
+    if _json_sha256(manifest) != provenance["extension_build_manifest_sha256"]:
+        raise RuntimeError("extension build manifest digest changed during benchmark")
+    provenance["post_run_verified"] = True
+
+
 def _cuda_version(call: Callable[[], tuple[object, int]]) -> int:
     result, version = call()
     if result != cudart.cudaError_t.cudaSuccess:
@@ -167,13 +323,22 @@ def _nvidia_smi_query(fields: tuple[str, ...]) -> dict[str, object]:
         f"--query-gpu={','.join(fields)}",
         "--format=csv,noheader,nounits",
     ]
-    result = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "fields": list(fields),
+            "returncode": -1,
+            "rows": [],
+            "stderr": f"nvidia-smi timed out after {exc.timeout}s",
+        }
     return {
         "fields": list(fields),
         "returncode": result.returncode,
@@ -187,13 +352,21 @@ def _nvidia_smi_query(fields: tuple[str, ...]) -> dict[str, object]:
 
 
 def _nvidia_smi_topology() -> dict[str, object]:
-    result = subprocess.run(
-        ["nvidia-smi", "topo", "-m"],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "topo", "-m"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"nvidia-smi topology timed out after {exc.timeout}s",
+        }
     return {
         "returncode": result.returncode,
         "stdout": result.stdout.rstrip(),
@@ -206,30 +379,39 @@ class _NvidiaSmiSampler:
         self.interval = interval
         self.samples: list[dict[str, object]] = []
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._phase = "unmarked"
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _sample(self) -> None:
+        sample = {
+            "monotonic_ns": time.monotonic_ns(),
+            "phase": self._phase,
+            "query": _nvidia_smi_query(NVIDIA_SMI_FIELDS),
+        }
+        with self._lock:
+            self.samples.append(sample)
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.samples.append(
-                {
-                    "monotonic_ns": time.monotonic_ns(),
-                    "query": _nvidia_smi_query(NVIDIA_SMI_FIELDS),
-                }
-            )
+            self._sample()
             self._stop.wait(self.interval)
 
     def start(self) -> None:
         self._thread.start()
 
+    def mark_phase(self, phase: str) -> None:
+        self._phase = phase
+        # A short timing phase must still contribute telemetry.
+        self._sample()
+
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join()
-        self.samples.append(
-            {
-                "monotonic_ns": time.monotonic_ns(),
-                "query": _nvidia_smi_query(NVIDIA_SMI_FIELDS),
-            }
-        )
+        self._thread.join(timeout=15)
+        if self._thread.is_alive():
+            raise RuntimeError("nvidia-smi sampler thread did not stop within 15s")
+        self._phase = "final"
+        self._sample()
 
 
 def _environment_toggles() -> dict[str, str]:
@@ -243,7 +425,17 @@ def _environment_toggles() -> dict[str, str]:
     }
 
 
-def _graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
+def _dim3_list(value: object) -> list[int]:
+    return [int(value.x), int(value.y), int(value.z)]
+
+
+def _graph_kernel_structure(
+    graph: torch.cuda.CUDAGraph,
+    *,
+    expected_kernel_nodes: int,
+) -> dict[str, object]:
+    """Prove the candidate's 1x1 control node directly orders its worker."""
+
     graph_handle = graph.raw_cuda_graph()
     result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
     if result != cudart.cudaError_t.cudaSuccess:
@@ -257,13 +449,82 @@ def _graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
             f"cudaGraphGetNodes(data) failed: {result}, {returned_nodes=}, {num_nodes=}"
         )
     kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
-    count = 0
+    kernel_nodes = []
     for node in nodes[:num_nodes]:
         result, node_type = cudart.cudaGraphNodeGetType(node)
         if result != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(f"cudaGraphNodeGetType failed: {result}")
-        count += node_type == kernel_type
-    return count
+        if node_type == kernel_type:
+            kernel_nodes.append(node)
+    if len(kernel_nodes) != expected_kernel_nodes:
+        raise AssertionError(
+            f"graph has {len(kernel_nodes)} kernel nodes, expected "
+            f"{expected_kernel_nodes}"
+        )
+
+    result, _, _, num_edges = cudart.cudaGraphGetEdges(graph_handle)
+    if result != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaGraphGetEdges(size) failed: {result}")
+    result, from_nodes, to_nodes, returned_edges = cudart.cudaGraphGetEdges(
+        graph_handle,
+        num_edges,
+    )
+    if result != cudart.cudaError_t.cudaSuccess or returned_edges != num_edges:
+        raise RuntimeError(
+            f"cudaGraphGetEdges(data) failed: {result}, {returned_edges=}, {num_edges=}"
+        )
+    kernel_edges = []
+    for source, destination in zip(
+        from_nodes[:num_edges],
+        to_nodes[:num_edges],
+        strict=True,
+    ):
+        result, source_type = cudart.cudaGraphNodeGetType(source)
+        if result != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"source cudaGraphNodeGetType failed: {result}")
+        result, destination_type = cudart.cudaGraphNodeGetType(destination)
+        if result != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"destination cudaGraphNodeGetType failed: {result}")
+        if source_type == kernel_type and destination_type == kernel_type:
+            kernel_edges.append((source, destination))
+
+    def geometry(node: object) -> tuple[list[int], list[int]]:
+        result, params = cudart.cudaGraphKernelNodeGetParams(node)
+        if result != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaGraphKernelNodeGetParams failed: {result}")
+        return _dim3_list(params.gridDim), _dim3_list(params.blockDim)
+
+    if expected_kernel_nodes == 2:
+        if len(kernel_edges) != 1:
+            raise AssertionError(
+                "staged candidate graph must contain one direct control-to-worker "
+                f"kernel edge, found {len(kernel_edges)}"
+            )
+        control, worker = map(geometry, kernel_edges[0])
+        if control != ([1, 1, 1], [1, 1, 1]):
+            raise AssertionError(f"control kernel is not <<<1,1>>>: {control}")
+        if worker[0][0] <= 1 or worker[1][0] < 64:
+            raise AssertionError(f"worker launch geometry is implausible: {worker}")
+        direct_edge = True
+    elif expected_kernel_nodes == 1:
+        if kernel_edges:
+            raise AssertionError("one-kernel baseline graph has a kernel edge")
+        control = (None, None)
+        worker = geometry(kernel_nodes[0])
+        direct_edge = False
+    else:
+        raise AssertionError(
+            "plain staged A/B contract supports only one-node baseline and "
+            "two-node candidate graphs"
+        )
+    return {
+        "kernel_nodes": len(kernel_nodes),
+        "direct_control_worker_edge": direct_edge,
+        "control_grid": control[0],
+        "control_block": control[1],
+        "worker_grid": worker[0],
+        "worker_block": worker[1],
+    }
 
 
 def _measure(
@@ -299,7 +560,38 @@ def _measure(
     return cold_us, samples
 
 
+def _mutating_replay_preflight(
+    operation: Callable[[], None],
+    *,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    stream: torch.cuda.Stream,
+    rank: int,
+    world_size: int,
+    replays: int,
+) -> None:
+    """Expose stale-slot reuse by validating changing data on both slot parities."""
+
+    if replays < 4:
+        raise ValueError("mutating preflight requires at least four replays")
+    rank_sum = world_size * (world_size + 1) // 2
+    for iteration in range(replays):
+        multiplier = iteration + 1
+        with torch.cuda.stream(stream):
+            inp.fill_(multiplier * (rank + 1))
+            operation()
+        stream.synchronize()
+        torch.testing.assert_close(
+            out,
+            torch.full_like(out, multiplier * rank_sum),
+            rtol=0,
+            atol=0,
+        )
+
+
 def _summary(samples: list[float]) -> dict[str, float]:
+    if not samples:
+        raise ValueError("cannot summarize an empty latency vector")
     ordered = sorted(samples)
 
     def percentile(fraction: float) -> float:
@@ -320,19 +612,30 @@ def _gather_rank_metrics(
     eager_samples: list[float],
     graph_cold_us: float,
     graph_samples: list[float],
-    graph_kernel_nodes: int,
+    graph_structure: dict[str, object],
     device: torch.device,
 ) -> list[dict[str, object]]:
-    eager = _summary(eager_samples)
-    graph = _summary(graph_samples)
-    names = ("mean_us", "p50_us", "p95_us", "min_us", "max_us")
+    if len(eager_samples) != len(graph_samples) or not eager_samples:
+        raise ValueError("eager/graph latency vectors must be non-empty and aligned")
+    control_grid = graph_structure["control_grid"] or [0, 0, 0]
+    control_block = graph_structure["control_block"] or [0, 0, 0]
+    structure_values = [
+        float(graph_structure["kernel_nodes"]),
+        float(bool(graph_structure["direct_control_worker_edge"])),
+        *map(float, control_grid),
+        *map(float, control_block),
+        *map(float, graph_structure["worker_grid"]),
+        *map(float, graph_structure["worker_block"]),
+    ]
+    if len(structure_values) != 14:
+        raise AssertionError("graph structure encoding must contain 14 values")
     local = torch.tensor(
         [
             eager_cold_us,
-            *(eager[name] for name in names),
+            *eager_samples,
             graph_cold_us,
-            *(graph[name] for name in names),
-            float(graph_kernel_nodes),
+            *graph_samples,
+            *structure_values,
         ],
         device=device,
         dtype=torch.float64,
@@ -343,33 +646,66 @@ def _gather_rank_metrics(
     result = []
     for rank, values_tensor in enumerate(gathered):
         values = values_tensor.cpu().tolist()
+        iters = len(eager_samples)
+        rank_eager_samples = values[1 : 1 + iters]
+        graph_cold_index = 1 + iters
+        rank_graph_samples = values[graph_cold_index + 1 : graph_cold_index + 1 + iters]
+        structure = values[graph_cold_index + 1 + iters :]
+        eager_summary = _summary(rank_eager_samples)
+        graph_summary = _summary(rank_graph_samples)
+        has_control = bool(int(structure[1]))
         result.append(
             {
                 "rank": rank,
                 "eager": {
                     "cold_us": values[0],
-                    **dict(zip(names, values[1:6], strict=True)),
+                    **eager_summary,
+                    "samples_us": rank_eager_samples,
                 },
                 "graph": {
-                    "cold_us": values[6],
-                    **dict(zip(names, values[7:12], strict=True)),
-                    "kernel_nodes": int(values[12]),
+                    "cold_us": values[graph_cold_index],
+                    **graph_summary,
+                    "samples_us": rank_graph_samples,
+                },
+                "graph_structure": {
+                    "kernel_nodes": int(structure[0]),
+                    "direct_control_worker_edge": has_control,
+                    "control_grid": [int(v) for v in structure[2:5]]
+                    if has_control
+                    else None,
+                    "control_block": [int(v) for v in structure[5:8]]
+                    if has_control
+                    else None,
+                    "worker_grid": [int(v) for v in structure[8:11]],
+                    "worker_block": [int(v) for v in structure[11:14]],
                 },
             }
         )
     return result
 
 
-def _slowest_rank_summary(per_rank: list[dict[str, object]]) -> dict[str, object]:
+def _distributed_critical_path(
+    per_rank: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    """Summarize max-rank latency at each aligned timed iteration."""
+
+    if not per_rank:
+        raise ValueError("distributed critical path requires at least one rank")
     result: dict[str, object] = {}
     for mode in ("eager", "graph"):
-        mode_rows = [row[mode] for row in per_rank]
+        rank_vectors = [list(row[mode]["samples_us"]) for row in per_rank]
+        lengths = {len(samples) for samples in rank_vectors}
+        if len(lengths) != 1 or not lengths or next(iter(lengths)) == 0:
+            raise ValueError(f"{mode} rank latency vectors are empty or misaligned")
+        critical_samples = [
+            max(rank_samples[index] for rank_samples in rank_vectors)
+            for index in range(next(iter(lengths)))
+        ]
         result[mode] = {
-            key: max(float(row[key]) for row in mode_rows) for key in METRIC_KEYS
+            "cold_us": max(float(row[mode]["cold_us"]) for row in per_rank),
+            **_summary(critical_samples),
+            "samples_us": critical_samples,
         }
-    result["graph"]["kernel_nodes"] = max(
-        int(row["graph"]["kernel_nodes"]) for row in per_rank
-    )
     return result
 
 
@@ -390,7 +726,12 @@ def _device_metadata() -> list[dict[str, object]]:
     return devices
 
 
-def _validate_record(record: dict[str, object], contract: dict[str, object]) -> None:
+def _validate_record(
+    record: dict[str, object],
+    contract: dict[str, object],
+    *,
+    expected_graph_kernel_nodes: int,
+) -> None:
     if set(record) != TOP_LEVEL_KEYS:
         raise ValueError(
             f"benchmark schema keys differ: {set(record) ^ TOP_LEVEL_KEYS}"
@@ -401,14 +742,39 @@ def _validate_record(record: dict[str, object], contract: dict[str, object]) -> 
         raise ValueError(
             f"benchmark contract mismatch: {record['contract']} != {contract}"
         )
+    scope = record["scope"]
+    if set(scope) != SCOPE_KEYS:
+        raise ValueError("benchmark scope schema mismatch")
+    if (
+        scope["operation"] != "plain_oneshot_all_reduce"
+        or scope["staging"] != "double_buffered_eager_ipc"
+        or int(scope["size_bytes"]) != int(contract["numel"]) * torch.bfloat16.itemsize
+        or "net algorithm" not in str(scope["comparison_semantics"]).lower()
+        or scope["excluded_paths"]
+        != ["fused_add_rms_norm", "twoshot_reduce_scatter", "twoshot_all_gather"]
+    ):
+        raise ValueError(
+            f"benchmark scope is not the narrow staged-path contract: {scope}"
+        )
     if set(record["identity"]) != IDENTITY_KEYS:
         raise ValueError("benchmark identity schema mismatch")
+    if set(record["provenance"]) != PROVENANCE_KEYS:
+        raise ValueError("benchmark provenance schema mismatch")
+    provenance = record["provenance"]
+    if not provenance["fresh_extension_cache"] or not provenance["post_run_verified"]:
+        raise ValueError("benchmark extension provenance was not freshly verified")
+    manifest = provenance["extension_build_manifest"]
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError("benchmark extension build manifest is empty")
+    for entry in manifest:
+        if set(entry) != {"path", "size_bytes", "sha256"}:
+            raise ValueError("benchmark extension manifest entry schema mismatch")
+    if _json_sha256(manifest) != provenance["extension_build_manifest_sha256"]:
+        raise ValueError("benchmark extension manifest digest mismatch")
     if set(record["software"]) != SOFTWARE_KEYS:
         raise ValueError("benchmark software schema mismatch")
     if set(record["hardware"]) != HARDWARE_KEYS:
         raise ValueError("benchmark hardware schema mismatch")
-    if set(record["expected"]) != EXPECTED_KEYS:
-        raise ValueError("benchmark expectation schema mismatch")
     if not isinstance(record["environment"], dict):
         raise ValueError("benchmark environment must be an object")
     if not isinstance(record["per_rank"], list) or len(record["per_rank"]) != int(
@@ -440,6 +806,7 @@ def _validate_record(record: dict[str, object], contract: dict[str, object]) -> 
     ):
         raise ValueError("benchmark NVIDIA samples must be a non-empty list")
     successful_samples = 0
+    successful_phases: set[str] = set()
     for sample in hardware["nvidia_smi_samples"]:
         if set(sample) != NVIDIA_SAMPLE_KEYS:
             raise ValueError("benchmark NVIDIA sample schema mismatch")
@@ -449,34 +816,81 @@ def _validate_record(record: dict[str, object], contract: dict[str, object]) -> 
             raise ValueError("benchmark NVIDIA sample query field mismatch")
         if sample["query"]["returncode"] == 0:
             successful_samples += 1
+            if not sample["query"]["rows"]:
+                raise ValueError("successful NVIDIA telemetry sample has zero rows")
+            successful_phases.add(str(sample["phase"]))
             if any(
                 len(row) != len(NVIDIA_SMI_FIELDS) for row in sample["query"]["rows"]
             ):
                 raise ValueError("benchmark NVIDIA sample row schema mismatch")
+            if len(sample["query"]["rows"]) != len(hardware["devices"]):
+                raise ValueError("benchmark NVIDIA sample/device cardinality mismatch")
     if successful_samples == 0:
         raise ValueError("benchmark collected no successful NVIDIA telemetry samples")
+    required_phases = {"mutating_preflight", "eager_timing", "graph_timing"}
+    if not required_phases <= successful_phases:
+        raise ValueError(
+            "benchmark lacks successful phase telemetry: "
+            f"{required_phases - successful_phases}"
+        )
     topology = hardware["nvidia_smi_topology"]
     if set(topology) != NVIDIA_TOPOLOGY_KEYS:
         raise ValueError("benchmark NVIDIA topology schema mismatch")
     if topology["returncode"] != 0 or not topology["stdout"]:
         raise ValueError(f"benchmark NVIDIA topology query failed: {topology}")
-    if set(record["slowest_rank"]) != {"eager", "graph"}:
-        raise ValueError("slowest-rank mode schema mismatch")
-    if set(record["slowest_rank"]["eager"]) != METRIC_KEYS:
-        raise ValueError("slowest eager metric schema mismatch")
-    if set(record["slowest_rank"]["graph"]) != METRIC_KEYS | {"kernel_nodes"}:
-        raise ValueError("slowest graph metric schema mismatch")
     for row in record["per_rank"]:
-        if set(row) != {"rank", "eager", "graph"}:
+        if set(row) != {"rank", "eager", "graph", "graph_structure"}:
             raise ValueError("per-rank schema mismatch")
-        if set(row["eager"]) != METRIC_KEYS:
+        if set(row["eager"]) != RANK_MODE_KEYS:
             raise ValueError("eager metric schema mismatch")
-        if set(row["graph"]) != METRIC_KEYS | {"kernel_nodes"}:
+        if set(row["graph"]) != RANK_MODE_KEYS:
             raise ValueError("graph metric schema mismatch")
+        for mode in ("eager", "graph"):
+            samples = row[mode]["samples_us"]
+            if not isinstance(samples, list) or len(samples) != int(contract["iters"]):
+                raise ValueError(f"per-rank {mode} sample vector length mismatch")
+            if any(
+                not math.isfinite(float(value)) or float(value) <= 0
+                for value in samples
+            ):
+                raise ValueError(f"per-rank {mode} samples must be finite and positive")
+            expected_summary = _summary([float(value) for value in samples])
+            for key, expected in expected_summary.items():
+                if float(row[mode][key]) != expected:
+                    raise ValueError(f"per-rank {mode} {key} summary mismatch")
+        structure = row["graph_structure"]
+        if set(structure) != GRAPH_STRUCTURE_KEYS:
+            raise ValueError("graph structure schema mismatch")
+        if int(structure["kernel_nodes"]) != expected_graph_kernel_nodes:
+            raise ValueError("graph kernel-node count mismatch")
+        if expected_graph_kernel_nodes == 2:
+            if (
+                structure["direct_control_worker_edge"] is not True
+                or structure["control_grid"] != [1, 1, 1]
+                or structure["control_block"] != [1, 1, 1]
+            ):
+                raise ValueError("candidate graph lacks direct <<<1,1>>> control edge")
+        elif (
+            structure["direct_control_worker_edge"] is not False
+            or structure["control_grid"] is not None
+            or structure["control_block"] is not None
+        ):
+            raise ValueError("baseline graph unexpectedly records a control node")
     if {int(row["rank"]) for row in record["per_rank"]} != set(
         range(int(contract["world_size"]))
     ):
         raise ValueError("per-rank identities do not match world size")
+    critical_path = record["distributed_critical_path"]
+    if set(critical_path) != {"eager", "graph"}:
+        raise ValueError("distributed critical-path mode schema mismatch")
+    for mode in ("eager", "graph"):
+        if set(critical_path[mode]) != CRITICAL_MODE_KEYS:
+            raise ValueError(f"distributed {mode} critical-path schema mismatch")
+    expected_critical_path = _distributed_critical_path(record["per_rank"])
+    if critical_path != expected_critical_path:
+        raise ValueError(
+            "distributed critical path was not derived from aligned rank maxima"
+        )
 
 
 def main() -> None:
@@ -484,12 +898,16 @@ def main() -> None:
     if (
         args.iters <= 0
         or args.warmup < 0
-        or args.numel <= 0
+        or args.numel != 32768
         or args.run_index < 0
-        or args.expected_graph_kernel_nodes <= 0
+        or args.expected_graph_kernel_nodes not in (1, 2)
+        or args.preflight_replays < 4
+        or args.distributed_timeout_seconds <= 0
     ):
         raise ValueError(
-            "numel/iters/run-index/node-count must be valid and warmup non-negative"
+            "this narrow harness requires 32,768 BF16 elements (64 KiB), "
+            "at least four preflight replays, one/two graph nodes, positive "
+            "iterations/timeout, and non-negative warmup/run-index"
         )
     if args.sampler_interval <= 0:
         raise ValueError("sampler interval must be positive")
@@ -501,28 +919,31 @@ def main() -> None:
     if git_dirty and not args.allow_dirty:
         raise ValueError(f"implementation worktree is dirty: {implementation_root}")
 
-    dist.init_process_group("nccl")
+    dist.init_process_group(
+        "nccl",
+        timeout=timedelta(seconds=args.distributed_timeout_seconds),
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+    _, pool_type, provenance = _verified_implementation(implementation_root)
     contract = {
         "world_size": world_size,
         "numel": args.numel,
         "dtype": DTYPE_NAME,
         "warmup": args.warmup,
         "iters": args.iters,
+        "preflight_replays": args.preflight_replays,
     }
     started_at = datetime.now(timezone.utc).isoformat()
     sampler = _NvidiaSmiSampler(args.sampler_interval) if rank == 0 else None
-    if sampler is not None:
-        sampler.start()
 
     pool = None
     try:
         nbytes = args.numel * torch.bfloat16.itemsize
-        pool = PCIeOneshotAllReducePool.from_process_group(
+        pool = pool_type.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
             max_input_bytes=nbytes,
@@ -542,7 +963,56 @@ def main() -> None:
             with torch.cuda.stream(stream):
                 channel.all_reduce(eager_inp, out=eager_out)
 
+        graph_inp = torch.full_like(eager_inp, rank + 1)
+        graph_out = torch.empty_like(graph_inp)
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with (
+            pool.capture(stream) as graph_channel,
+            torch.cuda.graph(
+                graph,
+                stream=stream,
+            ),
+        ):
+            graph_channel.all_reduce(graph_inp, out=graph_out)
+        graph_structure = _graph_kernel_structure(
+            graph,
+            expected_kernel_nodes=args.expected_graph_kernel_nodes,
+        )
+
+        def graph_operation() -> None:
+            with torch.cuda.stream(stream):
+                graph.replay()
+
+        # JIT compilation and graph construction are complete. Telemetry starts
+        # here and every correctness/timing phase receives an explicit marker.
+        if sampler is not None:
+            sampler.start()
+            sampler.mark_phase("mutating_preflight")
+        _mutating_replay_preflight(
+            eager_operation,
+            inp=eager_inp,
+            out=eager_out,
+            stream=stream,
+            rank=rank,
+            world_size=world_size,
+            replays=args.preflight_replays,
+        )
+        _mutating_replay_preflight(
+            graph_operation,
+            inp=graph_inp,
+            out=graph_out,
+            stream=stream,
+            rank=rank,
+            world_size=world_size,
+            replays=args.preflight_replays,
+        )
+
+        with torch.cuda.stream(stream):
+            eager_inp.fill_(rank + 1)
+        stream.synchronize()
         dist.barrier()
+        if sampler is not None:
+            sampler.mark_phase("eager_timing")
         eager_cold_us, eager_samples = _measure(
             eager_operation,
             stream=stream,
@@ -557,36 +1027,18 @@ def main() -> None:
             atol=0,
         )
 
-        graph_inp = torch.full_like(eager_inp, rank + 2)
-        graph_out = torch.empty_like(graph_inp)
-        graph = torch.cuda.CUDAGraph(keep_graph=True)
-        with (
-            pool.capture(stream) as graph_channel,
-            torch.cuda.graph(
-                graph,
-                stream=stream,
-            ),
-        ):
-            graph_channel.all_reduce(graph_inp, out=graph_out)
-        graph_kernel_nodes = _graph_kernel_count(graph)
-        if graph_kernel_nodes != args.expected_graph_kernel_nodes:
-            raise AssertionError(
-                f"graph has {graph_kernel_nodes} kernel nodes, expected "
-                f"{args.expected_graph_kernel_nodes}"
-            )
-
-        def graph_operation() -> None:
-            with torch.cuda.stream(stream):
-                graph.replay()
-
+        with torch.cuda.stream(stream):
+            graph_inp.fill_(rank + 1)
+        stream.synchronize()
         dist.barrier()
+        if sampler is not None:
+            sampler.mark_phase("graph_timing")
         graph_cold_us, graph_samples = _measure(
             graph_operation,
             stream=stream,
             warmup=args.warmup,
             iters=args.iters,
         )
-        expected += world_size
         torch.testing.assert_close(
             graph_out,
             torch.full_like(graph_out, expected),
@@ -599,10 +1051,12 @@ def main() -> None:
             eager_samples,
             graph_cold_us,
             graph_samples,
-            graph_kernel_nodes,
+            graph_structure,
             device,
         )
-        observed_nodes = {int(row["graph"]["kernel_nodes"]) for row in per_rank}
+        observed_nodes = {
+            int(row["graph_structure"]["kernel_nodes"]) for row in per_rank
+        }
         if observed_nodes != {args.expected_graph_kernel_nodes}:
             raise AssertionError(
                 f"rank graph-node counts {observed_nodes} do not match "
@@ -610,14 +1064,35 @@ def main() -> None:
             )
         torch.cuda.synchronize(device)
         dist.barrier()
+        _verify_post_run_provenance(
+            provenance,
+            implementation_root=implementation_root,
+            expected_git_sha=args.expected_git_sha,
+        )
 
         if sampler is not None:
+            sampler.mark_phase("provenance_and_finalize")
             sampler.stop()
         if rank == 0:
             harness_path = Path(__file__).resolve()
+            worker_argv = list(sys.argv)
             record = {
                 "schema": {"name": SCHEMA_NAME, "version": SCHEMA_VERSION},
                 "contract": contract,
+                "scope": {
+                    "operation": "plain_oneshot_all_reduce",
+                    "staging": "double_buffered_eager_ipc",
+                    "size_bytes": nbytes,
+                    "comparison_semantics": (
+                        "net algorithm comparison between public baseline and "
+                        "candidate; not isolated launch overhead"
+                    ),
+                    "excluded_paths": [
+                        "fused_add_rms_norm",
+                        "twoshot_reduce_scatter",
+                        "twoshot_all_gather",
+                    ],
+                },
                 "identity": {
                     "label": args.label,
                     "variant": args.variant,
@@ -626,8 +1101,13 @@ def main() -> None:
                     "implementation_git_sha": git_sha,
                     "implementation_git_dirty": git_dirty,
                     "harness_sha256": _sha256(harness_path),
+                    "controller_sha256": args.controller_sha256,
+                    "controller_argv_sha256": args.controller_argv_sha256,
+                    "worker_argv": worker_argv,
+                    "worker_argv_sha256": _json_sha256(worker_argv),
                     "started_at_utc": started_at,
                 },
+                "provenance": provenance,
                 "software": {
                     "python": platform.python_version(),
                     "platform": platform.platform(),
@@ -635,6 +1115,7 @@ def main() -> None:
                     "torch_cuda": torch.version.cuda,
                     "cuda_runtime_version": _cuda_version(cudart.cudaRuntimeGetVersion),
                     "cuda_driver_version": _cuda_version(cudart.cudaDriverGetVersion),
+                    "nvcc_version": _run_command(["nvcc", "--version"]),
                 },
                 "hardware": {
                     "hostname": socket.gethostname(),
@@ -645,14 +1126,14 @@ def main() -> None:
                     "nvidia_smi_topology": _nvidia_smi_topology(),
                 },
                 "environment": _environment_toggles(),
-                "expected": {
-                    "staged_graph_kernel_nodes": args.expected_graph_kernel_nodes,
-                    "registered_graph_kernel_nodes": 1,
-                },
                 "per_rank": per_rank,
-                "slowest_rank": _slowest_rank_summary(per_rank),
+                "distributed_critical_path": _distributed_critical_path(per_rank),
             }
-            _validate_record(record, contract)
+            _validate_record(
+                record,
+                contract,
+                expected_graph_kernel_nodes=args.expected_graph_kernel_nodes,
+            )
             rendered = json.dumps(record, indent=2, sort_keys=True)
             print(rendered, flush=True)
             args.output.parent.mkdir(parents=True, exist_ok=True)
