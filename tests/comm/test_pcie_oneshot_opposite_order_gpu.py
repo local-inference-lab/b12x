@@ -75,12 +75,14 @@ def _run_eager_opposite_order(
     stream_a = torch.cuda.Stream(device=device)
     stream_b = torch.cuda.Stream(device=device)
 
-    # Channel construction exchanges IPC handles. All ranks construct A then B
-    # so channel identities pair correctly before their GPU enqueue orders
-    # intentionally diverge.
-    channel_a = pool.for_stream(stream_a)
-    dist.barrier()
-    channel_b = pool.for_stream(stream_b)
+    # Each rank supplies the same logical set in opposite local order. The pool
+    # must canonicalize allocation by id rather than pairing local stream keys.
+    logical_ids = ("eager:a", "eager:b")
+    if rank % 2:
+        logical_ids = tuple(reversed(logical_ids))
+    pool.prepare_channels(logical_ids)
+    channel_a = pool.for_stream(stream_a, channel_id="eager:a")
+    channel_b = pool.for_stream(stream_b, channel_id="eager:b")
     dist.barrier()
     assert channel_a is not channel_b
     assert channel_a._signal_ptrs != channel_b._signal_ptrs
@@ -115,9 +117,13 @@ def _capture_channel(
     stream: torch.cuda.Stream,
     inp: torch.Tensor,
     out: torch.Tensor,
+    channel_id: str,
 ) -> tuple[object, torch.cuda.CUDAGraph]:
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(stream) as channel, torch.cuda.graph(graph, stream=stream):
+    with (
+        pool.capture(stream, channel_id=channel_id) as channel,
+        torch.cuda.graph(graph, stream=stream),
+    ):
         channel.all_reduce(inp, out=out)
     return channel, graph
 
@@ -136,24 +142,23 @@ def _run_graph_opposite_order(
     }
     outputs = {name: torch.empty_like(inp) for name, inp in inputs.items()}
 
-    # Capture channel creation also exchanges IPC handles, so all ranks capture
-    # A then B. Replays may subsequently be enqueued in opposite channel order.
-    channel_a, graph_a = _capture_channel(
-        pool,
-        stream_a,
-        inputs["a"],
-        outputs["a"],
-    )
-    stream_a.synchronize()
+    logical_ids = ("graph:a", "graph:b")
+    if rank % 2:
+        logical_ids = tuple(reversed(logical_ids))
+    pool.prepare_channels(logical_ids)
+    captured = {}
+    for name in _rank_order(rank):
+        captured[name] = _capture_channel(
+            pool,
+            {"a": stream_a, "b": stream_b}[name],
+            inputs[name],
+            outputs[name],
+            f"graph:{name}",
+        )
+        {"a": stream_a, "b": stream_b}[name].synchronize()
     dist.barrier()
-    channel_b, graph_b = _capture_channel(
-        pool,
-        stream_b,
-        inputs["b"],
-        outputs["b"],
-    )
-    stream_b.synchronize()
-    dist.barrier()
+    channel_a, graph_a = captured["a"]
+    channel_b, graph_b = captured["b"]
     assert channel_a is not channel_b
     assert channel_a._signal_ptrs != channel_b._signal_ptrs
 

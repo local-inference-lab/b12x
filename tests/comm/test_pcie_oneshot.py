@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     _compute_crossover_size,
     _group_ranks,
     _require_full_grid_residency,
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     parse_pcie_oneshot_max_size,
 )
 
@@ -160,7 +162,14 @@ def test_full_grid_residency_rejects_mig_like_capacity_collectively(
     monkeypatch.setenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "32")
     exchanged = []
 
-    def exchange(local_error, *, exchange_group, phase):
+    def exchange(
+        local_error,
+        *,
+        exchange_group,
+        phase,
+        exports_retained_on_exchange_failure,
+    ):
+        assert not exports_retained_on_exchange_failure
         exchanged.append((local_error, exchange_group, phase))
         return ((f"RuntimeError: {local_error}",), ())
 
@@ -789,6 +798,149 @@ def test_pool_creates_distinct_channels_per_stream_key(monkeypatch):
     assert [entry[0] for entry in created] == [7, 8]
 
 
+def test_collective_logical_channel_preparation_is_canonical(monkeypatch):
+    created = []
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: created.append(stream_key) or object(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_state, group: [local_state, local_state],
+    )
+
+    pool.prepare_channels(("draft", "target"))
+    pool.prepare_channels(("target", "draft"))
+
+    assert list(pool._logical_channels) == ["draft", "target"]
+    assert created == [None, None]
+
+
+def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypatch):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+
+    def gather(local_state, group):
+        requested, existing = local_state
+        return [local_state, (("other",), existing)]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+    )
+
+    with pytest.raises(RuntimeError, match="differs across ranks"):
+        pool.prepare_channels(("target",))
+
+
+def test_collective_no_id_captures_use_distinct_monotonic_channels(monkeypatch):
+    created = []
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+
+    def new_channel(stream_key):
+        runtime = _make_runtime(eager=True)
+        runtime._bind_stream_key(stream_key)
+        created.append(runtime)
+        pool._all_channels.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(pool, "_new_channel", new_channel)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_state, group: [local_state, local_state],
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: int(stream or 7),
+    )
+
+    pool.prepare_channels(("default",))
+    with pool.capture(7) as target_channel:
+        pass
+    with pool.capture(7) as draft_channel:
+        pass
+
+    assert target_channel is not draft_channel
+    assert pool._implicit_capture_ordinal == 2
+    assert tuple(pool._logical_channels) == (
+        "default",
+        "__sparkinfer_capture__:0",
+        "__sparkinfer_capture__:1",
+    )
+    assert pool._channels == {}
+
+
+def test_collective_no_id_capture_ordinal_is_checkpointed(monkeypatch):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    checkpoint = pool.checkpoint_channels()
+    pool._implicit_capture_ordinal = 9
+
+    pool.rollback_channels(checkpoint)
+
+    assert pool._implicit_capture_ordinal == 0
+
+
+def test_collective_no_id_capture_rejects_rank_ordinal_skew(monkeypatch):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    pool._logical_channels["default"] = _make_runtime(eager=True)
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+
+    def gather(local_state, group):
+        requested, existing = local_state
+        return [local_state, (("__sparkinfer_capture__:1",), existing)]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+    )
+
+    with pytest.raises(RuntimeError, match="differs across ranks"), pool.capture(7):
+        pass
+
+    assert pool._implicit_capture_ordinal == 0
+
+
 def test_pool_reuses_single_channel_across_stream_keys(monkeypatch):
     created = []
 
@@ -882,9 +1034,58 @@ def test_nested_capture_reuses_its_outer_channel(monkeypatch):
         capturing[0] = False
 
     assert target_channel is not draft_channel
-    assert pool._channels[70] is target_channel
-    assert pool._channels[80] is draft_channel
+    assert pool._channels == {}
+    assert target_channel in pool._all_channels
+    assert draft_channel in pool._all_channels
     assert [entry[0] for entry in created] == [7, 8]
+
+
+def test_pool_restores_nested_capture_mappings_in_lifo_order(monkeypatch):
+    current_stream = [7]
+    capturing = [False]
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    eager_channel = pool.for_stream()
+    with pool.capture(7) as outer_channel:
+        assert pool._channels == {7: outer_channel}
+
+        current_stream[0] = 8
+        with pool.capture() as inner_channel:
+            capturing[0] = True
+            current_stream[0] = 80
+            assert pool.for_stream() is inner_channel
+            assert pool._channels == {
+                7: outer_channel,
+                8: inner_channel,
+                80: inner_channel,
+            }
+            capturing[0] = False
+
+        assert pool._channels == {7: outer_channel}
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is outer_channel
+        capturing[0] = False
+
+    assert eager_channel is not outer_channel
+    assert outer_channel is not inner_channel
+    assert pool._channels == {7: eager_channel}
+    assert pool._capture_channel_stack == []
 
 
 def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
@@ -929,8 +1130,7 @@ def test_reused_capture_stream_keys_get_distinct_channels(monkeypatch):
         capturing[0] = False
 
     assert target_channel is not draft_channel
-    assert pool._channels[7] is draft_channel
-    assert pool._channels[70] is draft_channel
+    assert pool._channels == {}
     assert target_channel in pool._all_channels
     assert draft_channel in pool._all_channels
     assert [entry[0] for entry in created] == [7, 7]
@@ -1049,6 +1249,7 @@ def test_channel_destructor_retains_all_cuda_ownership_without_side_effects():
         SharedBuffer(4000, (5000,)),
     ]
     channel._registered_input_ptrs = {1: (2,)}
+    channel._coordinated_close_complete = False
 
     channel.__del__()
 
@@ -1059,6 +1260,36 @@ def test_channel_destructor_retains_all_cuda_ownership_without_side_effects():
     assert not channel._ipc_exports_freed
     assert [shared.local_ptr for shared in channel._owned_buffers] == [1000, 4000]
     assert channel._registered_input_ptrs == {1: (2,)}
+    assert _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(id(channel)) is channel
+
+
+def test_channel_gc_quarantines_rank_data_tensor_and_native_pointer():
+    events = []
+
+    class RankData:
+        def __del__(self):
+            events.append("rank_data_freed")
+
+    channel = object.__new__(PCIeOneshotAllReduce)
+    channel._ptr = 123
+    channel._owned_buffers = []
+    channel._coordinated_close_complete = False
+    channel.rank_data = RankData()
+    channel_id = id(channel)
+
+    del channel
+    gc.collect()
+
+    retained = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(channel_id)
+    assert retained._ptr == 123
+    assert events == []
+
+    # The production quarantine is process-lifetime. Tests may release this
+    # fake only after proving the owned allocation survived object GC.
+    retained._coordinated_close_complete = True
+    del retained
+    gc.collect()
+    assert events == ["rank_data_freed"]
 
 
 def test_pool_rejects_channel_rollback_during_capture():

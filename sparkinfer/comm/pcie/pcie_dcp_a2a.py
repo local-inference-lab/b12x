@@ -21,12 +21,18 @@ from .pcie_oneshot import (
     _finish_collective_runtime_setup,
     _raise_local_cleanup_errors,
     _align_up,
+    _broadcast_gather_object,
     _coordinated_close_channels,
     _current_stream_key,
     _is_current_stream_capturing,
+    _implicit_capture_channel_id,
     _normalize_device,
+    _normalize_logical_channel_id,
     _OwnedSharedBuffer,
+    _finish_collective_unowned_runtime_setup,
+    _require_collective_contract,
     _require_full_grid_residency,
+    _run_collective_preallocation_setup,
 )
 
 
@@ -192,22 +198,8 @@ class PCIeDCPA2A:
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]] = None,
         ext_module=None,
         stream_affine: bool = True,
+        _factory_managed_setup: bool = False,
     ) -> None:
-        if world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(f"unsupported world size {world_size}")
-        if not 0 <= rank < world_size:
-            raise ValueError(f"invalid rank {rank} for world size {world_size}")
-        if (
-            len(signal_ptrs) != world_size
-            or len(staging0_ptrs) != world_size
-            or len(staging1_ptrs) != world_size
-        ):
-            raise ValueError("signal and staging pointers must match world size")
-        if total_heads <= 0 or total_heads % world_size != 0:
-            raise ValueError("total_heads must be divisible by world_size")
-        if head_dim <= 0 or head_dim % 8 != 0:
-            raise ValueError("head_dim must be a positive multiple of 8")
-
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.device = _normalize_device(device)
@@ -216,12 +208,9 @@ class PCIeDCPA2A:
         self.total_heads = int(total_heads)
         self.head_dim = int(head_dim)
         self.query_head_dim = int(query_head_dim or head_dim)
-        if self.query_head_dim <= 0 or self.query_head_dim % 8 != 0:
-            raise ValueError("query_head_dim must be a positive multiple of 8")
-        self.heads_per_rank = self.total_heads // self.world_size
         self._ipc = ipc
         self._owned_buffers = list(owned_buffers or ())
-        self._ext = ext_module or _load_extension()
+        self._ext = ext_module
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -229,15 +218,118 @@ class PCIeDCPA2A:
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
-        self._ptr = self._ext.init_dcp_a2a(
-            list(signal_ptrs),
-            list(staging0_ptrs),
-            list(staging1_ptrs),
-            int(output_capacity_elems),
-            int(lse_offset),
-            int(lse_capacity),
-            self.rank,
-        )
+
+        def validate_arguments() -> bool:
+            if self.world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {self.world_size}")
+            if not 0 <= self.rank < self.world_size:
+                raise ValueError(
+                    f"invalid rank {self.rank} for world size {self.world_size}"
+                )
+            if (
+                len(signal_ptrs) != self.world_size
+                or len(staging0_ptrs) != self.world_size
+                or len(staging1_ptrs) != self.world_size
+            ):
+                raise ValueError("signal and staging pointers must match world size")
+            if self.total_heads <= 0 or self.total_heads % self.world_size != 0:
+                raise ValueError("total_heads must be divisible by world_size")
+            if self.head_dim <= 0 or self.head_dim % 8 != 0:
+                raise ValueError("head_dim must be a positive multiple of 8")
+            if self.query_head_dim <= 0 or self.query_head_dim % 8 != 0:
+                raise ValueError("query_head_dim must be a positive multiple of 8")
+            return True
+
+        if (
+            not _factory_managed_setup
+            and self.device.type == "cuda"
+            and self.exchange_group is not None
+        ):
+            _run_collective_preallocation_setup(
+                owner="PCIe DCP A2A direct constructor argument validation",
+                exchange_group=self.exchange_group,
+                setup=validate_arguments,
+            )
+        else:
+            validate_arguments()
+        self.heads_per_rank = self.total_heads // self.world_size
+
+        if not _factory_managed_setup and self.device.type == "cuda":
+            _require_full_grid_residency(
+                owner="PCIe DCP A2A direct constructor",
+                required_sms=DCP_A2A_REQUIRED_SMS,
+                device=self.device,
+                exchange_group=self.exchange_group,
+            )
+
+            def prepare():
+                return ext_module or _load_extension()
+
+            if self.exchange_group is None:
+                self._ext = prepare()
+            else:
+                self._ext = _run_collective_preallocation_setup(
+                    owner="PCIe DCP A2A direct constructor",
+                    exchange_group=self.exchange_group,
+                    setup=prepare,
+                )
+        else:
+            self._ext = self._ext or _load_extension()
+
+        if (
+            not _factory_managed_setup
+            and self.device.type == "cuda"
+            and self.exchange_group is not None
+        ):
+            _require_collective_contract(
+                owner="PCIe DCP A2A direct constructor",
+                exchange_group=self.exchange_group,
+                contract=(
+                    self.world_size,
+                    self.max_batch_size,
+                    self.total_heads,
+                    self.head_dim,
+                    self.query_head_dim,
+                    int(output_capacity_elems),
+                    int(lse_offset),
+                    int(lse_capacity),
+                ),
+            )
+
+        self._ptr = 0
+        init_error: BaseException | None = None
+        try:
+            self._ptr = self._ext.init_dcp_a2a(
+                list(signal_ptrs),
+                list(staging0_ptrs),
+                list(staging1_ptrs),
+                int(output_capacity_elems),
+                int(lse_offset),
+                int(lse_capacity),
+                self.rank,
+            )
+        except Exception as exc:
+            init_error = exc
+
+        if (
+            not _factory_managed_setup
+            and self.device.type == "cuda"
+            and self.exchange_group is not None
+        ):
+
+            def abort_native_runtime() -> None:
+                if self._ptr:
+                    self._ext.dispose(self._ptr)
+                    self._ptr = 0
+
+            _finish_collective_unowned_runtime_setup(
+                owner="PCIe DCP A2A direct constructor",
+                exchange_group=self.exchange_group,
+                local_error=init_error,
+                local_cleanup=abort_native_runtime,
+            )
+        elif init_error is not None:
+            raise init_error
 
     @classmethod
     def from_exchange_group(
@@ -264,16 +356,36 @@ class PCIeDCPA2A:
             device=device_obj,
             exchange_group=exchange_group,
         )
-        ipc = CudaRTLibrary()
-        ipc.cudaSetDevice(device_obj.index or 0)
-        ext = ext_module or _load_extension()
-        layout = _staging_layout(
-            signal_bytes=int(ext.meta_size()),
-            world_size=world_size,
-            max_batch_size=max_batch_size,
-            total_heads=total_heads,
-            head_dim=head_dim,
-            query_head_dim=query_head_dim,
+
+        def prepare():
+            prepared_ipc = CudaRTLibrary()
+            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_ext = ext_module or _load_extension()
+            layout = _staging_layout(
+                signal_bytes=int(prepared_ext.meta_size()),
+                world_size=world_size,
+                max_batch_size=max_batch_size,
+                total_heads=total_heads,
+                head_dim=head_dim,
+                query_head_dim=query_head_dim,
+            )
+            return prepared_ipc, prepared_ext, layout
+
+        ipc, ext, layout = _run_collective_preallocation_setup(
+            owner="PCIe DCP A2A",
+            exchange_group=exchange_group,
+            setup=prepare,
+        )
+        _require_collective_contract(
+            owner="PCIe DCP A2A channel layout",
+            exchange_group=exchange_group,
+            contract=(
+                int(max_batch_size),
+                int(total_heads),
+                int(head_dim),
+                int(query_head_dim or head_dim),
+                layout,
+            ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group,
@@ -308,6 +420,7 @@ class PCIeDCPA2A:
                 owned_buffers=[slab],
                 ext_module=ext,
                 stream_affine=stream_affine,
+                _factory_managed_setup=True,
             )
         except Exception as exc:
             init_error = exc
@@ -633,11 +746,18 @@ class PCIeDCPA2APool:
         self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
+        self._logical_channels: dict[str, PCIeDCPA2A] = {}
+        self._captured_channel_ids: set[str] = set()
+        self._implicit_capture_ordinal = 0
         self._all_channels: list[PCIeDCPA2A] = []
         self._capture_channel_stack: list[PCIeDCPA2A] = []
         self._closed = False
         if channel_factory is None and exchange_group is None:
             raise ValueError("exchange_group is required unless channel_factory is set")
+        if channel_factory is None:
+            if self.device.type != "cuda":
+                raise ValueError("PCIe DCP A2A pool requires a CUDA device")
+            self.prepare_channels(("default",))
 
     @classmethod
     def from_exchange_group(
@@ -708,17 +828,57 @@ class PCIeDCPA2APool:
         self._all_channels.append(channel)
         return channel
 
-    def checkpoint_channels(self) -> tuple[int, dict[int, PCIeDCPA2A]]:
+    def prepare_channels(self, channel_ids: Sequence[str]) -> None:
+        """Collectively allocate globally named channels in canonical order."""
+
+        normalized = tuple(
+            sorted({_normalize_logical_channel_id(value) for value in channel_ids})
+        )
+        if not normalized:
+            return
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2APool is closed")
+
+        if self._channel_factory is None:
+            assert self.exchange_group is not None
+            local_state = (normalized, tuple(sorted(self._logical_channels)))
+            gathered = _broadcast_gather_object(local_state, self.exchange_group)
+            if any(state != local_state for state in gathered):
+                raise RuntimeError(
+                    "PCIe DCP A2A logical channel preparation differs across "
+                    f"ranks: {gathered}"
+                )
+
+        for channel_id in normalized:
+            if channel_id in self._logical_channels:
+                continue
+            self._logical_channels[channel_id] = self._new_channel(None)
+
+    def checkpoint_channels(
+        self,
+    ) -> tuple[
+        int,
+        dict[int, PCIeDCPA2A],
+        dict[str, PCIeDCPA2A],
+        set[str],
+        int,
+    ]:
         """Snapshot channel ownership before a throwaway graph capture."""
         if self._closed:
             raise RuntimeError("PCIeDCPA2APool is closed")
         if self._capture_channel_stack:
             raise RuntimeError("cannot checkpoint channels during capture")
-        return len(self._all_channels), dict(self._channels)
+        return (
+            len(self._all_channels),
+            dict(self._channels),
+            dict(self._logical_channels),
+            set(self._captured_channel_ids),
+            self._implicit_capture_ordinal,
+        )
 
     def rollback_channels(
         self,
-        checkpoint: tuple[int, dict[int, PCIeDCPA2A]],
+        checkpoint: tuple,
     ) -> None:
         """Close channels created after ``checkpoint`` and restore mappings.
 
@@ -729,7 +889,29 @@ class PCIeDCPA2APool:
             raise RuntimeError("PCIeDCPA2APool is closed")
         if self._capture_channel_stack:
             raise RuntimeError("cannot roll back channels during capture")
-        all_channels_len, channels = checkpoint
+        if len(checkpoint) == 2:
+            all_channels_len, channels = checkpoint
+            logical_channels = dict(self._logical_channels)
+            captured_channel_ids = set(self._captured_channel_ids)
+            implicit_capture_ordinal = self._implicit_capture_ordinal
+        elif len(checkpoint) == 4:
+            (
+                all_channels_len,
+                channels,
+                logical_channels,
+                captured_channel_ids,
+            ) = checkpoint
+            implicit_capture_ordinal = self._implicit_capture_ordinal
+        elif len(checkpoint) == 5:
+            (
+                all_channels_len,
+                channels,
+                logical_channels,
+                captured_channel_ids,
+                implicit_capture_ordinal,
+            ) = checkpoint
+        else:
+            raise ValueError("invalid channel checkpoint")
         if not 0 <= all_channels_len <= len(self._all_channels):
             raise ValueError("channel checkpoint does not belong to this pool")
 
@@ -751,8 +933,16 @@ class PCIeDCPA2APool:
         # failed unmap/free remains reachable for an explicit retry.
         self._all_channels = retained
         self._channels = dict(channels)
+        self._logical_channels = dict(logical_channels)
+        self._captured_channel_ids = set(captured_channel_ids)
+        self._implicit_capture_ordinal = int(implicit_capture_ordinal)
 
-    def for_stream(self, stream: object = None) -> PCIeDCPA2A:
+    def for_stream(
+        self,
+        stream: object = None,
+        *,
+        channel_id: str = "default",
+    ) -> PCIeDCPA2A:
         if self._closed:
             raise RuntimeError("PCIeDCPA2APool is closed")
         if self.single_channel:
@@ -770,6 +960,23 @@ class PCIeDCPA2APool:
             # key. The enclosing capture, not a stale key mapping, determines
             # which IPC channel is safe for this graph.
             channel = self._capture_channel_stack[-1]
+            self._channels[key] = channel
+            return channel
+        if self._channel_factory is None:
+            logical_id = _normalize_logical_channel_id(channel_id)
+            channel = self._logical_channels.get(logical_id)
+            if channel is None:
+                raise RuntimeError(
+                    f"logical channel {logical_id!r} is not prepared; call "
+                    "prepare_channels() collectively before use"
+                )
+            mapped = self._channels.get(key)
+            if mapped is not None and mapped is not channel:
+                raise RuntimeError(
+                    f"CUDA stream key {key} is already bound to another logical "
+                    "PCIe DCP A2A channel"
+                )
+            channel._bind_stream_key(stream_key)
             self._channels[key] = channel
             return channel
         channel = self._channels.get(key)
@@ -805,8 +1012,9 @@ class PCIeDCPA2APool:
         threads: int = 256,
         block_limit: int = 16,
         stream: object = None,
+        channel_id: str = "default",
     ) -> torch.Tensor:
-        channel = self.for_stream(stream)
+        channel = self.for_stream(stream, channel_id=channel_id)
         if stream is not None and self.device.type == "cuda":
             with torch.cuda.stream(stream):
                 return channel.lse_reduce_scatter(
@@ -834,8 +1042,9 @@ class PCIeDCPA2APool:
         threads: int = 256,
         block_limit: int = 16,
         stream: object = None,
+        channel_id: str = "default",
     ) -> torch.Tensor:
-        channel = self.for_stream(stream)
+        channel = self.for_stream(stream, channel_id=channel_id)
         if stream is not None and self.device.type == "cuda":
             with torch.cuda.stream(stream):
                 return channel.all_gather_heads(
@@ -852,17 +1061,52 @@ class PCIeDCPA2APool:
         )
 
     @contextmanager
-    def capture(self, stream: object = None):
-        """Bind nested CUDA captures to the enclosing stream's channel."""
+    def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
+        """Bind capture to a globally named channel.
+
+        Explicit unknown ids are prepared collectively and fail closed when
+        rank ids differ. Production callers should pre-prepare the full set of
+        independently replayable graph ids before entering any capture.
+
+        For compatibility, omitting the id assigns a collective monotonic id
+        to each outer capture. This isolates existing vLLM profiling, target,
+        and draft graph managers even when their local CUDA stream handles are
+        recycled. All ranks must enter no-id captures in the same order.
+        """
         previous_channels: Optional[dict[int, PCIeDCPA2A]] = None
+        if not self.single_channel and _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "PCIe DCP A2A capture context must be entered before CUDA graph "
+                "capture starts"
+            )
         if self.single_channel:
-            channel = self.for_stream(stream)
-        else:
-            if _is_current_stream_capturing(self.device):
+            channel = self.for_stream(
+                stream, channel_id="default" if channel_id is None else channel_id
+            )
+        elif self._channel_factory is None:
+            implicit_id = channel_id is None
+            logical_id = (
+                _implicit_capture_channel_id(self._implicit_capture_ordinal)
+                if implicit_id
+                else _normalize_logical_channel_id(channel_id)
+            )
+            if logical_id in self._captured_channel_ids:
                 raise RuntimeError(
-                    "PCIe DCP A2A capture context must be entered before CUDA "
-                    "graph capture starts"
+                    f"logical channel {logical_id!r} was already captured; each "
+                    "independently replayable graph requires a unique id"
                 )
+            if logical_id not in self._logical_channels:
+                self.prepare_channels((logical_id,))
+            previous_channels = dict(self._channels)
+            stream_key = _current_stream_key(self.device, stream)
+            key = 0 if stream_key is None else int(stream_key)
+            channel = self._logical_channels[logical_id]
+            channel._bind_stream_key(stream_key)
+            self._channels[key] = channel
+            self._captured_channel_ids.add(logical_id)
+            if implicit_id:
+                self._implicit_capture_ordinal += 1
+        else:
             previous_channels = dict(self._channels)
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)
@@ -908,6 +1152,8 @@ class PCIeDCPA2APool:
         self._closed = True
         self._all_channels.clear()
         self._channels.clear()
+        self._logical_channels.clear()
+        self._captured_channel_ids.clear()
 
     def __del__(self) -> None:
         # Graphs may retain these channels after Python ownership disappears.

@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import sparkinfer.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
+from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
@@ -269,7 +270,8 @@ def _check_graph(
     device: torch.device,
 ) -> None:
     stream = torch.cuda.Stream(device=device)
-    channel = pool.for_stream(stream)
+    pool.prepare_channels(("graph",))
+    channel = pool.for_stream(stream, channel_id="graph")
     layers = 7
     input_storages = [
         torch.empty(
@@ -526,6 +528,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
+    if rank != 0:
+        # Simulate one constrained/MIG-like rank in an otherwise full device
+        # group; every peer must reject before any IPC allocation.
+        os.environ.pop("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", None)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
@@ -557,8 +563,56 @@ def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    original_cuda_rt = pcie_dcp_a2a.CudaRTLibrary
+    original_allocate = PCIeOneshotAllReduce._allocate_shared_buffer
+
+    class FakeExt:
+        @staticmethod
+        def meta_size():
+            return 256
+
+    def fail_cuda_rt():
+        raise RuntimeError("injected rank-zero pre-allocation failure")
+
+    def unexpected_allocate(*args, **kwargs):
+        raise AssertionError("CUDA IPC allocation started after a peer preflight failure")
+
+    if rank == 0:
+        pcie_dcp_a2a.CudaRTLibrary = fail_cuda_rt
+    PCIeOneshotAllReduce._allocate_shared_buffer = staticmethod(unexpected_allocate)
+    try:
+        with pytest.raises(RuntimeError, match="pre-allocation setup"):
+            PCIeDCPA2A.from_process_group(
+                process_group=dist.group.WORLD,
+                device=device,
+                max_batch_size=MAX_BATCH,
+                total_heads=TOTAL_HEADS,
+                head_dim=HEAD_DIM,
+                query_head_dim=QUERY_HEAD_DIM,
+                ext_module=FakeExt(),
+            )
+        dist.barrier()
+    finally:
+        pcie_dcp_a2a.CudaRTLibrary = original_cuda_rt
+        PCIeOneshotAllReduce._allocate_shared_buffer = original_allocate
+        dist.destroy_process_group()
+
+
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
-    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1":
+    if (
+        os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
+        or os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
+    ):
         pytest.skip("running the reduced-SM residency rejection gate")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -587,6 +641,26 @@ def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
         )
     mp.spawn(
         _residency_rejection_worker,
+        args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def test_pcie_dcp_a2a_coordinates_one_rank_preflight_failure_before_ipc():
+    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") != "1":
+        pytest.skip("set the one-rank preflight rejection gate to run this test")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if world_size not in (2, 4, 8):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+        )
+    mp.spawn(
+        _preflight_rejection_worker,
         args=(world_size, _free_port()),
         nprocs=world_size,
         join=True,

@@ -278,6 +278,164 @@ def test_pool_uses_distinct_channels_for_target_and_draft_captures(monkeypatch):
         pool.for_stream()
 
 
+def test_pool_collectively_prepares_logical_channels_in_canonical_order(
+    monkeypatch,
+):
+    created = []
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: created.append(stream_key) or object(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
+        lambda local_state, group: [local_state, local_state],
+    )
+
+    pool.prepare_channels(("target", "draft"))
+    pool.prepare_channels(("draft", "target"))
+
+    assert list(pool._logical_channels) == ["draft", "target"]
+    assert created == [None, None]
+
+
+def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch):
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+
+    def gather(local_state, group):
+        requested, existing = local_state
+        return [(("other",), existing), local_state]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
+    )
+
+    with pytest.raises(RuntimeError, match="differs across ranks"):
+        pool.prepare_channels(("target",))
+
+
+def test_pool_no_id_captures_use_distinct_monotonic_channels(monkeypatch):
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+
+    def new_channel(stream_key):
+        runtime = _make_runtime()
+        runtime._bind_stream_key(stream_key)
+        pool._all_channels.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(pool, "_new_channel", new_channel)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
+        lambda local_state, group: [local_state, local_state],
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: int(stream or 7),
+    )
+
+    pool.prepare_channels(("default",))
+    with pool.capture(7) as target_channel:
+        pass
+    with pool.capture(7) as draft_channel:
+        pass
+
+    assert target_channel is not draft_channel
+    assert pool._implicit_capture_ordinal == 2
+    assert tuple(pool._logical_channels) == (
+        "default",
+        "__sparkinfer_capture__:0",
+        "__sparkinfer_capture__:1",
+    )
+    assert pool._channels == {}
+
+
+def test_pool_no_id_capture_ordinal_is_checkpointed():
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    checkpoint = pool.checkpoint_channels()
+    pool._implicit_capture_ordinal = 9
+
+    pool.rollback_channels(checkpoint)
+
+    assert pool._implicit_capture_ordinal == 0
+
+
+def test_pool_no_id_capture_rejects_rank_ordinal_skew(monkeypatch):
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    pool._logical_channels["default"] = _make_runtime()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+
+    def gather(local_state, group):
+        requested, existing = local_state
+        return [local_state, (("__sparkinfer_capture__:1",), existing)]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
+    )
+
+    with pytest.raises(RuntimeError, match="differs across ranks"), pool.capture(7):
+        pass
+
+    assert pool._implicit_capture_ordinal == 0
+
+
 def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
     created = []
     current_stream = [7]

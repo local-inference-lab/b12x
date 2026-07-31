@@ -30,7 +30,9 @@ from .pcie_oneshot import (
     _coordinated_close_channels,
     _normalize_device,
     _OwnedSharedBuffer,
+    _require_collective_contract,
     _require_full_grid_residency,
+    _run_collective_preallocation_setup,
 )
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
@@ -122,23 +124,63 @@ class PCIeTwoShotSP:
             device=device_obj,
             exchange_group=exchange_group,
         )
-        ipc = CudaRTLibrary()
-        ipc.cudaSetDevice(device_obj.index or 0)
-        ext = ext_module or _load_extension()
 
-        # Per-slot staging: [world][pack_stride] Fp8Packs then
-        # [world][scale_stride] fp32 scales, regions 256B-aligned.
-        max_rows_per_rank = max_rows // world_size
-        packs_per_row = row_elems // 16
-        pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
-        payload_bytes = world_size * pack_stride * 16
-        scale_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
-        scale_stride = _align_up(max_rows_per_rank, 64)
-        slot_bytes = _align_up(
-            scale_offset + world_size * scale_stride * 4, IPC_SLAB_ALIGNMENT
+        def prepare():
+            prepared_ipc = CudaRTLibrary()
+            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_ext = ext_module or _load_extension()
+
+            # Per-slot staging: [world][pack_stride] Fp8Packs then
+            # [world][scale_stride] fp32 scales, regions 256B-aligned.
+            max_rows_per_rank = max_rows // world_size
+            packs_per_row = row_elems // 16
+            pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
+            payload_bytes = world_size * pack_stride * 16
+            scale_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
+            scale_stride = _align_up(max_rows_per_rank, 64)
+            slot_bytes = _align_up(
+                scale_offset + world_size * scale_stride * 4, IPC_SLAB_ALIGNMENT
+            )
+            signal_bytes = _align_up(int(prepared_ext.meta_size()), IPC_SLAB_ALIGNMENT)
+            slab_bytes = signal_bytes + 2 * slot_bytes
+            return (
+                prepared_ipc,
+                prepared_ext,
+                pack_stride,
+                scale_offset,
+                scale_stride,
+                signal_bytes,
+                slot_bytes,
+                slab_bytes,
+            )
+
+        (
+            ipc,
+            ext,
+            pack_stride,
+            scale_offset,
+            scale_stride,
+            signal_bytes,
+            slot_bytes,
+            slab_bytes,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe twoshot",
+            exchange_group=exchange_group,
+            setup=prepare,
         )
-        signal_bytes = _align_up(int(ext.meta_size()), IPC_SLAB_ALIGNMENT)
-        slab_bytes = signal_bytes + 2 * slot_bytes
+        _require_collective_contract(
+            owner="PCIe twoshot channel layout",
+            exchange_group=exchange_group,
+            contract=(
+                int(max_rows),
+                int(row_elems),
+                int(pack_stride),
+                int(scale_offset),
+                int(scale_stride),
+                int(signal_bytes),
+                int(slab_bytes),
+            ),
+        )
 
         shared = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group,
