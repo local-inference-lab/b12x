@@ -230,8 +230,8 @@ def _find_loops(
 
     A branch whose target is at or before its own offset closes a loop running
     from the target to the branch. Nested loops therefore appear as separate,
-    overlapping entries; callers pick by size rather than by nesting, because
-    the GEMM mainloop is the largest body by a wide margin.
+    overlapping entries, in offset order; which one is the mainloop is not
+    decided here (see ``_select_mainloop``).
     """
     by_offset = {offset: index for index, (offset, _, _) in enumerate(instructions)}
     loops: list[Loop] = []
@@ -382,7 +382,10 @@ def main() -> int:
     parser.add_argument(
         "--whole-kernel",
         action="store_true",
-        help="also census the whole entry point, not just its largest loop",
+        help=(
+            "also census the whole entry point, not just its mainloop (the "
+            "smallest MMA-issuing loop; see _select_mainloop)"
+        ),
     )
     parser.add_argument(
         "--dump-sass",

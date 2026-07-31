@@ -22,6 +22,32 @@ def _clear_registries(fdw):
     fdw._CAPTURE_CLAIMED.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scratch_registries():
+    """Leave the process-wide scratch registries as they were found.
+
+    These tests clear buckets other tests (and any warm serving path in the
+    same interpreter) rely on, so the clears must not outlive the module.
+    """
+    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+
+    saved = (
+        dict(fdw._QUANT_SCRATCH),
+        dict(fdw._CAPTURE_ASSIGNED),
+        {key: list(value) for key, value in fdw._CAPTURE_CLAIMED.items()},
+    )
+    try:
+        yield
+    finally:
+        for registry, snapshot in zip(
+            (fdw._QUANT_SCRATCH, fdw._CAPTURE_ASSIGNED, fdw._CAPTURE_CLAIMED),
+            saved,
+            strict=True,
+        ):
+            registry.clear()
+            registry.update(snapshot)
+
+
 @cuda_required
 def test_capture_claims_eager_bucket_per_stream(monkeypatch):
     """Fake-capture unit test of the claim logic (no real graph needed)."""

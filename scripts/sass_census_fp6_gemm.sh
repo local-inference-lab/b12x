@@ -99,6 +99,15 @@ for shape in $SHAPES; do
   "$PYTHON" "$ROOT/scripts/sass_instruction_mix.py" \
       "$cache" --kernel DenseGemmKernel --whole-kernel \
     >"$OUT_DIR/$tag.census.txt" 2>&1
+  census_rc=$?
+  # File size alone cannot tell a census from a traceback: stderr lands in the
+  # same file, so a crashed run leaves a non-empty file that sed would print as
+  # though it were a census.
+  if [[ $census_rc -ne 0 ]]; then
+    echo "census exited $census_rc for $shape; see $OUT_DIR/$tag.census.txt" >&2
+    tail -n 20 "$OUT_DIR/$tag.census.txt" >&2
+    continue
+  fi
   if [[ ! -s "$OUT_DIR/$tag.census.txt" ]]; then
     echo "census produced no output for $shape" >&2
     continue

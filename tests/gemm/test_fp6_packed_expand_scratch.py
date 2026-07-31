@@ -17,6 +17,35 @@ cuda_required = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_expand_registries():
+    """Snapshot and restore the process-wide expansion-scratch registries.
+
+    These tests clear buffers that any warm path in the same interpreter may
+    already have sized and claimed, so the clears must not outlive the module.
+    """
+    import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
+
+    saved_scratch = dict(fdw._EXPAND_SCRATCH)
+    saved_assigned = dict(fdw._EXPAND_CAPTURE_ASSIGNED)
+    saved_claimed = {
+        key: list(value) for key, value in fdw._EXPAND_CAPTURE_CLAIMED.items()
+    }
+    fdw._EXPAND_SCRATCH.clear()
+    fdw._EXPAND_CAPTURE_ASSIGNED.clear()
+    fdw._EXPAND_CAPTURE_CLAIMED.clear()
+    try:
+        yield
+    finally:
+        for registry, snapshot in (
+            (fdw._EXPAND_SCRATCH, saved_scratch),
+            (fdw._EXPAND_CAPTURE_ASSIGNED, saved_assigned),
+            (fdw._EXPAND_CAPTURE_CLAIMED, saved_claimed),
+        ):
+            registry.clear()
+            registry.update(snapshot)
+
+
 @cuda_required
 @pytest.mark.parametrize(
     "n,k",
@@ -96,7 +125,6 @@ def test_scratch_reuse_and_growth(monkeypatch):
 
     torch.manual_seed(2)
     monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
-    fdw._EXPAND_SCRATCH.clear()
 
     k = 512
     m = 128
@@ -135,9 +163,6 @@ def test_capture_claims_an_eager_buffer(monkeypatch):
     import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
 
     monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
-    fdw._EXPAND_SCRATCH.clear()
-    fdw._EXPAND_CAPTURE_ASSIGNED.clear()
-    fdw._EXPAND_CAPTURE_CLAIMED.clear()
 
     device = torch.device("cuda")
     eager = fdw._packed_expand_scratch(1 << 20, device)
@@ -156,9 +181,6 @@ def test_capture_refuses_to_allocate_unplanned_scratch(monkeypatch):
     import sparkinfer.quantization.mxfp6.fp6_dense_weights as fdw
 
     monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
-    fdw._EXPAND_SCRATCH.clear()
-    fdw._EXPAND_CAPTURE_ASSIGNED.clear()
-    fdw._EXPAND_CAPTURE_CLAIMED.clear()
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="no eager buffer"):
@@ -172,7 +194,6 @@ def test_small_m_stays_packed(monkeypatch):
 
     torch.manual_seed(3)
     monkeypatch.setattr(fdw, "_PACKED_B_EXPAND_LARGE_M", True)
-    fdw._EXPAND_SCRATCH.clear()
 
     n, k = 6144, 512
     fp6w = fdw.quantize_dense_weight_to_fp6(

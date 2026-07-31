@@ -233,6 +233,25 @@ def main() -> None:
                 f"/start_profile failed with status {status}: {body.strip()}"
             )
 
+    def _stop_profile_quietly() -> None:
+        """Best-effort /stop_profile on an error path; never masks the cause."""
+        try:
+            status, body = http_json(
+                f"{base_url}/stop_profile", headers=headers, payload={}
+            )
+            stop_response.write_text(body, encoding="utf-8")
+            if status != 200:
+                print(
+                    f"warning: /stop_profile returned {status} while unwinding: "
+                    f"{body.strip()}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                f"warning: could not stop the server profile: {exc}",
+                file=sys.stderr,
+            )
+
     # Prefill inverts the window. The decode modes deliberately wait PAST the
     # first token so the capture lands in steady decode; prefill is the work
     # that happens BEFORE it, so profiling has to be running when the request
@@ -246,12 +265,21 @@ def main() -> None:
     stream.start()
     started_at = time.time()
 
-    if not stream.wait_for_first_token(args.first_token_timeout):
-        stream.stop()
-        detail = ""
-        if stream.error:
-            detail = f" request error: {stream.error}"
-        raise RuntimeError(f"timed out waiting for the first streamed token.{detail}")
+    try:
+        if not stream.wait_for_first_token(args.first_token_timeout):
+            stream.stop()
+            detail = ""
+            if stream.error:
+                detail = f" request error: {stream.error}"
+            raise RuntimeError(
+                f"timed out waiting for the first streamed token.{detail}"
+            )
+    except BaseException:
+        # Prefill starts the profile before the request, so bailing out here
+        # would leave the server profiling forever and poison the next capture.
+        if prefill_mode:
+            _stop_profile_quietly()
+        raise
 
     first_token_at = time.time()
 

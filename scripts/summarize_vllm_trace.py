@@ -277,6 +277,9 @@ _IS_HOST_CAT_RE = re.compile(
     r"cuda_runtime|cuda_driver|user_annotation|cpu_op|python|ac2g|fwdbwd", re.I
 )
 _IS_CUDA_CAT_RE = re.compile(r"cuda|gpu|kernel", re.I)
+# Automatic worker ceiling. A resident trace is several GB per process, so
+# one-per-core OOMs the box long before it saturates it.
+_MAX_AUTO_WORKERS = 4
 _IS_CUDA_NAME_RE = re.compile(r"cuda|gemm|nccl|cutlass|triton", re.I)
 
 # STRICTER than _IS_CUDA_CAT_RE: real device-side execution only. The bucket
@@ -737,7 +740,9 @@ def main() -> None:
     if not traces:
         raise SystemExit("no trace files found")
 
-    workers = args.workers or min(len(traces), os.cpu_count() or 1)
+    # Each worker parses a multi-GB trace into its own process, so the default
+    # is capped by memory rather than by core count; --workers overrides.
+    workers = args.workers or min(len(traces), os.cpu_count() or 1, _MAX_AUTO_WORKERS)
     if _fast_json is None:
         print(
             "note: orjson not installed; JSON parse is the slow step. "

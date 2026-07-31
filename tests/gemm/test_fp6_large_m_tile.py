@@ -6,9 +6,10 @@ only see (128,128) starved to a single mainloop stage by a full-tile epilogue,
 and once ``_choose_epilogue`` frees those bytes the wide tile wins by 17-19% on
 every Behemoth shard. Tiles only change the CTA work decomposition — the
 per-output-element accumulation order is identical — so outputs must be
-BIT-IDENTICAL across tiles. The m<=16 decode regime takes the wave-cliff
-heuristic ((16,64), or (32,128) when ceil(N/64) leaves a tiny tail wave);
-`SPARKINFER_FP6_DECODE_TILE` forces a fixed tile for A/B.
+BIT-IDENTICAL across tiles. The m<=16 decode regime takes (16,64) for every
+wide-N shape — the (32,128) tiny-tail-wave exemption was retired once
+occupancy 2 removed the lone tail wave; `SPARKINFER_FP6_DECODE_TILE` forces a
+fixed tile for A/B.
 """
 from __future__ import annotations
 
@@ -43,8 +44,15 @@ def test_fp6_large_m_tile_bit_exact_vs_old_pin(m, monkeypatch):
     torch.testing.assert_close(y_new, y_old, rtol=0.0, atol=0.0)
 
 
-def test_fp6_tile_regime_selection():
+def test_fp6_tile_regime_selection(monkeypatch):
+    import sparkinfer._lib.dense_gemm as dg
     from sparkinfer._lib.dense_gemm import _select_default_mma_tiler_mn
+
+    # Both tiles below are env-overridable, so pin them to their defaults: the
+    # assertions are about the policy, not about the environment the suite
+    # happens to run in.
+    monkeypatch.setattr(dg, "_SPARKINFER_FP6_LARGE_M_TILE", (128, 128))
+    monkeypatch.setattr(dg, "_SPARKINFER_FP6_DECODE_TILE", None)
 
     common = dict(sm_count=188, is_mxfp8=False, is_mxfp6=True)
     # Decode regime: width-64 unless ceil(N/64) leaves a tiny tail wave.

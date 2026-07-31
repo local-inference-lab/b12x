@@ -171,11 +171,13 @@ tok/s at every context.
 | 32k | 4723.62 | 6937 | 82.58  |
 
 This is the post-epilogue-policy state, not a before/after: no true-prefill
-sweep of Qwen exists from before 3.6c, and 3.1 is a different harness. The one
-comparison that does survive the harness change is decode, since 3.1's
-decode-dominated check (1024 in / 1024 out) amortized TTFT away: 106.94 then
-against 110.86 at 1k now, so decode is not regressed. Prefill shows no hole at
-any context, which is the signature a bad `_choose_epilogue` pick would leave.
+sweep of Qwen exists from before 3.6c, and 3.1 is a different harness. Nor is
+decode comparable across the two: 3.1's decode-dominated check ran 1024 in /
+1024 out with TTFT amortized in, while 3.1b reports a separated decode rate at
+each context, and the prompt set and MTP acceptance differ. 106.94 there and
+110.86 at 1k here are the same order, which is all that can be claimed — this
+section is **not** a decode regression check. Prefill shows no hole at any
+context, which is the signature a bad `_choose_epilogue` pick would leave.
 
 Two observations recorded rather than chased:
 
@@ -262,7 +264,7 @@ run-to-run spread is +/-0.03 tok/s on decode.
 | 16k | 6451.6  | 2539 | 25.69 |
 | 32k | 14773.4 | 2218 | 24.38 |
 
-Prefill here is 8.7-14.6% above the same sweep taken before the epilogue fix in
+Prefill here is 8.1-14.2% above the same sweep taken before the epilogue fix in
 3.6c (2104 / 2428 / 2429 / 2281 / 2024 tok/s, TTFT 486.6 / 1687.2 / 3373.2 /
 7183.6 / 16190.2 ms). Decode rose 0.6-0.7% across the board, which is *not*
 attributable to that change — the decode tile is provably untouched by it — and

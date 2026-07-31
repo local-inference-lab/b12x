@@ -25,6 +25,7 @@ from typing import Dict, Tuple
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
+import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
 
 from sparkinfer._lib.compiler import KernelCompileSpec, compile as sparkinfer_compile
@@ -164,7 +165,31 @@ def compile_fp6_expand_packed(packed_bytes: int):
         ),
     )
 
-    def launch(packed_flat, out_flat):
+    def launch(packed_flat: torch.Tensor, out_flat: torch.Tensor) -> None:
+        # The kernel derives its trip count from the compiled packed_bytes and
+        # addresses both operands as raw contiguous uint8, so a short, strided
+        # or wrongly-typed buffer is an out-of-bounds write, not an error.
+        if (
+            packed_flat.dtype != torch.uint8
+            or not packed_flat.is_contiguous()
+            or packed_flat.numel() != packed_bytes
+        ):
+            raise ValueError(
+                "packed_flat must be a contiguous uint8 tensor of exactly "
+                f"{packed_bytes} elements; got dtype {packed_flat.dtype}, "
+                f"numel {packed_flat.numel()}, contiguous "
+                f"{packed_flat.is_contiguous()}"
+            )
+        if (
+            out_flat.dtype != torch.uint8
+            or not out_flat.is_contiguous()
+            or out_flat.numel() < out_bytes
+        ):
+            raise ValueError(
+                "out_flat must be a contiguous uint8 tensor of at least "
+                f"{out_bytes} elements; got dtype {out_flat.dtype}, numel "
+                f"{out_flat.numel()}, contiguous {out_flat.is_contiguous()}"
+            )
         raw(packed_flat, out_flat[:out_bytes], current_cuda_stream())
 
     _KERNEL_CACHE[cache_key] = launch

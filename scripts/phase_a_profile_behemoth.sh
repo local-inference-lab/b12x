@@ -102,13 +102,19 @@ DECODE_PROMPT="$OUT_ROOT/decode_prompt.txt"
 make_prefill_prompt "$PREFILL_PROMPT"
 echo "Count from one to twenty in words, then keep counting." >"$DECODE_PROMPT"
 
+# One unreachable server or 404 endpoint must not discard the arms that did
+# capture, nor the evidence header below (set -e would abort the script).
 # Prefill: long prompt, 1 output token.
-capture_one fp6 "$BASE_FP6" "$MODEL_FP6" prefill 1 "$PREFILL_PROMPT"
-capture_one fp8 "$BASE_FP8" "$MODEL_FP8" prefill 1 "$PREFILL_PROMPT"
+capture_one fp6 "$BASE_FP6" "$MODEL_FP6" prefill 1 "$PREFILL_PROMPT" \
+  || echo "WARN: fp6 prefill capture failed; continuing." >&2
+capture_one fp8 "$BASE_FP8" "$MODEL_FP8" prefill 1 "$PREFILL_PROMPT" \
+  || echo "WARN: fp8 prefill capture failed; continuing." >&2
 
 # Decode: short prompt, longer generation.
-capture_one fp6 "$BASE_FP6" "$MODEL_FP6" decode 128 "$DECODE_PROMPT"
-capture_one fp8 "$BASE_FP8" "$MODEL_FP8" decode 128 "$DECODE_PROMPT"
+capture_one fp6 "$BASE_FP6" "$MODEL_FP6" decode 128 "$DECODE_PROMPT" \
+  || echo "WARN: fp6 decode capture failed; continuing." >&2
+capture_one fp8 "$BASE_FP8" "$MODEL_FP8" decode 128 "$DECODE_PROMPT" \
+  || echo "WARN: fp8 decode capture failed; continuing." >&2
 
 echo
 echo "=== summarizing traces under $OUT_ROOT ==="

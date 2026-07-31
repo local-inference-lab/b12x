@@ -42,9 +42,11 @@ def test_fp6_large_m_unroll_bit_exact(weight_form, m, k, monkeypatch):
     # codegen, so if it ever falls out of the compile-cache key both arms
     # collapse onto one kernel and this compares a path against itself.
     resolved: list[object] = []
+    unrolled: list[bool] = []
     _resolve = dg._get_compiled_dense_gemm_mxfp6
 
     def _spy(*spy_args, **spy_kwargs):
+        unrolled.append(bool(spy_kwargs["policy"].large_m_unroll))
         compiled = _resolve(*spy_args, **spy_kwargs)
         resolved.append(compiled)
         return compiled
@@ -57,6 +59,13 @@ def test_fp6_large_m_unroll_bit_exact(weight_form, m, k, monkeypatch):
     y_unrolled = fdw.dense_fp6_linear_expanded(x, weight, *args)
 
     assert len(resolved) == 2, f"expected one GEMM per arm, got {len(resolved)}"
+    # Separate failure mode from the cache-key check below: if the policy never
+    # asked for unroll=4 on these shapes there is nothing to compare, however
+    # distinct the two compiled kernels turn out to be.
+    assert unrolled == [False, True], (
+        f"expected policy large_m_unroll False then True, got {unrolled}; "
+        f"m={m} k={k} weight_form={weight_form} did not select the unroll"
+    )
     assert resolved[0] is not resolved[1], (
         "unroll=2 and unroll=4 resolved the SAME compiled kernel; the compile "
         "cache key is blind to the unroll flag, so this comparison is vacuous"

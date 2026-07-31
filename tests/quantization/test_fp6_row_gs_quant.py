@@ -32,11 +32,14 @@ def _host_row_gs(x: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]
 
 @cuda_required
 @pytest.mark.parametrize("fmt", ["e2m3", "e3m2", "e4m3"])
-def test_row_gs_kernel_matches_host_recipe(fmt):
+# k=2048 puts the row scan past one strided pass, so the multi-iteration
+# reduction and its tail elements are covered as well as the single-pass case.
+@pytest.mark.parametrize("k", [512, 2048])
+def test_row_gs_kernel_matches_host_recipe(k, fmt):
     from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
 
     torch.manual_seed(0)
-    m, k = 256, 512
+    m = 256
     device = torch.device("cuda")
     x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
     # Pin row amaxes at awkward spots, including a last-element amax

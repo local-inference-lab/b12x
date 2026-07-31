@@ -53,10 +53,14 @@ for shape in $SHAPES; do
   echo "=== $shape  M=$M N=$n K=$k ==="
   for arm in $ARMS; do
     log="$OUT_DIR/${MODE}_${shape}_${arm}.log"
+    # Per-arm JSON: the log carries the printed row, the JSON carries raw_ms
+    # and the benchmark's own evidence header. One path per arm, or the last
+    # arm overwrites the evidence of the ones it is compared against.
+    json="$OUT_DIR/${MODE}_${shape}_${arm}.json"
     if ! SPARKINFER_DENSE_SF_COPY_MODE="$arm" \
       "$PYTHON" "$ROOT/benchmarks/benchmark_dense_gemm_fp6.py" \
         --m "$M" --n "$n" --k "$k" "${ARM_FLAGS[@]}" \
-        --warmup 20 --iters 200 \
+        --warmup 20 --iters 200 --json-out "$json" \
       >"$log" 2>&1
     then
       echo "  $arm: FAILED (see $log)"
@@ -77,6 +81,14 @@ echo ""
   echo "m: $M"
   echo "arms: $ARMS"
   date -u +"captured_utc: %Y-%m-%dT%H:%M:%SZ"
-  nvidia-smi --query-gpu=index,uuid,name,pstate,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active --format=csv 2>/dev/null
+  # Record the failure instead of dropping the rows: an A/B without clock and
+  # throttle state is not evidence, and a silently missing block reads as if
+  # the query had been made and come back clean.
+  if ! smi=$(nvidia-smi --query-gpu=index,uuid,name,pstate,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active --format=csv 2>&1); then
+    echo "gpu_state: UNAVAILABLE (nvidia-smi failed)"
+    echo "$smi" | sed 's/^/  /'
+  else
+    echo "$smi"
+  fi
 } >"$OUT_DIR/evidence_header.txt"
 echo "Logs and evidence_header.txt in $OUT_DIR"

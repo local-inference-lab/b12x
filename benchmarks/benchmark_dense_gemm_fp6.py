@@ -63,6 +63,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from benchmarks.common import make_l2_flush_fn, nvidia_smi_gpu_mode_snapshot
 from benchmarks.fp6_common import (
+    CorrectnessError,
     capture_graph_replay,
     check_outputs,
     fmt_us,
@@ -157,7 +158,7 @@ def _bench_events(
         replay()
         ends[i].record()
     torch.cuda.synchronize()
-    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+    return [s.elapsed_time(e) for s, e in zip(starts, ends, strict=True)]
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -479,8 +480,10 @@ def _run_fp8_cutlass_arm(
             launch = fallback
             check = False
 
-    replay = capture_graph_replay(launch)
     try:
+        # Capture inside the guard too: a non-capturable optional arm must
+        # report SKIP, not abort the sweep the other arms are feeding.
+        replay = capture_graph_replay(launch)
         times = _bench_events(replay, warmup=warmup, iters=iters, l2_flush=l2_flush)
     except Exception as exc:
         return ArmResult(
@@ -495,14 +498,24 @@ def _run_fp8_cutlass_arm(
     cos: Optional[float] = None
     if check:
         cos = _cosine(out, oracle)
-        if cos < 0.95:
+        try:
+            # Same gate as the FP6 arms (cosine AND relative RMSE), so a
+            # scale bug cannot pass the FP8 reference arm on cosine alone.
+            check_outputs(
+                out,
+                oracle,
+                label=f"{arm_name} vs bf16 oracle",
+                cosine_threshold=0.95,
+                rel_rmse_threshold=0.35,
+            )
+        except CorrectnessError as exc:
             return ArmResult(
                 name=arm_name,
                 median_us=_med_us(times),
                 min_us=_min_us(times),
                 raw_ms=list(times),
                 cosine=cos,
-                skipped=f"correctness gate failed: cos={cos:.5f} < 0.95",
+                skipped=f"correctness gate failed: {exc}",
             )
     return ArmResult(
         name=arm_name,
@@ -538,6 +551,9 @@ def _print_evidence_header(args: argparse.Namespace) -> dict:
                 "SPARKINFER_DENSE_TILE_SWIZZLE"
             ),
             "SPARKINFER_DENSE_AB_STAGES": os.getenv("SPARKINFER_DENSE_AB_STAGES"),
+            "SPARKINFER_DENSE_SF_COPY_MODE": os.getenv(
+                "SPARKINFER_DENSE_SF_COPY_MODE"
+            ),
             "SPARKINFER_DENSE_TARGET_OCCUPANCY": os.getenv(
                 "SPARKINFER_DENSE_TARGET_OCCUPANCY"
             ),
@@ -757,8 +773,8 @@ def main() -> None:
         help=(
             "Item-4 evidence mode: sweep candidate MMA tiles for the FP6 "
             "expanded-B arm (the production prefill path) per shape x M, "
-            "asserting cross-tile bit-equality against the policy-default "
-            "(128,128) tile."
+            "asserting cross-tile bit-equality against the FIRST tile in "
+            "--tiles (put the tile you are comparing against first)."
         ),
     )
     parser.add_argument(

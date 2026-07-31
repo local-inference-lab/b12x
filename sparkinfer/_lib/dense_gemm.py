@@ -4859,6 +4859,12 @@ class _DenseGemmLaunch:
             # override set load a kernel cached without it.
             _SPARKINFER_DENSE_EPI_TILE,
             _SPARKINFER_DENSE_EPI_STAGES,
+            # Same argument for the mainloop depth: _compute_stages reads these
+            # two module globals directly, so a run with a stage override (or a
+            # test monkeypatching them) would otherwise reuse a kernel compiled
+            # at a different pipeline depth.
+            _DENSE_DECODE_STAGE3,
+            _SPARKINFER_DENSE_AB_STAGES,
         )
 
     @cute.jit
@@ -6225,6 +6231,11 @@ def _get_compiled_dense_gemm(
     direct_sfa_live16: bool = False,
     direct_m1_wo_a_inputs: bool = False,
     plain_fp8: bool = False,
+    # Explicit rather than read off the module global inside the launch: this
+    # function is memoized, so a global read would hand a caller the kernel
+    # compiled under whatever mode ran first (the same aliasing the MX-FP6
+    # path already avoids by passing it in).
+    sf_copy_mode: str = "autovec",
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -6335,6 +6346,7 @@ def _get_compiled_dense_gemm(
         direct_sfa_live16=direct_sfa_live16,
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
         plain_fp8=plain_fp8,
+        sf_copy_mode=sf_copy_mode,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -6489,6 +6501,7 @@ def _dense_gemm_launch_flat(
         sfb_k_reuse=sfb_k_reuse,
         b_tile_major=b_tile_major,
         alpha_is_one=alpha_is_one,
+        sf_copy_mode=_DENSE_SF_COPY_MODE,
         direct_sfa_live16=_use_direct_sfa_live16(
             m=int(a_tensor_gpu.shape[0]),
             n=n,
@@ -7595,12 +7608,17 @@ def dense_gemm(
             or row_scale.shape[0] != m
             or not row_scale.is_contiguous()
             or row_scale.dtype != cutlass_to_torch_dtype(c_cutlass_dtype)
+            # The epilogue reads it through a raw device pointer, so a
+            # host or wrong-device tensor is an illegal access, not an error.
+            or row_scale.device != a_torch.device
         ):
             raise ValueError(
                 "row_scale must be a contiguous 1-D tensor of shape (M,) in the "
-                f"C dtype; got shape {tuple(row_scale.shape)} dtype "
-                f"{row_scale.dtype} for M={m}, C dtype "
-                f"{cutlass_to_torch_dtype(c_cutlass_dtype)}"
+                f"C dtype on the operand device; got shape "
+                f"{tuple(row_scale.shape)} dtype {row_scale.dtype} device "
+                f"{row_scale.device} for M={m}, C dtype "
+                f"{cutlass_to_torch_dtype(c_cutlass_dtype)}, operand device "
+                f"{a_torch.device}"
             )
     if is_mxfp6:
         # Dedicated MX-FP6 launch path (bypasses the torch custom ops, like
@@ -7730,6 +7748,7 @@ def dense_gemm(
             b_tile_major=rhs_values_tiled is not None,
             quantize_c=True,
             alpha_is_one=alpha_is_one,
+            sf_copy_mode=_DENSE_SF_COPY_MODE,
             direct_sfa_live16=_use_direct_sfa_live16(
                 m=m,
                 n=n,
@@ -7865,6 +7884,7 @@ def dense_gemm(
             b_tile_major=False,
             alpha_is_one=alpha_is_one,
             plain_fp8=True,
+            sf_copy_mode=_DENSE_SF_COPY_MODE,
         )
         compiled_plain_fp8(
             a_tensor_gpu=a_torch,
