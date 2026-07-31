@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import socket
 
@@ -16,9 +17,15 @@ pytestmark = pytest.mark.skipif(
     reason="set SPARKINFER_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
 )
 
-TORTURE_EAGER_ITERS = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256"))
-TORTURE_GRAPH_REPLAYS = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256"))
-TORTURE_MULTISTREAM_ITERS = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256"))
+TORTURE_EAGER_ITERS = int(
+    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
+)
+TORTURE_GRAPH_REPLAYS = int(
+    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
+)
+TORTURE_MULTISTREAM_ITERS = int(
+    os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
+)
 
 
 def _free_port() -> int:
@@ -36,7 +43,26 @@ def _rank_sum(world_size: int) -> int:
     return world_size * (world_size - 1) // 2
 
 
-def _run_eager(pool: PCIeOneshotAllReducePool, device: torch.device, rank: int, world_size: int) -> None:
+def _local_eager_words(
+    channel, stream: torch.cuda.Stream, *, offset: int = 0
+) -> tuple[int, int]:
+    assert channel._ipc is not None
+    assert channel._eager_ptrs is not None
+    words = (ctypes.c_uint64(), ctypes.c_uint64())
+    for word, slot_ptrs in zip(words, channel._eager_ptrs, strict=True):
+        channel._ipc.cudaMemcpyAsync(
+            ctypes.addressof(word),
+            slot_ptrs[channel.rank] + offset,
+            ctypes.sizeof(word),
+            int(stream.cuda_stream),
+        )
+    stream.synchronize()
+    return words[0].value, words[1].value
+
+
+def _run_eager(
+    pool: PCIeOneshotAllReducePool, device: torch.device, rank: int, world_size: int
+) -> None:
     dtypes = (torch.float16, torch.bfloat16, torch.float32)
     numels = (8, 256, 4096, 32768)
     rank_sum = _rank_sum(world_size)
@@ -60,7 +86,6 @@ def _run_graph_scratch_reuse(
     world_size: int,
 ) -> None:
     stream = torch.cuda.Stream(device=device)
-    channel = pool.for_stream(stream)
     rank_sum = _rank_sum(world_size)
     layers = 17
     numel = 4096
@@ -77,7 +102,7 @@ def _run_graph_scratch_reuse(
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(stream), torch.cuda.graph(graph, stream=stream):
+    with pool.capture(stream) as channel, torch.cuda.graph(graph, stream=stream):
         for layer in range(layers):
             scratch.copy_(sources[layer])
             channel.all_reduce(scratch, out=outs[layer])
@@ -90,6 +115,30 @@ def _run_graph_scratch_reuse(
         for layer, out in enumerate(outs):
             base = float((iteration % 32) * 5 + layer)
             _assert_constant(out, world_size * base + rank_sum)
+
+    # A graph with an odd number of collectives must change its selected
+    # staging slot on every replay. Host-side selection would freeze here.
+    snapshots = [_local_eager_words(channel, stream)]
+    for iteration in (101, 102):
+        fill_sources(iteration)
+        graph.replay()
+        stream.synchronize()
+        snapshots.append(_local_eager_words(channel, stream))
+        for layer, out in enumerate(outs):
+            base = float((iteration % 32) * 5 + layer)
+            _assert_constant(out, world_size * base + rank_sum)
+    changed_slots = [
+        {
+            slot
+            for slot, (before, after) in enumerate(
+                zip(snapshots[index], snapshots[index + 1], strict=True)
+            )
+            if before != after
+        }
+        for index in range(2)
+    ]
+    assert all(len(changed) == 1 for changed in changed_slots)
+    assert changed_slots[0] != changed_slots[1]
 
 
 def _run_multistream(
