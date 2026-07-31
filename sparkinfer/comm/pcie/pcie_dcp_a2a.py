@@ -574,6 +574,9 @@ class PCIeDCPA2A:
                 ext.dispose(pointer)
                 runtime._ptr = 0
 
+        def detach_shared_ownership() -> None:
+            runtime._owned_buffers.clear()
+
         _finish_collective_runtime_setup(
             owner="PCIe DCP A2A",
             exchange_group=exchange_group,
@@ -581,6 +584,7 @@ class PCIeDCPA2A:
             shared=slab,
             local_error=init_error,
             local_cleanup=abort_native_runtime,
+            detach_shared_ownership=detach_shared_ownership,
         )
         return runtime
 

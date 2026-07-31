@@ -13,7 +13,10 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     _abort_collective_ipc_setup,
     _broadcast_gather_object,
     _compute_crossover_size,
+    _finish_collective_runtime_setup,
     _group_ranks,
+    _OwnedSharedBuffer,
+    _require_no_retained_ipc_setup,
     _require_full_grid_residency,
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _RETAINED_FAILED_IPC_EXPORTS,
@@ -874,6 +877,67 @@ def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypat
     assert cleanup_calls == 2
     assert ipc.closed == [2000]
     assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_initial_native_verdict_exchange_retains_complete_setup_until_retry(
+    monkeypatch,
+):
+    events = []
+
+    class FakeIPC:
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append(("close", ptr))
+
+        def cudaFree(self, ptr):
+            events.append(("free", ptr))
+
+    ipc = FakeIPC()
+    group = object()
+    status_round = 0
+
+    def exchange(local_status, exchange_group):
+        nonlocal status_round
+        assert exchange_group is group
+        status_round += 1
+        if status_round == 1:
+            raise RuntimeError("injected first native verdict exchange failure")
+        return [local_status, ()]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="must be coordinated by every rank") as exc:
+        _finish_collective_runtime_setup(
+            owner="PCIe twoshot proof",
+            exchange_group=group,
+            ipc=ipc,
+            shared=_OwnedSharedBuffer(
+                local_ptr=1000,
+                peer_ptrs=(1000, 2000),
+                remote_ptrs=(2000,),
+            ),
+            local_error=None,
+            local_cleanup=lambda: events.append(("dispose", 3000)),
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.local_ptr == 1000
+    assert retained.remote_ptrs == [2000]
+    assert retained.local_cleanup is not None
+    assert events == []
+    assert _RETAINED_FAILED_IPC_EXPORTS[retained.key] is retained
+
+    # The retained generation gate rejects another setup on this process group
+    # before CUDA allocation.  A caller may only retry after arranging the same
+    # retry call on every rank that participated in the failed exchange.
+    with pytest.raises(RuntimeError, match="retained CUDA IPC setup gate"):
+        _require_no_retained_ipc_setup(group)
+    assert events == []
+
+    retained.retry()
+    assert events == [("dispose", 3000), ("close", 2000), ("free", 1000)]
     assert _RETAINED_FAILED_IPC_EXPORTS == {}
 
 

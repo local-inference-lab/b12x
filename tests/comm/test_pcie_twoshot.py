@@ -10,9 +10,15 @@ import ctypes
 import os
 import time
 
+import pytest
 import torch
 import torch.distributed as dist
 
+from sparkinfer.comm.pcie.pcie_oneshot import (
+    PCIeOneshotAllReduce,
+    _OwnedSharedBuffer,
+    _RETAINED_FAILED_IPC_EXPORTS,
+)
 from sparkinfer.comm.pcie.pcie_twoshot import (
     PCIeTwoShotSP,
     quantize_per_row,
@@ -20,6 +26,101 @@ from sparkinfer.comm.pcie.pcie_twoshot import (
 
 ROWS = 4096
 ROW_ELEMS = 6144
+
+
+def test_factory_retains_twoshot_native_and_ipc_ownership_when_verdict_fails(
+    monkeypatch,
+) -> None:
+    events: list[tuple[str, int]] = []
+
+    class FakeIPC:
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append(("close", ptr))
+
+        def cudaFree(self, ptr):
+            events.append(("free", ptr))
+
+    class FakeExt:
+        @staticmethod
+        def init_twoshot(*args):
+            return 3000
+
+        @staticmethod
+        def dispose(ptr):
+            events.append(("dispose", ptr))
+
+    ipc = FakeIPC()
+    ext = FakeExt()
+    group = object()
+    shared = _OwnedSharedBuffer(
+        local_ptr=1000,
+        peer_ptrs=(1000, 2000),
+        remote_ptrs=(2000,),
+    )
+    preallocation_round = 0
+
+    def fake_preallocation(*, owner, exchange_group, setup):
+        nonlocal preallocation_round
+        assert exchange_group is group
+        preallocation_round += 1
+        if preallocation_round == 1:
+            return torch.device("cuda:0"), 8, 16
+        assert preallocation_round == 2
+        return ipc, ext, 1, 256, 64, 256, 512, 1280
+
+    verdict_round = 0
+
+    def exchange(local_status, exchange_group):
+        nonlocal verdict_round
+        assert exchange_group is group
+        verdict_round += 1
+        if verdict_round == 1:
+            raise RuntimeError("injected twoshot native verdict exchange failure")
+        return [local_status, ()]
+
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_twoshot._run_collective_preallocation_setup",
+        fake_preallocation,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_twoshot._require_full_grid_residency",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_twoshot._require_collective_contract",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        PCIeOneshotAllReduce,
+        "_allocate_shared_buffer",
+        classmethod(lambda cls, *args, **kwargs: shared),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        exchange,
+    )
+
+    with pytest.raises(RuntimeError, match="must be coordinated by every rank") as exc:
+        PCIeTwoShotSP.from_exchange_group(
+            exchange_group=group,
+            device="cuda:0",
+            max_rows=8,
+            row_elems=16,
+            ext_module=ext,
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.local_ptr == 1000
+    assert retained.remote_ptrs == [2000]
+    assert retained.local_cleanup is not None
+    assert events == []
+    assert _RETAINED_FAILED_IPC_EXPORTS[retained.key] is retained
+
+    retained.retry()
+    assert events == [("dispose", 3000), ("close", 2000), ("free", 1000)]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
 
 
 def _align_up(value: int, alignment: int) -> int:

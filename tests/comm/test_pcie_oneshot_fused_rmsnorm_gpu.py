@@ -234,9 +234,6 @@ def _run_graph(
         rank,
     )
     out = torch.empty_like(inp)
-    pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
-    pool.for_stream(channel_id="eager:fused-rmsnorm")
-
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with (
         pool.capture(channel_id="graph:fused-rmsnorm") as channel,
@@ -321,6 +318,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_concurrent_channels=2,
     )
     try:
+        pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
+        pool.for_stream(channel_id="eager:fused-rmsnorm")
         _run_eager(pool, device, rank)
         dist.barrier()
         _run_graph(pool, device, rank)

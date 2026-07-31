@@ -780,26 +780,61 @@ def _finish_collective_runtime_setup(
     shared: _OwnedSharedBuffer,
     local_error: BaseException | None,
     local_cleanup: Optional[Callable[[], None]] = None,
+    detach_shared_ownership: Optional[Callable[[], None]] = None,
 ) -> None:
     """Require every rank to construct its native runtime before returning."""
 
-    statuses = _exchange_setup_failures(
-        local_error,
-        exchange_group=exchange_group,
-        phase=f"{owner} native initialization",
-    )
-    if any(statuses):
-        _abort_collective_ipc_setup(
-            owner=owner,
-            setup_phase="native initialization",
-            setup_statuses=statuses,
+    try:
+        statuses = _exchange_setup_failures(
+            local_error,
             exchange_group=exchange_group,
+            phase=f"{owner} native initialization",
+        )
+    except Exception as exchange_error:
+        # A failed first verdict exchange cannot establish whether every rank
+        # observed the same outcome.  Do not locally dispose, unmap, or free:
+        # retain the complete native/import/export ownership set and the
+        # same-group generation gate until the caller deliberately coordinates
+        # retry() on every participating rank.  This is especially important
+        # for twoshot, whose runtime object is not constructed until after this
+        # verdict succeeds.
+        retained = _retain_failed_ipc_setup(
             ipc=ipc,
             local_ptr=shared.local_ptr,
+            exchange_group=exchange_group,
+            owner=owner,
+            phase="native initialization status exchange",
             remote_ptrs=shared.remote_ptrs,
-            local_error=local_error,
             local_cleanup=local_cleanup,
+            state="unmap",
         )
+        if detach_shared_ownership is not None:
+            detach_shared_ownership()
+        error = RuntimeError(
+            f"{owner} native initialization status exchange failed; CUDA IPC "
+            "native/import/export ownership was retained and retry must be "
+            "coordinated by every rank"
+        )
+        raise _attach_retryable_setup(error, retained) from exchange_error
+    if any(statuses):
+        try:
+            _abort_collective_ipc_setup(
+                owner=owner,
+                setup_phase="native initialization",
+                setup_statuses=statuses,
+                exchange_group=exchange_group,
+                ipc=ipc,
+                local_ptr=shared.local_ptr,
+                remote_ptrs=shared.remote_ptrs,
+                local_error=local_error,
+                local_cleanup=local_cleanup,
+            )
+        finally:
+            # Rollback either released the shared allocation or transferred it
+            # to a _RetryableIPCExport.  Prevent a partially constructed runtime
+            # finalizer from retaining or releasing the same resources again.
+            if detach_shared_ownership is not None:
+                detach_shared_ownership()
 
 
 def _coordinated_close_channels(
@@ -1474,6 +1509,11 @@ class PCIeOneshotAllReduce:
             if pointer:
                 ext.dispose(pointer)
                 runtime._ptr = 0
+            if hasattr(runtime, "rank_data"):
+                del runtime.rank_data
+
+        def detach_shared_ownership() -> None:
+            runtime._owned_buffers.clear()
 
         _finish_collective_runtime_setup(
             owner="PCIe oneshot",
@@ -1482,6 +1522,7 @@ class PCIeOneshotAllReduce:
             shared=channel_buffers.owned_buffer,
             local_error=init_error,
             local_cleanup=abort_native_runtime,
+            detach_shared_ownership=detach_shared_ownership,
         )
         return runtime
 
@@ -2539,6 +2580,11 @@ class PCIeOneshotAllReducePool:
             if pointer:
                 self._ext.dispose(pointer)
                 channel._ptr = 0
+            if hasattr(channel, "rank_data"):
+                del channel.rank_data
+
+        def detach_shared_ownership() -> None:
+            channel._owned_buffers.clear()
 
         _finish_collective_runtime_setup(
             owner="PCIe oneshot pool channel",
@@ -2547,6 +2593,7 @@ class PCIeOneshotAllReducePool:
             shared=channel_buffers.owned_buffer,
             local_error=init_error,
             local_cleanup=abort_native_runtime,
+            detach_shared_ownership=detach_shared_ownership,
         )
         channel._bind_stream_key(stream_key)
         self._all_channels.append(channel)
