@@ -29,7 +29,6 @@ AUTOTUNE_CEILING = 1 * 1024 * 1024
 AUTOTUNE_FINE_STEP = 8 * 1024
 IPC_SLAB_ALIGNMENT = 256
 ONESHOT_REQUIRED_SMS = 36
-_IMPLICIT_CAPTURE_CHANNEL_PREFIX = "__sparkinfer_capture__"
 
 # CUDA graph nodes and the native runtime retain raw pointers into rank_data.
 # GC cannot synchronize arbitrary streams, so an abandoned runtime must keep
@@ -37,6 +36,7 @@ _IMPLICIT_CAPTURE_CHANNEL_PREFIX = "__sparkinfer_capture__"
 # close() is the only path that removes this need.  A dict makes manual/finalizer
 # re-entry idempotent while the retained object prevents id reuse.
 _ABANDONED_PCIE_RUNTIME_QUARANTINE: dict[int, object] = {}
+_RETAINED_FAILED_IPC_EXPORTS: dict[tuple[int, int], "_RetryableIPCExport"] = {}
 _SetupResult = TypeVar("_SetupResult")
 
 
@@ -68,6 +68,12 @@ def _normalize_device(device: torch.device | int | str) -> torch.device:
     if isinstance(device, int):
         return torch.device(f"cuda:{device}")
     return torch.device(device)
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError("expected a CUDA device")
+    return torch.cuda.current_device() if device.index is None else int(device.index)
 
 
 def _current_stream_key(
@@ -129,10 +135,6 @@ def _normalize_logical_channel_id(channel_id: str) -> str:
     return normalized
 
 
-def _implicit_capture_channel_id(ordinal: int) -> str:
-    return f"{_IMPLICIT_CAPTURE_CHANNEL_PREFIX}:{int(ordinal)}"
-
-
 def _group_ranks(group: ProcessGroup) -> list[int]:
     world_size = dist.get_world_size(group=group)
     if hasattr(dist, "get_process_group_ranks"):
@@ -190,6 +192,35 @@ class _OwnedSharedBuffer:
     local_ptr: int
     peer_ptrs: tuple[int, ...]
     remote_ptrs: tuple[int, ...]
+
+
+@dataclass
+class _RetryableIPCExport:
+    ipc: CudaRTLibrary
+    local_ptr: int
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return id(self.ipc), int(self.local_ptr)
+
+    def retry(self) -> None:
+        if not self.local_ptr:
+            return
+        key = self.key
+        self.ipc.cudaFree(self.local_ptr)
+        self.local_ptr = 0
+        _RETAINED_FAILED_IPC_EXPORTS.pop(key, None)
+
+
+def _retain_failed_ipc_export(
+    ipc: CudaRTLibrary, local_ptr: int
+) -> _RetryableIPCExport:
+    key = id(ipc), int(local_ptr)
+    retained = _RETAINED_FAILED_IPC_EXPORTS.get(key)
+    if retained is None:
+        retained = _RetryableIPCExport(ipc=ipc, local_ptr=int(local_ptr))
+        _RETAINED_FAILED_IPC_EXPORTS[key] = retained
+    return retained
 
 
 def _format_setup_error(error: BaseException | None) -> tuple[str, ...]:
@@ -464,25 +495,42 @@ def _abort_collective_ipc_setup(
         raise error from local_error
 
     free_error: BaseException | None = None
+    retained_export: _RetryableIPCExport | None = None
     if local_ptr is not None:
         try:
             ipc.cudaFree(local_ptr)
         except Exception as exc:
             free_error = exc
-    free_statuses = _exchange_setup_failures(
-        free_error,
-        exchange_group=exchange_group,
-        phase=f"{setup_phase} rollback export free",
-    )
+            retained_export = _retain_failed_ipc_export(ipc, local_ptr)
+    try:
+        free_statuses = _exchange_setup_failures(
+            free_error,
+            exchange_group=exchange_group,
+            phase=f"{setup_phase} rollback export free",
+        )
+    except Exception as exchange_error:
+        error = RuntimeError(
+            _setup_failure_message(
+                owner,
+                f"{setup_phase} rollback export free status exchange",
+                setup_statuses,
+                exports_retained=retained_export is not None,
+            )
+        )
+        if retained_export is not None:
+            error.retryable_export = retained_export  # type: ignore[attr-defined]
+        raise error from (free_error or local_error or exchange_error)
     if any(free_statuses):
         error = RuntimeError(
             _setup_failure_message(
                 owner,
                 f"{setup_phase} rollback export free",
                 free_statuses,
-                exports_retained=False,
+                exports_retained=True,
             )
         )
+        if retained_export is not None:
+            error.retryable_export = retained_export  # type: ignore[attr-defined]
         raise error from (local_error or free_error)
 
     error = RuntimeError(
@@ -777,6 +825,7 @@ class PCIeOneshotAllReduce:
         signal_ptrs: Sequence[int],
         eager_buffer_ptrs0: Optional[Sequence[int]] = None,
         eager_buffer_ptrs1: Optional[Sequence[int]] = None,
+        eager_buffer_bytes: Optional[int] = None,
         exchange_group: Optional[ProcessGroup] = None,
         process_group: Optional[ProcessGroup] = None,
         ipc: Optional[CudaRTLibrary] = None,
@@ -785,69 +834,138 @@ class PCIeOneshotAllReduce:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         stream_affine: bool = True,
-        _factory_managed_setup: bool = False,
     ):
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self.device = _normalize_device(device)
-        self.exchange_group = _resolve_exchange_group(exchange_group, process_group)
-        # Compatibility alias for older callers that still refer to this as
-        # `process_group`.
-        self.process_group = self.exchange_group
-        self.max_size = int(max_size)
-        self._ipc = ipc
-        self._ext = ext_module
-        self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
-        self._owned_buffers = list(owned_buffers or [])
-        self._registered_input_ptrs: dict[int, tuple[int, ...]] = {}
-        self._stream_affine = bool(stream_affine)
-        self._owner_stream_key: Optional[int] = None
-        self._closed = False
-        self._ipc_imports_closed = False
-        self._ipc_exports_freed = False
-        self._coordinated_close_complete = False
-        self._native_ipc_import_close_failed = False
-        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        resolved_group = _resolve_exchange_group(exchange_group, process_group)
 
-        def validate_arguments() -> bool:
-            if self.world_size not in SUPPORTED_WORLD_SIZES:
-                raise ValueError(f"unsupported world size {self.world_size}")
-            if self.rank < 0 or self.rank >= self.world_size:
+        def normalize_and_validate():
+            device_obj = _normalize_device(device)
+            normalized_rank = int(rank)
+            normalized_world_size = int(world_size)
+            normalized_signals = tuple(int(ptr) for ptr in signal_ptrs)
+            normalized_eager0 = (
+                None
+                if eager_buffer_ptrs0 is None
+                else tuple(int(ptr) for ptr in eager_buffer_ptrs0)
+            )
+            normalized_eager1 = (
+                None
+                if eager_buffer_ptrs1 is None
+                else tuple(int(ptr) for ptr in eager_buffer_ptrs1)
+            )
+            normalized_max_size = int(max_size)
+            normalized_rank_data_bytes = int(rank_data_bytes)
+            normalized_eager_bytes = (
+                None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+            )
+            if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {normalized_world_size}")
+            if not 0 <= normalized_rank < normalized_world_size:
                 raise ValueError(
-                    f"invalid rank {self.rank} for world size {self.world_size}"
+                    f"invalid rank {normalized_rank} for world size "
+                    f"{normalized_world_size}"
                 )
-            if len(signal_ptrs) != self.world_size:
+            if len(normalized_signals) != normalized_world_size:
                 raise ValueError("signal_ptrs must match world size")
-            if (eager_buffer_ptrs0 is None) != (eager_buffer_ptrs1 is None):
+            if (normalized_eager0 is None) != (normalized_eager1 is None):
                 raise ValueError("eager buffers must be provided as a pair")
             if (
-                eager_buffer_ptrs0 is not None
-                and len(eager_buffer_ptrs0) != self.world_size
+                normalized_eager0 is not None
+                and len(normalized_eager0) != normalized_world_size
             ):
                 raise ValueError("eager_buffer_ptrs0 must match world size")
             if (
-                eager_buffer_ptrs1 is not None
-                and len(eager_buffer_ptrs1) != self.world_size
+                normalized_eager1 is not None
+                and len(normalized_eager1) != normalized_world_size
             ):
                 raise ValueError("eager_buffer_ptrs1 must match world size")
-            if ext_module is None and self.device.type != "cuda":
+            if normalized_max_size <= 0:
+                raise ValueError("max_size must be positive")
+            if normalized_rank_data_bytes <= 0:
+                raise ValueError("rank_data_bytes must be positive")
+            if normalized_eager0 is not None:
+                if normalized_eager_bytes is None:
+                    raise ValueError(
+                        "eager_buffer_bytes is required with eager buffer pointers"
+                    )
+                if normalized_eager_bytes <= 0:
+                    raise ValueError("eager_buffer_bytes must be positive")
+                if normalized_max_size > normalized_eager_bytes:
+                    raise ValueError("max_size exceeds eager buffer capacity")
+            if ext_module is None and device_obj.type != "cuda":
                 raise ValueError("PCIe oneshot allreduce requires a CUDA device")
-            return True
+            if device_obj.type == "cuda" and resolved_group is None:
+                raise ValueError(
+                    "exchange_group is required for a CUDA PCIe oneshot runtime; "
+                    "use from_exchange_group()"
+                )
+            if resolved_group is not None:
+                if device_obj.type != "cuda":
+                    raise ValueError(
+                        "distributed PCIe oneshot allreduce requires a CUDA device"
+                    )
+                group_rank = dist.get_rank(group=resolved_group)
+                group_world_size = dist.get_world_size(group=resolved_group)
+                if normalized_rank != group_rank:
+                    raise ValueError(
+                        f"supplied rank {normalized_rank} does not match process "
+                        f"group rank {group_rank}"
+                    )
+                if normalized_world_size != group_world_size:
+                    raise ValueError(
+                        f"supplied world size {normalized_world_size} does not "
+                        f"match process group size {group_world_size}"
+                    )
+            return (
+                device_obj,
+                normalized_rank,
+                normalized_world_size,
+                normalized_signals,
+                normalized_eager0,
+                normalized_eager1,
+                normalized_eager_bytes,
+                normalized_max_size,
+                normalized_rank_data_bytes,
+            )
 
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
-            _run_collective_preallocation_setup(
+        if resolved_group is not None:
+            normalized = _run_collective_preallocation_setup(
                 owner="PCIe oneshot direct constructor argument validation",
-                exchange_group=self.exchange_group,
-                setup=validate_arguments,
+                exchange_group=resolved_group,
+                setup=normalize_and_validate,
             )
         else:
-            validate_arguments()
+            normalized = normalize_and_validate()
 
-        if not _factory_managed_setup and self.device.type == "cuda":
+        (
+            device_obj,
+            normalized_rank,
+            normalized_world_size,
+            normalized_signals,
+            normalized_eager0,
+            normalized_eager1,
+            normalized_eager_bytes,
+            normalized_max_size,
+            normalized_rank_data_bytes,
+        ) = normalized
+
+        self._initialize_prepared_state(
+            rank=normalized_rank,
+            world_size=normalized_world_size,
+            device=device_obj,
+            signal_ptrs=normalized_signals,
+            eager_buffer_ptrs0=normalized_eager0,
+            eager_buffer_ptrs1=normalized_eager1,
+            eager_buffer_bytes=normalized_eager_bytes,
+            exchange_group=resolved_group,
+            ipc=ipc,
+            owned_buffers=owned_buffers,
+            max_size=normalized_max_size,
+            rank_data_bytes=normalized_rank_data_bytes,
+            ext_module=ext_module,
+            stream_affine=stream_affine,
+        )
+
+        if self.device.type == "cuda":
             _require_full_grid_residency(
                 owner="PCIe oneshot direct constructor",
                 required_sms=ONESHOT_REQUIRED_SMS,
@@ -860,7 +978,7 @@ class PCIeOneshotAllReduce:
                 if prepared_ipc is None and (ext_module is None or owned_buffers):
                     prepared_ipc = CudaRTLibrary()
                 if prepared_ipc is not None:
-                    prepared_ipc.cudaSetDevice(self.device.index or 0)
+                    prepared_ipc.cudaSetDevice(_cuda_device_index(self.device))
                 return prepared_ipc, ext_module or _load_extension()
 
             if self.exchange_group is None:
@@ -872,54 +990,23 @@ class PCIeOneshotAllReduce:
                     setup=prepare,
                 )
         else:
-            if self._ipc is None and (ext_module is None or owned_buffers):
-                self._ipc = CudaRTLibrary()
             self._ext = self._ext or _load_extension()
 
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
+        if self.device.type == "cuda" and self.exchange_group is not None:
             _require_collective_contract(
                 owner="PCIe oneshot direct constructor",
                 exchange_group=self.exchange_group,
                 contract=(
                     self.world_size,
-                    int(max_size),
-                    int(rank_data_bytes),
-                    eager_buffer_ptrs0 is not None,
+                    self.max_size,
+                    self.rank_data_bytes,
+                    self.eager_buffer_bytes,
+                    self._pending_eager_ptrs is not None,
                 ),
             )
 
-        self._ptr = 0
-        self._eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
-        init_error: BaseException | None = None
-        try:
-            self.rank_data = torch.empty(
-                rank_data_bytes, dtype=torch.uint8, device=self.device
-            )
-            self._ptr = self._ext.init_custom_ar(
-                list(self._signal_ptrs), self.rank_data, self.rank
-            )
-            if eager_buffer_ptrs0 is not None and eager_buffer_ptrs1 is not None:
-                self._eager_ptrs = (
-                    tuple(int(ptr) for ptr in eager_buffer_ptrs0),
-                    tuple(int(ptr) for ptr in eager_buffer_ptrs1),
-                )
-                self._ext.register_pcie_buffers(
-                    self._ptr,
-                    list(self._eager_ptrs[0]),
-                    list(self._eager_ptrs[1]),
-                )
-        except Exception as exc:
-            init_error = exc
-
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
+        init_error = self._initialize_native_runtime()
+        if self.device.type == "cuda" and self.exchange_group is not None:
 
             def abort_native_runtime() -> None:
                 if self._ptr:
@@ -935,6 +1022,90 @@ class PCIeOneshotAllReduce:
         elif init_error is not None:
             raise init_error
 
+    def _initialize_prepared_state(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        signal_ptrs: Sequence[int],
+        eager_buffer_ptrs0: Optional[Sequence[int]],
+        eager_buffer_ptrs1: Optional[Sequence[int]],
+        eager_buffer_bytes: Optional[int],
+        exchange_group: Optional[ProcessGroup],
+        ipc: Optional[CudaRTLibrary],
+        owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
+        max_size: int,
+        rank_data_bytes: int,
+        ext_module,
+        stream_affine: bool,
+    ) -> None:
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.device = device
+        self.exchange_group = exchange_group
+        self.process_group = exchange_group
+        self.max_size = int(max_size)
+        self.rank_data_bytes = int(rank_data_bytes)
+        self.eager_buffer_bytes = (
+            None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
+        self._ipc = ipc
+        self._ext = ext_module
+        self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
+        self._pending_eager_ptrs = (
+            None
+            if eager_buffer_ptrs0 is None or eager_buffer_ptrs1 is None
+            else (
+                tuple(int(ptr) for ptr in eager_buffer_ptrs0),
+                tuple(int(ptr) for ptr in eager_buffer_ptrs1),
+            )
+        )
+        self._owned_buffers = list(owned_buffers or [])
+        self._registered_input_ptrs: dict[int, tuple[int, ...]] = {}
+        self._stream_affine = bool(stream_affine)
+        self._owner_stream_key: Optional[int] = None
+        self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._native_ipc_import_close_failed = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        self._ptr = 0
+        self._eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
+
+    def _initialize_native_runtime(self) -> BaseException | None:
+        init_error: BaseException | None = None
+        try:
+            self.rank_data = torch.empty(
+                self.rank_data_bytes, dtype=torch.uint8, device=self.device
+            )
+            self._ptr = self._ext.init_custom_ar(
+                list(self._signal_ptrs), self.rank_data, self.rank
+            )
+            if self._pending_eager_ptrs is not None:
+                self._eager_ptrs = self._pending_eager_ptrs
+                self._ext.register_pcie_buffers(
+                    self._ptr,
+                    list(self._eager_ptrs[0]),
+                    list(self._eager_ptrs[1]),
+                )
+        except Exception as exc:
+            init_error = exc
+        finally:
+            self._pending_eager_ptrs = None
+        return init_error
+
+    @classmethod
+    def _from_prepared_factory(
+        cls,
+        **kwargs,
+    ) -> tuple["PCIeOneshotAllReduce", BaseException | None]:
+        runtime = object.__new__(cls)
+        runtime._initialize_prepared_state(**kwargs)
+        init_error = runtime._initialize_native_runtime()
+        return runtime, init_error
+
     @classmethod
     def from_ipc(
         cls,
@@ -945,6 +1116,7 @@ class PCIeOneshotAllReduce:
         signal_ptrs: Sequence[int],
         eager_buffer_ptrs0: Optional[Sequence[int]] = None,
         eager_buffer_ptrs1: Optional[Sequence[int]] = None,
+        eager_buffer_bytes: Optional[int] = None,
         exchange_group: Optional[ProcessGroup] = None,
         process_group: Optional[ProcessGroup] = None,
         max_size: int = DEFAULT_MAX_SIZE,
@@ -952,14 +1124,14 @@ class PCIeOneshotAllReduce:
         ext_module=None,
         stream_affine: bool = True,
     ) -> "PCIeOneshotAllReduce":
-        device_obj = _normalize_device(device)
         return cls(
             rank=rank,
             world_size=world_size,
-            device=device_obj,
+            device=device,
             signal_ptrs=signal_ptrs,
             eager_buffer_ptrs0=eager_buffer_ptrs0,
             eager_buffer_ptrs1=eager_buffer_ptrs1,
+            eager_buffer_bytes=eager_buffer_bytes,
             exchange_group=exchange_group,
             process_group=process_group,
             max_size=max_size,
@@ -982,12 +1154,38 @@ class PCIeOneshotAllReduce:
     ) -> "PCIeOneshotAllReduce":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
-        if world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(f"unsupported world size {world_size}")
 
-        device_obj = _normalize_device(device)
-        if device_obj.type != "cuda":
-            raise ValueError("PCIe oneshot requires a CUDA device")
+        def validate_factory_arguments():
+            device_obj = _normalize_device(device)
+            normalized_eager_bytes = int(eager_buffer_bytes)
+            normalized_max_size = int(max_size)
+            normalized_rank_data_bytes = int(rank_data_bytes)
+            if world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {world_size}")
+            if device_obj.type != "cuda":
+                raise ValueError("PCIe oneshot requires a CUDA device")
+            if normalized_eager_bytes <= 0:
+                raise ValueError("eager_buffer_bytes must be positive")
+            if normalized_max_size <= 0:
+                raise ValueError("max_size must be positive")
+            if normalized_max_size > normalized_eager_bytes:
+                raise ValueError("max_size exceeds eager buffer capacity")
+            if normalized_rank_data_bytes <= 0:
+                raise ValueError("rank_data_bytes must be positive")
+            return (
+                device_obj,
+                normalized_eager_bytes,
+                normalized_max_size,
+                normalized_rank_data_bytes,
+            )
+
+        device_obj, eager_buffer_bytes, max_size, rank_data_bytes = (
+            _run_collective_preallocation_setup(
+                owner="PCIe oneshot argument validation",
+                exchange_group=exchange_group,
+                setup=validate_factory_arguments,
+            )
+        )
 
         _require_full_grid_residency(
             owner="PCIe oneshot",
@@ -998,7 +1196,7 @@ class PCIeOneshotAllReduce:
 
         def prepare() -> tuple[CudaRTLibrary, object, int]:
             prepared_ipc = CudaRTLibrary()
-            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             prepared_ext = ext_module or _load_extension()
             return prepared_ipc, prepared_ext, int(prepared_ext.meta_size())
 
@@ -1012,7 +1210,9 @@ class PCIeOneshotAllReduce:
             exchange_group=exchange_group,
             contract=(
                 signal_bytes,
-                int(eager_buffer_bytes),
+                eager_buffer_bytes,
+                max_size,
+                rank_data_bytes,
                 _push_mode_enabled(),
             ),
         )
@@ -1024,28 +1224,22 @@ class PCIeOneshotAllReduce:
             ipc=ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
-        runtime = object.__new__(cls)
-        init_error: BaseException | None = None
-        try:
-            cls.__init__(
-                runtime,
-                rank=rank,
-                world_size=world_size,
-                device=device_obj,
-                signal_ptrs=channel_buffers.signal_ptrs,
-                eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
-                eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
-                exchange_group=exchange_group,
-                ipc=ipc,
-                owned_buffers=owned_buffers,
-                max_size=max_size,
-                rank_data_bytes=rank_data_bytes,
-                ext_module=ext,
-                stream_affine=stream_affine,
-                _factory_managed_setup=True,
-            )
-        except Exception as exc:
-            init_error = exc
+        runtime, init_error = cls._from_prepared_factory(
+            rank=rank,
+            world_size=world_size,
+            device=device_obj,
+            signal_ptrs=channel_buffers.signal_ptrs,
+            eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+            eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+            eager_buffer_bytes=eager_buffer_bytes,
+            exchange_group=exchange_group,
+            ipc=ipc,
+            owned_buffers=owned_buffers,
+            max_size=max_size,
+            rank_data_bytes=rank_data_bytes,
+            ext_module=ext,
+            stream_affine=stream_affine,
+        )
 
         def abort_native_runtime() -> None:
             pointer = getattr(runtime, "_ptr", 0)
@@ -1071,7 +1265,7 @@ class PCIeOneshotAllReduce:
         device: torch.device | int | str,
         max_input_bytes: int = DEFAULT_MAX_SIZE,
         eager_buffer_bytes: Optional[int] = None,
-        max_size: int = DEFAULT_MAX_SIZE,
+        max_size: Optional[int] = None,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         stream_affine: bool = True,
@@ -1082,7 +1276,7 @@ class PCIeOneshotAllReduce:
             eager_buffer_bytes=max_input_bytes
             if eager_buffer_bytes is None
             else eager_buffer_bytes,
-            max_size=max_size,
+            max_size=max_input_bytes if max_size is None else max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
             stream_affine=stream_affine,
@@ -1117,25 +1311,39 @@ class PCIeOneshotAllReduce:
         )
         if any(prepare_statuses):
             free_error: BaseException | None = None
+            retained_export: _RetryableIPCExport | None = None
             if local_ptr is not None:
                 try:
                     ipc.cudaFree(local_ptr)
                 except Exception as exc:
                     free_error = exc
-            free_statuses = _exchange_setup_failures(
-                free_error,
-                exchange_group=exchange_group,
-                phase="CUDA IPC export preparation rollback",
-            )
+                    retained_export = _retain_failed_ipc_export(ipc, local_ptr)
+            try:
+                free_statuses = _exchange_setup_failures(
+                    free_error,
+                    exchange_group=exchange_group,
+                    phase="CUDA IPC export preparation rollback",
+                )
+            except Exception as exchange_error:
+                error = RuntimeError(
+                    "failed to exchange CUDA IPC export rollback status; "
+                    "CUDA IPC exports were retained"
+                )
+                if retained_export is not None:
+                    error.retryable_export = retained_export  # type: ignore[attr-defined]
+                raise error from (free_error or prepare_error or exchange_error)
             if any(free_statuses):
-                raise RuntimeError(
+                error = RuntimeError(
                     _setup_failure_message(
                         "PCIe shared buffer",
                         "export preparation rollback",
                         free_statuses,
-                        exports_retained=False,
+                        exports_retained=True,
                     )
-                ) from (prepare_error or free_error)
+                )
+                if retained_export is not None:
+                    error.retryable_export = retained_export  # type: ignore[attr-defined]
+                raise error from (prepare_error or free_error)
             raise RuntimeError(
                 _setup_failure_message(
                     "PCIe shared buffer",
@@ -1563,6 +1771,9 @@ class PCIeOneshotAllReduce:
         if self.device.type != "cuda":
             raise ValueError("autotune requires a CUDA device")
         bench_stream = torch.cuda.Stream(device=self.device)
+        effective_ceiling = int(ceiling_bytes)
+        if self.eager_buffer_bytes is not None:
+            effective_ceiling = min(effective_ceiling, self.eager_buffer_bytes)
         crossover, results = _compute_crossover_size(
             lambda size_bytes: self._bench_graph_latency(
                 size_bytes,
@@ -1571,9 +1782,11 @@ class PCIeOneshotAllReduce:
                 warmup,
                 iters,
             ),
-            ceiling_bytes=ceiling_bytes,
+            ceiling_bytes=effective_ceiling,
             fine_step_bytes=fine_step_bytes,
         )
+        if self.eager_buffer_bytes is not None:
+            crossover = min(crossover, self.eager_buffer_bytes)
         self.max_size = crossover
 
         if self.rank == 0:
@@ -1803,25 +2016,85 @@ class PCIeOneshotAllReducePool:
             Callable[[Optional[int]], PCIeOneshotAllReduce]
         ] = None,
     ):
-        if world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(f"unsupported world size {world_size}")
-        if rank < 0 or rank >= world_size:
-            raise ValueError(f"invalid rank {rank} for world size {world_size}")
+        resolved_group = _resolve_exchange_group(exchange_group, process_group)
 
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self.device = _normalize_device(device)
-        self.exchange_group = _resolve_exchange_group(exchange_group, process_group)
+        def normalize_and_validate():
+            normalized_rank = int(rank)
+            normalized_world_size = int(world_size)
+            device_obj = _normalize_device(device)
+            normalized_eager_bytes = int(eager_buffer_bytes)
+            normalized_max_size = int(max_size)
+            normalized_rank_data_bytes = int(rank_data_bytes)
+            normalized_single_channel = bool(single_channel)
+            if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {normalized_world_size}")
+            if not 0 <= normalized_rank < normalized_world_size:
+                raise ValueError(
+                    f"invalid rank {normalized_rank} for world size "
+                    f"{normalized_world_size}"
+                )
+            if normalized_eager_bytes <= 0:
+                raise ValueError("eager_buffer_bytes must be positive")
+            if normalized_max_size <= 0:
+                raise ValueError("max_size must be positive")
+            if normalized_max_size > normalized_eager_bytes:
+                raise ValueError("max_size exceeds eager buffer capacity")
+            if normalized_rank_data_bytes <= 0:
+                raise ValueError("rank_data_bytes must be positive")
+            if channel_factory is None:
+                if resolved_group is None:
+                    raise ValueError(
+                        "exchange_group is required unless channel_factory is "
+                        "provided"
+                    )
+                if device_obj.type != "cuda":
+                    raise ValueError("PCIe oneshot pool requires a CUDA device")
+                group_rank = dist.get_rank(group=resolved_group)
+                group_world_size = dist.get_world_size(group=resolved_group)
+                if normalized_rank != group_rank:
+                    raise ValueError(
+                        f"supplied rank {normalized_rank} does not match process "
+                        f"group rank {group_rank}"
+                    )
+                if normalized_world_size != group_world_size:
+                    raise ValueError(
+                        f"supplied world size {normalized_world_size} does not "
+                        f"match process group size {group_world_size}"
+                    )
+            return (
+                normalized_rank,
+                normalized_world_size,
+                device_obj,
+                normalized_eager_bytes,
+                normalized_max_size,
+                normalized_rank_data_bytes,
+                normalized_single_channel,
+            )
+
+        if channel_factory is None and resolved_group is not None:
+            normalized = _run_collective_preallocation_setup(
+                owner="PCIe oneshot pool argument validation",
+                exchange_group=resolved_group,
+                setup=normalize_and_validate,
+            )
+        else:
+            normalized = normalize_and_validate()
+
+        (
+            self.rank,
+            self.world_size,
+            self.device,
+            self.eager_buffer_bytes,
+            self.max_size,
+            self.rank_data_bytes,
+            self.single_channel,
+        ) = normalized
+        self.exchange_group = resolved_group
         self.process_group = self.exchange_group
-        self.eager_buffer_bytes = int(eager_buffer_bytes)
-        self.max_size = int(max_size)
-        self.rank_data_bytes = int(rank_data_bytes)
-        self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeOneshotAllReduce] = {}
         self._logical_channels: dict[str, PCIeOneshotAllReduce] = {}
         self._captured_channel_ids: set[str] = set()
-        self._implicit_capture_ordinal = 0
         self._all_channels: list[PCIeOneshotAllReduce] = []
         self._capture_channel_stack: list[PCIeOneshotAllReduce] = []
         self._closed = False
@@ -1830,12 +2103,7 @@ class PCIeOneshotAllReducePool:
         self._ext = ext_module
         self._signal_bytes = 0
         if self._channel_factory is None:
-            if self.exchange_group is None:
-                raise ValueError(
-                    "exchange_group is required unless channel_factory is provided"
-                )
-            if self.device.type != "cuda":
-                raise ValueError("PCIe oneshot pool requires a CUDA device")
+            assert self.exchange_group is not None
             _require_full_grid_residency(
                 owner="PCIe oneshot",
                 required_sms=ONESHOT_REQUIRED_SMS,
@@ -1845,7 +2113,7 @@ class PCIeOneshotAllReducePool:
 
             def prepare() -> tuple[CudaRTLibrary, object, int]:
                 prepared_ipc = self._ipc or CudaRTLibrary()
-                prepared_ipc.cudaSetDevice(self.device.index or 0)
+                prepared_ipc.cudaSetDevice(_cuda_device_index(self.device))
                 prepared_ext = self._ext or _load_extension()
                 return (
                     prepared_ipc,
@@ -1866,6 +2134,9 @@ class PCIeOneshotAllReducePool:
                 contract=(
                     self._signal_bytes,
                     self.eager_buffer_bytes,
+                    self.max_size,
+                    self.rank_data_bytes,
+                    self.single_channel,
                     _push_mode_enabled(),
                 ),
             )
@@ -1906,7 +2177,7 @@ class PCIeOneshotAllReducePool:
         device: torch.device | int | str,
         max_input_bytes: int = DEFAULT_MAX_SIZE,
         eager_buffer_bytes: Optional[int] = None,
-        max_size: int = DEFAULT_MAX_SIZE,
+        max_size: Optional[int] = None,
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         single_channel: bool = False,
@@ -1917,7 +2188,7 @@ class PCIeOneshotAllReducePool:
             eager_buffer_bytes=max_input_bytes
             if eager_buffer_bytes is None
             else eager_buffer_bytes,
-            max_size=max_size,
+            max_size=max_input_bytes if max_size is None else max_size,
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
             single_channel=single_channel,
@@ -1942,28 +2213,22 @@ class PCIeOneshotAllReducePool:
             ipc=self._ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
-        channel = object.__new__(PCIeOneshotAllReduce)
-        init_error: BaseException | None = None
-        try:
-            PCIeOneshotAllReduce.__init__(
-                channel,
-                rank=self.rank,
-                world_size=self.world_size,
-                device=self.device,
-                signal_ptrs=channel_buffers.signal_ptrs,
-                eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
-                eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
-                exchange_group=self.exchange_group,
-                ipc=self._ipc,
-                owned_buffers=owned_buffers,
-                max_size=self.max_size,
-                rank_data_bytes=self.rank_data_bytes,
-                ext_module=self._ext,
-                stream_affine=not self.single_channel,
-                _factory_managed_setup=True,
-            )
-        except Exception as exc:
-            init_error = exc
+        channel, init_error = PCIeOneshotAllReduce._from_prepared_factory(
+            rank=self.rank,
+            world_size=self.world_size,
+            device=self.device,
+            signal_ptrs=channel_buffers.signal_ptrs,
+            eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
+            eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
+            eager_buffer_bytes=self.eager_buffer_bytes,
+            exchange_group=self.exchange_group,
+            ipc=self._ipc,
+            owned_buffers=owned_buffers,
+            max_size=self.max_size,
+            rank_data_bytes=self.rank_data_bytes,
+            ext_module=self._ext,
+            stream_affine=not self.single_channel,
+        )
 
         def abort_native_runtime() -> None:
             pointer = getattr(channel, "_ptr", 0)
@@ -2021,7 +2286,6 @@ class PCIeOneshotAllReducePool:
         dict[int, PCIeOneshotAllReduce],
         dict[str, PCIeOneshotAllReduce],
         set[str],
-        int,
     ]:
         """Snapshot channel ownership before a throwaway graph capture."""
         if self._closed:
@@ -2033,7 +2297,6 @@ class PCIeOneshotAllReducePool:
             dict(self._channels),
             dict(self._logical_channels),
             set(self._captured_channel_ids),
-            self._implicit_capture_ordinal,
         )
 
     def rollback_channels(
@@ -2053,22 +2316,12 @@ class PCIeOneshotAllReducePool:
             all_channels_len, channels = checkpoint
             logical_channels = dict(self._logical_channels)
             captured_channel_ids = set(self._captured_channel_ids)
-            implicit_capture_ordinal = self._implicit_capture_ordinal
         elif len(checkpoint) == 4:
             (
                 all_channels_len,
                 channels,
                 logical_channels,
                 captured_channel_ids,
-            ) = checkpoint
-            implicit_capture_ordinal = self._implicit_capture_ordinal
-        elif len(checkpoint) == 5:
-            (
-                all_channels_len,
-                channels,
-                logical_channels,
-                captured_channel_ids,
-                implicit_capture_ordinal,
             ) = checkpoint
         else:
             raise ValueError("invalid channel checkpoint")
@@ -2093,7 +2346,6 @@ class PCIeOneshotAllReducePool:
         self._channels = dict(channels)
         self._logical_channels = dict(logical_channels)
         self._captured_channel_ids = set(captured_channel_ids)
-        self._implicit_capture_ordinal = int(implicit_capture_ordinal)
 
     def for_stream(
         self,
@@ -2236,11 +2488,9 @@ class PCIeOneshotAllReducePool:
         callers that know the full graph set should call prepare_channels()
         once before capture.
 
-        The no-id compatibility path assigns a collective monotonically
-        ordered id to each outer capture. This keeps existing vLLM callers
-        safe when profiling, target, and draft graph managers reuse a local
-        CUDA stream handle. Every rank must enter these contexts in the same
-        order; ordinal or rank-count skew fails during collective preparation.
+        Distributed pools require this semantic id. A local capture ordinal or
+        CUDA stream handle cannot distinguish target and draft graphs when
+        ranks construct them in a different order, so guessing is unsafe.
         """
         previous_channels: Optional[dict[int, PCIeOneshotAllReduce]] = None
         if not self.single_channel and _is_current_stream_capturing(self.device):
@@ -2253,12 +2503,12 @@ class PCIeOneshotAllReducePool:
                 stream, channel_id="default" if channel_id is None else channel_id
             )
         elif self._channel_factory is None:
-            implicit_id = channel_id is None
-            logical_id = (
-                _implicit_capture_channel_id(self._implicit_capture_ordinal)
-                if implicit_id
-                else _normalize_logical_channel_id(channel_id)
-            )
+            if channel_id is None:
+                raise RuntimeError(
+                    "distributed PCIe oneshot capture requires a stable semantic "
+                    "channel_id shared by every rank"
+                )
+            logical_id = _normalize_logical_channel_id(channel_id)
             if logical_id in self._captured_channel_ids:
                 raise RuntimeError(
                     f"logical channel {logical_id!r} was already captured; each "
@@ -2273,8 +2523,6 @@ class PCIeOneshotAllReducePool:
             channel._bind_stream_key(stream_key)
             self._channels[channel_key] = channel
             self._captured_channel_ids.add(logical_id)
-            if implicit_id:
-                self._implicit_capture_ordinal += 1
         else:
             stream_key = _current_stream_key(self.device, stream)
             channel_key = 0 if stream_key is None else int(stream_key)

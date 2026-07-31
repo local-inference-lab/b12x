@@ -28,6 +28,7 @@ from .pcie_oneshot import (
     _raise_local_cleanup_errors,
     _align_up,
     _coordinated_close_channels,
+    _cuda_device_index,
     _normalize_device,
     _OwnedSharedBuffer,
     _require_collective_contract,
@@ -65,8 +66,12 @@ def quantize_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 class PCIeTwoShotSP:
     """Two-shot fp8-transport reduce_scatter / all_gather runtime."""
 
-    def __init__(
-        self,
+    def __init__(self, *args, **kwargs) -> None:
+        raise RuntimeError("use PCIeTwoShotSP.from_exchange_group()")
+
+    @classmethod
+    def _from_prepared_factory(
+        cls,
         *,
         rank: int,
         world_size: int,
@@ -78,7 +83,8 @@ class PCIeTwoShotSP:
         exchange_group: ProcessGroup,
         max_rows: int,
         row_elems: int,
-    ) -> None:
+    ) -> "PCIeTwoShotSP":
+        self = object.__new__(cls)
         self.rank = rank
         self.world_size = world_size
         self.device = device
@@ -94,6 +100,7 @@ class PCIeTwoShotSP:
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        return self
 
     @classmethod
     def from_exchange_group(
@@ -107,16 +114,28 @@ class PCIeTwoShotSP:
     ) -> "PCIeTwoShotSP":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
-        if world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(f"unsupported world size {world_size}")
-        if row_elems % 16 != 0:
-            raise ValueError("row_elems must be a multiple of 16")
-        if max_rows % world_size != 0:
-            raise ValueError("max_rows must be divisible by world size")
 
-        device_obj = _normalize_device(device)
-        if device_obj.type != "cuda":
-            raise ValueError("PCIe twoshot requires a CUDA device")
+        def validate_factory_arguments():
+            device_obj = _normalize_device(device)
+            normalized_max_rows = int(max_rows)
+            normalized_row_elems = int(row_elems)
+            if world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {world_size}")
+            if device_obj.type != "cuda":
+                raise ValueError("PCIe twoshot requires a CUDA device")
+            if normalized_max_rows <= 0:
+                raise ValueError("max_rows must be positive")
+            if normalized_row_elems <= 0 or normalized_row_elems % 16 != 0:
+                raise ValueError("row_elems must be a positive multiple of 16")
+            if normalized_max_rows % world_size != 0:
+                raise ValueError("max_rows must be divisible by world size")
+            return device_obj, normalized_max_rows, normalized_row_elems
+
+        device_obj, max_rows, row_elems = _run_collective_preallocation_setup(
+            owner="PCIe twoshot argument validation",
+            exchange_group=exchange_group,
+            setup=validate_factory_arguments,
+        )
 
         _require_full_grid_residency(
             owner="PCIe twoshot",
@@ -127,7 +146,7 @@ class PCIeTwoShotSP:
 
         def prepare():
             prepared_ipc = CudaRTLibrary()
-            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             prepared_ext = ext_module or _load_extension()
 
             # Per-slot staging: [world][pack_stride] Fp8Packs then
@@ -222,7 +241,7 @@ class PCIeTwoShotSP:
             local_error=init_error,
             local_cleanup=abort_native_runtime,
         )
-        return cls(
+        return cls._from_prepared_factory(
             rank=rank,
             world_size=world_size,
             device=device_obj,

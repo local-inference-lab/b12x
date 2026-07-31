@@ -24,8 +24,8 @@ from .pcie_oneshot import (
     _broadcast_gather_object,
     _coordinated_close_channels,
     _current_stream_key,
+    _cuda_device_index,
     _is_current_stream_capturing,
-    _implicit_capture_channel_id,
     _normalize_device,
     _normalize_logical_channel_id,
     _OwnedSharedBuffer,
@@ -198,63 +198,132 @@ class PCIeDCPA2A:
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]] = None,
         ext_module=None,
         stream_affine: bool = True,
-        _factory_managed_setup: bool = False,
     ) -> None:
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self.device = _normalize_device(device)
-        self.exchange_group = exchange_group
-        self.max_batch_size = int(max_batch_size)
-        self.total_heads = int(total_heads)
-        self.head_dim = int(head_dim)
-        self.query_head_dim = int(query_head_dim or head_dim)
-        self._ipc = ipc
-        self._owned_buffers = list(owned_buffers or ())
-        self._ext = ext_module
-        self._stream_affine = bool(stream_affine)
-        self._owner_stream_key: Optional[int] = None
-        self._closed = False
-        self._ipc_imports_closed = False
-        self._ipc_exports_freed = False
-        self._coordinated_close_complete = False
-        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
-
-        def validate_arguments() -> bool:
-            if self.world_size not in SUPPORTED_WORLD_SIZES:
-                raise ValueError(f"unsupported world size {self.world_size}")
-            if not 0 <= self.rank < self.world_size:
+        def normalize_and_validate():
+            device_obj = _normalize_device(device)
+            normalized_rank = int(rank)
+            normalized_world_size = int(world_size)
+            normalized_signals = tuple(int(ptr) for ptr in signal_ptrs)
+            normalized_staging0 = tuple(int(ptr) for ptr in staging0_ptrs)
+            normalized_staging1 = tuple(int(ptr) for ptr in staging1_ptrs)
+            normalized_max_batch = int(max_batch_size)
+            normalized_total_heads = int(total_heads)
+            normalized_head_dim = int(head_dim)
+            normalized_query_dim = int(
+                head_dim if query_head_dim is None else query_head_dim
+            )
+            normalized_output_capacity = int(output_capacity_elems)
+            normalized_lse_offset = int(lse_offset)
+            normalized_lse_capacity = int(lse_capacity)
+            if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {normalized_world_size}")
+            if not 0 <= normalized_rank < normalized_world_size:
                 raise ValueError(
-                    f"invalid rank {self.rank} for world size {self.world_size}"
+                    f"invalid rank {normalized_rank} for world size "
+                    f"{normalized_world_size}"
                 )
             if (
-                len(signal_ptrs) != self.world_size
-                or len(staging0_ptrs) != self.world_size
-                or len(staging1_ptrs) != self.world_size
+                len(normalized_signals) != normalized_world_size
+                or len(normalized_staging0) != normalized_world_size
+                or len(normalized_staging1) != normalized_world_size
             ):
                 raise ValueError("signal and staging pointers must match world size")
-            if self.total_heads <= 0 or self.total_heads % self.world_size != 0:
+            if normalized_max_batch <= 0:
+                raise ValueError("max_batch_size must be positive")
+            if (
+                normalized_total_heads <= 0
+                or normalized_total_heads % normalized_world_size != 0
+            ):
                 raise ValueError("total_heads must be divisible by world_size")
-            if self.head_dim <= 0 or self.head_dim % 8 != 0:
+            if normalized_head_dim <= 0 or normalized_head_dim % 8 != 0:
                 raise ValueError("head_dim must be a positive multiple of 8")
-            if self.query_head_dim <= 0 or self.query_head_dim % 8 != 0:
+            if normalized_query_dim <= 0 or normalized_query_dim % 8 != 0:
                 raise ValueError("query_head_dim must be a positive multiple of 8")
-            return True
+            required_output = (
+                normalized_max_batch
+                * normalized_total_heads
+                * max(normalized_head_dim, normalized_query_dim)
+            )
+            if normalized_output_capacity < required_output:
+                raise ValueError("output capacity is smaller than configured shape")
+            if normalized_lse_offset < 0:
+                raise ValueError("lse_offset must be non-negative")
+            if (
+                normalized_lse_capacity
+                < normalized_max_batch * normalized_total_heads
+            ):
+                raise ValueError("LSE capacity is smaller than configured shape")
+            if ext_module is None and device_obj.type != "cuda":
+                raise ValueError("PCIe DCP A2A requires a CUDA device")
+            if device_obj.type == "cuda" and exchange_group is None:
+                raise ValueError(
+                    "exchange_group is required for a CUDA PCIe DCP A2A runtime; "
+                    "use from_exchange_group()"
+                )
+            if exchange_group is not None:
+                if device_obj.type != "cuda":
+                    raise ValueError(
+                        "distributed PCIe DCP A2A requires a CUDA device"
+                    )
+                group_rank = dist.get_rank(group=exchange_group)
+                group_world_size = dist.get_world_size(group=exchange_group)
+                if normalized_rank != group_rank:
+                    raise ValueError(
+                        f"supplied rank {normalized_rank} does not match process "
+                        f"group rank {group_rank}"
+                    )
+                if normalized_world_size != group_world_size:
+                    raise ValueError(
+                        f"supplied world size {normalized_world_size} does not "
+                        f"match process group size {group_world_size}"
+                    )
+            return (
+                device_obj,
+                normalized_rank,
+                normalized_world_size,
+                normalized_signals,
+                normalized_staging0,
+                normalized_staging1,
+                normalized_max_batch,
+                normalized_total_heads,
+                normalized_head_dim,
+                normalized_query_dim,
+                normalized_output_capacity,
+                normalized_lse_offset,
+                normalized_lse_capacity,
+            )
 
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
-            _run_collective_preallocation_setup(
+        if exchange_group is not None:
+            normalized = _run_collective_preallocation_setup(
                 owner="PCIe DCP A2A direct constructor argument validation",
-                exchange_group=self.exchange_group,
-                setup=validate_arguments,
+                exchange_group=exchange_group,
+                setup=normalize_and_validate,
             )
         else:
-            validate_arguments()
-        self.heads_per_rank = self.total_heads // self.world_size
+            normalized = normalize_and_validate()
 
-        if not _factory_managed_setup and self.device.type == "cuda":
+        self._initialize_prepared_state(
+            rank=normalized[1],
+            world_size=normalized[2],
+            device=normalized[0],
+            signal_ptrs=normalized[3],
+            staging0_ptrs=normalized[4],
+            staging1_ptrs=normalized[5],
+            max_batch_size=normalized[6],
+            total_heads=normalized[7],
+            head_dim=normalized[8],
+            query_head_dim=normalized[9],
+            output_capacity_elems=normalized[10],
+            lse_offset=normalized[11],
+            lse_capacity=normalized[12],
+            exchange_group=exchange_group,
+            ipc=ipc,
+            owned_buffers=owned_buffers,
+            ext_module=ext_module,
+            stream_affine=stream_affine,
+        )
+
+        if self.device.type == "cuda":
             _require_full_grid_residency(
                 owner="PCIe DCP A2A direct constructor",
                 required_sms=DCP_A2A_REQUIRED_SMS,
@@ -276,11 +345,7 @@ class PCIeDCPA2A:
         else:
             self._ext = self._ext or _load_extension()
 
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
+        if self.device.type == "cuda" and self.exchange_group is not None:
             _require_collective_contract(
                 owner="PCIe DCP A2A direct constructor",
                 exchange_group=self.exchange_group,
@@ -290,32 +355,14 @@ class PCIeDCPA2A:
                     self.total_heads,
                     self.head_dim,
                     self.query_head_dim,
-                    int(output_capacity_elems),
-                    int(lse_offset),
-                    int(lse_capacity),
+                    self.output_capacity_elems,
+                    self.lse_offset,
+                    self.lse_capacity,
                 ),
             )
 
-        self._ptr = 0
-        init_error: BaseException | None = None
-        try:
-            self._ptr = self._ext.init_dcp_a2a(
-                list(signal_ptrs),
-                list(staging0_ptrs),
-                list(staging1_ptrs),
-                int(output_capacity_elems),
-                int(lse_offset),
-                int(lse_capacity),
-                self.rank,
-            )
-        except Exception as exc:
-            init_error = exc
-
-        if (
-            not _factory_managed_setup
-            and self.device.type == "cuda"
-            and self.exchange_group is not None
-        ):
+        init_error = self._initialize_native_runtime()
+        if self.device.type == "cuda" and self.exchange_group is not None:
 
             def abort_native_runtime() -> None:
                 if self._ptr:
@@ -330,6 +377,79 @@ class PCIeDCPA2A:
             )
         elif init_error is not None:
             raise init_error
+
+    def _initialize_prepared_state(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        signal_ptrs: Sequence[int],
+        staging0_ptrs: Sequence[int],
+        staging1_ptrs: Sequence[int],
+        max_batch_size: int,
+        total_heads: int,
+        head_dim: int,
+        query_head_dim: int,
+        output_capacity_elems: int,
+        lse_offset: int,
+        lse_capacity: int,
+        exchange_group: Optional[ProcessGroup],
+        ipc: Optional[CudaRTLibrary],
+        owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
+        ext_module,
+        stream_affine: bool,
+    ) -> None:
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.device = device
+        self.exchange_group = exchange_group
+        self.max_batch_size = int(max_batch_size)
+        self.total_heads = int(total_heads)
+        self.head_dim = int(head_dim)
+        self.query_head_dim = int(query_head_dim)
+        self.heads_per_rank = self.total_heads // self.world_size
+        self.output_capacity_elems = int(output_capacity_elems)
+        self.lse_offset = int(lse_offset)
+        self.lse_capacity = int(lse_capacity)
+        self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
+        self._staging0_ptrs = tuple(int(ptr) for ptr in staging0_ptrs)
+        self._staging1_ptrs = tuple(int(ptr) for ptr in staging1_ptrs)
+        self._ipc = ipc
+        self._owned_buffers = list(owned_buffers or ())
+        self._ext = ext_module
+        self._stream_affine = bool(stream_affine)
+        self._owner_stream_key: Optional[int] = None
+        self._closed = False
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        self._ptr = 0
+
+    def _initialize_native_runtime(self) -> BaseException | None:
+        init_error: BaseException | None = None
+        try:
+            self._ptr = self._ext.init_dcp_a2a(
+                list(self._signal_ptrs),
+                list(self._staging0_ptrs),
+                list(self._staging1_ptrs),
+                self.output_capacity_elems,
+                self.lse_offset,
+                self.lse_capacity,
+                self.rank,
+            )
+        except Exception as exc:
+            init_error = exc
+        return init_error
+
+    @classmethod
+    def _from_prepared_factory(
+        cls, **kwargs
+    ) -> tuple["PCIeDCPA2A", BaseException | None]:
+        runtime = object.__new__(cls)
+        runtime._initialize_prepared_state(**kwargs)
+        return runtime, runtime._initialize_native_runtime()
 
     @classmethod
     def from_exchange_group(
@@ -346,9 +466,49 @@ class PCIeDCPA2A:
     ) -> "PCIeDCPA2A":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
-        device_obj = _normalize_device(device)
-        if device_obj.type != "cuda":
-            raise ValueError("PCIe DCP A2A requires a CUDA device")
+
+        def validate_factory_arguments():
+            device_obj = _normalize_device(device)
+            normalized_max_batch = int(max_batch_size)
+            normalized_total_heads = int(total_heads)
+            normalized_head_dim = int(head_dim)
+            normalized_query_dim = int(
+                head_dim if query_head_dim is None else query_head_dim
+            )
+            if world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {world_size}")
+            if device_obj.type != "cuda":
+                raise ValueError("PCIe DCP A2A requires a CUDA device")
+            if normalized_max_batch <= 0:
+                raise ValueError("max_batch_size must be positive")
+            if (
+                normalized_total_heads <= 0
+                or normalized_total_heads % world_size != 0
+            ):
+                raise ValueError("total_heads must be divisible by world_size")
+            if normalized_head_dim <= 0 or normalized_head_dim % 8 != 0:
+                raise ValueError("head_dim must be a positive multiple of 8")
+            if normalized_query_dim <= 0 or normalized_query_dim % 8 != 0:
+                raise ValueError("query_head_dim must be a positive multiple of 8")
+            return (
+                device_obj,
+                normalized_max_batch,
+                normalized_total_heads,
+                normalized_head_dim,
+                normalized_query_dim,
+            )
+
+        (
+            device_obj,
+            max_batch_size,
+            total_heads,
+            head_dim,
+            query_head_dim,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe DCP A2A argument validation",
+            exchange_group=exchange_group,
+            setup=validate_factory_arguments,
+        )
 
         _require_full_grid_residency(
             owner="PCIe DCP A2A",
@@ -359,7 +519,7 @@ class PCIeDCPA2A:
 
         def prepare():
             prepared_ipc = CudaRTLibrary()
-            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
             prepared_ext = ext_module or _load_extension()
             layout = _staging_layout(
                 signal_bytes=int(prepared_ext.meta_size()),
@@ -383,7 +543,7 @@ class PCIeDCPA2A:
                 int(max_batch_size),
                 int(total_heads),
                 int(head_dim),
-                int(query_head_dim or head_dim),
+                int(query_head_dim),
                 layout,
             ),
         )
@@ -393,37 +553,30 @@ class PCIeDCPA2A:
             zero_fill=True,
             ipc=ipc,
         )
-        runtime = object.__new__(cls)
-        init_error: BaseException | None = None
-        try:
-            cls.__init__(
-                runtime,
-                rank=rank,
-                world_size=world_size,
-                device=device_obj,
-                signal_ptrs=slab.peer_ptrs,
-                staging0_ptrs=tuple(
-                    ptr + layout.staging0_offset for ptr in slab.peer_ptrs
-                ),
-                staging1_ptrs=tuple(
-                    ptr + layout.staging1_offset for ptr in slab.peer_ptrs
-                ),
-                max_batch_size=max_batch_size,
-                total_heads=total_heads,
-                head_dim=head_dim,
-                output_capacity_elems=layout.output_capacity_elems,
-                lse_offset=layout.lse_offset,
-                lse_capacity=layout.lse_capacity,
-                query_head_dim=query_head_dim,
-                exchange_group=exchange_group,
-                ipc=ipc,
-                owned_buffers=[slab],
-                ext_module=ext,
-                stream_affine=stream_affine,
-                _factory_managed_setup=True,
-            )
-        except Exception as exc:
-            init_error = exc
+        runtime, init_error = cls._from_prepared_factory(
+            rank=rank,
+            world_size=world_size,
+            device=device_obj,
+            signal_ptrs=slab.peer_ptrs,
+            staging0_ptrs=tuple(
+                ptr + layout.staging0_offset for ptr in slab.peer_ptrs
+            ),
+            staging1_ptrs=tuple(
+                ptr + layout.staging1_offset for ptr in slab.peer_ptrs
+            ),
+            max_batch_size=max_batch_size,
+            total_heads=total_heads,
+            head_dim=head_dim,
+            output_capacity_elems=layout.output_capacity_elems,
+            lse_offset=layout.lse_offset,
+            lse_capacity=layout.lse_capacity,
+            query_head_dim=query_head_dim,
+            exchange_group=exchange_group,
+            ipc=ipc,
+            owned_buffers=[slab],
+            ext_module=ext,
+            stream_affine=stream_affine,
+        )
 
         def abort_native_runtime() -> None:
             pointer = getattr(runtime, "_ptr", 0)
@@ -732,31 +885,93 @@ class PCIeDCPA2APool:
         single_channel: bool = False,
         channel_factory: Optional[Callable[[Optional[int]], PCIeDCPA2A]] = None,
     ) -> None:
-        if world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(f"unsupported world size {world_size}")
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self.device = _normalize_device(device)
-        self.max_batch_size = int(max_batch_size)
-        self.total_heads = int(total_heads)
-        self.head_dim = int(head_dim)
-        self.query_head_dim = int(query_head_dim or head_dim)
+        def normalize_and_validate():
+            normalized_rank = int(rank)
+            normalized_world_size = int(world_size)
+            device_obj = _normalize_device(device)
+            normalized_max_batch = int(max_batch_size)
+            normalized_total_heads = int(total_heads)
+            normalized_head_dim = int(head_dim)
+            normalized_query_dim = int(
+                head_dim if query_head_dim is None else query_head_dim
+            )
+            normalized_single_channel = bool(single_channel)
+            if normalized_world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {normalized_world_size}")
+            if not 0 <= normalized_rank < normalized_world_size:
+                raise ValueError(
+                    f"invalid rank {normalized_rank} for world size "
+                    f"{normalized_world_size}"
+                )
+            if normalized_max_batch <= 0:
+                raise ValueError("max_batch_size must be positive")
+            if (
+                normalized_total_heads <= 0
+                or normalized_total_heads % normalized_world_size != 0
+            ):
+                raise ValueError("total_heads must be divisible by world_size")
+            if normalized_head_dim <= 0 or normalized_head_dim % 8 != 0:
+                raise ValueError("head_dim must be a positive multiple of 8")
+            if normalized_query_dim <= 0 or normalized_query_dim % 8 != 0:
+                raise ValueError("query_head_dim must be a positive multiple of 8")
+            if channel_factory is None:
+                if exchange_group is None:
+                    raise ValueError(
+                        "exchange_group is required unless channel_factory is set"
+                    )
+                if device_obj.type != "cuda":
+                    raise ValueError("PCIe DCP A2A pool requires a CUDA device")
+                group_rank = dist.get_rank(group=exchange_group)
+                group_world_size = dist.get_world_size(group=exchange_group)
+                if normalized_rank != group_rank:
+                    raise ValueError(
+                        f"supplied rank {normalized_rank} does not match process "
+                        f"group rank {group_rank}"
+                    )
+                if normalized_world_size != group_world_size:
+                    raise ValueError(
+                        f"supplied world size {normalized_world_size} does not "
+                        f"match process group size {group_world_size}"
+                    )
+            return (
+                normalized_rank,
+                normalized_world_size,
+                device_obj,
+                normalized_max_batch,
+                normalized_total_heads,
+                normalized_head_dim,
+                normalized_query_dim,
+                normalized_single_channel,
+            )
+
+        if channel_factory is None and exchange_group is not None:
+            normalized = _run_collective_preallocation_setup(
+                owner="PCIe DCP A2A pool argument validation",
+                exchange_group=exchange_group,
+                setup=normalize_and_validate,
+            )
+        else:
+            normalized = normalize_and_validate()
+        (
+            self.rank,
+            self.world_size,
+            self.device,
+            self.max_batch_size,
+            self.total_heads,
+            self.head_dim,
+            self.query_head_dim,
+            self.single_channel,
+        ) = normalized
         self.exchange_group = exchange_group
         self._ext = ext_module
-        self.single_channel = bool(single_channel)
         self._channel_factory = channel_factory
         self._channels: dict[int, PCIeDCPA2A] = {}
         self._logical_channels: dict[str, PCIeDCPA2A] = {}
         self._captured_channel_ids: set[str] = set()
-        self._implicit_capture_ordinal = 0
         self._all_channels: list[PCIeDCPA2A] = []
         self._capture_channel_stack: list[PCIeDCPA2A] = []
         self._closed = False
-        if channel_factory is None and exchange_group is None:
-            raise ValueError("exchange_group is required unless channel_factory is set")
         if channel_factory is None:
-            if self.device.type != "cuda":
-                raise ValueError("PCIe DCP A2A pool requires a CUDA device")
             self.prepare_channels(("default",))
 
     @classmethod
@@ -861,7 +1076,6 @@ class PCIeDCPA2APool:
         dict[int, PCIeDCPA2A],
         dict[str, PCIeDCPA2A],
         set[str],
-        int,
     ]:
         """Snapshot channel ownership before a throwaway graph capture."""
         if self._closed:
@@ -873,7 +1087,6 @@ class PCIeDCPA2APool:
             dict(self._channels),
             dict(self._logical_channels),
             set(self._captured_channel_ids),
-            self._implicit_capture_ordinal,
         )
 
     def rollback_channels(
@@ -893,22 +1106,12 @@ class PCIeDCPA2APool:
             all_channels_len, channels = checkpoint
             logical_channels = dict(self._logical_channels)
             captured_channel_ids = set(self._captured_channel_ids)
-            implicit_capture_ordinal = self._implicit_capture_ordinal
         elif len(checkpoint) == 4:
             (
                 all_channels_len,
                 channels,
                 logical_channels,
                 captured_channel_ids,
-            ) = checkpoint
-            implicit_capture_ordinal = self._implicit_capture_ordinal
-        elif len(checkpoint) == 5:
-            (
-                all_channels_len,
-                channels,
-                logical_channels,
-                captured_channel_ids,
-                implicit_capture_ordinal,
             ) = checkpoint
         else:
             raise ValueError("invalid channel checkpoint")
@@ -935,7 +1138,6 @@ class PCIeDCPA2APool:
         self._channels = dict(channels)
         self._logical_channels = dict(logical_channels)
         self._captured_channel_ids = set(captured_channel_ids)
-        self._implicit_capture_ordinal = int(implicit_capture_ordinal)
 
     def for_stream(
         self,
@@ -1068,10 +1270,8 @@ class PCIeDCPA2APool:
         rank ids differ. Production callers should pre-prepare the full set of
         independently replayable graph ids before entering any capture.
 
-        For compatibility, omitting the id assigns a collective monotonic id
-        to each outer capture. This isolates existing vLLM profiling, target,
-        and draft graph managers even when their local CUDA stream handles are
-        recycled. All ranks must enter no-id captures in the same order.
+        Distributed pools require this semantic id. Local ordinals and stream
+        handles cannot identify target versus draft graphs across ranks.
         """
         previous_channels: Optional[dict[int, PCIeDCPA2A]] = None
         if not self.single_channel and _is_current_stream_capturing(self.device):
@@ -1084,12 +1284,12 @@ class PCIeDCPA2APool:
                 stream, channel_id="default" if channel_id is None else channel_id
             )
         elif self._channel_factory is None:
-            implicit_id = channel_id is None
-            logical_id = (
-                _implicit_capture_channel_id(self._implicit_capture_ordinal)
-                if implicit_id
-                else _normalize_logical_channel_id(channel_id)
-            )
+            if channel_id is None:
+                raise RuntimeError(
+                    "distributed PCIe DCP A2A capture requires a stable semantic "
+                    "channel_id shared by every rank"
+                )
+            logical_id = _normalize_logical_channel_id(channel_id)
             if logical_id in self._captured_channel_ids:
                 raise RuntimeError(
                     f"logical channel {logical_id!r} was already captured; each "
@@ -1104,8 +1304,6 @@ class PCIeDCPA2APool:
             channel._bind_stream_key(stream_key)
             self._channels[key] = channel
             self._captured_channel_ids.add(logical_id)
-            if implicit_id:
-                self._implicit_capture_ordinal += 1
         else:
             previous_channels = dict(self._channels)
             stream_key = _current_stream_key(self.device, stream)

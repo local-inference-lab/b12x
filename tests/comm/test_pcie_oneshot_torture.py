@@ -102,7 +102,10 @@ def _run_graph_scratch_reuse(
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(stream) as channel, torch.cuda.graph(graph, stream=stream):
+    with (
+        pool.capture(stream, channel_id="graph:torture") as channel,
+        torch.cuda.graph(graph, stream=stream),
+    ):
         for layer in range(layers):
             scratch.copy_(sources[layer])
             channel.all_reduce(scratch, out=outs[layer])
@@ -159,8 +162,8 @@ def _run_multistream(
 ) -> None:
     stream_a = torch.cuda.Stream(device=device)
     stream_b = torch.cuda.Stream(device=device)
-    pool.for_stream(stream_a)
-    pool.for_stream(stream_b)
+    pool.for_stream(stream_a, channel_id="eager:a")
+    pool.for_stream(stream_b, channel_id="eager:b")
     rank_sum = _rank_sum(world_size)
 
     inp_a = torch.empty(2048, device=device, dtype=torch.float16)
@@ -173,10 +176,10 @@ def _run_multistream(
         base_b = float(100 + (iteration % 64) * 2)
         with torch.cuda.stream(stream_a):
             inp_a.fill_(base_a + rank)
-            pool.all_reduce(inp_a, out=out_a)
+            pool.all_reduce(inp_a, out=out_a, channel_id="eager:a")
         with torch.cuda.stream(stream_b):
             inp_b.fill_(base_b + rank)
-            pool.all_reduce(inp_b, out=out_b)
+            pool.all_reduce(inp_b, out=out_b, channel_id="eager:b")
         stream_a.synchronize()
         stream_b.synchronize()
         _assert_constant(out_a, world_size * base_a + rank_sum)
@@ -198,6 +201,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_input_bytes=1 << 20,
     )
     try:
+        pool.prepare_channels(("eager:a", "eager:b", "graph:torture"))
         _run_eager(pool, device, rank, world_size)
         dist.barrier()
         _run_graph_scratch_reuse(pool, device, rank, world_size)

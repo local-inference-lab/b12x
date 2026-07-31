@@ -16,8 +16,9 @@ def _mock_collective_failure(monkeypatch) -> None:
         phase,
         exports_retained_on_exchange_failure=True,
     ):
-        assert local_error is not None
         assert not exports_retained_on_exchange_failure
+        if local_error is None:
+            return ((), ())
         return ((f"RuntimeError: {local_error}",), ())
 
     monkeypatch.setattr(oneshot, "_exchange_setup_failures", exchange)
@@ -111,6 +112,7 @@ def test_direct_constructor_coordinates_argument_failure_before_residency(
             "_require_full_grid_residency",
             lambda **kwargs: pytest.fail("residency gate must not start"),
         )
+
         def constructor():
             return oneshot.PCIeOneshotAllReduce(
                 rank=0,
@@ -126,6 +128,7 @@ def test_direct_constructor_coordinates_argument_failure_before_residency(
             "_require_full_grid_residency",
             lambda **kwargs: pytest.fail("residency gate must not start"),
         )
+
         def constructor():
             return dcp.PCIeDCPA2A(
                 rank=0,
@@ -165,6 +168,12 @@ def test_exported_direct_constructor_contains_capability_and_setup_coordination(
     assert "_require_full_grid_residency(" in source
     assert "_run_collective_preallocation_setup(" in source
     assert "_finish_collective_unowned_runtime_setup(" in source
+    assert "_factory_managed_setup" not in source
+
+
+def test_twoshot_direct_construction_cannot_bypass_factory_gates() -> None:
+    with pytest.raises(RuntimeError, match="from_exchange_group"):
+        twoshot.PCIeTwoShotSP()
 
 
 def test_oneshot_direct_cuda_constructor_executes_all_collective_gates(
@@ -205,6 +214,8 @@ def test_oneshot_direct_cuda_constructor_executes_all_collective_gates(
         lambda **kwargs: events.append("native-verdict"),
     )
     monkeypatch.setattr(oneshot.torch, "empty", lambda *args, **kwargs: FakeTensor())
+    monkeypatch.setattr(oneshot.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(oneshot.dist, "get_world_size", lambda group=None: 2)
 
     runtime = oneshot.PCIeOneshotAllReduce(
         rank=0,
@@ -259,6 +270,8 @@ def test_dcp_direct_cuda_constructor_executes_all_collective_gates(
         "_finish_collective_unowned_runtime_setup",
         lambda **kwargs: events.append("native-verdict"),
     )
+    monkeypatch.setattr(dcp.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(dcp.dist, "get_world_size", lambda group=None: 2)
 
     runtime = dcp.PCIeDCPA2A(
         rank=0,

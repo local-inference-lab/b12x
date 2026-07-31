@@ -235,9 +235,13 @@ def _run_graph(
     )
     out = torch.empty_like(inp)
     pool.for_stream()
+    pool.prepare_channels(("graph:fused-rmsnorm",))
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with pool.capture() as channel, torch.cuda.graph(graph):
+    with (
+        pool.capture(channel_id="graph:fused-rmsnorm") as channel,
+        torch.cuda.graph(graph),
+    ):
         pool.all_reduce_fused_add_rms_norm(
             inp,
             residual,

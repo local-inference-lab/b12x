@@ -103,6 +103,7 @@ def _make_runtime(
     if eager:
         kwargs["eager_buffer_ptrs0"] = tuple(range(200, 200 + world_size))
         kwargs["eager_buffer_ptrs1"] = tuple(range(300, 300 + world_size))
+        kwargs["eager_buffer_bytes"] = max_size
     return PCIeOneshotAllReduce(
         rank=rank,
         world_size=world_size,
