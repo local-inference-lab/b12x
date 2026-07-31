@@ -2471,7 +2471,10 @@ class MoEMicroKernelBackend:
             # ---- FC1 weight load + dot product ----
             ebase_w = Int64(eid) * Int64(cfg.two_n) * Int64(cfg.k_half)
             ebase_sf = Int64(eid) * Int64(cfg.w1_sf_rows * cfg.w1_sf_cols)
-            ebase_sf_packed = Int64(eid) * Int64((cfg.k_dim // 32) * cfg.two_n)
+            e8m0_w1_n_cols = _align_up(cfg.two_n, 64)
+            ebase_sf_packed = Int64(eid) * Int64(
+                (cfg.k_dim // 32) * e8m0_w1_n_cols
+            )
             ebase_sf_packed_e4m3 = Int64(eid) * Int64(
                 (cfg.k_dim // 16) * _align_up(cfg.two_n, 64)
             )
@@ -2644,7 +2647,7 @@ class MoEMicroKernelBackend:
 
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                            nc1 = Int32(cfg.two_n)
+                            nc1 = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -2768,7 +2771,7 @@ class MoEMicroKernelBackend:
 
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbbg = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                        nc1g = Int32(cfg.two_n)
+                        nc1g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -3085,7 +3088,7 @@ class MoEMicroKernelBackend:
                         sf_u5 = Float32(0.0)
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb_u = lane_seg_base >> Int32(1)
-                            nc_u = Int32(cfg.two_n)
+                            nc_u = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -3225,7 +3228,7 @@ class MoEMicroKernelBackend:
                     sf_g5 = Float32(0.0)
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbb_g = lane_seg_base >> Int32(1)
-                        nc_g = Int32(cfg.two_n)
+                        nc_g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -3463,7 +3466,7 @@ class MoEMicroKernelBackend:
 
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb_u = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                            nc_u = Int32(cfg.two_n)
+                            nc_u = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -3645,7 +3648,7 @@ class MoEMicroKernelBackend:
 
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbb_g = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                        nc_g = Int32(cfg.two_n)
+                        nc_g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -3940,7 +3943,7 @@ class MoEMicroKernelBackend:
                                 ebase_sf_packed,
                                 lane,
                                 row_u,
-                                Int32(cfg.two_n),
+                                Int32(e8m0_w1_n_cols),
                                 Int32(cfg.k_dim // 32),
                             )
                             sf_u1 = sf_u0
@@ -3976,7 +3979,7 @@ class MoEMicroKernelBackend:
                             ebase_sf_packed,
                             lane,
                             row_g,
-                            Int32(cfg.two_n),
+                            Int32(e8m0_w1_n_cols),
                             Int32(cfg.k_dim // 32),
                         )
                         sf_g1 = sf_g0
@@ -4470,7 +4473,7 @@ class MoEMicroKernelBackend:
                                         ebase_sf_packed,
                                         scale_col >> Int32(1),
                                         row_g,
-                                        Int32(cfg.two_n),
+                                        Int32(e8m0_w1_n_cols),
                                         Int32(cfg.k_dim // 32),
                                     )
                                     if valid_seg > Int32(0)
@@ -4527,7 +4530,7 @@ class MoEMicroKernelBackend:
                                             ebase_sf_packed,
                                             scale_col >> Int32(1),
                                             row_u,
-                                            Int32(cfg.two_n),
+                                            Int32(e8m0_w1_n_cols),
                                             Int32(cfg.k_dim // 32),
                                         )
                                         if valid_seg > Int32(0)
