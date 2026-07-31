@@ -30,10 +30,12 @@ from .pcie_oneshot import (
     _coordinated_close_channels,
     _normalize_device,
     _OwnedSharedBuffer,
+    _require_full_grid_residency,
 )
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
 FP8_MAX = 448.0
+TWOSHOT_REQUIRED_SMS = 64
 
 
 @lru_cache(maxsize=1)
@@ -114,6 +116,12 @@ class PCIeTwoShotSP:
         if device_obj.type != "cuda":
             raise ValueError("PCIe twoshot requires a CUDA device")
 
+        _require_full_grid_residency(
+            owner="PCIe twoshot",
+            required_sms=TWOSHOT_REQUIRED_SMS,
+            device=device_obj,
+            exchange_group=exchange_group,
+        )
         ipc = CudaRTLibrary()
         ipc.cudaSetDevice(device_obj.index or 0)
         ext = ext_module or _load_extension()

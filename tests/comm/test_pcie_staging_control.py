@@ -109,6 +109,40 @@ def test_fused_rms_residency_is_runtime_derived_and_capture_cached() -> None:
     assert cap(3, 2, 8) == 3
 
 
+@pytest.mark.parametrize(
+    ("source_name", "python_name", "constant_name", "required_sms"),
+    (
+        ("pcie_oneshot.cu", "pcie_oneshot.py", "ONESHOT_REQUIRED_SMS", 36),
+        ("pcie_twoshot.cu", "pcie_twoshot.py", "TWOSHOT_REQUIRED_SMS", 64),
+        ("pcie_dcp_a2a.cu", "pcie_dcp_a2a.py", "DCP_A2A_REQUIRED_SMS", 64),
+    ),
+)
+def test_peer_waiting_grid_is_fully_resident_or_rejected_before_ipc(
+    source_name: str,
+    python_name: str,
+    constant_name: str,
+    required_sms: int,
+) -> None:
+    source = (PCIE / source_name).read_text(encoding="utf-8")
+    wrapper = (PCIE / python_name).read_text(encoding="utf-8")
+
+    assert f"constexpr int kMaxBlocks = {required_sms};" in source
+    assert source.count("__global__ void __launch_bounds__(512, 1)") == 2
+    assert f"{constant_name} = {required_sms}" in wrapper
+    assert "_require_full_grid_residency(" in wrapper
+
+    # All peer-waiting worker launches use no dynamic shared memory. Combined
+    # with launch_bounds(..., 1), one CTA is resident per visible SM; requiring
+    # kMaxBlocks SMs makes every possible worker CTA simultaneously resident.
+    worker_launches = [
+        line
+        for line in source.splitlines()
+        if "<<<blocks, threads, 0, stream>>>" in line
+    ]
+    assert worker_launches
+    assert all(", 0, stream>>>" in line for line in worker_launches)
+
+
 def test_oneshot_control_is_staged_only_and_precedes_each_worker() -> None:
     source = (PCIE / "pcie_oneshot.cu").read_text(encoding="utf-8")
     control_launch = "advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);"

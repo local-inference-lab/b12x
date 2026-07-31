@@ -26,11 +26,13 @@ from .pcie_oneshot import (
     _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
+    _require_full_grid_residency,
 )
 
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+DCP_A2A_REQUIRED_SMS = 64
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -256,6 +258,12 @@ class PCIeDCPA2A:
         if device_obj.type != "cuda":
             raise ValueError("PCIe DCP A2A requires a CUDA device")
 
+        _require_full_grid_residency(
+            owner="PCIe DCP A2A",
+            required_sms=DCP_A2A_REQUIRED_SMS,
+            device=device_obj,
+            exchange_group=exchange_group,
+        )
         ipc = CudaRTLibrary()
         ipc.cudaSetDevice(device_obj.index or 0)
         ext = ext_module or _load_extension()

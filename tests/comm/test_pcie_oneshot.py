@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,6 +12,7 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     _broadcast_gather_object,
     _compute_crossover_size,
     _group_ranks,
+    _require_full_grid_residency,
     parse_pcie_oneshot_max_size,
 )
 
@@ -127,6 +130,56 @@ def test_parse_pcie_oneshot_max_size_accepts_auto_and_suffixes():
     assert parse_pcie_oneshot_max_size("64KB") == 64 * 1024
     assert parse_pcie_oneshot_max_size("2m") == 2 * 1024 * 1024
     assert parse_pcie_oneshot_max_size(4096) == 4096
+
+
+def test_full_grid_residency_accepts_device_with_enough_visible_sms(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=84),
+    )
+
+    _require_full_grid_residency(
+        owner="test collective",
+        required_sms=64,
+        device=torch.device("cuda:0"),
+        exchange_group=None,
+    )
+
+
+def test_full_grid_residency_rejects_mig_like_capacity_collectively(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=84),
+    )
+    monkeypatch.setenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "32")
+    exchanged = []
+
+    def exchange(local_error, *, exchange_group, phase):
+        exchanged.append((local_error, exchange_group, phase))
+        return ((f"RuntimeError: {local_error}",), ())
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._exchange_setup_failures", exchange
+    )
+
+    group = object()
+    with pytest.raises(RuntimeError, match="requires at least 64 visible SMs") as exc:
+        _require_full_grid_residency(
+            owner="test collective",
+            required_sms=64,
+            device=torch.device("cuda:0"),
+            exchange_group=group,
+        )
+
+    assert exchanged
+    assert exchanged[0][1:] == (group, "test collective resident-grid capability")
+    assert "exports were retained" not in str(exc.value)
 
 
 def test_compute_crossover_size_runs_fine_sweep():

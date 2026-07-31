@@ -28,6 +28,7 @@ DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
 AUTOTUNE_CEILING = 1 * 1024 * 1024
 AUTOTUNE_FINE_STEP = 8 * 1024
 IPC_SLAB_ALIGNMENT = 256
+ONESHOT_REQUIRED_SMS = 36
 
 
 def parse_pcie_oneshot_max_size(value: str | int | None) -> Optional[int]:
@@ -201,6 +202,64 @@ def _exchange_setup_failures(
             )
         statuses.append(tuple(str(item) for item in status))
     return tuple(statuses)
+
+
+def _require_full_grid_residency(
+    *,
+    owner: str,
+    required_sms: int,
+    device: torch.device,
+    exchange_group: Optional[ProcessGroup],
+) -> None:
+    """Reject devices where a peer-waiting worker grid may not all reside.
+
+    The PCIe worker kernels use ``__launch_bounds__(512, 1)`` and zero dynamic
+    shared memory, so every visible SM can host at least one worker CTA.  A
+    device with at least the extension's maximum block count can therefore
+    make the complete grid resident regardless of block scheduling order.  We
+    intentionally reject smaller/MIG-like slices instead of assuming CUDA
+    schedules matching block indices in the same order on every rank.
+    """
+
+    local_error: BaseException | None = None
+    visible_sms = 0
+    try:
+        visible_sms = int(
+            torch.cuda.get_device_properties(device).multi_processor_count
+        )
+        test_visible_sms = int(
+            os.getenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0"
+        )
+        if test_visible_sms > 0:
+            visible_sms = min(visible_sms, test_visible_sms)
+        if visible_sms < required_sms:
+            raise RuntimeError(
+                f"{owner} requires at least {required_sms} visible SMs so every "
+                "peer-waiting CTA can be resident; this device/MIG slice exposes "
+                f"{visible_sms}"
+            )
+    except Exception as exc:
+        local_error = exc
+
+    if exchange_group is None:
+        if local_error is not None:
+            raise local_error
+        return
+
+    statuses = _exchange_setup_failures(
+        local_error,
+        exchange_group=exchange_group,
+        phase=f"{owner} resident-grid capability",
+    )
+    if any(statuses):
+        raise RuntimeError(
+            _setup_failure_message(
+                owner,
+                "resident-grid capability",
+                statuses,
+                exports_retained=False,
+            )
+        ) from local_error
 
 
 def _setup_failure_message(
@@ -678,10 +737,19 @@ class PCIeOneshotAllReduce:
         ext_module=None,
         stream_affine: bool = True,
     ) -> "PCIeOneshotAllReduce":
+        device_obj = _normalize_device(device)
+        resolved_group = _resolve_exchange_group(exchange_group, process_group)
+        if device_obj.type == "cuda":
+            _require_full_grid_residency(
+                owner="PCIe oneshot",
+                required_sms=ONESHOT_REQUIRED_SMS,
+                device=device_obj,
+                exchange_group=resolved_group,
+            )
         return cls(
             rank=rank,
             world_size=world_size,
-            device=device,
+            device=device_obj,
             signal_ptrs=signal_ptrs,
             eager_buffer_ptrs0=eager_buffer_ptrs0,
             eager_buffer_ptrs1=eager_buffer_ptrs1,
@@ -714,6 +782,12 @@ class PCIeOneshotAllReduce:
         if device_obj.type != "cuda":
             raise ValueError("PCIe oneshot requires a CUDA device")
 
+        _require_full_grid_residency(
+            owner="PCIe oneshot",
+            required_sms=ONESHOT_REQUIRED_SMS,
+            device=device_obj,
+            exchange_group=exchange_group,
+        )
         ipc = CudaRTLibrary()
         ipc.cudaSetDevice(device_obj.index or 0)
         ext = ext_module or _load_extension()
@@ -1521,6 +1595,12 @@ class PCIeOneshotAllReducePool:
                 )
             if self.device.type != "cuda":
                 raise ValueError("PCIe oneshot pool requires a CUDA device")
+            _require_full_grid_residency(
+                owner="PCIe oneshot",
+                required_sms=ONESHOT_REQUIRED_SMS,
+                device=self.device,
+                exchange_group=self.exchange_group,
+            )
             self._ipc = self._ipc or CudaRTLibrary()
             self._ipc.cudaSetDevice(self.device.index or 0)
             self._ext = self._ext or _load_extension()

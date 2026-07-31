@@ -9,7 +9,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+import sparkinfer.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
+    PCIeDCPA2A,
     PCIeDCPA2APool,
     _load_extension,
     _staging_layout,
@@ -523,7 +525,41 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    original_cuda_rt = pcie_dcp_a2a.CudaRTLibrary
+
+    def unexpected_cuda_rt():
+        raise AssertionError("CUDA IPC allocation started before residency rejection")
+
+    pcie_dcp_a2a.CudaRTLibrary = unexpected_cuda_rt
+    try:
+        with pytest.raises(RuntimeError, match="requires at least 64 visible SMs"):
+            PCIeDCPA2A.from_process_group(
+                process_group=dist.group.WORLD,
+                device=device,
+                max_batch_size=MAX_BATCH,
+                total_heads=TOTAL_HEADS,
+                head_dim=HEAD_DIM,
+                query_head_dim=QUERY_HEAD_DIM,
+            )
+        dist.barrier()
+    finally:
+        pcie_dcp_a2a.CudaRTLibrary = original_cuda_rt
+        dist.destroy_process_group()
+
+
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
+    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1":
+        pytest.skip("running the reduced-SM residency rejection gate")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
@@ -535,3 +571,23 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
         )
     _load_extension()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
+    if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
+        pytest.skip("set the reduced-SM residency rejection gate to run this test")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if world_size not in (2, 4, 8):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+        )
+    mp.spawn(
+        _residency_rejection_worker,
+        args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=True,
+    )
