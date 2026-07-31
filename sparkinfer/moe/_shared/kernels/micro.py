@@ -106,9 +106,7 @@ def _fp6_micro_enabled() -> bool:
     Keeps the validated dynamic FP6 fused path as the only FP6 backend until
     the micro kernel is wired into dispatch and numerically proven.
     """
-    return os.environ.get(
-        "SPARKINFER_ENABLE_FP6_MICRO", "0"
-    ).strip().lower() not in (
+    return os.environ.get("SPARKINFER_ENABLE_FP6_MICRO", "0").strip().lower() not in (
         "",
         "0",
         "false",
@@ -727,8 +725,7 @@ class MoEMicroKernelBackend:
             # valid divisor so every FC1 chunk covers whole 16-value blocks.
             # Aligned production shapes retain their existing geometry.
             while num_fc1_chunks > 1 and (
-                n % num_fc1_chunks != 0
-                or (n // num_fc1_chunks) % _BLOCK_SIZE != 0
+                n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0
             ):
                 num_fc1_chunks -= 1
         if self.w4a16_mode and m > 1:
@@ -2486,9 +2483,7 @@ class MoEMicroKernelBackend:
             ebase_w = Int64(eid) * Int64(cfg.two_n) * Int64(cfg.k_half)
             ebase_sf = Int64(eid) * Int64(cfg.w1_sf_rows * cfg.w1_sf_cols)
             e8m0_w1_n_cols = _align_up(cfg.two_n, 64)
-            ebase_sf_packed = Int64(eid) * Int64(
-                (cfg.k_dim // 32) * e8m0_w1_n_cols
-            )
+            ebase_sf_packed = Int64(eid) * Int64((cfg.k_dim // 32) * e8m0_w1_n_cols)
             ebase_sf_packed_e4m3 = Int64(eid) * Int64(
                 (cfg.k_dim // 16) * _align_up(cfg.two_n, 64)
             )
