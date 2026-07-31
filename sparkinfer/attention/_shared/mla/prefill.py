@@ -48,7 +48,7 @@ def _cache_block_stride_bytes(
     record_bytes: int | None = None,
 ) -> int:
     from sparkinfer.attention._shared.mla.compressed_reference import (
-        compressed_mla_page_nbytes,
+        COMPRESSED_MLA_BYTES_PER_TOKEN,
     )
 
     if model_type == ModelType.GLM_NSA:
@@ -57,12 +57,10 @@ def _cache_block_stride_bytes(
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
     else:
-        expected = int(compressed_mla_page_nbytes(int(page_size)))
-    # Contiguous inputs are flattened before launch, so their original rank is
-    # not a physical-layout contract and the standard page stride applies.
-    # Only packed, non-contiguous vLLM views preserve a real per-block stride in
-    # dimension 0.
-    if not cache.is_contiguous() and cache.ndim >= 2:
+        expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
+    # The runtime page stride is part of the cache contract. It can be either
+    # the exact payload width or a larger packed/padded stride.
+    if cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:
             raise ValueError(

@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import pytest
 import torch
 
+from sparkinfer.attention._shared.mla.compressed_api import (
+    _validate_compressed_cache_layout,
+)
+from sparkinfer.attention._shared.mla.kernel import (
+    _cache_block_stride_bytes as _decode_cache_block_stride_bytes,
+)
+from sparkinfer.attention._shared.mla.prefill import (
+    _cache_block_stride_bytes as _prefill_cache_block_stride_bytes,
+)
+from sparkinfer.attention._shared.mla.prefill_mg import (
+    _cache_block_stride_bytes as _prefill_mg_cache_block_stride_bytes,
+)
 from sparkinfer.attention._shared.mla.compressed_reference import (
+    COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_C128_PAGE_SIZE,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
+    compressed_mla_page_nbytes,
     compressed_sparse_mla_reference,
     pack_compressed_mla_kv_cache_reference,
 )
@@ -26,6 +41,68 @@ _SHARED_CORE_HEAD_DIM = 576
 _SHARED_CORE_V_HEAD_DIM = 512
 _LOCAL_Q_HEADS = 32
 _SM_SCALE = 1.0 / math.sqrt(_COMPRESSED_HEAD_DIM)
+
+
+@pytest.mark.parametrize("page_size", [16, 64, 256])
+def test_compressed_mla_layout_accepts_contiguous_and_padded_pages(
+    page_size: int,
+) -> None:
+    payload_nbytes = page_size * COMPRESSED_MLA_BYTES_PER_TOKEN
+    padded_nbytes = compressed_mla_page_nbytes(page_size)
+
+    _validate_compressed_cache_layout(
+        torch.empty((2, payload_nbytes), dtype=torch.uint8),
+        page_size=page_size,
+        name="cache",
+    )
+    _validate_compressed_cache_layout(
+        torch.empty((2, padded_nbytes), dtype=torch.uint8),
+        page_size=page_size,
+        name="cache",
+    )
+
+
+def test_compressed_mla_layout_rejects_short_page() -> None:
+    payload_nbytes = COMPRESSED_MLA_C128_PAGE_SIZE * COMPRESSED_MLA_BYTES_PER_TOKEN
+    with pytest.raises(ValueError, match="contiguous payload"):
+        _validate_compressed_cache_layout(
+            torch.empty((2, payload_nbytes - 1), dtype=torch.uint8),
+            page_size=COMPRESSED_MLA_C128_PAGE_SIZE,
+            name="cache",
+        )
+
+
+@pytest.mark.parametrize(
+    "stride_fn,kwargs",
+    [
+        (_decode_cache_block_stride_bytes, {"model_type": 0}),
+        (_prefill_cache_block_stride_bytes, {"model_type": 0}),
+        (_prefill_mg_cache_block_stride_bytes, {"is_glm": False}),
+    ],
+)
+@pytest.mark.parametrize("padded", [False, True])
+def test_compressed_mla_dispatch_uses_physical_page_stride(
+    stride_fn: Callable[..., int],
+    kwargs: dict[str, object],
+    padded: bool,
+) -> None:
+    payload_nbytes = COMPRESSED_MLA_DSV4_PAGE_SIZE * COMPRESSED_MLA_BYTES_PER_TOKEN
+    physical_nbytes = (
+        compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)
+        if padded
+        else payload_nbytes
+    )
+    storage = torch.empty(2 * physical_nbytes, dtype=torch.uint8)
+    cache = torch.as_strided(
+        storage,
+        size=(2, payload_nbytes),
+        stride=(physical_nbytes, 1),
+    )
+
+    assert (
+        stride_fn(cache, page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE, **kwargs)
+        == physical_nbytes
+    )
 
 
 def _make_split_merge_tensors(

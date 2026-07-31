@@ -16,6 +16,7 @@ from .compressed_config import (
     compressed_mla_split_chunks_for_contract,
 )
 from .compressed_reference import (
+    COMPRESSED_MLA_BYTES_PER_TOKEN,
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_MLA_HEAD_DIM,
     compressed_mla_page_nbytes,
@@ -523,11 +524,14 @@ def _validate_compressed_cache_layout(
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-    expected_page_nbytes = compressed_mla_page_nbytes(page_size)
-    if int(cache.shape[1]) != expected_page_nbytes:
+    payload_nbytes = page_size * COMPRESSED_MLA_BYTES_PER_TOKEN
+    padded_page_nbytes = compressed_mla_page_nbytes(page_size)
+    page_nbytes = int(cache.shape[1])
+    if page_nbytes not in (payload_nbytes, padded_page_nbytes):
         raise ValueError(
-            f"{name} page byte width must be {expected_page_nbytes} for page_size "
-            f"{page_size}, got {int(cache.shape[1])}"
+            f"{name} page byte width must be the contiguous payload "
+            f"{payload_nbytes} or padded width {padded_page_nbytes} for "
+            f"page_size {page_size}, got {page_nbytes}"
         )
 
 

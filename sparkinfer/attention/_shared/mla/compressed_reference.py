@@ -5,10 +5,11 @@ vector, a 64-dimension BF16 RoPE vector, and seven UE8M0 scale bytes for the
 noPE groups.  Within each page the token payloads are packed first, followed by
 the per-token scale region:
 
-    [page_size * 576 payload bytes][page_size * 8 scale bytes][padding]
+    [page_size * 576 payload bytes][page_size * 8 scale bytes][optional padding]
 
-The padding rounds page byte size up to a 576-byte multiple, matching the
-SGLang memory-pool contract.
+SGLang rounds the page byte size up to a 576-byte multiple. vLLM may instead
+use a contiguous allocation whose page stride ends immediately after the scale
+region. Both layouts contain the same compressed-MLA payload.
 """
 
 from __future__ import annotations
