@@ -191,6 +191,12 @@ static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
   return flag;
 }
 
+static DINLINE FlagType ld_flag_acquire_gpu(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  return flag;
+}
+
 __global__ void advance_staging_slot_kernel(Signal* self_sg) {
   if (threadIdx.x == 0) {
     const FlagType generation = self_sg->staging_generation;
