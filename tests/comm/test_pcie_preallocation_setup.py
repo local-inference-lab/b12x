@@ -483,3 +483,4 @@ def test_dcp_direct_cuda_constructor_executes_all_collective_gates(
         "native-init",
         "native-verdict",
     ]
+    runtime._coordinated_close_complete = True

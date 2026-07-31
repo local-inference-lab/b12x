@@ -343,14 +343,23 @@ class PCIeTwoShot {
       throw std::runtime_error("pcie_twoshot scale capacity exceeded");
   }
 
+  void check_launch_config(int threads, int block_limit) const {
+    if (threads < world_size_ || threads > 1024 || threads % 32 != 0)
+      throw std::runtime_error(
+          "pcie_twoshot threads must be a multiple of 32 in [world size, 1024]");
+    if (block_limit <= 0)
+      throw std::runtime_error("pcie_twoshot block limit must be positive");
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
+  }
+
   void reduce_scatter(cudaStream_t stream, const void* payload, const void* scale, void* out,
                       int64_t num_rows, int64_t row_elems, int threads, int block_limit) {
+    check_launch_config(threads, block_limit);
     if (num_rows % world_size_ != 0)
       throw std::runtime_error("num_rows must be divisible by world size");
     const int64_t rows_per_rank = num_rows / world_size_;
     check_shard(rows_per_rank, row_elems);
-    if (block_limit > kMaxBlocks)
-      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
@@ -369,9 +378,8 @@ class PCIeTwoShot {
 
   void all_gather(cudaStream_t stream, const void* payload, const void* scale, void* out,
                   int64_t rows_per_rank, int64_t row_elems, int threads, int block_limit) {
+    check_launch_config(threads, block_limit);
     check_shard(rows_per_rank, row_elems);
-    if (block_limit > kMaxBlocks)
-      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));

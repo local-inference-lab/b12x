@@ -191,6 +191,24 @@ def test_twoshot_control_precedes_reduce_scatter_and_all_gather_workers() -> Non
     )
 
 
+def test_twoshot_validates_launch_geometry_before_grid_division() -> None:
+    source = (PCIE / "pcie_twoshot.cu").read_text(encoding="utf-8")
+    validator = _section(source, "void check_launch_config(", "void reduce_scatter(")
+
+    assert "threads < world_size_" in validator
+    assert "threads > 1024" in validator
+    assert "threads % 32 != 0" in validator
+    assert "block_limit <= 0" in validator
+    assert "block_limit > kMaxBlocks" in validator
+
+    reduce_scatter = _section(source, "void reduce_scatter(", "void all_gather(")
+    all_gather = _section(source, "void all_gather(", "\n};")
+    for operation in (reduce_scatter, all_gather):
+        assert operation.index("check_launch_config(threads, block_limit);") < (
+            operation.index("(shard_packs + threads - 1) / threads")
+        )
+
+
 def test_dcp_control_selects_one_slot_per_operation_before_workers() -> None:
     source = (PCIE / "pcie_dcp_a2a.cu").read_text(encoding="utf-8")
     control_launch = "advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);"

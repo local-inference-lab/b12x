@@ -382,7 +382,7 @@ def test_strict_close_reports_unmap_failure_retains_exports_and_retries_only_fai
 
     with pytest.raises(
         RuntimeError,
-        match="coordinated PCIe close failed during IPC unmap.*not freed",
+        match=r"coordinated PCIe close failed during IPC unmap.*not freed",
     ):
         runtime.close()
 

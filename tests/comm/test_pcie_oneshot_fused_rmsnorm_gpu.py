@@ -159,8 +159,9 @@ def _cuda_graph_kernel_chain(
         if result != cudart.cudaError_t.cudaSuccess and hasattr(
             cudart, "cudaGraphNodeGetParams"
         ):
-            result, node_params = cudart.cudaGraphNodeGetParams(node)
-            params = node_params.kernel
+            fallback_result, node_params = cudart.cudaGraphNodeGetParams(node)
+            assert fallback_result == cudart.cudaError_t.cudaSuccess
+            result, params = fallback_result, node_params.kernel
         assert result == cudart.cudaError_t.cudaSuccess
         return _dim3_tuple(params.gridDim), _dim3_tuple(params.blockDim)
 

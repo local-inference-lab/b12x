@@ -494,12 +494,16 @@ def _graph_kernel_structure(
 
     def geometry(node: object) -> tuple[list[int], list[int]]:
         result, params = cudart.cudaGraphKernelNodeGetParams(node)
-        if (
-            result != cudart.cudaError_t.cudaSuccess
-            and hasattr(cudart, "cudaGraphNodeGetParams")
+        if result != cudart.cudaError_t.cudaSuccess and hasattr(
+            cudart, "cudaGraphNodeGetParams"
         ):
-            result, node_params = cudart.cudaGraphNodeGetParams(node)
-            params = node_params.kernel
+            fallback_result, node_params = cudart.cudaGraphNodeGetParams(node)
+            if fallback_result != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(
+                    "cudaGraphKernelNodeGetParams failed: "
+                    f"{result}; cudaGraphNodeGetParams failed: {fallback_result}"
+                )
+            result, params = fallback_result, node_params.kernel
         if result != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(f"cudaGraphKernelNodeGetParams failed: {result}")
         return _dim3_list(params.gridDim), _dim3_list(params.blockDim)
@@ -959,8 +963,11 @@ def main() -> None:
             max_input_bytes=nbytes,
             max_size=nbytes,
         )
+        eager_channel_id = "eager:control-node-benchmark"
+        graph_channel_id = "graph:control-node-benchmark"
+        pool.prepare_channels((eager_channel_id, graph_channel_id))
         stream = torch.cuda.Stream(device=device)
-        channel = pool.for_stream(stream)
+        channel = pool.for_stream(stream, channel_id=eager_channel_id)
         eager_inp = torch.full(
             (args.numel,),
             rank + 1,
@@ -977,7 +984,7 @@ def main() -> None:
         graph_out = torch.empty_like(graph_inp)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with (
-            pool.capture(stream) as graph_channel,
+            pool.capture(stream, channel_id=graph_channel_id) as graph_channel,
             torch.cuda.graph(
                 graph,
                 stream=stream,

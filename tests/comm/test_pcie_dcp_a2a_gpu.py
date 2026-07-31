@@ -702,6 +702,11 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
 def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
     if os.getenv("SPARKINFER_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") != "1":
         pytest.skip("set the reduced-SM residency rejection gate to run this test")
+    visible_sms = int(os.getenv("SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+    assert 0 < visible_sms < pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS, (
+        "set SPARKINFER_PCIE_TEST_VISIBLE_SM_COUNT below "
+        f"{pcie_dcp_a2a.DCP_A2A_REQUIRED_SMS} to exercise the residency gate"
+    )
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))

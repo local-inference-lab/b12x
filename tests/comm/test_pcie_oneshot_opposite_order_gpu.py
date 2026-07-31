@@ -251,8 +251,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         torch.cuda.synchronize(device)
         dist.barrier()
     finally:
-        pool.close()
-        dist.destroy_process_group()
+        try:
+            pool.close()
+        finally:
+            dist.destroy_process_group()
 
 
 def _spawn_with_timeout(port: int) -> None:

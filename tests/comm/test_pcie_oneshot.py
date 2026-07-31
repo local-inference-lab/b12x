@@ -710,7 +710,7 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
         "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
-    with pytest.raises(RuntimeError, match="retained.*peer unmap failed") as exc:
+    with pytest.raises(RuntimeError, match=r"retained.*peer unmap failed") as exc:
         PCIeOneshotAllReduce._allocate_shared_buffer(
             object(), 256, zero_fill=True, ipc=ipc
         )
@@ -1450,7 +1450,7 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
     def gather(local_state, group):
         if not local_state or isinstance(local_state[0], str):
             return [local_state, ()]
-        requested, existing = local_state
+        _requested, existing = local_state
         return [local_state, (("other",), existing)]
 
     monkeypatch.setattr(

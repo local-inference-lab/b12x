@@ -16,6 +16,18 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_benchmark_prepares_distinct_stable_eager_and_graph_channels() -> None:
+    source = (
+        _ROOT / "benchmarks" / "benchmark_pcie_oneshot_control_node.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'eager_channel_id = "eager:control-node-benchmark"' in source
+    assert 'graph_channel_id = "graph:control-node-benchmark"' in source
+    assert "pool.prepare_channels((eager_channel_id, graph_channel_id))" in source
+    assert "pool.for_stream(stream, channel_id=eager_channel_id)" in source
+    assert "pool.capture(stream, channel_id=graph_channel_id)" in source
+
+
 def _load_functions(relative_path: str, names: set[str]) -> dict[str, object]:
     path = _ROOT / relative_path
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
