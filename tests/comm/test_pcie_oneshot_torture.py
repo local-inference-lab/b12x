@@ -109,36 +109,46 @@ def _run_graph_scratch_reuse(
     stream.synchronize()
 
     for iteration in range(TORTURE_GRAPH_REPLAYS):
-        fill_sources(iteration)
-        graph.replay()
+        with torch.cuda.stream(stream):
+            fill_sources(iteration)
+            graph.replay()
         stream.synchronize()
         for layer, out in enumerate(outs):
             base = float((iteration % 32) * 5 + layer)
             _assert_constant(out, world_size * base + rank_sum)
 
-    # A graph with an odd number of collectives must change its selected
-    # staging slot on every replay. Host-side selection would freeze here.
+    # A graph with an odd number of collectives must swap which slot receives
+    # the final layer on every replay. Both slots are overwritten by this
+    # 17-layer graph, so merely counting changed slots cannot identify the
+    # selected parity: the final two layer markers must exchange positions.
     snapshots = [_local_eager_words(channel, stream)]
+    expected_words = [
+        tuple(int(source.view(torch.uint64)[0].item()) for source in sources[-2:])
+    ]
     for iteration in (101, 102):
-        fill_sources(iteration)
-        graph.replay()
+        with torch.cuda.stream(stream):
+            fill_sources(iteration)
+            graph.replay()
         stream.synchronize()
         snapshots.append(_local_eager_words(channel, stream))
+        expected_words.append(
+            tuple(int(source.view(torch.uint64)[0].item()) for source in sources[-2:])
+        )
         for layer, out in enumerate(outs):
             base = float((iteration % 32) * 5 + layer)
             _assert_constant(out, world_size * base + rank_sum)
-    changed_slots = [
-        {
-            slot
-            for slot, (before, after) in enumerate(
-                zip(snapshots[index], snapshots[index + 1], strict=True)
-            )
-            if before != after
-        }
-        for index in range(2)
-    ]
-    assert all(len(changed) == 1 for changed in changed_slots)
-    assert changed_slots[0] != changed_slots[1]
+
+    final_slots = []
+    for snapshot, expected in zip(snapshots, expected_words, strict=True):
+        assert set(snapshot) == set(expected), (
+            f"staging slots {snapshot} do not contain the final layer markers "
+            f"{expected}"
+        )
+        final_slots.append(snapshot.index(expected[-1]))
+    assert all(
+        final_slots[index] != final_slots[index + 1]
+        for index in range(len(final_slots) - 1)
+    ), f"odd-collective graph did not alternate final staging slots: {final_slots}"
 
 
 def _run_multistream(
