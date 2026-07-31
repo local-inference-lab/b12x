@@ -1183,9 +1183,12 @@ def prepare_w4a16_e8m0_native_weights(
     w13_rows = shape.w13_rows
     is_gated = shape.is_gated
     allow_w2_k_tail = intermediate_size % 32 != 0
-    padded_w13_scale_n = (
-        _e8m0_logical_tail_scale_n(w13_rows) if allow_w2_k_tail else w13_rows
-    )
+    # Packed E8M0 scale rows are permuted in 64-row blocks independently of
+    # whether W2 has a compact K tail.  Ungated 32-aligned intermediates such
+    # as I=224 therefore still need W13's 224 scale rows padded to 256; tying
+    # this padding to ``allow_w2_k_tail`` advertised the direct shape and then
+    # rejected it during preparation.
+    padded_w13_scale_n = _e8m0_logical_tail_scale_n(w13_rows)
 
     w13_scale = _validate_e8m0_k32_scales(
         w13_e8m0_scale,
