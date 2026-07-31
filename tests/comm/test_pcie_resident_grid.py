@@ -64,11 +64,15 @@ def test_grid_rendezvous_launches_have_occupancy_guards(
     source_name: str, kernels: tuple[str, ...], guarded_launches: int
 ) -> None:
     source = (PCIE / source_name).read_text(encoding="utf-8")
+    header = (PCIE / "resident_grid.h").read_text(encoding="utf-8")
     assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in source
     assert "cudaDevAttrMultiProcessorCount" in source
+    assert "cudaDevAttrCooperativeLaunch" in source
+    assert "cudaLaunchCooperativeKernel" in header
     for kernel in kernels:
         assert kernel in source
-    assert source.count("<<<resident_blocks") == guarded_launches
+    assert source.count("launch_cooperative(") == guarded_launches
+    assert "<<<resident_blocks" not in source
     assert "resident grid capacity" in source
 
     if source_name == "pcie_oneshot.cu":
@@ -76,3 +80,16 @@ def test_grid_rendezvous_launches_have_occupancy_guards(
             "ctas_per_row = std::min(ctas_per_row, resident_capacity / rows);" in source
         )
         assert "rows > resident_capacity" in source
+
+
+def test_cooperative_admission_is_required_for_overlapping_full_grids() -> None:
+    # A per-launch clamp alone admits both of these 14-CTA grids even though
+    # their aggregate demand is 28 CTAs on a 14-CTA MIG-sized capacity. If the
+    # scheduler partially admits both, neither grid-wide rendezvous can finish.
+    capacity = 14
+    independently_clamped_grids = (14, 14)
+    assert all(grid <= capacity for grid in independently_clamped_grids)
+    assert sum(independently_clamped_grids) > capacity
+
+    header = (PCIE / "resident_grid.h").read_text(encoding="utf-8")
+    assert "cudaLaunchCooperativeKernel" in header

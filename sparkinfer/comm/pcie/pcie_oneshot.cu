@@ -203,10 +203,11 @@ template <int ngpus>
 DINLINE void select_rank_data(RankData& selected, const DoubleRankData& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
     // The host clamps this launch to the exact kernel's simultaneous residency
-    // limit. The last arriving block publishes one launch-wide generation, so
-    // variable grid sizes cannot split a launch across two slabs. A Signal and
-    // its staging slots remain single-stream-owned; concurrent streams require
-    // separate channels.
+    // limit and launches cooperatively, so the scheduler atomically admits the
+    // entire grid even when other channels overlap. The last arriving block
+    // publishes one launch-wide generation, so variable grid sizes cannot split
+    // a launch across two slabs. A Signal and its staging slots remain
+    // single-stream-owned; concurrent streams require separate channels.
     const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
     const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
     if (prior == static_cast<FlagType>(gridDim.x - 1)) {
@@ -673,6 +674,12 @@ class PCIeAllreduce {
     int sm_count = 0;
     CHECK_CUDA_SUCCESS(
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+    int cooperative_launch = 0;
+    CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(
+        &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
+    if (cooperative_launch == 0)
+      throw std::runtime_error(
+          "PCIe rendezvous kernels require cooperative-launch support");
     const int capacity =
         sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
     if (capacity <= 0)
@@ -795,13 +802,12 @@ class PCIeAllreduce {
     if (stage_input) {                                                                                               \
       const int resident_blocks = clamp_resident_blocks(                                                            \
           pcie_allreduce_kernel<T, ngpus, true>, threads, blocks);                                                   \
-      pcie_allreduce_kernel<T, ngpus, true>                                                                          \
-          <<<resident_blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);        \
+      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(                                                       \
+          pcie_allreduce_kernel<T, ngpus, true>, resident_blocks, threads, stream,                                  \
+          data_options, sg_, self_sg_, input, output, rank_, size));                                                 \
     } else {                                                                                                         \
-      const int resident_blocks = clamp_resident_blocks(                                                            \
-          pcie_allreduce_kernel<T, ngpus, false>, threads, blocks);                                                  \
       pcie_allreduce_kernel<T, ngpus, false>                                                                         \
-          <<<resident_blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);        \
+          <<<blocks, threads, 0, stream>>>(data_options, sg_, self_sg_, input, output, rank_, size);                 \
     }                                                                                                                \
   } while (0)
     switch (world_size_) {
@@ -932,9 +938,10 @@ class PCIeAllreduce {
     const int shard_packs = size / pack_size;
 
 #define KL(ngpus, SINGLE, MODE)                                                                                       \
-  pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE><<<blocks, threads, 0, stream>>>(                   \
-      data_options, sg_, self_sg_, input, residual, weight, output, residual_output, rank_, hidden_packs,            \
-      ctas_per_row, shard_packs, epsilon);
+  CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(                                                           \
+      pcie_allreduce_fused_add_rms_norm_kernel<T, ngpus, SINGLE, MODE>, blocks, threads, stream,                    \
+      data_options, sg_, self_sg_, input, residual, weight, output, residual_output, rank_, hidden_packs,           \
+      ctas_per_row, shard_packs, epsilon));
 #define DISPATCH_MODE(ngpus, SINGLE)                                                                                  \
   do {                                                                                                               \
     if (mode == kModeStagePush) {                                                                                    \

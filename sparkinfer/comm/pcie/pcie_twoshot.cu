@@ -103,9 +103,11 @@ template <int ngpus>
 DINLINE void select_rank_ptrs(RankPtrs& selected, const DoubleRankPtrs& options, Signal* self_sg) {
   if (threadIdx.x == 0) {
     // The host clamps this launch to the exact kernel's simultaneous residency
-    // limit. Rendezvous before publishing the generation so every block in
-    // this launch selects one slab even when the preceding launch used a
-    // different grid size. A Signal and its slots remain single-stream-owned.
+    // limit and launches cooperatively, so overlapping channels cannot each
+    // occupy only part of their rendezvous grid. Rendezvous before publishing
+    // the generation so every block selects one slab even when the preceding
+    // launch used a different grid size. A Signal and its slots remain
+    // single-stream-owned.
     const FlagType generation = ld_flag_acquire_gpu(&self_sg->staging_generation);
     const FlagType prior = atomicAdd(&self_sg->staging_arrive, FlagType{1});
     if (prior == static_cast<FlagType>(gridDim.x - 1)) {
@@ -369,6 +371,12 @@ class PCIeTwoShot {
       int sm_count = 0;
       CHECK_CUDA_SUCCESS(
           cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+      int cooperative_launch = 0;
+      CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(
+          &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
+      if (cooperative_launch == 0)
+        throw std::runtime_error(
+            "PCIe rendezvous kernels require cooperative-launch support");
       capacity =
           sparkinfer::pcie::resident_grid_capacity(active_blocks_per_sm, sm_count);
       if (capacity <= 0)
@@ -394,10 +402,13 @@ class PCIeTwoShot {
       constexpr int ngpus = decltype(ng)::value;
       const int resident_blocks =
           clamp_resident_blocks(rs_fp8_kernel<ngpus>, threads, blocks);
-      rs_fp8_kernel<ngpus><<<resident_blocks, threads, 0, stream>>>(
-          reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
-          staging_, pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(
+          rs_fp8_kernel<ngpus>, resident_blocks, threads, stream,
+          reinterpret_cast<const Fp8Pack*>(payload),
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_,
+          scale_offset_, scale_stride_, sg_, self_sg_,
+          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank),
+          int(row_elems)));
     });
   }
 
@@ -413,10 +424,13 @@ class PCIeTwoShot {
       constexpr int ngpus = decltype(ng)::value;
       const int resident_blocks =
           clamp_resident_blocks(ag_fp8_kernel<ngpus>, threads, blocks);
-      ag_fp8_kernel<ngpus><<<resident_blocks, threads, 0, stream>>>(
-          reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
-          staging_, pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(sparkinfer::pcie::launch_cooperative(
+          ag_fp8_kernel<ngpus>, resident_blocks, threads, stream,
+          reinterpret_cast<const Fp8Pack*>(payload),
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_,
+          scale_offset_, scale_stride_, sg_, self_sg_,
+          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank),
+          int(row_elems)));
     });
   }
 };
