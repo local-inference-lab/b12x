@@ -350,6 +350,10 @@ def test_pool_collectively_prepares_logical_channels_in_canonical_order(
         "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
         lambda local_state, group: [local_state, local_state],
     )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, local_status],
+    )
 
     pool.prepare_channels(("target", "draft"))
     pool.prepare_channels(("draft", "target"))
@@ -377,15 +381,74 @@ def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch
     )
 
     def gather(local_state, group):
+        if not local_state or isinstance(local_state[0], str):
+            return [local_state, ()]
         requested, existing = local_state
         return [(("other",), existing), local_state]
 
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
     )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+    )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(("target",))
+
+
+def test_pool_invalid_logical_id_is_rejected_collectively(monkeypatch):
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
+    )
+
+    with pytest.raises(RuntimeError, match="must not be empty"):
+        pool.prepare_channels(("",))
+
+
+def test_pool_eager_channel_requires_id_and_rejects_duplicate_stream_owner(
+    monkeypatch,
+):
+    eager = _make_runtime()
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: eager,
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    pool._logical_channels["eager:dcp"] = eager
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: int(stream),
+    )
+
+    with pytest.raises(RuntimeError, match="explicit semantic channel_id"):
+        pool.for_stream(7)
+    assert pool.for_stream(7, channel_id="eager:dcp") is eager
+    with pytest.raises(RuntimeError, match="stream-affine"):
+        pool.for_stream(8, channel_id="eager:dcp")
 
 
 def test_pool_capture_requires_stable_semantic_id(monkeypatch):
@@ -406,9 +469,14 @@ def test_pool_capture_requires_stable_semantic_id(monkeypatch):
         "_new_channel",
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
+    )
 
-    with pytest.raises(RuntimeError, match="stable semantic channel_id"), pool.capture(
-        7
+    with (
+        pytest.raises(RuntimeError, match="stable semantic channel_id"),
+        pool.capture(7),
     ):
         pass
 

@@ -156,9 +156,8 @@ def _cuda_graph_kernel_chain(
 
     def geometry(node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         result, params = cudart.cudaGraphKernelNodeGetParams(node)
-        if (
-            result != cudart.cudaError_t.cudaSuccess
-            and hasattr(cudart, "cudaGraphNodeGetParams")
+        if result != cudart.cudaError_t.cudaSuccess and hasattr(
+            cudart, "cudaGraphNodeGetParams"
         ):
             result, node_params = cudart.cudaGraphNodeGetParams(node)
             params = node_params.kernel
@@ -211,6 +210,7 @@ def _run_eager(
                 residual,
                 weight,
                 epsilon,
+                channel_id="eager:fused-rmsnorm",
             )
             torch.cuda.synchronize(device)
             _assert_close(out, expected_out, dtype)
@@ -234,8 +234,8 @@ def _run_graph(
         rank,
     )
     out = torch.empty_like(inp)
-    pool.for_stream()
-    pool.prepare_channels(("graph:fused-rmsnorm",))
+    pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
+    pool.for_stream(channel_id="eager:fused-rmsnorm")
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with (
@@ -249,6 +249,7 @@ def _run_graph(
             epsilon,
             out=out,
             residual_out=residual,
+            channel_id="graph:fused-rmsnorm",
         )
     # Staged capture is now control + worker, in that order. The registered
     # path still launches only its worker, but public graph capture deliberately
@@ -317,6 +318,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         device=device,
         max_input_bytes=128 * 1024,
         max_size=128 * 1024,
+        max_concurrent_channels=2,
     )
     try:
         _run_eager(pool, device, rank)

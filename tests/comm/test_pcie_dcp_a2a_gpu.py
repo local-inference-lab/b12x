@@ -148,7 +148,7 @@ def _check_eager(
                 dtype,
                 device,
             )
-            gathered_q = pool.all_gather_heads(local_q)
+            gathered_q = pool.all_gather_heads(local_q, channel_id="eager:dcp")
             expected_q = torch.cat(
                 [
                     _rank_query(
@@ -166,7 +166,9 @@ def _check_eager(
             torch.testing.assert_close(gathered_q, expected_q, rtol=0, atol=0)
 
             partial_output, partial_lse = _rank_inputs(step, rank, batch, dtype, device)
-            out = pool.lse_reduce_scatter(partial_output, partial_lse)
+            out = pool.lse_reduce_scatter(
+                partial_output, partial_lse, channel_id="eager:dcp"
+            )
             torch.cuda.synchronize(device)
             expected = _reference(
                 step,
@@ -199,6 +201,7 @@ def _check_eager(
                 head_major_input,
                 partial_lse,
                 out=head_major_output,
+                channel_id="eager:dcp",
             )
             torch.cuda.synchronize(device)
             assert actual is head_major_output
@@ -212,7 +215,7 @@ def _check_eager_adjacency(
     world_size: int,
     device: torch.device,
 ) -> None:
-    channel = pool.for_stream()
+    channel = pool.for_stream(channel_id="eager:dcp")
     first_query = _rank_query(700, rank, world_size, MAX_BATCH, torch.bfloat16, device)
     second_query = _rank_query(701, rank, world_size, MAX_BATCH, torch.bfloat16, device)
     partial_output, partial_lse = _rank_inputs(702, rank, 1, torch.bfloat16, device)
@@ -509,9 +512,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         total_heads=TOTAL_HEADS,
         head_dim=HEAD_DIM,
         query_head_dim=QUERY_HEAD_DIM,
+        max_concurrent_channels=2,
     )
     closed = False
     try:
+        pool.prepare_channels(("eager:dcp", "graph"))
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
         _check_eager_adjacency(pool, rank, world_size, device)
@@ -585,7 +590,9 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
         raise RuntimeError("injected rank-zero pre-allocation failure")
 
     def unexpected_allocate(*args, **kwargs):
-        raise AssertionError("CUDA IPC allocation started after a peer preflight failure")
+        raise AssertionError(
+            "CUDA IPC allocation started after a peer preflight failure"
+        )
 
     if rank == 0:
         pcie_dcp_a2a.CudaRTLibrary = fail_cuda_rt

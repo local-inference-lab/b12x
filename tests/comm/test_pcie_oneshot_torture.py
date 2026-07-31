@@ -74,7 +74,7 @@ def _run_eager(
             for iteration in range(TORTURE_EAGER_ITERS):
                 base = float((iteration % 64) * 3)
                 inp.fill_(base + rank)
-                pool.all_reduce(inp, out=out)
+                pool.all_reduce(inp, out=out, channel_id="eager:default")
                 torch.cuda.synchronize(device)
                 _assert_constant(out, world_size * base + rank_sum)
 
@@ -199,9 +199,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         process_group=dist.group.WORLD,
         device=device,
         max_input_bytes=1 << 20,
+        max_concurrent_channels=2,
     )
     try:
-        pool.prepare_channels(("eager:a", "eager:b", "graph:torture"))
+        pool.prepare_channels(("eager:default", "eager:a", "eager:b", "graph:torture"))
         _run_eager(pool, device, rank, world_size)
         dist.barrier()
         _run_graph_scratch_reuse(pool, device, rank, world_size)

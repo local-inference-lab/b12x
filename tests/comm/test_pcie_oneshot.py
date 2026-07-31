@@ -10,6 +10,7 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
+    _abort_collective_ipc_setup,
     _broadcast_gather_object,
     _compute_crossover_size,
     _group_ranks,
@@ -621,13 +622,17 @@ def test_failed_peer_setup_export_free_is_retained_and_retryable(monkeypatch):
         if not isinstance(local_object, tuple):
             return [local_object, b"remote"]
         status_round += 1
-        if status_round == 1:  # export preparation
+        if status_round == 1:  # retained-setup gate
             return [local_object, ()]
-        if status_round == 2:  # import-open verdict
+        if status_round == 2:  # export preparation
+            return [local_object, ()]
+        if status_round == 3:  # import-open verdict
             return [local_object, ("peer open failed",)]
-        if status_round == 3:  # rollback-unmap verdict
+        if status_round == 4:  # rollback-unmap verdict
             return [local_object, ()]
-        if status_round == 4:  # rollback-export-free verdict
+        if status_round == 5:  # rollback-export-free verdict
+            return [local_object, ()]
+        if status_round == 6:  # retry export-free verdict
             return [local_object, ()]
         raise AssertionError(f"unexpected status round {status_round}")
 
@@ -684,12 +689,16 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
         if not isinstance(local_object, tuple):
             return [local_object, b"remote0", b"remote1"]
         status_round += 1
-        if status_round == 1:  # export preparation
+        if status_round == 1:  # retained-setup gate
             return [local_object, (), ()]
-        if status_round == 2:  # import-open verdict
+        if status_round == 2:  # export preparation
+            return [local_object, (), ()]
+        if status_round == 3:  # import-open verdict
             return [local_object, ("peer open failed",), ()]
-        if status_round == 3:  # rollback-unmap verdict
+        if status_round == 4:  # rollback-unmap verdict
             return [local_object, ("peer unmap failed",), ()]
+        if status_round in (5, 6):  # retry unmap / retry export free
+            return [local_object, (), ()]
         raise AssertionError(f"unexpected status round {status_round}")
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
@@ -698,13 +707,262 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
         "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
 
-    with pytest.raises(RuntimeError, match="retained.*peer unmap failed"):
+    with pytest.raises(RuntimeError, match="retained.*peer unmap failed") as exc:
         PCIeOneshotAllReduce._allocate_shared_buffer(
             object(), 256, zero_fill=True, ipc=ipc
         )
 
     assert ipc.closed == [2000, 3000]
     assert ipc.freed == []
+    exc.value.retryable_setup.retry()
+    assert ipc.closed == [2000, 3000]
+    assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_handle_exchange_failure_retains_export_until_collective_retry(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.freed = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    status_round = 0
+    fail_handle_exchange = True
+
+    def exchange(local_object, group):
+        nonlocal status_round, fail_handle_exchange
+        if not isinstance(local_object, tuple):
+            if fail_handle_exchange:
+                fail_handle_exchange = False
+                raise RuntimeError("injected handle exchange failure")
+            return [local_object, b"remote"]
+        status_round += 1
+        return [local_object, ()]
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="handle exchange failed") as exc:
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=ipc
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.local_ptr == 1000
+    assert ipc.freed == []
+    retained.retry()
+    assert ipc.freed == [1000]
+    assert status_round == 4  # gate, export verdict, retry unmap, retry free
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_import_status_exchange_failure_retains_imports_for_retry(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            return 2000
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    status_round = 0
+
+    def exchange(local_object, group):
+        nonlocal status_round
+        if not isinstance(local_object, tuple):
+            return [local_object, b"remote"]
+        status_round += 1
+        if status_round == 3:
+            raise RuntimeError("injected import verdict exchange failure")
+        return [local_object, ()]
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="import-open status") as exc:
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=ipc
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.remote_ptrs == [2000]
+    assert ipc.closed == []
+    retained.retry()
+    assert ipc.closed == [2000]
+    assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.closed = []
+            self.freed = []
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            self.closed.append(ptr)
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    cleanup_calls = 0
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise RuntimeError("transient native dispose failure")
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
+    )
+
+    with pytest.raises(RuntimeError, match="rollback unmap") as exc:
+        _abort_collective_ipc_setup(
+            owner="test runtime",
+            setup_phase="native initialization",
+            setup_statuses=(("peer init failed",), ()),
+            exchange_group=object(),
+            ipc=ipc,
+            local_ptr=1000,
+            remote_ptrs=(2000,),
+            local_error=RuntimeError("peer init failed"),
+            local_cleanup=cleanup,
+        )
+
+    retained = exc.value.retryable_setup
+    assert cleanup_calls == 1
+    assert ipc.closed == [2000]
+    assert ipc.freed == []
+    retained.retry()
+    assert cleanup_calls == 2
+    assert ipc.closed == [2000]
+    assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_free_status_exchange_failure_keeps_coordination_ticket_without_double_free(
+    monkeypatch,
+):
+    class FakeIPC:
+        def __init__(self):
+            self.freed = []
+
+        def cudaFree(self, ptr):
+            self.freed.append(ptr)
+
+    ipc = FakeIPC()
+    status_round = 0
+
+    def exchange(local_status, group):
+        nonlocal status_round
+        status_round += 1
+        if status_round == 2:
+            raise RuntimeError("injected free verdict exchange failure")
+        return [local_status, ()]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="free status exchange") as exc:
+        _abort_collective_ipc_setup(
+            owner="test runtime",
+            setup_phase="native initialization",
+            setup_statuses=(("peer init failed",), ()),
+            exchange_group=object(),
+            ipc=ipc,
+            local_ptr=1000,
+            remote_ptrs=(),
+            local_error=RuntimeError("peer init failed"),
+        )
+
+    retained = exc.value.retryable_setup
+    assert retained.local_ptr == 0
+    assert ipc.freed == [1000]
+    retained.retry()
+    assert ipc.freed == [1000]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+def test_retained_generation_blocks_second_setup_before_cuda_allocation(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.malloc_calls = 0
+
+        def cudaMalloc(self, size):
+            self.malloc_calls += 1
+            raise RuntimeError("injected no-local-export allocation failure")
+
+    ipc = FakeIPC()
+    group = object()
+    status_round = 0
+
+    def exchange(local_status, exchange_group):
+        nonlocal status_round
+        status_round += 1
+        if status_round == 2:
+            raise RuntimeError("injected preparation verdict exchange failure")
+        return [local_status, ()]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+
+    with pytest.raises(RuntimeError, match="preparation status") as exc:
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            group, 256, zero_fill=True, ipc=ipc
+        )
+    retained = exc.value.retryable_setup
+    first_key = retained.key
+    assert retained.local_ptr == 0
+    assert ipc.malloc_calls == 1
+
+    with pytest.raises(RuntimeError, match="retained CUDA IPC setup gate"):
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            group, 256, zero_fill=True, ipc=ipc
+        )
+    assert ipc.malloc_calls == 1
+    assert tuple(_RETAINED_FAILED_IPC_EXPORTS) == (first_key,)
+
+    retained.retry()
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
 
 
 def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
@@ -1020,6 +1278,8 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
     )
 
     def gather(local_state, group):
+        if not local_state or isinstance(local_state[0], str):
+            return [local_state, ()]
         requested, existing = local_state
         return [local_state, (("other",), existing)]
 
@@ -1029,6 +1289,55 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(("target",))
+
+
+def test_invalid_logical_channel_id_is_rejected_collectively_before_allocation(
+    monkeypatch,
+):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    monkeypatch.setattr(
+        pool,
+        "_new_channel",
+        lambda stream_key: pytest.fail("channel allocation must not start"),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
+    )
+
+    with pytest.raises(RuntimeError, match="must not be empty"):
+        pool.prepare_channels(("  ",))
+
+
+def test_empty_logical_channel_set_still_enters_collective_contract(monkeypatch):
+    pool = PCIeOneshotAllReducePool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        channel_factory=lambda stream_key: _make_runtime(eager=True),
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+
+    def gather(local_state, group):
+        if not local_state or isinstance(local_state[0], str):
+            return [local_state, ()]
+        _, existing = local_state
+        return [local_state, (("peer-channel",), existing)]
+
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+    )
+
+    with pytest.raises(RuntimeError, match="differs across ranks"):
+        pool.prepare_channels(())
 
 
 def test_collective_capture_requires_stable_semantic_id(monkeypatch):
@@ -1046,32 +1355,42 @@ def test_collective_capture_requires_stable_semantic_id(monkeypatch):
         "_new_channel",
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_status, group: [local_status, ()],
+    )
 
-    with pytest.raises(RuntimeError, match="stable semantic channel_id"), pool.capture(
-        7
+    with (
+        pytest.raises(RuntimeError, match="stable semantic channel_id"),
+        pool.capture(7),
     ):
         pass
 
 
-def test_collective_default_eager_channel_rejects_second_stream(monkeypatch):
-    default = _make_runtime(eager=True)
+def test_collective_eager_channel_requires_id_and_rejects_duplicate_stream_owner(
+    monkeypatch,
+):
+    eager = _make_runtime(eager=True)
     pool = PCIeOneshotAllReducePool(
         rank=0,
         world_size=2,
         device=torch.device("cpu"),
-        channel_factory=lambda stream_key: default,
+        channel_factory=lambda stream_key: eager,
     )
     pool._channel_factory = None
     pool.exchange_group = object()
-    pool._logical_channels["default"] = default
+    pool._logical_channels["eager:model"] = eager
     monkeypatch.setattr(
         "sparkinfer.comm.pcie.pcie_oneshot._current_stream_key",
         lambda device, stream=None: int(stream),
     )
 
-    assert pool.for_stream(7) is default
+    with pytest.raises(RuntimeError, match="explicit semantic channel_id"):
+        pool.for_stream(7)
+
+    assert pool.for_stream(7, channel_id="eager:model") is eager
     with pytest.raises(RuntimeError, match="stream-affine"):
-        pool.for_stream(8)
+        pool.for_stream(8, channel_id="eager:model")
 
 
 def test_pool_reuses_single_channel_across_stream_keys(monkeypatch):

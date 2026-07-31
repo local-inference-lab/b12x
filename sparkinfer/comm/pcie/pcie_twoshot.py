@@ -22,6 +22,7 @@ from torch.utils.cpp_extension import load
 
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     _finish_collective_runtime_setup,
@@ -422,7 +423,13 @@ class PCIeTwoShotSP:
             device=self.device,
         )
 
-    def __del__(self) -> None:
+    def __del__(
+        self,
+        _quarantine: dict[int, object] = _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+    ) -> None:
         # GC cannot prove queued CUDA work is complete.  Explicit close() is the
         # only path allowed to synchronize, unmap imports, and free exports.
-        return
+        if getattr(self, "_coordinated_close_complete", False):
+            return
+        if getattr(self, "_fptr", 0) or getattr(self, "_owned_buffers", ()):
+            _quarantine[id(self)] = self

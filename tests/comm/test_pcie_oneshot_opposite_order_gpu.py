@@ -194,6 +194,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         device=device,
         max_input_bytes=NUMEL * torch.float32.itemsize,
         max_size=NUMEL * torch.float32.itemsize,
+        # Two independent streams intentionally enqueue peer-waiting grids at
+        # once; gate residency for the complete overlap, not one grid.
+        max_concurrent_channels=2,
     )
     try:
         _run_eager_opposite_order(pool, device, rank, world_size)

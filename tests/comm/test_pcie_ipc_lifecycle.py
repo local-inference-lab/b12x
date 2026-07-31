@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 import torch
 
 from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, PCIeDCPA2APool
 from sparkinfer.comm.pcie.pcie_oneshot import (
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
 )
@@ -78,7 +82,7 @@ def test_pool_destructor_is_nonblocking_and_does_not_touch_cuda_ownership(
         world_size=2,
         device=torch.device("cpu"),
         exchange_group=object(),
-        channel_factory=lambda stream_key: channel,
+        channel_factory=lambda stream_key: pytest.fail("factory must not run"),
     )
     pool._all_channels = [channel]
     pool._channels = {1: channel}
@@ -291,6 +295,80 @@ def test_twoshot_destructor_retains_imports_and_exports_without_cuda_calls(
     assert runtime._fptr == 123
     assert runtime._owned_buffers != []
     assert not runtime._ipc_exports_freed
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_dcp, _fake_twoshot))
+def test_real_gc_quarantines_dcp_and_twoshot_ownership(runtime_factory) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime_id = id(runtime)
+    runtime_ref = weakref.ref(runtime)
+
+    del runtime
+    gc.collect()
+
+    retained = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(runtime_id)
+    assert runtime_ref() is retained
+    assert events == []
+    pointer_attr = "_ptr" if isinstance(retained, PCIeDCPA2A) else "_fptr"
+    assert getattr(retained, pointer_attr) == 123
+    assert retained._owned_buffers
+    assert not retained._ipc_exports_freed
+
+    # Production deliberately keeps this ownership until process teardown.
+    # The fake can be released after marking the coordinated path complete.
+    retained._coordinated_close_complete = True
+    del retained
+    gc.collect()
+    assert runtime_ref() is None
+
+
+@pytest.mark.parametrize("runtime_factory", (_fake_dcp, _fake_twoshot))
+def test_explicitly_closed_dcp_and_twoshot_are_not_quarantined(runtime_factory) -> None:
+    events: list[object] = []
+    runtime = runtime_factory(events)
+    runtime.exchange_group = None
+    runtime.close()
+    runtime_id = id(runtime)
+    runtime_ref = weakref.ref(runtime)
+
+    del runtime
+    gc.collect()
+
+    assert runtime_ref() is None
+    assert runtime_id not in _ABANDONED_PCIE_RUNTIME_QUARANTINE
+
+
+def test_real_gc_quarantines_dcp_pool_and_its_channel() -> None:
+    channel = _fake_dcp([])
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: pytest.fail("factory must not run"),
+    )
+    pool._all_channels = [channel]
+    pool._channels = {0: channel}
+    pool_id = id(pool)
+    pool_ref = weakref.ref(pool)
+
+    del pool
+    gc.collect()
+
+    retained = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(pool_id)
+    assert pool_ref() is retained
+    assert retained._all_channels == [channel]
+    assert retained._channels
+
+    retained._closed = True
+    channel._coordinated_close_complete = True
+    del retained
+    del channel
+    gc.collect()
+    assert pool_ref() is None
 
 
 @pytest.mark.parametrize("runtime_factory", (_fake_oneshot, _fake_twoshot))
