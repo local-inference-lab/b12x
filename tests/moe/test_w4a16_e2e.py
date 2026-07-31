@@ -267,7 +267,7 @@ def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
     )
 
 
-@pytest.mark.parametrize("intermediate_size", [144, 352])
+@pytest.mark.parametrize("intermediate_size", [16, 144, 352])
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 @pytest.mark.parametrize("m", [1, 3])
 def test_w4a16_modelopt_direct_keeps_non64_intermediate_contract(
@@ -1256,8 +1256,22 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
     ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` to audit m==1/m>=2 and ungated/gated
     direct-FC2 implementations.
     """
+    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
     experts, hidden_size, topk = 1, 128, 1
     monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
+    direct_launches: list[tuple[int, int]] = []
+
+    def spy_direct_launch(*args, **kwargs) -> None:
+        direct_launches.append((int(kwargs["m"]), int(kwargs["intermediate_size"])))
+        real_direct_launch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_w4a16_small_m_direct_launch_flat",
+        spy_direct_launch,
+    )
     torch.manual_seed(
         20260731
         + m
@@ -1362,6 +1376,7 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         metrics = compare_to_reference(actual, expected)
         assert bool(torch.isfinite(actual).all().item())
         assert metrics.cos > 0.999, metrics
+    assert direct_launches == [(m, intermediate_size), (m, intermediate_size)]
     torch.testing.assert_close(first, replay, rtol=0, atol=0)
 
 
