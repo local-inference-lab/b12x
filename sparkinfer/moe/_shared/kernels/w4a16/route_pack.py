@@ -303,13 +303,11 @@ def pack_topk_routes_by_expert(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
-    numel_capacity, capacity_packed_routes, capacity_route_blocks = (
-        route_pack_capacity(
-            numel,
-            int(block_size),
-            int(num_experts),
-            topk=topk,
-        )
+    numel_capacity, capacity_packed_routes, capacity_route_blocks = route_pack_capacity(
+        numel,
+        int(block_size),
+        int(num_experts),
+        topk=topk,
     )
     if packed_route_indices is not None and block_expert_ids is not None:
         if (
@@ -341,10 +339,7 @@ def pack_topk_routes_by_expert(
     if (
         provided_routes is not None
         and provided_blocks is not None
-        and (
-            provided_routes < max_packed_routes
-            or provided_blocks < max_route_blocks
-        )
+        and (provided_routes < max_packed_routes or provided_blocks < max_route_blocks)
     ):
         raise ValueError(
             "W4A16 route-packing workspace is too small: "
