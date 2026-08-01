@@ -39,7 +39,7 @@ where = ["."]
 include = ["sparkinfer*"]
 
 [tool.setuptools.package-data]
-"sparkinfer.comm.pcie" = ["*.cu"]
+"sparkinfer.comm.pcie" = ["*.cu", "*.h"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
