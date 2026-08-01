@@ -72,6 +72,7 @@ def _serial_tier(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
+    block_size_m: int = 8,
 ) -> torch.Tensor:
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
@@ -82,7 +83,7 @@ def _serial_tier(
         device=x.device,
         route_num_experts=int(expert_map.numel()),
         full_rotation=True,
-        block_size_m=8,
+        block_size_m=block_size_m,
     )
     assert buffers.rotation_a_gate is not None
     assert buffers.rotation_a_up is not None
@@ -104,7 +105,7 @@ def _serial_tier(
         expert_counts=buffers.expert_counts,
         expert_map=expert_map,
         output_expert_map=expert_map,
-        route_block_size_m=8,
+        route_block_size_m=block_size_m,
         intermediate_rotation_scales=prepared.intermediate_rotations,
         full_rotation=True,
         suh_gate_table=prepared.gate_suh,
@@ -258,6 +259,136 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
         build_tiered_maps((0, 1), (1, 2), device=torch.device("cpu"))
     with pytest.raises(ValueError, match="disjoint partition"):
         build_tiered_maps((0, 4), (1, 2), device=torch.device("cpu"))
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
+    """Keep block-64 routing without grouping K3 and K4 reductions."""
+
+    torch.manual_seed(20260801)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, hidden, intermediate, topk = 64, 512, 256, 8
+    reference_tiles = (128, 128, 32, 512)
+    block64_tiles = (128, 64, 64, 128)
+    tier0_experts, tier1_experts = 6, 2
+
+    def tiers(tile_config: tuple[int, int, int, int]):
+        return tuple(
+            _prepared(
+                experts=experts,
+                hidden=hidden,
+                intermediate=intermediate,
+                bits=bits,
+                seed=seed,
+                device=device,
+                tile_config=tile_config,
+            )
+            for experts, bits, seed in (
+                (tier0_experts, 3, 301),
+                (tier1_experts, 4, 401),
+            )
+        )
+
+    reference_tiers = tiers(reference_tiles)
+    block64_tiers = tiers(block64_tiles)
+    for reference, candidate in zip(reference_tiers, block64_tiers, strict=True):
+        assert torch.equal(reference.w13, candidate.w13)
+        assert torch.equal(reference.w2, candidate.w2)
+
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_ids = torch.tensor(
+        [0, 6, 1, 7, 2, 3, 4, 5], dtype=torch.int32, device=device
+    ).expand(m, -1).contiguous()
+    topk_weights = torch.softmax(
+        torch.randn((m, topk), dtype=torch.float32, device=device), dim=-1
+    )
+    map0 = torch.cat(
+        (
+            torch.arange(tier0_experts, dtype=torch.int32, device=device),
+            torch.full((tier1_experts,), -1, dtype=torch.int32, device=device),
+        )
+    )
+    map1 = torch.cat(
+        (
+            torch.full((tier0_experts,), -1, dtype=torch.int32, device=device),
+            torch.arange(tier1_experts, dtype=torch.int32, device=device),
+        )
+    )
+
+    props = torch.cuda.get_device_properties(device)
+    global_to_combined, descriptor = build_tiered_maps(
+        range(tier0_experts), range(tier0_experts, 8), device=device
+    )
+
+    def one_grid(
+        prepared_tiers,
+        tile_config: tuple[int, int, int, int],
+        block_size_m: int,
+    ) -> torch.Tensor:
+        route_slots = max_packed_route_slots(m * topk, block_size_m, 8)
+        launch = compile_mixed_trellis(
+            size_m=m,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tier0_num_experts=tier0_experts,
+            tier1_num_experts=tier1_experts,
+            top_k=topk,
+            max_m_blocks=(route_slots + block_size_m - 1) // block_size_m,
+            moe_block_size=block_size_m,
+            sms=int(props.multi_processor_count),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=tile_config,
+        )
+        buffers = make_mixed_trellis_buffers(
+            launch, device=device, sms=int(props.multi_processor_count)
+        )
+        return run_mixed_trellis(
+            x,
+            prepared_tiers[0],
+            prepared_tiers[1],
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            combine_trellis_rotations(*prepared_tiers),
+            launch,
+            buffers,
+        ).clone()
+
+    reference = one_grid(reference_tiers, reference_tiles, 8)
+    candidate = one_grid(block64_tiers, block64_tiles, 64)
+    serial_block8 = _serial_tier(
+        x, reference_tiers[0], topk_weights, topk_ids, map0, block_size_m=8
+    ).clone()
+    serial_block8.add_(
+        _serial_tier(
+            x, reference_tiers[1], topk_weights, topk_ids, map1, block_size_m=8
+        )
+    )
+    serial_block64 = _serial_tier(
+        x, block64_tiers[0], topk_weights, topk_ids, map0, block_size_m=64
+    ).clone()
+    serial_block64.add_(
+        _serial_tier(
+            x, block64_tiers[1], topk_weights, topk_ids, map1, block_size_m=64
+        )
+    )
+    torch.cuda.synchronize(device)
+
+    denominator = reference.norm().clamp_min(1.0e-12)
+    serial8_error = float((serial_block8 - reference).norm() / denominator)
+    serial64_error = float((serial_block64 - reference).norm() / denominator)
+    candidate_error = float((candidate - reference).norm() / denominator)
+    print(
+        "mixed_trellis_block64_numerics "
+        f"serial_block8={serial8_error:.9e} "
+        f"serial_block64={serial64_error:.9e} "
+        f"one_grid_block64={candidate_error:.9e}"
+    )
+    assert serial64_error > 5.0e-5
+    assert candidate_error < 2.0e-5
+    assert candidate_error < serial64_error * 0.2
+    assert abs(candidate_error - serial8_error) < 1.0e-6
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
