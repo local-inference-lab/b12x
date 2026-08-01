@@ -673,6 +673,7 @@ def _permute_nvfp4_scales(
     size_n: int,
     a_dtype: torch.dtype,
     row_rotation: int | None = None,
+    output_size_n: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
     packed_scales: torch.Tensor | None = None
@@ -688,6 +689,7 @@ def _permute_nvfp4_scales(
             size_k=size_k,
             size_n=size_n,
             group_size=16,
+            output_size_n=output_size_n,
         )
         expert_packed = _process_nvfp4_packed_scales(
             expert_scales,
@@ -701,8 +703,9 @@ def _permute_nvfp4_scales(
             )
         packed_scales[expert].copy_(expert_packed)
     if packed_scales is None:
+        packed_size_n = int(size_n) if output_size_n is None else int(output_size_n)
         packed_scales = torch.empty(
-            (0, size_k // _PACKED_TILE_SIZE, size_n // 2),
+            (0, size_k // _PACKED_TILE_SIZE, packed_size_n // 2),
             dtype=torch.float8_e4m3fn,
             device=scales.device,
         )
@@ -1102,6 +1105,24 @@ def prepare_w4a16_modelopt_native_weights(
         size_n=hidden_size,
         a_dtype=params_dtype,
     )
+    micro_w13_scale = packed_w13_scale
+    micro_w13_global_scale = packed_w13_global_scale
+    if w13_rows % _PACKED_TILE_N_SIZE != 0:
+        # The direct micro reader uses the native 64-row scale permutation.
+        # Keep the final tile intact: truncating it after permutation discards
+        # logical rows whose permuted columns land above ``w13_rows``.
+        micro_scale_n = (
+            (w13_rows + _PACKED_TILE_N_SIZE - 1) // _PACKED_TILE_N_SIZE
+        ) * _PACKED_TILE_N_SIZE
+        micro_w13_scale, micro_w13_global_scale = _permute_nvfp4_scales(
+            w13_scale,
+            native_w13_global_scale,
+            size_k=hidden_size,
+            size_n=w13_rows,
+            a_dtype=params_dtype,
+            row_rotation=w13_row_rotation,
+            output_size_n=micro_scale_n,
+        )
 
     return W4A16ModelOptWeights(
         w13=w13_fp4,
@@ -1117,9 +1138,9 @@ def prepare_w4a16_modelopt_native_weights(
         is_gated=is_gated,
         params_dtype=params_dtype,
         source_format=source_format,
-        micro_w13_scale=packed_w13_scale,
+        micro_w13_scale=micro_w13_scale,
         micro_w13_global_scale=_process_nvfp4_micro_global_scale_from_packed(
-            packed_w13_global_scale,
+            micro_w13_global_scale,
             a_dtype=params_dtype,
         ),
         micro_w2_scale=packed_w2_scale,
@@ -1166,9 +1187,12 @@ def prepare_w4a16_e8m0_native_weights(
     w13_rows = shape.w13_rows
     is_gated = shape.is_gated
     allow_w2_k_tail = intermediate_size % 32 != 0
-    padded_w13_scale_n = (
-        _e8m0_logical_tail_scale_n(w13_rows) if allow_w2_k_tail else w13_rows
-    )
+    # Packed E8M0 scale rows are permuted in 64-row blocks independently of
+    # whether W2 has a compact K tail.  Ungated 32-aligned intermediates such
+    # as I=224 therefore still need W13's 224 scale rows padded to 256; tying
+    # this padding to ``allow_w2_k_tail`` advertised the direct shape and then
+    # rejected it during preparation.
+    padded_w13_scale_n = _e8m0_logical_tail_scale_n(w13_rows)
 
     w13_scale = _validate_e8m0_k32_scales(
         w13_e8m0_scale,

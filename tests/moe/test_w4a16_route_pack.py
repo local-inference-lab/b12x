@@ -6,6 +6,44 @@ import pytest
 import torch
 
 from sparkinfer.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
+from sparkinfer.moe._shared.kernels.w4a16.host import (
+    route_block_sizes_for_capacity,
+    select_route_block_size_m,
+)
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "topk", "num_experts"),
+    [
+        (1, 8, 160),
+        (64, 8, 160),
+        (144, 8, 160),
+        (1024, 8, 256),
+        (32, 64, 8),
+    ],
+)
+def test_capacity_block_sizes_cover_every_live_selection(
+    max_tokens: int,
+    topk: int,
+    num_experts: int,
+) -> None:
+    planned = route_block_sizes_for_capacity(max_tokens, topk, num_experts)
+    selected = {
+        select_route_block_size_m(m, topk, num_experts)
+        for m in range(1, max_tokens + 1)
+    }
+
+    assert selected.issubset(planned)
+    assert planned[0] == select_route_block_size_m(1, topk, num_experts)
+    assert planned[-1] == select_route_block_size_m(
+        max_tokens,
+        topk,
+        num_experts,
+    )
+
+
+def test_small_capacity_needs_only_block_8() -> None:
+    assert route_block_sizes_for_capacity(64, 8, 160) == (8,)
 
 
 def _expected_route_pack(
@@ -79,14 +117,19 @@ def test_pack_topk_routes_by_expert_groups_and_pads_routes(
         device="cuda",
     )
 
-    local_packed_routes, local_block_experts, local_packed_route_count = pack_topk_routes_by_expert(
-        topk_ids,
-        block_size,
-        num_experts,
+    local_packed_routes, local_block_experts, local_packed_route_count = (
+        pack_topk_routes_by_expert(
+            topk_ids,
+            block_size,
+            num_experts,
+        )
     )
-    expected_ids, expected_valid, expected_packed_route_count, expected_block_experts = (
-        _expected_route_pack(topk_ids, block_size, num_experts)
-    )
+    (
+        expected_ids,
+        expected_valid,
+        expected_packed_route_count,
+        expected_block_experts,
+    ) = _expected_route_pack(topk_ids, block_size, num_experts)
 
     sentinel = int(topk_ids.numel())
     valid = int(expected_packed_route_count.item())
@@ -99,12 +142,18 @@ def test_pack_topk_routes_by_expert_groups_and_pads_routes(
     host_route_payload = host_packed_routes[host_packed_routes < sentinel]
     assert host_route_payload.numel() == int(expected_valid.sum().item())
     for expert in range(num_experts):
-        actual = host_route_payload[expected_ids[host_route_payload] == expert].sort().values
-        expected = torch.nonzero(expected_valid & (expected_ids == expert), as_tuple=False)
+        actual = (
+            host_route_payload[expected_ids[host_route_payload] == expert].sort().values
+        )
+        expected = torch.nonzero(
+            expected_valid & (expected_ids == expert), as_tuple=False
+        )
         expected = expected.flatten().sort().values
         assert torch.equal(actual, expected), expert
 
-    host_block_experts = local_block_experts[:valid_blocks].detach().cpu().to(torch.int64)
+    host_block_experts = (
+        local_block_experts[:valid_blocks].detach().cpu().to(torch.int64)
+    )
     for block, expert in enumerate(host_block_experts.tolist()):
         block_routes = host_packed_routes[block * block_size : (block + 1) * block_size]
         payload = block_routes[block_routes < sentinel]
@@ -131,9 +180,12 @@ def test_pack_topk_routes_by_expert_handles_large_prefill_plan_shape() -> None:
             num_experts,
         )
     )
-    expected_ids, expected_valid, expected_packed_route_count, expected_block_experts = (
-        _expected_route_pack(topk_ids, block_size, num_experts)
-    )
+    (
+        expected_ids,
+        expected_valid,
+        expected_packed_route_count,
+        expected_block_experts,
+    ) = _expected_route_pack(topk_ids, block_size, num_experts)
 
     sentinel = int(topk_ids.numel())
     valid = int(expected_packed_route_count.item())
@@ -146,8 +198,12 @@ def test_pack_topk_routes_by_expert_handles_large_prefill_plan_shape() -> None:
     host_route_payload = host_packed_routes[host_packed_routes < sentinel]
     assert host_route_payload.numel() == int(expected_valid.sum().item())
     for expert in range(num_experts):
-        actual = host_route_payload[expected_ids[host_route_payload] == expert].sort().values
-        expected = torch.nonzero(expected_valid & (expected_ids == expert), as_tuple=False)
+        actual = (
+            host_route_payload[expected_ids[host_route_payload] == expert].sort().values
+        )
+        expected = torch.nonzero(
+            expected_valid & (expected_ids == expert), as_tuple=False
+        )
         expected = expected.flatten().sort().values
         assert torch.equal(actual, expected), expert
 
@@ -173,15 +229,20 @@ def test_pack_topk_routes_by_expert_applies_expert_map(
     expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device="cuda")
     expert_map[::2] = torch.arange(local_experts, dtype=torch.int32, device="cuda")
 
-    local_packed_routes, local_block_experts, local_packed_route_count = pack_topk_routes_by_expert(
-        topk_ids,
-        block_size,
-        global_experts,
-        expert_map=expert_map,
+    local_packed_routes, local_block_experts, local_packed_route_count = (
+        pack_topk_routes_by_expert(
+            topk_ids,
+            block_size,
+            global_experts,
+            expert_map=expert_map,
+        )
     )
-    expected_ids, expected_valid, expected_packed_route_count, expected_block_experts = (
-        _expected_route_pack(topk_ids, block_size, global_experts, expert_map)
-    )
+    (
+        expected_ids,
+        expected_valid,
+        expected_packed_route_count,
+        expected_block_experts,
+    ) = _expected_route_pack(topk_ids, block_size, global_experts, expert_map)
 
     sentinel = int(topk_ids.numel())
     valid = int(expected_packed_route_count.item())
@@ -194,7 +255,11 @@ def test_pack_topk_routes_by_expert_applies_expert_map(
     host_route_payload = host_packed_routes[host_packed_routes < sentinel]
     assert host_route_payload.numel() == int(expected_valid.sum().item())
     for local_expert in range(local_experts):
-        actual = host_route_payload[expected_ids[host_route_payload] == local_expert].sort().values
+        actual = (
+            host_route_payload[expected_ids[host_route_payload] == local_expert]
+            .sort()
+            .values
+        )
         expected = torch.nonzero(
             expected_valid & (expected_ids == local_expert),
             as_tuple=False,
@@ -213,14 +278,19 @@ def test_pack_topk_routes_by_expert_ignores_invalid_ids() -> None:
     block_size = 4
     num_experts = 8
 
-    local_packed_routes, local_block_experts, local_packed_route_count = pack_topk_routes_by_expert(
-        topk_ids,
-        block_size,
-        num_experts,
+    local_packed_routes, local_block_experts, local_packed_route_count = (
+        pack_topk_routes_by_expert(
+            topk_ids,
+            block_size,
+            num_experts,
+        )
     )
-    expected_ids, expected_valid, expected_packed_route_count, expected_block_experts = (
-        _expected_route_pack(topk_ids, block_size, num_experts)
-    )
+    (
+        expected_ids,
+        expected_valid,
+        expected_packed_route_count,
+        expected_block_experts,
+    ) = _expected_route_pack(topk_ids, block_size, num_experts)
 
     sentinel = int(topk_ids.numel())
     valid = int(expected_packed_route_count.item())
@@ -230,4 +300,6 @@ def test_pack_topk_routes_by_expert_ignores_invalid_ids() -> None:
     payload = local_packed_routes[:valid].detach().cpu().to(torch.int64)
     payload = payload[payload < sentinel]
     assert payload.numel() == int(expected_valid.sum().item())
-    assert torch.equal(payload[expected_ids[payload] == 4].sort().values, torch.tensor([2, 5]))
+    assert torch.equal(
+        payload[expected_ids[payload] == 4].sort().values, torch.tensor([2, 5])
+    )

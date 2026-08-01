@@ -7128,6 +7128,7 @@ def compile_w4a16_fused_moe(
     full_rotation: bool = False,
     rotation_input_dtype: str | None = None,
     broadcast_suh: bool = False,
+    _require_cached: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
@@ -7506,6 +7507,13 @@ def compile_w4a16_fused_moe(
             size_m=size_m,
             max_m_blocks=max_m_blocks,
             blocks_per_sm=kernel.blocks_per_sm,
+        )
+    if _require_cached:
+        raise RuntimeError(
+            "W4A16 fused MoE launch is not resolved for CUDA graph capture "
+            f"(m={size_m}, moe_block_size={moe_block_size}, "
+            f"max_m_blocks={max_m_blocks}); run an eager warmup at this token "
+            "count before capturing"
         )
 
     if (not collect_activation_amax) and _small_m_direct_supported(
@@ -9810,6 +9818,23 @@ def _resolve_route_block_size_m(
     return compiled
 
 
+def _w4a16_stream_is_capturing(
+    stream: cuda.CUstream,
+    *,
+    current_stream: cuda.CUstream,
+) -> bool:
+    """Observe capture on either Torch's current stream or an explicit stream."""
+    current_capturing = torch.cuda.is_current_stream_capturing()
+    if current_capturing or int(stream) == int(current_stream):
+        return current_capturing
+    result, status = cuda.cuStreamIsCapturing(stream)
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"cuStreamIsCapturing failed for the selected W4A16 stream: {result}"
+        )
+    return int(status) != 0
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -10088,7 +10113,8 @@ def run_w4a16_moe(
     if block_size_m not in _ALLOWED_ROUTED_SIZES:
         raise ValueError(f"unsupported W4A16 moe_block_size={block_size_m}")
 
-    stream = current_cuda_stream() if stream is None else stream
+    current_stream = current_cuda_stream()
+    stream = current_stream if stream is None else stream
     if (not collect_activation_amax) and _small_m_direct_supported(
         m=m,
         hidden_size=hidden_size,
@@ -10357,6 +10383,10 @@ def run_w4a16_moe(
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
             rotation_input_dtype=rotation_input_dtype,
+            _require_cached=_w4a16_stream_is_capturing(
+                stream,
+                current_stream=current_stream,
+            ),
         )
     else:
         if int(fused_launch.size_m) < m:

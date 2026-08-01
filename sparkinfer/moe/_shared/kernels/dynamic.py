@@ -822,7 +822,11 @@ class MoEDynamicKernelBackend:
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             num_topk=self.num_topk,
-            activation=self.activation,
+            # This helper is gated-only and is never launched unless the split
+            # materialized path is active.  Use a valid inert specialization for
+            # non-split activations (notably ReLU2) instead of rejecting them
+            # during otherwise valid monolithic-kernel construction.
+            activation=self.activation if self.w4a8_split_materialized else "silu",
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
@@ -1065,12 +1069,8 @@ class MoEDynamicKernelBackend:
         # MMA dispatch selector: FP6/FP8 byte-containers are indistinguishable
         # from FP8 by dtype, so pass the explicit sub-format string ("e4m3"/
         # "e2m3"/"e3m2"); the native FP4 path keeps passing the operand dtype.
-        self._mma_fmt_a = (
-            self.mxfp6_fmt_a if self.mxfp6_fmt_a is not None else None
-        )
-        self._mma_fmt_b = (
-            self.mxfp6_fmt_b if self.mxfp6_fmt_b is not None else None
-        )
+        self._mma_fmt_a = self.mxfp6_fmt_a if self.mxfp6_fmt_a is not None else None
+        self._mma_fmt_b = self.mxfp6_fmt_b if self.mxfp6_fmt_b is not None else None
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
         self.num_m_tiles = self.tile_shape_mnk[0] // (16 * self.atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
@@ -1405,9 +1405,7 @@ class MoEDynamicKernelBackend:
             beta = cutlass.Float32(SITU_DEFAULT_BETA)
             linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
             situ_gate = (
-                beta
-                * cute.math.tanh(gate / beta, fastmath=self.fast_math)
-                * sigmoid
+                beta * cute.math.tanh(gate / beta, fastmath=self.fast_math) * sigmoid
             )
             situ_up = linear_beta * cute.math.tanh(
                 up / linear_beta,
@@ -2636,9 +2634,7 @@ class MoEDynamicKernelBackend:
             # for the expansion (cute.recast_tensor strips sB's swizzle), and
             # ``storage`` must not be referenced inside warp-dispatch branches,
             # so only these Int32 addresses may cross into them.
-            sB_packed = cute.make_tensor(
-                storage.sB.data_ptr(), b_packed_smem_staged
-            )
+            sB_packed = cute.make_tensor(storage.sB.data_ptr(), b_packed_smem_staged)
             sB_up_packed = cute.make_tensor(
                 storage.sB_up.data_ptr(), b_packed_smem_staged
             )
@@ -4196,15 +4192,7 @@ class MoEDynamicKernelBackend:
             # region; A bufs in sA past the FC2-intermediate bytes; FC1
             # residual bufs in sC (dead until the epilogue rendezvous); FC2
             # residual bufs alias the (FC1-only) A-buf region.
-            if cutlass.const_expr(self.w4a8_repacked):
-                w4a8_sa0 = (
-                    ctrl_base_addr
-                    + Int32(Storage._offsets["sA"])
-                    + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
-                )
-                w4a8_res0 = ctrl_base_addr + Int32(Storage._offsets["sC"])
-                w4a8_res2 = w4a8_sa0
-            elif cutlass.const_expr(self.w4a8_small):
+            if cutlass.const_expr(self.w4a8_repacked or self.w4a8_small):
                 w4a8_sa0 = (
                     ctrl_base_addr
                     + Int32(Storage._offsets["sA"])
@@ -5912,23 +5900,17 @@ class MoEDynamicKernelBackend:
                                 zero_total = Int32(128) * sf_blocks_per_row
                                 zero_idx = Int32(tidx)
                                 while zero_idx < zero_total:
-                                    st_shared_u8(
-                                        sfa_base_addr + zero_idx, Uint8(0)
-                                    )
+                                    st_shared_u8(sfa_base_addr + zero_idx, Uint8(0))
                                     zero_idx += Int32(
-                                        self.num_mma_warps
-                                        * self.num_threads_per_warp
+                                        self.num_mma_warps * self.num_threads_per_warp
                                     )
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 zero_total_sa = Int32(128) * packed_cols
                                 zsa_idx = Int32(tidx)
                                 while zsa_idx < zero_total_sa:
-                                    st_shared_u8(
-                                        sa_base_addr + zsa_idx, Uint8(0)
-                                    )
+                                    st_shared_u8(sa_base_addr + zsa_idx, Uint8(0))
                                     zsa_idx += Int32(
-                                        self.num_mma_warps
-                                        * self.num_threads_per_warp
+                                        self.num_mma_warps * self.num_threads_per_warp
                                     )
                                 self.epilog_sync_barrier.arrive_and_wait()
                             quant_gs_value = gs_value
@@ -6015,9 +5997,7 @@ class MoEDynamicKernelBackend:
                                             ]
                                         )
                                         values[elem_idx] = value
-                                        block_max = fmax_f32(
-                                            block_max, fabs_f32(value)
-                                        )
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
                                     containers, scale_byte = (
                                         moe_mxfp6_quantize_input_block_containers(
                                             values,
@@ -6036,9 +6016,7 @@ class MoEDynamicKernelBackend:
                                     _row_flat = row * Int32(self.tile_shape_mnk[2])
                                     for elem_idx in cutlass.range_constexpr(32):
                                         _flat = (
-                                            _row_flat
-                                            + block_start
-                                            + Int32(elem_idx)
+                                            _row_flat + block_start + Int32(elem_idx)
                                         )
                                         st_shared_u8(
                                             sa_base_addr + (_flat ^ _row_sw),
@@ -6058,9 +6036,7 @@ class MoEDynamicKernelBackend:
                                             ]
                                         )
                                         values[elem_idx] = value
-                                        block_max = fmax_f32(
-                                            block_max, fabs_f32(value)
-                                        )
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
 
                                     packed64 = Uint64(0)
                                     scale_byte = Uint8(0)

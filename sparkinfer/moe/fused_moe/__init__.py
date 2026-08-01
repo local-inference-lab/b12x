@@ -14,6 +14,8 @@ Runtime lifecycle:
     ``plan(Caps)`` -> ``bind`` / ``bind_sparse`` / ``bind_route``
     (allocation-free views) -> ``run`` / ``run_sparse`` / ``route``
     (CUDA-graph capture safe)
+``required_nbytes(Caps)`` prices that scratch without compiling launches or
+retaining storage.
 ``route_topk`` is a standalone one-shot top-k router; ``run_sparse`` fuses
 gate -> top-k -> experts from router logits.
 
@@ -52,6 +54,7 @@ META = OpMeta(
         "Routing",
         "WeightsPlan",
         "plan",
+        "required_nbytes",
         "plan_execution",
         "plan_weights",
         "prepare_weights",
@@ -101,6 +104,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         clear_caches,
         is_supported,
         plan,
+        required_nbytes,
         plan_execution,
         plan_weights,
         prepare_weights,
