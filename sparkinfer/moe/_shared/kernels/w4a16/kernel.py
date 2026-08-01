@@ -4603,6 +4603,7 @@ class W4A16FusedMoeKernel:
         full_rotation: bool = False,
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
+        defer_router_weight_to_sum: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -4680,11 +4681,18 @@ class W4A16FusedMoeKernel:
                     "intermediate_rotation requires unclamped gated silu or situ "
                     "(no swiglu limit/oai)"
                 )
-            if int(intermediate_size) % 128 != 0:
+            if int(intermediate_size) % 128 not in (0, 64):
                 raise ValueError(
-                    "intermediate_rotation requires intermediate_size % 128 == 0"
+                    "intermediate_rotation requires 128-wide blocks with an "
+                    "optional 64-wide tail"
                 )
         self.full_rotation = bool(full_rotation)
+        self.defer_router_weight_to_sum = bool(defer_router_weight_to_sum)
+        if self.defer_router_weight_to_sum and self.apply_router_weight_on_input:
+            raise ValueError(
+                "defer_router_weight_to_sum is incompatible with "
+                "apply_router_weight_on_input"
+            )
         # suh tables hold one shared row (kquant shared-su artifacts): index
         # them with a zero expert stride.
         self.broadcast_suh = bool(broadcast_suh)
@@ -4748,7 +4756,9 @@ class W4A16FusedMoeKernel:
             num_experts=num_experts,
             top_k=1,
             mul_topk_weights=(
-                not bool(apply_router_weight_on_input) and not self.full_rotation
+                not bool(apply_router_weight_on_input)
+                and not self.full_rotation
+                and not self.defer_router_weight_to_sum
             ),
             tile_n=fc2_tile_n,
             tile_k=fc2_tile_k,
@@ -4807,6 +4817,7 @@ class W4A16FusedMoeKernel:
             self.full_rotation,
             self.broadcast_suh,
             self.rotation_input_dtype,
+            self.defer_router_weight_to_sum,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
@@ -5336,7 +5347,7 @@ class W4A16FusedMoeKernel:
         lane = tid & Int32(31)
         warp_in_cta = tid >> Int32(5)
         warps_per_cta = Int32(self.cta_threads // 32)
-        nblk = Int32(self.intermediate_size // 128)
+        nblk = Int32((self.intermediate_size + 127) // 128)
         live_routes = active_m * Int32(self.top_k)
         route_count = packed_route_count[Int32(0)].to(Int32)
         fc1_cols = Int32(self.fc1_cols)
@@ -5345,7 +5356,6 @@ class W4A16FusedMoeKernel:
         gwarp = cta * warps_per_cta + warp_in_cta
         gw_stride = grid_x * warps_per_cta
         total_units = route_count * nblk
-        elem = lane * Int32(4)
         unit = gwarp
         while unit < total_units:
             route_pos = unit // nblk
@@ -5353,6 +5363,12 @@ class W4A16FusedMoeKernel:
             row = packed_route_indices[route_pos].to(Int32)
             expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
             if row >= Int32(0) and row < live_routes and expert >= Int32(0):
+                is_tail64 = Int32(0)
+                elem = lane * Int32(4)
+                if cutlass.const_expr(self.intermediate_size % 128 == 64):
+                    if blk == nblk - Int32(1):
+                        is_tail64 = Int32(1)
+                        elem = (lane & Int32(15)) * Int32(4)
                 col0 = blk * Int32(128) + elem
                 g_base = row * fc1_cols + col0
                 u_base = g_base + isz
@@ -5367,6 +5383,9 @@ class W4A16FusedMoeKernel:
                 u3 = fc1_bf16_flat[u_base + Int32(3)].to(cutlass.Float32)
                 gh0, gh1, gh2, gh3 = self._had128_quad(g0, g1, g2, g3, lane)
                 uh0, uh1, uh2, uh3 = self._had128_quad(u0, u1, u2, u3, lane)
+                if is_tail64 != Int32(0):
+                    gh0, gh1, gh2, gh3 = self._had64_quad(g0, g1, g2, g3, lane)
+                    uh0, uh1, uh2, uh3 = self._had64_quad(u0, u1, u2, u3, lane)
                 svg0 = rot_scales_flat[s_base + Int32(0)].to(cutlass.Float32)
                 svg1 = rot_scales_flat[s_base + Int32(1)].to(cutlass.Float32)
                 svg2 = rot_scales_flat[s_base + Int32(2)].to(cutlass.Float32)
@@ -5429,11 +5448,14 @@ class W4A16FusedMoeKernel:
                     a2 = self._silu_f32(ig2) * iu2 * sd2
                     a3 = self._silu_f32(ig3) * iu3 * sd3
                 o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
+                if is_tail64 != Int32(0):
+                    o0, o1, o2, o3 = self._had64_quad(a0, a1, a2, a3, lane)
                 out_base = row * isz + col0
-                activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
-                activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
-                activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
-                activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
+                if is_tail64 == Int32(0) or lane < Int32(16):
+                    activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
+                    activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
+                    activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
+                    activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
             unit += gw_stride
 
     @cute.jit
@@ -5606,6 +5628,49 @@ class W4A16FusedMoeKernel:
         return h0 * rs, h1 * rs, h2 * rs, h3 * rs
 
     @cute.jit
+    def _had64_quad(
+        self,
+        v0: cutlass.Float32,
+        v1: cutlass.Float32,
+        v2: cutlass.Float32,
+        v3: cutlass.Float32,
+        lane: Int32,
+    ):
+        """Normalized H64 with four adjacent elements per half-warp lane.
+
+        Callers duplicate the 64-value tail in both warp halves.  XOR shuffle
+        offsets below 16 never cross the half-warp boundary, so both halves
+        execute the same transform and only lanes 0..15 need to store it.
+        """
+
+        s0 = v0 + v1
+        d0 = v0 - v1
+        s1 = v2 + v3
+        d1 = v2 - v3
+        h0 = s0 + s1
+        h1 = d0 + d1
+        h2 = s0 - s1
+        h3 = d0 - d1
+        for i in cutlass.range_constexpr(4):
+            st = 1 << i
+            p0 = cute.arch.shuffle_sync_bfly(h0, offset=st)
+            p1 = cute.arch.shuffle_sync_bfly(h1, offset=st)
+            p2 = cute.arch.shuffle_sync_bfly(h2, offset=st)
+            p3 = cute.arch.shuffle_sync_bfly(h3, offset=st)
+            if (lane & Int32(st)) != Int32(0):
+                h0 = p0 - h0
+                h1 = p1 - h1
+                h2 = p2 - h2
+                h3 = p3 - h3
+            else:
+                h0 = p0 + h0
+                h1 = p1 + h1
+                h2 = p2 + h2
+                h3 = p3 + h3
+        rs = cutlass.Float32(0.125)  # 1 / sqrt(64)
+        return h0 * rs, h1 * rs, h2 * rs, h3 * rs
+
+    @cute.jit
     def _sigmoid_f32(self, x: cutlass.Float32) -> cutlass.Float32:
         if cutlass.const_expr(self.fast_math):
             e = cute.math.exp(-x, fastmath=True)
@@ -5640,18 +5705,23 @@ class W4A16FusedMoeKernel:
             lane = tid & Int32(31)
             warp_in_cta = tid >> Int32(5)
             warps_per_cta = Int32(self.cta_threads // 32)
-            nblk = Int32(self.intermediate_size // 128)
+            nblk = Int32((self.intermediate_size + 127) // 128)
             fc1_cols = Int32(self.fc1_cols)
             isz = Int32(self.intermediate_size)
             rot_row = Int32(3 * self.intermediate_size)
             gwarp = cta * warps_per_cta + warp_in_cta
             gw_stride = grid_x * warps_per_cta
             total_units = active_m * Int32(self.top_k) * nblk
-            e = lane * Int32(4)
             unit = gwarp
             while unit < total_units:
                 row = unit // nblk
                 blk = unit - row * nblk
+                is_tail64 = Int32(0)
+                e = lane * Int32(4)
+                if cutlass.const_expr(self.intermediate_size % 128 == 64):
+                    if blk == nblk - Int32(1):
+                        is_tail64 = Int32(1)
+                        e = (lane & Int32(15)) * Int32(4)
                 col0 = blk * Int32(128) + e
                 g_base = row * fc1_cols + col0
                 u_base = g_base + isz
@@ -5668,6 +5738,9 @@ class W4A16FusedMoeKernel:
                 # blockwise-128 Hadamard on gate and up (pre-silu, output side)
                 gh0, gh1, gh2, gh3 = self._had128_quad(g0, g1, g2, g3, lane)
                 uh0, uh1, uh2, uh3 = self._had128_quad(u0, u1, u2, u3, lane)
+                if is_tail64 != Int32(0):
+                    gh0, gh1, gh2, gh3 = self._had64_quad(g0, g1, g2, g3, lane)
+                    uh0, uh1, uh2, uh3 = self._had64_quad(u0, u1, u2, u3, lane)
                 # post-scale svh_gate / svh_up
                 svg0 = rot_scales_flat[s_base + Int32(0)].to(cutlass.Float32)
                 svg1 = rot_scales_flat[s_base + Int32(1)].to(cutlass.Float32)
@@ -5697,11 +5770,14 @@ class W4A16FusedMoeKernel:
                 a3 = self._silu_f32(ig2_3) * iu2_3 * sd3
                 # blockwise-128 Hadamard on the activation (post-silu, input side)
                 o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
+                if is_tail64 != Int32(0):
+                    o0, o1, o2, o3 = self._had64_quad(a0, a1, a2, a3, lane)
                 out_base = row * isz + col0
-                activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
-                activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
-                activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
-                activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
+                if is_tail64 == Int32(0) or lane < Int32(16):
+                    activated_bf16_flat[out_base + Int32(0)] = self._cast_elem(o0)
+                    activated_bf16_flat[out_base + Int32(1)] = self._cast_elem(o1)
+                    activated_bf16_flat[out_base + Int32(2)] = self._cast_elem(o2)
+                    activated_bf16_flat[out_base + Int32(3)] = self._cast_elem(o3)
                 unit += gw_stride
             return
         idx = cta * Int32(self.cta_threads) + tid
@@ -6527,9 +6603,7 @@ class W4A16TopKSumKernel:
                         v1 = fc2_flat[base + Int32(1)].to(cutlass.Float32)
                         v2 = fc2_flat[base + Int32(2)].to(cutlass.Float32)
                         v3 = fc2_flat[base + Int32(3)].to(cutlass.Float32)
-                        h0, h1, h2, h3 = self._had128_quad(
-                            v0, v1, v2, v3, lane
-                        )
+                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
                         if cutlass.const_expr(self.broadcast_svh):
                             sbase = col0
                         else:
@@ -8545,9 +8619,11 @@ def _w4a16_fused_moe_launch_flat(
             )
         suh_gate_arg = suh_gate_table.reshape(-1)
         suh_up_arg = suh_up_table.reshape(-1)
-        broadcast_suh = (
-            num_experts > 1 and suh_gate_arg.numel() == hidden_size
-        )
+        # For E=1 the shapes [E,H] and [1,H] are identical.  Treat that case
+        # as broadcast as well: stride zero and per-expert stride address the
+        # same row, while choosing broadcast keeps gate/up classification
+        # symmetric and makes single-expert closure harnesses valid.
+        broadcast_suh = suh_gate_arg.numel() == hidden_size
         if broadcast_suh != (suh_up_arg.numel() == hidden_size):
             raise ValueError(
                 "suh gate/up tables must both be per-expert or both broadcast"
@@ -9054,10 +9130,7 @@ def _w4a16_topk_sum_launch_flat(
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     broadcast_svh = (
-        full_rotation
-        and svh_table is not None
-        and num_experts > 1
-        and svh_table.numel() == hidden_size
+        full_rotation and svh_table is not None and svh_table.numel() == hidden_size
     )
     sum_kernel = compile_w4a16_topk_sum(
         m=m,
@@ -9916,6 +9989,16 @@ def run_w4a16_moe(
             )
         num_local_experts = int(prepared.num_experts)
         intermediate_size_full = int(prepared.intermediate_size)
+        actual_tail = intermediate_size_full % 128
+        prepared_tail = int(getattr(prepared, "tp_local_intermediate_hadamard_tail", 0))
+        if actual_tail not in (0, 64) or prepared_tail != actual_tail:
+            raise ValueError(
+                "full-rotation Trellis rank-local Hadamard contract is not "
+                "satisfied: "
+                f"I={intermediate_size_full}, shape_tail={actual_tail}, "
+                f"artifact_tail={prepared_tail}. H64 tails require a "
+                "TP-local-quantized checkpoint."
+            )
         # H-side tables may hold a single broadcast row (kquant shared-su
         # artifacts); the kernels index them with a zero expert stride.
         for name, table, shapes in (

@@ -18,6 +18,11 @@ _POST_PREFIX_BLOCK_T = 256
 _SMALL_PREFIX_MAX_PACKED_ROUTES = 4096
 _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 128
 _SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT = 65536
+# The fused prefix materializes [BLOCK_E, BLOCK_T] route matches. At E=896
+# this rounds to 1024x256 and spills enough state for CUDA to reject even a
+# single decode launch on a nearly full K3 rank. The split histogram path uses
+# the caller-owned expert_counts workspace and keeps its live vectors bounded.
+_SMALL_PREFIX_MAX_EXPERTS = 256
 
 
 _FAST_COUNT_BLOCK_T = 1024
@@ -339,10 +344,7 @@ def pack_topk_routes_by_expert(
     if (
         provided_routes is not None
         and provided_blocks is not None
-        and (
-            provided_routes < max_packed_routes
-            or provided_blocks < max_route_blocks
-        )
+        and (provided_routes < max_packed_routes or provided_blocks < max_route_blocks)
     ):
         raise ValueError(
             "W4A16 route-packing workspace is too small: "
@@ -398,6 +400,7 @@ def pack_topk_routes_by_expert(
         block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
         and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
         and block_e * block_m <= _SMALL_PREFIX_MAX_EXPERT_BLOCK_PRODUCT
+        and block_e <= _SMALL_PREFIX_MAX_EXPERTS
     )
     if use_small_prefix:
         # Decode-sized W4A16 MoE calls are launch-overhead sensitive. Keep the

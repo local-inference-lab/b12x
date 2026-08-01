@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,10 +11,14 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+    pack_topk_routes_by_expert,
+    run_w4a16_moe,
+)
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
     build_tiered_maps,
     combine_trellis_rotations,
+    compile_mixed_mxfp4_trellis,
     compile_mixed_trellis,
     make_mixed_trellis_buffers,
     run_mixed_trellis,
@@ -258,6 +264,90 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
         build_tiered_maps((0, 1), (1, 2), device=torch.device("cpu"))
     with pytest.raises(ValueError, match="disjoint partition"):
         build_tiered_maps((0, 4), (1, 2), device=torch.device("cpu"))
+
+
+def test_build_tiered_maps_covers_kimi_k3_tp16_without_expert_padding() -> None:
+    """The normal TP16 path retains all 896 experts on every rank.
+
+    A representative 44%/56% split exceeds the old eight-bit tier-local ABI
+    on both sides.  Sixteen-bit descriptors must preserve it exactly.
+    """
+
+    tier0 = tuple(range(394))
+    tier1 = tuple(range(394, 896))
+    route_map, descriptors = build_tiered_maps(tier0, tier1, device=torch.device("cpu"))
+    assert torch.equal(route_map, torch.arange(896, dtype=torch.int32))
+    assert int(descriptors[393]) == 393
+    assert int(descriptors[394]) == (1 << 16)
+    assert int(descriptors[895]) == (1 << 16) | 501
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_kimi_k3_decode_route_pack_bounds_896_expert_prefix() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    topk_ids = torch.tensor([[0, 394, 1, 395] * 4], dtype=torch.int32, device=device)
+    route_slots = max_packed_route_slots(topk_ids.numel(), 8, 896)
+    packed = torch.empty(route_slots, dtype=torch.int32, device=device)
+    block_experts = torch.empty(
+        (route_slots + 7) // 8, dtype=torch.int32, device=device
+    )
+    packed_count = torch.empty(1, dtype=torch.int32, device=device)
+    expert_offsets = torch.empty(897, dtype=torch.int32, device=device)
+    expert_counts = torch.empty(896, dtype=torch.int32, device=device)
+
+    pack_topk_routes_by_expert(
+        topk_ids,
+        8,
+        896,
+        expert_map=torch.arange(896, dtype=torch.int32, device=device),
+        packed_route_indices=packed,
+        block_expert_ids=block_experts,
+        packed_route_count=packed_count,
+        expert_offsets=expert_offsets,
+        expert_counts=expert_counts,
+    )
+    torch.cuda.synchronize(device)
+
+    active = torch.nonzero(expert_counts, as_tuple=False).view(-1).cpu().tolist()
+    assert route_slots == 128
+    assert int(packed_count.item()) == 32
+    assert active == [0, 1, 394, 395]
+
+
+def test_kimi_k3_tp16_onegrid_rejects_unmarked_h64_artifact() -> None:
+    with pytest.raises(ValueError, match="TP-local-quantized checkpoint"):
+        compile_mixed_mxfp4_trellis(
+            size_m=1,
+            hidden_size=3584,
+            intermediate_size=192,
+            tier0_num_experts=394,
+            tier1_num_experts=502,
+            top_k=16,
+            max_m_blocks=16,
+            sms=1,
+            max_shared_mem=99_999,
+            force_tile_config=(128, 64, 64, 128),
+        )
+
+
+def test_mixed_onegrid_rejects_logical_counts_larger_than_physical_weights() -> None:
+    launch = SimpleNamespace(tier0_num_experts=394, tier1_num_experts=502)
+    tier0 = SimpleNamespace(num_experts=2)
+    tier1 = SimpleNamespace(num_experts=2)
+
+    with pytest.raises(ValueError, match="physical expert counts"):
+        run_mixed_trellis(
+            None,
+            tier0,
+            tier1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            launch,
+            None,
+        )
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

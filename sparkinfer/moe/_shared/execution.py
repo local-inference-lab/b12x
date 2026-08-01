@@ -271,6 +271,7 @@ class MoEWeightPreparationPlan:
     storage_policy: WeightStoragePolicy
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
+    tp_local_intermediate_hadamard_tail: int = 0
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -312,7 +313,20 @@ class MoEWeightPreparationPlan:
                 )
             object.__setattr__(self, "trellis_bits", bits)
             object.__setattr__(self, "trellis_tile_config", tile_config)
-        elif self.trellis_bits is not None or self.trellis_tile_config is not None:
+            tail = int(self.tp_local_intermediate_hadamard_tail)
+            shape_tail = self.intermediate_size % 128
+            if shape_tail not in (0, 64) or tail != shape_tail:
+                raise ValueError(
+                    "Trellis rank-local Hadamard metadata does not match the "
+                    f"shape: I={self.intermediate_size}, shape_tail={shape_tail}, "
+                    f"artifact_tail={tail}"
+                )
+            object.__setattr__(self, "tp_local_intermediate_hadamard_tail", tail)
+        elif (
+            self.trellis_bits is not None
+            or self.trellis_tile_config is not None
+            or self.tp_local_intermediate_hadamard_tail
+        ):
             raise ValueError(
                 "trellis_bits/trellis_tile_config require "
                 "source_format='exl3_trellis_mcg'"
@@ -597,6 +611,7 @@ def plan_moe_weight_preparation(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    tp_local_intermediate_hadamard_tail: int = 0,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -800,6 +815,7 @@ def plan_moe_weight_preparation(
         storage_policy=storage_policy,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
+        tp_local_intermediate_hadamard_tail=(tp_local_intermediate_hadamard_tail),
     )
 
 

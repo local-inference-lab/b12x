@@ -139,6 +139,10 @@ class PreparedW4A16MoeWeights:
     intermediate_rotations: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
     tile_config: tuple[int, int, int, int] | None = None
+    # Nonzero only for artifacts quantized after TP sharding.  Kimi-K3 TP16
+    # uses rank-local H128+H64 transforms; a globally transformed checkpoint
+    # sliced at 192 channels is not compatible even though tensor shapes match.
+    tp_local_intermediate_hadamard_tail: int = 0
 
 
 # Compatibility for internal callers that still use the historical NF3 name.
@@ -1613,6 +1617,7 @@ def prepare_trellis256_moe_weights(
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
     tile_config: tuple[int, int, int, int] | None = None,
+    tp_local_intermediate_hadamard_tail: int = 0,
     workspace: torch.Tensor | None = None,
 ) -> PreparedW4A16MoeWeights:
     """Wrap or synthesize native EXL3 tiles for ``trellis3_t256``.
@@ -1636,6 +1641,7 @@ def prepare_trellis256_moe_weights(
     num_experts = int(num_experts)
     fc1_tile_n = int(fc1_tile_n)
     fc2_tile_n = int(fc2_tile_n)
+    tp_local_intermediate_hadamard_tail = int(tp_local_intermediate_hadamard_tail)
     if params_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("trellis3_t256 W4A16 weights require fp16 or bf16 activations")
     requested_trellis_bits = None if trellis_bits is None else int(trellis_bits)
@@ -1883,6 +1889,20 @@ def prepare_trellis256_moe_weights(
         )
     if have_full_rotation:
         assert intermediate_rotations is not None and down_svh is not None
+        actual_tail = intermediate_size % 128
+        if tp_local_intermediate_hadamard_tail != actual_tail:
+            raise ValueError(
+                "full-rotation Trellis intermediate Hadamard metadata does not "
+                "match the rank-local shape: "
+                f"marker={tp_local_intermediate_hadamard_tail}, "
+                f"I={intermediate_size}, tail={actual_tail}. A 64-channel tail "
+                "is valid only for a checkpoint quantized after TP sharding."
+            )
+        if actual_tail not in (0, 64):
+            raise ValueError(
+                "full-rotation Trellis supports H128 blocks with an optional "
+                f"H64 rank-local tail, got I={intermediate_size}"
+            )
         for name, scale, shapes in (
             (
                 "intermediate_rotations",
@@ -1910,6 +1930,11 @@ def prepare_trellis256_moe_weights(
                 )
             if not scale.is_contiguous():
                 raise ValueError(f"trellis3_t256 {name} must be contiguous")
+    elif tp_local_intermediate_hadamard_tail:
+        raise ValueError(
+            "tp_local_intermediate_hadamard_tail requires full-rotation "
+            "Trellis scale tables"
+        )
 
     if tile_config is not None:
         tile_config = tuple(int(value) for value in tile_config)
@@ -1986,6 +2011,7 @@ def prepare_trellis256_moe_weights(
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
         tile_config=tile_config,
+        tp_local_intermediate_hadamard_tail=(tp_local_intermediate_hadamard_tail),
     )
 
 

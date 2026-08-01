@@ -271,6 +271,7 @@ class TPW4A16Workspace:
     full_rotation: bool = False
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
+    tp_local_intermediate_hadamard_tail: int = 0
     route_block_size_m: int | None = None
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
     planned_apply_router_weight_on_input: bool = False
@@ -686,6 +687,7 @@ class _TPCoreWorkspacePlan:
     full_rotation: bool = False
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
+    tp_local_intermediate_hadamard_tail: int = 0
     route_block_size_m: int | None = None
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
 
@@ -861,9 +863,7 @@ class TPMoEScratchPlan:
     _prewarmed_fused_launches: tuple[tuple[int, object], ...] = field(
         default=(), repr=False
     )
-    _prewarmed_topk_sum_launches: tuple[
-        tuple[torch.dtype, bool, object], ...
-    ] = field(
+    _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
         default=(), repr=False
     )
 
@@ -2515,6 +2515,7 @@ def _plan_core_workspace(
     w4a16_block_size_m: int | None = None,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    tp_local_intermediate_hadamard_tail: int = 0,
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -2559,10 +2560,18 @@ def _plan_core_workspace(
                 raise ValueError(
                     "trellis3_t256 workspace requires source_format='exl3_trellis_mcg'"
                 )
-            if int(k) % 128 != 0 or int(n) % 128 != 0:
+            shape_tail = int(n) % 128
+            artifact_tail = int(tp_local_intermediate_hadamard_tail)
+            if int(k) % 128 != 0 or shape_tail not in (0, 64):
                 raise ValueError(
-                    "full-rotation Trellis requires hidden and intermediate "
-                    "dimensions divisible by 128"
+                    "full-rotation Trellis requires H128 and rank-local "
+                    f"H128/H64 intermediate geometry, got H={k}, I={n}"
+                )
+            if artifact_tail != shape_tail:
+                raise ValueError(
+                    "full-rotation Trellis H64 tails require a TP-local-"
+                    f"quantized artifact: shape_tail={shape_tail}, "
+                    f"artifact_tail={artifact_tail}"
                 )
             if int(trellis_bits) not in (3, 4, 5, 6):
                 raise ValueError("trellis_bits must be one of 3, 4, 5, 6")
@@ -2702,6 +2711,7 @@ def _plan_core_workspace(
             full_rotation=full_rotation,
             trellis_bits=int(trellis_bits),
             trellis_tile_config=trellis_tile_config,
+            tp_local_intermediate_hadamard_tail=artifact_tail,
             route_block_size_m=w4a16_block_size_m,
             tensor_specs=tuple(tensor_specs),
         )
@@ -3123,6 +3133,9 @@ def _materialize_workspace_from_core_arena(
             full_rotation=plan.full_rotation,
             trellis_bits=plan.trellis_bits,
             trellis_tile_config=plan.trellis_tile_config,
+            tp_local_intermediate_hadamard_tail=(
+                plan.tp_local_intermediate_hadamard_tail
+            ),
             route_block_size_m=plan.route_block_size_m,
             volatile_launch_state=bool(volatile_launch_state),
         )
@@ -4809,6 +4822,7 @@ def plan_sparkinfer_fp4_moe_weights(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    tp_local_intermediate_hadamard_tail: int = 0,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -4836,6 +4850,7 @@ def plan_sparkinfer_fp4_moe_weights(
         w4a16_layout=w4a16_layout,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
+        tp_local_intermediate_hadamard_tail=(tp_local_intermediate_hadamard_tail),
     )
 
 
@@ -4951,6 +4966,9 @@ def prepare_sparkinfer_fp4_moe_weights(
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
             tile_config=tile_config,
+            tp_local_intermediate_hadamard_tail=(
+                plan.tp_local_intermediate_hadamard_tail
+            ),
             # The live kernel workspace is carved from the caller-owned MoE
             # scratch arena at bind time. Keep only a zero-copy placeholder in
             # the persistent prepared-weight object.
@@ -6133,6 +6151,9 @@ def plan_tp_moe_arena_layout(
             w4a16_block_size_m=w4a16_block_size_m,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
+            tp_local_intermediate_hadamard_tail=(
+                weight_plan.tp_local_intermediate_hadamard_tail
+            ),
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
@@ -6202,12 +6223,10 @@ def _plan_full_rotation_w4a16_launches(
         )
     block_size_m = int(core_plan.route_block_size_m)
     weight_layout = _normalize_w4a16_weight_layout(
-        caps.w4a16_weight_layout
-        or _w4a16_weight_layout_for_source(caps.source_format)
+        caps.w4a16_weight_layout or _w4a16_weight_layout_for_source(caps.source_format)
     )
     scale_format = _normalize_w4a16_scale_format(
-        caps.w4a16_scale_format
-        or _w4a16_scale_format_for_source(caps.source_format)
+        caps.w4a16_scale_format or _w4a16_scale_format_for_source(caps.source_format)
     )
     if weight_layout != "trellis3_t256" or scale_format != "e4m3_k32":
         raise RuntimeError(
@@ -6221,9 +6240,7 @@ def _plan_full_rotation_w4a16_launches(
         block_size_m,
         core_plan.route_E,
     )
-    capacity_m_blocks = (
-        capacity_route_slots + block_size_m - 1
-    ) // block_size_m
+    capacity_m_blocks = (capacity_route_slots + block_size_m - 1) // block_size_m
     rotation_input_dtype = _w4a16_element_dtype(core_plan.dtype)
 
     with torch.cuda.device(core_plan.device):
@@ -6425,6 +6442,9 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_block_size_m=caps.w4a16_block_size_m,
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
+        tp_local_intermediate_hadamard_tail=(
+            caps.weight_plan.tp_local_intermediate_hadamard_tail
+        ),
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=launch_plan.deterministic_output,
         swiglu_limit=launch_plan.swiglu_limit,
@@ -6610,9 +6630,9 @@ def _prewarm_w4a16_planned_launches(
                                 broadcast_svh=broadcast_svh,
                             )
                             if not broadcast_svh:
-                                topk_sum_launches[
-                                    (token_count, ids_dtype, mapped)
-                                ] = resolved_topk_sum
+                                topk_sum_launches[(token_count, ids_dtype, mapped)] = (
+                                    resolved_topk_sum
+                                )
             else:
                 topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                     m=token_count,
@@ -6829,6 +6849,9 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_block_size_m=caps.w4a16_block_size_m,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
+            tp_local_intermediate_hadamard_tail=(
+                weight_plan.tp_local_intermediate_hadamard_tail
+            ),
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
