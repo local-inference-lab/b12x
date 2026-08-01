@@ -55,6 +55,7 @@ class MixedTrellisCompileResult:
     fc2_tile_k: int
     fc2_tile_n: int
     moe_block_size: int
+    fc2_moe_block_size: int
     max_m_blocks: int
     blocks_per_sm: int
     sms: int
@@ -109,7 +110,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 1
+    ABI_VERSION = 2
 
     def __init__(
         self,
@@ -145,7 +146,15 @@ class W4A16MixedTrellisKernel:
         for phase in ("fc1", "fc2"):
             gemms = tuple(getattr(moe, phase) for moe in (driver, tier0, tier1))
             geometry = tuple(
-                (g.n_tiles, g.k_tiles, g.tile_n, g.tile_k, g.cta_threads) for g in gemms
+                (
+                    g.n_tiles,
+                    g.k_tiles,
+                    g.tile_n,
+                    g.tile_k,
+                    g.cta_threads,
+                    g.moe_block_size,
+                )
+                for g in gemms
             )
             if geometry[1:] != geometry[:-1]:
                 raise ValueError(
@@ -214,7 +223,12 @@ class W4A16MixedTrellisKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
     ):
-        combined_expert = block_expert_ids[route_block_idx].to(Int32)
+        metadata_block_idx = route_block_idx
+        if cutlass.const_expr(not is_fc1):
+            metadata_block_idx = route_block_idx // Int32(
+                self.driver.moe_block_size // self.driver.fc2.moe_block_size
+            )
+        combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
         if combined_expert >= Int32(0) and combined_expert < Int32(self.total_experts):
             descriptor = descriptor_map[combined_expert].to(Int32)
             if descriptor >= Int32(0):
@@ -557,6 +571,7 @@ def compile_mixed_trellis(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
+            fc2_moe_block_size=(8 if int(moe_block_size) == 64 else moe_block_size),
             element_dtype="fp16",
             weight_layout="trellis3_t256",
             scale_format="e4m3_k32",
@@ -573,9 +588,15 @@ def compile_mixed_trellis(
         tier0=make_kernel(int(tier0_num_experts), int(tier0_bits)),
         tier1=make_kernel(int(tier1_num_experts), int(tier1_bits)),
     )
-    if kernel.shared_words * 4 > int(max_shared_mem) - 512:
+    # shared_words is the complete dynamically allocated MemRange used by the
+    # cooperative kernel. CUDA permits a launch exactly at the device's
+    # opt-in shared-memory limit; rejecting an additional 512 bytes here
+    # unnecessarily excludes the stock mixed-K tile geometry at block-64.
+    if kernel.shared_words * 4 > int(max_shared_mem):
         raise ValueError(
-            "mixed Trellis shared-memory requirement exceeds the device limit"
+            "mixed Trellis shared-memory requirement exceeds the device limit: "
+            f"required={kernel.shared_words * 4} "
+            f"limit={int(max_shared_mem)}"
         )
     device = int(torch.cuda.current_device())
     cache_key = (
@@ -698,6 +719,7 @@ def compile_mixed_trellis(
         fc2_tile_k=fc2_tile_k,
         fc2_tile_n=fc2_tile_n,
         moe_block_size=int(moe_block_size),
+        fc2_moe_block_size=int(kernel.driver.fc2.moe_block_size),
         max_m_blocks=int(max_m_blocks),
         blocks_per_sm=int(kernel.blocks_per_sm),
         sms=int(sms),
