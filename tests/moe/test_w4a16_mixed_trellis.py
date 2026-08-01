@@ -353,14 +353,17 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
         f"phases={phase_equal} final={torch.equal(candidate, reference)} "
         f"packed_block={candidate_launch.moe_block_size} "
         f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
+        f"fc2_schedule_factor={candidate_launch.fc2_schedule_route_block_factor} "
         f"regs={candidate_launch.registers_per_thread} "
         f"local={candidate_launch.local_memory_bytes} "
         f"smem={candidate_launch.shared_memory_bytes}"
     )
     assert reference_launch.moe_block_size == 8
     assert reference_launch.fc2_moe_block_size == 8
+    assert reference_launch.fc2_schedule_route_block_factor == 1
     assert candidate_launch.moe_block_size == 64
     assert candidate_launch.fc2_moe_block_size == 8
+    assert candidate_launch.fc2_schedule_route_block_factor == 8
     assert phase_equal == (True, True, True)
     assert torch.equal(candidate, reference)
     assert candidate_launch.local_memory_bytes == 0

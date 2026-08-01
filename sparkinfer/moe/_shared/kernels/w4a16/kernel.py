@@ -706,6 +706,7 @@ class W4A16GemmKernel:
         fused_topk_sum: bool = False,
         fused_sum_topk: int = 1,
         schedule_whole_tiles: bool = False,
+        schedule_route_block_factor: int = 1,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -881,6 +882,18 @@ class W4A16GemmKernel:
         # the split-K tail machinery entirely. Requires the host to bound the
         # wave count; used by the exact-geometry hybrid decode schedule.
         self.schedule_whole_tiles = bool(schedule_whole_tiles)
+        self.schedule_route_block_factor = int(schedule_route_block_factor)
+        if self.schedule_route_block_factor < 1:
+            raise ValueError("schedule_route_block_factor must be >= 1")
+        if self.schedule_route_block_factor != 1 and (
+            not self.schedule_whole_tiles
+            or self.direct_topk_routes
+            or self.dense_route_fast_path
+        ):
+            raise ValueError(
+                "grouped route-block scheduling requires route-packed "
+                "whole-tile execution"
+            )
         if (
             self.schedule_whole_tiles
             and not self.direct_topk_routes
@@ -1039,6 +1052,7 @@ class W4A16GemmKernel:
             # entry even when their arithmetic geometry otherwise matches.
             self.blocks_per_sm,
             self.schedule_whole_tiles,
+            self.schedule_route_block_factor,
         )
 
     @cute.jit
@@ -1294,7 +1308,7 @@ class W4A16GemmKernel:
             ) // Int32(self.moe_block_size)
         elif cutlass.const_expr(not self.direct_topk_routes):
             route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
-                self.moe_block_size
+                self.moe_block_size * self.schedule_route_block_factor
             )
         k_tiles = Int32(self.k_tiles)
         global_mn_tiles = route_blocks * n_tiles
@@ -4591,6 +4605,7 @@ class W4A16FusedMoeKernel:
         moe_block_size: int,
         max_m_blocks: int,
         fc2_moe_block_size: int | None = None,
+        fc2_schedule_route_block_factor: int = 1,
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
@@ -4657,6 +4672,9 @@ class W4A16FusedMoeKernel:
         self.fc2_moe_block_size = int(
             moe_block_size if fc2_moe_block_size is None else fc2_moe_block_size
         )
+        self.fc2_schedule_route_block_factor = int(
+            fc2_schedule_route_block_factor
+        )
         if (
             self.fc2_moe_block_size not in _ALLOWED_ROUTED_SIZES
             or self.moe_block_size % self.fc2_moe_block_size != 0
@@ -4665,6 +4683,18 @@ class W4A16FusedMoeKernel:
                 "FC2 route subtile must be an allowed divisor of the packed "
                 f"route block: packed={self.moe_block_size}, "
                 f"fc2={self.fc2_moe_block_size}"
+            )
+        expected_fc2_schedule_factor = (
+            self.moe_block_size // self.fc2_moe_block_size
+        )
+        if self.fc2_schedule_route_block_factor not in (
+            1,
+            expected_fc2_schedule_factor,
+        ):
+            raise ValueError(
+                "FC2 schedule factor must be one or cover one packed route "
+                f"block: factor={self.fc2_schedule_route_block_factor}, "
+                f"expected={expected_fc2_schedule_factor}"
             )
         self.activation = activation
         self.activation_is_gated = is_gated
@@ -4784,6 +4814,7 @@ class W4A16FusedMoeKernel:
             fused_topk_sum=self.tc_decode_fused_sum,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
+            schedule_route_block_factor=self.fc2_schedule_route_block_factor,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:

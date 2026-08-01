@@ -56,6 +56,7 @@ class MixedTrellisCompileResult:
     fc2_tile_n: int
     moe_block_size: int
     fc2_moe_block_size: int
+    fc2_schedule_route_block_factor: int
     max_m_blocks: int
     blocks_per_sm: int
     sms: int
@@ -110,7 +111,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 2
+    ABI_VERSION = 3
 
     def __init__(
         self,
@@ -153,6 +154,7 @@ class W4A16MixedTrellisKernel:
                     g.tile_k,
                     g.cta_threads,
                     g.moe_block_size,
+                    g.schedule_route_block_factor,
                 )
                 for g in gemms
             )
@@ -160,6 +162,13 @@ class W4A16MixedTrellisKernel:
                 raise ValueError(
                     f"mixed Trellis kernels disagree on {phase} geometry: {geometry}"
                 )
+        fc2_factor = int(driver.fc2.schedule_route_block_factor)
+        expected_factor = int(driver.moe_block_size // driver.fc2.moe_block_size)
+        if fc2_factor not in (1, expected_factor):
+            raise ValueError(
+                "mixed Trellis FC2 schedule factor must be one or cover one "
+                f"packed route block: factor={fc2_factor}, expected={expected_factor}"
+            )
         if tier0.num_experts > 256 or tier1.num_experts > 256:
             raise ValueError("tier-local expert ids must fit in eight bits")
         if driver.num_experts != tier0.num_experts + tier1.num_experts:
@@ -226,7 +235,11 @@ class W4A16MixedTrellisKernel:
         metadata_block_idx = route_block_idx
         if cutlass.const_expr(not is_fc1):
             metadata_block_idx = route_block_idx // Int32(
-                self.driver.moe_block_size // self.driver.fc2.moe_block_size
+                self.driver.moe_block_size
+                // (
+                    self.driver.fc2.moe_block_size
+                    * self.driver.fc2.schedule_route_block_factor
+                )
             )
         combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
         if combined_expert >= Int32(0) and combined_expert < Int32(self.total_experts):
@@ -239,57 +252,77 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier0.fc1
                     else:
                         gemm = self.tier0.fc2
-                    gemm._run_tile(
-                        a_flat,
-                        a_alt_flat,
-                        t0_b_flat,
-                        c_flat,
-                        t0_scales_flat,
-                        t0_global_scale,
-                        packed_route_indices,
-                        topk_weights,
-                        c_tmp,
-                        locks,
-                        smem_base,
-                        tid,
-                        route_block_idx,
-                        local_expert,
-                        output_n_tile,
-                        reduce_k_tile,
-                        reduce_tile_count,
-                        reduce_slice_count,
-                        reduce_slice_idx,
-                        lock_slot,
-                        active_size_m,
-                    )
+                    for subtile in cutlass.range_constexpr(
+                        gemm.schedule_route_block_factor
+                    ):
+                        tile_route_block_idx = (
+                            route_block_idx
+                            * Int32(gemm.schedule_route_block_factor)
+                            + Int32(subtile)
+                        )
+                        gemm._run_tile(
+                            a_flat,
+                            a_alt_flat,
+                            t0_b_flat,
+                            c_flat,
+                            t0_scales_flat,
+                            t0_global_scale,
+                            packed_route_indices,
+                            topk_weights,
+                            c_tmp,
+                            locks,
+                            smem_base,
+                            tid,
+                            tile_route_block_idx,
+                            local_expert,
+                            output_n_tile,
+                            reduce_k_tile,
+                            reduce_tile_count,
+                            reduce_slice_count,
+                            reduce_slice_idx,
+                            lock_slot
+                            * Int32(gemm.schedule_route_block_factor)
+                            + Int32(subtile),
+                            active_size_m,
+                        )
                 elif tier == Int32(1) and local_expert < Int32(self.tier1.num_experts):
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier1.fc1
                     else:
                         gemm = self.tier1.fc2
-                    gemm._run_tile(
-                        a_flat,
-                        a_alt_flat,
-                        t1_b_flat,
-                        c_flat,
-                        t1_scales_flat,
-                        t1_global_scale,
-                        packed_route_indices,
-                        topk_weights,
-                        c_tmp,
-                        locks,
-                        smem_base,
-                        tid,
-                        route_block_idx,
-                        local_expert,
-                        output_n_tile,
-                        reduce_k_tile,
-                        reduce_tile_count,
-                        reduce_slice_count,
-                        reduce_slice_idx,
-                        lock_slot,
-                        active_size_m,
-                    )
+                    for subtile in cutlass.range_constexpr(
+                        gemm.schedule_route_block_factor
+                    ):
+                        tile_route_block_idx = (
+                            route_block_idx
+                            * Int32(gemm.schedule_route_block_factor)
+                            + Int32(subtile)
+                        )
+                        gemm._run_tile(
+                            a_flat,
+                            a_alt_flat,
+                            t1_b_flat,
+                            c_flat,
+                            t1_scales_flat,
+                            t1_global_scale,
+                            packed_route_indices,
+                            topk_weights,
+                            c_tmp,
+                            locks,
+                            smem_base,
+                            tid,
+                            tile_route_block_idx,
+                            local_expert,
+                            output_n_tile,
+                            reduce_k_tile,
+                            reduce_tile_count,
+                            reduce_slice_count,
+                            reduce_slice_idx,
+                            lock_slot
+                            * Int32(gemm.schedule_route_block_factor)
+                            + Int32(subtile),
+                            active_size_m,
+                        )
 
     @cute.jit
     def __call__(
@@ -572,6 +605,7 @@ def compile_mixed_trellis(
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
             fc2_moe_block_size=(8 if int(moe_block_size) == 64 else moe_block_size),
+            fc2_schedule_route_block_factor=(8 if int(moe_block_size) == 64 else 1),
             element_dtype="fp16",
             weight_layout="trellis3_t256",
             scale_format="e4m3_k32",
@@ -720,6 +754,9 @@ def compile_mixed_trellis(
         fc2_tile_n=fc2_tile_n,
         moe_block_size=int(moe_block_size),
         fc2_moe_block_size=int(kernel.driver.fc2.moe_block_size),
+        fc2_schedule_route_block_factor=int(
+            kernel.driver.fc2.schedule_route_block_factor
+        ),
         max_m_blocks=int(max_m_blocks),
         blocks_per_sm=int(kernel.blocks_per_sm),
         sms=int(sms),
