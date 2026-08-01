@@ -263,37 +263,29 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
-    """Keep block-64 routing without grouping K3 and K4 reductions."""
+    """Block-64 packing plus FC2 subtiles preserves stock one-grid arithmetic."""
 
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 64, 512, 256, 8
-    reference_tiles = (128, 128, 32, 512)
-    block64_tiles = (128, 64, 64, 128)
+    tile_config = (128, 128, 32, 512)
     tier0_experts, tier1_experts = 6, 2
 
-    def tiers(tile_config: tuple[int, int, int, int]):
-        return tuple(
-            _prepared(
-                experts=experts,
-                hidden=hidden,
-                intermediate=intermediate,
-                bits=bits,
-                seed=seed,
-                device=device,
-                tile_config=tile_config,
-            )
-            for experts, bits, seed in (
-                (tier0_experts, 3, 301),
-                (tier1_experts, 4, 401),
-            )
+    prepared_tiers = tuple(
+        _prepared(
+            experts=experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            seed=seed,
+            device=device,
+            tile_config=tile_config,
         )
-
-    reference_tiers = tiers(reference_tiles)
-    block64_tiers = tiers(block64_tiles)
-    for reference, candidate in zip(reference_tiers, block64_tiers, strict=True):
-        assert torch.equal(reference.w13, candidate.w13)
-        assert torch.equal(reference.w2, candidate.w2)
+        for experts, bits, seed in (
+            (tier0_experts, 3, 301),
+            (tier1_experts, 4, 401),
+        )
+    )
 
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
     topk_ids = torch.tensor(
@@ -302,29 +294,14 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
     topk_weights = torch.softmax(
         torch.randn((m, topk), dtype=torch.float32, device=device), dim=-1
     )
-    map0 = torch.cat(
-        (
-            torch.arange(tier0_experts, dtype=torch.int32, device=device),
-            torch.full((tier1_experts,), -1, dtype=torch.int32, device=device),
-        )
-    )
-    map1 = torch.cat(
-        (
-            torch.full((tier0_experts,), -1, dtype=torch.int32, device=device),
-            torch.arange(tier1_experts, dtype=torch.int32, device=device),
-        )
-    )
-
     props = torch.cuda.get_device_properties(device)
     global_to_combined, descriptor = build_tiered_maps(
         range(tier0_experts), range(tier0_experts, 8), device=device
     )
 
     def one_grid(
-        prepared_tiers,
-        tile_config: tuple[int, int, int, int],
         block_size_m: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, object, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         route_slots = max_packed_route_slots(m * topk, block_size_m, 8)
         launch = compile_mixed_trellis(
             size_m=m,
@@ -342,7 +319,7 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
         buffers = make_mixed_trellis_buffers(
             launch, device=device, sms=int(props.multi_processor_count)
         )
-        return run_mixed_trellis(
+        output = run_mixed_trellis(
             x,
             prepared_tiers[0],
             prepared_tiers[1],
@@ -354,41 +331,42 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
             launch,
             buffers,
         ).clone()
+        phase_outputs = (
+            buffers.fc1.clone(),
+            buffers.activated.clone(),
+            buffers.fc2.clone(),
+        )
+        return output, launch, phase_outputs
 
-    reference = one_grid(reference_tiers, reference_tiles, 8)
-    candidate = one_grid(block64_tiers, block64_tiles, 64)
-    serial_block8 = _serial_tier(
-        x, reference_tiers[0], topk_weights, topk_ids, map0, block_size_m=8
-    ).clone()
-    serial_block8.add_(
-        _serial_tier(
-            x, reference_tiers[1], topk_weights, topk_ids, map1, block_size_m=8
-        )
-    )
-    serial_block64 = _serial_tier(
-        x, block64_tiers[0], topk_weights, topk_ids, map0, block_size_m=64
-    ).clone()
-    serial_block64.add_(
-        _serial_tier(
-            x, block64_tiers[1], topk_weights, topk_ids, map1, block_size_m=64
-        )
-    )
+    reference, reference_launch, reference_phases = one_grid(8)
+    candidate, candidate_launch, candidate_phases = one_grid(64)
     torch.cuda.synchronize(device)
 
-    denominator = reference.norm().clamp_min(1.0e-12)
-    serial8_error = float((serial_block8 - reference).norm() / denominator)
-    serial64_error = float((serial_block64 - reference).norm() / denominator)
-    candidate_error = float((candidate - reference).norm() / denominator)
-    print(
-        "mixed_trellis_block64_numerics "
-        f"serial_block8={serial8_error:.9e} "
-        f"serial_block64={serial64_error:.9e} "
-        f"one_grid_block64={candidate_error:.9e}"
+    phase_equal = tuple(
+        torch.equal(candidate_phase, reference_phase)
+        for candidate_phase, reference_phase in zip(
+            candidate_phases, reference_phases, strict=True
+        )
     )
-    assert serial64_error > 5.0e-5
-    assert candidate_error < 2.0e-5
-    assert candidate_error < serial64_error * 0.2
-    assert abs(candidate_error - serial8_error) < 1.0e-6
+    print(
+        "mixed_trellis_block64_fc2_subtile_parity "
+        f"phases={phase_equal} final={torch.equal(candidate, reference)} "
+        f"packed_block={candidate_launch.moe_block_size} "
+        f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
+        f"regs={candidate_launch.registers_per_thread} "
+        f"local={candidate_launch.local_memory_bytes} "
+        f"smem={candidate_launch.shared_memory_bytes}"
+    )
+    assert reference_launch.moe_block_size == 8
+    assert reference_launch.fc2_moe_block_size == 8
+    assert candidate_launch.moe_block_size == 64
+    assert candidate_launch.fc2_moe_block_size == 8
+    assert phase_equal == (True, True, True)
+    assert torch.equal(candidate, reference)
+    assert candidate_launch.local_memory_bytes == 0
+    assert candidate_launch.shared_memory_bytes <= int(
+        props.shared_memory_per_block_optin
+    )
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

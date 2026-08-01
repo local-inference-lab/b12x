@@ -205,6 +205,11 @@ _W4A16_REGS_SM121 = {
     (128, 3, 4, 8, False): 249,
     (128, 3, 8, 4, False): 250,
     (256, 4, 16, 4, False): 255,
+    # Measured by the mixed-Trellis block-64 qualification gate. This is the
+    # stock one-grid prefill tile geometry (N=128, K=128) with four 16-row
+    # route blocks per CTA. Keeping the measured entry permits block-64
+    # routing without changing the K3/K4 accumulation geometry.
+    (256, 4, 8, 8, False): 255,
     (128, 4, 4, 8, False): 255,
     (128, 4, 8, 4, False): 255,
 }
@@ -4585,6 +4590,7 @@ class W4A16FusedMoeKernel:
         fc2_tile_k: int,
         moe_block_size: int,
         max_m_blocks: int,
+        fc2_moe_block_size: int | None = None,
         element_dtype: str = "bf16",
         fast_math: bool = True,
         swiglu_limit: float | None = None,
@@ -4648,6 +4654,18 @@ class W4A16FusedMoeKernel:
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
         self.moe_block_size = int(moe_block_size)
+        self.fc2_moe_block_size = int(
+            moe_block_size if fc2_moe_block_size is None else fc2_moe_block_size
+        )
+        if (
+            self.fc2_moe_block_size not in _ALLOWED_ROUTED_SIZES
+            or self.moe_block_size % self.fc2_moe_block_size != 0
+        ):
+            raise ValueError(
+                "FC2 route subtile must be an allowed divisor of the packed "
+                f"route block: packed={self.moe_block_size}, "
+                f"fc2={self.fc2_moe_block_size}"
+            )
         self.activation = activation
         self.activation_is_gated = is_gated
         self.activation_is_situ = activation == SITU
@@ -4752,8 +4770,10 @@ class W4A16FusedMoeKernel:
             ),
             tile_n=fc2_tile_n,
             tile_k=fc2_tile_k,
-            moe_block_size=moe_block_size,
-            max_m_blocks=max_m_blocks,
+            moe_block_size=self.fc2_moe_block_size,
+            max_m_blocks=(
+                max_m_blocks * self.moe_block_size // self.fc2_moe_block_size
+            ),
             element_dtype=element_dtype,
             weight_layout=weight_layout,
             scale_format=scale_format,
