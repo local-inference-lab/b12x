@@ -861,9 +861,7 @@ class TPMoEScratchPlan:
     _prewarmed_fused_launches: tuple[tuple[int, object], ...] = field(
         default=(), repr=False
     )
-    _prewarmed_topk_sum_launches: tuple[
-        tuple[torch.dtype, bool, object], ...
-    ] = field(
+    _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
         default=(), repr=False
     )
 
@@ -6229,12 +6227,10 @@ def _plan_full_rotation_w4a16_launches(
         )
     block_size_m = int(core_plan.route_block_size_m)
     weight_layout = _normalize_w4a16_weight_layout(
-        caps.w4a16_weight_layout
-        or _w4a16_weight_layout_for_source(caps.source_format)
+        caps.w4a16_weight_layout or _w4a16_weight_layout_for_source(caps.source_format)
     )
     scale_format = _normalize_w4a16_scale_format(
-        caps.w4a16_scale_format
-        or _w4a16_scale_format_for_source(caps.source_format)
+        caps.w4a16_scale_format or _w4a16_scale_format_for_source(caps.source_format)
     )
     if weight_layout != "trellis3_t256" or scale_format != "e4m3_k32":
         raise RuntimeError(
@@ -6652,9 +6648,9 @@ def _prewarm_w4a16_planned_launches(
                                 broadcast_svh=broadcast_svh,
                             )
                             if not broadcast_svh:
-                                topk_sum_launches[
-                                    (token_count, ids_dtype, mapped)
-                                ] = resolved_topk_sum
+                                topk_sum_launches[(token_count, ids_dtype, mapped)] = (
+                                    resolved_topk_sum
+                                )
             else:
                 topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                     m=token_count,

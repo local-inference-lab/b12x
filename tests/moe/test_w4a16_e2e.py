@@ -249,9 +249,10 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     assert len(fused_calls) == 2
     assert {call["size_m"] for call in fused_calls} == {3072}
     assert {call["max_m_blocks"] for call in fused_calls} == {542}
-    assert workspace.planned_fused_moe_launches[
-        ("trellis3_t256", "e4m3_k32", 3072, False)
-    ] is resolved_fused
+    assert (
+        workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
+        is resolved_fused
+    )
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:

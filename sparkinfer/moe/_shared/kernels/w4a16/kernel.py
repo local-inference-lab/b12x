@@ -6527,9 +6527,7 @@ class W4A16TopKSumKernel:
                         v1 = fc2_flat[base + Int32(1)].to(cutlass.Float32)
                         v2 = fc2_flat[base + Int32(2)].to(cutlass.Float32)
                         v3 = fc2_flat[base + Int32(3)].to(cutlass.Float32)
-                        h0, h1, h2, h3 = self._had128_quad(
-                            v0, v1, v2, v3, lane
-                        )
+                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
                         if cutlass.const_expr(self.broadcast_svh):
                             sbase = col0
                         else:
@@ -8553,9 +8551,7 @@ def _w4a16_fused_moe_launch_flat(
             )
         suh_gate_arg = suh_gate_table.reshape(-1)
         suh_up_arg = suh_up_table.reshape(-1)
-        broadcast_suh = (
-            num_experts > 1 and suh_gate_arg.numel() == hidden_size
-        )
+        broadcast_suh = num_experts > 1 and suh_gate_arg.numel() == hidden_size
         if broadcast_suh != (suh_up_arg.numel() == hidden_size):
             raise ValueError(
                 "suh gate/up tables must both be per-expert or both broadcast"
