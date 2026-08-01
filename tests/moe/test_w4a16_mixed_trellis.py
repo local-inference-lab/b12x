@@ -363,7 +363,8 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
     assert reference_launch.fc2_schedule_route_block_factor == 1
     assert candidate_launch.moe_block_size == 64
     assert candidate_launch.fc2_moe_block_size == 8
-    assert candidate_launch.fc2_schedule_route_block_factor == 8
+    assert candidate_launch.fc2_schedule_route_block_factor == 2
+    assert candidate_launch.fc2_paired_m8_routes is True
     assert phase_equal == (True, True, True)
     assert torch.equal(candidate, reference)
     assert candidate_launch.local_memory_bytes == 0
