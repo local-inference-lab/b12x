@@ -516,10 +516,11 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_w4a16_e8m0_native_micro_matches_kimi_k3_tp16_shape() -> None:
+@pytest.mark.parametrize("m", [1, 2, 8])
+def test_w4a16_e8m0_native_micro_matches_kimi_k3_tp16_shape(m: int) -> None:
     """Regression for K3's aligned seven-segment H=3584 direct decode path."""
     experts, hidden_size, intermediate_size = 4, 3584, 192
-    m, topk = 1, 16
+    topk = 16
     torch.manual_seed(20260729)
     w13 = torch.randint(
         0,
@@ -556,11 +557,21 @@ def test_w4a16_e8m0_native_micro_matches_kimi_k3_tp16_shape() -> None:
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
     )
-    intermediate_cache2 = torch.zeros(
-        2 * m * 128 * topk, dtype=torch.bfloat16, device="cuda"
+    # Poison the unwritten 64-BF16 tail of every 256-value FC2 chunk.  The
+    # narrow direct kernel must mask it; zero-filled scratch hid 0 * NaN bugs.
+    intermediate_cache2 = torch.full(
+        (2 * m * 128 * topk,),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
-    topk_ids = (torch.arange(topk, device="cuda") % experts).to(torch.int32)[None, :]
+    topk_ids = (
+        (torch.arange(topk, device="cuda") % experts)
+        .to(torch.int32)[None, :]
+        .expand(m, -1)
+        .contiguous()
+    )
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
     topk_weights /= topk_weights.sum(dim=1, keepdim=True)
 

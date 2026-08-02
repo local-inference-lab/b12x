@@ -757,9 +757,7 @@ class MoEMicroKernelBackend:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
-        elif m == 1:
-            grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
-        elif m == 2:
+        elif m == 1 or m == 2:
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
             grid_x = max(1, min(int(max_active_ctas), fc2_tasks))
@@ -820,7 +818,6 @@ class MoEMicroKernelBackend:
         k_row1 = k_row0 + Int32(1)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
@@ -862,10 +859,36 @@ class MoEMicroKernelBackend:
             row_mode_32_1 = k_row1 & Int32(31)
 
             kk_off = Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            # A narrow FC2 chunk reserves 256 BF16 values (128 u32), but
+            # compact native shapes such as Kimi K3's TP16 I=192 only write
+            # the first 192 values.  Mask the unread tail as well as its
+            # weight: IEEE 0 * NaN is NaN when reused scratch contains poison.
+            if cutlass.const_expr((cfg.w2_sf_cols >> 2) < 4):
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1251,7 +1274,6 @@ class MoEMicroKernelBackend:
         k_row3 = k_row0 + Int32(3)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         token_inter_base = t * Int32(cfg.inter_u32)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
@@ -1296,10 +1318,32 @@ class MoEMicroKernelBackend:
             ebase_sf = Int64(eid) * Int64(cfg.w2_sf_rows * cfg.w2_sf_cols)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr((cfg.w2_sf_cols >> 2) < 4):
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1513,10 +1557,32 @@ class MoEMicroKernelBackend:
             ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr((cfg.w2_sf_cols >> 2) < 4):
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if w_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
