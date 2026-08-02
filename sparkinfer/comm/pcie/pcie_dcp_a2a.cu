@@ -262,6 +262,12 @@ __global__ void __launch_bounds__(512, 1)
         const int64_t source_base = src == rank ? local_base : staging_base;
         const Pack<T> values = rot_packs[i][source_base + pack];
         const float weight = weights[i] * inv_weight_sum;
+        // Empty DCP shards legitimately return LSE=-inf and an undefined
+        // (often NaN) partial output. IEEE 0*NaN is still NaN, so skip the
+        // source instead of relying on its zero softmax weight to sanitize it.
+        if (weight == 0.0f) {
+          continue;
+        }
 #pragma unroll
         for (int element = 0; element < kPackElems; ++element) {
           accum[element] += weight * to_float(values.values[element]);

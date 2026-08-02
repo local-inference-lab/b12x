@@ -55,6 +55,16 @@ def _inputs(
         generator=generator,
         dtype=torch.float32,
     ).to(device=device, dtype=torch.bfloat16)
+    if batch > 0:
+        # Triton MLA may leave the output undefined when a local shard has no
+        # KV tokens. Exercise both an all-ranks-empty head and one empty source
+        # among otherwise valid contributors; 0 * NaN must never poison the
+        # reduced output.
+        output[0, 0].fill_(torch.nan)
+        lse[0, 0] = -torch.inf
+        if rank == 0:
+            output[0, 2].fill_(torch.nan)
+            lse[0, 2] = torch.nan
     return output, lse, query
 
 
@@ -161,7 +171,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             print(
                 "PASS Kimi K3 TP16/DCP8 A2A: world=8, local_heads=6, "
                 "gathered_heads=48, head_dim=512, query_head_dim=576, "
-                "eager_batches=1/2/8/64, graph_batch=1",
+                "eager_batches=1/2/8/64, graph_batch=1, invalid_lse_nan_output=ok",
                 flush=True,
             )
     finally:

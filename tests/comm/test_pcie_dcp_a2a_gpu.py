@@ -55,6 +55,8 @@ def _rank_inputs(
         dtype=torch.float32,
     ).to(device=device)
     if batch > 0:
+        output[0, 0].fill_(torch.nan)
+        output[0, 1].fill_(torch.nan)
         lse[0, 0] = -torch.inf
         lse[0, 1] = torch.nan
         if source_rank == 0:
