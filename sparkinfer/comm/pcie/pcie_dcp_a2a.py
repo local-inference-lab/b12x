@@ -300,20 +300,35 @@ class PCIeDCPA2A:
         else:
             normalized = normalize_and_validate()
 
+        (
+            prepared_device,
+            prepared_rank,
+            prepared_world_size,
+            prepared_signals,
+            prepared_staging0,
+            prepared_staging1,
+            prepared_max_batch,
+            prepared_total_heads,
+            prepared_head_dim,
+            prepared_query_dim,
+            prepared_output_capacity,
+            prepared_lse_offset,
+            prepared_lse_capacity,
+        ) = normalized
         self._initialize_prepared_state(
-            rank=normalized[1],
-            world_size=normalized[2],
-            device=normalized[0],
-            signal_ptrs=normalized[3],
-            staging0_ptrs=normalized[4],
-            staging1_ptrs=normalized[5],
-            max_batch_size=normalized[6],
-            total_heads=normalized[7],
-            head_dim=normalized[8],
-            query_head_dim=normalized[9],
-            output_capacity_elems=normalized[10],
-            lse_offset=normalized[11],
-            lse_capacity=normalized[12],
+            rank=prepared_rank,
+            world_size=prepared_world_size,
+            device=prepared_device,
+            signal_ptrs=prepared_signals,
+            staging0_ptrs=prepared_staging0,
+            staging1_ptrs=prepared_staging1,
+            max_batch_size=prepared_max_batch,
+            total_heads=prepared_total_heads,
+            head_dim=prepared_head_dim,
+            query_head_dim=prepared_query_dim,
+            output_capacity_elems=prepared_output_capacity,
+            lse_offset=prepared_lse_offset,
+            lse_capacity=prepared_lse_capacity,
             exchange_group=exchange_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
@@ -1192,6 +1207,8 @@ class PCIeDCPA2APool:
         if self.single_channel:
             key = 0
             stream_key = None
+            if self._channel_factory is None and channel_id is None:
+                channel_id = _SINGLE_CHANNEL_ID
         else:
             stream_key = _current_stream_key(self.device, stream)
             key = 0 if stream_key is None else int(stream_key)

@@ -41,6 +41,7 @@ def _load_functions(relative_path: str, names: set[str]) -> dict[str, object]:
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
     namespace: dict[str, object] = {
+        "CORRECTNESS_KEYS": {"verdict"},
         "math": math,
         "METRICS": ("mean_us", "p50_us", "p95_us"),
         "os": os,
@@ -50,8 +51,29 @@ def _load_functions(relative_path: str, names: set[str]) -> dict[str, object]:
         "subprocess": subprocess,
         "suppress": suppress,
     }
+    # Execute only the selected, dependency-injected helpers from the benchmark.
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "benchmarks/benchmark_pcie_oneshot_control_node.py",
+        "benchmarks/run_pcie_oneshot_control_node_ab.py",
+    ],
+)
+def test_benchmark_correctness_contract_requires_an_explicit_pass(
+    relative_path: str,
+) -> None:
+    functions = _load_functions(relative_path, {"_validate_correctness"})
+    validate = functions["_validate_correctness"]
+
+    validate({"verdict": "pass"})
+    with pytest.raises(ValueError, match="correctness did not pass"):
+        validate({"verdict": "fail"})
+    with pytest.raises(ValueError, match="correctness schema mismatch"):
+        validate({"verdict": "pass", "details": "unexpected"})
 
 
 def test_distributed_critical_path_uses_aligned_iteration_maxima() -> None:

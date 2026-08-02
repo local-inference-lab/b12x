@@ -992,9 +992,8 @@ def _coordinated_close_channels(
             torch.cuda.synchronize(device)
         dist.barrier(group=exchange_group)
 
-    # Older DCP channels still expose the legacy best-effort protocol. Keep
-    # their existing ordering until they receive their own lifecycle migration;
-    # oneshot and twoshot opt into the strict peer-status protocol below.
+    # Channels with strict cleanup report local unmap status before any rank
+    # releases exports. Legacy channels retain their original ordered close.
     uses_strict_protocol = any(
         hasattr(channel, "_close_ipc_imports_strict") for channel in unique_channels
     )
@@ -1471,7 +1470,6 @@ class PCIeOneshotAllReduce:
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
-        self._native_ipc_import_close_failed = False
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
         self._ptr = 0
         self._eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
@@ -2306,16 +2304,6 @@ class PCIeOneshotAllReduce:
             return
         self._closed = True
         failures: list[tuple[str, Exception]] = []
-        if getattr(self, "_native_ipc_import_close_failed", False):
-            failures.append(
-                (
-                    "native runtime",
-                    RuntimeError(
-                        "a native IPC import failed during best-effort teardown "
-                        "and can no longer be retried"
-                    ),
-                )
-            )
         if getattr(self, "_ptr", 0):
             try:
                 self._ext.dispose(self._ptr)
@@ -2353,49 +2341,6 @@ class PCIeOneshotAllReduce:
             self._ipc_imports_closed = True
         if failures:
             _raise_local_cleanup_errors("PCIe oneshot", "IPC import close", failures)
-
-    def _close_ipc_imports_best_effort(self) -> None:
-        if self._ipc_imports_closed:
-            return
-        self._closed = True
-        native_imports_closed = not getattr(self, "_ptr", 0)
-        if getattr(self, "_ptr", 0):
-            dispose = getattr(self._ext, "dispose_best_effort", None)
-            if dispose is None:
-                dispose = self._ext.dispose
-            try:
-                result = dispose(self._ptr)
-            except Exception:
-                pass
-            else:
-                self._ptr = 0
-                # The native best-effort binding reports whether every graph
-                # import closed. Legacy/fake dispose methods return None and
-                # report failure by raising.
-                native_imports_closed = result is not False
-                if not native_imports_closed:
-                    self._native_ipc_import_close_failed = True
-
-        closed = self._closed_import_indices()
-        if self._ipc is not None:
-            for buffer_index, shared in enumerate(self._owned_buffers):
-                for remote_index, ptr in enumerate(shared.remote_ptrs):
-                    key = (buffer_index, remote_index)
-                    if key in closed:
-                        continue
-                    try:
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
-                    except Exception:
-                        pass
-                    else:
-                        closed.add(key)
-
-        if (
-            native_imports_closed
-            and not getattr(self, "_ptr", 0)
-            and self._all_python_ipc_imports_closed(closed)
-        ):
-            self._ipc_imports_closed = True
 
     def _free_ipc_exports_strict(self) -> None:
         if self._ipc_exports_freed:

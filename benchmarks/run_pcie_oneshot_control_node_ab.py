@@ -21,12 +21,13 @@ from contextlib import suppress
 from pathlib import Path
 
 
-RUN_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.run", "version": 2}
-SUITE_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.ab_suite", "version": 2}
+RUN_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.run", "version": 3}
+SUITE_SCHEMA = {"name": "sparkinfer.pcie_oneshot_control_node.ab_suite", "version": 3}
 RUN_TOP_LEVEL_KEYS = {
     "schema",
     "contract",
     "scope",
+    "correctness",
     "identity",
     "provenance",
     "software",
@@ -35,6 +36,7 @@ RUN_TOP_LEVEL_KEYS = {
     "per_rank",
     "distributed_critical_path",
 }
+CORRECTNESS_KEYS = {"verdict"}
 CONTRACT_KEYS = {
     "world_size",
     "numel",
@@ -163,7 +165,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-worktree", type=Path, required=True)
     parser.add_argument("--pairs", type=int, default=4)
     parser.add_argument("--world-size", type=int, default=4)
-    parser.add_argument("--numel", type=int, default=32768)
+    parser.add_argument(
+        "--numel",
+        type=int,
+        default=32768,
+        help="fixed at 32768 BF16 elements (64 KiB); other values are rejected",
+    )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=1000)
     parser.add_argument("--sampler-interval", type=float, default=0.2)
@@ -292,6 +299,13 @@ def _distributed_critical_path(
     return result
 
 
+def _validate_correctness(correctness: object) -> None:
+    if not isinstance(correctness, dict) or set(correctness) != CORRECTNESS_KEYS:
+        raise ValueError("run correctness schema mismatch")
+    if correctness["verdict"] != "pass":
+        raise ValueError(f"run correctness did not pass: {correctness}")
+
+
 def _validate_run(
     record: dict[str, object],
     *,
@@ -310,6 +324,7 @@ def _validate_run(
         raise ValueError(f"run schema keys differ: {set(record) ^ RUN_TOP_LEVEL_KEYS}")
     if record["schema"] != RUN_SCHEMA:
         raise ValueError(f"run schema mismatch: {record['schema']}")
+    _validate_correctness(record["correctness"])
     if set(record["contract"]) != CONTRACT_KEYS or record["contract"] != contract:
         raise ValueError(f"run contract mismatch: {record['contract']} != {contract}")
     scope = record["scope"]
@@ -619,12 +634,12 @@ def main() -> None:
     controller_argv_sha256 = _json_sha256(controller_argv)
     baseline_root = args.baseline_worktree.resolve()
     candidate_root = args.candidate_worktree.resolve()
-    harness_source = args.harness.resolve()
     roots = (baseline_root, candidate_root)
     if baseline_root == candidate_root:
         raise ValueError("baseline and candidate worktrees must differ")
     output_dir = _outside_worktrees(args.output_dir, roots, "output directory")
     output = _outside_worktrees(args.output, roots, "suite output")
+    harness_source = _outside_worktrees(args.harness, roots, "harness")
     if not harness_source.is_file():
         raise ValueError(f"harness does not exist: {harness_source}")
     baseline_sha = _git_sha(baseline_root)

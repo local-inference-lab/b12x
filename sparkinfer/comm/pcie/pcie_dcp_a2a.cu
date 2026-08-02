@@ -66,6 +66,17 @@ static int dcp_block_limit_override() {
   return value;
 }
 
+static int dcp_test_delay_rank() {
+  static const int value = env_int("SPARKINFER_PCIE_DCP_TEST_DELAY_RANK", -1);
+  return value;
+}
+
+static uint64_t dcp_test_delay_cycles() {
+  static const uint64_t value = static_cast<uint64_t>(std::max(
+      0, env_int("SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES", 0)));
+  return value;
+}
+
 struct Signal {
   alignas(128) FlagType staging_generation;
   FlagType active_staging_slot;
@@ -465,10 +476,8 @@ public:
         1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
     advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
     CHECK_CUDA_SUCCESS(cudaGetLastError());
-    const int delayed_rank =
-        env_int("SPARKINFER_PCIE_DCP_TEST_DELAY_RANK", -1);
-    const uint64_t delay_cycles = static_cast<uint64_t>(std::max(
-        0, env_int("SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES", 0)));
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
 
 #define LAUNCH(world)                                                          \
   dcp_lse_reduce_kernel<T, world><<<blocks, threads, 0, stream>>>(             \
@@ -530,10 +539,8 @@ public:
         1, std::min(block_limit, (rows + warps_per_block - 1) / warps_per_block));
     advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
     CHECK_CUDA_SUCCESS(cudaGetLastError());
-    const int delayed_rank =
-        env_int("SPARKINFER_PCIE_DCP_TEST_DELAY_RANK", -1);
-    const uint64_t delay_cycles = static_cast<uint64_t>(std::max(
-        0, env_int("SPARKINFER_PCIE_DCP_TEST_POST_BARRIER_DELAY_CYCLES", 0)));
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
 
 #define LAUNCH(world)                                                          \
   all_gather_heads_kernel<T, world><<<blocks, threads, 0, stream>>>(           \

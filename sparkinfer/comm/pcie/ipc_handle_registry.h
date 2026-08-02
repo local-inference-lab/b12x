@@ -40,16 +40,19 @@ class IpcHandleRegistry {
 
   Error close_all_noexcept() noexcept {
     Error first_error = Success;
-    for (auto& entry : handles_) {
-      Handle& handle = entry.second;
-      if (handle == Handle{}) {
+    for (auto it = handles_.begin(); it != handles_.end();) {
+      if (it->second == Handle{}) {
+        it = handles_.erase(it);
         continue;
       }
-      const Error error = close_(handle);
+      const Error error = close_(it->second);
       if (error == Success) {
-        handle = Handle{};
-      } else if (first_error == Success) {
-        first_error = error;
+        it = handles_.erase(it);
+      } else {
+        if (first_error == Success) {
+          first_error = error;
+        }
+        ++it;
       }
     }
     return first_error;

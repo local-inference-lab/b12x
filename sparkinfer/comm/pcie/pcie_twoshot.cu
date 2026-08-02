@@ -306,6 +306,7 @@ class PCIeTwoShot {
       : rank_(rank),
         world_size_(world_size),
         self_sg_(signals[rank]),
+        staging_{},
         pack_stride_(pack_stride),
         scale_offset_(scale_offset),
         scale_stride_(scale_stride),

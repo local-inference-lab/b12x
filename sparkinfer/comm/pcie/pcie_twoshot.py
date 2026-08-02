@@ -362,40 +362,6 @@ class PCIeTwoShotSP:
         if failures:
             _raise_local_cleanup_errors("PCIe twoshot", "IPC import close", failures)
 
-    def _close_ipc_imports_best_effort(self) -> None:
-        if self._ipc_imports_closed:
-            return
-        self._closed = True
-        native_imports_closed = not self._fptr
-        if self._fptr:
-            try:
-                self._ext.dispose(self._fptr)
-            except Exception:
-                pass
-            else:
-                self._fptr = 0
-                native_imports_closed = True
-
-        closed = self._closed_import_indices()
-        for buffer_index, shared in enumerate(self._owned_buffers):
-            for remote_index, ptr in enumerate(shared.remote_ptrs):
-                key = (buffer_index, remote_index)
-                if key in closed:
-                    continue
-                try:
-                    self._ipc.cudaIpcCloseMemHandle(ptr)
-                except Exception:
-                    pass
-                else:
-                    closed.add(key)
-
-        if (
-            native_imports_closed
-            and not self._fptr
-            and self._all_python_ipc_imports_closed(closed)
-        ):
-            self._ipc_imports_closed = True
-
     def _free_ipc_exports_strict(self) -> None:
         if self._ipc_exports_freed:
             return

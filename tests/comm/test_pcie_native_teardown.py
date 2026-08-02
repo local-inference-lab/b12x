@@ -114,11 +114,19 @@ def test_native_ipc_registry_destructor_survives_injected_close_failure(
                 if (close_calls != 3) {
                   return 12;
                 }
+                if (owner.handles.find(1) != owner.handles.end() ||
+                    owner.handles.find(2) == owner.handles.end() ||
+                    owner.handles.find(3) != owner.handles.end()) {
+                  return 17;
+                }
                 if (owner.handles.close_all_noexcept() != kSuccess) {
                   return 13;
                 }
                 if (close_calls != 4) {
                   return 14;
+                }
+                if (owner.handles.find(2) != owner.handles.end()) {
+                  return 18;
                 }
                 if (owner.handles.close_all_noexcept() != kSuccess ||
                     close_calls != 4) {

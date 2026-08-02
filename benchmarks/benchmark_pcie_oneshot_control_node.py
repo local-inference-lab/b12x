@@ -33,12 +33,13 @@ import torch.distributed as dist
 from cuda.bindings import runtime as cudart
 
 SCHEMA_NAME = "sparkinfer.pcie_oneshot_control_node.run"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DTYPE_NAME = "bfloat16"
 TOP_LEVEL_KEYS = {
     "schema",
     "contract",
     "scope",
+    "correctness",
     "identity",
     "provenance",
     "software",
@@ -47,6 +48,7 @@ TOP_LEVEL_KEYS = {
     "per_rank",
     "distributed_critical_path",
 }
+CORRECTNESS_KEYS = {"verdict"}
 CONTRACT_KEYS = {
     "world_size",
     "numel",
@@ -263,7 +265,12 @@ def _verified_implementation(
     extension = module._load_extension()
     extension_path = Path(extension.__file__).resolve()
     build_root = extension_path.parent
-    expected_cache = Path(os.environ["TORCH_EXTENSIONS_DIR"]).resolve()
+    cache_value = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if not cache_value:
+        raise RuntimeError(
+            "TORCH_EXTENSIONS_DIR must name a fresh per-run extension cache"
+        )
+    expected_cache = Path(cache_value).resolve()
     if not extension_path.is_relative_to(expected_cache):
         raise RuntimeError(
             f"loaded extension {extension_path} is outside fresh cache {expected_cache}"
@@ -412,6 +419,10 @@ class _NvidiaSmiSampler:
             raise RuntimeError("nvidia-smi sampler thread did not stop within 15s")
         self._phase = "final"
         self._sample()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
 
 def _environment_toggles() -> dict[str, str]:
@@ -740,6 +751,13 @@ def _device_metadata() -> list[dict[str, object]]:
     return devices
 
 
+def _validate_correctness(correctness: object) -> None:
+    if not isinstance(correctness, dict) or set(correctness) != CORRECTNESS_KEYS:
+        raise ValueError("benchmark correctness schema mismatch")
+    if correctness["verdict"] != "pass":
+        raise ValueError(f"benchmark correctness did not pass: {correctness}")
+
+
 def _validate_record(
     record: dict[str, object],
     contract: dict[str, object],
@@ -752,6 +770,7 @@ def _validate_record(
         )
     if record["schema"] != {"name": SCHEMA_NAME, "version": SCHEMA_VERSION}:
         raise ValueError(f"unsupported benchmark schema: {record['schema']}")
+    _validate_correctness(record["correctness"])
     if set(record["contract"]) != CONTRACT_KEYS or record["contract"] != contract:
         raise ValueError(
             f"benchmark contract mismatch: {record['contract']} != {contract}"
@@ -1110,6 +1129,7 @@ def main() -> None:
                         "twoshot_all_gather",
                     ],
                 },
+                "correctness": {"verdict": "pass"},
                 "identity": {
                     "label": args.label,
                     "variant": args.variant,
@@ -1156,7 +1176,7 @@ def main() -> None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(rendered + "\n", encoding="utf-8")
     finally:
-        if sampler is not None and sampler._thread.is_alive():
+        if sampler is not None and sampler.is_alive:
             sampler.stop()
         if pool is not None:
             pool.close()

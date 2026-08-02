@@ -265,27 +265,15 @@ def test_control_and_worker_launches_have_immediate_error_checks(
         assert suffix.lstrip().startswith("CHECK_CUDA_SUCCESS(cudaGetLastError());")
 
 
-def test_control_node_graph_topology_contract() -> None:
-    # This is a node-topology contract, not a performance claim. Public-head
-    # A/B results compare net algorithms; only the staged plain one-shot 64 KiB
-    # path is covered by the dedicated timing harness.
-    control_nodes = {
-        "oneshot_registered": 0,
-        "oneshot_staged_pull": 1,
-        "fused_registered": 0,
-        "fused_staged_pull": 1,
-        "fused_staged_push": 1,
-        "twoshot_reduce_scatter": 1,
-        "twoshot_all_gather": 1,
-        "dcp_lse_reduce_scatter": 1,
-        "dcp_all_gather_heads": 1,
-    }
-    total_nodes = {name: 1 + extra for name, extra in control_nodes.items()}
+@pytest.mark.parametrize(
+    "source_name",
+    ("pcie_oneshot.cu", "pcie_twoshot.cu", "pcie_dcp_a2a.cu"),
+)
+def test_each_staged_collective_has_one_control_launch(source_name: str) -> None:
+    source = (PCIE / source_name).read_text(encoding="utf-8")
+    control_launch = "advance_staging_slot_kernel<<<1, 1, 0, stream>>>"
 
-    assert total_nodes["oneshot_registered"] == 1
-    assert total_nodes["fused_registered"] == 1
-    assert {
-        total_nodes[name]
-        for name in total_nodes
-        if name not in {"oneshot_registered", "fused_registered"}
-    } == {2}
+    # Each source implements exactly two staged collectives. Registered
+    # one-shot paths remain control-free; their conditional gating is covered
+    # by the neighboring source and GPU graph tests.
+    assert source.count(control_launch) == 2

@@ -24,6 +24,15 @@ from sparkinfer.comm.pcie.pcie_oneshot import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pcie_global_registries():
+    _RETAINED_FAILED_IPC_EXPORTS.clear()
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
+    yield
+    _RETAINED_FAILED_IPC_EXPORTS.clear()
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
+
+
 class _FakeExt:
     def __init__(self):
         self.init_calls = []
@@ -2056,6 +2065,7 @@ def test_channel_destructor_retains_all_cuda_ownership_without_side_effects():
     assert [shared.local_ptr for shared in channel._owned_buffers] == [1000, 4000]
     assert channel._registered_input_ptrs == {1: (2,)}
     assert _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(id(channel)) is channel
+    channel._coordinated_close_complete = True
 
 
 def test_channel_gc_quarantines_rank_data_tensor_and_native_pointer():

@@ -6,6 +6,7 @@ import torch
 from sparkinfer.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
+    _SINGLE_CHANNEL_ID,
     _staging_layout,
     lse_reduce_scatter_reference,
 )
@@ -383,7 +384,7 @@ def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch
     def gather(local_state, group):
         if not local_state or isinstance(local_state[0], str):
             return [local_state, ()]
-        requested, existing = local_state
+        _requested, existing = local_state
         return [(("other",), existing), local_state]
 
     monkeypatch.setattr(
@@ -449,6 +450,26 @@ def test_pool_eager_channel_requires_id_and_rejects_duplicate_stream_owner(
     assert pool.for_stream(7, channel_id="eager:dcp") is eager
     with pytest.raises(RuntimeError, match="stream-affine"):
         pool.for_stream(8, channel_id="eager:dcp")
+
+
+def test_distributed_single_channel_pool_uses_prepared_default() -> None:
+    eager = _make_runtime()
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        single_channel=True,
+        channel_factory=lambda stream_key: eager,
+    )
+    pool._channel_factory = None
+    pool.exchange_group = object()
+    pool._logical_channels[_SINGLE_CHANNEL_ID] = eager
+
+    assert pool.for_stream() is eager
+    assert pool._channels == {0: eager}
 
 
 def test_pool_capture_requires_stable_semantic_id(monkeypatch):
