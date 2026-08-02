@@ -40,7 +40,6 @@ include = ["sparkinfer*"]
 
 [tool.setuptools.package-data]
 "sparkinfer.comm.pcie" = ["*.cu"]
-"sparkinfer.gemm.trellis_linear" = ["csrc/*.cu", "csrc/vendor/*.cuh", "csrc/vendor/*.h", "csrc/vendor/LICENSE*", "csrc/vendor/quant/*.cuh"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
