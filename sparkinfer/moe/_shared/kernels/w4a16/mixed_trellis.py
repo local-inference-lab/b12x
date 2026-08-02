@@ -600,6 +600,9 @@ class W4A16MixedTrellisKernel:
             intermediate_rotations,
             gate_suh,
             up_suh,
+            descriptor_map,
+            Int32(self.total_experts),
+            Int32(self.total_experts),
             smem_base,
             tid,
             cta,
@@ -1123,6 +1126,8 @@ def run_mixed_trellis(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
+        Int32(launch.topk_sum.num_experts),
+        Int32(launch.topk_sum.route_num_experts),
         m,
         stream,
     )

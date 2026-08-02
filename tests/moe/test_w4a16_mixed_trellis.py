@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 import torch
 
@@ -9,8 +13,13 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+    W4A16FusedMoeKernel,
+    W4A16TopKSumKernel,
+    run_w4a16_moe,
+)
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+    W4A16MixedTrellisKernel,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
@@ -27,6 +36,60 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     return major == 12 and minor in (0, 1)
+
+
+def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
+    """Keep the direct CuTe call aligned with the shared driver's ABI."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel.kernel)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_moe_body"
+    ]
+    assert len(calls) == 1
+
+    driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
+    assert len(calls[0].args) == len(driver_parameters) - 1
+    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+        "descriptor_map",
+        "Int32(self.total_experts)",
+        "Int32(self.total_experts)",
+        "smem_base",
+        "tid",
+        "cta",
+        "grid_x",
+        "active_m",
+        "fc1_emit",
+        "fc2_emit",
+    ]
+
+
+def test_mixed_runtime_tracks_topk_sum_contract() -> None:
+    """Keep the direct compiled top-k launch aligned with its runtime ABI."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_mixed_trellis)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compiled"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "topk_sum"
+    ]
+    assert len(calls) == 1
+
+    sum_parameters = inspect.signature(W4A16TopKSumKernel.__call__).parameters
+    assert len(calls[0].args) == len(sum_parameters) - 1
+    assert [ast.unparse(arg) for arg in calls[0].args[-4:]] == [
+        "Int32(launch.topk_sum.num_experts)",
+        "Int32(launch.topk_sum.route_num_experts)",
+        "m",
+        "stream",
+    ]
 
 
 def _prepared(
