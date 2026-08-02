@@ -6231,6 +6231,46 @@ def _trellis_mcg_asm_constants(asm: str) -> str:
 
 
 @dsl_user_op
+def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=None):
+    """Align two words from a two- or three-word circular Trellis span.
+
+    This is the 32-bit SHF equivalent of shifting a temporary 64/96-bit integer.
+    Keeping the operation on the native integer pipe avoids compiler-generated
+    wide-integer carry chains in the K6 dequantization hot loop.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(z0).ir_value(loc=loc, ip=ip),
+            Uint32(z1).ir_value(loc=loc, ip=ip),
+            Uint32(z2).ir_value(loc=loc, ip=ip),
+            Uint32(shift).ir_value(loc=loc, ip=ip),
+            Uint32(word_delta).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred two_words;
+            .reg .b32 mid, upper;
+            setp.eq.u32 two_words, $6, 1;
+            selp.b32 mid, $2, $3, two_words;
+            selp.b32 upper, 0, $2, two_words;
+            shf.r.wrap.b32 $0, $4, mid, $5;
+            shf.r.wrap.b32 $1, mid, upper, $5;
+        }
+        """,
+        "=r,=r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@dsl_user_op
 def packed_dequant_trellis_to_half2x4(
     win_a, win_b, bits: int = 3, *, loc=None, ip=None
 ):

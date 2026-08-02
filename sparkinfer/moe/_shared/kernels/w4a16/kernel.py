@@ -11,10 +11,14 @@ import cuda.bindings.driver as cuda
 import cuda.bindings.runtime as cuda_runtime
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils as cutlass_utils
+import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cutlass.base_dsl.compiler import OptLevel
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, Uint64, dsl_user_op
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
+from cutlass.cute.nvgpu import cpasync
 
 from sparkinfer._lib.compiler import (
     KernelCompileSpec,
@@ -78,6 +82,7 @@ from sparkinfer._lib.intrinsics import (
     st_shared_v4_f32,
     st_shared_v4_u32,
     threadfence,
+    trellis_align_stream_u32x2,
     warp_reduce,
 )
 from sparkinfer._lib.utils import current_cuda_stream, make_ptr
@@ -515,6 +520,7 @@ class W4A16GemmCompileResult:
     w13_layout: str = "w13"
     dense_route_fast_path: bool = False
     trellis_bits: int = 3
+    tma_warp_specialized: bool = False
 
 
 @dataclass(frozen=True)
@@ -1099,6 +1105,13 @@ class W4A16GemmKernel:
     @cute.jit
     def _int4_addr(self, smem_base: Int32, int4_off: Int32) -> Int32:
         return smem_base + int4_off * Int32(16)
+
+    @cute.jit
+    def _epilogue_sync(self, sync_barrier: cutlass.Constexpr = None):
+        if cutlass.const_expr(sync_barrier is None):
+            cute.arch.sync_threads()
+        else:
+            sync_barrier.arrive_and_wait()
 
     @cute.jit
     def _dequant_e2m1x4_to_elem2x2(self, packed: Uint32):
@@ -2875,11 +2888,20 @@ class W4A16GemmKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
         uses_m_block_8: cutlass.Constexpr[bool],
+        sync_barrier: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(uses_m_block_8):
             self._fold_cta_partials_m8(acc0, smem_base, tid)
         else:
-            self._fold_cta_partials_large_m(acc0, acc1, acc2, acc3, smem_base, tid)
+            self._fold_cta_partials_large_m(
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                smem_base,
+                tid,
+                sync_barrier,
+            )
 
         if reduce_slice_count > Int32(1):
             self._wait_for_reduction_turn(
@@ -2929,6 +2951,7 @@ class W4A16GemmKernel:
                     output_n_tile,
                     block_valid_rows,
                     global_scale_f32,
+                    sync_barrier,
                 )
 
     @cute.jit
@@ -3708,16 +3731,9 @@ class W4A16GemmKernel:
                 z0 = ld_shared_u32(b_region + (tbase + i0) * Int32(4))
                 z1 = ld_shared_u32(b_region + (tbase + i1) * Int32(4))
                 z2 = ld_shared_u32(b_region + (tbase + i2) * Int32(4))
-                stream64 = Uint64(0)
-                if delta == Int32(1):
-                    stream64 = ((Uint64(z0) << Uint64(32)) | Uint64(z2)) >> Uint64(s2)
-                else:
-                    lower64 = (Uint64(z1) << Uint64(32)) | Uint64(z2)
-                    stream64 = (lower64 >> Uint64(s2)) | (
-                        Uint64(z0) << (Uint64(64) - Uint64(s2))
-                    )
-                wa[jj] = Uint32(stream64)
-                wb[jj] = Uint32(stream64 >> Uint64(32))
+                wa[jj], wb[jj] = trellis_align_stream_u32x2(
+                    z0, z1, z2, s2, delta
+                )
         return wa[0], wa[1], wa[2], wa[3], wb[0], wb[1], wb[2], wb[3]
 
     @cute.jit
@@ -4632,6 +4648,7 @@ class W4A16GemmKernel:
         block_valid_rows: Int32,
         metadata_row_base: Int32,
         store_iters: cutlass.Constexpr[int],
+        sync_barrier: cutlass.Constexpr = None,
     ):
         for _ in cutlass.range_constexpr(store_iters):
             row = c_gl_wr // c_gl_stride
@@ -4688,7 +4705,7 @@ class W4A16GemmKernel:
                     )
             c_gl_wr += c_gl_wr_delta
             c_sh_rd += c_sh_rd_delta
-        cute.arch.sync_threads()
+        self._epilogue_sync(sync_barrier)
 
     @cute.jit
     def _drain_output_smem_tail(
@@ -4704,6 +4721,7 @@ class W4A16GemmKernel:
         block_valid_rows: Int32,
         metadata_row_base: Int32,
         store_iters: cutlass.Constexpr[int],
+        sync_barrier: cutlass.Constexpr = None,
     ):
         for _ in cutlass.range_constexpr(store_iters):
             row = c_gl_wr // c_gl_stride_covered
@@ -4752,7 +4770,7 @@ class W4A16GemmKernel:
                     )
             c_gl_wr += c_gl_wr_delta
             c_sh_rd += c_sh_rd_delta
-        cute.arch.sync_threads()
+        self._epilogue_sync(sync_barrier)
 
     @cute.jit
     def _store_tile_m8(
@@ -4872,6 +4890,7 @@ class W4A16GemmKernel:
         acc3,
         smem_base: Int32,
         tid: Int32,
+        sync_barrier: cutlass.Constexpr = None,
     ):
         red_off = self.cta_threads // self.b_sh_stride_threads // 2
         if cutlass.const_expr(red_off >= 1):
@@ -4889,6 +4908,7 @@ class W4A16GemmKernel:
                         red_sh_stride,
                         red_sh_delta,
                         red_sh_rd,
+                        sync_barrier,
                     )
                 elif cutlass.const_expr(mb == 1):
                     self._fold_cta_partials_large_m_block(
@@ -4899,6 +4919,7 @@ class W4A16GemmKernel:
                         red_sh_stride,
                         red_sh_delta,
                         red_sh_rd,
+                        sync_barrier,
                     )
                 elif cutlass.const_expr(mb == 2):
                     self._fold_cta_partials_large_m_block(
@@ -4909,6 +4930,7 @@ class W4A16GemmKernel:
                         red_sh_stride,
                         red_sh_delta,
                         red_sh_rd,
+                        sync_barrier,
                     )
                 else:
                     self._fold_cta_partials_large_m_block(
@@ -4919,6 +4941,7 @@ class W4A16GemmKernel:
                         red_sh_stride,
                         red_sh_delta,
                         red_sh_rd,
+                        sync_barrier,
                     )
 
     @cute.jit
@@ -4931,6 +4954,7 @@ class W4A16GemmKernel:
         red_sh_stride: Int32,
         red_sh_delta: Int32,
         red_sh_rd: Int32,
+        sync_barrier: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(red_off == 2):
             if Int32(2) <= red_idx and red_idx < Int32(4):
@@ -4953,7 +4977,7 @@ class W4A16GemmKernel:
                             (flat_j * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                         ],
                     )
-            cute.arch.sync_threads()
+            self._epilogue_sync(sync_barrier)
 
         if Int32(1) <= red_idx and red_idx < Int32(2):
             for flat_j in cutlass.range_constexpr(8):
@@ -5022,7 +5046,7 @@ class W4A16GemmKernel:
                         (flat_j * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                     ],
                 )
-        cute.arch.sync_threads()
+        self._epilogue_sync(sync_barrier)
 
         if red_idx == Int32(0):
             for flat_j in cutlass.range_constexpr(8):
@@ -5063,7 +5087,7 @@ class W4A16GemmKernel:
                     ]
                     + r3
                 )
-        cute.arch.sync_threads()
+        self._epilogue_sync(sync_barrier)
 
     @cute.jit
     def _write_bf16x2_shared(
@@ -5093,6 +5117,7 @@ class W4A16GemmKernel:
         output_n_tile: Int32,
         block_valid_rows: Int32,
         global_scale_f32: cutlass.Float32,
+        sync_barrier: cutlass.Constexpr = None,
     ):
         if cutlass.const_expr(self.has_n_tile_tail):
             (
@@ -5142,7 +5167,7 @@ class W4A16GemmKernel:
                         acc3, smem_base, c_sh_wr, c_sh_stride, write_scale
                     )
                 c_sh_wr += Int32(16 * (4 * (2 * self.cta_n_blocks + 1)))
-        cute.arch.sync_threads()
+        self._epilogue_sync(sync_barrier)
 
         store_iters = _covering_count(
             16 * self.cta_m_blocks,
@@ -5161,6 +5186,7 @@ class W4A16GemmKernel:
                 block_valid_rows,
                 Int32(0),
                 store_iters,
+                sync_barrier,
             )
         else:
             self._drain_output_smem(
@@ -5174,6 +5200,7 @@ class W4A16GemmKernel:
                 block_valid_rows,
                 Int32(0),
                 store_iters,
+                sync_barrier,
             )
 
     @cute.jit
@@ -5231,6 +5258,534 @@ class W4A16GemmKernel:
                 ],
                 write_scale,
             )
+
+
+class W4A16TrellisDenseTmaKernel(W4A16GemmKernel):
+    """Experimental K6 dense GEMM with a dedicated TMA producer warp.
+
+    This path intentionally retains the existing Trellis dequant, MMA lane
+    mapping, reduction, and store code. Only global-to-shared staging changes:
+    one dedicated producer warp moves the contiguous A tile and native K6
+    payload while four consumer warps compute. Keeping it as a separate gated
+    kernel makes the experiment incapable of changing routed MoE or non-K6
+    behavior.
+    """
+
+    # Two complete warpgroups preserve enough registers for the accumulator:
+    # four compute warps, then one DMA warp plus three idle producer warps.
+    _TMA_THREADS = 8 * 32
+    _TMA_COMPUTE_THREADS = 4 * 32
+    _TMA_STAGES = 2
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not (
+            self.dense_route_fast_path
+            and self.weight_layout_trellis256
+            and self.trellis_bits == 6
+            and self.is_fp16
+            and self.moe_block_size == 64
+            and self.tile_k == 64
+            and self.tile_n == 128
+            and self.cta_threads == self._TMA_COMPUTE_THREADS
+            and self.schedule_whole_tiles
+            and not self.has_logical_tail
+            and not self.dual_a
+        ):
+            raise ValueError(
+                "Trellis dense TMA warp specialization requires exact FP16 K6 "
+                "E=1 M64/K64/N128 whole-tile geometry"
+            )
+        self.tma_compute_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self._TMA_COMPUTE_THREADS,
+        )
+        # Separate two-stage A/B TMA storage leaves room for one CTA per SM.
+        # The base kernel's occupancy estimate only accounts for its legacy
+        # aliased storage and can otherwise launch an oversized persistent grid.
+        self.blocks_per_sm = 1
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (*super().__cache_key__, "trellis_dense_tma_warp_v21_linear")
+
+    @cute.jit
+    def __call__(
+        self,
+        a_bf16_ptr: cute.Pointer,
+        a_alt_bf16_ptr: cute.Pointer,
+        b_i32: cute.Tensor,
+        c_bf16_ptr: cute.Pointer,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        grid_x: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        a_smem_layout = cute.tile_to_shape(
+            cute.nvgpu.warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(
+                    cutlass_utils.LayoutEnum.ROW_MAJOR,
+                    cutlass.Float16,
+                    self.tile_k,
+                ),
+                cutlass.Float16,
+            ),
+            (self.moe_block_size, self.tile_k, self._TMA_STAGES),
+            order=(1, 0, 2),
+        )
+        b_smem_layout = cute.make_layout(
+            (
+                self.cta_k_blocks,
+                self.cta_n_blocks,
+                8 * self.trellis_bits,
+                self._TMA_STAGES,
+            ),
+            stride=(
+                self.cta_n_blocks * (8 * self.trellis_bits),
+                8 * self.trellis_bits,
+                1,
+                self.cta_k_blocks
+                * self.cta_n_blocks
+                * (8 * self.trellis_bits),
+            ),
+        )
+        a = cute.make_tensor(
+            a_bf16_ptr,
+            layout=cute.make_layout(
+                (active_m, Int32(self.size_k)),
+                stride=(Int32(self.size_k), 1),
+            ),
+        )
+        c_bf16_flat = cute.make_tensor(
+            c_bf16_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.size_n),),
+                stride=(1,),
+            ),
+        )
+        a_atom_tma, a_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            a,
+            cute.slice_(a_smem_layout, (None, None, 0)),
+            (self.moe_block_size, self.tile_k),
+            num_multicast=1,
+        )
+        b_atom_tma, b_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            b_i32,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            (self.cta_k_blocks, self.cta_n_blocks, 8 * self.trellis_bits),
+            num_multicast=1,
+        )
+        self.kernel_tma(
+            a_atom_tma,
+            a_tma,
+            b_atom_tma,
+            b_tma,
+            c_bf16_flat,
+            scales_i32_flat,
+            global_scale,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            topk_weights_flat,
+            c_tmp_f32_flat,
+            locks_i32_flat,
+            active_m,
+            a_smem_layout,
+            b_smem_layout,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(self._TMA_THREADS, 1, 1),
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel_tma(
+        self,
+        a_atom_tma: cute.CopyAtom,
+        a: cute.Tensor,
+        b_atom_tma: cute.CopyAtom,
+        b: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.Layout,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        warp_idx = tid // Int32(32)
+        cta = Int32(bidx)
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            barriers: cute.struct.MemRange[
+                cutlass.Int64, self._TMA_STAGES * 2
+            ]
+            prefix: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.sh_a_off * 4],
+                1024,
+            ]
+            sa: cute.struct.MemRange[
+                cutlass.Float16,
+                cute.cosize(a_smem_layout),
+            ]
+            sb_data: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, cute.cosize(b_smem_layout)],
+                1024,
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.prefix.data_ptr())
+        sa = storage.sa.get_tensor(
+            a_smem_layout.outer,
+            swizzle=a_smem_layout.inner,
+        )
+        sb = storage.sb_data.get_tensor(b_smem_layout)
+        b_smem_base = shared_ptr_to_u32(storage.sb_data.data_ptr())
+        ga = cute.local_tile(
+            a,
+            (self.moe_block_size, self.tile_k),
+            (None, None),
+        )
+        gb = cute.local_tile(
+            b,
+            (self.cta_k_blocks, self.cta_n_blocks, 8 * self.trellis_bits),
+            (None, None, None),
+        )
+        cta_layout = cute.make_layout(1)
+        tsa, tga = cpasync.tma_partition(
+            a_atom_tma,
+            0,
+            cta_layout,
+            cute.group_modes(sa, 0, 2),
+            cute.group_modes(ga, 0, 2),
+        )
+        tsb, tgb = cpasync.tma_partition(
+            b_atom_tma,
+            0,
+            cta_layout,
+            cute.group_modes(sb, 0, 3),
+            cute.group_modes(gb, 0, 3),
+        )
+        tma_pipeline = pipeline.PipelineTmaAsync.create(
+            num_stages=self._TMA_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 4),
+            tx_count=(
+                self.moe_block_size * self.tile_k * 2
+                + self.cta_k_blocks
+                * self.cta_n_blocks
+                * (8 * self.trellis_bits)
+                * 4
+            ),
+            barrier_storage=storage.barriers.data_ptr(),
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        )
+        if tid == Int32(0):
+            cpasync.prefetch_descriptor(a_atom_tma)
+            cpasync.prefetch_descriptor(b_atom_tma)
+        cute.arch.sync_threads()
+
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self._TMA_STAGES,
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self._TMA_STAGES,
+        )
+        if warp_idx < Int32(4):
+            cute.arch.setmaxregister_increase(248)
+        else:
+            cute.arch.setmaxregister_decrease(24)
+        grid_x, _, _ = cute.arch.grid_dim()
+        route_blocks = active_m // Int32(self.moe_block_size)
+        total_tiles = route_blocks * Int32(self.n_tiles)
+        work_tile = cta
+        while work_tile < total_tiles:
+            route_block_idx = work_tile // Int32(self.n_tiles)
+            output_n_tile = work_tile - route_block_idx * Int32(self.n_tiles)
+            self._run_tile_tma(
+                a,
+                c_bf16_flat,
+                global_scale,
+                packed_route_indices,
+                topk_weights_flat,
+                c_tmp_f32_flat,
+                locks_i32_flat,
+                smem_base,
+                b_smem_base,
+                tid,
+                warp_idx,
+                route_block_idx,
+                output_n_tile,
+                Int32(0),
+                Int32(self.k_tiles),
+                Int32(1),
+                Int32(0),
+                Int32(0),
+                active_m,
+                a_atom_tma,
+                b_atom_tma,
+                tsa,
+                tga,
+                tsb,
+                tgb,
+                tma_pipeline,
+                producer_state,
+                consumer_state,
+            )
+            work_tile += Int32(grid_x)
+        if warp_idx == Int32(4):
+            tma_pipeline.producer_tail(producer_state)
+
+    @cute.jit
+    def _run_tile_tma(
+        self,
+        a: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        b_smem_base: Int32,
+        tid: Int32,
+        warp_idx: Int32,
+        route_block_idx: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+        active_m: Int32,
+        a_atom_tma: cute.CopyAtom,
+        b_atom_tma: cute.CopyAtom,
+        tsa: cute.Tensor,
+        tga: cute.Tensor,
+        tsb: cute.Tensor,
+        tgb: cute.Tensor,
+        tma_pipeline,
+        producer_state,
+        consumer_state,
+    ):
+        (
+            global_scale_f32,
+            block_valid_rows,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            b_sh_rd,
+            s_sh_rd,
+        ) = self._tile_common_prologue(
+            global_scale,
+            packed_route_indices,
+            topk_weights_flat,
+            smem_base,
+            tid,
+            route_block_idx,
+            Int32(0),
+            output_n_tile,
+            active_m,
+        )
+
+        if warp_idx == Int32(4):
+            tile_idx = Int32(0)
+            while tile_idx < reduce_tile_count:
+                tma_pipeline.producer_acquire(producer_state)
+                source_k_tile = reduce_k_tile + tile_idx
+                cute.copy(
+                    a_atom_tma,
+                    tga[(None, route_block_idx, source_k_tile)],
+                    tsa[(None, producer_state.index)],
+                    tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
+                )
+                cute.copy(
+                    b_atom_tma,
+                    tgb[(None, source_k_tile, output_n_tile, Int32(0))],
+                    tsb[(None, producer_state.index)],
+                    tma_bar_ptr=tma_pipeline.producer_get_barrier(producer_state),
+                )
+                tma_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+                tile_idx += Int32(1)
+        elif warp_idx < Int32(4):
+            self._consume_tile_tma(
+                c_bf16_flat,
+                c_tmp_f32_flat,
+                locks_i32_flat,
+                smem_base,
+                b_smem_base,
+                tid,
+                output_n_tile,
+                block_valid_rows,
+                global_scale_f32,
+                reduce_tile_count,
+                reduce_slice_count,
+                reduce_slice_idx,
+                lock_slot,
+                tma_pipeline,
+                consumer_state,
+                b_sh_rd,
+                s_sh_rd,
+            )
+
+        # Keep producer and consumers together through the complete tile
+        # lifecycle before this CTA can leave the pipeline.
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _consume_tile_tma(
+        self,
+        c_bf16_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        smem_base: Int32,
+        b_smem_base: Int32,
+        tid: Int32,
+        output_n_tile: Int32,
+        block_valid_rows: Int32,
+        global_scale_f32: cutlass.Float32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+        tma_pipeline,
+        consumer_state,
+        b_sh_rd: Int32,
+        s_sh_rd: Int32,
+    ):
+        a_sh_rd = self._a_shared_read_offset(tid, 16)
+        acc0 = [
+            cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+            for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+        ]
+        acc1 = [
+            cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+            for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+        ]
+        acc2 = [
+            cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+            for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+        ]
+        acc3 = [
+            cute.make_rmem_tensor((_SCALAR_ACC_FRAGMENT_WIDTH,), cutlass.Float32)
+            for _ in range(32 // _SCALAR_ACC_FRAGMENT_WIDTH)
+        ]
+        for frag in cutlass.range_constexpr(32 // _SCALAR_ACC_FRAGMENT_WIDTH):
+            acc0[frag].fill(0.0)
+            acc1[frag].fill(0.0)
+            acc2[frag].fill(0.0)
+            acc3[frag].fill(0.0)
+
+        b_regs = cute.make_rmem_tensor((2, 4), Uint32)
+        a_regs = cute.make_rmem_tensor((self.cta_m_blocks, 4), Uint32)
+        b_frag = cute.make_rmem_tensor((2, 2), Uint32)
+        tile_idx = Int32(0)
+        while tile_idx < reduce_tile_count:
+            tma_pipeline.consumer_wait(consumer_state)
+            pipe = consumer_state.index
+            for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
+                q0, q1, q2, q3, s0, s1, s2, s3 = (
+                    self._load_b_registers_trellis256(
+                        # The shared loader adds the legacy B-region offset.
+                        # Cancel it here because sb_data is already the region
+                        # base of the separate TMA staging allocation.
+                        b_smem_base - Int32(self.sh_b_off * 16),
+                        tid,
+                        pipe,
+                        Int32(kk),
+                    )
+                )
+                b_regs[0, 0] = q0
+                b_regs[0, 1] = q1
+                b_regs[0, 2] = q2
+                b_regs[0, 3] = q3
+                b_regs[1, 0] = s0
+                b_regs[1, 1] = s1
+                b_regs[1, 2] = s2
+                b_regs[1, 3] = s3
+                self._load_a_register_bundle(
+                    a_regs,
+                    smem_base,
+                    a_sh_rd,
+                    pipe,
+                    Int32(kk),
+                    False,
+                )
+                for jj in cutlass.range_constexpr(4):
+                    self._scaled_dequant_b_fragment_trellis256(
+                        b_frag,
+                        b_regs[0, jj],
+                        b_regs[1, jj],
+                    )
+                    for mb in cutlass.range_constexpr(self.cta_m_blocks):
+                        if cutlass.const_expr(mb == 0):
+                            self._mma_accumulate_large_m(
+                                acc0, a_regs, mb, jj, b_frag
+                            )
+                        elif cutlass.const_expr(mb == 1):
+                            self._mma_accumulate_large_m(
+                                acc1, a_regs, mb, jj, b_frag
+                            )
+                        elif cutlass.const_expr(mb == 2):
+                            self._mma_accumulate_large_m(
+                                acc2, a_regs, mb, jj, b_frag
+                            )
+                        else:
+                            self._mma_accumulate_large_m(
+                                acc3, a_regs, mb, jj, b_frag
+                            )
+            tma_pipeline.consumer_release(consumer_state)
+            consumer_state.advance()
+            tile_idx += Int32(1)
+
+        self._finish_tile(
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            c_bf16_flat,
+            c_tmp_f32_flat,
+            locks_i32_flat,
+            smem_base,
+            tid,
+            output_n_tile,
+            block_valid_rows,
+            global_scale_f32,
+            reduce_slice_count,
+            reduce_slice_idx,
+            lock_slot,
+            False,
+            self.tma_compute_barrier,
+        )
 
 
 class W4A16FusedMoeKernel:
@@ -7709,10 +8264,156 @@ class W4A16TopKSumKernel:
         return h0 * rs, h1 * rs, h2 * rs, h3 * rs
 
 
+class W4A16DenseHadamard128Kernel:
+    """FP16 blockwise H128 used by native dense Trellis linears.
+
+    EXL3 applies an incoherence scale before the input rotation and after the
+    output rotation.  Keeping both forms in one SparkInfer kernel removes the
+    runtime dependency on exllamav3_ext while preserving that ordering.
+    """
+
+    def __init__(self, *, width: int, scale_before: bool):
+        if width <= 0 or width % 128 != 0:
+            raise ValueError("dense H128 width must be a positive multiple of 128")
+        self.width = int(width)
+        self.scale_before = bool(scale_before)
+        self.cta_threads = 256
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (self.width, self.scale_before, self.cta_threads)
+
+    @cute.jit
+    def __call__(
+        self,
+        input_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        scale_ptr: cute.Pointer,
+        active_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        input_flat = cute.make_tensor(
+            input_ptr,
+            layout=cute.make_layout((active_m * Int32(self.width),), stride=(1,)),
+        )
+        output_flat = cute.make_tensor(
+            output_ptr,
+            layout=cute.make_layout((active_m * Int32(self.width),), stride=(1,)),
+        )
+        scale_flat = cute.make_tensor(
+            scale_ptr,
+            layout=cute.make_layout((Int32(self.width),), stride=(1,)),
+        )
+        total_units = active_m * Int32(self.width // 128)
+        grid = (_covering_count(total_units, self.cta_threads // 32), 1, 1)
+        self.kernel(input_flat, output_flat, scale_flat, active_m).launch(
+            grid=grid,
+            block=[self.cta_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        input_flat: cute.Tensor,
+        output_flat: cute.Tensor,
+        scale_flat: cute.Tensor,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        unit = Int32(bidx) * Int32(self.cta_threads // 32) + warp
+        nblocks = Int32(self.width // 128)
+        total_units = active_m * nblocks
+        if unit < total_units:
+            row = unit // nblocks
+            block = unit - row * nblocks
+            col0 = block * Int32(128) + lane * Int32(4)
+            base = row * Int32(self.width) + col0
+            v0 = input_flat[base + Int32(0)].to(cutlass.Float32)
+            v1 = input_flat[base + Int32(1)].to(cutlass.Float32)
+            v2 = input_flat[base + Int32(2)].to(cutlass.Float32)
+            v3 = input_flat[base + Int32(3)].to(cutlass.Float32)
+            if cutlass.const_expr(self.scale_before):
+                # exllamav3 uses __hmul2 before the transform; preserve the
+                # intermediate fp16 rounding instead of promoting the product.
+                v0 = cutlass.Float16(
+                    v0 * scale_flat[col0 + Int32(0)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                v1 = cutlass.Float16(
+                    v1 * scale_flat[col0 + Int32(1)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                v2 = cutlass.Float16(
+                    v2 * scale_flat[col0 + Int32(2)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                v3 = cutlass.Float16(
+                    v3 * scale_flat[col0 + Int32(3)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+            h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+            if cutlass.const_expr(not self.scale_before):
+                # The reference rounds H128 to fp16 before the post-scale.
+                h0 = cutlass.Float16(h0).to(cutlass.Float32) * scale_flat[
+                    col0 + Int32(0)
+                ].to(cutlass.Float32)
+                h1 = cutlass.Float16(h1).to(cutlass.Float32) * scale_flat[
+                    col0 + Int32(1)
+                ].to(cutlass.Float32)
+                h2 = cutlass.Float16(h2).to(cutlass.Float32) * scale_flat[
+                    col0 + Int32(2)
+                ].to(cutlass.Float32)
+                h3 = cutlass.Float16(h3).to(cutlass.Float32) * scale_flat[
+                    col0 + Int32(3)
+                ].to(cutlass.Float32)
+            output_flat[base + Int32(0)] = cutlass.Float16(h0)
+            output_flat[base + Int32(1)] = cutlass.Float16(h1)
+            output_flat[base + Int32(2)] = cutlass.Float16(h2)
+            output_flat[base + Int32(3)] = cutlass.Float16(h3)
+
+    @cute.jit
+    def _had128_quad(
+        self,
+        v0: cutlass.Float32,
+        v1: cutlass.Float32,
+        v2: cutlass.Float32,
+        v3: cutlass.Float32,
+        lane: Int32,
+    ):
+        s0 = v0 + v1
+        d0 = v0 - v1
+        s1 = v2 + v3
+        d1 = v2 - v3
+        h0 = s0 + s1
+        h1 = d0 + d1
+        h2 = s0 - s1
+        h3 = d0 - d1
+        for i in cutlass.range_constexpr(5):
+            step = 1 << i
+            p0 = cute.arch.shuffle_sync_bfly(h0, offset=step)
+            p1 = cute.arch.shuffle_sync_bfly(h1, offset=step)
+            p2 = cute.arch.shuffle_sync_bfly(h2, offset=step)
+            p3 = cute.arch.shuffle_sync_bfly(h3, offset=step)
+            if (lane & Int32(step)) != Int32(0):
+                h0 = p0 - h0
+                h1 = p1 - h1
+                h2 = p2 - h2
+                h3 = p3 - h3
+            else:
+                h0 = p0 + h0
+                h1 = p1 + h1
+                h2 = p2 + h2
+                h3 = p3 + h3
+        scale = cutlass.Float32(0.088388347648)
+        return h0 * scale, h1 * scale, h2 * scale, h3 * scale
+
+
 _CACHE: dict[tuple, W4A16GemmCompileResult] = {}
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
 _ACTIVATION_CACHE: dict[tuple, W4A16ActivationCompileResult] = {}
 _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
+_DENSE_HAD128_CACHE: dict[tuple, object] = {}
 _SMALL_M_DIRECT_CACHE: dict[tuple, _W4A16SmallMDirectLaunch] = {}
 
 
@@ -7986,7 +8687,26 @@ def compile_w4a16_gemm(
         device = int(torch.cuda.current_device())
     else:
         device = None
-    kernel = W4A16GemmKernel(
+    tma_warp_specialized = bool(
+        os.environ.get("SPARKINFER_TRELLIS_DENSE_TMA_WARP", "0") == "1"
+        and dense_route_fast_path
+        and weight_layout == "trellis3_t256"
+        and int(trellis_bits) == 6
+        and element_dtype == "fp16"
+        and int(moe_block_size) == 64
+        and int(tile_k) == 64
+        and int(tile_n) == 128
+        and int(size_m) % 64 == 0
+        and int(size_n) % 256 == 0
+        and int(size_k) % 64 == 0
+        and w13_layout == "packed"
+    )
+    kernel_cls = (
+        W4A16TrellisDenseTmaKernel
+        if tma_warp_specialized
+        else W4A16GemmKernel
+    )
+    kernel = kernel_cls(
         size_m=size_m,
         size_n=size_n,
         size_k=size_k,
@@ -8018,7 +8738,11 @@ def compile_w4a16_gemm(
             blocks_per_sm=kernel.blocks_per_sm,
         )
 
-    compile_size_m = _fake_m_for_specialization(size_m)
+    compile_size_m = (
+        int(size_m)
+        if tma_warp_specialized
+        else _fake_m_for_specialization(size_m)
+    )
     compile_route_blocks = 1
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -8028,11 +8752,19 @@ def compile_w4a16_gemm(
         )
     else:
         b_fake_elements = num_experts * (size_k // 16) * (size_n // 16 * 32)
-    b_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b_fake_elements,),
-        assumed_align=16,
-    )
+    if tma_warp_specialized:
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (size_k // 16, size_n // 16, 8 * int(trellis_bits)),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+    else:
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (b_fake_elements,),
+            assumed_align=16,
+        )
     c_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -8112,6 +8844,7 @@ def compile_w4a16_gemm(
             3,
             cache_key,
         ),
+        dsl_compile_options=(OptLevel(2) if tma_warp_specialized else None),
     )
     result = W4A16GemmCompileResult(
         compiled=compiled,
@@ -8125,6 +8858,7 @@ def compile_w4a16_gemm(
         w13_layout=w13_layout,
         dense_route_fast_path=bool(dense_route_fast_path),
         trellis_bits=int(trellis_bits),
+        tma_warp_specialized=tma_warp_specialized,
     )
     _CACHE[cache_key] = result
     return result
@@ -10549,6 +11283,107 @@ def _trellis256_dense_tile_config(size_k: int, size_n: int) -> tuple[int, int]:
     )
 
 
+def _trellis256_dense_launch_geometry(
+    *,
+    size_m: int,
+    size_k: int,
+    size_n: int,
+    sms: int,
+) -> tuple[int, tuple[int, int]]:
+    """Avoid short spill waves in the persistent dense-Trellis schedule.
+
+    A default M64/N256 launch can leave only a handful of CTAs in a second or
+    third SM wave. Narrow projections benefit from a smaller M tile, while wide
+    projections already expose enough N parallelism and only need N128 for a
+    two-wave spill. Past three waves the smaller tile's scheduler overhead costs
+    more than the remaining imbalance.
+    """
+    default = (64, (64, 256 if size_n % 256 == 0 else 128))
+    if size_n % 256 != 0 or sms <= 0:
+        return default
+    tasks = _covering_count(int(size_m), 64) * (int(size_n) // 256)
+    waves = _covering_count(tasks, int(sms))
+    if waves not in (2, 3):
+        return default
+    spill = tasks - (waves - 1) * int(sms)
+    if spill > max(16, int(sms) // 10):
+        return default
+    n_tiles_256 = int(size_n) // 256
+    if n_tiles_256 <= 32:
+        return (48, (64, 128 if waves == 2 else 256))
+    if waves == 2:
+        return (64, (64, 128))
+    if int(size_k) <= 4096:
+        return (48, (64, 256))
+    return default
+
+
+def _compile_trellis_dense_hadamard128(*, width: int, scale_before: bool):
+    cache_key = ("trellis_dense_hadamard128", int(width), bool(scale_before))
+    cached = _DENSE_HAD128_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    kernel = W4A16DenseHadamard128Kernel(
+        width=int(width),
+        scale_before=bool(scale_before),
+    )
+    fp16_fake = make_ptr(
+        cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = sparkinfer_compile(
+        kernel,
+        fp16_fake,
+        fp16_fake,
+        fp16_fake,
+        Int32(1),
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "gemm.trellis_dense.hadamard128",
+            1,
+            cache_key,
+        ),
+    )
+    _DENSE_HAD128_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _run_trellis_dense_hadamard128(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    scale_before: bool,
+) -> None:
+    if x.dtype != torch.float16 or output.dtype != torch.float16:
+        raise TypeError("native dense H128 requires fp16 input and output")
+    if x.ndim != 2 or output.shape != x.shape or not x.is_contiguous():
+        raise ValueError("native dense H128 requires equal contiguous rank-2 tensors")
+    if not output.is_contiguous() or output.device != x.device:
+        raise ValueError("native dense H128 output must be contiguous on the input device")
+    if (
+        scale.dtype != torch.float16
+        or scale.device != x.device
+        or not scale.is_contiguous()
+        or scale.numel() != x.shape[1]
+    ):
+        raise ValueError("native dense H128 scale must be contiguous fp16 with width elements")
+    compiled = _compile_trellis_dense_hadamard128(
+        width=int(x.shape[1]),
+        scale_before=bool(scale_before),
+    )
+    fp16 = cutlass.Float16
+    compiled(
+        make_ptr(fp16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(fp16, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(fp16, scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        int(x.shape[0]),
+        current_cuda_stream(),
+    )
+
+
 def _resolve_exl3_hadamard_128(hadamard_128):
     if hadamard_128 is None:
         try:
@@ -10610,6 +11445,8 @@ def _run_trellis256_dense_current_device(
     output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
+    _moe_block_size: int = 64,
+    _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run one native EXL3 linear on the already-selected CUDA device.
 
@@ -10664,6 +11501,75 @@ def _run_trellis256_dense_current_device(
         dtype=x.dtype,
         device=x.device,
     )
+    if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
+        raise ValueError("c_tmp must be at least 16-byte aligned")
+
+    external_hadamard_128 = (
+        None
+        if hadamard_128 is None
+        else _resolve_exl3_hadamard_128(hadamard_128)
+    )
+
+    # Decode and small batches use one cooperative K6 kernel that owns both
+    # H128 rotations. This avoids three launches and the generic routed-GEMM
+    # scheduler while retaining the checkpoint-native Trellis representation.
+    use_k6_small = (
+        m <= 128
+        and trellis_bits == 6
+        and compute_dtype == torch.float16
+        and external_hadamard_128 is None
+    )
+    if use_k6_small:
+        if x.dtype == torch.float16:
+            x_f16 = x
+        else:
+            input_f16 = _trellis_dense_buffer(
+                "input_f16",
+                input_f16,
+                shape=(m, size_k),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            input_f16.copy_(x)
+            x_f16 = input_f16
+        rotated_f16 = _trellis_dense_buffer(
+            "rotated_f16",
+            rotated_f16,
+            shape=(m, size_k),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        if output.dtype == torch.float16:
+            small_output = output
+        else:
+            output_f16 = _trellis_dense_buffer(
+                "output_f16",
+                output_f16,
+                shape=(m, size_n),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            small_output = output_f16
+        from sparkinfer.gemm.trellis_linear._small_m import run_k6_mcg
+
+        trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
+            size_k // 16,
+            size_n // 16,
+            96,
+        )
+        run_k6_mcg(
+            x_f16,
+            trellis_i16,
+            small_output,
+            prepared_dense.suh,
+            rotated_f16,
+            prepared_dense.svh,
+            prepared_dense.workspace,
+        )
+        if output.dtype != torch.float16:
+            output.copy_(small_output)
+        return output
+
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
         gemm_output,
@@ -10671,10 +11577,6 @@ def _run_trellis256_dense_current_device(
         dtype=compute_dtype,
         device=x.device,
     )
-    if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
-        raise ValueError("c_tmp must be at least 16-byte aligned")
-
-    hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
     if x.dtype == torch.float16:
         x_f16 = x
     else:
@@ -10694,7 +11596,15 @@ def _run_trellis256_dense_current_device(
         dtype=torch.float16,
         device=x.device,
     )
-    hadamard_128(x_f16, rotated_f16, prepared_dense.suh, None, 1.0)
+    if external_hadamard_128 is None:
+        _run_trellis_dense_hadamard128(
+            x_f16,
+            rotated_f16,
+            prepared_dense.suh,
+            scale_before=True,
+        )
+    else:
+        external_hadamard_128(x_f16, rotated_f16, prepared_dense.suh, None, 1.0)
     if compute_dtype == torch.float16:
         rotated_compute = rotated_f16
     else:
@@ -10712,10 +11622,40 @@ def _run_trellis256_dense_current_device(
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )
-    moe_block_size = 64
+    moe_block_size = int(_moe_block_size)
+    if moe_block_size not in _ALLOWED_ROUTED_SIZES:
+        raise ValueError(
+            f"unsupported Trellis dense moe_block_size={moe_block_size}"
+        )
+    use_tma_warp_tile = bool(
+        _force_tile_config is None
+        and os.environ.get("SPARKINFER_TRELLIS_DENSE_TMA_WARP", "0") == "1"
+        and moe_block_size == 64
+        and trellis_bits == 6
+        and compute_dtype == torch.float16
+        and m == 2048
+        and size_k == 4096
+        and size_n == 6144
+    )
+    if use_tma_warp_tile:
+        # The warp-specialized K6 kernel uses a narrower N tile to fit separate
+        # two-stage A/B TMA pipelines without reducing the compute warp budget.
+        tile_k, tile_n = (64, 128)
+    elif _force_tile_config is None and moe_block_size == 64:
+        moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
+            size_m=m,
+            size_k=size_k,
+            size_n=size_n,
+            sms=sms,
+        )
+    else:
+        tile_k, tile_n = (
+            _trellis256_dense_tile_config(size_k, size_n)
+            if _force_tile_config is None
+            else (int(_force_tile_config[0]), int(_force_tile_config[1]))
+        )
     route_blocks = (m + moe_block_size - 1) // moe_block_size
     route_slots = route_blocks * moe_block_size
-    tile_k, tile_n = _trellis256_dense_tile_config(size_k, size_n)
     launch = _compile_w4a16_gemm_launch(
         size_m=m,
         size_n=size_n,
@@ -10746,6 +11686,13 @@ def _run_trellis256_dense_current_device(
         sms * int(launch.kernel.blocks_per_sm),
         max(route_blocks * n_tiles, 1),
     )
+    trellis_arg = prepared_dense.trellis
+    if launch.kernel.tma_warp_specialized:
+        trellis_arg = prepared_dense.trellis.view(torch.int32).view(
+            size_k // 16,
+            size_n // 16,
+            8 * trellis_bits,
+        )
     launch.kernel.compiled(
         make_ptr(
             cutlass_dtype,
@@ -10759,7 +11706,7 @@ def _run_trellis256_dense_current_device(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        prepared_dense.trellis,
+        trellis_arg,
         make_ptr(
             cutlass_dtype,
             gemm_output.data_ptr(),
@@ -10792,7 +11739,15 @@ def _run_trellis256_dense_current_device(
         gemm_output_f16.copy_(gemm_output)
         gemm_f16 = gemm_output_f16
     if output.dtype == torch.float16:
-        hadamard_128(gemm_f16, output, None, prepared_dense.svh, 1.0)
+        if external_hadamard_128 is None:
+            _run_trellis_dense_hadamard128(
+                gemm_f16,
+                output,
+                prepared_dense.svh,
+                scale_before=False,
+            )
+        else:
+            external_hadamard_128(gemm_f16, output, None, prepared_dense.svh, 1.0)
     else:
         output_f16 = _trellis_dense_buffer(
             "output_f16",
@@ -10801,7 +11756,17 @@ def _run_trellis256_dense_current_device(
             dtype=torch.float16,
             device=x.device,
         )
-        hadamard_128(gemm_f16, output_f16, None, prepared_dense.svh, 1.0)
+        if external_hadamard_128 is None:
+            _run_trellis_dense_hadamard128(
+                gemm_f16,
+                output_f16,
+                prepared_dense.svh,
+                scale_before=False,
+            )
+        else:
+            external_hadamard_128(
+                gemm_f16, output_f16, None, prepared_dense.svh, 1.0
+            )
         output.copy_(output_f16)
     return output
 
@@ -10820,6 +11785,8 @@ def run_trellis256_dense(
     output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
+    _moe_block_size: int = 64,
+    _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run one native 3/4/5/6-bpw EXL3 linear through the fused t256 GEMM.
 
@@ -10850,6 +11817,8 @@ def run_trellis256_dense(
             output_f16=output_f16,
             hadamard_128=hadamard_128,
             stream=None,
+            _moe_block_size=_moe_block_size,
+            _force_tile_config=_force_tile_config,
         )
 
 

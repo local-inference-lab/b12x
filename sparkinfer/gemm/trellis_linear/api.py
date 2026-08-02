@@ -57,6 +57,8 @@ def run(
     gemm_output_f16: Optional[torch.Tensor] = None,
     output_f16: Optional[torch.Tensor] = None,
     hadamard_128=None,
+    _moe_block_size: int = 64,
+    _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Execute Trellis GEMM, optionally reusing all capture-time storage."""
     return run_trellis256_dense(
@@ -71,6 +73,8 @@ def run(
         gemm_output_f16=gemm_output_f16,
         output_f16=output_f16,
         hadamard_128=hadamard_128,
+        _moe_block_size=_moe_block_size,
+        _force_tile_config=_force_tile_config,
     )
 
 

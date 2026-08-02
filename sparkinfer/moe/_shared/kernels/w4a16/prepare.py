@@ -176,12 +176,15 @@ class PreparedTrellis256DenseWeight:
 
 
 def _make_workspace(
-    device: torch.device, *, max_blocks_per_sm: int = 4
+    device: torch.device,
+    *,
+    max_blocks_per_sm: int = 4,
+    min_elements: int = 0,
 ) -> torch.Tensor:
     props = torch.cuda.get_device_properties(device)
     sms = int(props.multi_processor_count)
     return torch.zeros(
-        (sms * int(max_blocks_per_sm) + 2,),
+        (max(sms * int(max_blocks_per_sm) + 2, int(min_elements)),),
         dtype=torch.int32,
         device=device,
     )
@@ -2150,7 +2153,11 @@ def prepare_trellis256_dense_weight(
         svh=svh,
         scale=dummy_scale,
         global_scale=torch.ones(1, dtype=torch.float32, device=device),
-        workspace=_make_workspace(device, max_blocks_per_sm=4),
+        workspace=_make_workspace(
+            device,
+            max_blocks_per_sm=4,
+            min_elements=out_features // 16,
+        ),
         in_features=in_features,
         out_features=out_features,
         params_dtype=params_dtype,
