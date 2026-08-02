@@ -218,8 +218,8 @@ def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 6, 8, 10):
-        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
+    if world_size not in (2, 4, 6, 8, 10, 16):
+        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, 10, and 16")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

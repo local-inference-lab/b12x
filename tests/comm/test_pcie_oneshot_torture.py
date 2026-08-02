@@ -155,8 +155,8 @@ def test_pcie_oneshot_eager_graph_and_multistream_torture():
         pytest.skip("CUDA is not available")
     available = torch.cuda.device_count()
     requested = int(os.getenv("SPARKINFER_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
-    if requested not in (2, 4, 6, 8, 10):
-        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
+    if requested not in (2, 4, 6, 8, 10, 16):
+        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, 10, and 16")
     if available < requested:
         pytest.skip(f"need {requested} CUDA devices, found {available}")
     mp.spawn(_worker, args=(requested, _free_port()), nprocs=requested, join=True)
