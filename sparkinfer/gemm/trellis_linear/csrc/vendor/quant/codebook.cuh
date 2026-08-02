@@ -155,3 +155,5 @@ __device__ inline float decode_3inst_f_diff(uint64_t x, float d)
 //    float y = fma(__int2float_rn(c), 0.008415f, -d);
 //    return y;
 //}
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

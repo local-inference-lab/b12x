@@ -7,6 +7,7 @@ import torch
 
 from sparkinfer.gemm import trellis_linear
 from sparkinfer.gemm.trellis_linear import api
+from sparkinfer.gemm.trellis_linear import _small_m
 from sparkinfer.gemm.trellis_linear._small_m import _default_num_sms
 from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
@@ -130,6 +131,18 @@ def test_k6_small_m_default_sms_preserves_glm_decode_overlap(
     expected: int,
 ) -> None:
     assert _default_num_sms(size_k, size_n, available_sms) == expected
+
+
+def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
+    monkeypatch.setattr(
+        _small_m,
+        "_extension",
+        lambda: pytest.fail("extension must not compile for an unsupported GPU"),
+    )
+
+    with pytest.raises(NotImplementedError, match="built for sm_120 only"):
+        _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
 
 
 @pytest.mark.parametrize(
@@ -272,6 +285,7 @@ def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = trellis_linear.run(x, weight, **kwargs)
+    output.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize(device)
 

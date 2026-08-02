@@ -457,3 +457,5 @@ void had_hf_r_128_d_inner
     atomicAdd(output_ptr + 64 + t, sh[64 + t]);
     atomicAdd(output_ptr + 96 + t, sh[96 + t]);
 }
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

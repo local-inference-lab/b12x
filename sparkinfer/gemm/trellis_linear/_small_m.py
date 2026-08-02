@@ -34,6 +34,11 @@ def _default_num_sms(size_k: int, size_n: int, available_sms: int) -> int:
     return available_sms if target is None else min(available_sms, target)
 
 
+@lru_cache(maxsize=None)
+def _available_sms(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
 def _extension_name() -> str:
     digest = hashlib.sha256()
     for path in (_SOURCE, *_VENDORED_FILES):
@@ -77,12 +82,20 @@ def run_k6_mcg(
     num_sms: int = 0,
 ) -> None:
     """Launch the capture-safe K6/MCG kernel on Torch's current stream."""
+    capability = torch.cuda.get_device_capability(x.device)
+    if capability != (12, 0):
+        raise NotImplementedError(
+            "Trellis K6 small-M kernel is built for sm_120 only; "
+            f"device reports sm_{capability[0]}{capability[1]}"
+        )
     if num_sms <= 0:
-        props = torch.cuda.get_device_properties(x.device)
+        device_index = x.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
         num_sms = _default_num_sms(
             int(x.shape[1]),
             int(output.shape[1]),
-            int(props.multi_processor_count),
+            _available_sms(int(device_index)),
         )
     _extension().launch_k6_mcg(
         x,

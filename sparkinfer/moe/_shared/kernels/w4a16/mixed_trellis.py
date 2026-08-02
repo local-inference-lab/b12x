@@ -212,6 +212,85 @@ class W4A16MixedTrellisKernel:
         )
 
     @cute.jit
+    def _dispatch_tier_gemm(
+        self,
+        gemm,
+        a_flat: cute.Tensor,
+        a_alt_flat: cute.Tensor,
+        b_flat: cute.Tensor,
+        c_flat: cute.Tensor,
+        scales_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        topk_weights: cute.Tensor,
+        c_tmp: cute.Tensor,
+        locks: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        route_block_idx: Int32,
+        local_expert: Int32,
+        output_n_tile: Int32,
+        reduce_k_tile: Int32,
+        reduce_tile_count: Int32,
+        reduce_slice_count: Int32,
+        reduce_slice_idx: Int32,
+        lock_slot: Int32,
+        active_size_m: Int32,
+    ):
+        factor = gemm.schedule_route_block_factor
+        first_route_block = route_block_idx * Int32(factor)
+        first_lock_slot = lock_slot * Int32(factor)
+        if cutlass.const_expr(gemm.paired_m8_routes):
+            gemm._run_tile_m8_pair(
+                a_flat,
+                a_alt_flat,
+                b_flat,
+                c_flat,
+                scales_flat,
+                global_scale,
+                packed_route_indices,
+                topk_weights,
+                c_tmp,
+                locks,
+                smem_base,
+                tid,
+                first_route_block,
+                local_expert,
+                output_n_tile,
+                reduce_k_tile,
+                reduce_tile_count,
+                reduce_slice_count,
+                reduce_slice_idx,
+                first_lock_slot,
+                active_size_m,
+            )
+        else:
+            for subtile in cutlass.range_constexpr(factor):
+                gemm._run_tile(
+                    a_flat,
+                    a_alt_flat,
+                    b_flat,
+                    c_flat,
+                    scales_flat,
+                    global_scale,
+                    packed_route_indices,
+                    topk_weights,
+                    c_tmp,
+                    locks,
+                    smem_base,
+                    tid,
+                    first_route_block + Int32(subtile),
+                    local_expert,
+                    output_n_tile,
+                    reduce_k_tile,
+                    reduce_tile_count,
+                    reduce_slice_count,
+                    reduce_slice_idx,
+                    first_lock_slot + Int32(subtile),
+                    active_size_m,
+                )
+
+    @cute.jit
     def _emit_tier_tile(
         self,
         is_fc1: cutlass.Constexpr,
@@ -261,135 +340,59 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier0.fc1
                     else:
                         gemm = self.tier0.fc2
-                    if cutlass.const_expr(gemm.paired_m8_routes):
-                        tile_route_block_idx = (
-                            route_block_idx
-                            * Int32(gemm.schedule_route_block_factor)
-                        )
-                        gemm._run_tile_m8_pair(
-                            a_flat,
-                            a_alt_flat,
-                            t0_b_flat,
-                            c_flat,
-                            t0_scales_flat,
-                            t0_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            smem_base,
-                            tid,
-                            tile_route_block_idx,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot * Int32(gemm.schedule_route_block_factor),
-                            active_size_m,
-                        )
-                    else:
-                        for subtile in cutlass.range_constexpr(
-                            gemm.schedule_route_block_factor
-                        ):
-                            tile_route_block_idx = (
-                                route_block_idx
-                                * Int32(gemm.schedule_route_block_factor)
-                                + Int32(subtile)
-                            )
-                            gemm._run_tile(
-                                a_flat,
-                                a_alt_flat,
-                                t0_b_flat,
-                                c_flat,
-                                t0_scales_flat,
-                                t0_global_scale,
-                                packed_route_indices,
-                                topk_weights,
-                                c_tmp,
-                                locks,
-                                smem_base,
-                                tid,
-                                tile_route_block_idx,
-                                local_expert,
-                                output_n_tile,
-                                reduce_k_tile,
-                                reduce_tile_count,
-                                reduce_slice_count,
-                                reduce_slice_idx,
-                                lock_slot
-                                * Int32(gemm.schedule_route_block_factor)
-                                + Int32(subtile),
-                                active_size_m,
-                            )
+                    self._dispatch_tier_gemm(
+                        gemm,
+                        a_flat,
+                        a_alt_flat,
+                        t0_b_flat,
+                        c_flat,
+                        t0_scales_flat,
+                        t0_global_scale,
+                        packed_route_indices,
+                        topk_weights,
+                        c_tmp,
+                        locks,
+                        smem_base,
+                        tid,
+                        route_block_idx,
+                        local_expert,
+                        output_n_tile,
+                        reduce_k_tile,
+                        reduce_tile_count,
+                        reduce_slice_count,
+                        reduce_slice_idx,
+                        lock_slot,
+                        active_size_m,
+                    )
                 elif tier == Int32(1) and local_expert < Int32(self.tier1.num_experts):
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier1.fc1
                     else:
                         gemm = self.tier1.fc2
-                    if cutlass.const_expr(gemm.paired_m8_routes):
-                        tile_route_block_idx = (
-                            route_block_idx
-                            * Int32(gemm.schedule_route_block_factor)
-                        )
-                        gemm._run_tile_m8_pair(
-                            a_flat,
-                            a_alt_flat,
-                            t1_b_flat,
-                            c_flat,
-                            t1_scales_flat,
-                            t1_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            smem_base,
-                            tid,
-                            tile_route_block_idx,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot * Int32(gemm.schedule_route_block_factor),
-                            active_size_m,
-                        )
-                    else:
-                        for subtile in cutlass.range_constexpr(
-                            gemm.schedule_route_block_factor
-                        ):
-                            tile_route_block_idx = (
-                                route_block_idx
-                                * Int32(gemm.schedule_route_block_factor)
-                                + Int32(subtile)
-                            )
-                            gemm._run_tile(
-                                a_flat,
-                                a_alt_flat,
-                                t1_b_flat,
-                                c_flat,
-                                t1_scales_flat,
-                                t1_global_scale,
-                                packed_route_indices,
-                                topk_weights,
-                                c_tmp,
-                                locks,
-                                smem_base,
-                                tid,
-                                tile_route_block_idx,
-                                local_expert,
-                                output_n_tile,
-                                reduce_k_tile,
-                                reduce_tile_count,
-                                reduce_slice_count,
-                                reduce_slice_idx,
-                                lock_slot
-                                * Int32(gemm.schedule_route_block_factor)
-                                + Int32(subtile),
-                                active_size_m,
-                            )
+                    self._dispatch_tier_gemm(
+                        gemm,
+                        a_flat,
+                        a_alt_flat,
+                        t1_b_flat,
+                        c_flat,
+                        t1_scales_flat,
+                        t1_global_scale,
+                        packed_route_indices,
+                        topk_weights,
+                        c_tmp,
+                        locks,
+                        smem_base,
+                        tid,
+                        route_block_idx,
+                        local_expert,
+                        output_n_tile,
+                        reduce_k_tile,
+                        reduce_tile_count,
+                        reduce_slice_count,
+                        reduce_slice_idx,
+                        lock_slot,
+                        active_size_m,
+                    )
 
     @cute.jit
     def __call__(

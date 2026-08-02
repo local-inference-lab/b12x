@@ -570,6 +570,43 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
 
 
+def test_trellis_scratch_plan_resolves_default_route_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: ((), ()),
+    )
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=512,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    caps = TPMoEScratchCaps(
+        max_tokens=3072,
+        core_token_counts=(3072,),
+        num_topk=8,
+        route_num_experts=0,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+    plan = plan_tp_moe_scratch(caps)
+
+    assert plan._core_workspace_plan.route_block_size_m == 64
+    assert plan.layout.core_token_counts[0] == 3072
+    assert 4096 not in plan.layout.core_token_counts
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
@@ -708,10 +745,7 @@ def test_w4a16_decode_scratch_covers_direct_topk_geometry(
             route_num_experts=0,
         )
     )
-    specs = {
-        spec.name: spec
-        for spec in plan._core_workspace_plan.tensor_specs
-    }
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
     block_size = select_route_block_size_m(tokens, topk, weight_plan.num_experts)
     packed_slots = max_packed_route_slots(
         tokens * topk,

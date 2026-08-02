@@ -53,3 +53,5 @@ int g_get_cc(int device);
 int g_get_num_sms(int device);
 
 void prepare_ctx(int device);
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

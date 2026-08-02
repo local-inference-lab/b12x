@@ -17,11 +17,13 @@
 // half rate. Accumulate each k-slice in fp16 and fold it into the persistent
 // fp32 accumulators before reduction. This changes numerical accumulation and
 // therefore remains an accuracy-gated optional variant.
-#if defined(__CUDA_ARCH__) && \
-    ((__CUDA_ARCH__ == 860) || (__CUDA_ARCH__ == 1200))
-    #define EXL3_GEMM_H_ACC 1
-#else
-    #define EXL3_GEMM_H_ACC 0
+#ifndef EXL3_GEMM_H_ACC
+    #if defined(__CUDA_ARCH__) && \
+        ((__CUDA_ARCH__ == 860) || (__CUDA_ARCH__ == 1200))
+        #define EXL3_GEMM_H_ACC 1
+    #else
+        #define EXL3_GEMM_H_ACC 0
+    #endif
 #endif
 
 template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
@@ -205,11 +207,11 @@ void exl3_gemm_kernel_inner
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
-    register FragA frag_a[FRAG_STAGES][TILEBLOCKS_M];
-    register FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
-    register FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+    FragA frag_a[FRAG_STAGES][TILEBLOCKS_M];
+    FragB frag_b[FRAG_STAGES][FRAGS_N_PER_WARP];
+    FragC frag_c[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #if EXL3_GEMM_H_ACC
-        register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
+        FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
     auto advance2 = [&] ()
@@ -776,3 +778,5 @@ void exl3_gemm_kernel_inner
         }
     }
 }
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

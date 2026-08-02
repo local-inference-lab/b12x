@@ -423,9 +423,7 @@ def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
 
 
 @dsl_user_op
-def ld_global_v2_u32(
-    base_ptr: Int64, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
+def ld_global_v2_u32(base_ptr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
     """Load 64 bits (2 x uint32) from coherent global memory."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
@@ -6254,6 +6252,7 @@ def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=No
             setp.eq.u32 two_words, $6, 1;
             selp.b32 mid, $2, $3, two_words;
             selp.b32 upper, 0, $2, two_words;
+            // PTX shf.r forms (b:a), so z0/mid and mid/upper are low/high.
             shf.r.wrap.b32 $0, $4, mid, $5;
             shf.r.wrap.b32 $1, mid, upper, $5;
         }

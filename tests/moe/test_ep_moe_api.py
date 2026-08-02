@@ -15,6 +15,7 @@ from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
 from sparkinfer.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     route_block_sizes_for_capacity,
+    route_pack_token_capacity,
 )
 from tests._reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
@@ -125,11 +126,14 @@ def test_ep_scratch_reserves_route_pack_power_of_two_capacity(
 
     layout = {spec.name: spec for spec in plan._layout}
     block_sizes = route_block_sizes_for_capacity(3, 2, 10)
+    capacity_rows = route_pack_token_capacity(3, 2) * 2
     expected_slots = max(
-        max_packed_route_slots(4 * 2, block_size, 10) for block_size in block_sizes
+        max_packed_route_slots(capacity_rows, block_size, 10)
+        for block_size in block_sizes
     )
     expected_blocks = max(
-        (max_packed_route_slots(4 * 2, block_size, 10) + block_size - 1) // block_size
+        (max_packed_route_slots(capacity_rows, block_size, 10) + block_size - 1)
+        // block_size
         for block_size in block_sizes
     )
     assert layout["packed_route_indices"].elements == expected_slots

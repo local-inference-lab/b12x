@@ -140,3 +140,5 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 
 fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);
 fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb);
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

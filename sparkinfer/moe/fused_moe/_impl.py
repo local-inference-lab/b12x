@@ -2304,9 +2304,7 @@ def _build_tp_moe_fp4_binding_from_views(
             f"{m * num_topk} routed rows"
         )
     if output_expert_map is not None and not plan.full_rotation:
-        raise ValueError(
-            "output_expert_map requires a full-rotation Trellis plan"
-        )
+        raise ValueError("output_expert_map requires a full-rotation Trellis plan")
     if route_expert_map is not None and plan.implementation != "w4a16":
         raise ValueError("route_expert_map is only supported for W4A16 plans")
     for name, expert_map in (
@@ -2665,9 +2663,7 @@ def _plan_core_workspace(
                         route_E,
                     )
                 )
-                direct_route_slots = (
-                    direct_m * int(num_topk) * direct_block_size
-                )
+                direct_route_slots = direct_m * int(num_topk) * direct_block_size
                 fc1_c_tmp_elements = max(
                     fc1_c_tmp_elements,
                     packed_gemm_scratch_elements(
@@ -5879,9 +5875,7 @@ def _w4a16_preplanned_launches(
         _TC_DECODE_MAX_M,
     )
 
-    sum_uses_expert_map = bool(
-        use_output_expert_map or use_route_expert_map
-    )
+    sum_uses_expert_map = bool(use_output_expert_map or use_route_expert_map)
     if (
         use_route_expert_map
         and not collect_activation_amax
@@ -6461,6 +6455,29 @@ def _plan_full_rotation_w4a16_launches(
     return fused_launches, topk_sum_launches
 
 
+def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
+    """Resolve the one route geometry shared by Trellis sizing and binding."""
+    if caps.w4a16_block_size_m is not None:
+        return int(caps.w4a16_block_size_m)
+    if caps.source_format != "exl3_trellis_mcg":
+        return None
+    from sparkinfer.moe._shared.kernels.w4a16.host import select_route_block_size_m
+
+    token_counts = _arena_core_token_counts(
+        max_tokens=caps.max_tokens,
+        num_topk=caps.num_topk,
+        core_token_counts=caps.core_token_counts,
+        quant_mode=caps.quant_mode,
+        bucket_w4a16_tokens=False,
+    )
+    route_experts = caps.route_num_experts or caps.weight_E
+    return select_route_block_size_m(
+        max(token_counts),
+        caps.num_topk,
+        route_experts,
+    )
+
+
 def _plan_tp_moe_arena_layout_from_caps(
     caps: TPMoEScratchCaps,
     *,
@@ -6485,7 +6502,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         swiglu_beta=caps.swiglu_beta,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=deterministic_output,
-        w4a16_block_size_m=caps.w4a16_block_size_m,
+        w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
     )
 
 
@@ -6513,6 +6530,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=deterministic_output,
     )
+    resolved_block_size_m = _resolve_trellis_route_block_size(caps)
     core_workspace_plan = _plan_core_workspace(
         launch_plan.implementation,
         launch_plan.quant_mode,
@@ -6533,7 +6551,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_weight_layout=caps.w4a16_weight_layout,
         w4a16_scale_format=caps.w4a16_scale_format,
         route_num_experts=caps.route_num_experts,
-        w4a16_block_size_m=caps.w4a16_block_size_m,
+        w4a16_block_size_m=resolved_block_size_m,
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
@@ -6834,7 +6852,7 @@ def _prewarm_w4a16_planned_launches(
                         workspace.route_E,
                     )
                 )
-                for broadcast_suh in ((False, True) if full_rotation else (False,)):
+                for broadcast_suh in (False, True) if full_rotation else (False,):
                     resolved_mapped_direct = compile_w4a16_fused_moe(
                         size_m=direct_m,
                         hidden_size=workspace.k,
@@ -6842,9 +6860,7 @@ def _prewarm_w4a16_planned_launches(
                         num_experts=workspace.weight_E,
                         top_k=workspace.num_topk,
                         activation=workspace.activation,
-                        apply_router_weight_on_input=bool(
-                            apply_router_weight_on_input
-                        ),
+                        apply_router_weight_on_input=bool(apply_router_weight_on_input),
                         zero_fc2_output=False,
                         moe_block_size=direct_block_size_m,
                         max_m_blocks=direct_m * int(workspace.num_topk),
@@ -6869,9 +6885,7 @@ def _prewarm_w4a16_planned_launches(
                         broadcast_suh=broadcast_suh,
                     )
                     if not broadcast_suh:
-                        mapped_direct_launches[direct_m] = (
-                            resolved_mapped_direct
-                        )
+                        mapped_direct_launches[direct_m] = resolved_mapped_direct
                 if full_rotation:
                     for broadcast_svh in (False, True):
                         resolved_topk_sum = compile_w4a16_topk_sum(
@@ -6887,9 +6901,9 @@ def _prewarm_w4a16_planned_launches(
                             broadcast_svh=broadcast_svh,
                         )
                         if not broadcast_svh:
-                            topk_sum_launches[
-                                (direct_m, torch.int32, True)
-                            ] = resolved_topk_sum
+                            topk_sum_launches[(direct_m, torch.int32, True)] = (
+                                resolved_topk_sum
+                            )
 
         if build_tc_decode:
             # The capture/route-pack token counts above are powers of two, but the
@@ -6982,7 +6996,9 @@ def materialize_tp_moe_arena_workspaces(
         num_topk=num_topk,
         core_token_counts=caps.core_token_counts,
         quant_mode=quant_mode,
+        bucket_w4a16_tokens=source_format != "exl3_trellis_mcg",
     )
+    resolved_block_size_m = _resolve_trellis_route_block_size(caps)
     t_counts = time.perf_counter() if _SPARKINFER_TIMING else 0.0
     selected: dict[tuple, tuple[TPMoEPlan, _TPCoreWorkspacePlan, int]] = {}
     for token_count in core_token_counts:
@@ -7018,7 +7034,7 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
             route_num_experts=caps.route_num_experts,
-            w4a16_block_size_m=caps.w4a16_block_size_m,
+            w4a16_block_size_m=resolved_block_size_m,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             apply_router_weight_on_input=apply_router_weight_on_input,

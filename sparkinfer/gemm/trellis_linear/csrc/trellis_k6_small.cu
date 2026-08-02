@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
+#include <mutex>
 #include <torch/extension.h>
 
 #include "vendor/util.h"
@@ -27,8 +28,21 @@ constexpr int kTileK = 32;
 constexpr int kTileN = 128;
 constexpr int kSharedStages = 4;
 constexpr int kFragmentStages = 3;
-constexpr int kThreads = 512;
-constexpr int kDynamicSmem = 90 * 1024;
+constexpr int kThreads = EXL3_GEMM_BASE_THREADS * (kTileK / 16);
+constexpr int kFragmentsNPerWarp =
+    2 * (kTileN / 16) / (EXL3_GEMM_BASE_THREADS / 32);
+constexpr int kASharedElements = kTileM * kTileK;
+constexpr int kBSharedElements =
+    (kTileK / 16) * (kTileN / 16) * 16 * kBits;
+constexpr int kCSharedElements =
+    4 * EXL3_GEMM_BASE_THREADS * kFragmentsNPerWarp > kTileN * kTileM
+        ? 4 * EXL3_GEMM_BASE_THREADS * kFragmentsNPerWarp
+        : kTileN * kTileM;
+constexpr int kDynamicSmem =
+    kSharedStages * (2 * kASharedElements + 2 * kBSharedElements) +
+    4 * kCSharedElements;
+static_assert(kDynamicSmem <= EXL3_SMEM_MAX_BYTES,
+              "Trellis K6 kernel exceeds the vendored shared-memory limit");
 
 void check_cuda(cudaError_t status, const char* operation) {
   TORCH_CHECK(status == cudaSuccess, operation, ": ", cudaGetErrorString(status));
@@ -43,9 +57,17 @@ void launch_k6_mcg(
     const torch::Tensor& svh,
     torch::Tensor& locks,
     int64_t requested_sms) {
-  const c10::cuda::CUDAGuard device_guard(input.device());
-  TORCH_CHECK(input.is_cuda() && trellis.is_cuda() && output.is_cuda(),
+  TORCH_CHECK(input.is_cuda() && trellis.is_cuda() && output.is_cuda() &&
+                  suh.is_cuda() && rotated_input.is_cuda() && svh.is_cuda() &&
+                  locks.is_cuda(),
               "Trellis K6 tensors must be CUDA tensors");
+  const int device = input.get_device();
+  TORCH_CHECK(trellis.get_device() == device && output.get_device() == device &&
+                  suh.get_device() == device &&
+                  rotated_input.get_device() == device &&
+                  svh.get_device() == device && locks.get_device() == device,
+              "Trellis K6 tensors must share one CUDA device");
+  const c10::cuda::CUDAGuard device_guard(input.device());
   TORCH_CHECK(input.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf,
               "Trellis K6 small-M path requires FP16 input and output");
   TORCH_CHECK(trellis.scalar_type() == at::kShort,
@@ -76,12 +98,13 @@ void launch_k6_mcg(
               "Trellis K6 native payload shape does not match M/K/N");
   TORCH_CHECK(suh.numel() == size_k && svh.numel() == size_n,
               "Trellis K6 rotation scale width mismatch");
-  TORCH_CHECK(size_k % kTileK == 0 && size_n % kTileN == 0,
-              "Trellis K6 K/N must be divisible by 32/128");
+  // The fused H128 preamble reads 128 contiguous scale elements per warp.
+  TORCH_CHECK(size_k % 128 == 0 && size_n % kTileN == 0,
+              "Trellis K6 K/N must be divisible by 128/128, got K=", size_k,
+              " N=", size_n);
   TORCH_CHECK(locks.numel() >= size_n / 16,
               "Trellis K6 lock workspace is too small");
 
-  int device = input.get_device();
   int available_sms = 0;
   check_cuda(cudaDeviceGetAttribute(&available_sms, cudaDevAttrMultiProcessorCount,
                                     device),
@@ -92,9 +115,13 @@ void launch_k6_mcg(
 
   auto kernel = exl3_gemm_kernel<kBits, false, kCodebookMcg, kTileM, kTileK,
                                  kTileN, kSharedStages, kFragmentStages>;
-  check_cuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  kDynamicSmem),
-             "cudaFuncSetAttribute");
+  static std::once_flag smem_attribute_once;
+  std::call_once(smem_attribute_once, [&] {
+    check_cuda(cudaFuncSetAttribute(kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kDynamicSmem),
+               "cudaFuncSetAttribute");
+  });
 
   const half* a_ptr = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   const uint16_t* b_ptr =
@@ -109,6 +136,8 @@ void launch_k6_mcg(
                   &size_n,     &lock_ptr,   &suh_ptr, &rotated_ptr, &svh_ptr};
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
+  // Keep this launch one-dimensional: vendored H128 scale indexing assumes
+  // gridDim.y == 1 because the caller already supplies its per-K scale offset.
   check_cuda(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(kernel), num_sms,
                                          kThreads, args, kDynamicSmem, stream),
              "cudaLaunchCooperativeKernel");

@@ -52,7 +52,7 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
     assert len(calls) == 1
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
-    assert len(calls[0].args) == len(driver_parameters) - 1
+    assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
     assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
         "descriptor_map",
         "Int32(self.total_experts)",
@@ -83,7 +83,7 @@ def test_mixed_runtime_tracks_topk_sum_contract() -> None:
     assert len(calls) == 1
 
     sum_parameters = inspect.signature(W4A16TopKSumKernel.__call__).parameters
-    assert len(calls[0].args) == len(sum_parameters) - 1
+    assert len(calls[0].args) + len(calls[0].keywords) == len(sum_parameters) - 1
     assert [ast.unparse(arg) for arg in calls[0].args[-4:]] == [
         "Int32(launch.topk_sum.num_experts)",
         "Int32(launch.topk_sum.route_num_experts)",
@@ -354,9 +354,11 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     )
 
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
-    topk_ids = torch.tensor(
-        [0, 6, 1, 7, 2, 3, 4, 5], dtype=torch.int32, device=device
-    ).expand(m, -1).contiguous()
+    topk_ids = (
+        torch.tensor([0, 6, 1, 7, 2, 3, 4, 5], dtype=torch.int32, device=device)
+        .expand(m, -1)
+        .contiguous()
+    )
     topk_weights = torch.softmax(
         torch.randn((m, topk), dtype=torch.float32, device=device), dim=-1
     )
@@ -414,9 +416,7 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
             candidate_phases, reference_phases, strict=True
         )
     )
-    print(
-        "mixed_trellis_large_block_fc2_subtile_parity "
-        f"phases={phase_equal} final={torch.equal(candidate, reference)} "
+    geometry = (
         f"packed_block={candidate_launch.moe_block_size} "
         f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
         f"fc2_schedule_factor={candidate_launch.fc2_schedule_route_block_factor} "
@@ -431,8 +431,8 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert candidate_launch.fc2_moe_block_size == 8
     assert candidate_launch.fc2_schedule_route_block_factor == 2
     assert candidate_launch.fc2_paired_m8_routes is True
-    assert phase_equal == (True, True, True)
-    assert torch.equal(candidate, reference)
+    assert phase_equal == (True, True, True), geometry
+    assert torch.equal(candidate, reference), geometry
     assert candidate_launch.local_memory_bytes == 0
     assert candidate_launch.shared_memory_bytes <= int(
         props.shared_memory_per_block_optin

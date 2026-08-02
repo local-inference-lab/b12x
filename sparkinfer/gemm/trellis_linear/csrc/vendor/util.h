@@ -136,3 +136,5 @@ constexpr void static_for_pack(F&& f)
 {
     (f(std::integral_constant<int, Values>{}), ...);
 }
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

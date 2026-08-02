@@ -254,6 +254,7 @@ __device__ __forceinline__ void dq8_aligned_4bits_bfe64(const uint32_t* ptr, int
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0, FragB& frag1)
 {
+    static_assert(bits >= 1 && bits <= 8, "unsupported EXL3 bitrate");
     if constexpr (bits == 1)
     {
         dq8_aligned_1bit<cb>(ptr, idx, frag0, frag1);
@@ -291,3 +292,5 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
         dq4<bits, cb>(ptr, idx + 4, frag1);
     }
 }
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3

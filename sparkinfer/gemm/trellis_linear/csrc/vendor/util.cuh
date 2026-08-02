@@ -84,43 +84,6 @@ union half_uint16
     __device__ half_uint16() : as_uint16(0) {}
 };
 
-#define cuda_check(ans) { gpu_assert((ans), __FILE__, __LINE__); }
-inline void gpu_assert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"GPU assert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-
-inline const char* cublasGetErrorString(cublasStatus_t status) {
-    switch (status) {
-        case CUBLAS_STATUS_SUCCESS:           return "CUBLAS_STATUS_SUCCESS";
-        case CUBLAS_STATUS_NOT_INITIALIZED:   return "CUBLAS_STATUS_NOT_INITIALIZED";
-        case CUBLAS_STATUS_ALLOC_FAILED:      return "CUBLAS_STATUS_ALLOC_FAILED";
-        case CUBLAS_STATUS_INVALID_VALUE:     return "CUBLAS_STATUS_INVALID_VALUE";
-        case CUBLAS_STATUS_ARCH_MISMATCH:     return "CUBLAS_STATUS_ARCH_MISMATCH";
-        case CUBLAS_STATUS_MAPPING_ERROR:     return "CUBLAS_STATUS_MAPPING_ERROR";
-        case CUBLAS_STATUS_EXECUTION_FAILED:  return "CUBLAS_STATUS_EXECUTION_FAILED";
-        case CUBLAS_STATUS_INTERNAL_ERROR:    return "CUBLAS_STATUS_INTERNAL_ERROR";
-        case CUBLAS_STATUS_NOT_SUPPORTED:     return "CUBLAS_STATUS_NOT_SUPPORTED";
-        case CUBLAS_STATUS_LICENSE_ERROR:     return "CUBLAS_STATUS_LICENSE_ERROR";
-        default:                              return "Unknown cuBLAS status";
-    }
-}
-
-#define cublas_check(ans) { cublas_assert((ans), __FILE__, __LINE__); }
-inline void cublas_assert(cublasStatus_t code, const char *file, int line, bool abort=true)
-{
-    if (code != CUBLAS_STATUS_SUCCESS)
-    {
-        fprintf(stderr, "cuBLAS assert: %s %s %d\n",
-                cublasGetErrorString(code), file, line);
-        if (abort) exit(static_cast<int>(code));
-    }
-}
-
 __device__ inline float fxor(float v, uint32_t mask)
 {
     uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
@@ -137,3 +100,5 @@ __device__ inline half2 h2xor(half2 v, uint32_t mask)
 
 #define NEG_INF_F16 __ushort_as_half(0xFC00)
 #define POS_INF_F16 __ushort_as_half(0x7C00)
+// Vendored from https://github.com/brandonmmusic-max/exllamav3 at 704aefd743b390af4bd0fb429d1906f9b964c7d8.
+// License: sparkinfer/gemm/trellis_linear/csrc/vendor/LICENSE.exllamav3
