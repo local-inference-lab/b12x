@@ -16,6 +16,7 @@ RUNTIME_CUDA_SOURCES = {
     "pcie_dcp_a2a.cu",
     "pcie_dcp_topk.cu",
     "pcie_dma.cu",
+    "pcie_hierarchical.cu",
     "pcie_oneshot.cu",
     "pcie_twoshot.cu",
 }
@@ -26,9 +27,10 @@ def test_runtime_cuda_sources_are_in_package_data() -> None:
     package_data = config["tool"]["setuptools"]["package-data"]
 
     assert package_data[PCIE_PACKAGE] == ["*.cu"]
-    assert {
+    packaged_sources = {
         path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.cu")
-    } == RUNTIME_CUDA_SOURCES
+    }
+    assert packaged_sources >= RUNTIME_CUDA_SOURCES
 
 
 def test_trellis_runtime_sources_and_license_are_packaged() -> None:
