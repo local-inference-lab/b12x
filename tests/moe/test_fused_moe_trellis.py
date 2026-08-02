@@ -31,6 +31,7 @@ def _weight_plan(
     activation: str = "silu",
     trellis_bits: int = 3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
+    tp_local_intermediate_hadamard_tail: int = 0,
 ) -> fused_moe.WeightsPlan:
     return fused_moe.plan_weights(
         quant_modes="w4a16",
@@ -43,6 +44,7 @@ def _weight_plan(
         w13_layout="w13",
         trellis_bits=trellis_bits,
         trellis_tile_config=tile_config,
+        tp_local_intermediate_hadamard_tail=tp_local_intermediate_hadamard_tail,
     )
 
 
@@ -136,6 +138,7 @@ def _prepare_weights(
     codebook: str = "mcg",
     mcg: torch.Tensor | int | None = 0xCBAC1FED,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
+    tp_local_intermediate_hadamard_tail: int = 0,
 ) -> fused_moe.ExpertWeights:
     bits = int(w13.shape[-1]) // 16
     plan = _weight_plan(
@@ -146,6 +149,7 @@ def _prepare_weights(
         activation=activation,
         trellis_bits=bits,
         tile_config=tile_config,
+        tp_local_intermediate_hadamard_tail=tp_local_intermediate_hadamard_tail,
     )
     if codebook != "mcg":
         # The unified planner records the only supported source codebook.
@@ -572,6 +576,83 @@ def test_nf3_and_trellis_share_the_w4a16_prepared_contract() -> None:
     assert isinstance(trellis, PreparedW4A16MoeWeights)
     assert nf3.weight_layout == "nf3_2p1"
     assert trellis.weight_layout == "trellis3_t256"
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_kimi_k3_tp16_planned_prefill_preserves_trellis_tile_contract() -> None:
+    """The lazy run must not replace K3's N64 FC1 preparation with N256.
+
+    K3 TP16 has I=192 per rank, so each projection is exactly three N64
+    tiles.  The generic M=256 heuristic selects N256, which cannot address a
+    projection-major Trellis artifact and used to fail in vLLM's profile
+    forward after the entire checkpoint had loaded.
+    """
+    torch.manual_seed(20260802)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, hidden, intermediate = 2, 3584, 192
+    topk, capacity = 16, 256
+    tile_config = (128, 64, 64, 128)
+
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 48),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 48),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).half()
+
+    weights = _prepare_weights(
+        w13,
+        w2,
+        gate_suh=scales((1, hidden)),
+        up_suh=scales((1, hidden)),
+        intermediate_rotations=scales((experts, 3 * intermediate)),
+        down_svh=scales((1, hidden)),
+        activation="situ",
+        tile_config=tile_config,
+        tp_local_intermediate_hadamard_tail=64,
+    )
+    plan = _plan(
+        weights,
+        max_tokens=capacity,
+        num_topk=topk,
+        route_num_experts=experts,
+        block_size_m=64,
+        device=device,
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    x = (torch.randn((capacity, hidden), device=device) * 1.0e-3).bfloat16()
+    ids = torch.arange(topk, device=device, dtype=torch.int32).remainder(experts)
+    ids = ids.expand(capacity, -1).contiguous()
+    router_weights = torch.full(
+        (capacity, topk), 1.0 / topk, dtype=torch.float32, device=device
+    )
+
+    output = fused_moe.run(
+        binding=fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=weights,
+            topk_weights=router_weights,
+            topk_ids=ids,
+        )
+    )
+    torch.cuda.synchronize(device)
+    assert output.shape == (capacity, hidden)
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

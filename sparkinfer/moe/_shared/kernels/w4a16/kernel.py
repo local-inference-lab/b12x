@@ -10383,6 +10383,15 @@ def run_w4a16_moe(
             intermediate_rotation=intermediate_rotation_scales is not None,
             full_rotation=full_rotation,
             rotation_input_dtype=rotation_input_dtype,
+            # Native Trellis preparation is tile-layout specific.  In
+            # particular, Kimi-K3 TP16's projection-major I=192 artifact uses
+            # N64 FC1 tiles; allowing the live-M heuristic to pick N256 makes
+            # each 192-wide gate/up projection non-integral.  Preserve the
+            # preparation contract on a lazy/cache lookup just as the explicit
+            # planning path does.
+            force_tile_config=(
+                getattr(prepared, "tile_config", None) if full_rotation else None
+            ),
             _require_cached=_w4a16_stream_is_capturing(
                 stream,
                 current_stream=current_stream,

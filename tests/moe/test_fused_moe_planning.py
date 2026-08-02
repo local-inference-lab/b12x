@@ -130,6 +130,7 @@ def test_required_nbytes_matches_scratch_plan(
     plan = fused_moe.plan(caps)
 
     assert fused_moe.required_nbytes(caps) == plan.scratch_specs()[0].shape[0]
+    assert plan._core_workspace_plan.tp_local_intermediate_hadamard_tail == 0
 
 
 def test_small_packed_plan_covers_direct_topk_scratch(

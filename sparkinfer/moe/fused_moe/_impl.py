@@ -934,6 +934,35 @@ class TPMoEScratchPlan:
         )
         if fast_math is None and self.caps.quant_mode == "w4a16":
             fast_math = self.caps.w4a16_fast_math
+        fused_launch = None
+        topk_sum_launch = None
+        if self._core_workspace_plan.full_rotation:
+            live_tokens = int(a.shape[0])
+            candidates = tuple(
+                (int(capacity), launch)
+                for capacity, launch in self._prewarmed_fused_launches
+                if int(capacity) >= live_tokens
+            )
+            if not candidates:
+                raise RuntimeError(
+                    "full-rotation Trellis plan has no prewarmed fused launch "
+                    f"covering m={live_tokens}"
+                )
+            _capacity, fused_launch = min(candidates, key=lambda item: item[0])
+            mapped = output_expert_map is not None
+            sum_candidates = tuple(
+                launch
+                for ids_dtype, use_expert_map, launch in (
+                    self._prewarmed_topk_sum_launches
+                )
+                if ids_dtype == topk_ids.dtype and bool(use_expert_map) == mapped
+            )
+            if len(sum_candidates) != 1:
+                raise RuntimeError(
+                    "full-rotation Trellis plan has no unique prewarmed top-k "
+                    f"sum launch for ids_dtype={topk_ids.dtype}, mapped={mapped}"
+                )
+            topk_sum_launch = sum_candidates[0]
         return _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
             tensors=tensors,
@@ -954,8 +983,8 @@ class TPMoEScratchPlan:
             layer_idx=layer_idx,
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
-            fused_launch=None,
-            topk_sum_launch=None,
+            fused_launch=fused_launch,
+            topk_sum_launch=topk_sum_launch,
         )
 
 
@@ -2559,6 +2588,10 @@ def _plan_core_workspace(
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
         route_E = requested_route_E if full_rotation else int(weight_E)
+        # This metadata is meaningful only for TP-local full-rotation Trellis.
+        # Keep ordinary MXFP4/NVFP4 W4A16 plans explicitly at the neutral value
+        # instead of leaving the returned workspace field unbound.
+        artifact_tail = 0
         if full_rotation:
             if source_format != "exl3_trellis_mcg":
                 raise ValueError(
@@ -6511,10 +6544,10 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
                 device=torch.device(caps.device),
             ),
         ),
-        # Keep strong references to the launches primed in the module caches,
-        # but leave the runtime binding unresolved.  ``run_w4a16_moe`` uses a
-        # None launch as a dispatch signal and then gets these exact objects
-        # from its compile cache without doing first-use JIT work.
+        # Keep strong references to every launch primed in the module caches.
+        # ``TPMoEScratchPlan.bind`` selects the smallest capacity covering the
+        # live row count and passes that exact object to the runtime, avoiding
+        # both a first-use JIT and a live-tail specialization.
         _prewarmed_fused_launches=fused_launches,
         _prewarmed_topk_sum_launches=topk_sum_launches,
     )

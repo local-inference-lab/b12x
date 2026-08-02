@@ -614,10 +614,10 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     }
 
 
-def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
+def test_trellis_scratch_plan_dispatches_prewarmed_capacity_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fused_launches = tuple((tokens, object()) for tokens in range(1, 5))
+    fused_launches = ((256, object()),)
     sums = tuple(
         (ids_dtype, mapped, object())
         for ids_dtype in (torch.int32, torch.int64)
@@ -642,8 +642,8 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
     )
     plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
-            max_tokens=4,
-            core_token_counts=(4,),
+            max_tokens=256,
+            core_token_counts=(256,),
             num_topk=2,
             route_num_experts=0,
             device="cpu",
@@ -673,8 +673,13 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
 
     assert plan._prewarmed_fused_launches == fused_launches
     assert plan._prewarmed_topk_sum_launches == sums
-    assert captured["fused_launch"] is None
-    assert captured["topk_sum_launch"] is None
+    assert captured["fused_launch"] is fused_launches[0][1]
+    expected_sum = next(
+        launch
+        for ids_dtype, mapped, launch in sums
+        if ids_dtype == torch.int32 and mapped
+    )
+    assert captured["topk_sum_launch"] is expected_sum
 
 
 def test_w4a16_topk6_bucket_binds_with_planned_scratch(
