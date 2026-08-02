@@ -125,6 +125,24 @@ def test_staging_layout_has_aligned_disjoint_slots():
     assert wider_query_layout.lse_offset > layout.lse_offset
 
 
+def test_kimi_k3_dcp8_staging_layout_covers_exact_mla_geometry():
+    # K3 has 96 query heads.  TP16 leaves six local heads; DCP8 gathers the
+    # eight ranks in each context group into the 48-head attention problem.
+    layout = _staging_layout(
+        signal_bytes=4096,
+        world_size=8,
+        max_batch_size=64,
+        total_heads=48,
+        head_dim=512,
+        query_head_dim=576,
+    )
+
+    assert layout.output_capacity_elems >= 64 * 48 * 576
+    assert layout.lse_capacity >= 64 * 48
+    assert layout.staging0_offset % 256 == 0
+    assert layout.staging1_offset % 256 == 0
+
+
 def test_reference_selects_destination_heads_and_combines_lse_weights():
     outputs = torch.tensor(
         [
@@ -187,9 +205,7 @@ def test_runtime_validates_and_dispatches_to_extension():
 def test_runtime_accepts_head_major_input_and_output():
     ext = _FakeExt()
     runtime = _make_runtime(ext)
-    input_storage = torch.arange(
-        32 * 4 * 64, dtype=torch.bfloat16
-    ).reshape(32, 4, 64)
+    input_storage = torch.arange(32 * 4 * 64, dtype=torch.bfloat16).reshape(32, 4, 64)
     partial_output = input_storage.transpose(0, 1)[:2]
     partial_lse = torch.zeros(2, 32, dtype=torch.float32)
     output_storage = torch.empty(16, 2, 64, dtype=torch.bfloat16)

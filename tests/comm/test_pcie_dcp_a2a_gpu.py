@@ -20,10 +20,10 @@ pytestmark = pytest.mark.skipif(
     reason="set SPARKINFER_RUN_PCIE_DCP_A2A_TEST=1 to run PCIe DCP A2A GPU tests",
 )
 
-TOTAL_HEADS = 16
+TOTAL_HEADS = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_TOTAL_HEADS", "16"))
 HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
-MAX_BATCH = 64
+MAX_BATCH = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_MAX_BATCH", "64"))
 TEST_BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
 
 
@@ -340,5 +340,12 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
+    if TOTAL_HEADS <= 0 or TOTAL_HEADS % world_size:
+        pytest.fail(
+            f"total heads {TOTAL_HEADS} must be positive and divisible by "
+            f"world size {world_size}"
+        )
+    if max(TEST_BATCHES) > MAX_BATCH:
+        pytest.fail(f"max batch {MAX_BATCH} must cover test batch {max(TEST_BATCHES)}")
     _load_extension()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
