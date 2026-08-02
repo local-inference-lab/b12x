@@ -201,6 +201,9 @@ _W4A16_REGS_SM121 = {
     (256, 2, 16, 4, False): 212,
     (128, 2, 4, 8, False): 215,
     (128, 2, 8, 4, False): 214,
+    # Measured from the spill-free mixed-Trellis block-32 prefill kernel.
+    # FC2 keeps the paired-M8 schedule qualified by mixed_trellis.py.
+    (256, 2, 8, 8, False): 175,
     (256, 3, 16, 4, False): 249,
     (128, 3, 4, 8, False): 249,
     (128, 3, 8, 4, False): 250,

@@ -654,6 +654,7 @@ def compile_mixed_trellis(
             "large-M cross-tier partial reductions"
         )
     total_experts = int(tier0_num_experts) + int(tier1_num_experts)
+    paired_m8_fc2 = int(moe_block_size) in (32, 64)
 
     def make_kernel(num_experts: int, bits: int) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
@@ -671,8 +672,8 @@ def compile_mixed_trellis(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
-            fc2_moe_block_size=(8 if int(moe_block_size) == 64 else moe_block_size),
-            fc2_schedule_route_block_factor=(2 if int(moe_block_size) == 64 else 1),
+            fc2_moe_block_size=(8 if paired_m8_fc2 else moe_block_size),
+            fc2_schedule_route_block_factor=(2 if paired_m8_fc2 else 1),
             element_dtype="fp16",
             weight_layout="trellis3_t256",
             scale_format="e4m3_k32",

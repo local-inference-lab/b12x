@@ -262,8 +262,11 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
-    """Block-64 packing plus FC2 subtiles preserves stock one-grid arithmetic."""
+@pytest.mark.parametrize("candidate_block_size", [32, 64])
+def test_one_grid_large_blocks_avoid_serial_prefill_drift(
+    candidate_block_size: int,
+) -> None:
+    """Large route blocks with paired-M8 FC2 preserve one-grid arithmetic."""
 
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -339,7 +342,7 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
         return output, launch, phase_outputs
 
     reference, reference_launch, reference_phases = one_grid(8)
-    candidate, candidate_launch, candidate_phases = one_grid(64)
+    candidate, candidate_launch, candidate_phases = one_grid(candidate_block_size)
     torch.cuda.synchronize(device)
 
     phase_equal = tuple(
@@ -349,7 +352,7 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
         )
     )
     print(
-        "mixed_trellis_block64_fc2_subtile_parity "
+        "mixed_trellis_large_block_fc2_subtile_parity "
         f"phases={phase_equal} final={torch.equal(candidate, reference)} "
         f"packed_block={candidate_launch.moe_block_size} "
         f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
@@ -361,7 +364,7 @@ def test_one_grid_block64_avoids_serial_prefill_drift() -> None:
     assert reference_launch.moe_block_size == 8
     assert reference_launch.fc2_moe_block_size == 8
     assert reference_launch.fc2_schedule_route_block_factor == 1
-    assert candidate_launch.moe_block_size == 64
+    assert candidate_launch.moe_block_size == candidate_block_size
     assert candidate_launch.fc2_moe_block_size == 8
     assert candidate_launch.fc2_schedule_route_block_factor == 2
     assert candidate_launch.fc2_paired_m8_routes is True
