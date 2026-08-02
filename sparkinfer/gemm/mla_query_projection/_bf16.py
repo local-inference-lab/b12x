@@ -11,15 +11,24 @@ import triton.language as tl
 
 from .._shared.mxfp8_bmm import _overlaps, _torch_stream
 
-_NOPE_DIM = 192
+_K3_NOPE_DIM = 128
+_DSV4_NOPE_DIM = 192
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _QUERY_DIM = _LATENT_DIM + _ROPE_DIM
 _MAX_M = 32
-_QUALIFIED_HEADS = frozenset((8, 11, 16))
+_QUALIFIED_GEOMETRIES = frozenset(
+    (
+        (6, _K3_NOPE_DIM),
+        (8, _K3_NOPE_DIM),
+        (8, _DSV4_NOPE_DIM),
+        (11, _DSV4_NOPE_DIM),
+        (16, _DSV4_NOPE_DIM),
+    )
+)
 _BLOCK_N = 32
 _BLOCK_K = 64
-_COMPILED_SIGNATURES: set[tuple[int, int, bool]] = set()
+_COMPILED_SIGNATURES: set[tuple[int, int, int, bool]] = set()
 
 
 @triton.jit
@@ -111,20 +120,20 @@ def _validate(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
-) -> tuple[int, int, bool]:
+) -> tuple[int, int, int, bool]:
     if q_nope.ndim != 3:
-        raise ValueError(f"q_nope must have shape [H,M,192], got {q_nope.shape}")
+        raise ValueError(f"q_nope must have shape [H,M,K], got {q_nope.shape}")
     heads, m, nope_dim = map(int, q_nope.shape)
-    if heads not in _QUALIFIED_HEADS or not 1 <= m <= _MAX_M or nope_dim != _NOPE_DIM:
+    if (heads, nope_dim) not in _QUALIFIED_GEOMETRIES or not 1 <= m <= _MAX_M:
         raise NotImplementedError(
             "the BF16 fused MLA query specialization requires "
-            f"H in {sorted(_QUALIFIED_HEADS)}, 1<=M<=32, K=192; "
+            f"(H,K) in {sorted(_QUALIFIED_GEOMETRIES)}, 1<=M<=32; "
             f"got H={heads}, M={m}, K={nope_dim}"
         )
-    if tuple(weight.shape) != (heads, _NOPE_DIM, _LATENT_DIM):
+    if tuple(weight.shape) != (heads, nope_dim, _LATENT_DIM):
         raise ValueError(
             "weight must have shape "
-            f"{(heads, _NOPE_DIM, _LATENT_DIM)}, got {tuple(weight.shape)}"
+            f"{(heads, nope_dim, _LATENT_DIM)}, got {tuple(weight.shape)}"
         )
     if tuple(q_pe.shape) != (m, heads, _ROPE_DIM):
         raise ValueError(
@@ -178,7 +187,7 @@ def _validate(
     for name, source in sources:
         if _overlaps(out, source):
             raise ValueError(f"out must not overlap {name}")
-    return heads, m, output_fp8
+    return heads, m, nope_dim, output_fp8
 
 
 def _launch(
@@ -188,14 +197,14 @@ def _launch(
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    heads, m, output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
+    heads, m, nope_dim, output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
     block_m = 16 if m <= 16 else 32
     device_index = int(
         q_nope.device.index
         if q_nope.device.index is not None
         else torch.cuda.current_device()
     )
-    signature = (device_index, block_m, output_fp8)
+    signature = (device_index, nope_dim, block_m, output_fp8)
     if (
         torch.cuda.is_current_stream_capturing()
         and signature not in _COMPILED_SIGNATURES
@@ -205,8 +214,8 @@ def _launch(
             f"M={m}, output_fp8={output_fp8}; "
             "call mla_query_projection.prewarm first"
         )
-    # This geometry wins across the complete qualified envelope (M=1..32 and
-    # H=8/11/16). Keeping one shape also bounds prewarm to two M regimes.
+    # This geometry wins across the complete qualified envelope. Keeping one
+    # shape also bounds prewarm to two M regimes per NOPE dimension.
     grid = (triton.cdiv(_LATENT_DIM, _BLOCK_N), heads)
     _mla_query_projection_bf16_kernel[grid](
         q_nope,
@@ -224,7 +233,7 @@ def _launch(
         out.stride(0),
         out.stride(1),
         OUTPUT_FP8=output_fp8,
-        NOPE_DIM=_NOPE_DIM,
+        NOPE_DIM=nope_dim,
         LATENT_DIM=_LATENT_DIM,
         ROPE_DIM=_ROPE_DIM,
         BLOCK_M=block_m,
@@ -300,15 +309,17 @@ def prewarm(
             f"output_dtype must be bfloat16 or float8_e4m3fn, got {output_dtype}"
         )
     if weight.ndim != 3:
-        raise ValueError(f"weight must have shape [H,192,512], got {weight.shape}")
+        raise ValueError(f"weight must have shape [H,K,512], got {weight.shape}")
     heads = int(weight.shape[0])
+    nope_dim = int(weight.shape[1])
+    latent_dim = int(weight.shape[2])
     values = tuple(dict.fromkeys(int(value) for value in m_values if int(value) > 0))
     for m in values:
         if not can_implement(
             num_heads=heads,
             max_m=m,
-            nope_dim=int(weight.shape[1]),
-            latent_dim=int(weight.shape[2]),
+            nope_dim=nope_dim,
+            latent_dim=latent_dim,
             output_dtype=output_dtype,
             device=weight.device,
         ):
@@ -331,7 +342,7 @@ def prewarm(
                 continue
             warmed_regimes.add(block_m)
             q_nope = torch.zeros(
-                (heads, m, _NOPE_DIM), dtype=torch.bfloat16, device=weight.device
+                (heads, m, nope_dim), dtype=torch.bfloat16, device=weight.device
             )
             q_pe = torch.zeros(
                 (m, heads, _ROPE_DIM), dtype=torch.bfloat16, device=weight.device
@@ -363,9 +374,8 @@ def can_implement(
     """Return whether the qualified BF16 fused-query kernel covers a plan."""
     del device
     return bool(
-        int(num_heads) in _QUALIFIED_HEADS
+        (int(num_heads), int(nope_dim)) in _QUALIFIED_GEOMETRIES
         and 1 <= int(max_m) <= _MAX_M
-        and int(nope_dim) == _NOPE_DIM
         and int(latent_dim) == _LATENT_DIM
         and output_dtype in (torch.bfloat16, torch.float8_e4m3fn)
     )

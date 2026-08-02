@@ -29,7 +29,6 @@ from sparkinfer.gemm import mla_query_projection
 
 
 PACK_ROWS = 448
-NOPE_DIM = 192
 LATENT_DIM = 512
 ROPE_DIM = 64
 BMM_SPEC = {
@@ -47,7 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--weight-format", choices=("mxfp8", "bf16"), default="mxfp8")
-    parser.add_argument("--heads", type=int, choices=(8, 11, 16), default=8)
+    parser.add_argument("--heads", type=int, choices=(6, 8, 11, 16), default=8)
+    parser.add_argument("--nope-dim", type=int, choices=(128, 192), default=192)
     parser.add_argument("--m", type=int, choices=range(1, 33), default=1)
     parser.add_argument("--output-dtype", choices=("bf16", "fp8"), default="fp8")
     parser.add_argument("--warmup", type=int, default=100)
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_weight(
-    *, heads: int, device: torch.device, generator: torch.Generator
+    *, heads: int, nope_dim: int, device: torch.device, generator: torch.Generator
 ) -> tuple[torch.Tensor, torch.Tensor]:
     values = (
         torch.randn(
@@ -78,8 +78,8 @@ def make_weight(
         dtype=torch.uint8,
     )
     return (
-        values.view(heads, PACK_ROWS, LATENT_DIM)[:, :NOPE_DIM, :],
-        scales.view(heads, PACK_ROWS, LATENT_DIM // 32)[:, :NOPE_DIM, :],
+        values.view(heads, PACK_ROWS, LATENT_DIM)[:, :nope_dim, :],
+        scales.view(heads, PACK_ROWS, LATENT_DIM // 32)[:, :nope_dim, :],
     )
 
 
@@ -180,12 +180,15 @@ def main() -> None:
     output_dtype = (
         torch.bfloat16 if args.output_dtype == "bf16" else torch.float8_e4m3fn
     )
-    if args.weight_format == "mxfp8" and args.heads not in (8, 16):
-        raise ValueError("MXFP8 query projection supports 8 or 16 heads")
+    if args.weight_format == "mxfp8" and (
+        args.heads not in (8, 16) or args.nope_dim != 192
+    ):
+        raise ValueError("MXFP8 query projection supports H=8/16 and K=192")
     generator = torch.Generator(device=device).manual_seed(args.seed)
     if args.weight_format == "mxfp8":
         weight: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = make_weight(
             heads=args.heads,
+            nope_dim=args.nope_dim,
             device=device,
             generator=generator,
         )
@@ -193,7 +196,7 @@ def main() -> None:
         weight = (
             torch.randn(
                 args.heads,
-                NOPE_DIM,
+                args.nope_dim,
                 LATENT_DIM,
                 device=device,
                 generator=generator,
@@ -204,7 +207,7 @@ def main() -> None:
     q_nope = torch.randn(
         args.heads,
         args.m,
-        NOPE_DIM,
+        args.nope_dim,
         device=device,
         generator=generator,
         dtype=torch.bfloat16,
@@ -341,7 +344,7 @@ def main() -> None:
         "shape": {
             "heads": args.heads,
             "m": args.m,
-            "nope_dim": NOPE_DIM,
+            "nope_dim": args.nope_dim,
             "latent_dim": LATENT_DIM,
             "rope_dim": ROPE_DIM,
             "weight_format": args.weight_format,

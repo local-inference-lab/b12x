@@ -51,12 +51,21 @@ def _reference_fp8(query: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
 
 
 def _bf16_inputs(
-    *, num_heads: int, m: int, seed: int = 47
+    *, num_heads: int, m: int, nope_dim: int = 192, seed: int = 47
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
-    q_nope = torch.randn(num_heads, m, 192, device="cuda", dtype=torch.bfloat16) * 0.5
+    q_nope = (
+        torch.randn(num_heads, m, nope_dim, device="cuda", dtype=torch.bfloat16) * 0.5
+    )
     weight = (
-        torch.randn(num_heads, 192, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+        torch.randn(
+            num_heads,
+            nope_dim,
+            512,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.05
     )
     q_full = torch.randn(m, num_heads, 576, device="cuda", dtype=torch.bfloat16)
     q_pe = q_full[..., 512:]
@@ -186,14 +195,19 @@ def test_fused_query_requires_scale_only_for_fp8() -> None:
         mla_query_projection.run(q_nope, weight, q_pe, out_fp8)
 
 
-@pytest.mark.parametrize("num_heads", [8, 11, 16])
+@pytest.mark.parametrize(
+    ("num_heads", "nope_dim"),
+    [(6, 128), (8, 128), (8, 192), (11, 192), (16, 192)],
+)
 @pytest.mark.parametrize("m", [1, 6, 17, 32])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_bf16_weight_matches_staged_projection(
-    num_heads: int, m: int, output_dtype: torch.dtype
+    num_heads: int, nope_dim: int, m: int, output_dtype: torch.dtype
 ) -> None:
     require_sparkinfer()
-    q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=num_heads, m=m)
+    q_nope, weight, q_pe, q_scale = _bf16_inputs(
+        num_heads=num_heads, m=m, nope_dim=nope_dim
+    )
     reference_bf16 = _reference_bf16_weight(q_nope, weight, q_pe)
 
     # Exercise the pitched caller-owned layout used by DCP workspaces.
@@ -226,9 +240,9 @@ def test_bf16_weight_cuda_graph_replays_fresh_inputs(
     output_dtype: torch.dtype,
 ) -> None:
     require_sparkinfer()
-    q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=11, m=4)
+    q_nope, weight, q_pe, q_scale = _bf16_inputs(num_heads=6, m=4, nope_dim=128)
     assert mla_query_projection.prewarm(weight, [4], output_dtype=output_dtype) == 1
-    out = torch.empty(4, 11, 576, device="cuda", dtype=output_dtype)
+    out = torch.empty(4, 6, 576, device="cuda", dtype=output_dtype)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -258,7 +272,7 @@ def test_bf16_weight_cuda_graph_replays_fresh_inputs(
         assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_bf16_weight_supports_virtual_tp_heads() -> None:
+def test_bf16_weight_supports_qualified_model_geometries() -> None:
     device = require_sparkinfer()
     kwargs = dict(
         num_heads=11,
@@ -273,7 +287,19 @@ def test_bf16_weight_supports_virtual_tp_heads() -> None:
     assert mla_query_projection.can_implement(
         **{**kwargs, "output_dtype": torch.float8_e4m3fn}
     )
+    assert mla_query_projection.can_implement(
+        **{**kwargs, "num_heads": 6, "nope_dim": 128}
+    )
+    assert mla_query_projection.can_implement(
+        **{**kwargs, "num_heads": 8, "nope_dim": 128}
+    )
     assert not mla_query_projection.can_implement(**{**kwargs, "num_heads": 12})
+    assert not mla_query_projection.can_implement(
+        **{**kwargs, "num_heads": 6, "nope_dim": 192}
+    )
+    assert not mla_query_projection.can_implement(
+        **{**kwargs, "num_heads": 11, "nope_dim": 128}
+    )
     assert not mla_query_projection.can_implement(**{**kwargs, "max_m": 33})
     assert not mla_query_projection.can_implement(
         **{**kwargs, "weight_format": "mxfp8"}
