@@ -732,8 +732,11 @@ class PCIeAllreduce {
       case 10:
         KL(10);
         break;
+      case 16:
+        KL(16);
+        break;
       default:
-        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
+        throw std::runtime_error("only supports (2,4,6,8,10,16) gpus, got " + std::to_string(world_size_));
     }
 #undef KL
   }
@@ -842,8 +845,11 @@ class PCIeAllreduce {
       case 10:
         DISPATCH(10);
         break;
+      case 16:
+        DISPATCH(16);
+        break;
       default:
-        throw std::runtime_error("only supports (2,4,6,8,10) gpus, got " + std::to_string(world_size_));
+        throw std::runtime_error("only supports (2,4,6,8,10,16) gpus, got " + std::to_string(world_size_));
     }
 #undef DISPATCH
 #undef DISPATCH_MODE

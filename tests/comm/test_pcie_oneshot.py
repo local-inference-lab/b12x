@@ -302,6 +302,21 @@ def test_world_size_10_is_supported_by_eager_pool():
     assert created == [(None, runtime)]
 
 
+def test_world_size_16_is_supported_by_eager_runtime():
+    runtime = _make_runtime(rank=15, world_size=16, eager=True)
+    try:
+        assert runtime.world_size == 16
+        assert len(runtime._signal_ptrs) == 16
+        assert runtime._ext.init_calls == [
+            (tuple(range(100, 116)), "cpu", 15)
+        ]
+        assert runtime._ext.register_pcie_buffers_calls == [
+            (12345, tuple(range(200, 216)), tuple(range(300, 316)))
+        ]
+    finally:
+        runtime.close()
+
+
 def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16)
