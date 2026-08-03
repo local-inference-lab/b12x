@@ -11,7 +11,7 @@ belong to the serving framework; SparkInfer owns only the prepared kernel path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Protocol, Sequence
 
@@ -97,6 +97,7 @@ class MixedTrellisBuffers:
 class MixedTrellisTier(Protocol):
     """Prepared Trellis tier fields consumed by the mixed launch."""
 
+    num_experts: int
     intermediate_rotations: torch.Tensor
     gate_suh: torch.Tensor
     up_suh: torch.Tensor
@@ -112,7 +113,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 4
+    ABI_VERSION = 5
 
     def __init__(
         self,
@@ -185,7 +186,6 @@ class W4A16MixedTrellisKernel:
         self.driver = driver
         self.tier0 = tier0
         self.tier1 = tier1
-        self.total_experts = driver.num_experts
         self.size_m = driver.size_m
         self.hidden_size = driver.hidden_size
         self.intermediate_size = driver.intermediate_size
@@ -207,6 +207,8 @@ class W4A16MixedTrellisKernel:
             self.driver.__cache_key__,
             self.tier0.__cache_key__,
             self.tier1.__cache_key__,
+            # Expert counts are runtime artifact data. All E-sized views and
+            # dispatch bounds are reconstructed from the launch scalars.
             self.blocks_per_sm,
             self.shared_words,
         )
@@ -312,6 +314,8 @@ class W4A16MixedTrellisKernel:
         smem_base: Int32,
         tid: Int32,
         active_size_m: Int32,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
         route_block_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
@@ -330,12 +334,13 @@ class W4A16MixedTrellisKernel:
                 )
             )
         combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
-        if combined_expert >= Int32(0) and combined_expert < Int32(self.total_experts):
+        total_experts = tier0_num_experts + tier1_num_experts
+        if combined_expert >= Int32(0) and combined_expert < total_experts:
             descriptor = descriptor_map[combined_expert].to(Int32)
             if descriptor >= Int32(0):
                 tier = descriptor >> Int32(8)
                 local_expert = descriptor & Int32(0xFF)
-                if tier == Int32(0) and local_expert < Int32(self.tier0.num_experts):
+                if tier == Int32(0) and local_expert < tier0_num_experts:
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier0.fc1
                     else:
@@ -364,7 +369,7 @@ class W4A16MixedTrellisKernel:
                         lock_slot,
                         active_size_m,
                     )
-                elif tier == Int32(1) and local_expert < Int32(self.tier1.num_experts):
+                elif tier == Int32(1) and local_expert < tier1_num_experts:
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier1.fc1
                     else:
@@ -400,36 +405,173 @@ class W4A16MixedTrellisKernel:
         rotation_input_ptr: cute.Pointer,
         rotation_gate: cute.Tensor,
         rotation_up: cute.Tensor,
-        t0_w13: cute.Tensor,
-        t0_w2: cute.Tensor,
-        t0_w13_scales: cute.Tensor,
-        t0_w2_scales: cute.Tensor,
-        t0_w13_global: cute.Tensor,
-        t0_w2_global: cute.Tensor,
-        t1_w13: cute.Tensor,
-        t1_w2: cute.Tensor,
-        t1_w13_scales: cute.Tensor,
-        t1_w2_scales: cute.Tensor,
-        t1_w13_global: cute.Tensor,
-        t1_w2_global: cute.Tensor,
+        t0_w13_ptr: cute.Pointer,
+        t0_w2_ptr: cute.Pointer,
+        t0_w13_scales_ptr: cute.Pointer,
+        t0_w2_scales_ptr: cute.Pointer,
+        t0_w13_global_ptr: cute.Pointer,
+        t0_w2_global_ptr: cute.Pointer,
+        t1_w13_ptr: cute.Pointer,
+        t1_w2_ptr: cute.Pointer,
+        t1_w13_scales_ptr: cute.Pointer,
+        t1_w2_scales_ptr: cute.Pointer,
+        t1_w13_global_ptr: cute.Pointer,
+        t1_w2_global_ptr: cute.Pointer,
         fc1: cute.Tensor,
         activated: cute.Tensor,
         fc2: cute.Tensor,
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
-        descriptor_map: cute.Tensor,
+        descriptor_map_ptr: cute.Pointer,
         topk_weights_ptr: cute.Pointer,
         fc1_scratch: cute.Tensor,
         fc2_scratch: cute.Tensor,
         workspace: cute.Tensor,
-        intermediate_rotations: cute.Tensor,
-        gate_suh: cute.Tensor,
-        up_suh: cute.Tensor,
+        intermediate_rotations_ptr: cute.Pointer,
+        gate_suh_ptr: cute.Pointer,
+        up_suh_ptr: cute.Pointer,
+        tier0_num_experts: cutlass.Int32,
+        tier1_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        tier0_experts = cutlass.Int64(tier0_num_experts)
+        tier1_experts = cutlass.Int64(tier1_num_experts)
+        total_experts = tier0_experts + tier1_experts
+
+        t0_w13 = cute.make_tensor(
+            t0_w13_ptr,
+            layout=cute.make_layout(
+                (
+                    tier0_experts
+                    * cutlass.Int64(self.hidden_size // 16)
+                    * cutlass.Int64(self.driver.fc1_cols // 16)
+                    * cutlass.Int64(8 * self.tier0.trellis_bits),
+                ),
+                stride=(1,),
+            ),
+        )
+        t0_w2 = cute.make_tensor(
+            t0_w2_ptr,
+            layout=cute.make_layout(
+                (
+                    tier0_experts
+                    * cutlass.Int64(self.intermediate_size // 16)
+                    * cutlass.Int64(self.hidden_size // 16)
+                    * cutlass.Int64(8 * self.tier0.trellis_bits),
+                ),
+                stride=(1,),
+            ),
+        )
+        t1_w13 = cute.make_tensor(
+            t1_w13_ptr,
+            layout=cute.make_layout(
+                (
+                    tier1_experts
+                    * cutlass.Int64(self.hidden_size // 16)
+                    * cutlass.Int64(self.driver.fc1_cols // 16)
+                    * cutlass.Int64(8 * self.tier1.trellis_bits),
+                ),
+                stride=(1,),
+            ),
+        )
+        t1_w2 = cute.make_tensor(
+            t1_w2_ptr,
+            layout=cute.make_layout(
+                (
+                    tier1_experts
+                    * cutlass.Int64(self.intermediate_size // 16)
+                    * cutlass.Int64(self.hidden_size // 16)
+                    * cutlass.Int64(8 * self.tier1.trellis_bits),
+                ),
+                stride=(1,),
+            ),
+        )
+        t0_w13_scales = cute.make_tensor(
+            t0_w13_scales_ptr,
+            layout=cute.make_layout(
+                (
+                    tier0_experts
+                    * cutlass.Int64(self.tier0.fc1.scale_k_groups)
+                    * cutlass.Int64(self.tier0.fc1.scale_size_n // 4),
+                ),
+                stride=(1,),
+            ),
+        )
+        t0_w2_scales = cute.make_tensor(
+            t0_w2_scales_ptr,
+            layout=cute.make_layout(
+                (
+                    tier0_experts
+                    * cutlass.Int64(self.tier0.fc2.scale_k_groups)
+                    * cutlass.Int64(self.tier0.fc2.scale_size_n // 4),
+                ),
+                stride=(1,),
+            ),
+        )
+        t1_w13_scales = cute.make_tensor(
+            t1_w13_scales_ptr,
+            layout=cute.make_layout(
+                (
+                    tier1_experts
+                    * cutlass.Int64(self.tier1.fc1.scale_k_groups)
+                    * cutlass.Int64(self.tier1.fc1.scale_size_n // 4),
+                ),
+                stride=(1,),
+            ),
+        )
+        t1_w2_scales = cute.make_tensor(
+            t1_w2_scales_ptr,
+            layout=cute.make_layout(
+                (
+                    tier1_experts
+                    * cutlass.Int64(self.tier1.fc2.scale_k_groups)
+                    * cutlass.Int64(self.tier1.fc2.scale_size_n // 4),
+                ),
+                stride=(1,),
+            ),
+        )
+        t0_w13_global = cute.make_tensor(
+            t0_w13_global_ptr,
+            layout=cute.make_layout((tier0_experts,), stride=(1,)),
+        )
+        t0_w2_global = cute.make_tensor(
+            t0_w2_global_ptr,
+            layout=cute.make_layout((tier0_experts,), stride=(1,)),
+        )
+        t1_w13_global = cute.make_tensor(
+            t1_w13_global_ptr,
+            layout=cute.make_layout((tier1_experts,), stride=(1,)),
+        )
+        t1_w2_global = cute.make_tensor(
+            t1_w2_global_ptr,
+            layout=cute.make_layout((tier1_experts,), stride=(1,)),
+        )
+        descriptor_map = cute.make_tensor(
+            descriptor_map_ptr,
+            layout=cute.make_layout((total_experts,), stride=(1,)),
+        )
+        intermediate_rotations = cute.make_tensor(
+            intermediate_rotations_ptr,
+            layout=cute.make_layout(
+                (total_experts * cutlass.Int64(3 * self.intermediate_size),),
+                stride=(1,),
+            ),
+        )
+        gate_suh = cute.make_tensor(
+            gate_suh_ptr,
+            layout=cute.make_layout(
+                (total_experts * cutlass.Int64(self.hidden_size),), stride=(1,)
+            ),
+        )
+        up_suh = cute.make_tensor(
+            up_suh_ptr,
+            layout=cute.make_layout(
+                (total_experts * cutlass.Int64(self.hidden_size),), stride=(1,)
+            ),
+        )
         rotation_input = cute.make_tensor(
             rotation_input_ptr,
             layout=cute.make_layout(
@@ -474,6 +616,8 @@ class W4A16MixedTrellisKernel:
             intermediate_rotations,
             gate_suh,
             up_suh,
+            tier0_num_experts,
+            tier1_num_experts,
             active_m,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -515,6 +659,8 @@ class W4A16MixedTrellisKernel:
         intermediate_rotations: cute.Tensor,
         gate_suh: cute.Tensor,
         up_suh: cute.Tensor,
+        tier0_num_experts: cutlass.Int32,
+        tier1_num_experts: cutlass.Int32,
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -555,6 +701,8 @@ class W4A16MixedTrellisKernel:
             smem_base,
             tid,
             active_m,
+            tier0_num_experts,
+            tier1_num_experts,
         )
         fc2_emit = partial(
             self._emit_tier_tile,
@@ -577,7 +725,10 @@ class W4A16MixedTrellisKernel:
             smem_base,
             tid,
             active_m * Int32(self.top_k),
+            tier0_num_experts,
+            tier1_num_experts,
         )
+        total_experts = tier0_num_experts + tier1_num_experts
         self.driver._moe_body(
             rotation_gate,
             rotation_up,
@@ -604,8 +755,8 @@ class W4A16MixedTrellisKernel:
             gate_suh,
             up_suh,
             descriptor_map,
-            Int32(self.total_experts),
-            Int32(self.total_experts),
+            total_experts,
+            total_experts,
             smem_base,
             tid,
             cta,
@@ -617,16 +768,6 @@ class W4A16MixedTrellisKernel:
 
 
 _CACHE: dict[tuple[object, ...], MixedTrellisCompileResult] = {}
-
-
-def _trellis_weight_fake(
-    *, num_experts: int, size_k: int, size_n: int, bits: int
-) -> cute.Tensor:
-    return cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (num_experts * (size_k // 16) * (size_n // 16) * (8 * bits),),
-        assumed_align=16,
-    )
 
 
 def compile_mixed_trellis(
@@ -715,9 +856,29 @@ def compile_mixed_trellis(
         int(size_m),
         int(max_m_blocks),
     )
+    topk_sum = compile_w4a16_topk_sum(
+        m=size_m,
+        topk=top_k,
+        hidden_size=hidden_size,
+        element_dtype="fp16",
+        full_rotation=True,
+        num_experts=total_experts,
+        route_num_experts=total_experts,
+        route_ids_dtype=route_ids_dtype,
+        use_expert_map=True,
+    )
     cached = _CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        # The compiled object is intentionally independent of the artifact's
+        # K3/K4 partition. Keep the current plan metadata and top-k launch,
+        # rather than leaking the first split that populated the cache.
+        return replace(
+            cached,
+            topk_sum=topk_sum,
+            tier0_num_experts=int(tier0_num_experts),
+            tier1_num_experts=int(tier1_num_experts),
+            sms=int(sms),
+        )
 
     compile_m = _fake_m_for_specialization(size_m)
     compile_rows = compile_m * top_k
@@ -730,24 +891,14 @@ def compile_mixed_trellis(
             dtype, (max(int(elements), 1),), assumed_align=align
         )
 
-    def tier_args(experts: int, bits: int):
+    def tier_args():
         return (
-            _trellis_weight_fake(
-                num_experts=experts,
-                size_k=hidden_size,
-                size_n=fc1_cols,
-                bits=bits,
-            ),
-            _trellis_weight_fake(
-                num_experts=experts,
-                size_k=intermediate_size,
-                size_n=hidden_size,
-                bits=bits,
-            ),
-            tensor(cutlass.Int32, 1),
-            tensor(cutlass.Int32, 1),
-            tensor(cutlass.Float32, experts),
-            tensor(cutlass.Float32, experts),
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         )
 
     scratch_elements = max(
@@ -759,22 +910,24 @@ def compile_mixed_trellis(
         make_ptr(rotation_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         tensor(cutlass_dtype, compile_rows * hidden_size),
         tensor(cutlass_dtype, compile_rows * hidden_size),
-        *tier_args(int(tier0_num_experts), int(tier0_bits)),
-        *tier_args(int(tier1_num_experts), int(tier1_bits)),
+        *tier_args(),
+        *tier_args(),
         tensor(cutlass_dtype, compile_rows * fc1_cols),
         tensor(cutlass_dtype, compile_rows * intermediate_size),
         tensor(cutlass_dtype, compile_rows * hidden_size),
         tensor(cutlass.Int32, moe_block_size),
         tensor(cutlass.Int32, 1),
         tensor(cutlass.Int32, 1, align=4),
-        tensor(cutlass.Int32, total_experts),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4),
         tensor(cutlass.Float32, scratch_elements),
         tensor(cutlass.Float32, scratch_elements),
         tensor(cutlass.Int32, 4 * 256 + 2),
-        tensor(cutlass.Float16, total_experts * 3 * intermediate_size),
-        tensor(cutlass.Float16, total_experts * hidden_size),
-        tensor(cutlass.Float16, total_experts * hidden_size),
+        make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        Int32(tier0_num_experts),
+        Int32(tier1_num_experts),
         1,
         1,
         current_cuda_stream(),
@@ -800,17 +953,6 @@ def compile_mixed_trellis(
                 "mixed Trellis codegen spills to local memory "
                 f"({local_bytes} bytes/thread)"
             )
-    topk_sum = compile_w4a16_topk_sum(
-        m=size_m,
-        topk=top_k,
-        hidden_size=hidden_size,
-        element_dtype="fp16",
-        full_rotation=True,
-        num_experts=total_experts,
-        route_num_experts=total_experts,
-        route_ids_dtype=route_ids_dtype,
-        use_expert_map=True,
-    )
     result = MixedTrellisCompileResult(
         compiled=compiled,
         topk_sum=topk_sum,
@@ -980,6 +1122,69 @@ def combine_trellis_rotations(
     )
 
 
+def _validate_mixed_trellis_tier_storage(
+    *,
+    name: str,
+    tier: MixedTrellisTier,
+    expected_experts: int,
+    bits: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: torch.device,
+) -> None:
+    """Fail closed before binding expert-sized storage as raw CuTe pointers."""
+    expected_experts = int(expected_experts)
+    bits = int(bits)
+    fc1_cols = 2 * int(intermediate_size)
+    expected = (
+        (
+            "w13",
+            tier.w13,
+            torch.int32,
+            expected_experts * (int(hidden_size) // 16) * (fc1_cols // 16) * (8 * bits),
+        ),
+        (
+            "w2",
+            tier.w2,
+            torch.int32,
+            expected_experts
+            * (int(intermediate_size) // 16)
+            * (int(hidden_size) // 16)
+            * (8 * bits),
+        ),
+        # Native Trellis decodes its codebook tiles directly. These scale
+        # pointers retain the prepared four-byte dummy ABI and are not the
+        # per-expert K/32 scale grids used by packed/NF3 weights.
+        ("w13_scale", tier.w13_scale, torch.uint8, 4),
+        ("w2_scale", tier.w2_scale, torch.uint8, 4),
+        (
+            "w13_global_scale",
+            tier.w13_global_scale,
+            torch.float32,
+            expected_experts,
+        ),
+        (
+            "w2_global_scale",
+            tier.w2_global_scale,
+            torch.float32,
+            expected_experts,
+        ),
+    )
+    for field, tensor, expected_dtype, expected_elements in expected:
+        if (
+            tensor.dtype != expected_dtype
+            or tensor.device != device
+            or not tensor.is_contiguous()
+            or int(tensor.numel()) != int(expected_elements)
+            or int(tensor.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                f"mixed Trellis {name}.{field} must be contiguous "
+                f"{expected_dtype} on {device} with {int(expected_elements)} "
+                "elements and at least 16-byte alignment"
+            )
+
+
 def run_mixed_trellis(
     x: torch.Tensor,
     tier0: MixedTrellisTier,
@@ -1011,11 +1216,70 @@ def run_mixed_trellis(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"mixed Trellis {name} must be contiguous")
+    for name, tier, expected_experts in (
+        ("tier0", tier0, launch.tier0_num_experts),
+        ("tier1", tier1, launch.tier1_num_experts),
+    ):
+        actual_experts = int(tier.num_experts)
+        if actual_experts != int(expected_experts):
+            raise ValueError(
+                f"mixed Trellis {name} has {actual_experts} experts, but the "
+                f"launch plan describes {int(expected_experts)}"
+            )
+    _validate_mixed_trellis_tier_storage(
+        name="tier0",
+        tier=tier0,
+        expected_experts=launch.tier0_num_experts,
+        bits=launch.tier0_bits,
+        hidden_size=launch.hidden_size,
+        intermediate_size=launch.intermediate_size,
+        device=x.device,
+    )
+    _validate_mixed_trellis_tier_storage(
+        name="tier1",
+        tier=tier1,
+        expected_experts=launch.tier1_num_experts,
+        bits=launch.tier1_bits,
+        hidden_size=launch.hidden_size,
+        intermediate_size=launch.intermediate_size,
+        device=x.device,
+    )
     total_experts = launch.tier0_num_experts + launch.tier1_num_experts
-    if int(global_to_combined.numel()) != total_experts:
-        raise ValueError("global_to_combined must cover every routed expert")
-    if int(descriptor_map.numel()) != total_experts:
-        raise ValueError("descriptor_map must cover the combined namespace")
+    for name, mapping in (
+        ("global_to_combined", global_to_combined),
+        ("descriptor_map", descriptor_map),
+    ):
+        if (
+            mapping.dtype != torch.int32
+            or mapping.device != x.device
+            or not mapping.is_contiguous()
+            or int(mapping.numel()) != total_experts
+        ):
+            raise ValueError(
+                f"mixed Trellis {name} must be contiguous int32 on {x.device} "
+                f"with {total_experts} elements"
+            )
+    for name, table, expected_elements in (
+        (
+            "intermediate rotations",
+            rotations.intermediate,
+            total_experts * 3 * launch.intermediate_size,
+        ),
+        ("gate SUH", rotations.gate_suh, total_experts * launch.hidden_size),
+        ("up SUH", rotations.up_suh, total_experts * launch.hidden_size),
+        ("down SVH", rotations.down_svh, total_experts * launch.hidden_size),
+    ):
+        if (
+            table.dtype != torch.float16
+            or table.device != x.device
+            or not table.is_contiguous()
+            or int(table.numel()) != expected_elements
+            or int(table.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                f"mixed Trellis {name} must be contiguous fp16 on {x.device} "
+                f"with {expected_elements} elements and at least 16-byte alignment"
+            )
     required_route_slots = max_packed_route_slots(
         m * launch.top_k, launch.moe_block_size, total_experts
     )
@@ -1057,25 +1321,90 @@ def run_mixed_trellis(
         ),
         buffers.rotation_gate.view(-1),
         buffers.rotation_up.view(-1),
-        tier0.w13.view(torch.int32).view(-1),
-        tier0.w2.view(torch.int32).view(-1),
-        tier0.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        tier0.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
-        tier0.w13_global_scale,
-        tier0.w2_global_scale,
-        tier1.w13.view(torch.int32).view(-1),
-        tier1.w2.view(torch.int32).view(-1),
-        tier1.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        tier1.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
-        tier1.w13_global_scale,
-        tier1.w2_global_scale,
+        make_ptr(
+            cutlass.Int32,
+            tier0.w13.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier0.w2.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier0.w13_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier0.w2_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            tier0.w13_global_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            tier0.w2_global_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier1.w13.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier1.w2.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier1.w13_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            tier1.w2_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            tier1.w13_global_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            tier1.w2_global_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         buffers.fc1.view(-1),
         buffers.activated.view(-1),
         buffers.fc2.view(-1),
         packed,
         block_experts,
         packed_count,
-        descriptor_map,
+        make_ptr(
+            cutlass.Int32,
+            descriptor_map.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         make_ptr(
             cutlass.Float32,
             topk_weights.data_ptr(),
@@ -1085,9 +1414,26 @@ def run_mixed_trellis(
         buffers.fc1_scratch,
         buffers.fc2_scratch,
         buffers.workspace,
-        rotations.intermediate.view(-1),
-        rotations.gate_suh.view(-1),
-        rotations.up_suh.view(-1),
+        make_ptr(
+            cutlass.Float16,
+            rotations.intermediate.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float16,
+            rotations.gate_suh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float16,
+            rotations.up_suh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        Int32(launch.tier0_num_experts),
+        Int32(launch.tier1_num_experts),
         m,
         max(int(launch.blocks_per_sm) * int(launch.sms), 1),
         stream,

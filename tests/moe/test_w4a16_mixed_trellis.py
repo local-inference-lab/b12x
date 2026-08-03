@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +21,8 @@ from sparkinfer.moe._shared.kernels.w4a16.kernel import (
 )
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
     W4A16MixedTrellisKernel,
+    _validate_mixed_trellis_tier_storage,
+    build_ordered_maps,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
@@ -29,6 +32,94 @@ from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
 from sparkinfer.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
 )
+
+
+def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ...]:
+    """Build the key without constructing CUDA-backed kernels.
+
+    The tier subkeys are stubbed, so this proves only that the outer mixed key
+    does not read expert counts directly. The GPU ABBA test covers real child
+    keys and verifies that they resolve to one compiled object.
+    """
+
+    kernel = object.__new__(W4A16MixedTrellisKernel)
+    kernel.driver = SimpleNamespace(__cache_key__=("driver",))
+    kernel.tier0 = SimpleNamespace(
+        __cache_key__=("dynamic-k3",), num_experts=tier0_experts
+    )
+    kernel.tier1 = SimpleNamespace(
+        __cache_key__=("dynamic-k4",), num_experts=tier1_experts
+    )
+    kernel.blocks_per_sm = 1
+    kernel.shared_words = 1
+    return kernel.__cache_key__
+
+
+def test_mixed_kernel_cache_key_is_tier_partition_agnostic() -> None:
+    # The exact K3/K4 partition is checkpoint data, not launch geometry. One
+    # compiled object must serve every 256-expert GLM-5.2 mixed layout.
+    assert _mixed_cache_key(206, 50) == _mixed_cache_key(160, 96)
+    assert _mixed_cache_key(192, 64) == _mixed_cache_key(206, 50)
+    assert _mixed_cache_key(96, 32) == _mixed_cache_key(80, 16)
+
+
+def test_mixed_kernel_uses_runtime_expert_bounds() -> None:
+    emit_source = textwrap.dedent(
+        inspect.getsource(W4A16MixedTrellisKernel._emit_tier_tile)
+    )
+    kernel_source = textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel.kernel))
+    call_parameters = inspect.signature(W4A16MixedTrellisKernel.__call__).parameters
+
+    assert "tier0_num_experts" in call_parameters
+    assert "tier1_num_experts" in call_parameters
+    assert "self.tier0.num_experts" not in emit_source
+    assert "self.tier1.num_experts" not in emit_source
+    assert "self.total_experts" not in emit_source
+    assert "self.total_experts" not in kernel_source
+    assert "local_expert < tier0_num_experts" in emit_source
+    assert "local_expert < tier1_num_experts" in emit_source
+
+
+def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
+    device = torch.device("cpu")
+    experts, hidden, intermediate, bits = 2, 128, 128, 3
+    tier = SimpleNamespace(
+        num_experts=experts,
+        w13=torch.empty(
+            experts * (hidden // 16) * ((2 * intermediate) // 16) * (8 * bits),
+            dtype=torch.int32,
+        ),
+        w2=torch.empty(
+            experts * (intermediate // 16) * (hidden // 16) * (8 * bits),
+            dtype=torch.int32,
+        ),
+        w13_scale=torch.empty(4, dtype=torch.uint8),
+        w2_scale=torch.empty(4, dtype=torch.uint8),
+        w13_global_scale=torch.empty(experts, dtype=torch.float32),
+        w2_global_scale=torch.empty(experts, dtype=torch.float32),
+    )
+
+    def validate(candidate) -> None:
+        _validate_mixed_trellis_tier_storage(
+            name="tier0",
+            tier=candidate,
+            expected_experts=experts,
+            bits=bits,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            device=device,
+        )
+
+    validate(tier)
+    for field, replacement in (
+        ("w13", tier.w13[:-1]),
+        ("w2", tier.w2.to(torch.int16)),
+        ("w13_scale", tier.w13_scale[:3]),
+        ("w2_global_scale", tier.w2_global_scale[:1]),
+    ):
+        candidate = SimpleNamespace(**{**vars(tier), field: replacement})
+        with pytest.raises(ValueError, match=rf"tier0\.{field}"):
+            validate(candidate)
 
 
 def _sm12x_available() -> bool:
@@ -55,8 +146,8 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
     assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
         "descriptor_map",
-        "Int32(self.total_experts)",
-        "Int32(self.total_experts)",
+        "total_experts",
+        "total_experts",
         "smem_base",
         "tid",
         "cta",
@@ -238,6 +329,31 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     )
     assert buffers.fc2.data_ptr() == buffers.rotation_gate.data_ptr()
 
+    misaligned_intermediate = torch.empty(
+        rotations.intermediate.numel() + 1, dtype=torch.float16, device=device
+    )[1:]
+    assert misaligned_intermediate.is_contiguous()
+    assert misaligned_intermediate.data_ptr() % 16 != 0
+    misaligned_rotations = type(rotations)(
+        intermediate=misaligned_intermediate,
+        gate_suh=rotations.gate_suh,
+        up_suh=rotations.up_suh,
+        down_svh=rotations.down_svh,
+    )
+    with pytest.raises(ValueError, match="intermediate rotations.*16-byte alignment"):
+        run_mixed_trellis(
+            x,
+            tier0,
+            tier1,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            misaligned_rotations,
+            launch,
+            buffers,
+        )
+
     eager = run_mixed_trellis(
         x,
         tier0,
@@ -315,6 +431,195 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         skipped - skipped_serial
     ).norm() / skipped_serial.norm().clamp_min(1.0e-12)
     assert float(skipped_relative) < 4.0e-3
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize(
+    ("layouts", "max_m_blocks"),
+    (
+        (((206, 50), (160, 96)), 8),
+        (((160, 96), (206, 50)), 9),
+        (((80, 16), (96, 32)), 10),
+    ),
+    ids=("206-50_then_160-96", "160-96_then_206-50", "total-96_then_total-128"),
+)
+def test_mixed_runtime_partition_reuses_one_compiled_object_abba(
+    layouts: tuple[tuple[int, int], tuple[int, int]], max_m_blocks: int
+) -> None:
+    """One compiled kernel must safely serve both production split families."""
+
+    torch.manual_seed(20260803)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, hidden, intermediate, topk = 2, 256, 128, 2
+    props = torch.cuda.get_device_properties(device)
+
+    def prepare_partition(
+        tier0_experts: int, tier1_experts: int, seed: int
+    ) -> tuple[object, object]:
+        return (
+            _prepared(
+                experts=tier0_experts,
+                hidden=hidden,
+                intermediate=intermediate,
+                bits=3,
+                seed=seed,
+                device=device,
+            ),
+            _prepared(
+                experts=tier1_experts,
+                hidden=hidden,
+                intermediate=intermediate,
+                bits=4,
+                seed=seed + 100,
+                device=device,
+            ),
+        )
+
+    def serial_partition(
+        x: torch.Tensor,
+        tiers: tuple[object, object],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        tier0_experts = int(tiers[0].num_experts)
+        tier1_experts = int(tiers[1].num_experts)
+        map0 = torch.cat(
+            (
+                torch.arange(tier0_experts, dtype=torch.int32, device=device),
+                torch.full((tier1_experts,), -1, dtype=torch.int32, device=device),
+            )
+        )
+        map1 = torch.cat(
+            (
+                torch.full((tier0_experts,), -1, dtype=torch.int32, device=device),
+                torch.arange(tier1_experts, dtype=torch.int32, device=device),
+            )
+        )
+        return _serial_tier(x, tiers[0], topk_weights, topk_ids, map0) + _serial_tier(
+            x, tiers[1], topk_weights, topk_ids, map1
+        )
+
+    tiers_a = prepare_partition(*layouts[0], seed=301)
+    tiers_b = prepare_partition(*layouts[1], seed=501)
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_weights = torch.tensor(
+        [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
+    )
+
+    # Exercise the highest local id in both tiers. Stale compile-time bounds
+    # would either skip these routes or read beyond the compact tier tensor.
+    def boundary_routes(layout: tuple[int, int]) -> torch.Tensor:
+        tier0_experts, tier1_experts = layout
+        total_experts = tier0_experts + tier1_experts
+        return torch.tensor(
+            [[tier0_experts - 1, total_experts - 1], [0, tier0_experts]],
+            dtype=torch.int32,
+            device=device,
+        )
+
+    topk_ids_a = boundary_routes(layouts[0])
+    topk_ids_b = boundary_routes(layouts[1])
+
+    def compile_partition(
+        tier0_experts: int, tier1_experts: int, *, sms: int | None = None
+    ):
+        return compile_mixed_trellis(
+            size_m=m,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tier0_num_experts=tier0_experts,
+            tier1_num_experts=tier1_experts,
+            top_k=topk,
+            max_m_blocks=max_m_blocks,
+            sms=int(props.multi_processor_count if sms is None else sms),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=(128, 128, 128, 128),
+        )
+
+    launch_a = compile_partition(*layouts[0])
+    launch_b = compile_partition(*layouts[1])
+    assert launch_a.compiled is launch_b.compiled
+    assert (launch_a.tier0_num_experts, launch_a.tier1_num_experts) == layouts[0]
+    assert (launch_b.tier0_num_experts, launch_b.tier1_num_experts) == layouts[1]
+    alternate_sms = max(int(props.multi_processor_count) - 1, 1)
+    launch_alt_sms = compile_partition(*layouts[1], sms=alternate_sms)
+    launch_restored_sms = compile_partition(
+        *layouts[0], sms=int(props.multi_processor_count)
+    )
+    assert launch_alt_sms.compiled is launch_a.compiled
+    assert launch_restored_sms.compiled is launch_a.compiled
+    assert launch_alt_sms.sms == alternate_sms
+    assert launch_restored_sms.sms == int(props.multi_processor_count)
+
+    def run_partition(
+        tiers: tuple[object, object],
+        topk_ids: torch.Tensor,
+        launch,
+        buffers,
+        global_to_combined: torch.Tensor,
+        descriptor: torch.Tensor,
+        rotations,
+    ) -> torch.Tensor:
+        return run_mixed_trellis(
+            x,
+            tiers[0],
+            tiers[1],
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            rotations,
+            launch,
+            buffers,
+        )
+
+    maps_a = build_ordered_maps(*layouts[0], device=device)
+    maps_b = build_ordered_maps(*layouts[1], device=device)
+    rotations_a = combine_trellis_rotations(*tiers_a)
+    rotations_b = combine_trellis_rotations(*tiers_b)
+    buffers_a = make_mixed_trellis_buffers(
+        launch_a, device=device, sms=int(props.multi_processor_count)
+    )
+    buffers_b = make_mixed_trellis_buffers(
+        launch_b, device=device, sms=int(props.multi_processor_count)
+    )
+    serial_a = serial_partition(x, tiers_a, topk_weights, topk_ids_a)
+    serial_b = serial_partition(x, tiers_b, topk_weights, topk_ids_b)
+
+    output_a1 = run_partition(
+        tiers_a, topk_ids_a, launch_a, buffers_a, *maps_a, rotations_a
+    ).clone()
+    output_b1 = run_partition(
+        tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
+    ).clone()
+    output_b2 = run_partition(
+        tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
+    ).clone()
+    output_a2 = run_partition(
+        tiers_a, topk_ids_a, launch_a, buffers_a, *maps_a, rotations_a
+    ).clone()
+    torch.cuda.synchronize(device)
+
+    for actual, expected in (
+        (output_a1, serial_a),
+        (output_b1, serial_b),
+        (output_b2, serial_b),
+        (output_a2, serial_a),
+    ):
+        assert not torch.isnan(actual).any()
+        relative = (actual - expected).norm() / expected.norm().clamp_min(1.0e-12)
+        assert float(relative) < 4.0e-3
+    assert torch.equal(output_a1, output_a2)
+    assert torch.equal(output_b1, output_b2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_b = run_partition(
+            tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured_b, output_b1)
 
 
 def test_build_tiered_maps_rejects_invalid_partitions() -> None:
