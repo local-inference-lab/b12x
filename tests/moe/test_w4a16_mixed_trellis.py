@@ -340,7 +340,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         up_suh=rotations.up_suh,
         down_svh=rotations.down_svh,
     )
-    with pytest.raises(ValueError, match="intermediate rotations.*16-byte alignment"):
+    with pytest.raises(ValueError, match=r"intermediate rotations.*16-byte alignment"):
         run_mixed_trellis(
             x,
             tier0,
