@@ -256,6 +256,54 @@ def _laguna_page128_one_wave_chunk_budget(
     )
 
 
+def _sm121_gqa8_decode_chunk_budget(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch: int,
+    max_effective_kv_pages: int,
+    window_left: int,
+) -> int | None:
+    """Return the measured GB10 split budget for the H256 GQA8 contract."""
+
+    if not (
+        q_dtype == torch.bfloat16
+        and kv_dtype in (torch.bfloat16, _FP8_KV_DTYPE)
+        and int(num_q_heads) == 8
+        and int(num_kv_heads) == 1
+        and int(head_dim_qk) == 256
+        and int(head_dim_vo) == 256
+        and int(page_size) == 64
+        and int(batch) == 1
+        and (
+            224 <= int(max_effective_kv_pages) <= 288
+            or 480 <= int(max_effective_kv_pages) <= 544
+            or 992 <= int(max_effective_kv_pages) <= 1056
+        )
+        and int(window_left) < 0
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 1)
+    ):
+        return None
+    # Graph-first sweeps on the 48-SM GB10 found distinct latency knees at the
+    # 16K, 32K, and 64K serving capacities.  Express them as maximum chunk
+    # counts so the device LUT remains adaptive for every live length captured
+    # by the same graph.
+    max_pages = int(max_effective_kv_pages)
+    if 224 <= max_pages <= 288:
+        return 19 if kv_dtype == torch.bfloat16 else 22
+    if 480 <= max_pages <= 544:
+        return 14 if kv_dtype == torch.bfloat16 else 18
+    if 992 <= max_pages <= 1056:
+        return 17 if kv_dtype == torch.bfloat16 else 18
+    return None
+
+
 def _is_laguna_fp8_gqa6_analytic_decode_graph(
     *,
     device: torch.device,
@@ -1135,6 +1183,21 @@ def plan_decode_graph_capacity(
     )
     if one_wave_chunks is not None:
         max_chunks_budget = min(max_chunks_budget, one_wave_chunks)
+    sm121_gqa8_chunks = _sm121_gqa8_decode_chunk_budget(
+        device=device,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        page_size=page_size,
+        batch=batch,
+        max_effective_kv_pages=max_effective_kv_pages,
+        window_left=window_left,
+    )
+    if sm121_gqa8_chunks is not None:
+        max_chunks_budget = min(max_chunks_budget, sm121_gqa8_chunks)
 
     split_policy_supported = q_dtype == torch.bfloat16 and (
         _merge_backend_supports_split_kv(

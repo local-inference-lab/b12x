@@ -5,7 +5,10 @@ and their JIT-built extension): kwargs-only constructors with the shared
 vocabulary (rank / world_size / device / ...), CUDA-graph-capturable methods,
 pools via ``<Class>Pool``.
 
-- ``OneshotAllReduce``: one-shot all-reduce (+ ``all_reduce_fused_add_rms_norm``).
+- ``AllReduce``: peer-safe world-size dispatch. TP2-TP8 use the all-peer
+  oneshot path; TP12/TP16 use bounded-degree four-GPU islands.
+- ``OneshotAllReduce``: low-level one-shot all-reduce
+  (+ ``all_reduce_fused_add_rms_norm``).
 - ``DmaAllReduce``: CE-copy ring reduce-scatter + all-gather for prefill
   sizes, with a runtime crossover autotuner (``autotune_dma_crossovers``).
 - ``TwoShotReduceScatter``: two-shot sequence-parallel collectives with
@@ -28,6 +31,7 @@ META = OpMeta(
     group="comm",
     api_style="stateful",
     entry_points=(
+        "AllReduce",
         "OneshotAllReduce",
         "OneshotAllReducePool",
         "DmaAllReduce",
@@ -55,6 +59,7 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        AllReduce,
         DcpAllToAll,
         DcpAllToAllPool,
         DcpTopKOwnerExchange,

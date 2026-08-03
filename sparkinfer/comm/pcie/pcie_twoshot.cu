@@ -31,6 +31,7 @@
 #include <torch/all.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <array>
 #include <sstream>
 #include <stdexcept>
@@ -57,12 +58,18 @@ using FlagType = uint32_t;
 constexpr int kFlagStride = 32;
 
 struct Signal {
+  alignas(128) FlagType staging_generation;
+  FlagType active_staging_slot;
   alignas(128) FlagType self_counter[kMaxBlocks][kMaxRanks];
   alignas(128) FlagType peer_counter[2][kMaxBlocks][kMaxRanks * kFlagStride];
 };
 
 struct __align__(16) RankPtrs {
   void* __restrict__ ptrs[kMaxRanks];
+};
+
+struct DoubleRankPtrs {
+  RankPtrs slots[2];
 };
 
 struct RankSignals {
@@ -79,6 +86,33 @@ static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
   return flag;
+}
+
+static DINLINE FlagType ld_flag_relaxed_gpu(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr) : "memory");
+  return flag;
+}
+
+__global__ void advance_staging_slot_kernel(Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    const FlagType generation = self_sg->staging_generation;
+    self_sg->active_staging_slot = generation & FlagType{1};
+    self_sg->staging_generation = generation + FlagType{1};
+  }
+}
+
+template <int ngpus>
+DINLINE void select_rank_ptrs(RankPtrs& selected, const DoubleRankPtrs& options, Signal* self_sg) {
+  if (threadIdx.x == 0) {
+    // A one-CTA control kernel publishes the slot on this same stream before
+    // the worker launch. Kernel completion is the ordering edge, so every CTA
+    // observes one launch-wide slot without a grid rendezvous.
+    const int slot = int(ld_flag_relaxed_gpu(&self_sg->active_staging_slot) & FlagType{1});
+#pragma unroll
+    for (int peer = 0; peer < ngpus; ++peer) selected.ptrs[peer] = options.slots[slot].ptrs[peer];
+  }
+  __syncthreads();
 }
 
 // Block-pairwise barrier: after it returns, all prior writes from every
@@ -146,9 +180,11 @@ DINLINE void block_range(int64_t total, int64_t& begin, int64_t& end) {
 template <int ngpus>
 __global__ void __launch_bounds__(512, 1) rs_fp8_kernel(
     const Fp8Pack* __restrict__ src_payload, const float* __restrict__ src_scale,
-    RankPtrs staging, int64_t pack_stride, int64_t scale_offset, int64_t scale_stride,
-    RankSignals sg, Signal* self_sg, nv_bfloat16* __restrict__ out, int rank,
-    int rows_per_rank, int row_elems) {
+    DoubleRankPtrs staging_options, int64_t pack_stride, int64_t scale_offset,
+    int64_t scale_stride, RankSignals sg, Signal* self_sg,
+    nv_bfloat16* __restrict__ out, int rank, int rows_per_rank, int row_elems) {
+  __shared__ RankPtrs staging;
+  select_rank_ptrs<ngpus>(staging, staging_options, self_sg);
   const int packs_per_row = row_elems / 16;
   const int64_t shard_packs = int64_t(rows_per_rank) * packs_per_row;
   int64_t begin, end;
@@ -200,9 +236,11 @@ __global__ void __launch_bounds__(512, 1) rs_fp8_kernel(
 template <int ngpus>
 __global__ void __launch_bounds__(512, 1) ag_fp8_kernel(
     const Fp8Pack* __restrict__ src_payload, const float* __restrict__ src_scale,
-    RankPtrs staging, int64_t pack_stride, int64_t scale_offset, int64_t scale_stride,
-    RankSignals sg, Signal* self_sg, nv_bfloat16* __restrict__ out, int rank,
-    int rows_per_rank, int row_elems) {
+    DoubleRankPtrs staging_options, int64_t pack_stride, int64_t scale_offset,
+    int64_t scale_stride, RankSignals sg, Signal* self_sg,
+    nv_bfloat16* __restrict__ out, int rank, int rows_per_rank, int row_elems) {
+  __shared__ RankPtrs staging;
+  select_rank_ptrs<ngpus>(staging, staging_options, self_sg);
   const int packs_per_row = row_elems / 16;
   const int64_t shard_packs = int64_t(rows_per_rank) * packs_per_row;
   int64_t begin, end;
@@ -256,12 +294,11 @@ class PCIeTwoShot {
   RankSignals sg_;
   Signal* self_sg_;
 
-  RankPtrs staging_[2];
+  DoubleRankPtrs staging_;
   int64_t pack_stride_;   // Fp8Packs per src region
   int64_t scale_offset_;  // bytes
   int64_t scale_stride_;  // floats per src region
   int64_t max_shard_packs_;
-  int slot_ = 0;
 
   PCIeTwoShot(Signal** signals, const std::vector<std::array<void*, 2>>& staging,
               int64_t pack_stride, int64_t scale_offset, int64_t scale_stride, int rank,
@@ -269,13 +306,14 @@ class PCIeTwoShot {
       : rank_(rank),
         world_size_(world_size),
         self_sg_(signals[rank]),
+        staging_{},
         pack_stride_(pack_stride),
         scale_offset_(scale_offset),
         scale_stride_(scale_stride),
         max_shard_packs_(pack_stride) {
     for (int i = 0; i < world_size_; i++) {
       sg_.signals[i] = signals[i];
-      for (int s = 0; s < 2; s++) staging_[s].ptrs[i] = staging[i][s];
+      for (int s = 0; s < 2; s++) staging_.slots[s].ptrs[i] = staging[i][s];
     }
   }
 
@@ -306,40 +344,56 @@ class PCIeTwoShot {
       throw std::runtime_error("pcie_twoshot scale capacity exceeded");
   }
 
+  void check_launch_config(int threads, int block_limit) const {
+    if (threads < world_size_ || threads > 1024 || threads % 32 != 0)
+      throw std::runtime_error(
+          "pcie_twoshot threads must be a multiple of 32 in [world size, 1024]");
+    if (block_limit <= 0)
+      throw std::runtime_error("pcie_twoshot block limit must be positive");
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("pcie_twoshot block limit exceeds signal capacity");
+  }
+
   void reduce_scatter(cudaStream_t stream, const void* payload, const void* scale, void* out,
                       int64_t num_rows, int64_t row_elems, int threads, int block_limit) {
+    check_launch_config(threads, block_limit);
     if (num_rows % world_size_ != 0)
       throw std::runtime_error("num_rows must be divisible by world size");
     const int64_t rows_per_rank = num_rows / world_size_;
     check_shard(rows_per_rank, row_elems);
-    const int s = slot_ % 2;
-    slot_++;
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
       rs_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
-          reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
-          staging_[s], pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
+          reinterpret_cast<const Fp8Pack*>(payload),
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_, scale_offset_,
+          scale_stride_, sg_, self_sg_, reinterpret_cast<nv_bfloat16*>(out), rank_,
+          int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
     });
   }
 
   void all_gather(cudaStream_t stream, const void* payload, const void* scale, void* out,
                   int64_t rows_per_rank, int64_t row_elems, int threads, int block_limit) {
+    check_launch_config(threads, block_limit);
     check_shard(rows_per_rank, row_elems);
-    const int s = slot_ % 2;
-    slot_++;
     const int64_t shard_packs = rows_per_rank * (row_elems / 16);
     int blocks =
         std::max<int64_t>(1, std::min<int64_t>(block_limit, (shard_packs + threads - 1) / threads));
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_sg_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
     dispatch([&](auto ng) {
       constexpr int ngpus = decltype(ng)::value;
       ag_fp8_kernel<ngpus><<<blocks, threads, 0, stream>>>(
-          reinterpret_cast<const Fp8Pack*>(payload), reinterpret_cast<const float*>(scale),
-          staging_[s], pack_stride_, scale_offset_, scale_stride_, sg_, self_sg_,
-          reinterpret_cast<nv_bfloat16*>(out), rank_, int(rows_per_rank), int(row_elems));
+          reinterpret_cast<const Fp8Pack*>(payload),
+          reinterpret_cast<const float*>(scale), staging_, pack_stride_, scale_offset_,
+          scale_stride_, sg_, self_sg_, reinterpret_cast<nv_bfloat16*>(out), rank_,
+          int(rows_per_rank), int(row_elems));
+      CHECK_CUDA_SUCCESS(cudaGetLastError());
     });
   }
 };

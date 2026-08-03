@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from ..._lib.gating import is_sparkinfer
+from .pcie_allreduce import (
+    PCIeAllReduce as AllReduce,
+)
 from .pcie_dcp_a2a import (
     PCIeDCPA2A as DcpAllToAll,
 )
@@ -48,6 +51,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "AllReduce",
     "OneshotAllReduce",
     "OneshotAllReducePool",
     "DmaAllReduce",

@@ -6,10 +6,7 @@ import triton
 import triton.language as tl
 import torch
 
-from sparkinfer.moe._shared.kernels.w4a16.host import (
-    max_packed_route_slots,
-    route_pack_numel_capacity,
-)
+from sparkinfer.moe._shared.kernels.w4a16.host import route_pack_capacity
 
 
 _COUNT_BLOCK_T = 256
@@ -306,25 +303,28 @@ def pack_topk_routes_by_expert(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
-    numel_capacity = route_pack_numel_capacity(numel, topk=topk)
-    capacity_packed_routes = max_packed_route_slots(
-        numel_capacity, int(block_size), int(num_experts)
-    )
-    capacity_route_blocks = (capacity_packed_routes + int(block_size) - 1) // int(
-        block_size
+    numel_capacity, capacity_packed_routes, capacity_route_blocks = route_pack_capacity(
+        numel,
+        int(block_size),
+        int(num_experts),
+        topk=topk,
     )
     if packed_route_indices is not None and block_expert_ids is not None:
         if (
             int(packed_route_indices.numel()) < capacity_packed_routes
             or int(block_expert_ids.numel()) < capacity_route_blocks
         ):
-            numel_capacity = numel
-            capacity_packed_routes = max_packed_route_slots(
-                numel, int(block_size), int(num_experts)
+            (
+                numel_capacity,
+                capacity_packed_routes,
+                capacity_route_blocks,
+            ) = route_pack_capacity(
+                numel,
+                int(block_size),
+                int(num_experts),
+                topk=topk,
+                bucket_tokens=False,
             )
-            capacity_route_blocks = (
-                capacity_packed_routes + int(block_size) - 1
-            ) // int(block_size)
     max_packed_routes = capacity_packed_routes
     max_route_blocks = capacity_route_blocks
     max_packed_routes = max(max_packed_routes, 1)
@@ -339,10 +339,7 @@ def pack_topk_routes_by_expert(
     if (
         provided_routes is not None
         and provided_blocks is not None
-        and (
-            provided_routes < max_packed_routes
-            or provided_blocks < max_route_blocks
-        )
+        and (provided_routes < max_packed_routes or provided_blocks < max_route_blocks)
     ):
         raise ValueError(
             "W4A16 route-packing workspace is too small: "

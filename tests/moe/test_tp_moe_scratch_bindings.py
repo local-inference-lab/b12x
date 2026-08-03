@@ -525,6 +525,254 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
 
 
+def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trellis must not pay the generic W4A16 compile-bucket memory cost."""
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=512,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=3072,
+            core_token_counts=(3072,),
+            num_topk=8,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=64,
+        )
+    )
+
+    assert plan.layout.core_token_counts[0] == 3072
+    assert 4096 not in plan.layout.core_token_counts
+    assert plan.layout.route_workspace_nbytes == 0
+    # This GLM-5.2 Trellis geometry currently needs 1054.16 MiB. Keep a small
+    # alignment margin while rejecting the much larger generic 4096-token
+    # bucket that this fixed-capacity path exists to avoid.
+    min_fixed_capacity_bytes = 1000 * (1 << 20)
+    max_fixed_capacity_bytes = 1060 * (1 << 20)
+    assert (
+        min_fixed_capacity_bytes
+        < plan.layout.core_workspace_nbytes
+        < max_fixed_capacity_bytes
+    )
+    assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
+
+
+def test_trellis_scratch_plan_resolves_default_route_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: ((), ()),
+    )
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=512,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    caps = TPMoEScratchCaps(
+        max_tokens=3072,
+        core_token_counts=(3072,),
+        num_topk=8,
+        route_num_experts=0,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+    plan = plan_tp_moe_scratch(caps)
+
+    assert plan._core_workspace_plan.route_block_size_m == 64
+    assert plan.layout.core_token_counts[0] == 3072
+    assert 4096 not in plan.layout.core_token_counts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
+    """The real planner must cover every fixed decode and route-pack variant."""
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=8,
+            device="cuda",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+        )
+    )
+
+    assert tuple(tokens for tokens, _launch in plan._prewarmed_fused_launches) == (
+        1,
+        2,
+        3,
+        4,
+    )
+    assert {
+        (ids_dtype, mapped)
+        for ids_dtype, mapped, _launch in plan._prewarmed_topk_sum_launches
+    } == {
+        (torch.int32, False),
+        (torch.int32, True),
+        (torch.int64, False),
+        (torch.int64, True),
+    }
+
+
+def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fused_launches = tuple((tokens, object()) for tokens in range(1, 5))
+    sums = tuple(
+        (ids_dtype, mapped, object())
+        for ids_dtype in (torch.int32, torch.int64)
+        for mapped in (False, True)
+    )
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_plan_full_rotation_w4a16_launches",
+        lambda **_kwargs: (fused_launches, sums),
+    )
+    weight_plan = plan_sparkinfer_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            core_token_counts=(4,),
+            num_topk=2,
+            route_num_experts=0,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+        )
+    )
+    tensors = _runtime_tensors(n=128)
+    captured = {}
+
+    def _capture_binding(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_build_tp_moe_fp4_binding_from_views",
+        _capture_binding,
+    )
+    output_expert_map = torch.arange(8, dtype=torch.int32)
+    plan.bind(
+        scratch=_scratch_for_plan(plan),
+        **_binding_args(tensors, _experts(tensors, weight_plan)),
+        output_expert_map=output_expert_map,
+    )
+
+    assert plan._prewarmed_fused_launches == fused_launches
+    assert plan._prewarmed_topk_sum_launches == sums
+    assert captured["fused_launch"] is None
+    assert captured["topk_sum_launch"] is None
+
+
+@pytest.mark.parametrize("tokens", (1, 2))
+def test_w4a16_decode_scratch_covers_direct_topk_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+) -> None:
+    from sparkinfer.moe._shared.kernels.w4a16.host import (
+        max_packed_route_slots,
+        packed_gemm_scratch_elements,
+        select_route_block_size_m,
+    )
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    topk = 8
+    hidden_size = 7168
+    intermediate_size = 256
+    weight_plan = _weight_plan(
+        "w4a16",
+        experts=1,
+        k=hidden_size,
+        n=intermediate_size,
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+    plan = plan_tp_moe_scratch(
+        _caps(
+            weight_plan=weight_plan,
+            max_tokens=tokens,
+            num_topk=topk,
+            core_token_counts=(tokens,),
+            route_num_experts=0,
+        )
+    )
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+    block_size = select_route_block_size_m(tokens, topk, weight_plan.num_experts)
+    packed_slots = max_packed_route_slots(
+        tokens * topk,
+        block_size,
+        weight_plan.num_experts,
+    )
+    direct_slots = tokens * topk * block_size
+
+    assert direct_slots > packed_slots
+    assert tp_moe_impl._tensor_numel(specs["fc1_c_tmp"].shape) >= (
+        packed_gemm_scratch_elements(
+            size_n=2 * intermediate_size,
+            route_slots=direct_slots,
+            moe_block_size=block_size,
+            sms=120,
+        )
+    )
+    assert tp_moe_impl._tensor_numel(specs["fc2_c_tmp"].shape) >= (
+        packed_gemm_scratch_elements(
+            size_n=hidden_size,
+            route_slots=direct_slots,
+            moe_block_size=block_size,
+            sms=120,
+        )
+    )
+
+
 def test_w4a16_topk6_bucket_binds_with_planned_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -698,18 +946,45 @@ def test_tp_moe_scratch_plan_binding_maps_caller_owned_scratch() -> None:
     assert binding.topk_ids is tensors["topk_ids"]
 
 
-def test_non_trellis_plan_rejects_expert_maps() -> None:
+def test_non_w4a16_plan_rejects_expert_maps() -> None:
     plan = plan_tp_moe_scratch(_caps())
     scratch = _scratch_for_plan(plan)
     tensors = _runtime_tensors()
     route_expert_map = torch.arange(8, dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="require a full-rotation Trellis plan"):
+    with pytest.raises(ValueError, match="only supported for W4A16"):
         plan.bind(
             scratch=scratch,
             **_binding_args(tensors, _experts(tensors, plan.caps.weight_plan)),
             route_expert_map=route_expert_map,
         )
+
+
+def test_packed_w4a16_plan_binds_global_route_map() -> None:
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+    plan = plan_tp_moe_scratch(
+        _caps(
+            weight_plan=weight_plan,
+            route_num_experts=12,
+        )
+    )
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors()
+    route_expert_map = torch.full((12,), -1, dtype=torch.int32)
+    route_expert_map[:8] = torch.arange(8, dtype=torch.int32)
+
+    binding = plan.bind(
+        scratch=scratch,
+        **_binding_args(tensors, _experts(tensors, weight_plan)),
+        route_expert_map=route_expert_map,
+    )
+
+    assert binding.route_expert_map is route_expert_map
+    assert binding.weight_E == 8
+    assert plan._core_workspace_plan.route_E == 12
 
 
 def test_tp_moe_scratch_plan_binds_caller_owned_scratch() -> None:

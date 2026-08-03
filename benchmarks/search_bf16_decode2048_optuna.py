@@ -568,7 +568,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    bench.require_sm120()
+    bench.require_cuda()
     if args.replays < 100:
         raise ValueError("--replays must be at least 100")
     l2_flush_bytes = resolve_l2_flush_bytes(args.l2_flush_bytes)

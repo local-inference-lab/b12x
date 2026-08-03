@@ -106,12 +106,9 @@ class _GuardedOutput:
             )
 
 
-def require_sm120() -> None:
+def require_cuda() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    capability = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if capability != (12, 0):
-        raise RuntimeError(f"SM120 is required, found compute capability {capability}")
 
 
 def _capture_graph(fn: Callable[[], None], *, warmup: int) -> torch.cuda.CUDAGraph:
@@ -3886,7 +3883,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     args.profile = _canonical_profile_name(args.profile)
 
-    require_sm120()
+    require_cuda()
     if args.window_left < -1:
         raise ValueError("--window-left must be -1 or a non-negative token count")
     if args.mode != "legacy-matrix" and args.window_left != -1:

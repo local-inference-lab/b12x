@@ -1,7 +1,7 @@
 """sparkinfer — consumer-Blackwell (SM120/SM121) kernels.
 
 CuTe-DSL kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention (paged,
-sparse/compressed MLA, NSA indexing), quantization, mHC residual, and PCIe
+dense/sparse/compressed MLA, NSA indexing), quantization, mHC residual, and PCIe
 collectives, ported from the sparkinfer project.  One grammar everywhere:
 
 - ops live at ``sparkinfer.<group>.<op>`` and declare themselves via ``META``;
@@ -40,6 +40,7 @@ from ._lib.runtime_control import (
 # the explicit private-module overrides below by tests/test_registry.py.
 _OPS: tuple[str, ...] = (
     "attention.paged",
+    "attention.dense_mla",
     "attention.sparse_mla",
     "attention.compressed_mla",
     "attention.nsa_indexer",

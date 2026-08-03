@@ -219,6 +219,20 @@ def select_route_block_size_m(m: int, topk: int, num_experts: int) -> int:
     return _W4A16_ALLOWED_ROUTED_SIZES[-1]
 
 
+def route_block_sizes_for_capacity(
+    max_tokens: int,
+    topk: int,
+    num_experts: int,
+) -> tuple[int, ...]:
+    """Conservative block-size set reachable within a token capacity."""
+    max_tokens = max(int(max_tokens), 1)
+    first = select_route_block_size_m(1, topk, num_experts)
+    last = select_route_block_size_m(max_tokens, topk, num_experts)
+    first_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(first)
+    last_idx = _W4A16_ALLOWED_ROUTED_SIZES.index(last)
+    return _W4A16_ALLOWED_ROUTED_SIZES[first_idx : last_idx + 1]
+
+
 def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int:
     max_packed_routes = int(numel) + int(num_experts) * (int(block_size) - 1)
     if int(numel) < int(num_experts):
@@ -238,6 +252,27 @@ def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
 def route_pack_token_capacity(tokens: int, topk: int) -> int:
     del topk
     return 1 << (max(int(tokens), 1) - 1).bit_length()
+
+
+def route_pack_capacity(
+    numel: int,
+    block_size: int,
+    num_experts: int,
+    *,
+    topk: int = 1,
+    bucket_tokens: bool = True,
+) -> tuple[int, int, int]:
+    """Return the canonical routed-row, packed-slot, and block capacities."""
+    numel_capacity = (
+        route_pack_numel_capacity(numel, topk=topk)
+        if bucket_tokens
+        else max(int(numel), 1)
+    )
+    packed_routes = max_packed_route_slots(
+        numel_capacity, int(block_size), int(num_experts)
+    )
+    route_blocks = (packed_routes + int(block_size) - 1) // int(block_size)
+    return max(numel_capacity, 1), max(packed_routes, 1), max(route_blocks, 1)
 
 
 def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, int]:
@@ -300,6 +335,14 @@ def plan_w4a16_buffers(
             )
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
+    # Small-M tensor-core decode may bypass expert packing and assign one full
+    # M block to every top-k route. Its accumulation scratch is therefore
+    # sized from ``routed_rows * block_size_m``, which can exceed the packed
+    # upper bound once routed_rows > route_num_experts. Keep the generic buffer
+    # helper graph-safe for every currently supported TC-decode shape.
+    gemm_route_slots = route_slots
+    if int(m) <= 8 and bool(prepared.is_gated):
+        gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
     return W4A16BufferPlan(
         routed_rows=routed_rows,
@@ -308,13 +351,13 @@ def plan_w4a16_buffers(
         route_blocks=route_blocks,
         fc1_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=fc1_cols,
-            route_slots=route_slots,
+            route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
         fc2_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=hidden_size,
-            route_slots=route_slots,
+            route_slots=gemm_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
@@ -424,6 +467,7 @@ __all__ = [
     "plan_w4a16_buffers",
     "reorder_w13_to_gate_up",
     "route_pack_numel_capacity",
+    "route_pack_capacity",
     "route_pack_token_capacity",
     "select_route_block_size_m",
     "unswizzle_block_scale",

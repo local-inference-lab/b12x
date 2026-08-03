@@ -575,6 +575,99 @@ def test_nf3_and_trellis_share_the_w4a16_prepared_contract() -> None:
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_full_rotation_topk16_route_parallel_sum_matches_reference() -> None:
+    """Exercise the K3 decode epilogue's eight-warp route partition."""
+    torch.manual_seed(20260730)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = 16
+    hidden = intermediate = 128
+    bits = 3
+    tile_config = (64, 128, 64, 128)
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    gate_suh = scales((1, hidden)).contiguous()
+    up_suh = scales((1, hidden)).contiguous()
+    intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
+    down_svh = scales((1, hidden)).contiguous()
+    weights = _prepare_weights(
+        w13,
+        w2,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        activation="situ",
+        tile_config=tile_config,
+    )
+    plan = _plan(
+        weights,
+        max_tokens=1,
+        num_topk=topk,
+        route_num_experts=experts,
+        block_size_m=8,
+        device=device,
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    x = (torch.randn((1, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.randperm(experts, device=device).to(torch.int32).view(1, topk)
+    router_weights = torch.rand((1, topk), dtype=torch.float32, device=device)
+    router_weights /= router_weights.sum(dim=1, keepdim=True)
+
+    binding = fused_moe.bind(
+        plan,
+        scratch=scratch,
+        a=x,
+        experts=weights,
+        topk_weights=router_weights,
+        topk_ids=ids,
+    )
+    actual = binding.run().clone()
+    torch.cuda.synchronize(device)
+    reference = _reference_full_rotation(
+        x,
+        ids,
+        router_weights,
+        w13,
+        w2,
+        gate_suh,
+        up_suh,
+        intermediate_rotations,
+        down_svh,
+        activation="situ",
+    )
+    relative_error = (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = binding.run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, actual)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 def test_planned_full_rotation_matches_reference_and_captures(
@@ -723,6 +816,208 @@ def test_planned_full_rotation_matches_reference_and_captures(
     torch.cuda.synchronize(device)
     assert captured_output.data_ptr() == external_output.data_ptr()
     assert torch.allclose(captured_output, mapped_eager, rtol=2.0e-3, atol=2.0e-3)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact EXL3 layer sizes are runtime data, including the W13 plane stride."""
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    torch.manual_seed(20260730)
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden = intermediate = 128
+    topk = max_tokens = 2
+    route_experts = 4
+    bits = 3
+    tile_config = (64, 128, 64, 128)
+    w4a16_kernel.clear_w4a16_kernel_cache()
+
+    compiled_after_first: tuple[dict[tuple, int], dict[tuple, int]] | None = None
+    for experts in (2, 3):
+        w13 = torch.randint(
+            -32768,
+            32767,
+            (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+            dtype=torch.int16,
+            device=device,
+        )
+        w2 = torch.randint(
+            -32768,
+            32767,
+            (experts, intermediate // 16, hidden // 16, 16 * bits),
+            dtype=torch.int16,
+            device=device,
+        )
+
+        def scales(shape: tuple[int, ...]) -> torch.Tensor:
+            return (0.875 + 0.25 * torch.rand(shape, device=device)).to(
+                torch.float16
+            )
+
+        gate_suh = scales((experts, hidden)).contiguous()
+        up_suh = scales((experts, hidden)).contiguous()
+        intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
+        down_svh = scales((experts, hidden)).contiguous()
+        weights = _prepare_weights(
+            w13,
+            w2,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            tile_config=tile_config,
+        )
+        plan = _plan(
+            weights,
+            max_tokens=max_tokens,
+            num_topk=topk,
+            route_num_experts=route_experts,
+            block_size_m=8,
+            device=device,
+        )
+        spec = plan.scratch_specs()[0]
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        x = (torch.randn((max_tokens, hidden), device=device) * 1.0e-3).to(
+            torch.bfloat16
+        )
+        global_ids = torch.tensor(
+            [[0, 3], [2, 1]], dtype=torch.int32, device=device
+        )
+        expert_map = (
+            torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+            if experts == 2
+            else torch.tensor([0, 1, 2, 2], dtype=torch.int32, device=device)
+        )
+        local_ids = expert_map[global_ids]
+        router_weights = torch.tensor(
+            [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
+        )
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=weights,
+            topk_weights=router_weights,
+            topk_ids=global_ids,
+            route_expert_map=expert_map,
+            output_expert_map=expert_map,
+        )
+        if binding.fused_launch is not None:
+            assert binding.fused_launch.direct_topk_routes
+            assert binding.fused_launch.use_expert_map
+
+        def _route_pack_must_not_run(*args, **kwargs):
+            raise AssertionError("mapped decode unexpectedly invoked route packing")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                w4a16_kernel,
+                "pack_topk_routes_by_expert",
+                _route_pack_must_not_run,
+            )
+            actual = fused_moe.run(binding=binding).clone()
+        torch.cuda.synchronize(device)
+        reference = _reference_full_rotation(
+            x,
+            local_ids,
+            router_weights,
+            w13,
+            w2,
+            gate_suh,
+            up_suh,
+            intermediate_rotations,
+            down_svh,
+        )
+        relative_error = (actual - reference).norm() / reference.norm().clamp_min(
+            1.0e-9
+        )
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), reference.flatten(), dim=0
+        )
+        assert float(relative_error) <= 2.0e-2
+        assert float(cosine) >= 0.999
+
+        if experts == 2:
+            # Unmapped, negative, and out-of-range global ids must be rejected
+            # inside the fused kernel before weight access. The top-k sum must
+            # skip those stale route rows as well.
+            sparse_map = torch.tensor(
+                [0, -1, 1, -1], dtype=torch.int32, device=device
+            )
+            invalid_global_ids = torch.tensor(
+                [[0, 1], [route_experts + 3, -1]],
+                dtype=torch.int32,
+                device=device,
+            )
+            masked_router_weights = router_weights.clone()
+            masked_router_weights[0, 1] = 0.0
+            masked_router_weights[1].zero_()
+            invalid_binding = fused_moe.bind(
+                plan,
+                scratch=scratch,
+                a=x,
+                experts=weights,
+                topk_weights=router_weights,
+                topk_ids=invalid_global_ids,
+                route_expert_map=sparse_map,
+                output_expert_map=sparse_map,
+            )
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    w4a16_kernel,
+                    "pack_topk_routes_by_expert",
+                    _route_pack_must_not_run,
+                )
+                invalid_actual = invalid_binding.run().clone()
+            invalid_reference = _reference_full_rotation(
+                x,
+                torch.zeros_like(invalid_global_ids),
+                masked_router_weights,
+                w13,
+                w2,
+                gate_suh,
+                up_suh,
+                intermediate_rotations,
+                down_svh,
+            )
+            invalid_relative_error = (
+                (invalid_actual - invalid_reference).norm()
+                / invalid_reference.norm().clamp_min(1.0e-9)
+            )
+            assert float(invalid_relative_error) <= 2.0e-2
+            assert torch.count_nonzero(invalid_actual[1]) == 0
+
+            graph = torch.cuda.CUDAGraph()
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    w4a16_kernel,
+                    "pack_topk_routes_by_expert",
+                    _route_pack_must_not_run,
+                )
+                with torch.cuda.graph(graph):
+                    captured_invalid = invalid_binding.run()
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(captured_invalid, invalid_actual)
+
+        compiled_now = (
+            {
+                key: id(value.compiled)
+                for key, value in w4a16_kernel._FUSED_CACHE.items()
+            },
+            {
+                key: id(value.compiled)
+                for key, value in w4a16_kernel._SUM_CACHE.items()
+            },
+        )
+        if compiled_after_first is None:
+            compiled_after_first = compiled_now
+            assert compiled_after_first[0]
+            assert compiled_after_first[1]
+        else:
+            assert compiled_now == compiled_after_first
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

@@ -25,9 +25,25 @@ from benchmarks.benchmark_paged_attention import (
     _resolve_decode_graph_bucket_policy,
     _strict_backend_replay_for_correctness,
     _strict_guarded_replay_for_correctness,
+    require_cuda,
 )
 
 from tests._reference.helpers import require_sparkinfer
+
+
+def test_benchmark_requires_cuda_without_restricting_compute_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda *_args, **_kwargs: pytest.fail(
+            "the paged-attention benchmark must not restrict compute capability"
+        ),
+    )
+
+    require_cuda()
 
 
 def test_balanced_graph_replay_schedule_alternates_ab_ba_pairs() -> None:

@@ -423,6 +423,26 @@ def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
 
 
 @dsl_user_op
+def ld_global_v2_u32(base_ptr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from coherent global memory."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1)
+
+
+@dsl_user_op
 def ld_global_v4_u32(
     base_ptr: Int64, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
@@ -672,6 +692,33 @@ def st_global_v2_f32(base_ptr: Int64, v0: Float32, v1: Float32, *, loc=None, ip=
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def st_global_v2_u32(
+    base_ptr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store 64 bits (2 x uint32) to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(base_ptr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.u32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -6179,6 +6226,47 @@ def _trellis_mcg_asm_constants(asm: str) -> str:
         .replace("__MASK__", f"{_TRELLIS_MASK:#010x}")
         .replace("__OR__", f"{_TRELLIS_OR:#010x}")
     )
+
+
+@dsl_user_op
+def trellis_align_stream_u32x2(z0, z1, z2, shift, word_delta, *, loc=None, ip=None):
+    """Align two words from a two- or three-word circular Trellis span.
+
+    This is the 32-bit SHF equivalent of shifting a temporary 64/96-bit integer.
+    Keeping the operation on the native integer pipe avoids compiler-generated
+    wide-integer carry chains in the K6 dequantization hot loop.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(z0).ir_value(loc=loc, ip=ip),
+            Uint32(z1).ir_value(loc=loc, ip=ip),
+            Uint32(z2).ir_value(loc=loc, ip=ip),
+            Uint32(shift).ir_value(loc=loc, ip=ip),
+            Uint32(word_delta).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred two_words;
+            .reg .b32 mid, upper;
+            setp.eq.u32 two_words, $6, 1;
+            selp.b32 mid, $2, $3, two_words;
+            selp.b32 upper, 0, $2, two_words;
+            // PTX shf.r forms (b:a), so z0/mid and mid/upper are low/high.
+            shf.r.wrap.b32 $0, $4, mid, $5;
+            shf.r.wrap.b32 $1, mid, upper, $5;
+        }
+        """,
+        "=r,=r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
 
 
 @dsl_user_op

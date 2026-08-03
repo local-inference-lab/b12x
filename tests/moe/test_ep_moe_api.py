@@ -5,9 +5,18 @@ import torch
 
 import sparkinfer.moe.ep_moe._impl as ep_moe
 from sparkinfer._lib.intrinsics import swizzle_block_scale
-from sparkinfer.moe.ep_moe._impl import EPMoEScratchCaps, plan_ep_moe_scratch, prepare_ep_expert_map, sparkinfer_ep_moe_fp4
+from sparkinfer.moe.ep_moe._impl import (
+    EPMoEScratchCaps,
+    plan_ep_moe_scratch,
+    prepare_ep_expert_map,
+    sparkinfer_ep_moe_fp4,
+)
 from sparkinfer.moe.fused_moe._impl import plan_sparkinfer_fp4_moe_weights
-from sparkinfer.moe._shared.kernels.w4a16.host import max_w4a16_route_capacity
+from sparkinfer.moe._shared.kernels.w4a16.host import (
+    max_packed_route_slots,
+    route_block_sizes_for_capacity,
+    route_pack_token_capacity,
+)
 from tests._reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
 
 
@@ -116,7 +125,17 @@ def test_ep_scratch_reserves_route_pack_power_of_two_capacity(
     )
 
     layout = {spec.name: spec for spec in plan._layout}
-    expected_slots, expected_blocks = max_w4a16_route_capacity(4 * 2, 10)
+    block_sizes = route_block_sizes_for_capacity(3, 2, 10)
+    capacity_rows = route_pack_token_capacity(3, 2) * 2
+    expected_slots = max(
+        max_packed_route_slots(capacity_rows, block_size, 10)
+        for block_size in block_sizes
+    )
+    expected_blocks = max(
+        (max_packed_route_slots(capacity_rows, block_size, 10) + block_size - 1)
+        // block_size
+        for block_size in block_sizes
+    )
     assert layout["packed_route_indices"].elements == expected_slots
     assert layout["block_expert_ids"].elements == expected_blocks
     assert layout["intermediate_cache2"].elements == 3 * 2 * 128
@@ -154,14 +173,18 @@ def _make_modelopt_weights(
         device="cuda",
     )
     w13_scale = swizzle_block_scale(
-        (torch.rand(experts, 2 * intermediate_size, hidden_size // 16, device="cuda")
-         * 0.25
-         + 0.03125).to(torch.float8_e4m3fn)
+        (
+            torch.rand(experts, 2 * intermediate_size, hidden_size // 16, device="cuda")
+            * 0.25
+            + 0.03125
+        ).to(torch.float8_e4m3fn)
     )
     w2_scale = swizzle_block_scale(
-        (torch.rand(experts, hidden_size, intermediate_size // 16, device="cuda")
-         * 0.25
-         + 0.03125).to(torch.float8_e4m3fn)
+        (
+            torch.rand(experts, hidden_size, intermediate_size // 16, device="cuda")
+            * 0.25
+            + 0.03125
+        ).to(torch.float8_e4m3fn)
     )
     w13_alpha = (torch.rand(experts, device="cuda") * 0.1 + 0.05).float()
     w2_alpha = (torch.rand(experts, device="cuda") * 0.1 + 0.05).float()
@@ -318,9 +341,11 @@ def test_ep_binding_replays_with_changed_routes_under_cuda_graph() -> None:
     global_ids = torch.tensor([0, 2])
     experts = _prepare_experts(a, weights, global_ids)
     expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32, device="cuda")
-    topk_ids = torch.tensor([[1, 3]], dtype=torch.int32, device="cuda").expand(
-        m, -1
-    ).contiguous()
+    topk_ids = (
+        torch.tensor([[1, 3]], dtype=torch.int32, device="cuda")
+        .expand(m, -1)
+        .contiguous()
+    )
     topk_weights = torch.full((m, topk), 0.5, dtype=torch.float32, device="cuda")
     nonlocal_output, binding = _run_ep_rank(
         a=a,

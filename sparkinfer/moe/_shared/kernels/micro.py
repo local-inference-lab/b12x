@@ -106,9 +106,7 @@ def _fp6_micro_enabled() -> bool:
     Keeps the validated dynamic FP6 fused path as the only FP6 backend until
     the micro kernel is wired into dispatch and numerically proven.
     """
-    return os.environ.get(
-        "SPARKINFER_ENABLE_FP6_MICRO", "0"
-    ).strip().lower() not in (
+    return os.environ.get("SPARKINFER_ENABLE_FP6_MICRO", "0").strip().lower() not in (
         "",
         "0",
         "false",
@@ -562,7 +560,11 @@ class MoEMicroKernelBackend:
         col: Int32,
         n_cols: Int32,
     ) -> Float32:
-        addr = base_addr + ebase + Int64(kb16) * Int64(n_cols) + Int64(col)
+        # ModelOpt's E4M3 scale permutation is tiled in 64 output rows. Direct
+        # micro preparation retains the final padded tile so every permuted
+        # logical scale remains addressable.
+        packed_n_cols = (n_cols + Int32(63)) & ~Int32(63)
+        addr = base_addr + ebase + Int64(kb16) * Int64(packed_n_cols) + Int64(col)
         word = ld_global_nc_u32(addr & ~Int64(3))
         byte = (word >> Uint32((addr & Int64(3)) * Int64(8))) & Uint32(0xFF)
         return cvt_w4a16_packed_e4m3_scale_to_f32(byte)
@@ -712,11 +714,32 @@ class MoEMicroKernelBackend:
                 rows_per_warp_div = 4
             elif cfg.k_segments_aligned and cfg.k_segments == 12 and self.is_gated:
                 rows_per_warp_div = 1
-            num_fc1_chunks = min(num_fc1_chunks, n // (rows_per_warp_div * _BLOCK_SIZE))
+            num_fc1_chunks = min(
+                num_fc1_chunks,
+                max(1, n // (rows_per_warp_div * _BLOCK_SIZE)),
+            )
+            # The retile cap is a floor division, so it can choose a chunk
+            # count that no longer partitions a merely 16-aligned native
+            # ModelOpt intermediate (for example, n=144 caps 9 chunks at 4,
+            # yielding a truncated 36-value chunk). Walk down to the largest
+            # valid divisor so every FC1 chunk covers whole 16-value blocks.
+            # Aligned production shapes retain their existing geometry.
+            while num_fc1_chunks > 1 and (
+                n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0
+            ):
+                num_fc1_chunks -= 1
         if self.w4a16_mode and m > 1:
             # Keep W4A16 multi-token FC1 chunks narrow enough to stay within
-            # the 512-thread launch register limit.
-            num_fc1_chunks = max(num_fc1_chunks, n // (_BLOCK_SIZE * 2))
+            # the 512-thread launch register limit. The chunk count must still
+            # divide n into whole 16-value blocks: floor(n/32) silently made
+            # i_chunk non-integral at shapes such as n=144 (four 36-value
+            # chunks), so FC1 wrote only 128 of 144 logical values.
+            num_fc1_chunks = max(
+                num_fc1_chunks,
+                (n + (_BLOCK_SIZE * 2) - 1) // (_BLOCK_SIZE * 2),
+            )
+            while n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0:
+                num_fc1_chunks += 1
         if self.a8_mx_mode:
             # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
             # (the default policy picks i_chunk=16 at m<=2).
@@ -752,9 +775,7 @@ class MoEMicroKernelBackend:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
-        elif m == 1:
-            grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
-        elif m == 2:
+        elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
             grid_x = max(1, min(int(max_active_ctas), fc2_tasks))
@@ -815,11 +836,18 @@ class MoEMicroKernelBackend:
         k_row1 = k_row0 + Int32(1)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
+        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+            # Native ModelOpt rows contain exactly n/8 packed u32 values.
+            # w2_sf_cols is padded to four scale columns, so its control-block
+            # count overstates the physical W2/packed-scale extent when n is a
+            # multiple of 16 but not 64 (for example, n=144). Keep the existing
+            # predicate byte-for-byte for the aligned production shapes, and
+            # gate odd-shape loads against the logical packed row instead.
+            w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -857,10 +885,38 @@ class MoEMicroKernelBackend:
             row_mode_32_1 = k_row1 & Int32(31)
 
             kk_off = Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr(cfg.n < 256):
+                # The 128-u32 swizzle block pads narrow intermediates to 256
+                # logical values. FC1 writes only n/8 lanes in each 32-lane
+                # plane. Mask the remaining lanes before the dot: their
+                # weights are zero, but stale NaN scratch would make 0*NaN
+                # contaminate the warp reduction.
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1058,12 +1114,23 @@ class MoEMicroKernelBackend:
                 kk_off = Int32(kk) * n_u32_per_expert + chunk_base
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                # If the last 256-wide chunk overhangs a non-256-aligned n
-                # (e.g. n=384), lanes past num_cb index the uninitialized
-                # intermediate tail. The weight there is already masked to 0,
-                # but 0 * NaN = NaN, so mask the activation read too. Gated by
-                # constexpr so 256-aligned shapes emit no extra runtime work.
-                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    packed_u32 = Int32(nc * 32) + lane
+                    w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
+                # If the last 256-value chunk overhangs logical n, lanes past
+                # the exact native row read an unwritten intermediate tail.
+                # The padded scale grid can look full at widths such as n=496,
+                # so its control-block count is not a valid activation bound.
+                # The weight is zero there, but 0 * NaN still poisons the sum.
+                # Preserve the legacy predicate for non-W4A16 modes and emit
+                # no extra work for 256-aligned native ModelOpt shapes.
+                if cutlass.const_expr(
+                    (self.w4a16_mode and cfg.n % 256 != 0)
+                    or (
+                        (not self.w4a16_mode)
+                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
+                    )
+                ):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -1246,7 +1313,6 @@ class MoEMicroKernelBackend:
         k_row3 = k_row0 + Int32(3)
 
         lane_byte_off = Int64(lane) * Int64(4)
-        n_u32_per_expert = Int32(cfg.fc2_n_chunks * 128)
         token_inter_base = t * Int32(cfg.inter_u32)
         sf_cols = Int32(cfg.w2_sf_cols)
         num_cb = sf_cols >> Int32(2)
@@ -1471,6 +1537,8 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
+        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+            w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -1508,10 +1576,36 @@ class MoEMicroKernelBackend:
             ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
 
             kk_off = token_inter_base + Int32(kk) * Int32(128)
-            xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
-            xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
-            xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
-            xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+            if cutlass.const_expr(cfg.n < 256):
+                # Match the m==1 path above: the packed 128-u32 swizzle has
+                # unwritten padding whenever the logical intermediate is
+                # narrower than 256 values.
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+            else:
+                xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                xh2 = Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                xh3 = Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
 
             u_packed0 = (
                 ld_global_nc_u32(
@@ -1726,9 +1820,20 @@ class MoEMicroKernelBackend:
                 chunk_base = Int32(nc) * Int32(128)
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
+                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    packed_u32 = Int32(nc * 32) + lane
+                    w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
                 if cutlass.const_expr(nc + 1 < cfg.fc2_n_chunks):
                     next_cb_idx = Int32(nc + 1) * Int32(4) + lane_cb
-                    if next_cb_idx < num_cb:
+                    next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
+                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                        next_packed_u32 = Int32((nc + 1) * 32) + lane
+                        next_w_valid = (
+                            Int32(1)
+                            if next_packed_u32 < Int32(cfg.n // 8)
+                            else Int32(0)
+                        )
+                    if next_w_valid > Int32(0):
                         next_chunk_base = Int32(nc + 1) * Int32(128)
                         prefetch_global_l2(
                             w2_base_addr
@@ -1766,7 +1871,12 @@ class MoEMicroKernelBackend:
                         cfg.w2_sf_rows * cfg.w2_sf_cols
                     )
                     next_cb_idx = lane_cb
-                    if next_cb_idx < num_cb:
+                    next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
+                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                        next_w_valid = (
+                            Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                        )
+                    if next_w_valid > Int32(0):
                         prefetch_global_l2(
                             w2_base_addr
                             + next_ebase_w
@@ -1831,9 +1941,15 @@ class MoEMicroKernelBackend:
                                 w2s_base_addr + next_ebase_sf + next_bsf_off3
                             )
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
-                # See _m1_fc2_rowpair_wide: mask the intermediate tail read for
-                # non-256-aligned n (0 weight * NaN tail = NaN). constexpr-gated.
-                if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
+                # See _m1_fc2_rowpair_wide: logical n, not the padded scale
+                # grid, determines whether the native intermediate tail is live.
+                if cutlass.const_expr(
+                    (self.w4a16_mode and cfg.n % 256 != 0)
+                    or (
+                        (not self.w4a16_mode)
+                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
+                    )
+                ):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -2366,8 +2482,11 @@ class MoEMicroKernelBackend:
             # ---- FC1 weight load + dot product ----
             ebase_w = Int64(eid) * Int64(cfg.two_n) * Int64(cfg.k_half)
             ebase_sf = Int64(eid) * Int64(cfg.w1_sf_rows * cfg.w1_sf_cols)
-            ebase_sf_packed = Int64(eid) * Int64((cfg.k_dim // 32) * cfg.two_n)
-            ebase_sf_packed_e4m3 = Int64(eid) * Int64((cfg.k_dim // 16) * cfg.two_n)
+            e8m0_w1_n_cols = _align_up(cfg.two_n, 64)
+            ebase_sf_packed = Int64(eid) * Int64((cfg.k_dim // 32) * e8m0_w1_n_cols)
+            ebase_sf_packed_e4m3 = Int64(eid) * Int64(
+                (cfg.k_dim // 16) * _align_up(cfg.two_n, 64)
+            )
             thread_byte_off = Int64(lane) * Int64(cfg.k_half // 32)
             xh_buf_base = Int32(0)
             if cutlass.const_expr(cfg.k_segments == 2):
@@ -2537,7 +2656,7 @@ class MoEMicroKernelBackend:
 
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                            nc1 = Int32(cfg.two_n)
+                            nc1 = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -2661,7 +2780,7 @@ class MoEMicroKernelBackend:
 
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbbg = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                        nc1g = Int32(cfg.two_n)
+                        nc1g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -2978,7 +3097,7 @@ class MoEMicroKernelBackend:
                         sf_u5 = Float32(0.0)
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb_u = lane_seg_base >> Int32(1)
-                            nc_u = Int32(cfg.two_n)
+                            nc_u = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -3118,7 +3237,7 @@ class MoEMicroKernelBackend:
                     sf_g5 = Float32(0.0)
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbb_g = lane_seg_base >> Int32(1)
-                        nc_g = Int32(cfg.two_n)
+                        nc_g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -3356,7 +3475,7 @@ class MoEMicroKernelBackend:
 
                         if cutlass.const_expr(self.scale_format_e8m0_k32):
                             kbb_u = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                            nc_u = Int32(cfg.two_n)
+                            nc_u = Int32(e8m0_w1_n_cols)
                             u_k0 = self._ld_e8m0_scale(
                                 w1s_base_addr,
                                 ebase_sf_packed,
@@ -3538,7 +3657,7 @@ class MoEMicroKernelBackend:
 
                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                         kbb_g = (lane * Int32(cfg.k_segments)) >> Int32(1)
-                        nc_g = Int32(cfg.two_n)
+                        nc_g = Int32(e8m0_w1_n_cols)
                         g_k0 = self._ld_e8m0_scale(
                             w1s_base_addr,
                             ebase_sf_packed,
@@ -3833,7 +3952,7 @@ class MoEMicroKernelBackend:
                                 ebase_sf_packed,
                                 lane,
                                 row_u,
-                                Int32(cfg.two_n),
+                                Int32(e8m0_w1_n_cols),
                                 Int32(cfg.k_dim // 32),
                             )
                             sf_u1 = sf_u0
@@ -3869,7 +3988,7 @@ class MoEMicroKernelBackend:
                             ebase_sf_packed,
                             lane,
                             row_g,
-                            Int32(cfg.two_n),
+                            Int32(e8m0_w1_n_cols),
                             Int32(cfg.k_dim // 32),
                         )
                         sf_g1 = sf_g0
@@ -4363,7 +4482,7 @@ class MoEMicroKernelBackend:
                                         ebase_sf_packed,
                                         scale_col >> Int32(1),
                                         row_g,
-                                        Int32(cfg.two_n),
+                                        Int32(e8m0_w1_n_cols),
                                         Int32(cfg.k_dim // 32),
                                     )
                                     if valid_seg > Int32(0)
@@ -4420,7 +4539,7 @@ class MoEMicroKernelBackend:
                                             ebase_sf_packed,
                                             scale_col >> Int32(1),
                                             row_u,
-                                            Int32(cfg.two_n),
+                                            Int32(e8m0_w1_n_cols),
                                             Int32(cfg.k_dim // 32),
                                         )
                                         if valid_seg > Int32(0)
