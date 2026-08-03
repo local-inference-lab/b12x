@@ -26,6 +26,24 @@ def _scratch(plan: dense_mla.Plan) -> torch.Tensor:
     )
 
 
+def _guarded_scratch(
+    plan: dense_mla.Plan,
+    *,
+    guard_bytes: int = 16 * 1024 * 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return exact planned scratch surrounded by initialized canaries."""
+    (spec,) = plan.scratch_specs()
+    assert spec.dtype == torch.uint8
+    storage = torch.full(
+        (spec.nbytes + 2 * guard_bytes,),
+        0xA5,
+        dtype=torch.uint8,
+        device=spec.device,
+    )
+    scratch = storage.narrow(0, guard_bytes, spec.nbytes)
+    return storage, scratch
+
+
 def _assert_matches(
     output: torch.Tensor,
     lse: torch.Tensor,
@@ -533,6 +551,93 @@ def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
 
 
 @torch.inference_mode()
+def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
+    """The 1M K3 plan must not touch inactive split storage or cache pages."""
+    device = require_sparkinfer()
+    torch.manual_seed(20260803)
+    page_size = 768
+    page_width = (131_072 + page_size - 1) // page_size
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=FP8,
+            num_q_heads=48,
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=131_072,
+            max_page_table_width=page_width,
+            num_cache_pages=1,
+            use_cuda_graph=True,
+        )
+    )
+    assert plan.num_splits == 94
+
+    q_float = torch.randn(1, 48, QK_DIM, device=device) * 0.1
+    cache_float = torch.randn(1, page_size, QK_DIM, device=device) * 0.1
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache = (cache_float / kv_scale).to(FP8)
+    page_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([257], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    output = torch.empty(
+        1,
+        48,
+        VALUE_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    guarded_storage, scratch = _guarded_scratch(plan)
+    binding = dense_mla.bind(
+        plan,
+        scratch=scratch,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    dense_mla.compile(binding=binding)
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output, captured_lse = dense_mla.run(binding=binding)
+    graph.replay()
+    torch.cuda.synchronize()
+    guard_bytes = scratch.storage_offset()
+    expected_guard = torch.full(
+        (guard_bytes,),
+        0xA5,
+        dtype=torch.uint8,
+        device=device,
+    )
+    torch.testing.assert_close(guarded_storage[:guard_bytes], expected_guard)
+    torch.testing.assert_close(guarded_storage[-guard_bytes:], expected_guard)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    _assert_matches(
+        captured_output,
+        captured_lse,
+        expected_output,
+        expected_lse,
+    )
+
+
+@torch.inference_mode()
 def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
     device = require_sparkinfer()
     torch.manual_seed(20260803)
@@ -616,6 +721,104 @@ def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
         page_table,
         cache_seqlens,
         cu_seqlens_q,
+    )
+    _assert_matches(
+        actual_output,
+        actual_lse,
+        expected_output,
+        expected_lse,
+    )
+
+
+@torch.inference_mode()
+def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
+    device = require_sparkinfer()
+    torch.manual_seed(20260803)
+    page_size = 768
+    record_bytes = QK_DIM
+    page_stride_bytes = page_size * record_bytes
+    high_page = torch.iinfo(torch.int32).max // page_stride_bytes + 2
+    live_pages = 2
+    pages = high_page + live_pages
+    assert high_page * page_stride_bytes > torch.iinfo(torch.int32).max
+
+    cache = torch.empty(
+        pages,
+        page_size,
+        QK_DIM,
+        dtype=FP8,
+        device=device,
+    )
+    cache_float = torch.randn(
+        live_pages,
+        page_size,
+        QK_DIM,
+        device=device,
+    ) * 0.1
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    cache[high_page:] = (cache_float / kv_scale).to(FP8)
+    page_table = torch.arange(
+        high_page,
+        pages,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(1, live_pages)
+    assert (
+        int(page_table.min().item()) * cache.stride(0) * cache.element_size()
+        > torch.iinfo(torch.int32).max
+    )
+
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=FP8,
+            num_q_heads=HEADS,
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=page_size * live_pages,
+            max_page_table_width=live_pages,
+            num_cache_pages=pages,
+        )
+    )
+    q_float = torch.randn(1, HEADS, QK_DIM, device=device) * 0.1
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache_seqlens = torch.tensor(
+        [page_size + 9],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    output = torch.empty(
+        1,
+        HEADS,
+        VALUE_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
     )
     _assert_matches(
         actual_output,

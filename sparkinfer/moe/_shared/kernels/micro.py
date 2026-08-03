@@ -4381,7 +4381,16 @@ class MoEMicroKernelBackend:
                             gw1 = ld_global_nc_u32(
                                 gate_byte_addr + seg_byte_off + Int64(4)
                             )
-                            if cutlass.const_expr(self.w4a16_mode):
+                            if cutlass.const_expr(self.scale_format_e8m0_k32):
+                                sf_g = self._ld_e8m0_scale(
+                                    w1s_base_addr,
+                                    ebase_sf_packed,
+                                    scale_col >> Int32(1),
+                                    row_g,
+                                    Int32(e8m0_w1_n_cols),
+                                    Int32(cfg.k_dim // 32),
+                                )
+                            elif cutlass.const_expr(self.w4a16_mode):
                                 sf_g = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
                                     ebase_sf_packed_e4m3,
@@ -4402,7 +4411,16 @@ class MoEMicroKernelBackend:
                                 uw1 = ld_global_nc_u32(
                                     up_byte_addr + seg_byte_off + Int64(4)
                                 )
-                                if cutlass.const_expr(self.w4a16_mode):
+                                if cutlass.const_expr(self.scale_format_e8m0_k32):
+                                    sf_u = self._ld_e8m0_scale(
+                                        w1s_base_addr,
+                                        ebase_sf_packed,
+                                        scale_col >> Int32(1),
+                                        row_u,
+                                        Int32(e8m0_w1_n_cols),
+                                        Int32(cfg.k_dim // 32),
+                                    )
+                                elif cutlass.const_expr(self.w4a16_mode):
                                     sf_u = self._ld_e4m3_packed_scale_col(
                                         w1s_base_addr,
                                         ebase_sf_packed_e4m3,

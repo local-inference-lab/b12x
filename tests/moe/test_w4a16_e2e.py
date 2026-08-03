@@ -960,6 +960,95 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_e8m0_native_aligned_generic_fc1_uses_k32_scale_stride() -> None:
+    """K/32 scales keep their native expert stride in aligned generic FC1."""
+    experts, hidden_size, intermediate_size = 8, 512, 128
+    rows = 2 * intermediate_size
+    torch.manual_seed(20260803)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0(
+        (experts, hidden_size, intermediate_size // 32), offset=1
+    )
+    w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=1,
+        topk=2,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    intermediate_cache2 = torch.zeros(
+        2 * 128 * 2, dtype=torch.bfloat16, device="cuda"
+    )
+    x = torch.randn(1, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.tensor([[6, 7]], dtype=torch.int32, device="cuda")
+    topk_weights = torch.tensor([[0.4, 0.6]], dtype=torch.float32, device="cuda")
+
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        activation="silu",
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        x,
+        w13,
+        w13_scale,
+        w13_global_scale,
+        w2,
+        w2_scale,
+        w2_global_scale,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation="silu",
+        w13_layout="w31",
+    )
+    torch.cuda.synchronize()
+
+    assert bool((actual != 0).any().item())
+    _assert_matches_oracle(actual, expected, activation="silu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("w13_layout", ["w13", "w31"])
 @pytest.mark.parametrize("activation", ["relu2", "silu"])
 def test_w4a16_e8m0_native_large_m_uses_main_gemm(
@@ -1070,6 +1159,7 @@ def test_w4a16_e8m0_native_large_m_uses_main_gemm(
         # same logical-tail path must engage (2048/TP6 = 352, 3072/TP16 = 192).
         ("silu", 352),
         ("relu2", 192),
+        ("situ", 192),
     ],
 )
 def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
@@ -1078,7 +1168,7 @@ def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
 ) -> None:
     """Native E8M0 supports compact FC2 K tails without padding I to 32."""
     experts, hidden_size = 4, 128
-    rows = intermediate_size * (2 if activation == "silu" else 1)
+    rows = intermediate_size * (2 if activation in {"silu", "situ"} else 1)
     topk, m = 2, 24
     assert intermediate_size % 8 == 0
     assert intermediate_size % 128 != 0

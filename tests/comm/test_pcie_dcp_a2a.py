@@ -148,6 +148,21 @@ def test_reference_selects_destination_heads_and_combines_lse_weights():
     torch.testing.assert_close(rank1, torch.tensor([[[20.0], [0.0]]]))
 
 
+def test_reference_ignores_nan_output_from_empty_shard():
+    outputs = torch.tensor(
+        [
+            [[[[torch.nan], [2.0]]]],
+            [[[[4.0], [6.0]]]],
+        ],
+        dtype=torch.float32,
+    ).reshape(2, 1, 2, 1)
+    lses = torch.tensor([[[-torch.inf, 0.0]], [[0.0, 0.0]]])
+
+    actual = lse_reduce_scatter_reference(outputs, lses, 0)
+
+    torch.testing.assert_close(actual, torch.tensor([[[4.0]]]))
+
+
 def test_runtime_validates_and_dispatches_to_extension():
     ext = _FakeExt()
     runtime = _make_runtime(ext)
@@ -181,6 +196,13 @@ def test_runtime_validates_and_dispatches_to_extension():
         16,
         (2, 16, 64),
     )
+
+    fp8_input = torch.arange(16 * 64, dtype=torch.float32).reshape(1, 16, 64)
+    fp8_input = fp8_input.to(torch.float8_e4m3fn)
+    fp8_gathered = runtime.all_gather_heads(fp8_input)
+    assert fp8_gathered.dtype == torch.float8_e4m3fn
+    expected_fp8 = torch.cat((fp8_input, fp8_input), dim=1)
+    assert torch.equal(fp8_gathered.view(torch.uint8), expected_fp8.view(torch.uint8))
     runtime.close()
     assert ext.dispose_calls == [1234]
 
