@@ -1,4 +1,4 @@
-"""Exact Kimi-K3 TP12 decode all-reduce benchmark.
+"""Exact Kimi-K3 TP12/TP16 decode all-reduce benchmark.
 
 Measures CUDA-graph replay for the two BF16 collective shapes used by each K3
 MoE layer:
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import socket
+import argparse
 from statistics import median
 
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
@@ -204,7 +205,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def main() -> None:
-    world_size = 12
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--world-size", type=int, choices=(12, 16), default=16)
+    args = parser.parse_args()
+    world_size = args.world_size
     if torch.cuda.device_count() < world_size:
         raise RuntimeError(
             f"TP12 benchmark needs 12 CUDA devices, found {torch.cuda.device_count()}"
