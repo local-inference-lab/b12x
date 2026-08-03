@@ -239,6 +239,38 @@ def _pad_projection_major_w13(tier, compiled_experts: int):
     return replace(tier, w13=padded.view(-1), num_experts=int(compiled_experts))
 
 
+def _pad_exact_tier_storage(tier, compiled_experts: int):
+    """Materialize the full expert-sized storage contract used by ABI 5."""
+    materialized = int(tier.num_experts)
+    bits = int(tier.trellis_bits)
+    padded = _pad_projection_major_w13(tier, compiled_experts)
+    w2 = torch.zeros(
+        (
+            int(compiled_experts),
+            INTERMEDIATE // 16,
+            HIDDEN // 16,
+            8 * bits,
+        ),
+        dtype=torch.int32,
+        device=tier.w2.device,
+    )
+    w2[:materialized].copy_(tier.w2.view(materialized, *w2.shape[1:]))
+
+    def pad_global(source: torch.Tensor) -> torch.Tensor:
+        output = torch.ones(
+            int(compiled_experts), dtype=source.dtype, device=source.device
+        )
+        output[:materialized].copy_(source)
+        return output
+
+    return replace(
+        padded,
+        w2=w2.view(-1),
+        w13_global_scale=pad_global(tier.w13_global_scale),
+        w2_global_scale=pad_global(tier.w2_global_scale),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[1, 2, 4, 8, 32])
@@ -266,8 +298,8 @@ def main() -> None:
     tier1 = _prepared(4, materialized, 401, device)
     mixed_tier0 = mixed_tier1 = rotations = None
     if args.variant in ("both", "mixed"):
-        mixed_tier0 = _pad_projection_major_w13(tier0, K3_EXPERTS)
-        mixed_tier1 = _pad_projection_major_w13(tier1, K4_EXPERTS)
+        mixed_tier0 = _pad_exact_tier_storage(tier0, K3_EXPERTS)
+        mixed_tier1 = _pad_exact_tier_storage(tier1, K4_EXPERTS)
         rotations = _padded_rotations(tier0, tier1, device)
     global_map, descriptor = build_ordered_maps(K3_EXPERTS, K4_EXPERTS, device=device)
     map0 = torch.cat(
