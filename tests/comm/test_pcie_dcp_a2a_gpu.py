@@ -725,8 +725,8 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
@@ -746,8 +746,8 @@ def test_pcie_dcp_a2a_rejects_reduced_sm_slice_before_ipc_allocation():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "2"))
-    if world_size not in (2, 4, 8):
-        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, and 8")
+    if world_size not in (2, 4, 8, 16):
+        pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"

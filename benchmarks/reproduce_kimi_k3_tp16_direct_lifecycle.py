@@ -55,6 +55,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-start", type=int, default=0)
     parser.add_argument("--scan-stop", type=int)
     parser.add_argument("--scan-step", type=int, default=1)
+    parser.add_argument("--benchmark-warmups", type=int, default=0)
+    parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument(
         "--mode",
         choices=(
@@ -287,6 +289,24 @@ def main() -> None:
         run_m1()
     torch.cuda.synchronize(device)
     print(f"M=1 capture passed; finite={bool(torch.isfinite(output_m1).all())}")
+
+    if args.benchmark_iterations:
+        for _ in range(args.benchmark_warmups):
+            graph.replay()
+        torch.cuda.synchronize(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(args.benchmark_iterations):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed_ms = start.elapsed_time(end)
+        print(
+            f"M=1 graph benchmark: iterations={args.benchmark_iterations}; "
+            f"total_ms={elapsed_ms:.6f}; "
+            f"per_layer_ms={elapsed_ms / args.benchmark_iterations:.6f}"
+        )
 
     if args.mode == "capture-m1":
         output_m1.fill_(float("nan"))

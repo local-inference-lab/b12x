@@ -39,7 +39,7 @@ from .pcie_oneshot import (
 )
 
 
-SUPPORTED_WORLD_SIZES = (2, 4, 8)
+SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
 DCP_A2A_REQUIRED_SMS = 64

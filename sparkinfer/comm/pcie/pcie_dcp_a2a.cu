@@ -41,7 +41,7 @@
 namespace pcie_dcp_a2a {
 
 constexpr int kMaxBlocks = 64;
-constexpr int kMaxRanks = 8;
+constexpr int kMaxRanks = 16;
 constexpr int kFlagStride = 32;
 using FlagType = uint32_t;
 
@@ -503,8 +503,11 @@ public:
     case 8:
       LAUNCH(8);
       break;
+    case 16:
+      LAUNCH(16);
+      break;
     default:
-      throw std::runtime_error("PCIe DCP A2A supports 2, 4, or 8 ranks");
+      throw std::runtime_error("PCIe DCP A2A supports 2, 4, 8, or 16 ranks");
     }
 #undef LAUNCH
     CHECK_CUDA_SUCCESS(cudaGetLastError());
@@ -566,8 +569,12 @@ public:
     case 8:
       LAUNCH(8);
       break;
+    case 16:
+      LAUNCH(16);
+      break;
     default:
-      throw std::runtime_error("PCIe DCP all-gather supports 2, 4, or 8 ranks");
+      throw std::runtime_error(
+          "PCIe DCP all-gather supports 2, 4, 8, or 16 ranks");
     }
 #undef LAUNCH
     CHECK_CUDA_SUCCESS(cudaGetLastError());
@@ -584,7 +591,8 @@ static fptr_t init_dcp_a2a(const std::vector<fptr_t> &signal_ptrs,
                            int64_t output_capacity_elems, int64_t lse_offset,
                            int64_t lse_capacity, int64_t rank) {
   const int world_size = signal_ptrs.size();
-  TORCH_CHECK(world_size == 2 || world_size == 4 || world_size == 8);
+  TORCH_CHECK(world_size == 2 || world_size == 4 || world_size == 8 ||
+              world_size == 16);
   TORCH_CHECK_EQ(staging0_ptrs.size(), signal_ptrs.size());
   TORCH_CHECK_EQ(staging1_ptrs.size(), signal_ptrs.size());
   TORCH_CHECK(rank >= 0 && rank < world_size);

@@ -12,10 +12,24 @@ import torch.multiprocessing as mp
 from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
 
 
-TOTAL_HEADS = 32
-HEAD_DIM = 512
-QUERY_HEAD_DIM = 576
-MAX_BATCH = 8
+TOTAL_HEADS = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
+HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_HEAD_DIM", "512"))
+QUERY_HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
+MAX_BATCH = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_MAX_BATCH", "8"))
+
+
+def _csv_ints(name: str, default: str) -> tuple[int, ...]:
+    return tuple(int(value) for value in os.getenv(name, default).split(","))
+
+
+def _launches() -> tuple[tuple[int, int], ...]:
+    values: list[tuple[int, int]] = []
+    for raw in os.getenv(
+        "SPARKINFER_PCIE_DCP_A2A_LAUNCHES", "256x16"
+    ).split(","):
+        threads, blocks = raw.lower().split("x", 1)
+        values.append((int(threads), int(blocks)))
+    return tuple(values)
 
 
 def _free_port() -> int:
@@ -24,9 +38,13 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _capture(fn: Callable[[], None]) -> torch.cuda.CUDAGraph:
+def _capture(
+    fn: Callable[[], None],
+    pool: PCIeDCPA2APool,
+    channel_id: str,
+) -> torch.cuda.CUDAGraph:
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with pool.capture(channel_id=channel_id), torch.cuda.graph(graph):
         fn()
     return graph
 
@@ -66,6 +84,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
     )
     dtype = torch.bfloat16
+    query_dtype = (
+        torch.float8_e4m3fn
+        if os.getenv("SPARKINFER_PCIE_DCP_A2A_QUERY_DTYPE", "bf16") == "fp8"
+        else torch.bfloat16
+    )
     heads_per_rank = TOTAL_HEADS // world_size
     pool = PCIeDCPA2APool.from_process_group(
         process_group=dist.group.WORLD,
@@ -75,11 +98,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         head_dim=HEAD_DIM,
         query_head_dim=QUERY_HEAD_DIM,
     )
-    pool.for_stream()
+    batches = _csv_ints("SPARKINFER_PCIE_DCP_A2A_BATCHES", "1,2,4,8")
+    launches = _launches()
+    channel_ids = tuple(
+        f"benchmark:{batch}:{threads}:{blocks}:{operation}"
+        for batch in batches
+        for threads, blocks in launches
+        for operation in ("reduce", "gather", "pair")
+    )
+    pool.prepare_channels(channel_ids)
     try:
         if rank == 0:
-            print("batch,reduce_in_bytes,gather_in_bytes,reduce_us,gather_us")
-        for batch in (1, 2, 4, 8):
+            print(
+                "batch,threads,block_limit,reduce_in_bytes,gather_in_bytes,"
+                "reduce_us,gather_us,pair_us"
+            )
+        for batch in batches:
             reduce_out = torch.randn(
                 batch, TOTAL_HEADS, HEAD_DIM, dtype=dtype, device=device
             )
@@ -89,34 +123,71 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             reduce_result = torch.empty(
                 batch, heads_per_rank, HEAD_DIM, dtype=dtype, device=device
             )
-            reduce_graph = _capture(
-                lambda: pool.lse_reduce_scatter(
-                    reduce_out, reduce_lse, reduce_result
-                )
-            )
-
             gather_in = torch.randn(
                 batch, heads_per_rank, QUERY_HEAD_DIM, dtype=dtype, device=device
-            )
+            ).to(query_dtype)
             gather_out = torch.empty(
-                batch, TOTAL_HEADS, QUERY_HEAD_DIM, dtype=dtype, device=device
-            )
-            gather_graph = _capture(
-                lambda: pool.all_gather_heads(gather_in, gather_out)
+                batch,
+                TOTAL_HEADS,
+                QUERY_HEAD_DIM,
+                dtype=query_dtype,
+                device=device,
             )
 
-            reduce_us = _median_latency(reduce_graph, device)
-            gather_us = _median_latency(gather_graph, device)
-            if rank == 0:
-                reduce_bytes = reduce_out.numel() * dtype.itemsize
-                gather_bytes = gather_in.numel() * dtype.itemsize
-                print(
-                    f"{batch},{reduce_bytes},{gather_bytes},"
-                    f"{reduce_us:.3f},{gather_us:.3f}",
-                    flush=True,
+            for threads, block_limit in launches:
+                channel_prefix = f"benchmark:{batch}:{threads}:{block_limit}"
+                reduce_graph = _capture(
+                    lambda: pool.lse_reduce_scatter(
+                        reduce_out,
+                        reduce_lse,
+                        reduce_result,
+                        threads=threads,
+                        block_limit=block_limit,
+                    ),
+                    pool,
+                    f"{channel_prefix}:reduce",
                 )
-            del reduce_graph, gather_graph
-            torch.cuda.synchronize(device)
+                gather_graph = _capture(
+                    lambda: pool.all_gather_heads(
+                        gather_in,
+                        gather_out,
+                        threads=threads,
+                        block_limit=block_limit,
+                    ),
+                    pool,
+                    f"{channel_prefix}:gather",
+                )
+
+                def pair() -> None:
+                    pool.all_gather_heads(
+                        gather_in,
+                        gather_out,
+                        threads=threads,
+                        block_limit=block_limit,
+                    )
+                    pool.lse_reduce_scatter(
+                        reduce_out,
+                        reduce_lse,
+                        reduce_result,
+                        threads=threads,
+                        block_limit=block_limit,
+                    )
+
+                pair_graph = _capture(pair, pool, f"{channel_prefix}:pair")
+                reduce_us = _median_latency(reduce_graph, device)
+                gather_us = _median_latency(gather_graph, device)
+                pair_us = _median_latency(pair_graph, device)
+                if rank == 0:
+                    reduce_bytes = reduce_out.numel() * dtype.itemsize
+                    gather_bytes = gather_in.numel() * query_dtype.itemsize
+                    print(
+                        f"{batch},{threads},{block_limit},{reduce_bytes},"
+                        f"{gather_bytes},{reduce_us:.3f},{gather_us:.3f},"
+                        f"{pair_us:.3f}",
+                        flush=True,
+                    )
+                del reduce_graph, gather_graph, pair_graph
+                torch.cuda.synchronize(device)
     finally:
         pool.close()
         dist.destroy_process_group()
