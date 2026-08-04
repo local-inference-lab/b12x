@@ -17,6 +17,7 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
 )
 from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+    MixedTrellisRotations,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
@@ -31,14 +32,15 @@ from sparkinfer.moe._shared.kernels.w4a16.prepare import (
 HIDDEN = 6144
 INTERMEDIATE = 512
 TOPK = 8
-K3_EXPERTS = 192
-K4_EXPERTS = 64
-TOTAL_EXPERTS = K3_EXPERTS + K4_EXPERTS
 DEFAULT_TILE_CONFIG = (128, 128, 32, 512)
 
 
 def _key(layer: int, expert: int, projection: str, rank: int, field: str) -> str:
     return f"model.layers.{layer}.mlp.experts.{expert}.{projection}.rank{rank}.{field}"
+
+
+def _shared_key(layer: int, projection: str, rank: int, field: str) -> str:
+    return f"model.layers.{layer}.mlp.experts.shared_h.{projection}.rank{rank}.{field}"
 
 
 def _load_tier(
@@ -63,15 +65,22 @@ def _load_tier(
             )
             return host.to(device=device, non_blocking=False).contiguous()
 
+        def h_rotation(projection: str, field: str) -> torch.Tensor:
+            shared_key = _shared_key(layer, projection, rank, field)
+            if shared_key in handle.keys():
+                host = handle.get_tensor(shared_key).reshape(1, HIDDEN)
+                return host.to(device=device, non_blocking=False).contiguous()
+            return stack(projection, field)
+
         gate = stack("gate_proj", "trellis")
         up = stack("up_proj", "trellis")
         down = stack("down_proj", "trellis")
-        gate_suh = stack("gate_proj", "suh")
+        gate_suh = h_rotation("gate_proj", "suh")
         gate_svh = stack("gate_proj", "svh")
-        up_suh = stack("up_proj", "suh")
+        up_suh = h_rotation("up_proj", "suh")
         up_svh = stack("up_proj", "svh")
         down_suh = stack("down_proj", "suh")
-        down_svh = stack("down_proj", "svh")
+        down_svh = h_rotation("down_proj", "svh")
 
     expected_last = 16 * bits
     expected_projection = (
@@ -115,6 +124,52 @@ def _load_tier(
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
         tile_config=tile_config,
+    )
+
+
+def _combine_rotations(tier0, tier1) -> tuple[MixedTrellisRotations, bool, bool]:
+    broadcast_suh = tier0.gate_suh.shape[0] == tier1.gate_suh.shape[0] == 1
+    broadcast_svh = tier0.down_svh.shape[0] == tier1.down_svh.shape[0] == 1
+    if not broadcast_suh and (
+        tier0.gate_suh.shape[0] == 1 or tier1.gate_suh.shape[0] == 1
+    ):
+        raise ValueError("mixed shared/per-expert SUH layouts are unsupported")
+    if not broadcast_svh and (
+        tier0.down_svh.shape[0] == 1 or tier1.down_svh.shape[0] == 1
+    ):
+        raise ValueError("mixed shared/per-expert SVH layouts are unsupported")
+    if broadcast_suh and not (
+        torch.equal(tier0.gate_suh, tier1.gate_suh)
+        and torch.equal(tier0.up_suh, tier1.up_suh)
+    ):
+        raise ValueError("shared SUH rows differ between bitrate tiers")
+    if broadcast_svh and not torch.equal(tier0.down_svh, tier1.down_svh):
+        raise ValueError("shared SVH rows differ between bitrate tiers")
+    if not broadcast_suh and not broadcast_svh:
+        return combine_trellis_rotations(tier0, tier1), False, False
+    return (
+        MixedTrellisRotations(
+            intermediate=torch.cat(
+                (tier0.intermediate_rotations, tier1.intermediate_rotations), dim=0
+            ).contiguous(),
+            gate_suh=(
+                tier0.gate_suh
+                if broadcast_suh
+                else torch.cat((tier0.gate_suh, tier1.gate_suh), dim=0).contiguous()
+            ),
+            up_suh=(
+                tier0.up_suh
+                if broadcast_suh
+                else torch.cat((tier0.up_suh, tier1.up_suh), dim=0).contiguous()
+            ),
+            down_svh=(
+                tier0.down_svh
+                if broadcast_svh
+                else torch.cat((tier0.down_svh, tier1.down_svh), dim=0).contiguous()
+            ),
+        ),
+        broadcast_suh,
+        broadcast_svh,
     )
 
 
@@ -220,11 +275,12 @@ def main() -> None:
     bitrates = [int(bits) for bits in bitmap[str(args.layer)]["k"]]
     k3_ids = [expert for expert, bits in enumerate(bitrates) if bits == 3]
     k4_ids = [expert for expert, bits in enumerate(bitrates) if bits == 4]
-    if len(k3_ids) != K3_EXPERTS or len(k4_ids) != K4_EXPERTS:
+    if not k3_ids or not k4_ids or len(k3_ids) + len(k4_ids) != len(bitrates):
         raise ValueError(
-            f"expected {K3_EXPERTS} K3 and {K4_EXPERTS} K4 experts, "
-            f"got {len(k3_ids)} and {len(k4_ids)}"
+            "checkpoint layer must contain only non-empty K3 and K4 tiers; "
+            f"got K3={len(k3_ids)} K4={len(k4_ids)} total={len(bitrates)}"
         )
+    total_experts = len(bitrates)
 
     print(
         f"loading layer={args.layer} rank={args.rank} K3={len(k3_ids)} K4={len(k4_ids)}"
@@ -248,8 +304,8 @@ def main() -> None:
         device=device,
     )
     global_to_combined, descriptor = build_tiered_maps(k3_ids, k4_ids, device=device)
-    map0 = torch.full((TOTAL_EXPERTS,), -1, dtype=torch.int32, device=device)
-    map1 = torch.full((TOTAL_EXPERTS,), -1, dtype=torch.int32, device=device)
+    map0 = torch.full((total_experts,), -1, dtype=torch.int32, device=device)
+    map1 = torch.full((total_experts,), -1, dtype=torch.int32, device=device)
     map0[torch.tensor(k3_ids, dtype=torch.long, device=device)] = torch.arange(
         len(k3_ids), dtype=torch.int32, device=device
     )
@@ -281,7 +337,8 @@ def main() -> None:
         )
 
     props = torch.cuda.get_device_properties(device)
-    route_slots = max_packed_route_slots(capacity * TOPK, 8, TOTAL_EXPERTS)
+    rotations, broadcast_suh, broadcast_svh = _combine_rotations(tier0, tier1)
+    route_slots = max_packed_route_slots(capacity * TOPK, 8, total_experts)
     launch = compile_mixed_trellis(
         size_m=capacity,
         hidden_size=HIDDEN,
@@ -293,11 +350,12 @@ def main() -> None:
         sms=int(props.multi_processor_count),
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=tile_config,
+        broadcast_suh=broadcast_suh,
+        broadcast_svh=broadcast_svh,
     )
     buffers = make_mixed_trellis_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
     )
-    rotations = combine_trellis_rotations(tier0, tier1)
 
     def mixed_fn() -> torch.Tensor:
         return run_mixed_trellis(
@@ -339,6 +397,7 @@ def main() -> None:
     allocated = torch.cuda.memory_allocated(device) / 2**30
     print(
         f"PASS m={args.m} capacity={capacity} tile={tile_config} "
+        f"K3/K4={len(k3_ids)}/{len(k4_ids)} shared-H={broadcast_suh}/{broadcast_svh} "
         f"rel={float(relative):.6e} "
         f"cos={float(cosine):.9f} "
         f"serial={serial_us:.2f}us mixed={mixed_us:.2f}us "
