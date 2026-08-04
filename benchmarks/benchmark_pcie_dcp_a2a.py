@@ -24,9 +24,7 @@ def _csv_ints(name: str, default: str) -> tuple[int, ...]:
 
 def _launches() -> tuple[tuple[int, int], ...]:
     values: list[tuple[int, int]] = []
-    for raw in os.getenv(
-        "B12X_PCIE_DCP_A2A_LAUNCHES", "256x16"
-    ).split(","):
+    for raw in os.getenv("B12X_PCIE_DCP_A2A_LAUNCHES", "256x16").split(","):
         threads, blocks = raw.lower().split("x", 1)
         values.append((int(threads), int(blocks)))
     return tuple(values)
@@ -84,11 +82,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
     )
     dtype = torch.bfloat16
-    query_dtype = (
-        torch.float8_e4m3fn
-        if os.getenv("B12X_PCIE_DCP_A2A_QUERY_DTYPE", "bf16") == "fp8"
-        else torch.bfloat16
+    query_dtype_name = (
+        os.getenv("B12X_PCIE_DCP_A2A_QUERY_DTYPE", "bf16").strip().lower()
     )
+    query_dtypes = {
+        "bf16": torch.bfloat16,
+        "fp8": torch.float8_e4m3fn,
+    }
+    try:
+        query_dtype = query_dtypes[query_dtype_name]
+    except KeyError:
+        raise ValueError(
+            "B12X_PCIE_DCP_A2A_QUERY_DTYPE must be 'bf16' or 'fp8'"
+        ) from None
     heads_per_rank = TOTAL_HEADS // world_size
     pool = PCIeDCPA2APool.from_process_group(
         process_group=dist.group.WORLD,
@@ -198,9 +204,7 @@ def main() -> None:
         raise SystemExit("CUDA is required")
     world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "8"))
     if torch.cuda.device_count() < world_size:
-        raise SystemExit(
-            f"need {world_size} GPUs, found {torch.cuda.device_count()}"
-        )
+        raise SystemExit(f"need {world_size} GPUs, found {torch.cuda.device_count()}")
     mp.spawn(
         _worker,
         args=(world_size, _free_port()),
