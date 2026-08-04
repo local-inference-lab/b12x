@@ -339,6 +339,25 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     )
     assert buffers.fc2.data_ptr() == buffers.rotation_gate.data_ptr()
 
+    misaligned_x = torch.empty(m * hidden + 1, dtype=torch.bfloat16, device=device)[
+        1:
+    ].view(m, hidden)
+    assert misaligned_x.is_contiguous()
+    assert misaligned_x.data_ptr() % 16 != 0
+    with pytest.raises(ValueError, match=r"input.*16-byte alignment"):
+        run_mixed_trellis(
+            misaligned_x,
+            tier0,
+            tier1,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            rotations,
+            launch,
+            buffers,
+        )
+
     misaligned_intermediate = torch.empty(
         rotations.intermediate.numel() + 1, dtype=torch.float16, device=device
     )[1:]
@@ -549,6 +568,19 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
             broadcast_rotations,
             expanded_launch,
             expanded_buffers,
+        )
+    with pytest.raises(ValueError, match=r"gate SUH.*128 elements"):
+        run_mixed_trellis(
+            x,
+            tier0,
+            tier1,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            expanded_rotations,
+            broadcast_launch,
+            broadcast_buffers,
         )
 
     broadcast = run_mixed_trellis(

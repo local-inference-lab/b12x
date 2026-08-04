@@ -1230,6 +1230,8 @@ def run_mixed_trellis(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"mixed Trellis {name} must be contiguous")
+    if int(x.data_ptr()) % 16 != 0:
+        raise ValueError("mixed Trellis input must have at least 16-byte alignment")
     for name, tier, expected_experts in (
         ("tier0", tier0, launch.tier0_num_experts),
         ("tier1", tier1, launch.tier1_num_experts),
