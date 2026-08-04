@@ -2966,8 +2966,14 @@ def wo_projection_inv_rope_mxfp8(
     expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Run WO projection from attention output without BF16 inverse-RoPE storage."""
+    """Run WO projection from attention output without BF16 inverse-RoPE storage.
 
+    The planned binding path writes every intermediate and the final output
+    into caller-owned arena views.  The functional path retains the opaque
+    allocating op needed by dynamic ``torch.compile`` callers.
+    """
+
+    bound_views = binding is not None
     if binding is not None:
         extras = [
             name
@@ -3006,6 +3012,10 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim = binding.rope_dim
         return_3d = binding.return_3d
         expected_m = binding.expected_m
+        x_q = binding.x_q
+        tmp = binding.tmp
+        tmp_q = binding.tmp_q
+        output = binding.output
     if (
         o is None
         or positions is None
@@ -3030,10 +3040,62 @@ def wo_projection_inv_rope_mxfp8(
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
         expected_m = int(tokens)
+    if bound_views:
+        alpha_one = _cached_alpha_one(o.device)
+        atomic_output_precleared = tokens <= 8
+        _run_wo_a_quant_kernel(
+            o,
+            positions,
+            cos_sin_cache,
+            x_q.values,
+            x_q.scale_rows,
+            x_q.scale_mma,
+            tokens,
+            weights.groups,
+            heads_per_group,
+            weights.group_width,
+            nope_dim + rope_dim,
+            nope_dim,
+            rope_dim,
+            clear_output=output if atomic_output_precleared else None,
+        )
+        wo_a_dense_gemm_mxfp8(
+            x_q,
+            weights.wo_a,
+            out=tmp,
+            alpha=alpha_one,
+            expected_m=expected_m,
+            sfb_k_replicated=weights.sfb_k_replicated,
+            stream=stream,
+        )
+        if atomic_output_precleared:
+            wo_b_dense_gemm_fused_quant_mxfp8(
+                tmp,
+                weights.wo_b,
+                out=output,
+                expected_m=expected_m,
+                sfb_k_replicated=weights.sfb_k_replicated,
+                _atomic_output_precleared=True,
+                stream=stream,
+            )
+        else:
+            quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
+            wo_b_dense_gemm_mxfp8(
+                tmp_q,
+                weights.wo_b,
+                out=output,
+                alpha=alpha_one,
+                expected_m=expected_m,
+                sfb_k_replicated=weights.sfb_k_replicated,
+                stream=stream,
+            )
+        if return_3d:
+            return output
+        return output[:, :, 0]
     # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
     # gemm chain internally, so the token-shaped activation MXFP8 views never
     # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any
-    # bound scratch is intentionally unused here.
+    # functional-path intermediates remain internal here.
     output = torch.ops.b12x.wo_projection_inv_rope_mxfp8_fused(
         o,
         positions,

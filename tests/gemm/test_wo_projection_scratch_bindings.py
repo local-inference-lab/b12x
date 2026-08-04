@@ -168,55 +168,54 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     )
     calls = {}
 
-    def fake_fused(
+    def fake_quantize(
         o_arg,
         positions_arg,
         cos_sin_cache_arg,
-        wo_a_values,
-        wo_a_values_tiled,
-        wo_a_scale_rows,
-        wo_a_scale_mma,
-        wo_b_values,
-        wo_b_values_tiled,
-        wo_b_scale_rows,
-        wo_b_scale_mma,
+        out_values,
+        out_scale_rows,
+        out_scale_mma,
+        tokens,
         groups,
-        group_width,
-        rank,
-        hidden,
         heads_per_group,
+        group_width,
+        head_dim,
         nope_dim,
         rope_dim,
-        expected_m,
-        sfb_k_replicated,
-        stream_int,
+        clear_output=None,
     ):
         calls["o"] = o_arg
         calls["positions"] = positions_arg
         calls["cos_sin_cache"] = cos_sin_cache_arg
-        calls["wo_a_values"] = wo_a_values
-        calls["wo_a_scale_rows"] = wo_a_scale_rows
-        calls["wo_a_scale_mma"] = wo_a_scale_mma
-        calls["wo_b_values"] = wo_b_values
-        calls["wo_b_scale_rows"] = wo_b_scale_rows
-        calls["wo_b_scale_mma"] = wo_b_scale_mma
+        calls["x_q_values"] = out_values
+        calls["x_q_scale_rows"] = out_scale_rows
+        calls["x_q_scale_mma"] = out_scale_mma
         calls["groups"] = groups
         calls["group_width"] = group_width
-        calls["rank"] = rank
-        calls["hidden"] = hidden
         calls["heads_per_group"] = heads_per_group
+        calls["head_dim"] = head_dim
         calls["nope_dim"] = nope_dim
         calls["rope_dim"] = rope_dim
-        calls["expected_m"] = expected_m
-        calls["sfb_k_replicated"] = sfb_k_replicated
-        calls["stream_int"] = stream_int
-        return torch.empty((o_arg.shape[0], hidden, 1), dtype=o_arg.dtype)
+        calls["clear_output"] = clear_output
 
-    monkeypatch.setattr(
-        wo_impl.torch.ops.b12x,
-        "wo_projection_inv_rope_mxfp8_fused",
-        fake_fused,
-    )
+    def fake_wo_a(x_q, wo_a, *, out, expected_m=None, stream=None, **kwargs):
+        calls["x_q"] = x_q
+        calls["wo_a"] = wo_a
+        calls["tmp_out"] = out
+        calls["expected_m"] = expected_m
+        calls["wo_a_stream"] = stream
+        return out
+
+    def fake_wo_b(tmp, wo_b, *, out, expected_m=None, stream=None, **kwargs):
+        calls["tmp"] = tmp
+        calls["wo_b"] = wo_b
+        calls["output_out"] = out
+        calls["wo_b_stream"] = stream
+        return out
+
+    monkeypatch.setattr(wo_impl, "_run_wo_a_quant_kernel", fake_quantize)
+    monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
+    monkeypatch.setattr(wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b)
 
     out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)
 
@@ -225,22 +224,26 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     assert calls["o"] is o
     assert calls["positions"] is positions
     assert calls["cos_sin_cache"] is cos_sin_cache
-    assert calls["wo_a_values"] is weights.wo_a.values
-    assert calls["wo_a_scale_rows"] is weights.wo_a.scale_rows
-    assert calls["wo_a_scale_mma"] is weights.wo_a.scale_mma
-    assert calls["wo_b_values"] is weights.wo_b.values
-    assert calls["wo_b_scale_rows"] is weights.wo_b.scale_rows
-    assert calls["wo_b_scale_mma"] is weights.wo_b.scale_mma
+    assert calls["x_q_values"] is binding.x_q.values
+    assert calls["x_q_scale_rows"] is binding.x_q.scale_rows
+    assert calls["x_q_scale_mma"] is binding.x_q.scale_mma
+    assert calls["x_q"] is binding.x_q
+    assert calls["wo_a"] is weights.wo_a
+    assert calls["tmp_out"] is binding.tmp
+    assert calls["tmp"] is binding.tmp
+    assert calls["wo_b"] is weights.wo_b
+    assert calls["output_out"] is binding.output
     assert calls["groups"] == 2
     assert calls["group_width"] == 128
-    assert calls["rank"] == 64
-    assert calls["hidden"] == 256
     assert calls["heads_per_group"] == 1
+    assert calls["head_dim"] == 128
     assert calls["nope_dim"] == 96
     assert calls["rope_dim"] == 32
     assert calls["expected_m"] == 3
-    assert calls["sfb_k_replicated"] == weights.sfb_k_replicated
-    assert calls["stream_int"] == 123
+    assert calls["clear_output"] is binding.output
+    assert calls["wo_a_stream"] == 123
+    assert calls["wo_b_stream"] == 123
+    assert out.data_ptr() == binding.output.data_ptr()
     assert out.shape == (3, 256, 1)
 
 

@@ -70,6 +70,46 @@ def _make_wo_projection_binding(
     )
 
 
+def _make_wo_projection_inv_rope_binding(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights,
+    *,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    expected_m: int | None = None,
+):
+    tokens = int(o.shape[0])
+    plan = plan_wo_projection_scratch(
+        WOProjectionScratchCaps(
+            device=o.device,
+            max_tokens=tokens,
+            groups=int(weights.groups),
+            group_width=int(weights.group_width),
+            rank=int(weights.rank),
+            hidden=int(weights.hidden),
+            dtype=o.dtype,
+        )
+    )
+    scratch = tuple(
+        torch.empty(shape, dtype=dtype, device=o.device)
+        for shape, dtype in plan.shapes_and_dtypes()
+    )
+    return plan.bind_inv_rope(
+        scratch=scratch,
+        o=o,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        weights=weights,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        expected_m=expected_m,
+    )
+
+
 def _sglang_wo_a_input_quant_reference(source_tgd: torch.Tensor) -> MXFP8Rows:
     tokens, groups, group_width = source_tgd.shape
     chunks = group_width // WO_A_INPUT_QUANT_GROUP_SIZE
@@ -734,6 +774,93 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     assert bool(torch.isfinite(replayed).all().item())
     assert bool((replayed != 0).any().item())
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", (1, 16))
+def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
+    tokens: int,
+) -> None:
+    require_b12x()
+    torch.manual_seed(31014 + tokens)
+
+    groups, heads_per_group = 2, 4
+    nope_dim, rope_dim = 96, 32
+    head_dim = nope_dim + rope_dim
+    group_width = heads_per_group * head_dim
+    rank, hidden = 64, 128
+    o = (
+        torch.randn(
+            (tokens, groups * heads_per_group, head_dim),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        / 4
+    ).contiguous()
+    positions = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    cos_sin_cache = torch.zeros(
+        (tokens + 1, rope_dim), device="cuda", dtype=torch.float32
+    )
+    cos_sin_cache[:, : rope_dim // 2] = 1
+    wo_a = (
+        torch.randn(
+            (groups, rank, group_width), device="cuda", dtype=torch.bfloat16
+        )
+        / group_width**0.5
+    )
+    wo_b = (
+        torch.randn(
+            (hidden, groups * rank), device="cuda", dtype=torch.bfloat16
+        )
+        / (groups * rank) ** 0.5
+    )
+    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
+    binding = _make_wo_projection_inv_rope_binding(
+        o,
+        positions,
+        cos_sin_cache,
+        weights,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        expected_m=tokens,
+    )
+
+    expected = wo_projection_inv_rope_mxfp8(
+        o,
+        positions,
+        cos_sin_cache,
+        weights,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        expected_m=tokens,
+    ).clone()
+    actual = wo_projection_inv_rope_mxfp8(binding=binding)
+    torch.cuda.synchronize()
+    assert actual.data_ptr() == binding.output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wo_projection_inv_rope_mxfp8(binding=binding)
+    o.copy_(torch.randn_like(o) / 4)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()
+    expected_replay = wo_projection_inv_rope_mxfp8(
+        o,
+        positions,
+        cos_sin_cache,
+        weights,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        expected_m=tokens,
+    ).clone()
+    torch.cuda.synchronize()
+
+    assert captured.data_ptr() == binding.output.data_ptr()
+    torch.testing.assert_close(replayed, expected_replay, rtol=0, atol=0)
 
 
 def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
