@@ -3257,18 +3257,19 @@ def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
 ):
-    """NVFP4 GLM TP4 XV-NoPE with H8 swap-AB fragment layout.
+    """Full-occupancy NVFP4 GLM TP4 XV-NoPE for the native H8 path.
 
-    P (probabilities) from S4 are in registers as ``w_pre`` in the swapped
-    (candidate x head) layout.  This function transposes them to (head x
-    candidate) by storing to the ``sm_p_full`` smem buffer, then loads via
-    ldmatrix as the A operand.  V is dequanted from E2M1 to BF16 in registers
-    as the B operand.  A single BF16 m16n8k16 MMA per (vc, nt) replaces the
-    FP8 path's 2-pass HIGH/LOW residual cycle.
+    The four math warps own disjoint 16-candidate probability fragments, so a
+    minimal 8x64 BF16 shared-memory rendezvous remains necessary before any
+    one warp can reduce all candidates.  After that rendezvous the MMA is
+    transposed: A is ``V.T`` (sixteen output dimensions by candidates) and B
+    is P (candidates by eight heads).  All rows of the m16n8 tile are useful,
+    halving the BF16 PV MMA count relative to the padded H8 implementation.
 
-    The output accumulator ``acc_nope`` uses the ordinary m16n8 output-row
-    mapping (lane gid owns head gid), matching the existing H8 FP8 S6 and
-    the S7 epilogue.
+    Each warp pairs its ordinary eight-dimension epilogue tile with the tile
+    32 dimensions above it.  The resulting dimension-major MMA fragment is
+    transposed through warp shuffles into the established head-major
+    ``acc_nope`` ABI, so online-softmax rescaling and S7 remain unchanged.
     """
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
@@ -3278,7 +3279,8 @@ def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
     cand0 = warp_id * Int32(16) + gid
     cand1 = cand0 + Int32(8)
 
-    # --- Store P to sm_p_full in (head x candidate) layout for ldmatrix A. ---
+    # Store each warp's register-owned P into the shared 8x64 matrix. This is
+    # the only cross-warp exchange; rows 8..15 are never read by this path.
     # w_pre[0],[1] = P[cand0, head0], P[cand0, head1]
     # w_pre[2],[3] = P[cand1, head0], P[cand1, head1]
     # sm_p_full is indexed as (head, candidate) with stride sm_p_stride.
@@ -3299,95 +3301,152 @@ def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
         w_pre[3],
     )
 
-    # ldmatrix.x4 reads a full 16-row A tile even though native GLM H8 only
-    # owns rows 0..7. Keep the architecturally-unused rows deterministic so
-    # their discarded accumulator fragments cannot depend on stale shared
-    # memory or turn into NaNs under sanitizers and graph replay.
-    upper_row_elem = tid_flat
-    while upper_row_elem < Int32(8 * sm_p_stride):
-        st_shared_bf16_from_f32(
-            sm_p_full_addr
-            + (Int32(8 * sm_p_stride) + upper_row_elem) * Int32(2),
-            Float32(0.0),
-        )
-        upper_row_elem += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
-    # --- PV MMA loop: A = P (head x cand) from smem, B = V (cand x d_v) regs. ---
-    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
-    a_col = (lane >> Int32(4)) * Int32(8)
-
+    # A = V.T uses two non-contiguous eight-row dimension tiles so one MMA
+    # fills the two existing nt slots owned by this warp. B = P is loaded as
+    # the ordinary K-major candidate x head operand from shared memory.
     for vc in cutlass.range_constexpr(n_v_chunks):
-        for nt in cutlass.range_constexpr(nt_per_warp_xv):
-            dim_base = Int32(vc) * Int32(v_chunk) + (
-                Int32(nt) * Int32(n_warps) + warp_id
-            ) * Int32(8)
-            col = dim_base + gid
-            xv0 = Float32(0.0)
-            xv1 = Float32(0.0)
-            xv2 = Float32(0.0)
-            xv3 = Float32(0.0)
-            for ks in cutlass.range_constexpr(bi // 16):
-                k_base = Int32(ks) * Int32(16)
-                # A: P (head x candidate) from smem via ldmatrix.
-                a_byte = (a_row * Int32(sm_p_stride) + (k_base + a_col)) * Int32(2)
-                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+        dim_lo = Int32(vc) * Int32(v_chunk) + warp_id * Int32(8) + gid
+        dim_hi = dim_lo + Int32(n_warps * 8)
+        xv0 = Float32(0.0)
+        xv1 = Float32(0.0)
+        xv2 = Float32(0.0)
+        xv3 = Float32(0.0)
+        for ks in cutlass.range_constexpr(bi // 16):
+            k_base = Int32(ks) * Int32(16)
+            ent0 = k_base + tid * Int32(2)
+            ent1 = ent0 + Int32(1)
+            ent8 = ent0 + Int32(8)
+            ent9 = ent0 + Int32(9)
 
-                # B: V (candidate x d_v) dequanted from E2M1 in registers.
-                ent0 = k_base + tid * Int32(2)
-                v0 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0,
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                v1 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(1),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                v8 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(8),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                v9 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(9),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                b0 = v0 | (v1 << Uint32(16))
-                b1 = v8 | (v9 << Uint32(16))
-                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
-                    xv0,
-                    xv1,
-                    xv2,
-                    xv3,
-                    a0,
-                    a1,
-                    a2,
-                    a3,
-                    b0,
-                    b1,
-                )
-            at = vc * nt_per_warp_xv + nt
-            acc_nope[at][0] = acc_nope[at][0] + xv0
-            acc_nope[at][1] = acc_nope[at][1] + xv1
-            acc_nope[at][2] = acc_nope[at][2] + xv2
-            acc_nope[at][3] = acc_nope[at][3] + xv3
+            outer0 = latent_scale
+            outer1 = latent_scale
+            outer8 = latent_scale
+            outer9 = latent_scale
+            if cutlass.const_expr(latent_scale_per_token):
+                outer0 = ld_shared_f32(kv_sc_base_addr + ent0 * Int32(4))
+                outer1 = ld_shared_f32(kv_sc_base_addr + ent1 * Int32(4))
+                outer8 = ld_shared_f32(kv_sc_base_addr + ent8 * Int32(4))
+                outer9 = ld_shared_f32(kv_sc_base_addr + ent9 * Int32(4))
+
+            # A rows 0..7 are the lower output-dimension tile; rows 8..15
+            # are the tile 32 dimensions above it. K is the candidate axis.
+            a00 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent0,
+                dim_lo,
+                outer0,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a01 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent1,
+                dim_lo,
+                outer1,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a08 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent8,
+                dim_lo,
+                outer8,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a09 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent9,
+                dim_lo,
+                outer9,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a10 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent0,
+                dim_hi,
+                outer0,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a11 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent1,
+                dim_hi,
+                outer1,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a18 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent8,
+                dim_hi,
+                outer8,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a19 = _nvfp4_scalar_bf16_u16(
+                kv_fp4_base_addr,
+                ent9,
+                dim_hi,
+                outer9,
+                kv_smem_stride=kv_smem_stride,
+            )
+            # PTX m16n8k16 BF16 A-fragment order is
+            #   {row gid, K+0:1}, {row gid+8, K+0:1},
+            #   {row gid, K+8:9}, {row gid+8, K+8:9}.
+            # Keep this explicit: swapping the middle registers is a legal
+            # instruction stream that silently cross-wires dimensions.
+            a0 = a00 | (a01 << Uint32(16))
+            a1 = a10 | (a11 << Uint32(16))
+            a2 = a08 | (a09 << Uint32(16))
+            a3 = a18 | (a19 << Uint32(16))
+
+            p_row_byte = gid * Int32(sm_p_stride * 2) + k_base * Int32(2)
+            b0 = _ld_u32(
+                sm_p_full_addr,
+                p_row_byte + tid * Int32(2 * 2),
+            )
+            b1 = _ld_u32(
+                sm_p_full_addr,
+                p_row_byte + (tid * Int32(2) + Int32(8)) * Int32(2),
+            )
+            xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
+                xv0,
+                xv1,
+                xv2,
+                xv3,
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+
+        # MMA D owns (dimension-row gid/gid+8, head columns 2*tid/+1).
+        # Transpose it to the established epilogue ownership
+        # (head row gid, dimension columns 2*tid/+1).
+        src_even_dim = tid * Int32(8) + (gid >> Int32(1))
+        src_odd_dim = src_even_dim + Int32(4)
+        lo0_even = cute.arch.shuffle_sync(xv0, src_even_dim)
+        lo0_odd = cute.arch.shuffle_sync(xv1, src_even_dim)
+        lo1_even = cute.arch.shuffle_sync(xv0, src_odd_dim)
+        lo1_odd = cute.arch.shuffle_sync(xv1, src_odd_dim)
+        hi0_even = cute.arch.shuffle_sync(xv2, src_even_dim)
+        hi0_odd = cute.arch.shuffle_sync(xv3, src_even_dim)
+        hi1_even = cute.arch.shuffle_sync(xv2, src_odd_dim)
+        hi1_odd = cute.arch.shuffle_sync(xv3, src_odd_dim)
+        lo0 = lo0_even
+        lo1 = lo1_even
+        hi0 = hi0_even
+        hi1 = hi1_even
+        if (gid & Int32(1)) != Int32(0):
+            lo0 = lo0_odd
+            lo1 = lo1_odd
+            hi0 = hi0_odd
+            hi1 = hi1_odd
+
+        at_lo = vc * nt_per_warp_xv
+        at_hi = at_lo + 1
+        acc_nope[at_lo][0] = acc_nope[at_lo][0] + lo0
+        acc_nope[at_lo][1] = acc_nope[at_lo][1] + lo1
+        acc_nope[at_hi][0] = acc_nope[at_hi][0] + hi0
+        acc_nope[at_hi][1] = acc_nope[at_hi][1] + hi1
     return acc_nope

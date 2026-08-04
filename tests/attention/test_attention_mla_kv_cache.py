@@ -471,6 +471,7 @@ def test_writer_records_feed_native_glm_h8_decode_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+    output.zero_()
     graph.replay()
     torch.cuda.synchronize(device)
 
@@ -482,6 +483,115 @@ def test_writer_records_feed_native_glm_h8_decode_graph(
         sm_scale=sm_scale,
         per_token_scale=per_token_scale,
     )
+    _assert_reader_matches_dequantized_records(output, expected)
+    assert launch.LAST_DECODE_PLAN["native_glm_h8"] is True
+    assert launch.LAST_DECODE_PLAN["kv_stage_packed"] is False
+    assert launch.LAST_DECODE_PLAN["kv_smem_stride"] == 288
+    assert launch.LAST_DECODE_PLAN["fp8_rope"] is True
+
+
+@torch.inference_mode()
+def test_native_glm_h8_fp8_rope_decode_graph_handles_high_pool_page_id() -> None:
+    """Replay the 368-byte reader from a live page beyond a 2^31 byte offset."""
+    device = require_sparkinfer()
+    import sparkinfer.attention._shared.mla.kernel as launch
+
+    heads = 8
+    topk = 129
+    q, live_cache, live_indices = _make_written_reader_case(
+        rows=1,
+        topk=topk,
+        seed=8_1368,
+        device=device,
+        per_token_scale=True,
+        heads=heads,
+    )
+    lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    sm_scale = _HEAD_DIM**-0.5
+    expected = _reference_attention_from_records(
+        q=q,
+        cache=live_cache,
+        indices=live_indices,
+        lengths=lengths,
+        sm_scale=sm_scale,
+        per_token_scale=True,
+    )
+
+    page_stride_bytes = _PAGE_SIZE * _RECORD_BYTES
+    int32_max = torch.iinfo(torch.int32).max
+    high_page = int32_max // page_stride_bytes + 2
+    live_pages = int(live_cache.shape[0])
+    # Roughly 2 GiB is deliberately left uninitialized. Only the real tail
+    # pages are populated, reproducing a long-lived/recycled paged pool.
+    cache = torch.empty(
+        (high_page + live_pages, _PAGE_SIZE, _RECORD_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    cache[high_page:].copy_(live_cache)
+    assert cache.stride(0) * cache.element_size() == page_stride_bytes
+    assert high_page * page_stride_bytes > int32_max
+    indices = live_indices + high_page * _PAGE_SIZE
+
+    caps = SPARKINFERSparseMLAScratchCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=heads,
+        max_q_rows=1,
+        max_batch=1,
+        max_width=topk,
+        max_kv_rows=topk,
+        head_dim=_HEAD_DIM,
+        v_head_dim=_V_HEAD_DIM,
+        max_chunks_per_row=8,
+        page_size=_PAGE_SIZE,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (scratch_spec,) = plan.scratch_specs()
+    scratch_storage = torch.zeros(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    binding = plan.bind(
+        scratch=scratch_storage,
+        q=q,
+        selected_indices=indices,
+        cache_seqlens_int32=lengths,
+        nsa_cache_seqlens_int32=lengths,
+    )
+    output = torch.empty(
+        (1, heads, _V_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    def run() -> None:
+        run_unified_decode(
+            q_all=q,
+            swa_k_cache=cache,
+            swa_indices=indices,
+            swa_topk_lengths=lengths,
+            workspace=binding.scratch,
+            sm_scale=sm_scale,
+            swa_page_size=_PAGE_SIZE,
+            forced_num_splits=2,
+            scale_format_override=ScaleFormat.NVFP4_E4M3,
+            fp8_rope_override=True,
+            latent_scale_per_token=True,
+            out=output,
+        )
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
     _assert_reader_matches_dequantized_records(output, expected)
     assert launch.LAST_DECODE_PLAN["native_glm_h8"] is True
     assert launch.LAST_DECODE_PLAN["kv_stage_packed"] is False
