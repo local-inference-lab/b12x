@@ -40,8 +40,11 @@ from .decode_math import (
     s1_qk_nope_block_scaled,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
+    s1_qk_nope_nvfp4_bf16,
+    s1_qk_nope_nvfp4_bf16_h8_swap_ab,
     s2_qk_rope_bf16,
     s2_qk_rope_bf16_glm_h8_swap_ab,
+    s2_qk_rope_bf16_nvfp4_h8_swap_ab,
     s3_mask_and_scale,
     s3_mask_and_scale_glm_h8_swap_ab,
     s4_online_softmax,
@@ -50,6 +53,7 @@ from .decode_math import (
     s6_xv_nope,
     s6_xv_nope_dsv4_h8_swap_ab,
     s6_xv_nope_glm_h8_swap_ab,
+    s6_xv_nope_nvfp4_bf16_h8_swap_ab,
     s6b_xv_rope,
     s6b_xv_rope_h8_swap_ab,
     s7_epilogue,
@@ -723,14 +727,16 @@ class UnifiedDecodeKernel:
         # Math warps are consumers; the final warp is the IO producer.
         is_io = warp_id >= Int32(self.math_threads // 32)
 
-        # Native H8 stages one contiguous data record per candidate. GLM keeps
-        # its 656-byte source layout; DSV4 pads its 576-byte source record to a
+        # Native H8 stages one contiguous data record per candidate. GLM FP8
+        # keeps its 656-byte source layout; NVFP4 uses the 432/368-byte record
+        # stride from traits. DSV4 pads its 576-byte source record to a
         # bank-friendly 592-byte shared row and puts the two 512-byte scale
         # footers immediately after the data buffers. Both alias the existing
         # kv_fp8/kv_sc/kv_rope allocation, so graph-time workspace is unchanged.
         staged_kv_stride = t.kv_smem_stride
         if cutlass.const_expr(self.native_glm_h8):
-            staged_kv_stride = _GLM_KV_GMEM_STRIDE
+            if cutlass.const_expr(t.scale_format != ScaleFormat.NVFP4_E4M3):
+                staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
         kv_fp8_buf = Int32(t.bi * staged_kv_stride)
@@ -814,7 +820,7 @@ class UnifiedDecodeKernel:
                     io_threads=self.io_threads,
                     split_mbar_arrival=self.native_dsv4_h16,
                     fp8_rope=t.fp8_rope,
-                    packed_glm=self.native_glm_h8,
+                    packed_glm=self.native_glm_h8 and t.scale_format != ScaleFormat.NVFP4_E4M3,
                     packed_dsv4=self.native_dsv4_h8,
                     per_token_latent_scale=t.latent_scale_per_token,
                 )
@@ -926,20 +932,40 @@ class UnifiedDecodeKernel:
                     split_cand_end = section_len
                 if cutlass.const_expr(self.native_h8):
                     if cutlass.const_expr(self.native_glm_h8):
-                        qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
-                            qk,
-                            q_fp8_addr,
-                            kv_fp8_b,
-                            q_sc_view,
-                            warp_first_cand,
-                            lane,
-                            num_scales=t.num_scales,
-                            quant_tile=t.quant_tile,
-                            q_nope_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride,
-                        )
-                        h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
-                        h8_rope_stride = staged_kv_stride
+                        if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                            qk = s1_qk_nope_nvfp4_bf16_h8_swap_ab(
+                                qk,
+                                q_fp8_addr,
+                                kv_fp8_b,
+                                warp_first_cand,
+                                lane,
+                                latent_scale,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_bf16_stride=t.q_nope_stride,
+                                kv_smem_stride=t.kv_smem_stride,
+                                latent_scale_per_token=t.latent_scale_per_token,
+                                kv_sc_base_addr=kv_sc_b,
+                            )
+                            # NVFP4 stages rope in a separate kv_rope smem
+                            # buffer (not packed with the NoPE record).
+                            h8_rope_addr = kv_rope_b
+                            h8_rope_stride = L.kv_rope_stride * 2
+                        else:
+                            qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                                qk,
+                                q_fp8_addr,
+                                kv_fp8_b,
+                                q_sc_view,
+                                warp_first_cand,
+                                lane,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride,
+                            )
+                            h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
+                            h8_rope_stride = staged_kv_stride
                     else:
                         qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
                             qk,
@@ -959,16 +985,32 @@ class UnifiedDecodeKernel:
                         )
                         h8_rope_addr = kv_rope_b
                         h8_rope_stride = staged_kv_stride
-                    qk = s2_qk_rope_bf16_glm_h8_swap_ab(
-                        qk,
-                        q_rope_addr,
-                        h8_rope_addr,
-                        warp_first_cand,
-                        lane,
-                        d_rope=t.d_rope,
-                        q_rope_stride=L.q_rope_stride,
-                        kv_rope_stride_bytes=h8_rope_stride,
-                    )
+                    if cutlass.const_expr(
+                        self.native_glm_h8
+                        and t.scale_format == ScaleFormat.NVFP4_E4M3
+                    ):
+                        qk = s2_qk_rope_bf16_nvfp4_h8_swap_ab(
+                            qk,
+                            q_rope_addr,
+                            h8_rope_addr,
+                            warp_first_cand,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            kv_rope_stride_bytes=h8_rope_stride,
+                            fp8_rope=t.fp8_rope,
+                        )
+                    else:
+                        qk = s2_qk_rope_bf16_glm_h8_swap_ab(
+                            qk,
+                            q_rope_addr,
+                            h8_rope_addr,
+                            warp_first_cand,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            kv_rope_stride_bytes=h8_rope_stride,
+                        )
                     qk = s3_mask_and_scale_glm_h8_swap_ab(
                         qk,
                         tok_buf_view,
@@ -1006,26 +1048,50 @@ class UnifiedDecodeKernel:
                         p[3] * wr1,
                     ]
                     if cutlass.const_expr(self.native_glm_h8):
-                        acc_nope = s6_xv_nope_glm_h8_swap_ab(
-                            w_pre,
-                            acc_nope,
-                            kv_fp8_b,
-                            w_head_sc_view,
-                            w_fp8_addr,
-                            warp_id,
-                            lane,
-                            tid,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=staged_kv_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=4,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                        )
+                        if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                            acc_nope = s6_xv_nope_nvfp4_bf16_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                sm_p_full_addr,
+                                warp_id,
+                                lane,
+                                tid,
+                                latent_scale,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                kv_smem_stride=t.kv_smem_stride,
+                                n_warps=4,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                num_threads=self.math_threads,
+                                sm_p_stride=L.sm_p_full_stride,
+                                barrier_id=3,
+                                latent_scale_per_token=t.latent_scale_per_token,
+                                kv_sc_base_addr=kv_sc_b,
+                            )
+                        else:
+                            acc_nope = s6_xv_nope_glm_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                w_head_sc_view,
+                                w_fp8_addr,
+                                warp_id,
+                                lane,
+                                tid,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                kv_smem_stride=staged_kv_stride,
+                                w_fp8_stride=t.bi + 16,
+                                n_warps=4,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
+                            )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
                             w_pre,
@@ -1543,7 +1609,8 @@ class UnifiedDecodeKernel:
         # Match the single-cache body's allocation-preserving packed H8 layout.
         staged_kv_stride = t.kv_smem_stride
         if cutlass.const_expr(self.native_glm_h8):
-            staged_kv_stride = _GLM_KV_GMEM_STRIDE
+            if cutlass.const_expr(t.scale_format != ScaleFormat.NVFP4_E4M3):
+                staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
         kv_fp8_buf = Int32(t.bi * staged_kv_stride)
@@ -1655,7 +1722,7 @@ class UnifiedDecodeKernel:
                     io_threads=self.io_threads,
                     split_mbar_arrival=self.native_dsv4_h16,
                     fp8_rope=t.fp8_rope,
-                    packed_glm=self.native_glm_h8,
+                    packed_glm=self.native_glm_h8 and t.scale_format != ScaleFormat.NVFP4_E4M3,
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
@@ -1884,20 +1951,38 @@ class UnifiedDecodeKernel:
                 qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                 if cutlass.const_expr(self.native_h8 or self.native_dsv4_h16):
                     if cutlass.const_expr(self.native_glm_h8):
-                        qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
-                            qk,
-                            q_fp8_stage,
-                            kv_fp8_b,
-                            q_sc_stage_view,
-                            warp_first_cand,
-                            lane,
-                            num_scales=t.num_scales,
-                            quant_tile=t.quant_tile,
-                            q_nope_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride,
-                        )
-                        h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
-                        h8_rope_stride = staged_kv_stride
+                        if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                            qk = s1_qk_nope_nvfp4_bf16_h8_swap_ab(
+                                qk,
+                                q_fp8_stage,
+                                kv_fp8_b,
+                                warp_first_cand,
+                                lane,
+                                latent_scale,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_bf16_stride=t.q_nope_stride,
+                                kv_smem_stride=t.kv_smem_stride,
+                                latent_scale_per_token=t.latent_scale_per_token,
+                                kv_sc_base_addr=kv_sc_b,
+                            )
+                            h8_rope_addr = kv_rope_b
+                            h8_rope_stride = L.kv_rope_stride * 2
+                        else:
+                            qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                                qk,
+                                q_fp8_stage,
+                                kv_fp8_b,
+                                q_sc_stage_view,
+                                warp_first_cand,
+                                lane,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride,
+                            )
+                            h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
+                            h8_rope_stride = staged_kv_stride
                     else:
                         qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
                             qk,
@@ -1917,16 +2002,32 @@ class UnifiedDecodeKernel:
                         )
                         h8_rope_addr = kv_rope_b
                         h8_rope_stride = staged_kv_stride
-                    qk = s2_qk_rope_bf16_glm_h8_swap_ab(
-                        qk,
-                        q_rope_stage,
-                        h8_rope_addr,
-                        warp_first_cand,
-                        lane,
-                        d_rope=t.d_rope,
-                        q_rope_stride=L.q_rope_stride,
-                        kv_rope_stride_bytes=h8_rope_stride,
-                    )
+                    if cutlass.const_expr(
+                        self.native_glm_h8
+                        and t.scale_format == ScaleFormat.NVFP4_E4M3
+                    ):
+                        qk = s2_qk_rope_bf16_nvfp4_h8_swap_ab(
+                            qk,
+                            q_rope_stage,
+                            h8_rope_addr,
+                            warp_first_cand,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            kv_rope_stride_bytes=h8_rope_stride,
+                            fp8_rope=t.fp8_rope,
+                        )
+                    else:
+                        qk = s2_qk_rope_bf16_glm_h8_swap_ab(
+                            qk,
+                            q_rope_stage,
+                            h8_rope_addr,
+                            warp_first_cand,
+                            lane,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            kv_rope_stride_bytes=h8_rope_stride,
+                        )
                     sc_start = split_cand_start
                     sec_len = section_len
                     if cutlass.const_expr(has_extra):
@@ -1976,26 +2077,50 @@ class UnifiedDecodeKernel:
                         p[3] * wr1,
                     ]
                     if cutlass.const_expr(self.native_glm_h8):
-                        acc_nope = s6_xv_nope_glm_h8_swap_ab(
-                            w_pre,
-                            acc_nope,
-                            kv_fp8_b,
-                            w_head_sc_view,
-                            w_fp8_addr,
-                            warp_id,
-                            lane,
-                            tid,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=staged_kv_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=4,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                        )
+                        if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+                            acc_nope = s6_xv_nope_nvfp4_bf16_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                sm_p_stage,
+                                warp_sel,
+                                lane,
+                                tid_sel,
+                                latent_scale,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                kv_smem_stride=t.kv_smem_stride,
+                                n_warps=4,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                num_threads=nt_stage,
+                                sm_p_stride=L.sm_p_full_stride,
+                                barrier_id=3,
+                                latent_scale_per_token=t.latent_scale_per_token,
+                                kv_sc_base_addr=kv_sc_b,
+                            )
+                        else:
+                            acc_nope = s6_xv_nope_glm_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                w_head_sc_view,
+                                w_fp8_addr,
+                                warp_id,
+                                lane,
+                                tid,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                kv_smem_stride=staged_kv_stride,
+                                w_fp8_stride=t.bi + 16,
+                                n_warps=4,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
+                            )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
                             w_pre,
@@ -2392,8 +2517,6 @@ def _sparse_mla_decode_grid_flat_launch(
         and int(grid_h_blocks) == 1
         and int(head_block_offset) == 0
         and not bool(has_extra)
-        # NVFP4 records are validated on the generic HPB=16 arm only.
-        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and _env_glm_h8_native_enabled()
     )
     native_dsv4_h8 = bool(
@@ -3027,9 +3150,6 @@ def run_unified_decode(
         int(model_type) == int(ModelType.GLM_NSA)
         and int(heads) == 8
         and not has_extra
-        # NVFP4 records (432B, packed E2M1+E4M3) are validated on the generic
-        # HPB=16 arm only; the packed-656B H8 staging would misread them.
-        and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
         and _env_glm_h8_native_enabled()
     )
     native_h8 = native_glm_h8 or native_dsv4_h8
@@ -3050,7 +3170,7 @@ def run_unified_decode(
         kv_stage_packed=native_h8 or native_dsv4_h16,
         kv_smem_stride=(
             _GLM_KV_GMEM_STRIDE
-            if native_glm_h8
+            if (native_glm_h8 and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3))
             else (
                 _DSV4_PACKED_SMEM_STRIDE
                 if (native_dsv4_h8 or native_dsv4_h16)

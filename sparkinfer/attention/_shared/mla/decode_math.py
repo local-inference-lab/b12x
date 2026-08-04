@@ -1127,6 +1127,84 @@ def s2_qk_rope_bf16_glm_h8_swap_ab(
     return qk
 
 
+@cute.jit
+def s2_qk_rope_bf16_nvfp4_h8_swap_ab(
+    qk,
+    q_rope_base_addr: Int32,
+    kv_rope_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    d_rope: cutlass.Constexpr,
+    q_rope_stride: cutlass.Constexpr,
+    kv_rope_stride_bytes: cutlass.Constexpr,
+    fp8_rope: cutlass.Constexpr = False,
+):
+    """NVFP4 GLM TP4 RoPE dot product in the swapped H8 fragment layout.
+
+    Handles both BF16 rope (432B record, ``fp8_rope=False``) and E4M3
+    fp8-rope (368B record, ``fp8_rope=True``).  The A operand (K-rope
+    candidates) is loaded via ldmatrix when BF16, or dequanted from E4M3
+    in registers when fp8_rope.  The B operand (Q-rope heads) is always
+    scalar BF16 loads from smem.
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    q_head = gid
+
+    for ks in cutlass.range_constexpr(d_rope // 16):
+        ko = Int32(ks) * Int32(16)
+        if cutlass.const_expr(fp8_rope):
+            # A: K-rope (candidates) -- dequant E4M3 to BF16 in registers.
+            # MMA A-fragment layout: row = gid (M-rows {gid, gid+8}),
+            # col-pair = 2*tid (K-cols {2*tid, 2*tid+8}).
+            col_offset = ko + Int32(2) * tid
+            cand0 = warp_first_cand + gid
+            cand1 = cand0 + Int32(8)
+            a0 = _fp8_rope_pair_bfloat2(
+                kv_rope_base_addr, cand0, col_offset, d_rope=d_rope,
+            )
+            a1 = _fp8_rope_pair_bfloat2(
+                kv_rope_base_addr, cand0, col_offset + Int32(8), d_rope=d_rope,
+            )
+            a2 = _fp8_rope_pair_bfloat2(
+                kv_rope_base_addr, cand1, col_offset, d_rope=d_rope,
+            )
+            a3 = _fp8_rope_pair_bfloat2(
+                kv_rope_base_addr, cand1, col_offset + Int32(8), d_rope=d_rope,
+            )
+        else:
+            # A: K-rope (candidates) -- BF16, ldmatrix from smem.
+            a_byte = (warp_first_cand + a_row) * Int32(kv_rope_stride_bytes) + (
+                ko + a_col
+            ) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_byte(kv_rope_base_addr, a_byte)
+            )
+        # B: Q-rope (heads) -- BF16 scalar loads from smem.
+        row_byte = q_head * Int32(q_rope_stride * 2) + ko * Int32(2)
+        b0 = _ld_u32(q_rope_base_addr, row_byte + tid * Int32(2) * Int32(2))
+        b1 = _ld_u32(
+            q_rope_base_addr,
+            row_byte + (tid * Int32(2) + Int32(8)) * Int32(2),
+        )
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0],
+            qk[1],
+            qk[2],
+            qk[3],
+            a0,
+            a1,
+            a2,
+            a3,
+            b0,
+            b1,
+        )
+    return qk
+
+
 # =============================================================================
 # S3 -- mask invalid candidates -> -inf, then qk *= sm_scale * LOG2E
 # =============================================================================
@@ -3043,3 +3121,263 @@ def _d2_load_b_fp8(
     t23 = byte_perm(r2, r3, sel)
     b1 = byte_perm(t01, t23, Int32(0x5410))
     return b0, b1
+
+
+
+# =============================================================================
+# NVFP4 H8 swap-AB: BF16 MMA with E2M1 register dequant, 4-warp, full m16n8
+# =============================================================================
+
+
+@cute.jit
+def s1_qk_nope_nvfp4_bf16_h8_swap_ab(
+    qk,
+    q_nope_bf16_base_addr: Int32,
+    kv_fp4_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    latent_scale: Float32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
+):
+    """NVFP4 GLM TP4 QK-NoPE with swapped A/B for full m16n8 occupancy.
+
+    Hardware A = 16-candidate K tile (E2M1 dequanted to BF16 in registers via
+    ``_nvfp4_pair_bfloat2``).  Hardware B = 8-head Q (BF16 scalar loads from
+    smem).  Four warps cover BI=64 candidates (16 per warp).
+
+    Fragment ownership (same as the FP8 H8 swap-AB path)::
+
+        qk[0] = score[cand=base+gid,   head=2*tid]
+        qk[1] = score[cand=base+gid,   head=2*tid+1]
+        qk[2] = score[cand=base+gid+8, head=2*tid]
+        qk[3] = score[cand=base+gid+8, head=2*tid+1]
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    cand0 = warp_first_cand + gid
+    cand1 = cand0 + Int32(8)
+    col_offset = Int32(2) * tid
+
+    for blk in cutlass.range_constexpr(num_scales):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            # A: K (candidates) -- dequant E2M1 to BF16 in registers.
+            # Each thread holds 4 uint32 (a0..a3) matching the m16n8k16 A
+            # operand layout: row = gid (M-rows {gid, gid+8}), col-pair =
+            # 2*tid (K-cols {2*tid, 2*tid+8}).  This matches the D output
+            # fragment layout (S3 reads cand=base+gid) and the B-fragment
+            # layout used by the generic non-swap NVFP4 S1.
+            a0 = _nvfp4_pair_bfloat2(
+                kv_fp4_base_addr,
+                cand0,
+                ko + col_offset,
+                latent_scale,
+                kv_smem_stride=kv_smem_stride,
+                latent_scale_per_token=latent_scale_per_token,
+                kv_sc_base_addr=kv_sc_base_addr,
+            )
+            a1 = _nvfp4_pair_bfloat2(
+                kv_fp4_base_addr,
+                cand0,
+                ko + col_offset + Int32(8),
+                latent_scale,
+                kv_smem_stride=kv_smem_stride,
+                latent_scale_per_token=latent_scale_per_token,
+                kv_sc_base_addr=kv_sc_base_addr,
+            )
+            a2 = _nvfp4_pair_bfloat2(
+                kv_fp4_base_addr,
+                cand1,
+                ko + col_offset,
+                latent_scale,
+                kv_smem_stride=kv_smem_stride,
+                latent_scale_per_token=latent_scale_per_token,
+                kv_sc_base_addr=kv_sc_base_addr,
+            )
+            a3 = _nvfp4_pair_bfloat2(
+                kv_fp4_base_addr,
+                cand1,
+                ko + col_offset + Int32(8),
+                latent_scale,
+                kv_smem_stride=kv_smem_stride,
+                latent_scale_per_token=latent_scale_per_token,
+                kv_sc_base_addr=kv_sc_base_addr,
+            )
+
+            # B: Q (heads) -- BF16 scalar loads from smem.
+            # Q is stored as (heads x kdim) with stride q_nope_bf16_stride.
+            # Each thread loads 2 uint32 (b0, b1) covering 4 kdim values for
+            # its head (gid), matching the m16n8k16 B operand layout.
+            q_byte = gid * Int32(q_nope_bf16_stride * 2) + (ko + tid * Int32(2)) * Int32(2)
+            b0 = _ld_u32(q_nope_bf16_base_addr, q_byte)
+            b1 = _ld_u32(
+                q_nope_bf16_base_addr,
+                q_byte + Int32(8 * 2),
+            )
+
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+                qk[0],
+                qk[1],
+                qk[2],
+                qk[3],
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+    return qk
+
+
+@cute.jit
+def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
+    w_pre,
+    acc_nope,
+    kv_fp4_base_addr: Int32,
+    sm_p_full_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    tid_flat: Int32,
+    latent_scale: Float32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    v_chunk: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    nt_per_warp_xv: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
+):
+    """NVFP4 GLM TP4 XV-NoPE with H8 swap-AB fragment layout.
+
+    P (probabilities) from S4 are in registers as ``w_pre`` in the swapped
+    (candidate x head) layout.  This function transposes them to (head x
+    candidate) by storing to the ``sm_p_full`` smem buffer, then loads via
+    ldmatrix as the A operand.  V is dequanted from E2M1 to BF16 in registers
+    as the B operand.  A single BF16 m16n8k16 MMA per (vc, nt) replaces the
+    FP8 path's 2-pass HIGH/LOW residual cycle.
+
+    The output accumulator ``acc_nope`` uses the ordinary m16n8 output-row
+    mapping (lane gid owns head gid), matching the existing H8 FP8 S6 and
+    the S7 epilogue.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    head0 = tid * Int32(2)
+    head1 = head0 + Int32(1)
+    cand0 = warp_id * Int32(16) + gid
+    cand1 = cand0 + Int32(8)
+
+    # --- Store P to sm_p_full in (head x candidate) layout for ldmatrix A. ---
+    # w_pre[0],[1] = P[cand0, head0], P[cand0, head1]
+    # w_pre[2],[3] = P[cand1, head0], P[cand1, head1]
+    # sm_p_full is indexed as (head, candidate) with stride sm_p_stride.
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(sm_p_stride) + cand0) * Int32(2),
+        w_pre[0],
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(sm_p_stride) + cand0) * Int32(2),
+        w_pre[1],
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(sm_p_stride) + cand1) * Int32(2),
+        w_pre[2],
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(sm_p_stride) + cand1) * Int32(2),
+        w_pre[3],
+    )
+    cute.arch.barrier(**bar_kw)
+
+    # --- PV MMA loop: A = P (head x cand) from smem, B = V (cand x d_v) regs. ---
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            dim_base = Int32(vc) * Int32(v_chunk) + (
+                Int32(nt) * Int32(n_warps) + warp_id
+            ) * Int32(8)
+            col = dim_base + gid
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for ks in cutlass.range_constexpr(bi // 16):
+                k_base = Int32(ks) * Int32(16)
+                # A: P (head x candidate) from smem via ldmatrix.
+                a_byte = (a_row * Int32(sm_p_stride) + (k_base + a_col)) * Int32(2)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+
+                # B: V (candidate x d_v) dequanted from E2M1 in registers.
+                ent0 = k_base + tid * Int32(2)
+                v0 = _nvfp4_scalar_bf16_u16(
+                    kv_fp4_base_addr,
+                    ent0,
+                    col,
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                )
+                v1 = _nvfp4_scalar_bf16_u16(
+                    kv_fp4_base_addr,
+                    ent0 + Int32(1),
+                    col,
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                )
+                v8 = _nvfp4_scalar_bf16_u16(
+                    kv_fp4_base_addr,
+                    ent0 + Int32(8),
+                    col,
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                )
+                v9 = _nvfp4_scalar_bf16_u16(
+                    kv_fp4_base_addr,
+                    ent0 + Int32(9),
+                    col,
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                )
+                b0 = v0 | (v1 << Uint32(16))
+                b1 = v8 | (v9 << Uint32(16))
+                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
+                    xv0,
+                    xv1,
+                    xv2,
+                    xv3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + xv0
+            acc_nope[at][1] = acc_nope[at][1] + xv1
+            acc_nope[at][2] = acc_nope[at][2] + xv2
+            acc_nope[at][3] = acc_nope[at][3] + xv3
+    return acc_nope
