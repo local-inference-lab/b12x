@@ -3271,6 +3271,11 @@ def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
     transposed through warp shuffles into the established head-major
     ``acc_nope`` ABI, so online-softmax rescaling and S7 remain unchanged.
     """
+    # The transposed MMA pairs exactly two eight-dimension epilogue tiles per
+    # warp.  Keep that implicit launch contract fail-closed if a future trait
+    # changes the GLM NVFP4 tile geometry.
+    assert cutlass.const_expr(nt_per_warp_xv == 2)
+    assert cutlass.const_expr(v_chunk == n_warps * 16)
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
