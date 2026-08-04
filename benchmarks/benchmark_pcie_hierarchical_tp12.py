@@ -100,7 +100,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.all_reduce(peer_count, op=dist.ReduceOp.MAX)
         if rank == 0:
             print(
-                "elements,bytes,blocks,nccl_median_us,custom_median_us,"
+                "world_size,elements,bytes,blocks,nccl_median_us,custom_median_us,"
                 "speedup,nccl_min_us,nccl_max_us,custom_min_us,custom_max_us,"
                 "nccl_max_abs_error,custom_max_abs_error,max_rank_delta,"
                 "max_mapped_peers",
@@ -186,7 +186,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     nccl_med = float(median(nccl_us))
                     custom_med = float(median(custom_us))
                     print(
-                        f"{elements},{elements * 2},{blocks},"
+                        f"{world_size},{elements},{elements * 2},{blocks},"
                         f"{nccl_med:.3f},{custom_med:.3f},"
                         f"{nccl_med / custom_med:.4f},"
                         f"{min(nccl_us):.3f},{max(nccl_us):.3f},"
@@ -211,7 +211,8 @@ def main() -> None:
     world_size = args.world_size
     if torch.cuda.device_count() < world_size:
         raise RuntimeError(
-            f"TP12 benchmark needs 12 CUDA devices, found {torch.cuda.device_count()}"
+            f"TP{world_size} benchmark needs {world_size} CUDA devices, "
+            f"found {torch.cuda.device_count()}"
         )
     mp.spawn(
         _worker,
