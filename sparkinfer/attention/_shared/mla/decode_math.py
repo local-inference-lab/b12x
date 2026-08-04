@@ -1158,8 +1158,9 @@ def s2_qk_rope_bf16_nvfp4_h8_swap_ab(
         ko = Int32(ks) * Int32(16)
         if cutlass.const_expr(fp8_rope):
             # A: K-rope (candidates) -- dequant E4M3 to BF16 in registers.
-            # MMA A-fragment layout: row = gid (M-rows {gid, gid+8}),
-            # col-pair = 2*tid (K-cols {2*tid, 2*tid+8}).
+            # PTX A-fragment order is {row gid, K+0:1},
+            # {row gid+8, K+0:1}, {row gid, K+8:9},
+            # {row gid+8, K+8:9}; mirror the BF16 ldmatrix path exactly.
             col_offset = ko + Int32(2) * tid
             cand0 = warp_first_cand + gid
             cand1 = cand0 + Int32(8)
@@ -1167,10 +1168,10 @@ def s2_qk_rope_bf16_nvfp4_h8_swap_ab(
                 kv_rope_base_addr, cand0, col_offset, d_rope=d_rope,
             )
             a1 = _fp8_rope_pair_bfloat2(
-                kv_rope_base_addr, cand0, col_offset + Int32(8), d_rope=d_rope,
+                kv_rope_base_addr, cand1, col_offset, d_rope=d_rope,
             )
             a2 = _fp8_rope_pair_bfloat2(
-                kv_rope_base_addr, cand1, col_offset, d_rope=d_rope,
+                kv_rope_base_addr, cand0, col_offset + Int32(8), d_rope=d_rope,
             )
             a3 = _fp8_rope_pair_bfloat2(
                 kv_rope_base_addr, cand1, col_offset + Int32(8), d_rope=d_rope,
@@ -3173,11 +3174,11 @@ def s1_qk_nope_nvfp4_bf16_h8_swap_ab(
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
             # A: K (candidates) -- dequant E2M1 to BF16 in registers.
-            # Each thread holds 4 uint32 (a0..a3) matching the m16n8k16 A
-            # operand layout: row = gid (M-rows {gid, gid+8}), col-pair =
-            # 2*tid (K-cols {2*tid, 2*tid+8}).  This matches the D output
-            # fragment layout (S3 reads cand=base+gid) and the B-fragment
-            # layout used by the generic non-swap NVFP4 S1.
+            # Each thread holds 4 uint32 (a0..a3) in PTX m16n8k16 A-fragment
+            # order: {row gid, K+0:1}, {row gid+8, K+0:1},
+            # {row gid, K+8:9}, {row gid+8, K+8:9}.  Keeping the candidate
+            # row transition in a1 (not a2) is important: the opposite order
+            # compiles but cross-wires candidate scores on real hardware.
             a0 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
                 cand0,
@@ -3187,16 +3188,16 @@ def s1_qk_nope_nvfp4_bf16_h8_swap_ab(
             )
             a1 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
-                cand0,
-                ko + col_offset + Int32(8),
-                latent_scale0,
+                cand1,
+                ko + col_offset,
+                latent_scale1,
                 kv_smem_stride=kv_smem_stride,
             )
             a2 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
-                cand1,
-                ko + col_offset,
-                latent_scale1,
+                cand0,
+                ko + col_offset + Int32(8),
+                latent_scale0,
                 kv_smem_stride=kv_smem_stride,
             )
             a3 = _nvfp4_pair_bfloat2(
