@@ -354,6 +354,7 @@ def _make_written_reader_case(
     seed: int,
     device: torch.device,
     per_token_scale: bool = False,
+    heads: int = _HEADS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -366,7 +367,7 @@ def _make_written_reader_case(
         dtype=torch.float32,
     ).to(device=device, dtype=torch.bfloat16)
     q = torch.randn(
-        (rows, _HEADS, _HEAD_DIM), generator=generator, dtype=torch.float32
+        (rows, heads, _HEAD_DIM), generator=generator, dtype=torch.float32
     ).to(device=device, dtype=torch.bfloat16)
     indices = torch.stack(
         [torch.randperm(topk, generator=generator) for _ in range(rows)]
@@ -388,6 +389,104 @@ def _make_written_reader_case(
         per_token_scale=per_token_scale,
     )
     return q, cache, indices
+
+
+@pytest.mark.parametrize(
+    "per_token_scale",
+    [False, True],
+    ids=["static", "dynamic-token"],
+)
+@torch.inference_mode()
+def test_writer_records_feed_native_glm_h8_decode_graph(
+    per_token_scale: bool,
+) -> None:
+    """The 368-byte FP8-RoPE record uses the native H8 path under replay."""
+    device = require_sparkinfer()
+    import sparkinfer.attention._shared.mla.kernel as launch
+
+    heads = 8
+    topk = 129
+    q, cache, indices = _make_written_reader_case(
+        rows=1,
+        topk=topk,
+        seed=8_1301,
+        device=device,
+        per_token_scale=per_token_scale,
+        heads=heads,
+    )
+    lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
+    sm_scale = _HEAD_DIM**-0.5
+    caps = SPARKINFERSparseMLAScratchCaps(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        num_q_heads=heads,
+        max_q_rows=1,
+        max_batch=1,
+        max_width=topk,
+        max_kv_rows=topk,
+        head_dim=_HEAD_DIM,
+        v_head_dim=_V_HEAD_DIM,
+        max_chunks_per_row=8,
+        page_size=_PAGE_SIZE,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (scratch_spec,) = plan.scratch_specs()
+    scratch_storage = torch.zeros(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    binding = plan.bind(
+        scratch=scratch_storage,
+        q=q,
+        selected_indices=indices,
+        cache_seqlens_int32=lengths,
+        nsa_cache_seqlens_int32=lengths,
+    )
+    output = torch.empty(
+        (1, heads, _V_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    def run() -> None:
+        run_unified_decode(
+            q_all=q,
+            swa_k_cache=cache,
+            swa_indices=indices,
+            swa_topk_lengths=lengths,
+            workspace=binding.scratch,
+            sm_scale=sm_scale,
+            swa_page_size=_PAGE_SIZE,
+            forced_num_splits=2,
+            scale_format_override=ScaleFormat.NVFP4_E4M3,
+            fp8_rope_override=True,
+            latent_scale_per_token=per_token_scale,
+            out=output,
+        )
+
+    run()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    expected = _reference_attention_from_records(
+        q=q,
+        cache=cache,
+        indices=indices,
+        lengths=lengths,
+        sm_scale=sm_scale,
+        per_token_scale=per_token_scale,
+    )
+    _assert_reader_matches_dequantized_records(output, expected)
+    assert launch.LAST_DECODE_PLAN["native_glm_h8"] is True
+    assert launch.LAST_DECODE_PLAN["kv_stage_packed"] is False
+    assert launch.LAST_DECODE_PLAN["kv_smem_stride"] == 288
+    assert launch.LAST_DECODE_PLAN["fp8_rope"] is True
 
 
 def _reference_attention_from_records(

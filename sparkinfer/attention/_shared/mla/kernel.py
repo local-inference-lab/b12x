@@ -40,7 +40,6 @@ from .decode_math import (
     s1_qk_nope_block_scaled,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
-    s1_qk_nope_nvfp4_bf16,
     s1_qk_nope_nvfp4_bf16_h8_swap_ab,
     s2_qk_rope_bf16,
     s2_qk_rope_bf16_glm_h8_swap_ab,
@@ -2105,11 +2104,11 @@ class UnifiedDecodeKernel:
                                 w_pre,
                                 acc_nope,
                                 kv_fp8_b,
-                                w_head_sc_view,
-                                w_fp8_addr,
-                                warp_id,
+                                w_head_sc_stage_view,
+                                w_fp8_stage,
+                                warp_sel,
                                 lane,
-                                tid,
+                                tid_sel,
                                 n_v_chunks=t.n_v_chunks,
                                 v_chunk=t.quant_tile,
                                 hpb=t.hpb,
@@ -2118,7 +2117,7 @@ class UnifiedDecodeKernel:
                                 w_fp8_stride=t.bi + 16,
                                 n_warps=4,
                                 nt_per_warp_xv=t.nt_per_warp_xv,
-                                num_threads=self.math_threads,
+                                num_threads=nt_stage,
                                 barrier_id=3,
                             )
                     else:
@@ -3167,7 +3166,14 @@ def run_unified_decode(
             else (320 if native_dsv4_h16 else int(traits.block_threads))
         ),
         io_warps=(2 if native_dsv4_h16 else 1),
-        kv_stage_packed=native_h8 or native_dsv4_h16,
+        kv_stage_packed=(
+            (
+                native_glm_h8
+                and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
+            )
+            or native_dsv4_h8
+            or native_dsv4_h16
+        ),
         kv_smem_stride=(
             _GLM_KV_GMEM_STRIDE
             if (native_glm_h8 and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3))

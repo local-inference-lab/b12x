@@ -1062,6 +1062,72 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
 
 
 @torch.inference_mode()
+def test_unified_glm_nvfp4_bf16_rope_h8_decode_live_graph_oracle() -> None:
+    """The 432-byte BF16-RoPE NVFP4 record uses native H8 under replay."""
+    device = require_sparkinfer()
+    import sparkinfer.attention._shared.mla.kernel as launch
+
+    rows, heads, width = 2, 8, 128
+    inputs = _make_nvfp4_glm_inputs(
+        rows=rows,
+        heads=heads,
+        width=width,
+        device=device,
+    )
+    workspace = _make_decode_workspace(
+        rows=rows,
+        heads=heads,
+        width=width,
+        device=device,
+    )
+    output = torch.empty(
+        (rows, heads, _GLM_V_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    expected = tuple(
+        _nvfp4_glm_reference(inputs, scenario)[0] for scenario in range(2)
+    )
+    assert not torch.allclose(expected[0], expected[1])
+
+    def launch_decode() -> None:
+        run_unified_decode(
+            q_all=inputs.q,
+            swa_k_cache=inputs.launch_cache,
+            swa_indices=inputs.indices,
+            swa_topk_lengths=inputs.lengths,
+            workspace=workspace,
+            sm_scale=_GLM_SM_SCALE,
+            swa_page_size=_PAGE_SIZE,
+            forced_num_splits=1,
+            scale_format_override=ScaleFormat.NVFP4_E4M3,
+            fp8_rope_override=False,
+            out=output,
+        )
+
+    _install_nvfp4_glm_scenario(inputs, 0)
+    launch_decode()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_decode()
+    for scenario in range(2):
+        _install_nvfp4_glm_scenario(inputs, scenario)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        _assert_output(
+            output,
+            expected[scenario],
+            label=f"GLM NVFP4 BF16-RoPE H8 replay {scenario}",
+        )
+
+    assert launch.LAST_DECODE_PLAN["native_glm_h8"] is True
+    assert launch.LAST_DECODE_PLAN["kv_stage_packed"] is False
+    assert launch.LAST_DECODE_PLAN["kv_smem_stride"] == 288
+    assert launch.LAST_DECODE_PLAN["fp8_rope"] is False
+
+
+@torch.inference_mode()
 def test_unified_glm_prefill_live_graph_oracle() -> None:
     """Validate GLM MG prefill with live inputs and fixed caller-owned output."""
     device = require_sparkinfer()

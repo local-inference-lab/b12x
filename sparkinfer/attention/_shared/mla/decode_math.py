@@ -3163,6 +3163,11 @@ def s1_qk_nope_nvfp4_bf16_h8_swap_ab(
     cand0 = warp_first_cand + gid
     cand1 = cand0 + Int32(8)
     col_offset = Int32(2) * tid
+    latent_scale0 = latent_scale
+    latent_scale1 = latent_scale
+    if cutlass.const_expr(latent_scale_per_token):
+        latent_scale0 = ld_shared_f32(kv_sc_base_addr + cand0 * Int32(4))
+        latent_scale1 = ld_shared_f32(kv_sc_base_addr + cand1 * Int32(4))
 
     for blk in cutlass.range_constexpr(num_scales):
         for ks in cutlass.range_constexpr(quant_tile // 16):
@@ -3177,37 +3182,29 @@ def s1_qk_nope_nvfp4_bf16_h8_swap_ab(
                 kv_fp4_base_addr,
                 cand0,
                 ko + col_offset,
-                latent_scale,
+                latent_scale0,
                 kv_smem_stride=kv_smem_stride,
-                latent_scale_per_token=latent_scale_per_token,
-                kv_sc_base_addr=kv_sc_base_addr,
             )
             a1 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
                 cand0,
                 ko + col_offset + Int32(8),
-                latent_scale,
+                latent_scale0,
                 kv_smem_stride=kv_smem_stride,
-                latent_scale_per_token=latent_scale_per_token,
-                kv_sc_base_addr=kv_sc_base_addr,
             )
             a2 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
                 cand1,
                 ko + col_offset,
-                latent_scale,
+                latent_scale1,
                 kv_smem_stride=kv_smem_stride,
-                latent_scale_per_token=latent_scale_per_token,
-                kv_sc_base_addr=kv_sc_base_addr,
             )
             a3 = _nvfp4_pair_bfloat2(
                 kv_fp4_base_addr,
                 cand1,
                 ko + col_offset + Int32(8),
-                latent_scale,
+                latent_scale1,
                 kv_smem_stride=kv_smem_stride,
-                latent_scale_per_token=latent_scale_per_token,
-                kv_sc_base_addr=kv_sc_base_addr,
             )
 
             # B: Q (heads) -- BF16 scalar loads from smem.
@@ -3301,6 +3298,19 @@ def s6_xv_nope_nvfp4_bf16_h8_swap_ab(
         sm_p_full_addr + (head1 * Int32(sm_p_stride) + cand1) * Int32(2),
         w_pre[3],
     )
+
+    # ldmatrix.x4 reads a full 16-row A tile even though native GLM H8 only
+    # owns rows 0..7. Keep the architecturally-unused rows deterministic so
+    # their discarded accumulator fragments cannot depend on stale shared
+    # memory or turn into NaNs under sanitizers and graph replay.
+    upper_row_elem = tid_flat
+    while upper_row_elem < Int32(8 * sm_p_stride):
+        st_shared_bf16_from_f32(
+            sm_p_full_addr
+            + (Int32(8 * sm_p_stride) + upper_row_elem) * Int32(2),
+            Float32(0.0),
+        )
+        upper_row_elem += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
     # --- PV MMA loop: A = P (head x cand) from smem, B = V (cand x d_v) regs. ---
