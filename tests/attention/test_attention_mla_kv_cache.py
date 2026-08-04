@@ -399,8 +399,10 @@ def _make_written_reader_case(
 @torch.inference_mode()
 def test_writer_records_feed_native_glm_h8_decode_graph(
     per_token_scale: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The 368-byte FP8-RoPE record uses the native H8 path under replay."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer()
     import sparkinfer.attention._shared.mla.kernel as launch
 
@@ -491,8 +493,11 @@ def test_writer_records_feed_native_glm_h8_decode_graph(
 
 
 @torch.inference_mode()
-def test_native_glm_h8_fp8_rope_decode_graph_handles_high_pool_page_id() -> None:
+def test_native_glm_h8_fp8_rope_decode_graph_handles_high_pool_page_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Replay the 368-byte reader from a live page beyond a 2^31 byte offset."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer()
     import sparkinfer.attention._shared.mla.kernel as launch
 

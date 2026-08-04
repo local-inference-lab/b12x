@@ -1062,8 +1062,11 @@ def test_unified_glm_decode_live_graph_oracle(entrypoint: str) -> None:
 
 
 @torch.inference_mode()
-def test_unified_glm_nvfp4_bf16_rope_h8_decode_live_graph_oracle() -> None:
+def test_unified_glm_nvfp4_bf16_rope_h8_decode_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The 432-byte BF16-RoPE NVFP4 record uses native H8 under replay."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer()
     import sparkinfer.attention._shared.mla.kernel as launch
 
@@ -1128,8 +1131,11 @@ def test_unified_glm_nvfp4_bf16_rope_h8_decode_live_graph_oracle() -> None:
 
 
 @torch.inference_mode()
-def test_unified_glm_nvfp4_bf16_rope_h8_graph_handles_high_pool_page_id() -> None:
+def test_unified_glm_nvfp4_bf16_rope_h8_graph_handles_high_pool_page_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Replay the 432-byte reader from a live page beyond a 2^31 byte offset."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer()
     import sparkinfer.attention._shared.mla.kernel as launch
 

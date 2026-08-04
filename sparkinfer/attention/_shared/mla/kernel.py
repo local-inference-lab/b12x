@@ -154,8 +154,16 @@ def _env_num_splits_override() -> int:
 
 
 def _env_glm_h8_native_enabled() -> bool:
+    """Return whether the experimental native GLM H8 NVFP4 path is enabled.
+
+    Keep the generic path as the default until a supported serving image shows
+    a repeatable end-to-end win.  The native implementation remains available
+    for qualification with ``SPARKINFER_MLA_SM120_GLM_H8_NATIVE=1``.
+    """
     raw = os.environ.get(_MLA_SM120_GLM_H8_NATIVE_ENV)
-    return raw is None or raw.strip().lower() not in {"0", "false", "off", "no"}
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
 def _env_dsv4_h16_native_mode() -> bool | None:

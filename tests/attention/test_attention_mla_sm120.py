@@ -1275,8 +1275,10 @@ def _run_unified_glm(
 @pytest.mark.parametrize("forced_num_splits", [1, 4])
 def test_unified_decode_glm_tp8_native_swap_ab_matches_reference(
     forced_num_splits,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GLM TP8 uses the native four-warp swapped-QK decode specialization."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer_sparse_mla()
     import sparkinfer.attention._shared.mla.kernel as launch
 
@@ -1324,8 +1326,11 @@ def test_unified_decode_glm_tp8_native_matches_padded_path(
 
 
 @torch.inference_mode()
-def test_unified_decode_glm_tp8_native_scalar_length_matches_reference() -> None:
+def test_unified_decode_glm_tp8_native_scalar_length_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The uniform scalar-length entry uses the same native TP8 math path."""
+    monkeypatch.setenv("SPARKINFER_MLA_SM120_GLM_H8_NATIVE", "1")
     device = require_sparkinfer_sparse_mla()
     import sparkinfer.attention._shared.mla.kernel as launch
 
