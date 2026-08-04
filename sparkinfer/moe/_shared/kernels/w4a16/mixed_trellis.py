@@ -66,6 +66,8 @@ class MixedTrellisCompileResult:
     local_memory_bytes: int
     rotation_input_dtype: str
     route_ids_dtype: torch.dtype
+    broadcast_suh: bool
+    broadcast_svh: bool
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 5
+    ABI_VERSION = 6
 
     def __init__(
         self,
@@ -140,6 +142,7 @@ class W4A16MixedTrellisKernel:
             "moe_block_size",
             "activation",
             "rotation_input_dtype",
+            "broadcast_suh",
             "cta_threads",
             "sms",
         ):
@@ -560,16 +563,19 @@ class W4A16MixedTrellisKernel:
                 stride=(1,),
             ),
         )
+        suh_rows = total_experts
+        if cutlass.const_expr(self.driver.broadcast_suh):
+            suh_rows = cutlass.Int64(1)
         gate_suh = cute.make_tensor(
             gate_suh_ptr,
             layout=cute.make_layout(
-                (total_experts * cutlass.Int64(self.hidden_size),), stride=(1,)
+                (suh_rows * cutlass.Int64(self.hidden_size),), stride=(1,)
             ),
         )
         up_suh = cute.make_tensor(
             up_suh_ptr,
             layout=cute.make_layout(
-                (total_experts * cutlass.Int64(self.hidden_size),), stride=(1,)
+                (suh_rows * cutlass.Int64(self.hidden_size),), stride=(1,)
             ),
         )
         rotation_input = cute.make_tensor(
@@ -787,6 +793,8 @@ def compile_mixed_trellis(
     moe_block_size: int = 8,
     rotation_input_dtype: str = "bf16",
     route_ids_dtype: torch.dtype = torch.int32,
+    broadcast_suh: bool = False,
+    broadcast_svh: bool = False,
 ) -> MixedTrellisCompileResult:
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("mixed Trellis route IDs must be int32 or int64")
@@ -829,6 +837,7 @@ def compile_mixed_trellis(
             intermediate_rotation=True,
             full_rotation=True,
             rotation_input_dtype=rotation_input_dtype,
+            broadcast_suh=broadcast_suh,
             schedule_whole_tiles=True,
         )
 
@@ -866,6 +875,7 @@ def compile_mixed_trellis(
         route_num_experts=total_experts,
         route_ids_dtype=route_ids_dtype,
         use_expert_map=True,
+        broadcast_svh=broadcast_svh,
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -878,6 +888,8 @@ def compile_mixed_trellis(
             tier0_num_experts=int(tier0_num_experts),
             tier1_num_experts=int(tier1_num_experts),
             sms=int(sms),
+            broadcast_suh=bool(broadcast_suh),
+            broadcast_svh=bool(broadcast_svh),
         )
 
     compile_m = _fake_m_for_specialization(size_m)
@@ -982,6 +994,8 @@ def compile_mixed_trellis(
         local_memory_bytes=local_bytes,
         rotation_input_dtype=str(rotation_input_dtype),
         route_ids_dtype=route_ids_dtype,
+        broadcast_suh=bool(broadcast_suh),
+        broadcast_svh=bool(broadcast_svh),
     )
     _CACHE[cache_key] = result
     return result
@@ -1265,9 +1279,21 @@ def run_mixed_trellis(
             rotations.intermediate,
             total_experts * 3 * launch.intermediate_size,
         ),
-        ("gate SUH", rotations.gate_suh, total_experts * launch.hidden_size),
-        ("up SUH", rotations.up_suh, total_experts * launch.hidden_size),
-        ("down SVH", rotations.down_svh, total_experts * launch.hidden_size),
+        (
+            "gate SUH",
+            rotations.gate_suh,
+            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
+        ),
+        (
+            "up SUH",
+            rotations.up_suh,
+            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
+        ),
+        (
+            "down SVH",
+            rotations.down_svh,
+            (1 if launch.broadcast_svh else total_experts) * launch.hidden_size,
+        ),
     ):
         if (
             table.dtype != torch.float16

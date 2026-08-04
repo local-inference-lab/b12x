@@ -20,6 +20,7 @@ from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     run_w4a16_moe,
 )
 from sparkinfer.moe._shared.kernels.w4a16.mixed_trellis import (
+    MixedTrellisRotations,
     W4A16MixedTrellisKernel,
     _validate_mixed_trellis_tier_storage,
     build_ordered_maps,
@@ -192,6 +193,7 @@ def _prepared(
     seed: int,
     device: torch.device,
     tile_config: tuple[int, int, int, int] = (128, 128, 128, 128),
+    shared_h: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -200,6 +202,14 @@ def _prepared(
             0.875 + 0.25 * torch.rand(shape, generator=generator, device=device)
         ).to(torch.float16)
 
+    if shared_h is None:
+        gate_suh = scales((experts, hidden))
+        up_suh = scales((experts, hidden))
+        intermediate_rotations = scales((experts, 3 * intermediate))
+        down_svh = scales((experts, hidden))
+    else:
+        gate_suh, up_suh, down_svh = shared_h
+        intermediate_rotations = scales((experts, 3 * intermediate))
     return prepare_trellis256_moe_weights(
         hidden_size=hidden,
         intermediate_size=intermediate,
@@ -212,10 +222,10 @@ def _prepared(
         params_dtype=torch.float16,
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
-        gate_suh=scales((experts, hidden)),
-        up_suh=scales((experts, hidden)),
-        intermediate_rotations=scales((experts, 3 * intermediate)),
-        down_svh=scales((experts, hidden)),
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
         tile_config=tile_config,
     )
 
@@ -431,6 +441,162 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         skipped - skipped_serial
     ).norm() / skipped_serial.norm().clamp_min(1.0e-12)
     assert float(skipped_relative) < 4.0e-3
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
+    """A physical one-row H rotation must stay broadcast through mixed K3/K4."""
+
+    torch.manual_seed(20260804)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, hidden, intermediate, topk = 2, 128, 128, 2
+    generator = torch.Generator(device=device).manual_seed(20260804)
+
+    def shared_row() -> torch.Tensor:
+        return (
+            0.875
+            + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
+        ).to(torch.float16)
+
+    shared_h = (shared_row(), shared_row(), shared_row())
+    tier0 = _prepared(
+        experts=2,
+        hidden=hidden,
+        intermediate=intermediate,
+        bits=3,
+        seed=301,
+        device=device,
+        shared_h=shared_h,
+    )
+    tier1 = _prepared(
+        experts=2,
+        hidden=hidden,
+        intermediate=intermediate,
+        bits=4,
+        seed=401,
+        device=device,
+        shared_h=shared_h,
+    )
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1], [3, 2]], dtype=torch.int32, device=device)
+    topk_weights = torch.tensor(
+        [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
+    )
+    map0 = torch.tensor([1, -1, 0, -1], dtype=torch.int32, device=device)
+    map1 = torch.tensor([-1, 1, -1, 0], dtype=torch.int32, device=device)
+    serial = _serial_tier(x, tier0, topk_weights, topk_ids, map0)
+    serial.add_(_serial_tier(x, tier1, topk_weights, topk_ids, map1))
+
+    intermediate_rotations = torch.cat(
+        (tier0.intermediate_rotations, tier1.intermediate_rotations), dim=0
+    ).contiguous()
+    broadcast_rotations = MixedTrellisRotations(
+        intermediate=intermediate_rotations,
+        gate_suh=shared_h[0],
+        up_suh=shared_h[1],
+        down_svh=shared_h[2],
+    )
+    total_experts = int(tier0.num_experts + tier1.num_experts)
+    expanded_rotations = MixedTrellisRotations(
+        intermediate=intermediate_rotations,
+        gate_suh=shared_h[0].expand(total_experts, -1).contiguous(),
+        up_suh=shared_h[1].expand(total_experts, -1).contiguous(),
+        down_svh=shared_h[2].expand(total_experts, -1).contiguous(),
+    )
+
+    props = torch.cuda.get_device_properties(device)
+
+    def compile_launch(*, broadcast: bool):
+        return compile_mixed_trellis(
+            size_m=m,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tier0_num_experts=2,
+            tier1_num_experts=2,
+            top_k=topk,
+            max_m_blocks=8,
+            sms=int(props.multi_processor_count),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=(128, 128, 128, 128),
+            broadcast_suh=broadcast,
+            broadcast_svh=broadcast,
+        )
+
+    broadcast_launch = compile_launch(broadcast=True)
+    expanded_launch = compile_launch(broadcast=False)
+    assert broadcast_launch.broadcast_suh is True
+    assert broadcast_launch.broadcast_svh is True
+    assert expanded_launch.broadcast_suh is False
+    assert expanded_launch.broadcast_svh is False
+    assert broadcast_launch.compiled is not expanded_launch.compiled
+
+    global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
+    broadcast_buffers = make_mixed_trellis_buffers(
+        broadcast_launch, device=device, sms=int(props.multi_processor_count)
+    )
+    expanded_buffers = make_mixed_trellis_buffers(
+        expanded_launch, device=device, sms=int(props.multi_processor_count)
+    )
+    with pytest.raises(ValueError, match=r"gate SUH.*512 elements"):
+        run_mixed_trellis(
+            x,
+            tier0,
+            tier1,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            broadcast_rotations,
+            expanded_launch,
+            expanded_buffers,
+        )
+
+    broadcast = run_mixed_trellis(
+        x,
+        tier0,
+        tier1,
+        topk_weights,
+        topk_ids,
+        global_to_combined,
+        descriptor,
+        broadcast_rotations,
+        broadcast_launch,
+        broadcast_buffers,
+    ).clone()
+    expanded = run_mixed_trellis(
+        x,
+        tier0,
+        tier1,
+        topk_weights,
+        topk_ids,
+        global_to_combined,
+        descriptor,
+        expanded_rotations,
+        expanded_launch,
+        expanded_buffers,
+    ).clone()
+    torch.cuda.synchronize(device)
+    assert torch.equal(broadcast, expanded)
+    relative = (broadcast - serial).norm() / serial.norm().clamp_min(1.0e-12)
+    assert float(relative) < 4.0e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_mixed_trellis(
+            x,
+            tier0,
+            tier1,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            broadcast_rotations,
+            broadcast_launch,
+            broadcast_buffers,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, broadcast)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
