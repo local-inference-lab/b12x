@@ -615,18 +615,20 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(
     compressed_sparse_mla_decode_forward to SM120 sparse MLA.run_unified_prefill (single-pass
     DSV4 prefill), NOT run_unified_decode."""
     device = require_b12x_sparse_mla()
-    routed = {"prefill": 0, "decode": 0}
+    routed = {"prefill": 0, "decode": 0, "lse_ptr": None}
 
-    def fake_run_unified_prefill(*, q, output=None, **kwargs):
+    def fake_run_unified_prefill(*, q, output=None, lse_out=None, **kwargs):
         del kwargs
         routed["prefill"] += 1
+        assert lse_out is not None
+        routed["lse_ptr"] = lse_out.data_ptr()
         if output is not None:
             output.zero_()
             out = output
         else:
             out = q[:, :, :_DSV4_HEAD_DIM].clone()
-        lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
-        return out, lse
+        lse_out.zero_()
+        return out, lse_out
 
     def fake_run_unified_decode(**kwargs):
         routed["decode"] += 1
@@ -656,6 +658,7 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(
     assert out.shape == (1, _DSV4_HEADS, _DSV4_HEAD_DIM)
     assert routed["prefill"] == 1
     assert routed["decode"] == 0
+    assert routed["lse_ptr"] == scratch.final_lse.data_ptr()
 
 
 @torch.inference_mode()

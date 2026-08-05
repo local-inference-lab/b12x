@@ -353,6 +353,23 @@ def _run_sm120_compressed_prefill(
             q_all=q3,
             v_head_dim=COMPRESSED_SPARSE_MLA_HEAD_DIM,
         )
+    final_lse = getattr(workspace, "final_lse", None)
+    if final_lse is None:
+        raise RuntimeError(
+            "compressed MLA prefill requires caller-owned final_lse scratch"
+        )
+    final_lse = final_lse[: int(q3.shape[0])]
+    if tuple(final_lse.shape) != (int(q3.shape[0]), int(q3.shape[1])):
+        raise ValueError(
+            "compressed MLA final_lse scratch must have live shape "
+            f"{(int(q3.shape[0]), int(q3.shape[1]))}, got {tuple(final_lse.shape)}"
+        )
+    if final_lse.dtype != torch.float32 or final_lse.device != q3.device:
+        raise ValueError(
+            "compressed MLA final_lse scratch must be float32 on the query device"
+        )
+    if not final_lse.is_contiguous():
+        raise ValueError("compressed MLA final_lse scratch must be contiguous")
 
     extra_kwargs: dict = {}
     if indexed_k_cache is not None:
@@ -374,6 +391,7 @@ def _run_sm120_compressed_prefill(
         topk_length=swa_topk_lengths,
         attn_sink=attn_sink,
         output=output,
+        lse_out=final_lse,
         **extra_kwargs,
     )
     if not return_lse:
