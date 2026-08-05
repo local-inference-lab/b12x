@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import statistics
+import subprocess
+import sys
 
 import torch
 
@@ -39,7 +42,80 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=5000)
     parser.add_argument("--trials", type=int, default=7)
     parser.add_argument("--seed", type=int, default=20260804)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.validation_cases < 1:
+        parser.error("--validation-cases must be >= 1")
+    if args.iterations < 1:
+        parser.error("--iterations must be >= 1")
+    if args.trials < 1:
+        parser.error("--trials must be >= 1")
+    return args
+
+
+def _command_output(
+    command: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    allow_empty: bool = False,
+) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    if result.returncode != 0:
+        return "unavailable"
+    output = result.stdout.strip()
+    return output if output or allow_empty else "unavailable"
+
+
+def _provenance(device: torch.device) -> dict[str, object]:
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    commit = _command_output(["git", "rev-parse", "HEAD"], cwd=repo)
+    worktree = _command_output(["git", "rev-parse", "--show-toplevel"], cwd=repo)
+    status = _command_output(["git", "status", "--short"], cwd=repo, allow_empty=True)
+    device_index = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device_index)
+    uuid = str(getattr(props, "uuid", ""))
+    physical_selector = uuid if uuid and uuid != "None" else str(device_index)
+    gpu_mode = _command_output(
+        [
+            "nvidia-smi",
+            "-i",
+            physical_selector,
+            "--query-gpu=index,uuid,pci.bus_id,pstate,clocks.current.graphics,"
+            "clocks.current.memory,power.limit",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    return {
+        "command": [sys.executable, *sys.argv],
+        "cwd": os.getcwd(),
+        "git_commit": commit,
+        "worktree": worktree,
+        "git_dirty": None if status == "unavailable" else bool(status),
+        "gpu": {
+            "requested_device": str(device),
+            "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "logical_index": device_index,
+            "name": props.name,
+            "uuid": uuid,
+            "pci_bus_id": str(getattr(props, "pci_bus_id", "")),
+            "capability": list(torch.cuda.get_device_capability(device_index)),
+            "mode": gpu_mode,
+            "mode_fields": (
+                "index,uuid,pci.bus_id,pstate,clocks.current.graphics_mhz,"
+                "clocks.current.memory_mhz,power_limit_w"
+            ),
+        },
+        "ratio_direction": "higher_speedup_is_better",
+    }
 
 
 def _capture(run, *, reset: bool) -> torch.cuda.CUDAGraph:
@@ -221,6 +297,7 @@ def main() -> None:
     reset_median = statistics.median(reset_times)
     persistent_median = statistics.median(persistent_times)
     result = {
+        "provenance": _provenance(device),
         "shape": {
             "m": m,
             "hidden_size": hidden_size,

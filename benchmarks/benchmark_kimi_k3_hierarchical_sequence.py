@@ -390,22 +390,46 @@ def _worker(
         if rank == 0:
             calls = layers * len(shapes)
             med = float(median(timings))
-            vectorized_bf16x2 = (
-                os.getenv(
-                    "B12X_PCIE_HIERARCHICAL_BF16X2",
-                    "1",
+            if mode == "lane":
+                # The benchmark-only lane POC has fixed launch geometry in
+                # kimi_k3_lane_allreduce_poc.cu and does not implement BF16x2.
+                wait_nanosleep_cycles = 64
+                configured_scalar_threads = 256
+                effective_threads = [256 for _ in shapes]
+                vectorized_bf16x2 = False
+                vectorized_bf16x2_max_elements = None
+            else:
+                wait_nanosleep_cycles = int(
+                    os.getenv(
+                        "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
+                        "24",
+                    )
                 )
-                == "1"
-            )
-            vectorized_bf16x2_max_elements = int(
-                os.getenv(
-                    "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
-                    "7168",
+                vectorized_bf16x2 = (
+                    os.getenv(
+                        "B12X_PCIE_HIERARCHICAL_BF16X2",
+                        "1",
+                    )
+                    == "1"
                 )
-            )
-            configured_scalar_threads = int(
-                os.getenv("B12X_PCIE_HIERARCHICAL_THREADS", "224")
-            )
+                vectorized_bf16x2_max_elements = int(
+                    os.getenv(
+                        "B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+                        "7168",
+                    )
+                )
+                configured_scalar_threads = int(
+                    os.getenv("B12X_PCIE_HIERARCHICAL_THREADS", "224")
+                )
+                effective_threads = [
+                    (
+                        112
+                        if vectorized_bf16x2
+                        and elements <= vectorized_bf16x2_max_elements
+                        else configured_scalar_threads
+                    )
+                    for elements in shapes
+                ]
             print(
                 json.dumps(
                     {
@@ -425,22 +449,9 @@ def _worker(
                         "bit_exact_grouped_reference": True,
                         "bit_exact_across_ranks": True,
                         "input_immutable": True,
-                        "wait_nanosleep_cycles": int(
-                            os.getenv(
-                                "B12X_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES",
-                                "24",
-                            )
-                        ),
+                        "wait_nanosleep_cycles": wait_nanosleep_cycles,
                         "configured_scalar_threads": configured_scalar_threads,
-                        "effective_threads_per_block_by_shape": [
-                            (
-                                112
-                                if vectorized_bf16x2
-                                and elements <= vectorized_bf16x2_max_elements
-                                else configured_scalar_threads
-                            )
-                            for elements in shapes
-                        ],
+                        "effective_threads_per_block_by_shape": effective_threads,
                         "vectorized_bf16x2": vectorized_bf16x2,
                         "vectorized_bf16x2_max_elements": (
                             vectorized_bf16x2_max_elements
