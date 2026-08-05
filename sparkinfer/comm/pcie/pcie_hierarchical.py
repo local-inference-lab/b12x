@@ -30,14 +30,84 @@ SUPPORTED_WORLD_SIZES = (12, 16)
 SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32)
 
 
+def _wait_nanosleep_cycles_from_env() -> int:
+    raw = os.getenv("SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES", "24")
+    try:
+        cycles = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES must be an integer"
+        ) from exc
+    if not 0 <= cycles <= 1024:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES must be in [0, 1024]"
+        )
+    return cycles
+
+
+def _threads_from_env() -> int:
+    raw = os.getenv("SPARKINFER_PCIE_HIERARCHICAL_THREADS", "224")
+    try:
+        threads = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_THREADS must be an integer"
+        ) from exc
+    if not 32 <= threads <= 1024 or threads % 32 != 0:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_THREADS must be a multiple of 32 "
+            "in [32, 1024]"
+        )
+    return threads
+
+
+def _vectorized_bf16x2_from_env() -> bool:
+    raw = os.getenv("SPARKINFER_PCIE_HIERARCHICAL_BF16X2", "1")
+    if raw not in ("0", "1"):
+        raise ValueError("SPARKINFER_PCIE_HIERARCHICAL_BF16X2 must be 0 or 1")
+    return raw == "1"
+
+
+def _vectorized_bf16x2_max_elements_from_env() -> int:
+    raw = os.getenv(
+        "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS",
+        "7168",
+    )
+    try:
+        max_elements = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS must be an integer"
+        ) from exc
+    if not 0 <= max_elements <= 1 << 30:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS must be in [0, 2**30]"
+        )
+    return max_elements
+
+
 @lru_cache(maxsize=1)
 def _load_extension():
     source = Path(__file__).with_name("pcie_hierarchical.cu")
     verbose = os.getenv("SPARKINFER_PCIE_HIERARCHICAL_VERBOSE_BUILD", "0") == "1"
+    wait_cycles = _wait_nanosleep_cycles_from_env()
+    threads = _threads_from_env()
+    vectorized_bf16x2 = _vectorized_bf16x2_from_env()
+    vectorized_bf16x2_max_elements = _vectorized_bf16x2_max_elements_from_env()
     return load(
-        name="sparkinfer_pcie_hierarchical_ext",
+        name=(
+            f"sparkinfer_pcie_hierarchical_ext_t{threads}_ns{wait_cycles}_"
+            f"v{int(vectorized_bf16x2)}_vm{vectorized_bf16x2_max_elements}"
+        ),
         sources=[str(source)],
-        extra_cuda_cflags=["-O3"],
+        extra_cuda_cflags=[
+            "-O3",
+            f"-DSPARKINFER_PCIE_HIERARCHICAL_NANOSLEEP_CYCLES={wait_cycles}",
+            f"-DSPARKINFER_PCIE_HIERARCHICAL_THREADS={threads}",
+            f"-DSPARKINFER_PCIE_HIERARCHICAL_BF16X2={int(vectorized_bf16x2)}",
+            "-DSPARKINFER_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS="
+            f"{vectorized_bf16x2_max_elements}",
+        ],
         extra_ldflags=["-lcuda"],
         verbose=verbose,
     )
@@ -67,6 +137,28 @@ def _pick_blocks(elements: int) -> int:
     if elements <= 0:
         raise ValueError("elements must be positive")
     return 16 if elements <= 4096 else 32
+
+
+def _buffer_modes_from_env() -> tuple[bool, bool]:
+    """Return mutually exclusive experimental synchronization modes."""
+
+    double_buffered = (
+        os.getenv("SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "0") == "1"
+    )
+    deferred_consumption = (
+        os.getenv(
+            "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+            "0",
+        )
+        == "1"
+    )
+    if double_buffered and deferred_consumption:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER and "
+            "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION are "
+            "mutually exclusive"
+        )
+    return double_buffered, deferred_consumption
 
 
 class PCIeHierarchicalAllReduce:
@@ -103,6 +195,10 @@ class PCIeHierarchicalAllReduce:
 
         self.max_elements = int(max_elements)
         self.blocks = None if blocks is None else int(blocks)
+        (
+            self.double_buffered,
+            self.deferred_consumption,
+        ) = _buffer_modes_from_env()
         self._ext = ext_module or _load_extension()
         self._ipc = CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
@@ -176,6 +272,11 @@ class PCIeHierarchicalAllReduce:
             selected_blocks = _pick_blocks(inp.numel())
         if selected_blocks not in SUPPORTED_BLOCKS:
             raise ValueError(f"blocks must be one of {SUPPORTED_BLOCKS}")
+        if self.double_buffered and selected_blocks != _pick_blocks(inp.numel()):
+            raise ValueError(
+                "double-buffered hierarchical all-reduce requires the "
+                "automatic K3 launch geometry"
+            )
         if out is None:
             out = torch.empty_like(inp)
         if (
@@ -192,6 +293,8 @@ class PCIeHierarchicalAllReduce:
             inp,
             out,
             selected_blocks,
+            self.double_buffered,
+            self.deferred_consumption,
         )
         return out
 

@@ -27,6 +27,7 @@ from sparkinfer.moe._shared.kernels.w4a16.host import (
 from sparkinfer.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     MoEMicroKernelW4A16SmallMDirect,
+    _small_m_direct_host_barrier_reset_enabled,
     _w4a16_stream_is_capturing,
     _small_m_direct_supported,
     compile_w4a16_fused_moe,
@@ -46,6 +47,15 @@ from tests._reference.helpers import (
     run_tp_moe_fp4,
 )
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
+
+
+def test_w4a16_small_m_host_barrier_reset_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET", raising=False)
+    assert _small_m_direct_host_barrier_reset_enabled()
+    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
+    assert not _small_m_direct_host_barrier_reset_enabled()
 
 
 def test_w4a16_fused_compile_rejects_unresolved_capture_launch(
@@ -677,19 +687,13 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
             dtype=torch.uint8,
             device=device,
         )
-        w13_scale = _pattern_e8m0(
-            (experts, rows, hidden_size // 32), offset=experts
-        )
+        w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32), offset=experts)
         w2_scale = _pattern_e8m0(
             (experts, hidden_size, intermediate_size // 32),
             offset=experts + 1,
         )
-        w13_global_scale = torch.ones(
-            experts, dtype=torch.float32, device=device
-        )
-        w2_global_scale = torch.ones(
-            experts, dtype=torch.float32, device=device
-        )
+        w13_global_scale = torch.ones(experts, dtype=torch.float32, device=device)
+        w2_global_scale = torch.ones(experts, dtype=torch.float32, device=device)
         prepared = prepare_w4a16_packed_weights(
             w13,
             w13_scale,
@@ -708,9 +712,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
             dtype=torch.bfloat16,
             device=device,
         )
-        x = (torch.randn(m, hidden_size, device=device) * 0.125).to(
-            torch.bfloat16
-        )
+        x = (torch.randn(m, hidden_size, device=device) * 0.125).to(torch.bfloat16)
         topk_ids = torch.tensor(
             [
                 [0, experts - 1],
@@ -796,8 +798,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
         _assert_matches_oracle(actual, expected, activation=activation)
 
         compiled_now = {
-            key: id(value.compiled)
-            for key, value in w4a16_kernel._FUSED_CACHE.items()
+            key: id(value.compiled) for key, value in w4a16_kernel._FUSED_CACHE.items()
         }
         if compiled_after_first is None:
             compiled_after_first = compiled_now
@@ -980,9 +981,7 @@ def test_w4a16_e8m0_native_aligned_generic_fc1_uses_k32_scale_stride() -> None:
         device="cuda",
     )
     w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
-    w2_scale = _pattern_e8m0(
-        (experts, hidden_size, intermediate_size // 32), offset=1
-    )
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
     w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
     w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
     prepared = prepare_w4a16_e8m0_native_weights(
@@ -1003,9 +1002,7 @@ def test_w4a16_e8m0_native_aligned_generic_fc1_uses_k32_scale_stride() -> None:
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
     )
-    intermediate_cache2 = torch.zeros(
-        2 * 128 * 2, dtype=torch.bfloat16, device="cuda"
-    )
+    intermediate_cache2 = torch.zeros(2 * 128 * 2, dtype=torch.bfloat16, device="cuda")
     x = torch.randn(1, hidden_size, dtype=torch.bfloat16, device="cuda")
     topk_ids = torch.tensor([[6, 7]], dtype=torch.int32, device="cuda")
     topk_weights = torch.tensor([[0.4, 0.6]], dtype=torch.float32, device="cuda")
@@ -1951,9 +1948,7 @@ def test_w4a16_mapped_decode_consumes_global_map_without_route_pack(
         intermediate_size=intermediate_size,
         activation=activation,
     )
-    expert_map = torch.full(
-        (global_experts,), -1, dtype=torch.int32, device="cuda"
-    )
+    expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device="cuda")
     mapped_global_ids = torch.tensor(
         [0, 2, 3, 5, 7, 8, 10, 11], dtype=torch.int32, device="cuda"
     )
@@ -2078,9 +2073,7 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         dtype=torch.uint8,
         device=device,
     )
-    w1_scale = _pattern_e8m0(
-        (local_experts, 2 * intermediate_size, hidden_size // 32)
-    )
+    w1_scale = _pattern_e8m0((local_experts, 2 * intermediate_size, hidden_size // 32))
     w2_scale = _pattern_e8m0(
         (local_experts, hidden_size, intermediate_size // 32),
         offset=1,
@@ -2130,12 +2123,8 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     x = (torch.randn(1, hidden_size, device=device) * 0.25).to(torch.bfloat16)
     topk_ids = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
     topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32, device=device)
-    expert_map = torch.full(
-        (global_experts,), -1, dtype=torch.int32, device=device
-    )
-    expert_map[::2] = torch.arange(
-        local_experts - 2, dtype=torch.int32, device=device
-    )
+    expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device=device)
+    expert_map[::2] = torch.arange(local_experts - 2, dtype=torch.int32, device=device)
     output = torch.empty_like(x)
     binding = plan.bind(
         scratch=scratch,

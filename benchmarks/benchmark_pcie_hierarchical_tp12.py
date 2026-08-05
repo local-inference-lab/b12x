@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sparkinfer.comm.pcie import AllReduce
-from sparkinfer.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS
+from sparkinfer.comm.pcie.pcie_hierarchical import SUPPORTED_BLOCKS, _pick_blocks
 
 
 def _free_port() -> int:
@@ -117,14 +117,37 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             )
             fp32_ref = inp.float()
             dist.all_reduce(fp32_ref)
+            gathered_inputs = [torch.empty_like(inp) for _ in range(world_size)]
+            dist.all_gather(gathered_inputs, inp)
+            island_partials = []
+            for island_base in range(0, world_size, 4):
+                partial = torch.zeros_like(inp, dtype=torch.float32)
+                for peer in range(island_base, island_base + 4):
+                    partial.add_(gathered_inputs[peer].float())
+                island_partials.append(partial)
+            grouped_ref_fp32 = torch.zeros_like(inp, dtype=torch.float32)
+            for partial in island_partials:
+                grouped_ref_fp32.add_(partial)
+            grouped_ref = grouped_ref_fp32.to(torch.bfloat16)
             nccl_actual = inp.clone()
             dist.all_reduce(nccl_actual)
             nccl_max_abs_error = (nccl_actual.float() - fp32_ref).abs().max()
             dist.all_reduce(nccl_max_abs_error, op=dist.ReduceOp.MAX)
 
-            for blocks in SUPPORTED_BLOCKS:
+            blocks_to_test = (
+                (_pick_blocks(elements),)
+                if runtime._runtime.double_buffered
+                else SUPPORTED_BLOCKS
+            )
+            for blocks in blocks_to_test:
                 actual = runtime.all_reduce(inp, blocks=blocks)
                 torch.cuda.synchronize(device)
+                if not torch.equal(actual, grouped_ref):
+                    grouped_delta = (actual.float() - grouped_ref.float()).abs().max()
+                    raise AssertionError(
+                        "custom output differs from the exact grouped-order "
+                        f"reference: {grouped_delta.item()}"
+                    )
                 custom_max_abs_error = (actual.float() - fp32_ref).abs().max()
                 dist.all_reduce(custom_max_abs_error, op=dist.ReduceOp.MAX)
 

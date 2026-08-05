@@ -779,6 +779,144 @@ class PCIeDCPA2A:
         )
         return out
 
+    def all_gather_pair(
+        self,
+        local_first: torch.Tensor,
+        local_second: torch.Tensor,
+        out_first: Optional[torch.Tensor] = None,
+        out_second: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 512,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather two raw projection rows behind one IPC barrier.
+
+        The two tensors may use different floating dtypes. Their bytes are
+        copied independently into rank-major outputs without conversion.
+        """
+        self._check_stream()
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2A is closed")
+        inputs = (local_first, local_second)
+        if any(value.device != self.device for value in inputs):
+            raise ValueError("paired inputs must be on the runtime device")
+        if any(value.ndim != 2 for value in inputs):
+            raise ValueError("paired inputs must have shape [batch, width]")
+        if any(not value.is_contiguous() for value in inputs):
+            raise ValueError("paired inputs must be contiguous")
+        batch = int(local_first.shape[0])
+        if batch <= 0 or batch > self.max_batch_size:
+            raise ValueError(
+                f"batch size {batch} exceeds configured capacity {self.max_batch_size}"
+            )
+        if int(local_second.shape[0]) != batch:
+            raise ValueError("paired inputs must have the same batch size")
+        combined_row_bytes = sum(
+            int(value.shape[1]) * value.element_size() for value in inputs
+        )
+        if combined_row_bytes != self.query_head_dim:
+            raise ValueError(
+                "paired row bytes must match the runtime query dimension: "
+                f"got {combined_row_bytes}, expected {self.query_head_dim}"
+            )
+
+        expected_first = (batch, int(local_first.shape[1]) * self.world_size)
+        expected_second = (batch, int(local_second.shape[1]) * self.world_size)
+        if out_first is None:
+            out_first = torch.empty(
+                expected_first,
+                device=local_first.device,
+                dtype=local_first.dtype,
+            )
+        if out_second is None:
+            out_second = torch.empty(
+                expected_second,
+                device=local_second.device,
+                dtype=local_second.dtype,
+            )
+        for name, output, expected, source in (
+            ("first", out_first, expected_first, local_first),
+            ("second", out_second, expected_second, local_second),
+        ):
+            if output.device != self.device or output.dtype != source.dtype:
+                raise ValueError(f"{name} output device and dtype must match input")
+            if output.shape != expected:
+                raise ValueError(
+                    f"{name} output shape must be {expected}, got {tuple(output.shape)}"
+                )
+            if not output.is_contiguous():
+                raise ValueError(f"{name} output must be contiguous")
+        self._ext.all_gather_pair(
+            self._ptr,
+            local_first,
+            local_second,
+            out_first,
+            out_second,
+            int(threads),
+        )
+        return out_first, out_second
+
+    def all_gather_pair_kimi_topk(
+        self,
+        local_down: torch.Tensor,
+        local_router: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_down: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather Kimi-K3's TP16 latent row and select its 16 experts."""
+        self._check_stream()
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2A is closed")
+        if self.world_size != 16:
+            raise ValueError("Kimi paired gather+top-k requires TP16")
+        expected = (
+            (local_down, (1, 224), torch.bfloat16, "local_down"),
+            (local_router, (1, 56), torch.float32, "local_router"),
+            (correction_bias, (896,), torch.float32, "correction_bias"),
+        )
+        for value, shape, dtype, name in expected:
+            if (
+                value.device != self.device
+                or value.shape != shape
+                or value.dtype != dtype
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {shape} {dtype} on {self.device}"
+                )
+        if out_down is None:
+            out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
+        if topk_weights is None:
+            topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32)
+        if topk_ids is None:
+            topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32)
+        outputs = (
+            (out_down, (1, 3584), torch.bfloat16, "out_down"),
+            (topk_weights, (1, 16), torch.float32, "topk_weights"),
+            (topk_ids, (1, 16), torch.int32, "topk_ids"),
+        )
+        for value, shape, dtype, name in outputs:
+            if (
+                value.device != self.device
+                or value.shape != shape
+                or value.dtype != dtype
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {shape} {dtype} on {self.device}"
+                )
+        self._ext.all_gather_pair_kimi_topk(
+            self._ptr,
+            local_down,
+            local_router,
+            correction_bias,
+            out_down,
+            topk_weights,
+            topk_ids,
+        )
+        return out_down, topk_weights, topk_ids
+
     def _closed_import_indices(self) -> set[tuple[int, int]]:
         closed = getattr(self, "_closed_ipc_import_indices", None)
         if closed is None:
@@ -1325,6 +1463,67 @@ class PCIeDCPA2APool:
             out,
             threads=threads,
             block_limit=block_limit,
+        )
+
+    def all_gather_pair(
+        self,
+        local_first: torch.Tensor,
+        local_second: torch.Tensor,
+        out_first: Optional[torch.Tensor] = None,
+        out_second: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 512,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        channel = self.for_stream(stream, channel_id=channel_id)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return channel.all_gather_pair(
+                    local_first,
+                    local_second,
+                    out_first,
+                    out_second,
+                    threads=threads,
+                )
+        return channel.all_gather_pair(
+            local_first,
+            local_second,
+            out_first,
+            out_second,
+            threads=threads,
+        )
+
+    def all_gather_pair_kimi_topk(
+        self,
+        local_down: torch.Tensor,
+        local_router: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_down: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        *,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        channel = self.for_stream(stream, channel_id=channel_id)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return channel.all_gather_pair_kimi_topk(
+                    local_down,
+                    local_router,
+                    correction_bias,
+                    out_down,
+                    topk_weights,
+                    topk_ids,
+                )
+        return channel.all_gather_pair_kimi_topk(
+            local_down,
+            local_router,
+            correction_bias,
+            out_down,
+            topk_weights,
+            topk_ids,
         )
 
     @contextmanager

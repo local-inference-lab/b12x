@@ -16,12 +16,15 @@
 #include <math_constants.h>
 #include <torch/all.h>
 #include <torch/extension.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -39,6 +42,8 @@
   } while (0)
 
 namespace pcie_dcp_a2a {
+
+namespace cg = cooperative_groups;
 
 constexpr int kMaxBlocks = 64;
 constexpr int kMaxRanks = 16;
@@ -413,6 +418,307 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
+// Gather two independently typed, contiguous rank-local rows behind one IPC
+// barrier. The payload is copied as raw 16-byte records, so BF16 projection
+// values and FP32 router logits retain every bit while landing in separate,
+// globally rank-major output tensors. One CTA is intentional: Kimi-K3's pair
+// is only 672 bytes per rank and the ordinary gather also selects one CTA for
+// this geometry.
+template <int world_size>
+__global__ void __launch_bounds__(512, 1)
+    all_gather_pair_kernel(
+        const uint8_t *__restrict__ local_first,
+        const uint8_t *__restrict__ local_second,
+        DoubleStaging staging_options, RankSignals signals, Signal *self,
+        uint8_t *__restrict__ output_first,
+        uint8_t *__restrict__ output_second, int rank, int batch,
+        int first_row_bytes, int second_row_bytes, int delayed_rank,
+        uint64_t delay_cycles) {
+  using BytePack = Pack<uint8_t>;
+  constexpr int kPackBytes = sizeof(BytePack);
+  const int first_packs = first_row_bytes / kPackBytes;
+  const int second_packs = second_row_bytes / kPackBytes;
+  const int combined_packs = first_packs + second_packs;
+  const auto *first = reinterpret_cast<const BytePack *>(local_first);
+  const auto *second = reinterpret_cast<const BytePack *>(local_second);
+
+  __shared__ RankStaging staging;
+  select_staging<world_size>(staging, staging_options, self);
+
+  auto *staging_out = reinterpret_cast<BytePack *>(staging.ptrs[rank]);
+  for (int linear = threadIdx.x; linear < batch * first_packs;
+       linear += blockDim.x) {
+    const int batch_index = linear / first_packs;
+    const int pack = linear - batch_index * first_packs;
+    staging_out[batch_index * combined_packs + pack] = first[linear];
+  }
+  for (int linear = threadIdx.x; linear < batch * second_packs;
+       linear += blockDim.x) {
+    const int batch_index = linear / second_packs;
+    const int pack = linear - batch_index * second_packs;
+    staging_out[batch_index * combined_packs + first_packs + pack] =
+        second[linear];
+  }
+  start_barrier<world_size, true>(signals, self, rank);
+  test_post_barrier_delay(rank, delayed_rank, delay_cycles);
+
+  auto *first_out = reinterpret_cast<BytePack *>(output_first);
+  auto *second_out = reinterpret_cast<BytePack *>(output_second);
+  const int first_output_packs = batch * world_size * first_packs;
+  for (int linear = threadIdx.x; linear < first_output_packs;
+       linear += blockDim.x) {
+    const int batch_index = linear / (world_size * first_packs);
+    const int row_pack = linear - batch_index * world_size * first_packs;
+    const int source_rank = row_pack / first_packs;
+    const int pack = row_pack - source_rank * first_packs;
+    const auto *source =
+        source_rank == rank
+            ? first
+            : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
+    const int source_base = source_rank == rank
+                                ? batch_index * first_packs
+                                : batch_index * combined_packs;
+    first_out[linear] = source[source_base + pack];
+  }
+  const int second_output_packs = batch * world_size * second_packs;
+  for (int linear = threadIdx.x; linear < second_output_packs;
+       linear += blockDim.x) {
+    const int batch_index = linear / (world_size * second_packs);
+    const int row_pack = linear - batch_index * world_size * second_packs;
+    const int source_rank = row_pack / second_packs;
+    const int pack = row_pack - source_rank * second_packs;
+    const auto *source =
+        source_rank == rank
+            ? second
+            : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
+    const int source_base = source_rank == rank
+                                ? batch_index * second_packs
+                                : batch_index * combined_packs + first_packs;
+    second_out[linear] = source[source_base + pack];
+  }
+}
+
+// TP16 Kimi-K3 decode specialization.  The ordinary paired path materializes
+// all 896 FP32 router logits and then launches a separate top-k kernel.  This
+// path reads the rank-local router shards directly from the same IPC staging
+// used by the BF16 down-projection gather and emits only the 16 selected
+// experts.  Selection uses the same float ordering and lower-expert-id tie
+// break as vLLM's native one-group sigmoid+bias top-k implementation.
+__device__ __forceinline__ uint32_t kimi_float_order_key(float value) {
+  const uint32_t bits = __float_as_uint(value);
+  const uint32_t mask = (bits & 0x80000000U) != 0U ? 0xffffffffU : 0x80000000U;
+  return bits ^ mask;
+}
+
+__device__ __forceinline__ uint64_t kimi_topk_key(float score, int expert) {
+  return (uint64_t{kimi_float_order_key(score)} << 32) |
+         uint64_t{0xffff - expert};
+}
+
+__device__ __forceinline__ int kimi_topk_expert(uint64_t key) {
+  return 0xffff - static_cast<int>(key & uint64_t{0xffff});
+}
+
+__device__ __forceinline__ uint64_t kimi_warp_max_key(uint64_t key) {
+  const uint32_t hi = static_cast<uint32_t>(key >> 32);
+  const uint32_t lo = static_cast<uint32_t>(key);
+  uint32_t max_hi;
+  asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n"
+               : "=r"(max_hi)
+               : "r"(hi));
+  const uint32_t lo_contribution = hi == max_hi ? lo : 0U;
+  uint32_t max_lo;
+  asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n"
+               : "=r"(max_lo)
+               : "r"(lo_contribution));
+  return (uint64_t{max_hi} << 32) | uint64_t{max_lo};
+}
+
+template <int count>
+__device__ __forceinline__ void kimi_sort_keys_descending(uint64_t (&keys)[count]) {
+  static_assert(count == 2 || count == 8);
+#pragma unroll
+  for (int width = 2; width <= count; width *= 2) {
+#pragma unroll
+    for (int stride = width / 2; stride > 0; stride /= 2) {
+#pragma unroll
+      for (int index = 0; index < count; ++index) {
+        const int peer = index ^ stride;
+        if (peer > index) {
+          const bool descending = (index & width) == 0;
+          const bool swap = descending ? keys[index] < keys[peer]
+                                       : keys[index] > keys[peer];
+          if (swap) {
+            const uint64_t temporary = keys[index];
+            keys[index] = keys[peer];
+            keys[peer] = temporary;
+          }
+        }
+      }
+    }
+  }
+}
+
+template <int count>
+__device__ __forceinline__ uint64_t kimi_lane_owned_top16(
+    uint64_t (&keys)[count], int lane) {
+  kimi_sort_keys_descending(keys);
+  uint64_t previous = 0;
+  uint64_t lane_key = 0;
+#pragma unroll
+  for (int selected = 0; selected < 16; ++selected) {
+    const bool remove_head = selected > 0 && previous == keys[0];
+    const int tail_expert = kimi_topk_expert(keys[count - 1]);
+#pragma unroll
+    for (int item = 0; item < count; ++item) {
+      keys[item] = remove_head && item == count - 1
+                       ? kimi_topk_key(-CUDART_INF_F, tail_expert)
+                   : remove_head ? keys[item + 1]
+                                 : keys[item];
+    }
+    previous = kimi_warp_max_key(keys[0]);
+    if (lane == selected) {
+      lane_key = previous;
+    }
+  }
+  return lane_key;
+}
+
+template <int world_size>
+__global__ void __launch_bounds__(512, 1)
+    all_gather_pair_kimi_topk_kernel(
+        const __nv_bfloat16 *__restrict__ local_down,
+        const float *__restrict__ local_router, DoubleStaging staging_options,
+        RankSignals signals, Signal *self,
+        const float *__restrict__ correction_bias,
+        __nv_bfloat16 *__restrict__ output_down,
+        float *__restrict__ topk_weights, int32_t *__restrict__ topk_ids,
+        int rank, int delayed_rank, uint64_t delay_cycles) {
+  static_assert(world_size == 16);
+  constexpr int kThreads = 512;
+  constexpr int kTopkThreads = 256;
+  constexpr int kRouterWarps = 4;
+  constexpr int kPreprocessItems = 4;
+  constexpr int kLocalDown = 224;
+  constexpr int kLocalExperts = 56;
+  constexpr int kNumExperts = world_size * kLocalExperts;
+  constexpr int kTopK = 16;
+  constexpr int kDownBytes = kLocalDown * sizeof(__nv_bfloat16);
+  constexpr int kRouterBytes = kLocalExperts * sizeof(float);
+  constexpr int kDownPacks = kDownBytes / sizeof(Pack<uint8_t>);
+  constexpr int kRouterPacks = kRouterBytes / sizeof(Pack<uint8_t>);
+  constexpr int kCombinedPacks = kDownPacks + kRouterPacks;
+  using BytePack = Pack<uint8_t>;
+  __shared__ RankStaging staging;
+  __shared__ float selection_scores[kNumExperts];
+  __shared__ float unbiased_scores[kNumExperts];
+  __shared__ uint64_t intermediate_keys[4 * kTopK];
+  select_staging<world_size>(staging, staging_options, self);
+
+  auto *staging_out = reinterpret_cast<BytePack *>(staging.ptrs[rank]);
+  const auto *down_packs = reinterpret_cast<const BytePack *>(local_down);
+  const auto *router_packs = reinterpret_cast<const BytePack *>(local_router);
+  for (int pack = threadIdx.x; pack < kDownPacks; pack += blockDim.x) {
+    staging_out[pack] = down_packs[pack];
+  }
+  for (int pack = threadIdx.x; pack < kRouterPacks; pack += blockDim.x) {
+    staging_out[kDownPacks + pack] = router_packs[pack];
+  }
+  start_barrier<world_size, true>(signals, self, rank);
+  test_post_barrier_delay(rank, delayed_rank, delay_cycles);
+
+  const int lane = int(threadIdx.x) & 31;
+  const int warp_id = int(threadIdx.x) >> 5;
+  // Pull both payloads with the ordinary pair kernel's 512-thread copy
+  // geometry, but land router bytes in shared memory instead of a global
+  // 896-float intermediate. The following CTA barrier is the handoff to the
+  // native-shaped top-k phase.
+  auto *down_out_packs = reinterpret_cast<BytePack *>(output_down);
+  auto *router_shared_packs =
+      reinterpret_cast<BytePack *>(selection_scores);
+  for (int linear = int(threadIdx.x);
+       linear < world_size * (kDownPacks + kRouterPacks);
+       linear += kThreads) {
+    if (linear < world_size * kDownPacks) {
+      const int source_rank = linear / kDownPacks;
+      const int pack = linear - source_rank * kDownPacks;
+      const auto *source =
+          source_rank == rank
+              ? down_packs
+              : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
+      down_out_packs[linear] = source[pack];
+    } else {
+      const int router_linear = linear - world_size * kDownPacks;
+      const int source_rank = router_linear / kRouterPacks;
+      const int pack = router_linear - source_rank * kRouterPacks;
+      const auto *source =
+          source_rank == rank
+              ? router_packs
+              : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]) +
+                    kDownPacks;
+      router_shared_packs[router_linear] = source[pack];
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kTopkThreads) {
+#pragma unroll
+    for (int item = 0; item < kPreprocessItems; ++item) {
+      const int expert = int(threadIdx.x) + item * kTopkThreads;
+      if (expert < kNumExperts) {
+        float unbiased = 0.0F;
+        float selection = -CUDART_INF_F;
+        const float input = selection_scores[expert];
+        const float bias = correction_bias[expert];
+        if (isfinite(input) && isfinite(bias)) {
+          unbiased = 0.5F * tanhf(0.5F * input) + 0.5F;
+          const float biased = unbiased + bias;
+          selection = biased == 0.0F ? 0.0F : biased;
+        }
+        unbiased_scores[expert] = unbiased;
+        selection_scores[expert] = selection;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (warp_id < kRouterWarps) {
+    uint64_t worker_keys[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      const int expert = warp_id * 256 + item * 32 + lane;
+      const float score =
+          expert < kNumExperts ? selection_scores[expert] : -CUDART_INF_F;
+      worker_keys[item] = kimi_topk_key(score, expert);
+    }
+    const uint64_t selected = kimi_lane_owned_top16(worker_keys, lane);
+    if (lane < kTopK) {
+      intermediate_keys[warp_id * kTopK + lane] = selected;
+    }
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    uint64_t merge_keys[2];
+#pragma unroll
+    for (int item = 0; item < 2; ++item) {
+      merge_keys[item] = intermediate_keys[item * 32 + lane];
+    }
+    const uint64_t selected = kimi_lane_owned_top16(merge_keys, lane);
+    const int expert = lane < kTopK ? kimi_topk_expert(selected) : -1;
+    const bool finite = lane < kTopK && expert >= 0 && expert < kNumExperts;
+    const float unbiased = finite ? unbiased_scores[expert] : 0.0F;
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+    const float sum = cg::reduce(warp, unbiased, cg::plus<float>{});
+    if (lane < kTopK) {
+      float scale = 1.0F;
+      scale /= sum + 1e-20F;
+      topk_weights[lane] = finite ? unbiased * scale : 0.0F;
+      topk_ids[lane] = expert;
+    }
+  }
+}
+
 class PCIeDCPA2A {
 public:
   int rank_;
@@ -579,6 +885,89 @@ public:
 #undef LAUNCH
     CHECK_CUDA_SUCCESS(cudaGetLastError());
   }
+
+  void all_gather_pair(cudaStream_t stream, const void *local_first,
+                       const void *local_second, void *output_first,
+                       void *output_second, int batch, int first_row_bytes,
+                       int second_row_bytes, int threads) {
+    constexpr int kPackBytes = sizeof(Pack<uint8_t>);
+    const int64_t output_bytes =
+        int64_t(batch) * world_size_ * (first_row_bytes + second_row_bytes);
+    // Staging slots are allocated in two-byte capacity units because the
+    // attention path is BF16. Raw paired payloads may use all those bytes.
+    if (output_bytes > output_capacity_elems_ * 2) {
+      throw std::runtime_error("PCIe DCP pair staging capacity exceeded");
+    }
+    if (first_row_bytes <= 0 || second_row_bytes <= 0 ||
+        first_row_bytes % kPackBytes != 0 ||
+        second_row_bytes % kPackBytes != 0) {
+      throw std::runtime_error(
+          "paired rows must be positive and 16-byte aligned");
+    }
+    if (threads < world_size_ || threads > 512 || threads % 32 != 0) {
+      throw std::runtime_error("invalid paired-gather thread count");
+    }
+    if (const int env_threads = dcp_threads_override(); env_threads > 0) {
+      threads = std::min(512, std::max(64, (env_threads / 32) * 32));
+    }
+
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
+
+#define LAUNCH_PAIR(world)                                                     \
+  all_gather_pair_kernel<world><<<1, threads, 0, stream>>>(                   \
+      reinterpret_cast<const uint8_t *>(local_first),                         \
+      reinterpret_cast<const uint8_t *>(local_second), staging_, signals_,   \
+      self_signal_, reinterpret_cast<uint8_t *>(output_first),                \
+      reinterpret_cast<uint8_t *>(output_second), rank_, batch,              \
+      first_row_bytes, second_row_bytes, delayed_rank, delay_cycles)
+    switch (world_size_) {
+    case 2:
+      LAUNCH_PAIR(2);
+      break;
+    case 4:
+      LAUNCH_PAIR(4);
+      break;
+    case 8:
+      LAUNCH_PAIR(8);
+      break;
+    case 16:
+      LAUNCH_PAIR(16);
+      break;
+    default:
+      throw std::runtime_error("PCIe DCP supports 2, 4, 8, or 16 ranks");
+    }
+#undef LAUNCH_PAIR
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+  }
+
+  void all_gather_pair_kimi_topk(
+      cudaStream_t stream, const __nv_bfloat16 *local_down,
+      const float *local_router, const float *correction_bias,
+      __nv_bfloat16 *output_down, float *topk_weights, int32_t *topk_ids) {
+    if (world_size_ != 16) {
+      throw std::runtime_error(
+          "Kimi paired gather+top-k requires exactly 16 ranks");
+    }
+    constexpr int kLocalPayloadBytes =
+        224 * sizeof(__nv_bfloat16) + 56 * sizeof(float);
+    if (int64_t(world_size_) * kLocalPayloadBytes >
+        output_capacity_elems_ * 2) {
+      throw std::runtime_error("PCIe DCP Kimi staging capacity exceeded");
+    }
+
+    advance_staging_slot_kernel<<<1, 1, 0, stream>>>(self_signal_);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+    const int delayed_rank = dcp_test_delay_rank();
+    const uint64_t delay_cycles = dcp_test_delay_cycles();
+    all_gather_pair_kimi_topk_kernel<16><<<1, 512, 0, stream>>>(
+        local_down, local_router, staging_, signals_, self_signal_,
+        correction_bias, output_down, topk_weights, topk_ids, rank_,
+        delayed_rank, delay_cycles);
+    CHECK_CUDA_SUCCESS(cudaGetLastError());
+  }
 };
 
 } // namespace pcie_dcp_a2a
@@ -741,6 +1130,103 @@ static void all_gather_heads(fptr_t pointer, torch::Tensor &local_input,
   }
 }
 
+static bool is_supported_pair_dtype(at::ScalarType dtype) {
+  return dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
+         dtype == at::ScalarType::Float ||
+         dtype == at::ScalarType::Float8_e4m3fn;
+}
+
+static void all_gather_pair(fptr_t pointer, torch::Tensor &local_first,
+                            torch::Tensor &local_second,
+                            torch::Tensor &output_first,
+                            torch::Tensor &output_second, int64_t threads) {
+  auto *runtime = reinterpret_cast<pcie_dcp_a2a::PCIeDCPA2A *>(pointer);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_first));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK(local_first.is_cuda() && local_second.is_cuda() &&
+              output_first.is_cuda() && output_second.is_cuda());
+  TORCH_CHECK(local_first.device() == local_second.device() &&
+              local_first.device() == output_first.device() &&
+              local_first.device() == output_second.device());
+  TORCH_CHECK(local_first.is_contiguous() && local_second.is_contiguous() &&
+              output_first.is_contiguous() && output_second.is_contiguous());
+  TORCH_CHECK_EQ(local_first.dim(), 2);
+  TORCH_CHECK_EQ(local_second.dim(), 2);
+  TORCH_CHECK_EQ(output_first.dim(), 2);
+  TORCH_CHECK_EQ(output_second.dim(), 2);
+  TORCH_CHECK_EQ(local_first.scalar_type(), output_first.scalar_type());
+  TORCH_CHECK_EQ(local_second.scalar_type(), output_second.scalar_type());
+  TORCH_CHECK(is_supported_pair_dtype(local_first.scalar_type()) &&
+              is_supported_pair_dtype(local_second.scalar_type()),
+              "paired inputs must be float16, bfloat16, float32, or "
+              "float8_e4m3fn");
+
+  const int64_t batch = local_first.size(0);
+  TORCH_CHECK_GT(batch, 0);
+  TORCH_CHECK_EQ(local_second.size(0), batch);
+  TORCH_CHECK_EQ(output_first.size(0), batch);
+  TORCH_CHECK_EQ(output_second.size(0), batch);
+  TORCH_CHECK_EQ(output_first.size(1),
+                 local_first.size(1) * runtime->world_size_);
+  TORCH_CHECK_EQ(output_second.size(1),
+                 local_second.size(1) * runtime->world_size_);
+  const int64_t first_row_bytes =
+      local_first.size(1) * local_first.element_size();
+  const int64_t second_row_bytes =
+      local_second.size(1) * local_second.element_size();
+  TORCH_CHECK_LE(first_row_bytes, std::numeric_limits<int>::max());
+  TORCH_CHECK_LE(second_row_bytes, std::numeric_limits<int>::max());
+
+  runtime->all_gather_pair(
+      stream, local_first.data_ptr(), local_second.data_ptr(),
+      output_first.data_ptr(), output_second.data_ptr(), int(batch),
+      int(first_row_bytes), int(second_row_bytes), int(threads));
+}
+
+static void all_gather_pair_kimi_topk(
+    fptr_t pointer, torch::Tensor &local_down, torch::Tensor &local_router,
+    torch::Tensor &correction_bias, torch::Tensor &output_down,
+    torch::Tensor &topk_weights, torch::Tensor &topk_ids) {
+  auto *runtime = reinterpret_cast<pcie_dcp_a2a::PCIeDCPA2A *>(pointer);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_down));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(runtime->world_size_, 16);
+  TORCH_CHECK(local_down.is_cuda() && local_router.is_cuda() &&
+              correction_bias.is_cuda() && output_down.is_cuda() &&
+              topk_weights.is_cuda() && topk_ids.is_cuda());
+  TORCH_CHECK(local_down.device() == local_router.device() &&
+              local_down.device() == correction_bias.device() &&
+              local_down.device() == output_down.device() &&
+              local_down.device() == topk_weights.device() &&
+              local_down.device() == topk_ids.device());
+  TORCH_CHECK(local_down.is_contiguous() && local_router.is_contiguous() &&
+              correction_bias.is_contiguous() && output_down.is_contiguous() &&
+              topk_weights.is_contiguous() && topk_ids.is_contiguous());
+  TORCH_CHECK_EQ(local_down.scalar_type(), at::ScalarType::BFloat16);
+  TORCH_CHECK_EQ(local_router.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(correction_bias.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(output_down.scalar_type(), at::ScalarType::BFloat16);
+  TORCH_CHECK_EQ(topk_weights.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(topk_ids.scalar_type(), at::ScalarType::Int);
+  TORCH_CHECK(local_down.sizes() == at::IntArrayRef({1, 224}));
+  TORCH_CHECK(local_router.sizes() == at::IntArrayRef({1, 56}));
+  TORCH_CHECK(correction_bias.sizes() == at::IntArrayRef({896}));
+  TORCH_CHECK(output_down.sizes() == at::IntArrayRef({1, 3584}));
+  TORCH_CHECK(topk_weights.sizes() == at::IntArrayRef({1, 16}));
+  TORCH_CHECK(topk_ids.sizes() == at::IntArrayRef({1, 16}));
+
+  runtime->all_gather_pair_kimi_topk(
+      stream,
+      reinterpret_cast<const __nv_bfloat16 *>(local_down.data_ptr()),
+      reinterpret_cast<const float *>(local_router.data_ptr()),
+      reinterpret_cast<const float *>(correction_bias.data_ptr()),
+      reinterpret_cast<__nv_bfloat16 *>(output_down.data_ptr()),
+      reinterpret_cast<float *>(topk_weights.data_ptr()),
+      reinterpret_cast<int32_t *>(topk_ids.data_ptr()));
+}
+
 static void dispose(fptr_t pointer) {
   delete reinterpret_cast<pcie_dcp_a2a::PCIeDCPA2A *>(pointer);
 }
@@ -753,6 +1239,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "fused PCIe DCP LSE reduce-scatter");
   module.def("all_gather_heads", &all_gather_heads,
              "PCIe DCP head-dimension all-gather");
+  module.def("all_gather_pair", &all_gather_pair,
+             "PCIe DCP raw paired all-gather");
+  module.def("all_gather_pair_kimi_topk", &all_gather_pair_kimi_topk,
+             "TP16 Kimi paired projection gather and sigmoid top-k");
   module.def("dispose", &dispose, "dispose PCIe DCP A2A");
   module.def("meta_size", &meta_size, "signal metadata size");
 }

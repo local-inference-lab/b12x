@@ -76,6 +76,49 @@ class _FakeExt:
         )
         out.copy_(torch.cat((local_input, local_input), dim=1))
 
+    def all_gather_pair(
+        self,
+        pointer,
+        local_first,
+        local_second,
+        out_first,
+        out_second,
+        threads,
+    ):
+        self.run_calls.append(
+            (
+                pointer,
+                "all_gather_pair",
+                threads,
+                tuple(local_first.shape),
+                tuple(local_second.shape),
+            )
+        )
+        out_first.copy_(torch.cat((local_first, local_first), dim=1))
+        out_second.copy_(torch.cat((local_second, local_second), dim=1))
+
+    def all_gather_pair_kimi_topk(
+        self,
+        pointer,
+        local_down,
+        local_router,
+        correction_bias,
+        out_down,
+        topk_weights,
+        topk_ids,
+    ):
+        self.run_calls.append(
+            (
+                pointer,
+                "all_gather_pair_kimi_topk",
+                tuple(local_down.shape),
+                tuple(local_router.shape),
+            )
+        )
+        out_down.zero_()
+        topk_weights.fill_(1.0 / 16.0)
+        topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
+
     def dispose(self, pointer):
         self.dispose_calls.append(pointer)
 
@@ -94,6 +137,26 @@ def _make_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
         output_capacity_elems=4 * 32 * 64,
         lse_offset=4 * 32 * 64 * 2,
         lse_capacity=4 * 32,
+        ext_module=ext or _FakeExt(),
+    )
+
+
+def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
+    world_size = 16
+    return PCIeDCPA2A(
+        rank=0,
+        world_size=world_size,
+        device=torch.device("cpu"),
+        signal_ptrs=tuple(range(100, 100 + world_size)),
+        staging0_ptrs=tuple(range(200, 200 + world_size)),
+        staging1_ptrs=tuple(range(300, 300 + world_size)),
+        max_batch_size=1,
+        total_heads=world_size,
+        head_dim=672,
+        output_capacity_elems=world_size * 672,
+        lse_offset=world_size * 672 * 2,
+        lse_capacity=world_size,
+        query_head_dim=672,
         ext_module=ext or _FakeExt(),
     )
 
@@ -203,6 +266,23 @@ def test_runtime_validates_and_dispatches_to_extension():
     assert fp8_gathered.dtype == torch.float8_e4m3fn
     expected_fp8 = torch.cat((fp8_input, fp8_input), dim=1)
     assert torch.equal(fp8_gathered.view(torch.uint8), expected_fp8.view(torch.uint8))
+
+    local_first = torch.arange(2 * 16, dtype=torch.bfloat16).reshape(2, 16)
+    local_second = torch.arange(2 * 8, dtype=torch.float32).reshape(2, 8)
+    paired_first, paired_second = runtime.all_gather_pair(
+        local_first,
+        local_second,
+        threads=256,
+    )
+    assert torch.equal(paired_first, torch.cat((local_first, local_first), dim=1))
+    assert torch.equal(paired_second, torch.cat((local_second, local_second), dim=1))
+    assert ext.run_calls[-1] == (
+        1234,
+        "all_gather_pair",
+        256,
+        (2, 16),
+        (2, 8),
+    )
     runtime.close()
     assert ext.dispose_calls == [1234]
 
@@ -221,6 +301,33 @@ def test_runtime_accepts_head_major_input_and_output():
     assert actual is out
     assert actual.stride() == (64, 2 * 64, 1)
     torch.testing.assert_close(actual, partial_output[:, :16])
+
+
+def test_kimi_tp16_pair_topk_dispatches_compact_outputs() -> None:
+    ext = _FakeExt()
+    runtime = _make_kimi_tp16_runtime(ext)
+    local_down = torch.arange(224, dtype=torch.bfloat16).view(1, 224)
+    local_router = torch.arange(56, dtype=torch.float32).view(1, 56)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    down, weights, ids = runtime.all_gather_pair_kimi_topk(
+        local_down,
+        local_router,
+        correction_bias,
+    )
+
+    assert down.shape == (1, 3584)
+    assert weights.shape == (1, 16)
+    assert ids.shape == (1, 16)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(ids, torch.arange(16, dtype=torch.int32).view(1, 16))
+    assert ext.run_calls[-1] == (
+        1234,
+        "all_gather_pair_kimi_topk",
+        (1, 224),
+        (1, 56),
+    )
+    runtime.close()
 
 
 def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
@@ -245,6 +352,11 @@ def test_runtime_rejects_shape_dtype_and_capacity_mismatches():
         runtime.all_gather_heads(good_output[:, :8])
     with pytest.raises(ValueError, match="exceeds configured capacity"):
         runtime.all_gather_heads(torch.zeros(5, 16, 64, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="paired row bytes"):
+        runtime.all_gather_pair(
+            torch.zeros(1, 8, dtype=torch.bfloat16),
+            torch.zeros(1, 8, dtype=torch.float32),
+        )
 
 
 def test_constructor_rejects_invalid_query_and_staging_capacity():

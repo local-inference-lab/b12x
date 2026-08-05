@@ -7950,6 +7950,17 @@ def _small_m_direct_supported(
     )
 
 
+def _small_m_direct_host_barrier_reset_enabled() -> bool:
+    """Whether to clear reusable small-M grid-barrier state before launch.
+
+    The micro-kernel barrier resets its arrival counter and advances its epoch
+    before releasing the grid, so completed launches can safely reuse both
+    scalars.  Keep the historical host reset as the default while the
+    persistent-epoch path is evaluated independently and end-to-end.
+    """
+    return os.environ.get("SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET", "1") != "0"
+
+
 def _compile_w4a16_small_m_direct(
     *,
     m: int,
@@ -11549,8 +11560,9 @@ def run_w4a16_moe(
             )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
-        barrier_count.zero_()
-        barrier_epoch.zero_()
+        if _small_m_direct_host_barrier_reset_enabled():
+            barrier_count.zero_()
+            barrier_epoch.zero_()
         torch.ops.sparkinfer.w4a16_small_m_direct_launch(
             a_input,
             prepared.w13.view(torch.uint8),
