@@ -240,6 +240,7 @@ class Binding:
     kv_scale: torch.Tensor | None
     q_scale: torch.Tensor | None
     sm_scale: float
+    active_splits: int
 
 
 def _storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
@@ -343,6 +344,7 @@ def _validate_binding(
     kv_scale: torch.Tensor | None,
     q_scale: torch.Tensor | None,
     sm_scale: float,
+    active_splits: int,
 ) -> Binding:
     if q.ndim != 3 or tuple(q.shape[1:]) != (
         scratch.num_q_heads,
@@ -439,6 +441,12 @@ def _validate_binding(
     sm_scale = float(sm_scale)
     if not (sm_scale > 0.0):
         raise ValueError("sm_scale must be positive")
+    active_splits = int(active_splits)
+    if not 1 <= active_splits <= scratch.num_splits:
+        raise ValueError(
+            "active_splits must be in the planned range "
+            f"[1, {scratch.num_splits}], got {active_splits}"
+        )
     return Binding(
         scratch=scratch,
         q=q.detach(),
@@ -450,6 +458,7 @@ def _validate_binding(
         kv_scale=kv_scale,
         q_scale=q_scale,
         sm_scale=sm_scale,
+        active_splits=active_splits,
     )
 
 
@@ -546,6 +555,7 @@ class Plan:
         kv_scale: torch.Tensor | None = None,
         q_scale: torch.Tensor | None = None,
         sm_scale: float = K3_SM_SCALE,
+        active_splits: int | None = None,
     ) -> Binding:
         storage = scratch_tensor(
             scratch,
@@ -564,6 +574,9 @@ class Plan:
             kv_scale=kv_scale,
             q_scale=q_scale,
             sm_scale=sm_scale,
+            active_splits=(
+                self.num_splits if active_splits is None else int(active_splits)
+            ),
         )
 
 

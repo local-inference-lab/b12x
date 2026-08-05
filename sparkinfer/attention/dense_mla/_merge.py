@@ -54,6 +54,7 @@ class DenseMlaMergeKernel:
         partial_lse: cute.Tensor,
         output: cute.Tensor,
         final_lse: cute.Tensor,
+        active_splits: Int32,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -61,6 +62,7 @@ class DenseMlaMergeKernel:
             partial_lse,
             output,
             final_lse,
+            active_splits,
         ).launch(
             grid=(output.shape[0], output.shape[1], 1),
             block=[128, 1, 1],
@@ -74,6 +76,7 @@ class DenseMlaMergeKernel:
         partial_lse: cute.Tensor,
         output: cute.Tensor,
         final_lse: cute.Tensor,
+        active_splits: Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
         lane = cute.arch.lane_idx()
@@ -101,7 +104,7 @@ class DenseMlaMergeKernel:
         if warp == Int32(0):
             merged_max = Float32(-Float32.inf)
             split = lane
-            while split < Int32(self.num_splits):
+            while split < active_splits:
                 part_lse = Float32(partial_lse[query, head, split])
                 if part_lse > merged_max:
                     merged_max = part_lse
@@ -117,7 +120,7 @@ class DenseMlaMergeKernel:
 
             merged_sum = Float32(0.0)
             split = lane
-            while split < Int32(self.num_splits):
+            while split < active_splits:
                 part_lse = Float32(partial_lse[query, head, split])
                 weight = Float32(0.0)
                 if part_lse != Float32(-Float32.inf):
@@ -150,7 +153,7 @@ class DenseMlaMergeKernel:
             accumulator[idx] = Float32(0.0)
 
         split = Int32(0)
-        while split < Int32(self.num_splits):
+        while split < active_splits:
             weight = Float32(split_weight[split])
             # Capture-static tail splits deliberately leave their partial
             # vectors undefined and publish -inf LSE.  Do not load those

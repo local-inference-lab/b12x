@@ -602,7 +602,9 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         cu_seqlens_q=cu_seqlens_q,
         q_scale=q_scale,
         kv_scale=kv_scale,
+        active_splits=1,
     )
+    assert binding.active_splits == 1
     dense_mla.compile(binding=binding)
     actual_output, actual_lse = dense_mla.run(binding=binding)
     torch.cuda.synchronize()
@@ -635,6 +637,28 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         expected_output,
         expected_lse,
     )
+
+    # The active prefix preserves the maximum-context split boundaries and
+    # only omits mathematically empty tail splits. It must therefore match a
+    # full-plan launch exactly, including the BF16 output bits.
+    full_output = torch.empty_like(output)
+    full_binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=full_output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    assert full_binding.active_splits == plan.num_splits
+    full_actual, full_lse = dense_mla.run(binding=full_binding)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(full_actual, captured_output, rtol=0, atol=0)
+    torch.testing.assert_close(full_lse, captured_lse, rtol=0, atol=0)
 
 
 @torch.inference_mode()

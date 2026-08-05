@@ -95,6 +95,7 @@ class DenseMlaForwardKernel:
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
+        active_splits: Int32,
         stream: cuda.CUstream,
     ):
         query_tiles = (total_q + Int32(self.query_tile - 1)) // Int32(self.query_tile)
@@ -117,8 +118,9 @@ class DenseMlaForwardKernel:
             page_table_stride,
             total_q,
             batch,
+            active_splits,
         ).launch(
-            grid=(query_tiles, self.head_tiles, self.num_splits),
+            grid=(query_tiles, self.head_tiles, active_splits),
             block=[self.block_threads, 1, 1],
             min_blocks_per_mp=1,
             stream=stream,
@@ -140,6 +142,7 @@ class DenseMlaForwardKernel:
         query_row: Int32,
         head_base: Int32,
         split: Int32,
+        active_splits: Int32,
         local_warp: Int32,
         lane: Int32,
         local_tid: Int32,
@@ -317,23 +320,42 @@ class DenseMlaForwardKernel:
             global_sum_fragment[1],
         ]
         if cutlass.const_expr(self.num_splits > 1):
-            write_partial_or_final(
-                accumulator,
-                global_max,
-                global_sum,
-                partial_output,
-                partial_lse,
-                query_row,
-                head_base,
-                split,
-                local_warp,
-                lane,
-                value_scale,
-                query_valid,
-                has_splits=True,
-                fp8=self.fp8,
-                ln2=0.6931471805599453,
-            )
+            if active_splits > Int32(1):
+                write_partial_or_final(
+                    accumulator,
+                    global_max,
+                    global_sum,
+                    partial_output,
+                    partial_lse,
+                    query_row,
+                    head_base,
+                    split,
+                    local_warp,
+                    lane,
+                    value_scale,
+                    query_valid,
+                    has_splits=True,
+                    fp8=self.fp8,
+                    ln2=0.6931471805599453,
+                )
+            else:
+                write_partial_or_final(
+                    accumulator,
+                    global_max,
+                    global_sum,
+                    output,
+                    final_lse,
+                    query_row,
+                    head_base,
+                    split,
+                    local_warp,
+                    lane,
+                    value_scale,
+                    query_valid,
+                    has_splits=False,
+                    fp8=self.fp8,
+                    ln2=0.6931471805599453,
+                )
         else:
             write_partial_or_final(
                 accumulator,
@@ -374,6 +396,7 @@ class DenseMlaForwardKernel:
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
+        active_splits: Int32,
     ):
         tid = Int32(cute.arch.thread_idx()[0])
         lane = cute.arch.lane_idx()
@@ -420,11 +443,17 @@ class DenseMlaForwardKernel:
                 query_row = query_start + query_slot
                 if query_row < total_q:
                     if cutlass.const_expr(self.num_splits > 1):
-                        partial_lse[
-                            query_row,
-                            head_base + local_head,
-                            split,
-                        ] = Float32(-Float32.inf)
+                        if active_splits > Int32(1):
+                            partial_lse[
+                                query_row,
+                                head_base + local_head,
+                                split,
+                            ] = Float32(-Float32.inf)
+                        else:
+                            final_lse[
+                                query_row,
+                                head_base + local_head,
+                            ] = Float32(-Float32.inf)
                     else:
                         final_lse[
                             query_row,
@@ -557,6 +586,7 @@ class DenseMlaForwardKernel:
                     query_row,
                     head_base,
                     split,
+                    active_splits,
                     local_warp,
                     lane,
                     local_tid,
@@ -584,6 +614,7 @@ class DenseMlaForwardKernel:
                     query_row,
                     head_base,
                     split,
+                    active_splits,
                     local_warp,
                     lane,
                     local_tid,
@@ -611,6 +642,7 @@ class DenseMlaForwardKernel:
                     query_row,
                     head_base,
                     split,
+                    active_splits,
                     local_warp,
                     lane,
                     local_tid,
@@ -638,6 +670,7 @@ class DenseMlaForwardKernel:
                     query_row,
                     head_base,
                     split,
+                    active_splits,
                     local_warp,
                     lane,
                     local_tid,

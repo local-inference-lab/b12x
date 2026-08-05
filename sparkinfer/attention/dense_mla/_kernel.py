@@ -188,11 +188,12 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         Int64(int(binding.page_table.stride(0))),
         Int32(int(binding.q.shape[0])),
         Int32(int(binding.cache_seqlens.shape[0])),
+        Int32(binding.active_splits),
         stream,
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        1,
+        3,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
@@ -255,11 +256,12 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
             dynamic_layout=True,
         ),
         _to_cute(scratch.final_lse, cutlass.Float32, align=4),
+        Int32(binding.active_splits),
         stream,
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.merge",
-        3,
+        4,
         key_field("num_splits", scratch.num_splits),
         key_field("heads", scratch.num_q_heads),
         tensor_key(
@@ -343,7 +345,7 @@ def run_dense_mla(
 
     forward = _forward_launch(binding)
     run_compiled(compiled_forward, forward.args)
-    if binding.scratch.num_splits > 1:
+    if binding.scratch.num_splits > 1 and binding.active_splits > 1:
         assert compiled_merge is not None
         merge = _merge_launch(binding)
         assert merge is not None
