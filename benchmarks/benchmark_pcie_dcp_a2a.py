@@ -24,6 +24,10 @@ TOTAL_HEADS = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
 HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_HEAD_DIM", "512"))
 QUERY_HEAD_DIM = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
 MAX_BATCH = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_MAX_BATCH", "8"))
+GEOMETRY_OVERRIDE_ENVS = (
+    "SPARKINFER_PCIE_DCP_THREADS",
+    "SPARKINFER_PCIE_DCP_BLOCK_LIMIT",
+)
 
 
 def _csv_ints(name: str, default: str) -> tuple[int, ...]:
@@ -51,6 +55,17 @@ def _launches(world_size: int) -> tuple[tuple[int, int], ...]:
             raise ValueError(f"invalid launch {raw!r}: blocks must be in [1, 64]")
         values.append((threads, blocks))
     return tuple(values)
+
+
+def _reject_production_geometry_overrides() -> None:
+    active = tuple(
+        name for name in GEOMETRY_OVERRIDE_ENVS if os.getenv(name, "").strip()
+    )
+    if active:
+        raise ValueError(
+            "benchmark launch sweeps require production geometry overrides to be "
+            f"unset; active overrides: {', '.join(active)}"
+        )
 
 
 def _batches() -> tuple[int, ...]:
@@ -149,6 +164,14 @@ def _rank_query(
     ).to(device=device, dtype=query_dtype)
 
 
+def _assert_gather_exact(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    if actual.dtype == torch.float8_e4m3fn:
+        if not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)):
+            raise AssertionError("raw-byte FP8 gather differs from its reference")
+        return
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _validate_graphs(
     *,
     rank: int,
@@ -181,34 +204,41 @@ def _validate_graphs(
     torch.testing.assert_close(reduce_result, expected_reduce, rtol=2e-2, atol=2e-2)
     gather_graph.replay()
     torch.cuda.synchronize(device)
-    torch.testing.assert_close(gather_out, expected_gather, rtol=0, atol=0)
+    _assert_gather_exact(gather_out, expected_gather)
     pair_graph.replay()
     torch.cuda.synchronize(device)
     torch.testing.assert_close(reduce_result, expected_reduce, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(gather_out, expected_gather, rtol=0, atol=0)
+    _assert_gather_exact(gather_out, expected_gather)
 
 
 def _git_value(*args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=pathlib.Path(__file__).resolve().parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=pathlib.Path(__file__).resolve().parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    if result.returncode != 0:
+        return "unavailable"
     return result.stdout.strip()
 
 
 def _metadata(world_size: int, query_dtype_name: str) -> dict[str, object]:
     device_index = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device_index)
+    status = _git_value("status", "--short")
     return {
         "schema": "sparkinfer.pcie_dcp_a2a.graph_benchmark.v1",
         "command": [sys.executable, *sys.argv],
         "cwd": os.getcwd(),
         "git_commit": _git_value("rev-parse", "HEAD"),
         "worktree": _git_value("rev-parse", "--show-toplevel"),
-        "dirty": bool(_git_value("status", "--short")),
+        "dirty": None if status == "unavailable" else bool(status),
         "world_size": world_size,
         "query_dtype": query_dtype_name,
         "gpu": {
@@ -376,6 +406,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def main() -> None:
+    _reject_production_geometry_overrides()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     world_size = int(os.getenv("SPARKINFER_PCIE_DCP_A2A_WORLD_SIZE", "8"))

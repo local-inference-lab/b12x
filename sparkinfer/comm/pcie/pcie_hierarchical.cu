@@ -634,7 +634,11 @@ static void all_reduce_bf16(
   auto* output_ptr = reinterpret_cast<nv_bfloat16*>(output.data_ptr());
   const bool vectorized_bf16x2 =
       pcie_hierarchical::kEnableVectorizedBF16x2 &&
-      input.numel() <= pcie_hierarchical::kVectorizedBF16x2MaxElements;
+      input.numel() <= pcie_hierarchical::kVectorizedBF16x2MaxElements &&
+      reinterpret_cast<std::uintptr_t>(input_ptr) % alignof(__nv_bfloat162) ==
+          0 &&
+      reinterpret_cast<std::uintptr_t>(output_ptr) % alignof(__nv_bfloat162) ==
+          0;
   if (runtime->world_size == 12) {
     if (deferred_consumption) {
       pcie_hierarchical::deferred_consumption_preamble<3>
