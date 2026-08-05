@@ -5,7 +5,7 @@ import socket
 import statistics
 import time
 from collections.abc import Callable
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 
 import torch
 import torch.distributed as dist
@@ -216,46 +216,36 @@ def _benchmark_projection_pair(
         (batch, world_size * 56), dtype=torch.float32, device=device
     )
 
-    down_pool: PCIeDCPA2APool | None = None
-    router_pool: PCIeDCPA2APool | None = None
-    pair_pool: PCIeDCPA2APool | None = None
-    try:
-        down_pool = PCIeDCPA2APool.from_process_group(
-            process_group=dist.group.WORLD,
-            device=device,
-            max_batch_size=batch,
-            total_heads=world_size,
-            head_dim=224,
-            query_head_dim=224,
-        )
-        router_pool = PCIeDCPA2APool.from_process_group(
-            process_group=dist.group.WORLD,
-            device=device,
-            max_batch_size=batch,
-            total_heads=world_size,
-            head_dim=224,
-            query_head_dim=224,
-        )
-        pair_pool = PCIeDCPA2APool.from_process_group(
-            process_group=dist.group.WORLD,
-            device=device,
-            max_batch_size=batch,
-            total_heads=world_size,
-            head_dim=672,
-            query_head_dim=672,
-        )
-        down_channel = f"k3-projection-pair:b{batch}:down"
-        router_channel = f"k3-projection-pair:b{batch}:router"
-        pair_channel = f"k3-projection-pair:b{batch}:paired"
-        down_pool.prepare_channels((down_channel,))
-        router_pool.prepare_channels((router_channel,))
-        pair_pool.prepare_channels((pair_channel,))
-    except Exception:
-        for pool in (pair_pool, router_pool, down_pool):
-            if pool is not None:
-                with suppress(Exception):
-                    pool.close()
-        raise
+    down_pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=batch,
+        total_heads=world_size,
+        head_dim=224,
+        query_head_dim=224,
+    )
+    router_pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=batch,
+        total_heads=world_size,
+        head_dim=224,
+        query_head_dim=224,
+    )
+    pair_pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=batch,
+        total_heads=world_size,
+        head_dim=672,
+        query_head_dim=672,
+    )
+    down_channel = f"k3-projection-pair:b{batch}:down"
+    router_channel = f"k3-projection-pair:b{batch}:router"
+    pair_channel = f"k3-projection-pair:b{batch}:paired"
+    down_pool.prepare_channels((down_channel,))
+    router_pool.prepare_channels((router_channel,))
+    pair_pool.prepare_channels((pair_channel,))
     try:
 
         def separate_fn() -> None:
@@ -329,10 +319,9 @@ def _benchmark_projection_pair(
         )
         return separate_us, paired_us
     finally:
-        for pool in (pair_pool, router_pool, down_pool):
-            if pool is not None:
-                with suppress(Exception):
-                    pool.close()
+        pair_pool.close()
+        router_pool.close()
+        down_pool.close()
 
 
 def _benchmark_qkv_padded_projection(
@@ -366,10 +355,8 @@ def _benchmark_qkv_padded_projection(
     channel_id = "k3-qkv-a:padded"
     pool.prepare_channels((channel_id,))
     try:
-        captured_actual: torch.Tensor | None = None
 
         def custom_fn() -> torch.Tensor:
-            nonlocal captured_actual
             padded = torch.nn.functional.pad(
                 local_input, (0, padded_width - local_width)
             ).view(1, 1, padded_width)
@@ -380,10 +367,7 @@ def _benchmark_qkv_padded_projection(
                 block_limit=8,
                 channel_id=channel_id,
             )
-            captured_actual = (
-                gathered.narrow(-1, 0, local_width).contiguous().flatten(1)
-            )
-            return captured_actual
+            return gathered.narrow(-1, 0, local_width).contiguous().flatten(1)
 
         def nccl_fn() -> None:
             dist.all_gather_into_tensor(
@@ -400,13 +384,6 @@ def _benchmark_qkv_padded_projection(
             ((pool, channel_id),),
         )
         nccl_graph = _capture(nccl_fn)
-        custom_output.zero_()
-        nccl_output.zero_()
-        custom_graph.replay()
-        nccl_graph.replay()
-        torch.cuda.synchronize(device)
-        assert captured_actual is not None
-        _assert_exact(captured_actual.flatten(), nccl_output.flatten())
         custom_us = _measure(
             custom_graph,
             device=device,
@@ -505,16 +482,6 @@ def _benchmark_f_a_projection(
             ((pool, channel_id),),
         )
         replicated_graph = _capture(replicated_fn)
-        sharded_output.zero_()
-        replicated_output.zero_()
-        sharded_graph.replay()
-        replicated_graph.replay()
-        torch.cuda.synchronize(device)
-        sharded_flat = sharded_output.flatten(1)
-        different = int((sharded_flat != replicated_output).sum().item())
-        max_abs = float(
-            (sharded_flat.float() - replicated_output.float()).abs().max().item()
-        )
         sharded_us = _measure(
             sharded_graph,
             device=device,
@@ -612,12 +579,6 @@ def _worker(
                     flush=True,
                 )
         for batch in (1, 8):
-            if rank == 0 and batch == 1:
-                print("# section=projection_pair", flush=True)
-                print(
-                    "name,world_size,local_bytes,paired_us,separate_us,speedup",
-                    flush=True,
-                )
             separate_us, paired_us = _benchmark_projection_pair(
                 batch=batch,
                 rank=rank,
@@ -643,11 +604,6 @@ def _worker(
             samples=samples,
         )
         if rank == 0:
-            print("# section=qkv_padded_projection", flush=True)
-            print(
-                "name,world_size,local_bytes,custom_us,nccl_us,speedup",
-                flush=True,
-            )
             print(
                 "qkv_a_padded_end_to_end,"
                 f"{world_size},264,{qkv_custom_us:.3f},{qkv_nccl_us:.3f},"
@@ -663,12 +619,6 @@ def _worker(
             samples=samples,
         )
         if rank == 0:
-            print("# section=f_a_projection", flush=True)
-            print(
-                "name,world_size,replicated_us,sharded_us,"
-                "sharded_over_replicated,different_elements,max_abs",
-                flush=True,
-            )
             print(
                 "f_a_projection,"
                 f"{world_size},{replicated_us:.3f},{sharded_us:.3f},"

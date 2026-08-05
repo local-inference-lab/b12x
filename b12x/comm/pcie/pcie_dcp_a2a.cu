@@ -436,9 +436,9 @@ __global__ void __launch_bounds__(512, 1)
         uint64_t delay_cycles) {
   using BytePack = Pack<uint8_t>;
   constexpr int kPackBytes = sizeof(BytePack);
-  const int64_t first_packs = first_row_bytes / kPackBytes;
-  const int64_t second_packs = second_row_bytes / kPackBytes;
-  const int64_t combined_packs = first_packs + second_packs;
+  const int first_packs = first_row_bytes / kPackBytes;
+  const int second_packs = second_row_bytes / kPackBytes;
+  const int combined_packs = first_packs + second_packs;
   const auto *first = reinterpret_cast<const BytePack *>(local_first);
   const auto *second = reinterpret_cast<const BytePack *>(local_second);
 
@@ -446,16 +446,16 @@ __global__ void __launch_bounds__(512, 1)
   select_staging<world_size>(staging, staging_options, self);
 
   auto *staging_out = reinterpret_cast<BytePack *>(staging.ptrs[rank]);
-  for (int64_t linear = threadIdx.x; linear < batch * first_packs;
+  for (int linear = threadIdx.x; linear < batch * first_packs;
        linear += blockDim.x) {
-    const int64_t batch_index = linear / first_packs;
-    const int64_t pack = linear - batch_index * first_packs;
+    const int batch_index = linear / first_packs;
+    const int pack = linear - batch_index * first_packs;
     staging_out[batch_index * combined_packs + pack] = first[linear];
   }
-  for (int64_t linear = threadIdx.x; linear < batch * second_packs;
+  for (int linear = threadIdx.x; linear < batch * second_packs;
        linear += blockDim.x) {
-    const int64_t batch_index = linear / second_packs;
-    const int64_t pack = linear - batch_index * second_packs;
+    const int batch_index = linear / second_packs;
+    const int pack = linear - batch_index * second_packs;
     staging_out[batch_index * combined_packs + first_packs + pack] =
         second[linear];
   }
@@ -464,36 +464,36 @@ __global__ void __launch_bounds__(512, 1)
 
   auto *first_out = reinterpret_cast<BytePack *>(output_first);
   auto *second_out = reinterpret_cast<BytePack *>(output_second);
-  const int64_t first_output_packs = batch * world_size * first_packs;
-  for (int64_t linear = threadIdx.x; linear < first_output_packs;
+  const int first_output_packs = batch * world_size * first_packs;
+  for (int linear = threadIdx.x; linear < first_output_packs;
        linear += blockDim.x) {
-    const int64_t batch_index = linear / (world_size * first_packs);
-    const int64_t row_pack = linear - batch_index * world_size * first_packs;
-    const int source_rank = static_cast<int>(row_pack / first_packs);
-    const int64_t pack = row_pack - source_rank * first_packs;
+    const int batch_index = linear / (world_size * first_packs);
+    const int row_pack = linear - batch_index * world_size * first_packs;
+    const int source_rank = row_pack / first_packs;
+    const int pack = row_pack - source_rank * first_packs;
     const auto *source =
         source_rank == rank
             ? first
             : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
-    const int64_t source_base = source_rank == rank
-                                    ? batch_index * first_packs
-                                    : batch_index * combined_packs;
+    const int source_base = source_rank == rank
+                                ? batch_index * first_packs
+                                : batch_index * combined_packs;
     first_out[linear] = source[source_base + pack];
   }
-  const int64_t second_output_packs = batch * world_size * second_packs;
-  for (int64_t linear = threadIdx.x; linear < second_output_packs;
+  const int second_output_packs = batch * world_size * second_packs;
+  for (int linear = threadIdx.x; linear < second_output_packs;
        linear += blockDim.x) {
-    const int64_t batch_index = linear / (world_size * second_packs);
-    const int64_t row_pack = linear - batch_index * world_size * second_packs;
-    const int source_rank = static_cast<int>(row_pack / second_packs);
-    const int64_t pack = row_pack - source_rank * second_packs;
+    const int batch_index = linear / (world_size * second_packs);
+    const int row_pack = linear - batch_index * world_size * second_packs;
+    const int source_rank = row_pack / second_packs;
+    const int pack = row_pack - source_rank * second_packs;
     const auto *source =
         source_rank == rank
             ? second
             : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
-    const int64_t source_base =
-        source_rank == rank ? batch_index * second_packs
-                            : batch_index * combined_packs + first_packs;
+    const int source_base = source_rank == rank
+                                ? batch_index * second_packs
+                                : batch_index * combined_packs + first_packs;
     second_out[linear] = source[source_base + pack];
   }
 }
@@ -610,8 +610,8 @@ __global__ void __launch_bounds__(512, 1)
   constexpr int kCombinedPacks = kDownPacks + kRouterPacks;
   using BytePack = Pack<uint8_t>;
   __shared__ RankStaging staging;
-  __shared__ __align__(16) float selection_scores[kNumExperts];
-  __shared__ __align__(16) float unbiased_scores[kNumExperts];
+  __shared__ float selection_scores[kNumExperts];
+  __shared__ float unbiased_scores[kNumExperts];
   __shared__ uint64_t intermediate_keys[4 * kTopK];
   select_staging<world_size>(staging, staging_options, self);
 

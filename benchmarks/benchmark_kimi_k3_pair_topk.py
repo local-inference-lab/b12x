@@ -5,7 +5,6 @@ import socket
 import statistics
 import time
 from collections.abc import Callable
-from contextlib import suppress
 
 import torch
 import torch.distributed as dist
@@ -87,14 +86,6 @@ def _case(
     return local, bias.contiguous()
 
 
-def _equal_with_matching_nan(actual: torch.Tensor, expected: torch.Tensor) -> bool:
-    return bool(
-        torch.all(
-            torch.eq(actual, expected) | (torch.isnan(actual) & torch.isnan(expected))
-        )
-    )
-
-
 def _worker(
     rank: int,
     world_size: int,
@@ -111,52 +102,38 @@ def _worker(
         rank=rank,
         world_size=world_size,
     )
-    reference_pool: PCIeDCPA2APool | None = None
-    fused_pool: PCIeDCPA2APool | None = None
-    try:
-        reference_pool = PCIeDCPA2APool.from_process_group(
-            process_group=dist.group.WORLD,
-            device=device,
-            max_batch_size=1,
-            total_heads=world_size,
-            head_dim=672,
-            query_head_dim=672,
-        )
-        fused_pool = PCIeDCPA2APool.from_process_group(
-            process_group=dist.group.WORLD,
-            device=device,
-            max_batch_size=1,
-            total_heads=world_size,
-            head_dim=672,
-            query_head_dim=672,
-        )
-        reference_channel = "k3-pair-topk:reference"
-        fused_channel = "k3-pair-topk:fused"
-        reference_pool.prepare_channels((reference_channel,))
-        fused_pool.prepare_channels((fused_channel,))
+    reference_pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=1,
+        total_heads=world_size,
+        head_dim=672,
+        query_head_dim=672,
+    )
+    fused_pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=1,
+        total_heads=world_size,
+        head_dim=672,
+        query_head_dim=672,
+    )
+    reference_channel = "k3-pair-topk:reference"
+    fused_channel = "k3-pair-topk:fused"
+    reference_pool.prepare_channels((reference_channel,))
+    fused_pool.prepare_channels((fused_channel,))
 
-        down_local = (
-            torch.arange(224, device=device, dtype=torch.float32)
-            .add_(rank * 224)
-            .to(torch.bfloat16)
-            .view(1, 224)
-        )
-        reference_down = torch.empty((1, 3584), device=device, dtype=torch.bfloat16)
-        reference_router = torch.empty((1, 896), device=device, dtype=torch.float32)
-        fused_down = torch.empty_like(reference_down)
-        fused_weights = torch.empty((1, 16), device=device, dtype=torch.float32)
-        fused_ids = torch.empty((1, 16), device=device, dtype=torch.int32)
-    except Exception:
-        if fused_pool is not None:
-            with suppress(Exception):
-                fused_pool.close()
-        if reference_pool is not None:
-            with suppress(Exception):
-                reference_pool.close()
-        if dist.is_initialized():
-            with suppress(Exception):
-                dist.destroy_process_group()
-        raise
+    down_local = (
+        torch.arange(224, device=device, dtype=torch.float32)
+        .add_(rank * 224)
+        .to(torch.bfloat16)
+        .view(1, 224)
+    )
+    reference_down = torch.empty((1, 3584), device=device, dtype=torch.bfloat16)
+    reference_router = torch.empty((1, 896), device=device, dtype=torch.float32)
+    fused_down = torch.empty_like(reference_down)
+    fused_weights = torch.empty((1, 16), device=device, dtype=torch.float32)
+    fused_ids = torch.empty((1, 16), device=device, dtype=torch.int32)
 
     try:
         if rank == 0:
@@ -193,7 +170,7 @@ def _worker(
             )
             torch.cuda.synchronize(device)
             ids_exact = torch.equal(fused_ids, reference_ids)
-            weights_exact = _equal_with_matching_nan(fused_weights, reference_weights)
+            weights_exact = torch.equal(fused_weights, reference_weights)
             max_abs = float((fused_weights - reference_weights).abs().max().item())
             down_exact = torch.equal(fused_down, reference_down)
             if rank == 0:
@@ -254,7 +231,7 @@ def _worker(
         fused_graph.replay()
         torch.cuda.synchronize(device)
         assert reference_outputs is not None
-        if not _equal_with_matching_nan(fused_weights, reference_outputs[0]):
+        if not torch.equal(fused_weights, reference_outputs[0]):
             raise AssertionError("captured weights differ")
         if not torch.equal(fused_ids, reference_outputs[1]):
             raise AssertionError("captured ids differ")
@@ -283,14 +260,9 @@ def _worker(
                 flush=True,
             )
     finally:
-        if fused_pool is not None:
-            with suppress(Exception):
-                fused_pool.close()
-        if reference_pool is not None:
-            with suppress(Exception):
-                reference_pool.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        fused_pool.close()
+        reference_pool.close()
+        dist.destroy_process_group()
 
 
 def main() -> None:

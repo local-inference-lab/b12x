@@ -14,7 +14,6 @@
 #include <torch/extension.h>
 
 #include <cstdint>
-#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -346,7 +345,7 @@ static int64_t init_runtime(
   if (rank < 0 || rank >= world_size) {
     throw std::invalid_argument("invalid lane POC rank");
   }
-  auto runtime = std::make_unique<Runtime>();
+  auto* runtime = new Runtime;
   runtime->rank = static_cast<int>(rank);
   runtime->world_size = world_size;
   runtime->max_elements = max_elements;
@@ -359,12 +358,14 @@ static int64_t init_runtime(
   const int local_rank = runtime->rank % lane_allreduce_poc::kIslandSize;
   const int num_islands = world_size / lane_allreduce_poc::kIslandSize;
   if (runtime->slabs[runtime->rank] == nullptr) {
+    delete runtime;
     throw std::invalid_argument("lane POC self slab is missing");
   }
   for (int peer_local = 0; peer_local < lane_allreduce_poc::kIslandSize;
        ++peer_local) {
     const int peer_rank = island * lane_allreduce_poc::kIslandSize + peer_local;
     if (runtime->slabs[peer_rank] == nullptr) {
+      delete runtime;
       throw std::invalid_argument("lane POC local peer slab is missing");
     }
   }
@@ -372,10 +373,11 @@ static int64_t init_runtime(
     const int peer_rank =
         peer_island * lane_allreduce_poc::kIslandSize + local_rank;
     if (runtime->slabs[peer_rank] == nullptr) {
+      delete runtime;
       throw std::invalid_argument("lane POC cross-island peer slab is missing");
     }
   }
-  return reinterpret_cast<int64_t>(runtime.release());
+  return reinterpret_cast<int64_t>(runtime);
 }
 
 static void all_reduce_bf16(
