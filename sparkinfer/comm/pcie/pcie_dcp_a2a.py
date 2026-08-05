@@ -41,6 +41,7 @@ from .pcie_oneshot import (
 
 SUPPORTED_WORLD_SIZES = (2, 4, 8)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+SUPPORTED_GATHER_DTYPES = (*SUPPORTED_DTYPES, torch.float8_e4m3fn)
 DCP_A2A_REQUIRED_SMS = 64
 
 
@@ -165,6 +166,7 @@ def lse_reduce_scatter_reference(
     outputs = partial_outputs[:, :, head_slice, :].float()
     lses = partial_lses[:, :, head_slice].float()
     valid = torch.isfinite(lses)
+    outputs = torch.where(valid.unsqueeze(-1), outputs, torch.zeros_like(outputs))
     sanitized = torch.where(valid, lses, torch.full_like(lses, -torch.inf))
     max_lse = sanitized.amax(dim=0)
     max_lse = torch.where(torch.isfinite(max_lse), max_lse, 0.0)
@@ -737,7 +739,7 @@ class PCIeDCPA2A:
             raise RuntimeError("PCIeDCPA2A is closed")
         if local_input.device != self.device:
             raise ValueError("input must be on the runtime device")
-        if local_input.dtype not in SUPPORTED_DTYPES:
+        if local_input.dtype not in SUPPORTED_GATHER_DTYPES:
             raise ValueError(f"unsupported input dtype {local_input.dtype}")
         if local_input.ndim != 3:
             raise ValueError("input must have shape [batch, local_heads, head_dim]")

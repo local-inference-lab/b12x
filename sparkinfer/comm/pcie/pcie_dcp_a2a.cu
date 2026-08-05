@@ -97,7 +97,9 @@ struct DoubleStaging {
 };
 
 template <typename T> struct __align__(16) Pack {
-  T values[8];
+  // Every transaction is exactly 16 bytes. Half/BF16 therefore carry eight
+  // elements while the raw E4M3 query-gather path carries sixteen bytes.
+  T values[16 / sizeof(T)];
 };
 
 #define DINLINE __device__ __forceinline__
@@ -329,6 +331,12 @@ __global__ void __launch_bounds__(512, 1)
         const int64_t source_base = src == rank ? local_base : staging_base;
         const Pack<T> values = rot_packs[i][source_base + pack];
         const float weight = weights[i] * inv_weight_sum;
+        // Empty DCP shards legitimately return LSE=-inf and leave their
+        // partial output undefined. IEEE 0*NaN is NaN, so do not read or
+        // accumulate an invalid contributor merely because its weight is 0.
+        if (weight == 0.0f) {
+          continue;
+        }
 #pragma unroll
         for (int element = 0; element < kPackElems; ++element) {
           accum[element] += weight * to_float(values.values[element]);
@@ -357,7 +365,7 @@ __global__ void __launch_bounds__(512, 1)
                             Signal *self, T *__restrict__ output, int rank,
                             int batch, int local_heads, int head_dim,
                             int delayed_rank, uint64_t delay_cycles) {
-  constexpr int kPackElems = 8;
+  constexpr int kPackElems = 16 / sizeof(T);
   const int packs_per_head = head_dim / kPackElems;
   const int total_heads = local_heads * world_size;
   const int rows = batch * total_heads;
@@ -506,13 +514,15 @@ public:
   void all_gather_heads(cudaStream_t stream, const T *local_input, T *output,
                         int batch, int local_heads, int head_dim, int threads,
                         int block_limit) {
+    constexpr int kPackElems = 16 / sizeof(T);
     const int total_heads = local_heads * world_size_;
     const int64_t output_elems = int64_t(batch) * total_heads * head_dim;
     if (output_elems > output_capacity_elems_) {
       throw std::runtime_error("PCIe DCP all-gather staging capacity exceeded");
     }
-    if (head_dim % 8 != 0) {
-      throw std::runtime_error("head_dim must be a multiple of 8");
+    if (head_dim % kPackElems != 0) {
+      throw std::runtime_error(
+          "head_dim must align to a 16-byte gather transaction");
     }
     if (threads < world_size_ || threads > 1024) {
       throw std::runtime_error("invalid thread count");
@@ -709,8 +719,17 @@ static void all_gather_heads(fptr_t pointer, torch::Tensor &local_input,
         reinterpret_cast<nv_bfloat16 *>(output.data_ptr()), int(batch),
         int(local_heads), int(head_dim), int(threads), int(block_limit));
     break;
+  case at::ScalarType::Float8_e4m3fn:
+    // The gather is a bitwise exchange. Treat E4M3 records as bytes; no
+    // arithmetic or conversion occurs in this path.
+    runtime->all_gather_heads(
+        stream, reinterpret_cast<const uint8_t *>(local_input.data_ptr()),
+        reinterpret_cast<uint8_t *>(output.data_ptr()), int(batch),
+        int(local_heads), int(head_dim), int(threads), int(block_limit));
+    break;
   default:
-    TORCH_CHECK(false, "local_input must be float16 or bfloat16");
+    TORCH_CHECK(false,
+                "local_input must be float16, bfloat16, or float8_e4m3fn");
   }
 }
 

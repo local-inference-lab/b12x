@@ -208,6 +208,37 @@ def _check_eager(
             assert actual.movedim(0, 1).stride(0) == MAX_BATCH * HEAD_DIM
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
+    for step, batch in enumerate(TEST_BATCHES, start=100):
+        local_q = _rank_query(
+            step,
+            rank,
+            world_size,
+            batch,
+            torch.float8_e4m3fn,
+            device,
+        )
+        gathered_q = pool.all_gather_heads(local_q, channel_id="eager:dcp")
+        expected_q = torch.cat(
+            [
+                _rank_query(
+                    step,
+                    source,
+                    world_size,
+                    batch,
+                    torch.float8_e4m3fn,
+                    device,
+                )
+                for source in range(world_size)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(
+            gathered_q.view(torch.uint8),
+            expected_q.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
 
 def _check_eager_adjacency(
     pool: PCIeDCPA2APool,
@@ -309,7 +340,7 @@ def _check_graph(
             1,
             TOTAL_HEADS // world_size,
             QUERY_HEAD_DIM,
-            dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn,
             device=device,
         )
         for _ in range(layers)
@@ -319,7 +350,7 @@ def _check_graph(
             1,
             TOTAL_HEADS,
             QUERY_HEAD_DIM,
-            dtype=torch.bfloat16,
+            dtype=torch.float8_e4m3fn,
             device=device,
         )
         for _ in range(layers)
@@ -361,7 +392,7 @@ def _check_graph(
                     rank,
                     world_size,
                     1,
-                    torch.bfloat16,
+                    torch.float8_e4m3fn,
                     device,
                 )
             )
@@ -373,7 +404,7 @@ def _check_graph(
                             source,
                             world_size,
                             1,
-                            torch.bfloat16,
+                            torch.float8_e4m3fn,
                             device,
                         )
                         for source in range(world_size)
@@ -397,7 +428,12 @@ def _check_graph(
         for out, reference in zip(outputs, expected, strict=True):
             torch.testing.assert_close(out, reference, rtol=2e-2, atol=2e-2)
         for out, reference in zip(gathered_queries, expected_queries, strict=True):
-            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+            torch.testing.assert_close(
+                out.view(torch.uint8),
+                reference.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
 
     # One captured operation has odd capture-time parity. Adjacent A -> A
     # replays must advance the device-owned slot at execution time.
