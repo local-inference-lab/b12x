@@ -206,7 +206,7 @@ def _dense_mla_scratch_layout(
     )
 
 
-@dataclass(kw_only=True, slots=True)
+@dataclass(kw_only=True)
 class Scratch:
     shared_scratch: torch.Tensor
     device: torch.device
@@ -228,7 +228,7 @@ class Scratch:
     final_lse: torch.Tensor
 
 
-@dataclass(frozen=True, kw_only=True, slots=True)
+@dataclass(frozen=True, kw_only=True)
 class Binding:
     scratch: Scratch
     q: torch.Tensor
@@ -462,51 +462,6 @@ def _validate_binding(
     )
 
 
-def _bind_prevalidated(
-    *,
-    scratch: Scratch,
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    output: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    kv_scale: torch.Tensor | None,
-    q_scale: torch.Tensor | None,
-    sm_scale: float,
-    active_splits: int,
-) -> Binding:
-    """Build fresh views for a caller that already proved the tensor contract.
-
-    Framework integrations validate and capacity-plan these capture-static
-    tensors while constructing their attention metadata. Repeating storage
-    bounds, shape, stride, device, and dtype checks in every layer of every
-    decode step adds Python latency but no additional safety. This path still
-    creates a new caller-scratch-owned ``Scratch`` and ``Binding`` per call;
-    it never caches a binding or workspace.
-    """
-    active_splits = int(active_splits)
-    if not 1 <= active_splits <= scratch.num_splits:
-        raise ValueError(
-            "active_splits must be in the planned range "
-            f"[1, {scratch.num_splits}], got {active_splits}"
-        )
-    cache = kv_cache[:, :, 0, :] if kv_cache.ndim == 4 else kv_cache
-    return Binding(
-        scratch=scratch,
-        q=q,
-        kv_cache=cache,
-        output=output,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        kv_scale=kv_scale,
-        q_scale=q_scale,
-        sm_scale=float(sm_scale),
-        active_splits=active_splits,
-    )
-
-
 def _materialize(
     caps: Caps,
     scratch_storage: torch.Tensor,
@@ -563,75 +518,6 @@ def _materialize(
     )
 
 
-def _materialize_prevalidated(
-    caps: Caps,
-    scratch_storage: torch.Tensor,
-    layout: _ScratchLayout,
-) -> Scratch:
-    """Map fresh typed views without repeating the generic layout checks.
-
-    ``Plan.bind(validate=False)`` is used only after the framework has proved
-    that the capture-static byte tensor matches the plan.  Keep the ownership
-    contract explicit by constructing new tensor views and a new ``Scratch``
-    container for every bind, while avoiding per-layer scalar-tensor dtype
-    queries and generic alignment work.
-    """
-    partial_output = None
-    partial_lse = None
-    if layout.num_splits > 1:
-        assert layout.partial_output_offset_bytes is not None
-        assert layout.partial_lse_offset_bytes is not None
-        bf16_storage = scratch_storage.view(torch.bfloat16)
-        partial_output = bf16_storage.as_strided(
-            (
-                caps.max_total_q,
-                caps.num_q_heads,
-                layout.num_splits,
-                K3_VALUE_DIM,
-            ),
-            (
-                caps.num_q_heads * layout.num_splits * K3_VALUE_DIM,
-                layout.num_splits * K3_VALUE_DIM,
-                K3_VALUE_DIM,
-                1,
-            ),
-            bf16_storage.storage_offset() + layout.partial_output_offset_bytes // 2,
-        )
-        fp32_storage = scratch_storage.view(torch.float32)
-        partial_lse = fp32_storage.as_strided(
-            (caps.max_total_q, caps.num_q_heads, layout.num_splits),
-            (caps.num_q_heads * layout.num_splits, layout.num_splits, 1),
-            fp32_storage.storage_offset() + layout.partial_lse_offset_bytes // 4,
-        )
-    else:
-        fp32_storage = scratch_storage.view(torch.float32)
-    final_lse = fp32_storage.as_strided(
-        (caps.max_total_q, caps.num_q_heads),
-        (caps.num_q_heads, 1),
-        fp32_storage.storage_offset() + layout.final_lse_offset_bytes // 4,
-    )
-    return Scratch(
-        shared_scratch=scratch_storage,
-        device=caps.device,
-        mode=caps.mode,
-        kv_dtype=caps.kv_dtype,
-        num_q_heads=caps.num_q_heads,
-        page_size=caps.page_size,
-        max_total_q=caps.max_total_q,
-        max_batch=caps.max_batch,
-        max_cache_tokens=caps.max_cache_tokens,
-        max_page_table_width=caps.max_page_table_width,
-        num_cache_pages=caps.num_cache_pages,
-        num_splits=layout.num_splits,
-        chunks_per_split=layout.chunks_per_split,
-        query_tile=_query_tile(caps),
-        use_cuda_graph=caps.use_cuda_graph,
-        partial_output=partial_output,
-        partial_lse=partial_lse,
-        final_lse=final_lse,
-    )
-
-
 @dataclass(frozen=True)
 class Plan:
     caps: Caps
@@ -670,28 +556,14 @@ class Plan:
         q_scale: torch.Tensor | None = None,
         sm_scale: float = K3_SM_SCALE,
         active_splits: int | None = None,
-        validate: bool = True,
     ) -> Binding:
-        if not validate and isinstance(scratch, torch.Tensor):
-            # Framework integrations hand us the exact planned 1-D uint8
-            # tensor.  They validated it when constructing attention metadata;
-            # mapping it directly is the hot decode path.  Non-tensor adapters
-            # and the checked public path retain the generic validator below.
-            storage = scratch
-            scratch_views = _materialize_prevalidated(
-                self.caps,
-                storage,
-                self.layout,
-            )
-        else:
-            storage = scratch_tensor(
-                scratch,
-                self._scratch_specs,
-                owner="dense MLA",
-            )
-            scratch_views = _materialize(self.caps, storage, self.layout)
-        bind_impl = _validate_binding if validate else _bind_prevalidated
-        return bind_impl(
+        storage = scratch_tensor(
+            scratch,
+            self._scratch_specs,
+            owner="dense MLA",
+        )
+        scratch_views = _materialize(self.caps, storage, self.layout)
+        return _validate_binding(
             scratch=scratch_views,
             q=q,
             kv_cache=kv_cache,
