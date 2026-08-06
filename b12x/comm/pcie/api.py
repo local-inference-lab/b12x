@@ -37,6 +37,9 @@ from .pcie_oneshot import (
 from .pcie_twoshot import (
     PCIeTwoShotSP as TwoShotReduceScatter,
 )
+from .pcie_vocab_argmax import (
+    PCIeVocabParallelArgmax as VocabParallelArgmax,
+)
 
 
 def is_supported(device=None) -> bool:
@@ -59,6 +62,7 @@ __all__ = [
     "DcpAllToAll",
     "DcpAllToAllPool",
     "DcpTopKOwnerExchange",
+    "VocabParallelArgmax",
     "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",
