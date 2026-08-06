@@ -117,7 +117,11 @@ class _FakeExt:
         )
         out_down.zero_()
         topk_weights.fill_(1.0 / 16.0)
-        topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
+        topk_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .repeat(local_down.shape[0], 1)
+        )
 
     def dispose(self, pointer):
         self.dispose_calls.append(pointer)
@@ -141,7 +145,11 @@ def _make_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
     )
 
 
-def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
+def _make_kimi_tp16_runtime(
+    ext: _FakeExt | None = None,
+    *,
+    max_batch_size: int = 8,
+) -> PCIeDCPA2A:
     world_size = 16
     return PCIeDCPA2A(
         rank=0,
@@ -150,12 +158,12 @@ def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
         signal_ptrs=tuple(range(100, 100 + world_size)),
         staging0_ptrs=tuple(range(200, 200 + world_size)),
         staging1_ptrs=tuple(range(300, 300 + world_size)),
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
         total_heads=world_size,
         head_dim=672,
-        output_capacity_elems=world_size * 672,
-        lse_offset=world_size * 672 * 2,
-        lse_capacity=world_size,
+        output_capacity_elems=max_batch_size * world_size * 672,
+        lse_offset=max_batch_size * world_size * 672 * 2,
+        lse_capacity=max_batch_size * world_size,
         query_head_dim=672,
         ext_module=ext or _FakeExt(),
     )
@@ -303,29 +311,38 @@ def test_runtime_accepts_head_major_input_and_output():
     torch.testing.assert_close(actual, partial_output[:, :16])
 
 
-def test_kimi_tp16_pair_topk_dispatches_compact_outputs() -> None:
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+def test_kimi_tp16_pair_topk_dispatches_compact_outputs(batch: int) -> None:
     ext = _FakeExt()
     runtime = _make_kimi_tp16_runtime(ext)
-    local_down = torch.arange(224, dtype=torch.bfloat16).view(1, 224)
-    local_router = torch.arange(56, dtype=torch.float32).view(1, 56)
+    local_down = torch.arange(batch * 224, dtype=torch.bfloat16).view(batch, 224)
+    local_router = torch.arange(batch * 56, dtype=torch.float32).view(batch, 56)
     correction_bias = torch.zeros(896, dtype=torch.float32)
+    routing_payload = torch.empty((batch * 2, 16), dtype=torch.float32)
+    weights_view = routing_payload[:batch]
+    ids_view = routing_payload[batch:].view(torch.int32)
 
     down, weights, ids = runtime.all_gather_pair_kimi_topk(
         local_down,
         local_router,
         correction_bias,
+        topk_weights=weights_view,
+        topk_ids=ids_view,
     )
 
-    assert down.shape == (1, 3584)
-    assert weights.shape == (1, 16)
-    assert ids.shape == (1, 16)
+    assert down.shape == (batch, 3584)
+    assert weights.shape == (batch, 16)
+    assert ids.shape == (batch, 16)
+    assert weights.data_ptr() == weights_view.data_ptr()
+    assert ids.data_ptr() == ids_view.data_ptr()
     torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
-    assert torch.equal(ids, torch.arange(16, dtype=torch.int32).view(1, 16))
+    expected_ids = torch.arange(16, dtype=torch.int32).view(1, 16).repeat(batch, 1)
+    assert torch.equal(ids, expected_ids)
     assert ext.run_calls[-1] == (
         1234,
         "all_gather_pair_kimi_topk",
-        (1, 224),
-        (1, 56),
+        (batch, 224),
+        (batch, 56),
     )
     runtime.close()
 

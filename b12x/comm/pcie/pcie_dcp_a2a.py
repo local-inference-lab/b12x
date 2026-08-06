@@ -864,15 +864,18 @@ class PCIeDCPA2A:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather Kimi-K3's TP16 latent row and select its 16 experts."""
+        """Gather one to eight Kimi-K3 TP16 rows and select 16 experts."""
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
         if self.world_size != 16:
             raise ValueError("Kimi paired gather+top-k requires TP16")
+        if local_down.ndim != 2 or not 1 <= int(local_down.shape[0]) <= 8:
+            raise ValueError("local_down must contain between one and eight rows")
+        batch = int(local_down.shape[0])
         expected = (
-            (local_down, (1, 224), torch.bfloat16, "local_down"),
-            (local_router, (1, 56), torch.float32, "local_router"),
+            (local_down, (batch, 224), torch.bfloat16, "local_down"),
+            (local_router, (batch, 56), torch.float32, "local_router"),
             (correction_bias, (896,), torch.float32, "correction_bias"),
         )
         for value, shape, dtype, name in expected:
@@ -886,15 +889,21 @@ class PCIeDCPA2A:
                     f"{name} must be contiguous {shape} {dtype} on {self.device}"
                 )
         if out_down is None:
-            out_down = torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
+            out_down = torch.empty(
+                (batch, 3584), device=self.device, dtype=torch.bfloat16
+            )
         if topk_weights is None:
-            topk_weights = torch.empty((1, 16), device=self.device, dtype=torch.float32)
+            topk_weights = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.float32
+            )
         if topk_ids is None:
-            topk_ids = torch.empty((1, 16), device=self.device, dtype=torch.int32)
+            topk_ids = torch.empty(
+                (batch, 16), device=self.device, dtype=torch.int32
+            )
         outputs = (
-            (out_down, (1, 3584), torch.bfloat16, "out_down"),
-            (topk_weights, (1, 16), torch.float32, "topk_weights"),
-            (topk_ids, (1, 16), torch.int32, "topk_ids"),
+            (out_down, (batch, 3584), torch.bfloat16, "out_down"),
+            (topk_weights, (batch, 16), torch.float32, "topk_weights"),
+            (topk_ids, (batch, 16), torch.int32, "topk_ids"),
         )
         for value, shape, dtype, name in outputs:
             if (

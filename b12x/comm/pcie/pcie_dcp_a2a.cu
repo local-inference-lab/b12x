@@ -71,6 +71,15 @@ static int dcp_block_limit_override() {
   return value;
 }
 
+static int kimi_pair_topk_threads() {
+  static const int value = [] {
+    const int requested =
+        env_int("SPARKINFER_PCIE_KIMI_TOPK_THREADS", 384);
+    return std::min(512, std::max(256, (requested / 32) * 32));
+  }();
+  return value;
+}
+
 static int dcp_test_delay_rank() {
   static const int value = env_int("B12X_PCIE_DCP_TEST_DELAY_RANK", -1);
   return value;
@@ -498,12 +507,13 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
-// TP16 Kimi-K3 decode specialization.  The ordinary paired path materializes
-// all 896 FP32 router logits and then launches a separate top-k kernel.  This
-// path reads the rank-local router shards directly from the same IPC staging
-// used by the BF16 down-projection gather and emits only the 16 selected
-// experts.  Selection uses the same float ordering and lower-expert-id tie
-// break as vLLM's native one-group sigmoid+bias top-k implementation.
+// TP16 Kimi-K3 decode specialization. The ordinary paired path materializes
+// all 896 FP32 router logits and then launches separate sigmoid and top-k
+// kernels. This path assigns one CTA to every row, reads the rank-local router
+// shards directly from the same IPC staging used by the BF16 down-projection
+// gather, and emits only the 16 selected experts. Selection uses the same
+// float ordering and lower-expert-id tie break as vLLM's native one-group
+// sigmoid+bias top-k implementation.
 __device__ __forceinline__ uint32_t kimi_float_order_key(float value) {
   const uint32_t bits = __float_as_uint(value);
   const uint32_t mask = (bits & 0x80000000U) != 0U ? 0xffffffffU : 0x80000000U;
@@ -595,7 +605,6 @@ __global__ void __launch_bounds__(512, 1)
         float *__restrict__ topk_weights, int32_t *__restrict__ topk_ids,
         int rank, int delayed_rank, uint64_t delay_cycles) {
   static_assert(world_size == 16);
-  constexpr int kThreads = 512;
   constexpr int kTopkThreads = 256;
   constexpr int kRouterWarps = 4;
   constexpr int kPreprocessItems = 4;
@@ -608,6 +617,7 @@ __global__ void __launch_bounds__(512, 1)
   constexpr int kDownPacks = kDownBytes / sizeof(Pack<uint8_t>);
   constexpr int kRouterPacks = kRouterBytes / sizeof(Pack<uint8_t>);
   constexpr int kCombinedPacks = kDownPacks + kRouterPacks;
+  const int row = int(blockIdx.x);
   using BytePack = Pack<uint8_t>;
   __shared__ RankStaging staging;
   __shared__ __align__(16) float selection_scores[kNumExperts];
@@ -615,9 +625,12 @@ __global__ void __launch_bounds__(512, 1)
   __shared__ uint64_t intermediate_keys[4 * kTopK];
   select_staging<world_size>(staging, staging_options, self);
 
-  auto *staging_out = reinterpret_cast<BytePack *>(staging.ptrs[rank]);
-  const auto *down_packs = reinterpret_cast<const BytePack *>(local_down);
-  const auto *router_packs = reinterpret_cast<const BytePack *>(local_router);
+  auto *staging_out = reinterpret_cast<BytePack *>(staging.ptrs[rank]) +
+                      int64_t(row) * kCombinedPacks;
+  const auto *down_packs = reinterpret_cast<const BytePack *>(local_down) +
+                           int64_t(row) * kDownPacks;
+  const auto *router_packs = reinterpret_cast<const BytePack *>(local_router) +
+                             int64_t(row) * kRouterPacks;
   for (int pack = threadIdx.x; pack < kDownPacks; pack += blockDim.x) {
     staging_out[pack] = down_packs[pack];
   }
@@ -633,19 +646,21 @@ __global__ void __launch_bounds__(512, 1)
   // geometry, but land router bytes in shared memory instead of a global
   // 896-float intermediate. The following CTA barrier is the handoff to the
   // native-shaped top-k phase.
-  auto *down_out_packs = reinterpret_cast<BytePack *>(output_down);
+  auto *down_out_packs = reinterpret_cast<BytePack *>(output_down) +
+                         int64_t(row) * world_size * kDownPacks;
   auto *router_shared_packs =
       reinterpret_cast<BytePack *>(selection_scores);
   for (int linear = int(threadIdx.x);
        linear < world_size * (kDownPacks + kRouterPacks);
-       linear += kThreads) {
+       linear += blockDim.x) {
     if (linear < world_size * kDownPacks) {
       const int source_rank = linear / kDownPacks;
       const int pack = linear - source_rank * kDownPacks;
       const auto *source =
           source_rank == rank
               ? down_packs
-              : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]);
+              : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]) +
+                    int64_t(row) * kCombinedPacks;
       down_out_packs[linear] = source[pack];
     } else {
       const int router_linear = linear - world_size * kDownPacks;
@@ -655,7 +670,7 @@ __global__ void __launch_bounds__(512, 1)
           source_rank == rank
               ? router_packs
               : reinterpret_cast<const BytePack *>(staging.ptrs[source_rank]) +
-                    kDownPacks;
+                    int64_t(row) * kCombinedPacks + kDownPacks;
       router_shared_packs[router_linear] = source[pack];
     }
   }
@@ -711,10 +726,11 @@ __global__ void __launch_bounds__(512, 1)
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
     const float sum = cg::reduce(warp, unbiased, cg::plus<float>{});
     if (lane < kTopK) {
+      const int output = row * kTopK + lane;
       float scale = 1.0F;
       scale /= sum + 1e-20F;
-      topk_weights[lane] = finite ? unbiased * scale : 0.0F;
-      topk_ids[lane] = expert;
+      topk_weights[output] = finite ? unbiased * scale : 0.0F;
+      topk_ids[output] = expert;
     }
   }
 }
@@ -946,14 +962,19 @@ public:
   void all_gather_pair_kimi_topk(
       cudaStream_t stream, const __nv_bfloat16 *local_down,
       const float *local_router, const float *correction_bias,
-      __nv_bfloat16 *output_down, float *topk_weights, int32_t *topk_ids) {
+      __nv_bfloat16 *output_down, float *topk_weights, int32_t *topk_ids,
+      int batch) {
     if (world_size_ != 16) {
       throw std::runtime_error(
           "Kimi paired gather+top-k requires exactly 16 ranks");
     }
     constexpr int kLocalPayloadBytes =
         224 * sizeof(__nv_bfloat16) + 56 * sizeof(float);
-    if (int64_t(world_size_) * kLocalPayloadBytes >
+    if (batch < 1 || batch > 8) {
+      throw std::runtime_error(
+          "Kimi paired gather+top-k batch must be between 1 and 8");
+    }
+    if (int64_t(batch) * world_size_ * kLocalPayloadBytes >
         output_capacity_elems_ * 2) {
       throw std::runtime_error("PCIe DCP Kimi staging capacity exceeded");
     }
@@ -962,7 +983,8 @@ public:
     CHECK_CUDA_SUCCESS(cudaGetLastError());
     const int delayed_rank = dcp_test_delay_rank();
     const uint64_t delay_cycles = dcp_test_delay_cycles();
-    all_gather_pair_kimi_topk_kernel<16><<<1, 512, 0, stream>>>(
+    all_gather_pair_kimi_topk_kernel<16>
+        <<<batch, kimi_pair_topk_threads(), 0, stream>>>(
         local_down, local_router, staging_, signals_, self_signal_,
         correction_bias, output_down, topk_weights, topk_ids, rank_,
         delayed_rank, delay_cycles);
@@ -1210,12 +1232,16 @@ static void all_gather_pair_kimi_topk(
   TORCH_CHECK_EQ(output_down.scalar_type(), at::ScalarType::BFloat16);
   TORCH_CHECK_EQ(topk_weights.scalar_type(), at::ScalarType::Float);
   TORCH_CHECK_EQ(topk_ids.scalar_type(), at::ScalarType::Int);
-  TORCH_CHECK(local_down.sizes() == at::IntArrayRef({1, 224}));
-  TORCH_CHECK(local_router.sizes() == at::IntArrayRef({1, 56}));
+  TORCH_CHECK_EQ(local_down.dim(), 2);
+  TORCH_CHECK_EQ(local_router.dim(), 2);
+  const int64_t batch = local_down.size(0);
+  TORCH_CHECK(batch >= 1 && batch <= 8);
+  TORCH_CHECK(local_down.sizes() == at::IntArrayRef({batch, 224}));
+  TORCH_CHECK(local_router.sizes() == at::IntArrayRef({batch, 56}));
   TORCH_CHECK(correction_bias.sizes() == at::IntArrayRef({896}));
-  TORCH_CHECK(output_down.sizes() == at::IntArrayRef({1, 3584}));
-  TORCH_CHECK(topk_weights.sizes() == at::IntArrayRef({1, 16}));
-  TORCH_CHECK(topk_ids.sizes() == at::IntArrayRef({1, 16}));
+  TORCH_CHECK(output_down.sizes() == at::IntArrayRef({batch, 3584}));
+  TORCH_CHECK(topk_weights.sizes() == at::IntArrayRef({batch, 16}));
+  TORCH_CHECK(topk_ids.sizes() == at::IntArrayRef({batch, 16}));
 
   runtime->all_gather_pair_kimi_topk(
       stream,
@@ -1224,7 +1250,7 @@ static void all_gather_pair_kimi_topk(
       reinterpret_cast<const float *>(correction_bias.data_ptr()),
       reinterpret_cast<__nv_bfloat16 *>(output_down.data_ptr()),
       reinterpret_cast<float *>(topk_weights.data_ptr()),
-      reinterpret_cast<int32_t *>(topk_ids.data_ptr()));
+      reinterpret_cast<int32_t *>(topk_ids.data_ptr()), int(batch));
 }
 
 static void dispose(fptr_t pointer) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import statistics
 import time
@@ -35,51 +36,73 @@ def _capture(
     return graph
 
 
-def _measure(
-    graph: torch.cuda.CUDAGraph,
+def _measure_pair(
+    reference_graph: torch.cuda.CUDAGraph,
+    fused_graph: torch.cuda.CUDAGraph,
     *,
     device: torch.device,
     warmup: int,
     iterations: int,
     samples: int,
-) -> float:
-    timings: list[float] = []
-    for _ in range(samples):
-        dist.barrier()
-        for _ in range(warmup):
-            graph.replay()
-        torch.cuda.synchronize(device)
-        start = time.perf_counter()
-        for _ in range(iterations):
-            graph.replay()
-        torch.cuda.synchronize(device)
-        elapsed_us = (time.perf_counter() - start) * 1e6 / iterations
-        maximum = torch.tensor(elapsed_us, dtype=torch.float64, device=device)
-        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-        timings.append(float(maximum.item()))
-    return statistics.median(timings)
+) -> tuple[float, float, float]:
+    timings: dict[str, list[float]] = {"reference": [], "fused": []}
+    graphs = {"reference": reference_graph, "fused": fused_graph}
+    for sample in range(samples):
+        order = ("reference", "fused")
+        if sample % 2:
+            order = tuple(reversed(order))
+        for name in order:
+            graph = graphs[name]
+            dist.barrier()
+            for _ in range(warmup):
+                graph.replay()
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            for _ in range(iterations):
+                graph.replay()
+            torch.cuda.synchronize(device)
+            elapsed_us = (time.perf_counter() - start) * 1e6 / iterations
+            maximum = torch.tensor(elapsed_us, dtype=torch.float64, device=device)
+            dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+            timings[name].append(float(maximum.item()))
+    paired_savings = [
+        reference - fused
+        for reference, fused in zip(
+            timings["reference"], timings["fused"], strict=True
+        )
+    ]
+    return (
+        statistics.median(timings["reference"]),
+        statistics.median(timings["fused"]),
+        statistics.median(paired_savings),
+    )
 
 
 def _case(
     name: str,
     *,
     rank: int,
+    batch_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if name == "random":
         generator = torch.Generator(device=device).manual_seed(12004)
-        logits = torch.randn((1, 896), generator=generator, device=device)
+        logits = torch.randn((batch_size, 896), generator=generator, device=device)
         bias = torch.randn((896,), generator=generator, device=device).mul_(0.02)
     elif name == "ties":
-        logits = torch.zeros((1, 896), device=device)
+        logits = torch.zeros((batch_size, 896), device=device)
         bias = torch.zeros((896,), device=device)
     elif name == "near_ties":
-        logits = torch.linspace(-1e-5, 1e-5, 896, device=device).view(1, 896)
+        logits = torch.linspace(-1e-5, 1e-5, 896, device=device).repeat(batch_size, 1)
+        logits.add_(
+            torch.arange(batch_size, device=device, dtype=torch.float32).view(-1, 1)
+            * 1e-8
+        )
         bias = torch.linspace(1e-5, -1e-5, 896, device=device)
     elif name == "wide":
-        logits = torch.linspace(-80.0, 80.0, 896, device=device).view(1, 896)
+        logits = torch.linspace(-80.0, 80.0, 896, device=device).repeat(batch_size, 1)
         bias = torch.sin(torch.arange(896, device=device, dtype=torch.float32))
-        logits[0, 17] = float("nan")
+        logits[:, 17] = float("nan")
         bias[33] = float("inf")
     else:
         raise ValueError(name)
@@ -102,6 +125,7 @@ def _worker(
     warmup: int,
     iterations: int,
     samples: int,
+    batch_size: int,
 ) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -117,7 +141,7 @@ def _worker(
         reference_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
-            max_batch_size=1,
+            max_batch_size=batch_size,
             total_heads=world_size,
             head_dim=672,
             query_head_dim=672,
@@ -125,7 +149,7 @@ def _worker(
         fused_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
-            max_batch_size=1,
+            max_batch_size=batch_size,
             total_heads=world_size,
             head_dim=672,
             query_head_dim=672,
@@ -136,16 +160,23 @@ def _worker(
         fused_pool.prepare_channels((fused_channel,))
 
         down_local = (
-            torch.arange(224, device=device, dtype=torch.float32)
-            .add_(rank * 224)
+            torch.arange(batch_size * 224, device=device, dtype=torch.float32)
+            .view(batch_size, 224)
+            .add_(rank * batch_size * 224)
             .to(torch.bfloat16)
-            .view(1, 224)
         )
-        reference_down = torch.empty((1, 3584), device=device, dtype=torch.bfloat16)
-        reference_router = torch.empty((1, 896), device=device, dtype=torch.float32)
+        reference_down = torch.empty(
+            (batch_size, 3584), device=device, dtype=torch.bfloat16
+        )
+        reference_router = torch.empty(
+            (batch_size, 896), device=device, dtype=torch.float32
+        )
         fused_down = torch.empty_like(reference_down)
-        fused_weights = torch.empty((1, 16), device=device, dtype=torch.float32)
-        fused_ids = torch.empty((1, 16), device=device, dtype=torch.int32)
+        fused_payload = torch.empty(
+            (batch_size * 2, 16), device=device, dtype=torch.float32
+        )
+        fused_weights = fused_payload[:batch_size]
+        fused_ids = fused_payload[batch_size:].view(torch.int32)
     except Exception:
         if fused_pool is not None:
             with suppress(Exception):
@@ -164,7 +195,9 @@ def _worker(
         benchmark_router: torch.Tensor | None = None
         benchmark_bias: torch.Tensor | None = None
         for name in ("random", "ties", "near_ties", "wide"):
-            local_router, bias = _case(name, rank=rank, device=device)
+            local_router, bias = _case(
+                name, rank=rank, batch_size=batch_size, device=device
+            )
             reference_pool.all_gather_pair(
                 down_local,
                 local_router,
@@ -261,14 +294,8 @@ def _worker(
         if not torch.equal(fused_down, reference_down):
             raise AssertionError("captured down projection differs")
 
-        reference_us = _measure(
+        reference_us, fused_us, saved_us = _measure_pair(
             reference_graph,
-            device=device,
-            warmup=warmup,
-            iterations=iterations,
-            samples=samples,
-        )
-        fused_us = _measure(
             fused_graph,
             device=device,
             warmup=warmup,
@@ -276,10 +303,13 @@ def _worker(
             samples=samples,
         )
         if rank == 0:
+            threads = os.environ.get("SPARKINFER_PCIE_KIMI_TOPK_THREADS", "384")
             print(
-                "world_size,reference_us,fused_us,speedup,saved_us\n"
-                f"{world_size},{reference_us:.6f},{fused_us:.6f},"
-                f"{reference_us / fused_us:.6f},{reference_us - fused_us:.6f}",
+                "world_size,batch_size,threads,reference_us,fused_us,"
+                "speedup,saved_us\n"
+                f"{world_size},{batch_size},{threads},{reference_us:.6f},"
+                f"{fused_us:.6f},"
+                f"{reference_us / fused_us:.6f},{saved_us:.6f}",
                 flush=True,
             )
     finally:
@@ -299,9 +329,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     if args.world_size != 16:
         raise SystemExit("Kimi paired gather+top-k benchmark requires TP16")
+    if not 1 <= args.batch_size <= 8:
+        raise SystemExit("--batch-size must be between 1 and 8")
     mp.spawn(
         _worker,
         args=(
@@ -310,6 +343,7 @@ def main() -> None:
             args.warmup,
             args.iterations,
             args.samples,
+            args.batch_size,
         ),
         nprocs=args.world_size,
         join=True,
