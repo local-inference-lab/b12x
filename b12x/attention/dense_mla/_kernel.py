@@ -93,37 +93,20 @@ def _signature(binding: Binding) -> tuple[object, ...]:
     )
 
 
-@dataclass(frozen=True)
-class _ForwardLaunch:
+@dataclass(frozen=True, slots=True)
+class _ForwardCompileTemplate:
     entry: DenseMlaForwardKernel
-    args: tuple[object, ...]
     spec: KernelCompileSpec
 
 
-@dataclass(frozen=True)
-class _MergeLaunch:
+@dataclass(frozen=True, slots=True)
+class _MergeCompileTemplate:
     entry: DenseMlaMergeKernel
-    args: tuple[object, ...]
     spec: KernelCompileSpec
 
 
-def _forward_launch(binding: Binding) -> _ForwardLaunch:
+def _forward_args(binding: Binding) -> tuple[object, ...]:
     scratch = binding.scratch
-    fp8 = binding.q.dtype == _FP8
-    layout = make_smem_layout(
-        query_tile=scratch.query_tile,
-        fp8=fp8,
-    )
-    entry = DenseMlaForwardKernel(
-        layout=layout,
-        page_size=scratch.page_size,
-        num_heads=scratch.num_q_heads,
-        num_splits=scratch.num_splits,
-        chunks_per_split=scratch.chunks_per_split,
-        query_tile=scratch.query_tile,
-        fp8=fp8,
-    )
-
     q_bytes = _byte_base_pointer(binding.q)
     cache_bytes = _byte_base_pointer(binding.kv_cache)
     page_table = binding.page_table.reshape(-1)
@@ -139,7 +122,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     q_scale = binding.q_scale if binding.q_scale is not None else unused_scale_storage
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    args = (
+    return (
         _to_cute(
             q_bytes,
             cutlass.Uint8,
@@ -191,6 +174,24 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         Int32(binding.active_splits),
         stream,
     )
+
+
+def _forward_compile_template(binding: Binding) -> _ForwardCompileTemplate:
+    scratch = binding.scratch
+    fp8 = binding.q.dtype == _FP8
+    layout = make_smem_layout(
+        query_tile=scratch.query_tile,
+        fp8=fp8,
+    )
+    entry = DenseMlaForwardKernel(
+        layout=layout,
+        page_size=scratch.page_size,
+        num_heads=scratch.num_q_heads,
+        num_splits=scratch.num_splits,
+        chunks_per_split=scratch.chunks_per_split,
+        query_tile=scratch.query_tile,
+        fp8=fp8,
+    )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
         3,
@@ -223,7 +224,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         ),
         tensor_key(
             "output",
-            output,
+            binding.output,
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
@@ -231,18 +232,17 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             ),
         ),
     )
-    return _ForwardLaunch(entry=entry, args=args, spec=spec)
+    return _ForwardCompileTemplate(entry=entry, spec=spec)
 
 
-def _merge_launch(binding: Binding) -> _MergeLaunch | None:
+def _merge_args(binding: Binding) -> tuple[object, ...] | None:
     scratch = binding.scratch
     if scratch.num_splits == 1:
         return None
     assert scratch.partial_output is not None
     assert scratch.partial_lse is not None
-    entry = DenseMlaMergeKernel(scratch.num_splits)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    args = (
+    return (
         _to_cute(
             scratch.partial_output,
             cutlass.BFloat16,
@@ -259,6 +259,14 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         Int32(binding.active_splits),
         stream,
     )
+
+
+def _merge_compile_template(binding: Binding) -> _MergeCompileTemplate | None:
+    scratch = binding.scratch
+    if scratch.num_splits == 1:
+        return None
+    assert scratch.partial_output is not None
+    entry = DenseMlaMergeKernel(scratch.num_splits)
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.merge",
         4,
@@ -284,7 +292,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
             ),
         ),
     )
-    return _MergeLaunch(entry=entry, args=args, spec=spec)
+    return _MergeCompileTemplate(entry=entry, spec=spec)
 
 
 def _compile_entries(binding: Binding) -> tuple[object, object | None]:
@@ -293,21 +301,24 @@ def _compile_entries(binding: Binding) -> tuple[object, object | None]:
         compiled_forward = _FORWARD_CACHE.get(signature)
         compiled_merge = _MERGE_CACHE.get(signature)
     if compiled_forward is None:
-        launch = _forward_launch(binding)
+        template = _forward_compile_template(binding)
+        args = _forward_args(binding)
         compiled_forward = compile_cute(
-            launch.entry,
-            *launch.args,
-            compile_spec=launch.spec,
+            template.entry,
+            *args,
+            compile_spec=template.spec,
         )
         with _LOCK:
             _FORWARD_CACHE[signature] = compiled_forward
     if binding.scratch.num_splits > 1 and compiled_merge is None:
-        launch = _merge_launch(binding)
-        assert launch is not None
+        template = _merge_compile_template(binding)
+        args = _merge_args(binding)
+        assert template is not None
+        assert args is not None
         compiled_merge = compile_cute(
-            launch.entry,
-            *launch.args,
-            compile_spec=launch.spec,
+            template.entry,
+            *args,
+            compile_spec=template.spec,
         )
         with _LOCK:
             _MERGE_CACHE[signature] = compiled_merge
@@ -343,13 +354,12 @@ def run_dense_mla(
             )
         compiled_forward, compiled_merge = _compile_entries(binding)
 
-    forward = _forward_launch(binding)
-    run_compiled(compiled_forward, forward.args)
+    run_compiled(compiled_forward, _forward_args(binding))
     if binding.scratch.num_splits > 1 and binding.active_splits > 1:
         assert compiled_merge is not None
-        merge = _merge_launch(binding)
-        assert merge is not None
-        run_compiled(compiled_merge, merge.args)
+        merge_args = _merge_args(binding)
+        assert merge_args is not None
+        run_compiled(compiled_merge, merge_args)
     rows = int(binding.q.shape[0])
     return binding.output, binding.scratch.final_lse[:rows]
 
