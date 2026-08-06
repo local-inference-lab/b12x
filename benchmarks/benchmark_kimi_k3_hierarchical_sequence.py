@@ -270,6 +270,7 @@ def _worker(
     mode: str,
     layers: int,
     gap_cycles: int,
+    skew_cycles: int,
     stress_replays: int,
     warmup: int,
     iters: int,
@@ -322,11 +323,16 @@ def _worker(
             )
             if runtime.algorithm != "hierarchical":
                 raise AssertionError(f"unexpected algorithm {runtime.algorithm}")
-            actual_mode = (
-                "double"
-                if runtime._runtime.double_buffered
-                else ("deferred" if runtime._runtime.deferred_consumption else "legacy")
-            )
+            if runtime._runtime.double_buffered:
+                actual_mode = "double"
+            elif runtime._runtime.deferred_consumption:
+                actual_mode = (
+                    "deferred-post"
+                    if getattr(runtime._runtime, "post_preamble", False)
+                    else "deferred"
+                )
+            else:
+                actual_mode = "legacy"
         if actual_mode != mode:
             raise AssertionError(f"requested {mode}, constructed {actual_mode}")
 
@@ -348,22 +354,28 @@ def _worker(
             outputs.append(torch.empty_like(inp))
         inputs_before = [inp.clone() for inp in inputs]
 
+        def _sequence() -> None:
+            call_index = 0
+            for _ in range(layers):
+                for inp, out in zip(inputs, outputs, strict=True):
+                    if skew_cycles and call_index % world_size == rank:
+                        # Rotating laggard: every rank takes the same total
+                        # extra work per graph, but at call-shifted positions,
+                        # emulating per-rank inter-collective compute skew.
+                        torch.cuda._sleep(skew_cycles)
+                    runtime.all_reduce(inp, out=out)
+                    if gap_cycles:
+                        torch.cuda._sleep(gap_cycles)
+                    call_index += 1
+
         # Exercise the exact mixed-grid sequence eagerly before capture.
-        for _ in range(layers):
-            for inp, out in zip(inputs, outputs, strict=True):
-                runtime.all_reduce(inp, out=out)
-                if gap_cycles:
-                    torch.cuda._sleep(gap_cycles)
+        _sequence()
         torch.cuda.synchronize(device)
         _assert_outputs(outputs, references, inputs, inputs_before, device)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for _ in range(layers):
-                for inp, out in zip(inputs, outputs, strict=True):
-                    runtime.all_reduce(inp, out=out)
-                    if gap_cycles:
-                        torch.cuda._sleep(gap_cycles)
+            _sequence()
 
         for _ in range(stress_replays):
             graph.replay()
@@ -439,6 +451,7 @@ def _worker(
                         "layers_per_graph": layers,
                         "collectives_per_graph": calls,
                         "gap_cycles_after_each_collective": gap_cycles,
+                        "skew_cycles_rotating_laggard": skew_cycles,
                         "stress_replays": stress_replays,
                         "samples_graph_us_rank_max": timings,
                         "median_graph_us_rank_max": med,
@@ -474,11 +487,12 @@ def main() -> None:
     parser.add_argument("--world-size", type=int, choices=(12, 16), default=16)
     parser.add_argument(
         "--mode",
-        choices=("legacy", "double", "deferred", "lane"),
+        choices=("legacy", "double", "deferred", "deferred-post", "lane"),
         required=True,
     )
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--gap-cycles", type=int, default=100_000)
+    parser.add_argument("--skew-cycles", type=int, default=0)
     parser.add_argument("--stress-replays", type=int, default=2_000)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
@@ -513,6 +527,8 @@ def main() -> None:
         raise ValueError("layers/iters/samples must be positive; counts nonnegative")
     if args.gap_cycles < 0:
         raise ValueError("gap cycles must be nonnegative")
+    if args.skew_cycles < 0:
+        raise ValueError("skew cycles must be nonnegative")
     if not args.shapes or min(args.shapes) <= 0:
         raise ValueError("shapes must contain positive element counts")
     if torch.cuda.device_count() < args.world_size:
@@ -525,7 +541,10 @@ def main() -> None:
         "1" if args.mode == "double" else "0"
     )
     os.environ["B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION"] = (
-        "1" if args.mode == "deferred" else "0"
+        "1" if args.mode in ("deferred", "deferred-post") else "0"
+    )
+    os.environ["B12X_PCIE_HIERARCHICAL_POST_PREAMBLE"] = (
+        "1" if args.mode == "deferred-post" else "0"
     )
     mp.spawn(
         _worker,
@@ -535,6 +554,7 @@ def main() -> None:
             args.mode,
             args.layers,
             args.gap_cycles,
+            args.skew_cycles,
             args.stress_replays,
             args.warmup,
             args.iters,

@@ -139,7 +139,7 @@ def _pick_blocks(elements: int) -> int:
     return 16 if elements <= 4096 else 32
 
 
-def _buffer_modes_from_env() -> tuple[bool, bool]:
+def _buffer_modes_from_env() -> tuple[bool, bool, bool]:
     """Return mutually exclusive experimental synchronization modes."""
 
     double_buffered = (
@@ -152,13 +152,25 @@ def _buffer_modes_from_env() -> tuple[bool, bool]:
         )
         == "1"
     )
+    post_preamble = (
+        os.getenv(
+            "SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE",
+            "0",
+        )
+        == "1"
+    )
     if double_buffered and deferred_consumption:
         raise ValueError(
             "B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER and "
             "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION are "
             "mutually exclusive"
         )
-    return double_buffered, deferred_consumption
+    if post_preamble and not deferred_consumption:
+        raise ValueError(
+            "SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE requires "
+            "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION=1"
+        )
+    return double_buffered, deferred_consumption, post_preamble
 
 
 class PCIeHierarchicalAllReduce:
@@ -198,6 +210,7 @@ class PCIeHierarchicalAllReduce:
         (
             self.double_buffered,
             self.deferred_consumption,
+            self.post_preamble,
         ) = _buffer_modes_from_env()
         self._ext = ext_module or _load_extension()
         self._ipc = CudaRTLibrary()
@@ -226,6 +239,15 @@ class PCIeHierarchicalAllReduce:
                     self.max_elements,
                 )
             )
+            if self.deferred_consumption and self.post_preamble:
+                # Post-preamble mode trails each collective with the *next*
+                # collective's preamble; the very first collective is primed
+                # here so every main kernel keeps a preceding preamble.
+                with torch.cuda.device(self.device):
+                    self._ext.prime_deferred_preamble(
+                        self._runtime,
+                        self.device.index or 0,
+                    )
         except Exception:
             for ptr in self._remote_ptrs:
                 with suppress(Exception):
@@ -295,6 +317,7 @@ class PCIeHierarchicalAllReduce:
             selected_blocks,
             self.double_buffered,
             self.deferred_consumption,
+            self.post_preamble,
         )
         return out
 

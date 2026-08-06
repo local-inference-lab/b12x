@@ -600,13 +600,43 @@ static int64_t init_runtime(
   return reinterpret_cast<int64_t>(runtime);
 }
 
+static void launch_deferred_preamble(
+    const Runtime& runtime,
+    cudaStream_t stream) {
+  if (runtime.world_size == 12) {
+    pcie_hierarchical::deferred_consumption_preamble<3>
+        <<<1, 32, 0, stream>>>(runtime);
+  } else if (runtime.world_size == 16) {
+    pcie_hierarchical::deferred_consumption_preamble<4>
+        <<<1, 32, 0, stream>>>(runtime);
+  } else {
+    TORCH_CHECK(false, "unsupported hierarchical all-reduce world size");
+  }
+}
+
+static void prime_deferred_preamble(
+    int64_t runtime_handle,
+    int64_t device_index) {
+  // Post-preamble mode launches the consumption preamble *after* each
+  // collective, so the very first collective needs one priming preamble to
+  // keep the strict [preamble g][main g] pairing per rank.
+  auto* runtime = reinterpret_cast<Runtime*>(runtime_handle);
+  TORCH_CHECK(runtime != nullptr, "runtime is closed");
+  const c10::cuda::CUDAGuard guard(
+      static_cast<c10::DeviceIndex>(device_index));
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  launch_deferred_preamble(*runtime, stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 static void all_reduce_bf16(
     int64_t runtime_handle,
     torch::Tensor input,
     torch::Tensor output,
     int64_t blocks,
     bool double_buffered,
-    bool deferred_consumption) {
+    bool deferred_consumption,
+    bool post_preamble) {
   auto* runtime = reinterpret_cast<Runtime*>(runtime_handle);
   TORCH_CHECK(runtime != nullptr, "runtime is closed");
   TORCH_CHECK(input.is_cuda() && output.is_cuda(), "tensors must be CUDA");
@@ -627,6 +657,9 @@ static void all_reduce_bf16(
   TORCH_CHECK(
       !(double_buffered && deferred_consumption),
       "double buffering and deferred consumption are mutually exclusive");
+  TORCH_CHECK(
+      !post_preamble || deferred_consumption,
+      "post_preamble requires deferred consumption mode");
   const c10::cuda::CUDAGuard guard(input.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   const auto* input_ptr =
@@ -639,10 +672,24 @@ static void all_reduce_bf16(
           0 &&
       reinterpret_cast<std::uintptr_t>(output_ptr) % alignof(__nv_bfloat162) ==
           0;
+  // In deferred-consumption mode every main kernel must be preceded by
+  // exactly one preamble on this rank's stream. The default launches it
+  // immediately before the main kernel, where its global rendezvous absorbs
+  // the full inter-collective rank skew on the critical path -- and the main
+  // kernel's internal arrival waits then absorb much of that skew again.
+  // post_preamble instead launches the *next* collective's preamble right
+  // after the main kernel, while ranks are still aligned by the collective
+  // itself, so the rendezvous costs only its flag round-trips and the skew is
+  // absorbed once, inside the next main kernel. The strict per-rank
+  // [preamble g][main g] order is preserved because the trailing preamble of
+  // call g is the leading preamble of call g+1 (the first call is primed by
+  // prime_deferred_preamble). This holds across CUDA graph boundaries: every
+  // captured segment keeps the [main][preamble] suffix shape.
+  if (deferred_consumption && !post_preamble) {
+    launch_deferred_preamble(*runtime, stream);
+  }
   if (runtime->world_size == 12) {
     if (deferred_consumption) {
-      pcie_hierarchical::deferred_consumption_preamble<3>
-          <<<1, 32, 0, stream>>>(*runtime);
       pcie_hierarchical::launch_all_reduce_bf16<3, false, true>(
           stream, static_cast<int>(blocks), *runtime, input_ptr, output_ptr,
           input.numel(), vectorized_bf16x2);
@@ -657,8 +704,6 @@ static void all_reduce_bf16(
     }
   } else if (runtime->world_size == 16) {
     if (deferred_consumption) {
-      pcie_hierarchical::deferred_consumption_preamble<4>
-          <<<1, 32, 0, stream>>>(*runtime);
       pcie_hierarchical::launch_all_reduce_bf16<4, false, true>(
           stream, static_cast<int>(blocks), *runtime, input_ptr, output_ptr,
           input.numel(), vectorized_bf16x2);
@@ -674,6 +719,9 @@ static void all_reduce_bf16(
   } else {
     TORCH_CHECK(false, "unsupported hierarchical all-reduce world size");
   }
+  if (deferred_consumption && post_preamble) {
+    launch_deferred_preamble(*runtime, stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -684,6 +732,16 @@ static void destroy_runtime(int64_t runtime_handle) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("slab_bytes", &slab_bytes);
   module.def("init_runtime", &init_runtime);
-  module.def("all_reduce_bf16", &all_reduce_bf16);
+  module.def(
+      "all_reduce_bf16",
+      &all_reduce_bf16,
+      pybind11::arg("runtime_handle"),
+      pybind11::arg("input"),
+      pybind11::arg("output"),
+      pybind11::arg("blocks"),
+      pybind11::arg("double_buffered"),
+      pybind11::arg("deferred_consumption"),
+      pybind11::arg("post_preamble") = false);
+  module.def("prime_deferred_preamble", &prime_deferred_preamble);
   module.def("destroy_runtime", &destroy_runtime);
 }
