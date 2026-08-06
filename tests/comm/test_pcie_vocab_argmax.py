@@ -5,10 +5,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_hierarchical import (
+from b12x.comm.pcie.pcie_hierarchical import (
     _selected_peers as _allreduce_peers,
 )
-from sparkinfer.comm.pcie.pcie_vocab_argmax import (
+from b12x.comm.pcie.pcie_vocab_argmax import (
     PCIeVocabParallelArgmax,
     _exchange_ipc_handles,
     _selected_peers,
@@ -88,7 +88,7 @@ def test_vocab_argmax_wait_cycles(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
+    monkeypatch.setenv("B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
     assert _wait_nanosleep_cycles_from_env() == int(value)
 
 
@@ -97,7 +97,7 @@ def test_vocab_argmax_rejects_invalid_wait_cycles(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
+    monkeypatch.setenv("B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
     with pytest.raises(ValueError):
         _wait_nanosleep_cycles_from_env()
 

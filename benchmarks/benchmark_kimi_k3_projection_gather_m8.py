@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sparkinfer.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
 
 from benchmark_kimi_k3_projection_gather import (
     _assert_exact,

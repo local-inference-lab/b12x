@@ -210,7 +210,7 @@ def test_hierarchical_buffer_modes_are_opt_in(
         deferred_consumption,
     )
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE",
+        "B12X_PCIE_HIERARCHICAL_POST_PREAMBLE",
         post_preamble,
     )
     assert _buffer_modes_from_env() == expected
@@ -219,12 +219,12 @@ def test_hierarchical_buffer_modes_are_opt_in(
 def test_hierarchical_post_preamble_requires_deferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "0")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_DOUBLE_BUFFER", "0")
     monkeypatch.setenv(
-        "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
+        "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION",
         "0",
     )
-    monkeypatch.setenv("SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE", "1")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_POST_PREAMBLE", "1")
     with pytest.raises(ValueError, match="POST_PREAMBLE requires"):
         _buffer_modes_from_env()
 

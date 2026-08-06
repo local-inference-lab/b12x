@@ -64,11 +64,11 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
     host_barrier_reset: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import sparkinfer.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
-    monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
     monkeypatch.setenv(
-        "SPARKINFER_W4A16_SMALL_M_HOST_BARRIER_RESET",
+        "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET",
         "1" if host_barrier_reset else "0",
     )
     torch.manual_seed(20260805 + int(host_barrier_reset))

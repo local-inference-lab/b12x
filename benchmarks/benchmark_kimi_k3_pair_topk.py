@@ -303,7 +303,7 @@ def _worker(
             samples=samples,
         )
         if rank == 0:
-            threads = os.environ.get("SPARKINFER_PCIE_KIMI_TOPK_THREADS", "384")
+            threads = os.environ.get("B12X_PCIE_KIMI_TOPK_THREADS", "384")
             print(
                 "world_size,batch_size,threads,reference_us,fused_us,"
                 "speedup,saved_us\n"

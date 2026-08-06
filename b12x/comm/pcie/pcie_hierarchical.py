@@ -154,7 +154,7 @@ def _buffer_modes_from_env() -> tuple[bool, bool, bool]:
     )
     post_preamble = (
         os.getenv(
-            "SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE",
+            "B12X_PCIE_HIERARCHICAL_POST_PREAMBLE",
             "0",
         )
         == "1"
@@ -167,8 +167,8 @@ def _buffer_modes_from_env() -> tuple[bool, bool, bool]:
         )
     if post_preamble and not deferred_consumption:
         raise ValueError(
-            "SPARKINFER_PCIE_HIERARCHICAL_POST_PREAMBLE requires "
-            "SPARKINFER_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION=1"
+            "B12X_PCIE_HIERARCHICAL_POST_PREAMBLE requires "
+            "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION=1"
         )
     return double_buffered, deferred_consumption, post_preamble
 

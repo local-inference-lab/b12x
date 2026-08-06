@@ -74,7 +74,7 @@ static int dcp_block_limit_override() {
 static int kimi_pair_topk_threads() {
   static const int value = [] {
     const int requested =
-        env_int("SPARKINFER_PCIE_KIMI_TOPK_THREADS", 384);
+        env_int("B12X_PCIE_KIMI_TOPK_THREADS", 384);
     return std::min(512, std::max(256, (requested / 32) * 32));
   }();
   return value;
