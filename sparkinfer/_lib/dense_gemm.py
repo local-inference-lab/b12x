@@ -137,161 +137,10 @@ _SPARKINFER_TIMING_THRESHOLD_MS = float(
 _SPARKINFER_DENSE_SPLITK_TURBO = (
     os.getenv("SPARKINFER_DENSE_SPLITK_TURBO", "1") == "1"
 )
-# MX-FP6 large-M mainloop unroll (k-tile unroll 4 instead of 2, the MXFP8
-# prefill tactic). Numerics-neutral: the unroll is a pure codegen pragma (MMA
-# order per k-tile/k-block is unchanged) and the (128,128,64) swizzle branch
-# it also gates never applies to FP6 tiles. Default on after the Phase A
-# FP6-vs-DeepGEMM gap analysis; =0 restores the historical unroll=2 plan for
-# A/B runs.
-_SPARKINFER_FP6_LARGE_M_UNROLL = (
-    os.getenv("SPARKINFER_FP6_LARGE_M_UNROLL", "1") == "1"
-)
 
-
-def _parse_tile_env(
-    name: str, default: Optional[Tuple[int, int]]
-) -> Optional[Tuple[int, int]]:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        tm, tn = raw.lower().split("x")
-        return (int(tm), int(tn))
-    except ValueError as exc:
-        raise ValueError(f"{name} must look like '128x64', got {raw!r}") from exc
-
-
-# Wide-N (n > 1536) MX-FP6 prefill-regime (m > 16) MMA tile. All candidate
-# tiles are bit-identical, so this is a pure performance knob for A/B runs.
-#
-# (128,128) since Jul 28 2026. The earlier sweep that picked (128,64) could not
-# see this: every (128,128) arm it measured ran at ab_stage=1 because the
-# full-tile epilogue took 32KB of shared memory, so it compared a pipelined
-# narrow tile against an unpipelined wide one. With _choose_epilogue freeing
-# those bytes, (128,128) reaches 2 stages and wins on all four Behemoth TP=2
-# shards at M=8192 (qkv -18.0%, o -18.9%, down -17.1%, gate_up -18.1%), and
-# end-to-end serving prefill gains 8.7-14.6% across 1k-32k context.
-_SPARKINFER_FP6_LARGE_M_TILE = _parse_tile_env(
-    "SPARKINFER_FP6_LARGE_M_TILE", (128, 128)
-)
-# Optional forced MX-FP6 decode-regime (m <= 16, wide-N) tile for A/B runs.
-# Unset (default) = the measured wave-cliff heuristic in
-# _select_default_mma_tiler_mn; e.g. 16x128 restores the old fixed tile.
-_SPARKINFER_FP6_DECODE_TILE = _parse_tile_env(
-    "SPARKINFER_FP6_DECODE_TILE", None
-)
-
-# --- Experiment knobs (process-wide, read once at import) -------------------
-# Both are numerics-neutral: the tile-scheduler swizzle only changes WHICH CTA
-# computes which output tile (an L2-locality rasterization order), and the
-# pipeline depth only changes how far ahead the producer runs. Output bits are
-# unchanged. They are env-only (no per-call plumbing) precisely so an A/B is
-# run as two PROCESSES — the compiled-kernel cache key does not include them,
-# so switching mid-process would silently reuse the first kernel.
-#
-# SPARKINFER_DENSE_TILE_SWIZZLE=N (default 0 = keep the current per-tile rule)
-# overrides the swizzle for every tile that currently rasterizes linearly
-# (swizzle 1) — notably the FP6 prefill tile (128,64), whose grid is thousands
-# of tiles deep and re-streams operands with no L2-friendly grouping.
-_SPARKINFER_DENSE_TILE_SWIZZLE = int(
-    os.getenv("SPARKINFER_DENSE_TILE_SWIZZLE", "0")
-)
-# SPARKINFER_DENSE_AB_STAGES=N (default 0 = keep the measured caps) overrides
-# the mainloop stage cap. Always clamped by the smem-derived raw_ab_stage, so
-# an over-large N cannot exceed the smem budget.
-#
-# That clamp is not theoretical for prefill. The (128,64,128) tile resolves
-# raw_ab_stage=3 at occupancy 1: 101376 B of smem, less 2048 for the occupancy
-# reserve and mbarriers and 16384 for the epilogue sC, leaves 82944 against
-# 25600 per stage (A 16384 + B 8192 + SF 1024). So the flat cap of 4 has never
-# bound prefill, requesting 4/5/6 all compile the same three-stage kernel, and
-# an earlier sweep reading "s4 == s3, noise" was comparing a kernel to itself.
-# Only the s2 arm was a real stage-depth measurement, and it cost +15%.
-_SPARKINFER_DENSE_AB_STAGES = int(os.getenv("SPARKINFER_DENSE_AB_STAGES", "0"))
-# SPARKINFER_DENSE_EPI_TILE=MxN (default unset = the whole MMA tile) shrinks the
-# epilogue staging tile. Must divide the MMA tile in both modes.
-#
-# The epilogue buffer is sized epi_tile * epi_stage, and epi_stage_max is
-# (tile_n / epi_n) * (tile_m / epi_m), so an epi_tile equal to the MMA tile
-# pins epi_stage at 1 and reserves the full tile in smem. That is affordable at
-# (128,64) - 16384 B of 99328 - and decisive at (128,128), where it takes 32768
-# and leaves 66560 against 33792 per stage: ab_stage=1, i.e. no mainloop
-# pipeline at all. A (128,128) sweep therefore measured an unpipelined kernel
-# and reported it as a tile result.
-#
-# Numerics-neutral: this only changes the granularity at which finished output
-# tiles are staged and TMA-stored, not accumulation order, rounding, or any
-# operand value.
-#
-# Setting this disables _choose_epilogue, which otherwise makes the decision
-# per tile. Kept as an A/B and escape hatch, and it is an upper bound per mode
-# rather than an exact request - see _dense_epi_tile.
-_SPARKINFER_DENSE_EPI_TILE = _parse_tile_env("SPARKINFER_DENSE_EPI_TILE", None)
-# SPARKINFER_DENSE_EPI_STAGES=N (default 0 = the min(epi_stage_max, 4) rule)
-# caps the epilogue pipeline depth. Required to make EPI_TILE mean anything:
-# epi_stage_max is (tile_m/epi_m) * (tile_n/epi_n), so shrinking the epilogue
-# tile raises the stage count by the same factor and epi_bytes does not move
-# until the x4 cap bites. Measured: (128,128) with epi (128,64) resolved
-# epi_stage=2 and epi_bytes=32768, identical to the full-tile epilogue.
-_SPARKINFER_DENSE_EPI_STAGES = int(os.getenv("SPARKINFER_DENSE_EPI_STAGES", "0"))
-
-
-def _dense_epi_tile(mma_tiler_mn: Tuple[int, int]) -> Tuple[int, int]:
-    """Epilogue staging tile: the whole MMA tile unless overridden.
-
-    The override is an upper bound per mode, not an exact request. One process
-    compiles several tile shapes - a serving run builds the prefill tile and the
-    decode 16x64 in the same interpreter - so an exact request aimed at prefill
-    would abort the decode warmup on a tile it was never meant to describe.
-    """
-    if _SPARKINFER_DENSE_EPI_TILE is None:
-        return (mma_tiler_mn[0], mma_tiler_mn[1])
-    req_m, req_n = _SPARKINFER_DENSE_EPI_TILE
-    if req_m <= 0 or req_n <= 0:
-        raise ValueError(
-            f"SPARKINFER_DENSE_EPI_TILE must be positive, got {req_m}x{req_n}"
-        )
-    epi_m = min(req_m, mma_tiler_mn[0])
-    epi_n = min(req_n, mma_tiler_mn[1])
-    # A non-dividing epi_tile does not fail at compile time: zipped_divide and
-    # the TMA store atom would silently stage a tile that does not tessellate
-    # the output, so reject it here rather than write wrong C.
-    if mma_tiler_mn[0] % epi_m or mma_tiler_mn[1] % epi_n:
-        raise ValueError(
-            "SPARKINFER_DENSE_EPI_TILE must divide the MMA tile in both modes "
-            f"once clamped to it, got {req_m}x{req_n} -> {epi_m}x{epi_n} for "
-            f"MMA tile {mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
-        )
-    return (epi_m, epi_n)
-# Cap the decode-regime pipeline at 3 stages when two CTAs share the SM's smem.
-# Measured on Behemoth TP=2 (2x RTX PRO 6000, ncu, M=1, four shards): at
-# occupancy 2 the CTA gets half the budget, and the fourth stage buys less than
-# it costs - gate_up 213.9->204.3 us, down 117.1->110.1, o 53.2->49.1, with DRAM
-# throughput rising 71->75%, 66->70% and 61->66%. qkv is the control: it runs at
-# occupancy 1, keeps the whole budget, and REGRESSED 63.7->65.6 us at 3 stages,
-# which is why this is gated on occupancy rather than applied to all of decode.
-# Two stages was tried and is worse everywhere (+11% total, qkv +59%): it does
-# reach 3 CTAs/SM, but achieved occupancy never moves because the decode grids
-# are too small to fill the slots, so it only shortens the pipeline.
-# Numerics-neutral - stage depth is producer lookahead, not accumulation order.
-# Set SPARKINFER_DENSE_DECODE_STAGE3=0 to restore the flat cap for A/B.
-_DENSE_DECODE_STAGE3 = os.getenv(
-    "SPARKINFER_DENSE_DECODE_STAGE3", "1"
-).lower() not in ("0", "false")
-# SPARKINFER_DENSE_TARGET_OCCUPANCY=N (default 0 = keep the built-in rule)
-# forces the CTAs-per-SM target. Also numerics-neutral: it changes how many
-# output tiles are resident at once and, through the smem split in
-# _compute_stages, how deep each pipeline is - never the per-output-element
-# accumulation order.
-#
-# Why it exists: ncu on Behemoth-123B TP=2 decode (Jul 26) measured every one of
-# the four shards pinned at "Block Limit Shared Mem = 1", i.e. a single CTA per
-# SM, for 6-10% achieved occupancy and only 61-70% of DRAM peak. The MX-FP6
-# branch of _dense_gemm_target_occupancy that fixed this was derived from A/B
-# runs driven by this knob; it stays for the next such sweep.
-_SPARKINFER_DENSE_TARGET_OCCUPANCY = int(
-    os.getenv("SPARKINFER_DENSE_TARGET_OCCUPANCY", "0")
-)
+# MX-FP6 decode uses at most three mainloop stages when two CTAs share an SM.
+_FP6_DECODE_TILE = (16, 64)
+_FP6_PREFILL_TILE = (128, 128)
 _SPARKINFER_DENSE_ATOM_24 = (
     os.getenv("SPARKINFER_DENSE_ATOM_24", "0") == "1"
 )
@@ -299,11 +148,8 @@ _DENSE_LOAD_PATHS = ("tma", "cpasync")
 
 # Expand-ahead for packed-B: at k_block 0 the MMA warps wait for stage s+1 and
 # expand it in place, overlapping the expansion with ALL of stage s's MMA work
-# instead of putting it on the critical path at the stage boundary. This needs
-# >= 4 pipeline stages of producer slack (it measurably REGRESSED at 3 stages:
-# the consumer stalled on the wait before its MMA work instead of after), so
-# it is gated per-kernel in _setup_attributes. Env kill-switch for A/B runs:
-# SPARKINFER_PACKED_B_EXPAND_AHEAD=0 (read once at import).
+# instead of putting it on the critical path at the stage boundary. It requires
+# at least four pipeline stages of producer slack.
 _PACKED_B_EXPAND_AHEAD = os.environ.get(
     "SPARKINFER_PACKED_B_EXPAND_AHEAD", "1"
 ).lower() not in ("0", "false")
@@ -317,36 +163,6 @@ _PACKED_B_EXPAND_AHEAD = os.environ.get(
 _DENSE_FUSED_QUANT = os.environ.get(
     "SPARKINFER_DENSE_FUSED_QUANT", "0"
 ).lower() not in ("0", "false")
-
-# Strategy for the shared->register MX scale-factor copy: "autovec" (default),
-# "recast32", or "off" (one access per UE8M0 byte). See
-# DenseGemmKernel._copy_sf_fragment for what each does and why the obvious
-# approach - widening the copy atom - does not work.
-#
-# A SASS census of the prefill k-loop found 96 LDS.U8 against 64 LDSM.16.M88.4
-# and 128 QMMA: the scale factors move ~1/32 the operand bytes at 1.5x the load
-# instructions. Vectorizing cuts that to 16 shared loads but adds 96 PRMT to
-# unpack the bytes, leaving the loop 7.2% HEAVIER at 523 instructions. It is
-# still faster, because the instructions it removes are on the throttled
-# LSU/MIO pipe and the ones it adds are on the idle ALU pipe: -1.04% to -1.26%
-# on all four Behemoth TP=2 prefill shards (200 iters, median; 538-567 ->
-# 545-574 TFLOP/s), decode flat to -1.0%, oracle max_abs/rmse/cos identical to
-# every printed digit in both arms.
-#
-# "autovec" over "recast32" as the default although they generate identical
-# code here: autovec narrows itself where a layout will not vectorize, while
-# recast32 fails to compile. On an untested tile - narrow-N, a future decode
-# tile, MoE - silently keeping byte loads is a perf regression, and refusing to
-# build is an outage.
-_DENSE_SF_COPY_MODE = os.environ.get(
-    "SPARKINFER_DENSE_SF_COPY_MODE", "autovec"
-).lower()
-if _DENSE_SF_COPY_MODE not in ("off", "autovec", "recast32"):
-    raise ValueError(
-        "SPARKINFER_DENSE_SF_COPY_MODE must be one of off/autovec/recast32, "
-        f"got {_DENSE_SF_COPY_MODE!r}"
-    )
-
 
 @dataclass(frozen=True)
 class _DenseGemmPlan:
@@ -815,7 +631,6 @@ class DenseGemmKernel:
         b_packed: bool = False,
         plain_fp8: bool = False,
         fused_quant_bf16: Optional[bool] = None,
-        sf_copy_mode: str = "autovec",
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -868,14 +683,9 @@ class DenseGemmKernel:
             "b_packed expansion assumes tile_k == 128 (SW128 smem atom)"
         )
         self.b_packed = b_packed
-        # Read the env only as a fallback. Callers that memoize compiled
-        # kernels MUST pass this explicitly, because it changes codegen: the
-        # fused prologue dereferences x_bf16, and a cache that cannot see the
-        # flag will hand a fused kernel to a caller that passes no activation
-        # tensor. That is a real illegal read at the placeholder pointer, and
-        # the milder failure is worse - two callers silently sharing one
-        # kernel makes a fused-vs-unfused comparison compare a kernel with
-        # itself and pass.
+        # The fused flag changes code generation and must be explicit in every
+        # memoized launch key. The environment is only a direct-construction
+        # fallback.
         if fused_quant_bf16 is None:
             fused_quant_bf16 = _DENSE_FUSED_QUANT
         self.a_bf16_fused = bool(fused_quant_bf16) and use_m1_non_tma_a
@@ -909,7 +719,7 @@ class DenseGemmKernel:
         self.sfb_tile_shape_nk = (max(128, mma_tiler_mn[1]), tile_k)
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)  # Always (1,1,1) on the current target
-        self.epi_tile = _dense_epi_tile(mma_tiler_mn)
+        self.epi_tile = mma_tiler_mn
         self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
@@ -981,7 +791,7 @@ class DenseGemmKernel:
         # and shared-memory layouts.
         self.direct_sfa_prefix = direct_sfa_live16 and self.direct_sfb_representative
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
-        if mma_atom_mn in ((16, 32), (16, 64), (16, 128)):
+        if mma_atom_mn in ((16, 64), (16, 128)):
             # This table sets the MMA atom tiling only. The warp count is a
             # SEPARATE table below and both must list the same tiles: an atom
             # shape covering two warps of work under a launch geometry sized
@@ -997,10 +807,7 @@ class DenseGemmKernel:
 
         self.tiled_mma = None
         self.occupancy = target_occupancy
-        # Strategy for the shared->register scale-factor copy. See
-        # ``_copy_sf_fragment``. "off" keeps one access per UE8M0 byte.
-        self.sf_copy_mode = sf_copy_mode
-        if mma_atom_mn in ((16, 32), (16, 64), (16, 128)):
+        if mma_atom_mn in ((16, 64), (16, 128)):
             self.num_mma_warps = 2
         elif mma_atom_mn in ((32, 64), (32, 128)):
             self.num_mma_warps = 4
@@ -1098,32 +905,51 @@ class DenseGemmKernel:
             1,
         )
 
-        # Compute stage before compute smem layout
-        def _probe_stages(epi_tile: tuple, epi_stage_cap: int) -> tuple:
-            return self._compute_stages(
+        # MX-FP6 operands use Float8E4M3FN byte containers in global and
+        # shared memory. The explicit format is therefore the reliable policy
+        # discriminator; ``a_dtype`` alone also matches ordinary MXFP8.
+        if self.mxfp6_fmt_a is not None:
+            def _probe_stages(epi_tile: tuple, epi_stage_cap: int) -> tuple:
+                return self._compute_stages(
+                    self.tile_shape_mnk,
+                    self.a_dtype,
+                    self.b_dtype,
+                    self.sf_dtype,
+                    sfa_smem_layout_per_stage,
+                    sfb_smem_layout_per_stage,
+                    epi_tile,
+                    self.c_dtype,
+                    self.smem_capacity,
+                    self.occupancy,
+                    self.b_packed,
+                    epi_stage_cap,
+                    decode_stage3=True,
+                )
+
+            self.epi_tile, epi_stage_cap = self._choose_epilogue(
+                (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+                (16 * self.atom_shape[0], 8 * self.atom_shape[1]),
+                _probe_stages,
+                stages_through_smem=not self.use_m1_non_tma_c,
+            )
+            self.ab_stage, self.epi_stage = _probe_stages(
+                self.epi_tile, epi_stage_cap
+            )
+        else:
+            # Non-FP6 families use the generic stage policy.
+            self.ab_stage, self.epi_stage = self._compute_stages(
                 self.tile_shape_mnk,
                 self.a_dtype,
                 self.b_dtype,
                 self.sf_dtype,
                 sfa_smem_layout_per_stage,
                 sfb_smem_layout_per_stage,
-                epi_tile,
+                self.epi_tile,
                 self.c_dtype,
                 self.smem_capacity,
                 self.occupancy,
                 self.b_packed,
-                epi_stage_cap,
             )
-
-        self.epi_tile, _epi_stage_cap = self._choose_epilogue(
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
-            (16 * self.atom_shape[0], 8 * self.atom_shape[1]),
-            _probe_stages,
-            stages_through_smem=not self.use_m1_non_tma_c,
-        )
-        self.ab_stage, self.epi_stage = _probe_stages(
-            self.epi_tile, _epi_stage_cap
-        )
 
         assert self.epi_stage > 0, (
             "epi_stage <= 0, not enough shared memory. This configuration will be skipped."
@@ -1200,7 +1026,6 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         x_bf16: cute.Tensor = None,
         w_gscale: cute.Tensor = None,
-        row_scale: cute.Tensor = None,
     ):
         """Execute the GEMM operation.
 
@@ -1216,8 +1041,6 @@ class DenseGemmKernel:
             epilogue_op: Elementwise epilogue function
             x_bf16: BF16 activation input (MX-FP6 fused quant mode only)
             w_gscale: Weight global scale, shape (1,), f32 (fused mode only)
-            row_scale: Per-row epilogue scale, shape (M,), c_dtype
-                (``row_scale=True`` construction only)
         """
         # Dead kernel arguments on every non-fused path; substitute a
         # type-compatible live tensor so the traced signature stays uniform.
@@ -1227,11 +1050,6 @@ class DenseGemmKernel:
             x_bf16 = alpha
         if cutlass.const_expr(w_gscale is None):
             w_gscale = alpha
-        if cutlass.const_expr(row_scale is None):
-            assert not self.row_scale, "row_scale=True requires a row_scale tensor"
-            row_scale = c
-        else:
-            assert self.row_scale, "row_scale tensor passed to a non-row_scale kernel"
         # Setup static attributes
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
@@ -1427,7 +1245,6 @@ class DenseGemmKernel:
             alpha,
             x_bf16,
             w_gscale,
-            row_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1435,68 +1252,6 @@ class DenseGemmKernel:
             stream=stream,
         )
         return
-
-    @cute.jit
-    def _copy_sf_fragment(self, tiled_copy, src: cute.Tensor, dst: cute.Tensor) -> None:
-        """Move one thread's MX scale factors from smem into registers.
-
-        The default emits one ``LDS.U8`` per UE8M0 byte, which a SASS census of
-        the prefill k-loop showed costs 96 shared loads against 64 ``LDSM`` and
-        128 ``QMMA`` - the scale factors carry 1/32 the operand bytes at 1.5x
-        the load instructions, and they are a plausible source of the
-        ``mio_throttle`` stalls ncu attributes to this loop.
-
-        The per-thread fragment is 8 bytes shaped ``((1,(1,2)),(1,4))`` over
-        smem strides ``((0,(0,8)),(0,1))``: two runs of 4 contiguous bytes, the
-        runs 8 apart. So 4-wide access is physically available and 16-wide is
-        not - there are only 8 elements. Widening the copy ATOM to 32 bits
-        still fails, because a fixed-width atom requires the stride-1 mode to
-        lead and here it trails ("cannot vectorize copy to 4 elements (static
-        strides must be 1)"). Both alternatives below therefore work on the
-        layout rather than asserting a width, and both are rejected at compile
-        time if they do not fit, which is the failure mode we want on a path
-        that feeds quantization scales.
-        """
-        if cutlass.const_expr(self.sf_copy_mode == "autovec"):
-            # Let CuTe find the contiguous run itself instead of being told.
-            cute.autovec_copy(src, dst)
-        elif cutlass.const_expr(self.sf_copy_mode == "recast32"):
-            # Name the run explicitly: 4 UE8M0 bytes are exactly one Uint32, so
-            # the trailing stride-1 mode collapses to a single element and the
-            # surviving mode is the stride-8 one, which needs no vectorizing.
-            cute.autovec_copy(
-                cute.recast_tensor(src, cutlass.Uint32),
-                cute.recast_tensor(dst, cutlass.Uint32),
-            )
-        else:
-            cute.copy(tiled_copy, src, dst)
-
-    def _partition_fragment_SFB_sub_tile(self, sfb_tensor, thr_mma, tidx):
-        """partition_fragment_SFB with the n_rest=1 mode collapse repaired.
-
-        Mirrors cutlass.utils.blackwell_helpers.partition_fragment_SFB. The one
-        change is that the second group_modes runs only when the layout still
-        has the mode it is meant to merge. Upstream applies it unconditionally,
-        so a tile whose N spans exactly one perm_n group (tile_n == 32) has its
-        k mode folded into the value mode and comes back rank 2:
-
-            N=128 -> ((32,1),(2,4),4)   rank 3
-            N=64  -> ((32,1),(2,2),4)   rank 3
-            N=32  -> ((32,1),(2,4))     rank 2, aborts in tiled_copy_retile
-
-        SFA meets the same single-group case at M=16 and keeps its degenerate
-        mode, which is why only the B side ever hit this. The guard is inert
-        for every tile the policy actually selects.
-        """
-        thrfrg = sm120_utils.thrfrg_SFB(sfb_tensor.layout, thr_mma)
-        thr_tensor = cute.make_tensor(sfb_tensor.iterator, thrfrg)
-        thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
-        thr_vnk = (thr_vmnk[0], (thr_vmnk[2], thr_vmnk[3]))
-        partitioned = thr_tensor[thr_vnk, (None, None)]
-        partitioned = cute.group_modes(cute.flatten(partitioned), 0, 2)
-        if cutlass.const_expr(cute.rank(partitioned) > 3):
-            partitioned = cute.group_modes(partitioned, 1, 3)
-        return cute.make_fragment_like(partitioned)
 
     def _partition_fragment_SFA(
         self,
@@ -1679,7 +1434,6 @@ class DenseGemmKernel:
         alpha: cute.Tensor,
         directX_bf16: cute.Tensor,
         w_gscale: cute.Tensor,
-        mRowScale: cute.Tensor,
     ):
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
@@ -2247,7 +2001,7 @@ class DenseGemmKernel:
                         tCsSFB_tile_copy_view = thr_copy_ldmatrix_SFB.partition_S(
                             sSFB_tile
                         )
-                        tCrSFB_tile = self._partition_fragment_SFB_sub_tile(
+                        tCrSFB_tile = self._partition_fragment_SFB(
                             sSFB_tile[None, None, 0], thr_mma, tidx
                         )
                         tCrSFB_tile_copy_view = thr_copy_ldmatrix_SFB.retile(
@@ -2316,7 +2070,7 @@ class DenseGemmKernel:
                 # Whole-stage SF copy: scale bytes for all k blocks of the
                 # acquired stage load in one bulk copy (per-k_block SF reloads
                 # dominated the LDS/issue budget at prefill M).
-                self._copy_sf_fragment(
+                cute.copy(
                     smem_tiled_copy_SFA,
                     tCsSFA_p_filtered,
                     tCrSFA_copy_view_filtered,
@@ -2333,13 +2087,13 @@ class DenseGemmKernel:
                         ],
                     )
                 elif cutlass.const_expr(self.sfb_k_reuse):
-                    self._copy_sf_fragment(
+                    cute.copy(
                         smem_tiled_copy_SFB,
                         tCsSFB_p_filtered[None, None, 0],
                         tCrSFB_copy_view_filtered[None, None, 0],
                     )
                 else:
-                    self._copy_sf_fragment(
+                    cute.copy(
                         smem_tiled_copy_SFB,
                         tCsSFB_p_filtered,
                         tCrSFB_copy_view_filtered,
@@ -2514,7 +2268,7 @@ class DenseGemmKernel:
                             tCrSFB_copy_view_filtered = cute.filter_zeros(
                                 tCrSFB_tile_copy_view
                             )
-                            self._copy_sf_fragment(
+                            cute.copy(
                                 smem_tiled_copy_SFA,
                                 tCsSFA_p_filtered,
                                 tCrSFA_copy_view_filtered,
@@ -2531,13 +2285,13 @@ class DenseGemmKernel:
                                     ],
                                 )
                             elif cutlass.const_expr(self.sfb_k_reuse):
-                                self._copy_sf_fragment(
+                                cute.copy(
                                     smem_tiled_copy_SFB,
                                     tCsSFB_p_filtered[None, None, 0],
                                     tCrSFB_copy_view_filtered[None, None, 0],
                                 )
                             else:
-                                self._copy_sf_fragment(
+                                cute.copy(
                                     smem_tiled_copy_SFB,
                                     tCsSFB_p_filtered,
                                     tCrSFB_copy_view_filtered,
@@ -2795,8 +2549,8 @@ class DenseGemmKernel:
                                             # manufacturing NaN/Inf in a lane
                                             # whose accumulator is garbage.
                                             row_scale_value = cutlass.Float32(1.0)
-                                            if m_coord < Int32(mRowScale.shape[0]):
-                                                row_scale_value = mRowScale[
+                                            if m_coord < Int32(quantC_values.shape[0]):
+                                                row_scale_value = quantC_values[
                                                     m_coord
                                                 ].to(cutlass.Float32)
                                             tRS_rRowScale_slice[elem_idx] = (
@@ -4283,17 +4037,14 @@ class DenseGemmKernel:
         occupancy: int,
         b_packed: bool = False,
         epi_stage_cap: int = 0,
+        decode_stage3: bool = False,
     ) -> tuple:
         epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
             tile_shape_mnk[0] // epi_tile[0]
         )
         epi_stage = min(epi_stage_max, 4)
-        # A smaller epi_tile on its own frees nothing: epi_stage_max rises by
-        # exactly the factor the tile shrank, so epi_bytes is invariant until
-        # the x4 cap bites. Shrinking the epilogue footprint takes both.
-        cap = epi_stage_cap or _SPARKINFER_DENSE_EPI_STAGES
-        if cap:
-            epi_stage = max(1, min(epi_stage, cap))
+        if epi_stage_cap:
+            epi_stage = max(1, min(epi_stage, epi_stage_cap))
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_bytes = c_bytes_per_stage * epi_stage
 
@@ -4323,32 +4074,8 @@ class DenseGemmKernel:
             # In-place packed staging freed 12 KB/stage; deeper pipelines give
             # the producer the lookahead the packed consumer chain needs.
             ab_stage = max(1, min(raw_ab_stage, 5))
-        if _DENSE_DECODE_STAGE3 and occupancy >= 2 and tile_shape_mnk[0] <= 16:
-            # See _DENSE_DECODE_STAGE3: only the shapes that share an SM pay
-            # more for the fourth stage than it returns. Deliberately AFTER the
-            # b_packed bump, which would otherwise reinstate a deeper pipeline
-            # on exactly the packed decode shards this measured faster at 3.
+        if decode_stage3 and occupancy >= 2 and tile_shape_mnk[0] <= 16:
             ab_stage = max(1, min(raw_ab_stage, 3))
-        if _SPARKINFER_DENSE_AB_STAGES:
-            ab_stage = max(1, min(raw_ab_stage, _SPARKINFER_DENSE_AB_STAGES))
-        # Every stage-depth sweep so far has had to infer whether the request
-        # took effect from timings alone, which cannot distinguish "the deeper
-        # pipeline did not help" from "raw_ab_stage clamped and both arms
-        # compiled the same kernel".
-        logger.debug(
-            "dense stages: tile=%s occ=%d raw=%d -> ab_stage=%d "
-            "(ab %dB + sf %dB per stage, epi %s x%d = %dB, smem %dB)",
-            tile_shape_mnk,
-            occupancy,
-            raw_ab_stage,
-            ab_stage,
-            ab_bytes_per_stage,
-            sf_bytes_per_stage,
-            epi_tile,
-            epi_stage,
-            epi_bytes,
-            smem_capacity,
-        )
         return ab_stage, epi_stage
 
     @staticmethod
@@ -4358,27 +4085,7 @@ class DenseGemmKernel:
         probe,
         stages_through_smem: bool = True,
     ) -> tuple:
-        """Pick (epi_tile, epi_stage_cap) so the epilogue costs no mainloop stage.
-
-        The staged output tile competes with the mainloop for the same shared
-        memory, and the full-tile epilogue that every tile used to get is large
-        enough to decide the pipeline depth rather than merely fit beside it.
-        At (128,128) it reserved 32KB and left room for a single stage, which is
-        why that tile was recorded as 36% slower than (128,64) - the comparison
-        was against an unpipelined kernel.
-
-        Only two candidates, and the full tile wins ties, so a shape whose
-        epilogue was never the binding constraint keeps exactly the kernel it
-        has today. Measured on Behemoth TP=2 (RTX PRO 6000, M=8192, 2 passes,
-        bit-identical on every shard): (128,128) takes the fallback and runs
-        qkv -18.0%, o -18.9%, down -17.1%, gate_up -18.1% against the (128,64)
-        baseline, which itself keeps the full-tile epilogue.
-
-        The candidate must also be a whole number of MMA atom tiles. Decode's
-        (16,64) sits on a 16x16 atom, so its halved candidate is illegal and it
-        keeps the full tile for that reason as well as on the tie; (128,128)
-        sits on a 64x16 atom and (64,64) is exactly one atom tall.
-        """
+        """Choose an MX-FP6 epilogue tile without reducing mainloop depth."""
         full = (mma_tiler_mn[0], mma_tiler_mn[1])
         if not stages_through_smem:
             # The m=1 epilogue stores straight out of registers rather than
@@ -4400,15 +4107,6 @@ class DenseGemmKernel:
                 and epi_tile[1] % atom_n == 0
             )
 
-        if _SPARKINFER_DENSE_EPI_TILE is not None:
-            override = _dense_epi_tile(mma_tiler_mn)
-            if not _legal(override):
-                raise ValueError(
-                    f"SPARKINFER_DENSE_EPI_TILE resolved to {override[0]}x"
-                    f"{override[1]}, which is not a whole number of "
-                    f"{atom_m}x{atom_n} MMA atom tiles"
-                )
-            return override, 0
         full_ab, _ = probe(full, 0)
         half = (mma_tiler_mn[0] // 2, mma_tiler_mn[1] // 2)
         if not _legal(half):
@@ -4527,7 +4225,7 @@ class DenseGemmKernel:
             swizzle_size=(
                 16
                 if tile_shape_mnk == (128, 128, 64) and not large_m_unroll
-                else (_SPARKINFER_DENSE_TILE_SWIZZLE or 1)
+                else 1
             ),
         )
         if cutlass.const_expr(split_k_slices > 1):
@@ -4617,28 +4315,7 @@ class DenseGemmKernel:
         # consume only 16/32 columns.
         mma_check_mn = (mma_tiler_mn[1], mma_tiler_mn[0]) if swap_ab else mma_tiler_mn
         if ab_dtype == cutlass.Float8E4M3FN or is_mxfp6_ab_dtype(ab_dtype):
-            # (16,32) is supported but MEASURED SLOWER; no policy selects it and
-            # it is reachable only via SPARKINFER_FP6_DECODE_TILE=16x32. Do not
-            # retry it for decode bandwidth. It was built to double the CTA
-            # count on the N-narrow shards so two blocks land per SM, and that
-            # premise is simply wrong: decode runs the persistent tile
-            # scheduler, whose grid comes from resident-CTA capacity, not from
-            # the output-tile count. Halving N doubles the work tiles each CTA
-            # loops over and creates no CTAs.
-            #
-            # ncu on down (1x12288x14336), Jul 28 2026, RTX PRO 6000
-            # GPU-41235b51, /tmp/fp6_ncu_t1632 vs /tmp/fp6_ncu_t1664:
-            #   grid       192  -> 188   (not 384)
-            #   DRAM       71.3% -> 39.8%
-            #   duration   109.1 -> 195.7 us  (bench 96.2 -> 145.2)
-            #   smem/block 37.89 -> 38.91 KB  (UP: sm120_make_smem_layout_sfb
-            #              rounds any tile to a full 128-column SF block, so
-            #              narrowing N frees no smem and quadruples SFB reads)
-            # Numerics were byte-identical to (16,64) - cos 0.9992541075,
-            # max_abs 0.68877006 - as expected, since tile width changes column
-            # ownership and not accumulation order.
             if mma_check_mn not in (
-                (16, 32),
                 (16, 64),
                 (16, 128),
                 (32, 64),
@@ -4724,7 +4401,6 @@ class _DenseGemmLaunch:
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
         plain_fp8: bool = False,
-        sf_copy_mode: str = "autovec",
     ):
         self._n = n
         self._k = k
@@ -4759,12 +4435,6 @@ class _DenseGemmLaunch:
         self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
         self._plain_fp8 = bool(plain_fp8)
-        # Changes the emitted shared-load width, so it specializes the kernel
-        # and must be in compile_key(). The equivalent omission for
-        # target_occupancy was missed three times and for the fused-quant flag
-        # once, the latter handing a fused kernel to an unfused caller and
-        # faulting; a knob that changes codegen does not get to be a global.
-        self._sf_copy_mode = str(sf_copy_mode)
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -4851,20 +4521,6 @@ class _DenseGemmLaunch:
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
             self._plain_fp8,
-            self._sf_copy_mode,
-            # Only the overrides. _choose_epilogue is a deterministic function
-            # of the tile, dtypes, occupancy and smem capacity, all of which are
-            # already keyed above, so the resolved epilogue needs no entry - but
-            # the env knobs bypass it and would otherwise let a run with the
-            # override set load a kernel cached without it.
-            _SPARKINFER_DENSE_EPI_TILE,
-            _SPARKINFER_DENSE_EPI_STAGES,
-            # Same argument for the mainloop depth: _compute_stages reads these
-            # two module globals directly, so a run with a stage override (or a
-            # test monkeypatching them) would otherwise reuse a kernel compiled
-            # at a different pipeline depth.
-            _DENSE_DECODE_STAGE3,
-            _SPARKINFER_DENSE_AB_STAGES,
         )
 
     @cute.jit
@@ -4975,7 +4631,6 @@ class _DenseGemmLaunch:
             direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
             plain_fp8=self._plain_fp8,
-            sf_copy_mode=self._sf_copy_mode,
         )(
             a_tensor,
             a_tensor,
@@ -5103,12 +4758,14 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             layout=cute.make_ordered_layout((Int32(1),), order=(0,)),
         )
         if cutlass.const_expr(self._row_scale):
+            # Row scaling and quantized-C are mutually exclusive, so the
+            # existing quant_c_values operand carries the FP6 epilogue scale.
             row_scale_tensor = cute.make_tensor(
                 row_scale_ptr,
                 layout=cute.make_ordered_layout((m,), order=(0,)),
             )
         else:
-            row_scale_tensor = None
+            row_scale_tensor = alpha_tensor
         policy = self._policy
         DenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
@@ -5136,7 +4793,6 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             mxfp6_fmt_b=self._mxfp6_fmt_b,
             b_packed=self._b_packed,
             target_occupancy=self._target_occupancy,
-            sf_copy_mode=self._sf_copy_mode,
             row_scale=self._row_scale,
             fused_quant_bf16=self._fused_quant_env,
         )(
@@ -5148,7 +4804,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             sfa_tensor,
             sfb_tensor,
             c_tensor,
-            alpha_tensor,
+            row_scale_tensor,
             alpha_tensor,
             alpha_tensor,
             alpha_tensor,
@@ -5156,7 +4812,6 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
             current_stream,
             x_bf16=x_bf16_tensor,
             w_gscale=w_gscale_tensor,
-            row_scale=row_scale_tensor,
         )
 
 
@@ -5189,7 +4844,6 @@ def _get_compiled_dense_gemm_mxfp6(
     alpha_is_one: bool,
     row_scale: bool,
     fused_quant: bool,
-    sf_copy_mode: str,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -5309,10 +4963,7 @@ def _get_compiled_dense_gemm_mxfp6(
         b_preexpanded=b_preexpanded,
         row_scale=row_scale,
         fused_quant=fused_quant,
-        # MX-FP6 does not go through _get_compiled_dense_gemm, so the shared
-        # rule has to be called explicitly here; hardcoding a default is what
-        # silently kept this family at one CTA per SM. _target_occupancy is part
-        # of compile_key, so two settings never share a cached kernel.
+        # MX-FP6 uses the same occupancy policy as the other dense kernels.
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -5328,7 +4979,6 @@ def _get_compiled_dense_gemm_mxfp6(
             b_tile_major=False,
             is_mxfp6=True,
         ),
-        sf_copy_mode=sf_copy_mode,
     )
     compile_key = launch.compile_key()
     raise_if_kernel_resolution_frozen(
@@ -5489,7 +5139,6 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
             atom_shape_24=self._atom_shape_24,
             b_tile_major=self._b_tile_major,
             target_occupancy=self._target_occupancy,
-            sf_copy_mode=self._sf_copy_mode,
         )(
             a_tensor,
             a_source,
@@ -5768,7 +5417,6 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
             fused_quant_a_wide=self._fused_quant_a_wide,
             atom_shape_24=self._atom_shape_24,
             target_occupancy=self._target_occupancy,
-            sf_copy_mode=self._sf_copy_mode,
         )(
             a_tensor,
             a_source,
@@ -6145,11 +5793,6 @@ def _dense_gemm_target_occupancy(
 ) -> int:
     tile_m, tile_n = mma_tiler_mn
     n_tiles = ((n + tile_n - 1) // tile_n) * l
-    if _SPARKINFER_DENSE_TARGET_OCCUPANCY:
-        # Clamped by the smem budget downstream: _compute_stages divides the
-        # capacity by occupancy, so an unsatisfiable value degrades to a
-        # 1-stage pipeline rather than failing to launch.
-        return _SPARKINFER_DENSE_TARGET_OCCUPANCY
     if (
         # NOT is_mxfp6_ab_dtype(ab_dtype): the MX-FP6 path rewrites ab_dtype to
         # Float8E4M3FN byte-containers before compiling, so the operand dtype
@@ -6164,26 +5807,8 @@ def _dense_gemm_target_occupancy(
         and not b_tile_major
         and n_tiles > sm_count
     ):
-        # ncu, Behemoth-123B TP=2 decode, RTX PRO 6000 GPU-41235b51 (Jul 26
-        # 2026, fp6_t1664_occ{1,2}): a second resident CTA is the only lever
-        # that moved DRAM utilization. Deepening the pipeline instead - 5 -> 8
-        # ab_stages at occupancy 1, 60.4 -> 93.2 KB smem, same 8 loads in
-        # flight - changed nothing (gate_up 235.8 -> 237.8 us, 69.5 -> 68.9%
-        # DRAM), so the limiter is intra-CTA dependency serialization, not TMA
-        # queue depth: at 96 threads and 1 CTA/SM only 3 warps cover 4
-        # schedulers. Two CTAs give two independent consumer chains
-        # (gate_up -5.5%, down -7.1%, o -0.4%).
-        #
-        # n_tiles > sm_count is the whole condition because it is also what
-        # makes the tail-wave cliff disappear: at 192 tiles the persistent grid
-        # clamps to 188 at occupancy 1 and 4 CTAs run a second wave alone
-        # (down 121.9 -> 186.1 us). Below the SM count a second CTA can never
-        # be co-resident, so it only costs stage depth (qkv, 112 tiles: 67.0 ->
-        # 68.8 us) - hence the strict comparison rather than >=.
-        #
-        # Numerics-neutral: occupancy changes how many output tiles are
-        # resident and, via _compute_stages, how deep each pipeline is, never
-        # the per-output-element accumulation order.
+        # Two resident CTAs avoid a partial tail wave when the decode grid is
+        # larger than the SM count. Occupancy does not change MMA ordering.
         return 2
     return (
         2
@@ -6231,11 +5856,6 @@ def _get_compiled_dense_gemm(
     direct_sfa_live16: bool = False,
     direct_m1_wo_a_inputs: bool = False,
     plain_fp8: bool = False,
-    # Explicit rather than read off the module global inside the launch: this
-    # function is memoized, so a global read would hand a caller the kernel
-    # compiled under whatever mode ran first (the same aliasing the MX-FP6
-    # path already avoids by passing it in).
-    sf_copy_mode: str = "autovec",
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
@@ -6346,7 +5966,6 @@ def _get_compiled_dense_gemm(
         direct_sfa_live16=direct_sfa_live16,
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
         plain_fp8=plain_fp8,
-        sf_copy_mode=sf_copy_mode,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -6501,7 +6120,6 @@ def _dense_gemm_launch_flat(
         sfb_k_reuse=sfb_k_reuse,
         b_tile_major=b_tile_major,
         alpha_is_one=alpha_is_one,
-        sf_copy_mode=_DENSE_SF_COPY_MODE,
         direct_sfa_live16=_use_direct_sfa_live16(
             m=int(a_tensor_gpu.shape[0]),
             n=n,
@@ -6891,47 +6509,15 @@ def _select_default_mma_tiler_mn(
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
     if is_mxfp6:
-        # Small-M decode specialization for MX-FP6. m<=16 covers BS1 decode
-        # (m=1) AND the MTP spec-decode verify forward (m = 1 +
-        # num_speculative_tokens, typically 5-8), which streams the full
-        # weight set every step; all fit in one 16-row M-tile. Widening past
-        # the historical m<=4 cap is safe ONLY because the vLLM plugin
-        # warm-runs every dense shape at m in {1,2,4,5,8,16} at load time
-        # (_warm_dense_decode_shapes), so no first-use JIT can hit
-        # mid-serving on live prefill-tail token counts. A declared
-        # expected_m regime hint owns the decision when present.
+        # Decode and speculative verification fit in one 16-row M tile. A
+        # declared expected-M regime hint owns the decision when present.
         plan_m = expected_m if expected_m is not None else m
         if n > 1536 and plan_m <= 16:
-            if _SPARKINFER_FP6_DECODE_TILE is not None:
-                return _SPARKINFER_FP6_DECODE_TILE
-            # Decode-tile sweep (Jul 25 2026, packed-B stream — the
-            # production decode path — Behemoth TP=2 shards, RTX PRO 6000,
-            # /tmp/fp6_decode_tile_{packed,expanded}.json): width-64 tiles
-            # double the N-parallelism and win at M=1 (16x64: qkv N=7168
-            # -23%, gate_up N=28672 -7%) EXCEPT when ceil(N/64) lands just
-            # past a whole number of waves — o/down at N=12288 give 192 CTAs
-            # on 188 SMs, a 4-CTA tail wave running alone, 1.4-1.6x slower.
-            # All swept tiles were bit-identical (`bit` gate). The expanded-B
-            # arm was slower-or-equal on every shard at M=1, so packed remains
-            # the decode stream.
-            #
-            # The (32,128) cliff exemption was retired Jul 26 2026: the tail
-            # wave is an occupancy-1 artifact. _dense_gemm_target_occupancy now
-            # returns 2 for exactly these shapes, which lets the persistent
-            # grid reach 192 CTAs so there is no lone tail wave, and the
-            # width-64 tile then beats the exemption outright (down 121.9 ->
-            # 113.2 us, o 52.7 -> 52.5 us; same ncu run as the occupancy rule).
-            return (16, 64)
+            return _FP6_DECODE_TILE
         if n > 1536:
-            # Wide-N prefill regime (m > 16). M-INDEPENDENT by construction, so
-            # one kernel per (N,K) under frozen resolution is preserved. All
-            # candidate tiles are bit-identical (sweep `bit` gate). Override for
-            # A/B via SPARKINFER_FP6_LARGE_M_TILE=MxN.
-            #
-            # The Jul 26 2026 sweep that put (128,64) here is retired, not
-            # merely outvoted: it read the epilogue's shared-memory reservation
-            # as a property of the wide tile. See _SPARKINFER_FP6_LARGE_M_TILE.
-            return _SPARKINFER_FP6_LARGE_M_TILE
+            # The wide-N prefill choice is independent of live M, preserving
+            # one kernel per expected-M regime and (N, K) shape.
+            return _FP6_PREFILL_TILE
         return coarse_tile
     # The serving WO-B prefill GEMM is [M,4096] x [4096,4096]. DeepGEMM's
     # specialized O-projection dispatch switches it from BM64/BK128 to
@@ -7456,6 +7042,37 @@ def dense_gemm(
             "a_preexpanded/b_preexpanded/a_fmt/b_fmt/x_bf16/w_gscale are only "
             f"supported with an MX-FP6 ab_dtype, got ab_dtype={ab_dtype!r}"
         )
+    if (x_bf16 is None) != (w_gscale is None):
+        raise ValueError("x_bf16 and w_gscale must be provided together")
+    if x_bf16 is not None and w_gscale is not None:
+        if not is_mxfp6:
+            raise ValueError("fused quantization inputs require an MX-FP6 ab_dtype")
+        if (
+            x_bf16.shape != (m, k)
+            or x_bf16.dtype != torch.bfloat16
+            or not x_bf16.is_contiguous()
+            or x_bf16.device != a_torch.device
+            or x_bf16.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                "x_bf16 must be a contiguous, 16-byte-aligned BF16 tensor "
+                f"with shape {(m, k)} on {a_torch.device}; got shape "
+                f"{tuple(x_bf16.shape)}, dtype {x_bf16.dtype}, device "
+                f"{x_bf16.device}, data_ptr alignment {x_bf16.data_ptr() % 16}"
+            )
+        if (
+            w_gscale.shape != (1,)
+            or w_gscale.dtype != torch.float32
+            or not w_gscale.is_contiguous()
+            or w_gscale.device != a_torch.device
+            or w_gscale.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                "w_gscale must be a contiguous, 16-byte-aligned float32 tensor "
+                f"with shape (1,) on {a_torch.device}; got shape "
+                f"{tuple(w_gscale.shape)}, dtype {w_gscale.dtype}, device "
+                f"{w_gscale.device}, data_ptr alignment {w_gscale.data_ptr() % 16}"
+            )
 
     ab_cutlass_dtype = get_cutlass_dtype(ab_dtype)
     if mxfp6_fmt_a is not None:
@@ -7566,23 +7183,15 @@ def dense_gemm(
         )
         split_k_slices = 1
     if is_mxfp6 and (policy.split_k_slices != 1 or policy.large_m_unroll):
-        # The policy helper sees the FP8 byte-container dtype and picks the
-        # MXFP8 tactics. Split-K stays pinned OFF for MX-FP6: it changes the
-        # accumulation order (serving-only candidate, tracked separately).
-        # large_m_unroll IS taken (subject to the A/B kill switch): it is a
-        # numerics-neutral codegen pragma — k-tile unroll 4 vs 2, identical
-        # MMA order — and closes part of the measured FP6-vs-DeepGEMM prefill
-        # efficiency gap. Verified bit-identical by
-        # tests/gemm/test_fp6_large_m_unroll.py.
+        # The policy helper sees the FP8 byte-container dtype and may pick
+        # MXFP8 tactics that are not wired for MX-FP6.
         policy = _DenseGemmPolicy(
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
             direct_one_m_tile_scheduler=policy.direct_one_m_tile_scheduler,
             use_m1_non_tma=policy.use_m1_non_tma,
             split_k_slices=1,
             split_k_atomic_bf16=False,
-            large_m_unroll=(
-                policy.large_m_unroll and _SPARKINFER_FP6_LARGE_M_UNROLL
-            ),
+            large_m_unroll=False,
         )
         split_k_slices = 1
     split_k_output = split_k_slices > 1
@@ -7611,6 +7220,7 @@ def dense_gemm(
             # The epilogue reads it through a raw device pointer, so a
             # host or wrong-device tensor is an illegal access, not an error.
             or row_scale.device != a_torch.device
+            or row_scale.data_ptr() % 16 != 0
         ):
             raise ValueError(
                 "row_scale must be a contiguous 1-D tensor of shape (M,) in the "
@@ -7652,17 +7262,9 @@ def dense_gemm(
             b_preexpanded=b_preexpanded,
             alpha_is_one=alpha_is_one,
             row_scale=row_scale is not None,
-            # Part of the key, not read from the module global inside the
-            # kernel: it changes codegen (the fused prologue dereferences
-            # x_bf16), so two callers differing only in this flag must not
-            # share a compiled kernel. Tests monkeypatch the global, which is
-            # exactly the case a global read would alias.
-            #
-            # Conjoined with the tensor being present so that "fused kernel,
-            # no activation tensor" is unreachable rather than merely
-            # unlikely. That state read the placeholder pointer at 0x10.
+            # Fused quantization changes code generation and is part of the
+            # compiled-kernel key.
             fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None,
-            sf_copy_mode=_DENSE_SF_COPY_MODE,
         )
         if out is None:
             out = _empty_dense_gemm_output(
@@ -7748,7 +7350,6 @@ def dense_gemm(
             b_tile_major=rhs_values_tiled is not None,
             quantize_c=True,
             alpha_is_one=alpha_is_one,
-            sf_copy_mode=_DENSE_SF_COPY_MODE,
             direct_sfa_live16=_use_direct_sfa_live16(
                 m=m,
                 n=n,
@@ -7884,7 +7485,6 @@ def dense_gemm(
             b_tile_major=False,
             alpha_is_one=alpha_is_one,
             plain_fp8=True,
-            sf_copy_mode=_DENSE_SF_COPY_MODE,
         )
         compiled_plain_fp8(
             a_tensor_gpu=a_torch,

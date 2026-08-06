@@ -147,27 +147,15 @@ doesn't that eat the FP6 win?" It does not, for four reasons:
    the post-rebase performance regression: the same recipe as ~12 eager
    torch launches per linear cost ~1.7 ms/token at 27B decode scale
    (TPOT 11.47 → 9.79 ms/token once fused). Zero host-side launches
-   remain on the hot path. The large-M (prefill) regime fuses the same
-   recipe as two kernels — `RowGsKernel` (one bandwidth-bound pass for
-   per-row gs / inv-gs / alpha) feeding the TMA quantizer's `per_row`
-   mode, which applies the BF16 pre-scale in-registers — because the
-   small-M kernel's redundant per-CTA amax scan is unaffordable at
-   thousands of rows. The eager host chain it replaces cost ~2.2 s per
-   8192-token prefill chunk at 123B TP=2 scale (Phase A profiling,
-   Behemoth-R1-123B-v2).
+   remain on the hot path. Large-M activations use a row-scale pass followed
+   by the per-row TMA quantizer; both paths implement the same scaling
+   contract.
 3. **Quantized operands *reduce* memory traffic.** The A operand leaves
    the quantizer at 1 byte/value instead of 2 (BF16); the B operand
    streams from HBM in its 3:4-packed 6-bit form and expands to
    byte-containers in shared memory (`b_packed=True`), saving 25% of
    B-side HBM traffic versus even the byte-container layout. Decode-side
-   GEMMs are bandwidth-bound; the quant pays for itself. The packed
-   stream is a *decode-regime* win only: at prefill M it loses 1.27-1.28x
-   to the expanded-B kernel (compute-bound regime; Phase A, Behemoth
-   TP=2), so at M > 16 the linear expands the packed weight per call into
-   one shared grow-only scratch buffer (`ExpandPackedKernel`, one
-   coalesced pass, ~0.2 ms on the largest shard) and runs expanded-B —
-   prefill speed without per-layer expanded copies eroding the VRAM win.
-   Kill switch: `SPARKINFER_PACKED_B_EXPAND_LARGE_M=0`.
+   GEMMs are bandwidth-bound; the quant pays for itself.
 4. **We never leave the 6/8-bit path.** There is no dequantize-to-BF16
    step anywhere between the quantizer and the accumulator: FP6 codes
    travel as `uint8` byte-containers through the FP8-shaped TMA/ldmatrix

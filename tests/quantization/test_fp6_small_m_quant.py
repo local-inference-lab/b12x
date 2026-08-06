@@ -122,7 +122,7 @@ def test_small_m_compile_guards():
 def test_small_m_per_row_matches_host_chain(m, fmt):
     """The fused per-row kernel must reproduce the host pre-scale chain bit-for-bit.
 
-    Host reference (the serving decode recipe before fusion): per-row bf16
+    The host reference applies per-row BF16
     amax -> f32 clamp/div -> bf16 pre-scale -> quantize with the kernel's
     re-derived (unit) gs. The per_row=True kernel does all of it in one
     launch; codes, scale bytes, alpha AND the per-row output correction must
@@ -215,16 +215,12 @@ def test_row_scale_epilogue_bit_exact(m, monkeypatch):
 
 @cuda_required
 def test_fused_quant_preserves_per_row_scaling(monkeypatch):
-    """The fused prologue must never disable per-row activation scaling.
+    """The fused prologue preserves row-independent activation scaling.
 
-    The fused m=1 prologue derives ONE per-tensor global scale in the kernel,
-    so it is only equivalent to the per-row recipe when there is a single row.
-    Gating it at ``m <= _SMALL_M_QUANT_MAX`` instead of ``m == 1`` silently
-    downgraded 2 <= m <= 16 to per-tensor, which restores the
-    batch-composition dependence per-row scaling exists to remove: the same
-    row then produces different logits depending on which other rows share
-    its launch. Rows are independent, so y(x[:m])[i] must equal y(x)[i]
-    bit-for-bit no matter how the flag is set.
+    The fused prologue derives one per-tensor global scale, so it is equivalent
+    to the per-row recipe only for a single activation row. For 2 <= m <= 16,
+    the same row must produce identical logits regardless of which other rows
+    share its launch: y(x[:m])[i] must equal y(x)[i] bit-for-bit.
 
     m=1 is deliberately excluded. There the prologue legitimately DOES engage,
     and its exactness against the m=128 rows rests on the bf16 pre-scale

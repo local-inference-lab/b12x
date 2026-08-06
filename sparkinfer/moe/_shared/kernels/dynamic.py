@@ -39,7 +39,6 @@ route histogram and task queue while consuming the same prepared weights.
 
 from __future__ import annotations
 
-import logging
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -132,8 +131,6 @@ from sparkinfer.moe._shared.kernels.w4a8_phase2 import (
     W4A8MaterializedPhase2Kernel,
 )
 
-
-logger = logging.getLogger(__name__)
 
 _SF_VEC_SIZE = 16
 _TASK_SLICE_CHUNK = 1
@@ -1141,7 +1138,6 @@ class MoEDynamicKernelBackend:
             self.smem_capacity,
             self.occupancy,
         )
-        dense_ab_stage = self.ab_stage
         # dense._compute_stages assumes a single B/SFB buffer, but the gated
         # path keeps two (sB+sB_up, sSFB+sSFB_up) plus a third mbar pipeline.
         # For sub-128 MMA tiles its smaller A inflates the suggested stage
@@ -1237,28 +1233,6 @@ class MoEDynamicKernelBackend:
                     "the small gated or split materialized kernel"
                 )
         self.epi_stage = 1
-        # Logged here, after the w4a8 cap and the epi_stage pin, because both
-        # rewrite what _compute_stages returned. A tile comparison that records
-        # a pre-override depth is not a tile comparison — three dense
-        # conclusions were wrong because a full-tile epilogue silently sized
-        # the pipeline and an unpipelined wide tile was measured against a
-        # pipelined narrow one.
-        logger.debug(
-            "dynamic stages: tile=%s gated=%s ab_stage=%d (dense suggested %d, "
-            "max_fit %d) epi_tile=%s epi_stage=%d per_stage=%d fixed=%d "
-            "(sC %d) capacity=%d",
-            self.tile_shape_mnk,
-            self.is_gated,
-            self.ab_stage,
-            dense_ab_stage,
-            max_fit,
-            self.epi_tile,
-            self.epi_stage,
-            per_stage,
-            fixed,
-            self.tile_shape_mnk[0] * self.tile_shape_mnk[1] * 2,
-            self.smem_capacity,
-        )
         (
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,

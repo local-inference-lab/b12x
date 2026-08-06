@@ -1,12 +1,4 @@
-"""Tests for the fused LARGE-M per-row global-scale FP6 quantization path.
-
-The prefill path fuses the per-row activation global-scale recipe into two
-GPU kernels (:mod:`sparkinfer.quantization.mxfp6.fp6_row_gs` + the TMA
-quantizer's ``per_row`` mode), replacing the eager host chain in
-``fp6_dense_weights``. Codes, swizzled SFA scale bytes, ``alpha`` and the
-per-row output correction must be BIT-IDENTICAL to the host chain — same
-contract the small-M fused path already satisfies (test_fp6_small_m_quant).
-"""
+"""Exactness tests for large-M per-row FP6 activation quantization."""
 from __future__ import annotations
 
 import pytest
@@ -20,7 +12,7 @@ _TILE = 128
 
 
 def _host_row_gs(x: torch.Tensor, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """The eager per-row recipe from ``dense_fp6_linear_expanded`` (A/B path)."""
+    """Reference per-row recipe from ``dense_fp6_linear_expanded``."""
     from sparkinfer._lib.fp6 import mx_gs_numerator
 
     amax = x.abs().amax(dim=1, keepdim=True).float()
@@ -42,9 +34,8 @@ def test_row_gs_kernel_matches_host_recipe(k, fmt):
     m = 256
     device = torch.device("cuda")
     x = (torch.randn(m, k, device=device) * 0.1).to(torch.bfloat16)
-    # Pin row amaxes at awkward spots, including a last-element amax
-    # (regression for a partial row scan) and an all-zero row (clamp path,
-    # same as quantizer padding rows).
+    # Pin row amaxes at boundary positions, including the final element, and
+    # include an all-zero row for the same clamp path as padded rows.
     x[0, k - 1] = 4.0
     x[7] = 0.0
     x[m - 1, 0] = -2.625  # borderline divisor exercising div.rn vs torch div
@@ -84,7 +75,7 @@ def test_per_row_quantizer_matches_host_chain(m, fmt):
     x[3] = 0.0  # zero row: clamp path, mirrors quantizer padding rows
     w_gs = torch.tensor([0.75], dtype=torch.float32, device=device)
 
-    # Host chain (the SPARKINFER_DENSE_PER_ROW_IN_KERNEL=0 A/B path).
+    # Independent host formulation.
     gs_ref, inv_gs_ref = _host_row_gs(x, fmt)
     x_pre = (x.float() * gs_ref).to(torch.bfloat16)
     unit = torch.ones(1, dtype=torch.float32, device=device)
@@ -135,3 +126,41 @@ def test_per_row_compile_guards():
         compile_bf16_to_fp6_tma(128, 512, fmt="e3m2", emit="packed", per_row=True)
     with pytest.raises(AssertionError, match="multiple of 128"):
         compile_fp6_row_gs(128, 96)
+
+
+@cuda_required
+def test_row_gs_launch_rejects_misaligned_input():
+    from sparkinfer.quantization.mxfp6.fp6_row_gs import compile_fp6_row_gs
+
+    m, k = 128, 512
+    storage = torch.empty(m * k + 1, dtype=torch.bfloat16, device="cuda")
+    x = storage[1:].view(m, k)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    w_gs = torch.ones(1, dtype=torch.float32, device="cuda")
+    gs = torch.empty(m, dtype=torch.float32, device="cuda")
+    inv_gs = torch.empty(m, dtype=torch.bfloat16, device="cuda")
+    alpha = torch.empty(1, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="bf16_input"):
+        compile_fp6_row_gs(m, k)(x, w_gs, gs, inv_gs, alpha)
+
+
+@cuda_required
+def test_per_row_tma_launch_validates_scale_shape():
+    from sparkinfer.quantization.mxfp6 import (
+        allocate_bf16_to_fp6_tma_outputs,
+        compile_bf16_to_fp6_tma,
+    )
+
+    m, k = 128, 512
+    x = torch.zeros((m, k), dtype=torch.bfloat16, device="cuda")
+    wrong_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    out = allocate_bf16_to_fp6_tma_outputs(m, k, emit="bytes")
+
+    with pytest.raises(ValueError, match="global_scale"):
+        compile_bf16_to_fp6_tma(m, k, fmt="e4m3", emit="bytes", per_row=True)(
+            x,
+            wrong_scale,
+            out.packed_a_flat,
+            out.scale_flat,
+        )

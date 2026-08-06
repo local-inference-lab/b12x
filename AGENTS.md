@@ -24,28 +24,6 @@
   values. Do not reuse stale arch strings or benchmark leaders without current
   evidence.
 
-## Serving-profile capture requires PROFILE=1 at server launch
-
-The torch profiler endpoints do not exist unless the server was started for
-them. Any instruction to capture a serving profile MUST include the launch
-environment, not just the capture command:
-
-```bash
-PROFILE=1 PROFILE_DIR=/tmp/vllm_prof_<tag> \
-CUDA_VISIBLE_DEVICES=0,1 TP_SIZE=2 ./behemoth123b-r1-v2-fp6.sh "$API_KEY"
-```
-
-`PROFILE=1` is what makes the launch script export
-`VLLM_TORCH_PROFILER_DIR` and pass `--profiler-config`, which is what
-registers `POST /start_profile` and `/stop_profile`. Without it the capture
-script fails at `/start_profile` with a 404. `PROFILE_DIR` is also the only
-place the traces land — the capture tool's `--out-dir` holds request/stream
-logs, not traces — so the summarize step must be pointed at `PROFILE_DIR`.
-
-Use a distinct `PROFILE_DIR` per experiment. The directory accumulates
-traces across runs, and stale traces from a previous configuration will be
-silently folded into the next summary.
-
 ## 64-bit addressing for pool-scaled offsets
 
 Any arithmetic that scales a page/block/row id into a byte or element offset

@@ -1,4 +1,4 @@
-"""Per-row activation global-scale kernel for the LARGE-M FP6 quant path.
+"""Per-row activation global-scale kernel for large-M FP6 quantization.
 
 The serving per-row global-scale recipe (see ``fp6_dense_weights``) needs, for
 every activation row, ``gs_r = numerator(fmt) / max(amax_r, 1e-6)`` plus the
@@ -10,10 +10,7 @@ rows) a redundant scan is unaffordable, so this kernel computes the row scales
 in ONE bandwidth-bound pass (one CTA per row) and hands them to the TMA
 quantizer's ``per_row`` mode, which applies the bf16 pre-scale in-registers.
 
-Together they replace the eager host chain (``x.float()`` upcast, row amax,
-f32 multiply, bf16 cast — measured ~2.2 s per 8192-token prefill chunk on
-Behemoth-123B TP=2 once inductor fused it into ~7 ms/call triton reductions)
-while keeping every written bit identical:
+The two-kernel formulation matches the host arithmetic bit-for-bit:
 
 * the f32 max over exact ``|bf16|`` values is order-independent and therefore
   bit-identical to ``x.abs().amax(dim=1).float()``;
@@ -31,6 +28,7 @@ from typing import Dict, Tuple
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
+import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from sparkinfer._lib.compiler import KernelCompileSpec, compile as sparkinfer_compile
@@ -212,7 +210,37 @@ def compile_fp6_row_gs(m: int, k: int, fmt: str = "e4m3"):
         ),
     )
 
-    def launch(bf16_input, w_gscale, gs_out, inv_gs_out, alpha_out):
+    def launch(
+        bf16_input: torch.Tensor,
+        w_gscale: torch.Tensor,
+        gs_out: torch.Tensor,
+        inv_gs_out: torch.Tensor,
+        alpha_out: torch.Tensor,
+    ) -> None:
+        expected = (
+            ("bf16_input", bf16_input, (m, k), torch.bfloat16, 16),
+            ("w_gscale", w_gscale, (1,), torch.float32, 4),
+            ("gs_out", gs_out, (m,), torch.float32, 4),
+            ("inv_gs_out", inv_gs_out, (m,), torch.bfloat16, 2),
+            ("alpha_out", alpha_out, (1,), torch.float32, 4),
+        )
+        for name, tensor, shape, dtype, alignment in expected:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device.type != "cuda"
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % alignment != 0
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous CUDA {dtype} tensor with "
+                    f"shape {shape} and {alignment}-byte alignment; got shape "
+                    f"{tuple(tensor.shape)}, dtype {tensor.dtype}, device "
+                    f"{tensor.device}, contiguous {tensor.is_contiguous()}, "
+                    f"data_ptr % {alignment} = {tensor.data_ptr() % alignment}"
+                )
+        if any(tensor.device != bf16_input.device for _, tensor, *_ in expected[1:]):
+            raise ValueError("all row-scale kernel tensors must be on one device")
         raw(
             bf16_input,
             w_gscale,

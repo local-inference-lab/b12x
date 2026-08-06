@@ -154,8 +154,6 @@ def compile_bf16_to_fp6_tma(
         sfa_fake,
         mac,
         current_cuda_stream(),
-        # v2: per_row mode added (cache key gained the per_row field and the
-        # kernel source changed; per-tensor codegen is unchanged).
         compile_spec=KernelCompileSpec.from_key(
             "quantization.bf16_to_fp6_tma",
             2,
@@ -164,6 +162,48 @@ def compile_bf16_to_fp6_tma(
     )
 
     def launch(bf16_input, global_scale, packed_a_flat, scale_flat):
+        expected_scale_shape = (M,) if per_row else (1,)
+        expected = (
+            ("bf16_input", bf16_input, (M, K), torch.bfloat16, 16),
+            (
+                "global_scale",
+                global_scale,
+                expected_scale_shape,
+                torch.float32,
+                4,
+            ),
+            (
+                "packed_a_flat",
+                packed_a_flat,
+                (M * packed_k_bytes,),
+                torch.uint8,
+                16,
+            ),
+            (
+                "scale_flat",
+                scale_flat,
+                (M * K // _SF_VEC_SIZE_FP6,),
+                torch.uint8,
+                16,
+            ),
+        )
+        for name, tensor, shape, dtype, alignment in expected:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device.type != "cuda"
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % alignment != 0
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous CUDA {dtype} tensor with "
+                    f"shape {shape} and {alignment}-byte alignment; got shape "
+                    f"{tuple(tensor.shape)}, dtype {tensor.dtype}, device "
+                    f"{tensor.device}, contiguous {tensor.is_contiguous()}, "
+                    f"data_ptr % {alignment} = {tensor.data_ptr() % alignment}"
+                )
+        if any(tensor.device != bf16_input.device for _, tensor, *_ in expected[1:]):
+            raise ValueError("all BF16-to-FP6 tensors must be on one device")
         pa_storage = packed_a_flat.view(1, M, packed_k_bytes).permute(1, 2, 0)
         sfa_p = make_ptr(
             sf, scale_flat.data_ptr(), AddressSpace.gmem, assumed_align=16
