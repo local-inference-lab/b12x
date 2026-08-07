@@ -254,6 +254,22 @@ def route_pack_token_capacity(tokens: int, topk: int) -> int:
     return 1 << (max(int(tokens), 1) - 1).bit_length()
 
 
+def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
+    """Return one live row count for every route-capacity specialization."""
+    capacity = int(capacity)
+    if capacity < 1:
+        raise ValueError(
+            f"mixed Trellis warmup capacity must be positive, got {capacity}"
+        )
+    counts: list[int] = []
+    count = 1
+    while count < capacity:
+        counts.append(count)
+        count *= 2
+    counts.append(capacity)
+    return tuple(counts)
+
+
 def route_pack_capacity(
     numel: int,
     block_size: int,
@@ -469,6 +485,7 @@ __all__ = [
     "route_pack_numel_capacity",
     "route_pack_capacity",
     "route_pack_token_capacity",
+    "route_pack_warmup_token_counts",
     "select_route_block_size_m",
     "unswizzle_block_scale",
     "unswizzle_expert_scales",
