@@ -27,7 +27,11 @@ from b12x._lib.intrinsics import shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
-from .host import max_packed_route_slots, packed_gemm_scratch_elements
+from .host import (
+    max_packed_route_slots,
+    packed_gemm_scratch_elements,
+    route_pack_warmup_token_counts,
+)
 from .kernel import (
     W4A16FusedMoeKernel,
     _cutlass_element_dtype,
@@ -774,6 +778,67 @@ class W4A16MixedTrellisKernel:
 
 
 _CACHE: dict[tuple[object, ...], MixedTrellisCompileResult] = {}
+_ROUTE_PACK_WARMED: set[tuple[object, ...]] = set()
+
+
+def warmup_mixed_trellis_route_pack(
+    launch: MixedTrellisCompileResult,
+    buffers: MixedTrellisBuffers,
+    *,
+    expert_map: torch.Tensor,
+) -> int:
+    """Materialize every route-pack specialization reachable by ``launch``.
+
+    Route packing buckets token capacity to powers of two. A profile pass at
+    the maximum batch therefore does not cover smaller decode, speculative,
+    or final-prefill-chunk buckets. Load those CUDA modules eagerly while the
+    serving framework is still profiling persistent memory, so KV sizing sees
+    their real driver footprint instead of discovering it under live traffic.
+    """
+    device = buffers.packed_route_indices.device
+    if device.type != "cuda":
+        raise RuntimeError("mixed Trellis route-pack warmup requires CUDA buffers")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("mixed Trellis route-pack warmup cannot run during capture")
+
+    total_experts = int(launch.tier0_num_experts) + int(launch.tier1_num_experts)
+    warmed = 0
+    pending_keys: list[tuple[object, ...]] = []
+    with torch.cuda.device(device):
+        device_index = int(torch.cuda.current_device())
+        for token_count in route_pack_warmup_token_counts(launch.size_m):
+            key = (
+                device_index,
+                str(launch.route_ids_dtype),
+                int(token_count),
+                int(launch.top_k),
+                total_experts,
+                int(launch.moe_block_size),
+                True,
+            )
+            if key in _ROUTE_PACK_WARMED:
+                continue
+            dummy_topk_ids = torch.zeros(
+                (token_count, launch.top_k),
+                dtype=launch.route_ids_dtype,
+                device=device,
+            )
+            pack_topk_routes_by_expert(
+                dummy_topk_ids,
+                launch.moe_block_size,
+                total_experts,
+                expert_map=expert_map,
+                packed_route_indices=buffers.packed_route_indices,
+                block_expert_ids=buffers.block_expert_ids,
+                packed_route_count=buffers.packed_route_count,
+                expert_offsets=buffers.expert_offsets,
+                expert_counts=buffers.expert_counts,
+            )
+            pending_keys.append(key)
+            warmed += 1
+        torch.cuda.current_stream(device).synchronize()
+        _ROUTE_PACK_WARMED.update(pending_keys)
+    return warmed
 
 
 def compile_mixed_trellis(
@@ -1521,4 +1586,5 @@ __all__ = [
     "compile_mixed_trellis",
     "make_mixed_trellis_buffers",
     "run_mixed_trellis",
+    "warmup_mixed_trellis_route_pack",
 ]
