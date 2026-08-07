@@ -191,18 +191,30 @@ def route_pack_token_capacity(tokens: int, topk: int) -> int:
 
 
 def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
-    """Return one live row count for every route-capacity specialization."""
+    """Return live row counts covering capacity and scalar specializations.
+
+    Triton specializes the runtime ``live_numel`` scalar on alignment as well
+    as the constexpr route-capacity bucket. For a power-of-two bucket, the
+    bucket maximum and its first live member cover both alignment classes
+    reached by the GLM top-k route counts (for example 8 and 5 rows in the
+    8-row bucket). Warming only bucket maxima leaves the less-aligned variant
+    to compile on the first odd-sized request.
+    """
     capacity = int(capacity)
     if capacity < 1:
         raise ValueError(
             f"mixed Trellis warmup capacity must be positive, got {capacity}"
         )
     counts: list[int] = []
-    count = 1
-    while count < capacity:
-        counts.append(count)
-        count *= 2
-    counts.append(capacity)
+    bucket = 1
+    while bucket <= capacity:
+        first_in_bucket = 1 if bucket == 1 else bucket // 2 + 1
+        for count in (first_in_bucket, bucket):
+            if count <= capacity and (not counts or counts[-1] != count):
+                counts.append(count)
+        bucket *= 2
+    if counts[-1] != capacity:
+        counts.append(capacity)
     return tuple(counts)
 
 
