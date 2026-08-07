@@ -1344,26 +1344,38 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                         local_best = score
                         local_id = candidate
                     candidate += Int32(self._threads)
-                reduce_scores[tidx] = local_best
-                reduce_ids[tidx] = local_id
+                # Reduce inside each warp with shuffles first: the shared
+                # round trip only has to carry one candidate per warp, so a
+                # round costs a single block sync instead of log2(threads).
+                offset = Int32(16)
+                while offset > Int32(0):
+                    peer_score = cute.arch.shuffle_sync_bfly(local_best, offset)
+                    peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
+                    if peer_id >= Int32(0):
+                        if peer_score > local_best or (
+                            peer_score == local_best
+                            and (local_id < Int32(0) or peer_id < local_id)
+                        ):
+                            local_best = peer_score
+                            local_id = peer_id
+                    offset = offset // Int32(2)
+                warp = Int32(tidx) // Int32(32)
+                if Int32(tidx) % Int32(32) == Int32(0):
+                    reduce_scores[warp] = local_best
+                    reduce_ids[warp] = local_id
                 cute.arch.sync_threads()
-                stride = Int32(self._threads // 2)
-                while stride > Int32(0):
-                    if Int32(tidx) < stride:
-                        other_score = reduce_scores[tidx + stride]
-                        other_id = reduce_ids[tidx + stride]
-                        this_score = reduce_scores[tidx]
-                        this_id = reduce_ids[tidx]
-                        if other_id >= Int32(0):
-                            if other_score > this_score or (
-                                other_score == this_score
-                                and (this_id < Int32(0) or other_id < this_id)
-                            ):
-                                reduce_scores[tidx] = other_score
-                                reduce_ids[tidx] = other_id
-                    cute.arch.sync_threads()
-                    stride = stride // Int32(2)
-                best_expert = reduce_ids[0]
+                best_score = Float32(float("-inf"))
+                best_expert = Int32(-1)
+                for slot in cutlass.range_constexpr(self._threads // 32):
+                    cand_score = reduce_scores[slot]
+                    cand_id = reduce_ids[slot]
+                    if cand_id >= Int32(0):
+                        if cand_score > best_score or (
+                            cand_score == best_score
+                            and (best_expert < Int32(0) or cand_id < best_expert)
+                        ):
+                            best_score = cand_score
+                            best_expert = cand_id
                 selected_ids[selected] = best_expert
                 weight = Float32(0.0)
                 if best_expert >= Int32(0):
