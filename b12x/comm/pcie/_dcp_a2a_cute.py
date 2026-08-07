@@ -1319,73 +1319,107 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 expert += Int32(self._threads)
             cute.arch.sync_threads()
 
-            # Block-wide top-16 selection. The previous implementation ran
-            # this on thread 0 alone: 16 rounds x 896 candidates x up to 15
-            # prior-selection checks, about 1e5 serial steps per row, which
-            # made this kernel 320 us against 39 us for the C++ original.
-            # Each round now argmaxes across every thread and masks the winner
-            # with -inf, the same scheme the C++ kernel used.
+            # Two-level warp-local top-16, mirroring the C++ kernel this path
+            # replaced. Four warps each reduce 256 experts held in registers
+            # (8 per lane) with warp reductions, then warp 0 merges the 64
+            # survivors. A round costs two warp reductions instead of a
+            # shared-memory scan, and the selection needs one block barrier
+            # rather than two per round.
+            _NONE = Int32(0x7FFFFFFF)
+            lane = Int32(tidx) % Int32(32)
+            warp = Int32(tidx) // Int32(32)
+            won_score = Float32(float("-inf"))
+            won_expert = _NONE
+            cand_scores = cute.make_rmem_tensor((8,), Float32)
+            cand_experts = cute.make_rmem_tensor((8,), Int32)
+            if warp < Int32(4):
+                for item in cutlass.range_constexpr(8):
+                    expert_id = warp * Int32(256) + Int32(item * 32) + lane
+                    value = Float32(float("-inf"))
+                    if expert_id < Int32(896):
+                        value = selection_scores[expert_id]
+                    cand_scores[item] = value
+                    cand_experts[item] = expert_id
+                for selected in cutlass.range_constexpr(16):
+                    local_best = Float32(float("-inf"))
+                    local_id = _NONE
+                    for item in cutlass.range_constexpr(8):
+                        if cand_scores[item] > local_best or (
+                            cand_scores[item] == local_best
+                            and cand_experts[item] < local_id
+                        ):
+                            local_best = cand_scores[item]
+                            local_id = cand_experts[item]
+                    offset = Int32(16)
+                    while offset > Int32(0):
+                        peer_best = cute.arch.shuffle_sync_bfly(
+                            local_best, offset
+                        )
+                        peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
+                        if peer_best > local_best or (
+                            peer_best == local_best and peer_id < local_id
+                        ):
+                            local_best = peer_best
+                            local_id = peer_id
+                        offset = offset // Int32(2)
+                    round_best = local_best
+                    round_expert = local_id
+                    if lane == Int32(selected):
+                        won_score = round_best
+                        won_expert = round_expert
+                    for item in cutlass.range_constexpr(8):
+                        if cand_experts[item] == round_expert:
+                            cand_scores[item] = Float32(float("-inf"))
+                if lane < Int32(16):
+                    reduce_scores[warp * Int32(16) + lane] = won_score
+                    reduce_ids[warp * Int32(16) + lane] = won_expert
+            cute.arch.sync_threads()
             selected_ids = cute.make_rmem_tensor((16,), Int32)
             selected_weights = cute.make_rmem_tensor((16,), Float32)
-            for selected in cutlass.range_constexpr(16):
-                selected_ids[selected] = Int32(-1)
-                selected_weights[selected] = Float32(0.0)
             weight_sum = Float32(0.0)
-            for selected in cutlass.range_constexpr(16):
-                local_best = Float32(float("-inf"))
-                local_id = Int32(-1)
-                candidate = Int32(tidx)
-                while candidate < Int32(896):
-                    score = selection_scores[candidate]
-                    if score > local_best or (
-                        score == local_best
-                        and (local_id < Int32(0) or candidate < local_id)
-                    ):
-                        local_best = score
-                        local_id = candidate
-                    candidate += Int32(self._threads)
-                # Reduce inside each warp with shuffles first: the shared
-                # round trip only has to carry one candidate per warp, so a
-                # round costs a single block sync instead of log2(threads).
-                offset = Int32(16)
-                while offset > Int32(0):
-                    peer_score = cute.arch.shuffle_sync_bfly(local_best, offset)
-                    peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
-                    if peer_id >= Int32(0):
-                        if peer_score > local_best or (
-                            peer_score == local_best
-                            and (local_id < Int32(0) or peer_id < local_id)
+            if warp == Int32(0):
+                merge_scores = cute.make_rmem_tensor((2,), Float32)
+                merge_experts = cute.make_rmem_tensor((2,), Int32)
+                for item in cutlass.range_constexpr(2):
+                    merge_slot = Int32(item * 32) + lane
+                    merge_scores[item] = reduce_scores[merge_slot]
+                    merge_experts[item] = reduce_ids[merge_slot]
+                for selected in cutlass.range_constexpr(16):
+                    local_best = Float32(float("-inf"))
+                    local_id = _NONE
+                    for item in cutlass.range_constexpr(2):
+                        if merge_scores[item] > local_best or (
+                            merge_scores[item] == local_best
+                            and merge_experts[item] < local_id
                         ):
-                            local_best = peer_score
+                            local_best = merge_scores[item]
+                            local_id = merge_experts[item]
+                    offset = Int32(16)
+                    while offset > Int32(0):
+                        peer_best = cute.arch.shuffle_sync_bfly(
+                            local_best, offset
+                        )
+                        peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
+                        if peer_best > local_best or (
+                            peer_best == local_best and peer_id < local_id
+                        ):
+                            local_best = peer_best
                             local_id = peer_id
-                    offset = offset // Int32(2)
-                warp = Int32(tidx) // Int32(32)
-                if Int32(tidx) % Int32(32) == Int32(0):
-                    reduce_scores[warp] = local_best
-                    reduce_ids[warp] = local_id
-                cute.arch.sync_threads()
-                best_score = Float32(float("-inf"))
-                best_expert = Int32(-1)
-                for slot in cutlass.range_constexpr(self._threads // 32):
-                    cand_score = reduce_scores[slot]
-                    cand_id = reduce_ids[slot]
-                    if cand_id >= Int32(0):
-                        if cand_score > best_score or (
-                            cand_score == best_score
-                            and (best_expert < Int32(0) or cand_id < best_expert)
-                        ):
-                            best_score = cand_score
-                            best_expert = cand_id
-                selected_ids[selected] = best_expert
-                weight = Float32(0.0)
-                if best_expert >= Int32(0):
-                    weight = unbiased_scores[best_expert]
-                selected_weights[selected] = weight
-                weight_sum += weight
-                if Int32(tidx) == Int32(0):
-                    if best_expert >= Int32(0):
-                        selection_scores[best_expert] = Float32(float("-inf"))
-                cute.arch.sync_threads()
+                        offset = offset // Int32(2)
+                    round_best = local_best
+                    round_expert = local_id
+                    final_expert = Int32(-1)
+                    if round_expert != _NONE:
+                        final_expert = round_expert
+                    selected_ids[selected] = final_expert
+                    weight = Float32(0.0)
+                    if final_expert >= Int32(0):
+                        weight = unbiased_scores[final_expert]
+                    selected_weights[selected] = weight
+                    weight_sum += weight
+                    for item in cutlass.range_constexpr(2):
+                        if merge_experts[item] == round_expert:
+                            merge_scores[item] = Float32(float("-inf"))
             if Int32(tidx) == Int32(0):
                 scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
                 for selected in cutlass.range_constexpr(16):
