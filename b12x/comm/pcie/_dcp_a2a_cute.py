@@ -1253,6 +1253,13 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 unbiased_scores: cute.struct.Align[
                     cute.struct.MemRange[Float32, 896], 16
                 ]
+                # Per-thread partial argmax for the block-wide top-16 below.
+                reduce_scores: cute.struct.Align[
+                    cute.struct.MemRange[Float32, 512], 16
+                ]
+                reduce_ids: cute.struct.Align[
+                    cute.struct.MemRange[Int32, 512], 16
+                ]
 
             storage = smem_alloc.allocate(SharedStorage)
             selection_scores = storage.selection_scores.get_tensor(
@@ -1260,6 +1267,12 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             )
             unbiased_scores = storage.unbiased_scores.get_tensor(
                 cute.make_layout((896,), stride=(1,))
+            )
+            reduce_scores = storage.reduce_scores.get_tensor(
+                cute.make_layout((512,), stride=(1,))
+            )
+            reduce_ids = storage.reduce_ids.get_tensor(
+                cute.make_layout((512,), stride=(1,))
             )
 
             expert = Int32(tidx)
@@ -1306,43 +1319,62 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 expert += Int32(self._threads)
             cute.arch.sync_threads()
 
-            if Int32(tidx) == Int32(0):
-                selected_ids = cute.make_rmem_tensor((16,), Int32)
-                selected_weights = cute.make_rmem_tensor((16,), Float32)
-                for selected in cutlass.range_constexpr(16):
-                    selected_ids[selected] = Int32(-1)
-                    selected_weights[selected] = Float32(0.0)
-                weight_sum = Float32(0.0)
-                for selected in cutlass.range_constexpr(16):
-                    best_score = Float32(float("-inf"))
-                    best_expert = Int32(-1)
-                    candidate = Int32(0)
-                    while candidate < Int32(896):
-                        already_selected = False
-                        for prior in cutlass.range_constexpr(selected):
-                            if selected_ids[prior] == candidate:
-                                already_selected = True
-                        score = selection_scores[candidate]
-                        if not already_selected:
-                            if (
-                                score > best_score
-                                or (
-                                    score == best_score
-                                    and (
-                                        best_expert < Int32(0)
-                                        or candidate < best_expert
-                                    )
-                                )
+            # Block-wide top-16 selection. The previous implementation ran
+            # this on thread 0 alone: 16 rounds x 896 candidates x up to 15
+            # prior-selection checks, about 1e5 serial steps per row, which
+            # made this kernel 320 us against 39 us for the C++ original.
+            # Each round now argmaxes across every thread and masks the winner
+            # with -inf, the same scheme the C++ kernel used.
+            selected_ids = cute.make_rmem_tensor((16,), Int32)
+            selected_weights = cute.make_rmem_tensor((16,), Float32)
+            for selected in cutlass.range_constexpr(16):
+                selected_ids[selected] = Int32(-1)
+                selected_weights[selected] = Float32(0.0)
+            weight_sum = Float32(0.0)
+            for selected in cutlass.range_constexpr(16):
+                local_best = Float32(float("-inf"))
+                local_id = Int32(-1)
+                candidate = Int32(tidx)
+                while candidate < Int32(896):
+                    score = selection_scores[candidate]
+                    if score > local_best or (
+                        score == local_best
+                        and (local_id < Int32(0) or candidate < local_id)
+                    ):
+                        local_best = score
+                        local_id = candidate
+                    candidate += Int32(self._threads)
+                reduce_scores[tidx] = local_best
+                reduce_ids[tidx] = local_id
+                cute.arch.sync_threads()
+                stride = Int32(self._threads // 2)
+                while stride > Int32(0):
+                    if Int32(tidx) < stride:
+                        other_score = reduce_scores[tidx + stride]
+                        other_id = reduce_ids[tidx + stride]
+                        this_score = reduce_scores[tidx]
+                        this_id = reduce_ids[tidx]
+                        if other_id >= Int32(0):
+                            if other_score > this_score or (
+                                other_score == this_score
+                                and (this_id < Int32(0) or other_id < this_id)
                             ):
-                                best_score = score
-                                best_expert = candidate
-                        candidate += Int32(1)
-                    selected_ids[selected] = best_expert
-                    weight = Float32(0.0)
+                                reduce_scores[tidx] = other_score
+                                reduce_ids[tidx] = other_id
+                    cute.arch.sync_threads()
+                    stride = stride // Int32(2)
+                best_expert = reduce_ids[0]
+                selected_ids[selected] = best_expert
+                weight = Float32(0.0)
+                if best_expert >= Int32(0):
+                    weight = unbiased_scores[best_expert]
+                selected_weights[selected] = weight
+                weight_sum += weight
+                if Int32(tidx) == Int32(0):
                     if best_expert >= Int32(0):
-                        weight = unbiased_scores[best_expert]
-                    selected_weights[selected] = weight
-                    weight_sum += weight
+                        selection_scores[best_expert] = Float32(float("-inf"))
+                cute.arch.sync_threads()
+            if Int32(tidx) == Int32(0):
                 scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
                 for selected in cutlass.range_constexpr(16):
                     cute.arch.store(
