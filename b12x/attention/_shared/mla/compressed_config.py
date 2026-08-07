@@ -22,9 +22,18 @@ def compressed_mla_split_config_for_contract(
     rows: int,
     width: int,
     max_chunks: int | None = None,
+    decode_row_capacity: int | None = None,
 ) -> SparseMLASplitDecodeConfig:
     rows = max(int(rows), 1)
     width = max(int(width), 1)
+    decode_split_max_rows = _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
+    if decode_row_capacity is not None:
+        decode_row_capacity = int(decode_row_capacity)
+        if decode_row_capacity <= 0:
+            raise ValueError(
+                f"decode_row_capacity must be positive, got {decode_row_capacity}"
+            )
+        decode_split_max_rows = max(decode_split_max_rows, decode_row_capacity)
     chunk_limit = _COMPRESSED_MLA_SPLIT_MAX_CHUNKS
     if max_chunks is not None:
         chunk_limit = max(1, min(int(max_chunks), chunk_limit))
@@ -32,7 +41,7 @@ def compressed_mla_split_config_for_contract(
     decode_chunks = (
         width + _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE - 1
     ) // _COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE
-    if rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS and decode_chunks <= chunk_limit:
+    if rows <= decode_split_max_rows and decode_chunks <= chunk_limit:
         return SparseMLASplitDecodeConfig(
             chunk_size=_COMPRESSED_MLA_DECODE_SPLIT_CHUNK_SIZE,
             num_chunks=decode_chunks,
@@ -41,10 +50,7 @@ def compressed_mla_split_config_for_contract(
     wide_decode_chunks = (
         width + _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE - 1
     ) // _COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE
-    if (
-        rows <= _COMPRESSED_MLA_DECODE_SPLIT_MAX_ROWS
-        and wide_decode_chunks <= chunk_limit
-    ):
+    if rows <= decode_split_max_rows and wide_decode_chunks <= chunk_limit:
         return SparseMLASplitDecodeConfig(
             chunk_size=_COMPRESSED_MLA_DECODE_WIDE_CHUNK_SIZE,
             num_chunks=wide_decode_chunks,
@@ -68,11 +74,13 @@ def compressed_mla_split_chunks_for_contract(
     rows: int,
     width: int,
     max_chunks: int | None = None,
+    decode_row_capacity: int | None = None,
 ) -> int:
     return compressed_mla_split_config_for_contract(
         rows=rows,
         width=width,
         max_chunks=max_chunks,
+        decode_row_capacity=decode_row_capacity,
     ).num_chunks
 
 

@@ -46,6 +46,7 @@ class B12XCompressedMLAScratchCaps:
     max_kv_rows: int = 0
     max_chunks_per_row: int = 64
     max_q_chunks: int | None = None
+    decode_row_capacity: int | None = None
     page_size: int = 64
 
     def __post_init__(self) -> None:
@@ -74,6 +75,13 @@ class B12XCompressedMLAScratchCaps:
         )
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
+        if self.decode_row_capacity is not None:
+            decode_row_capacity = int(self.decode_row_capacity)
+            if decode_row_capacity <= 0:
+                raise ValueError(
+                    f"decode_row_capacity must be positive, got {decode_row_capacity}"
+                )
+            object.__setattr__(self, "decode_row_capacity", decode_row_capacity)
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
 
 
@@ -376,6 +384,7 @@ def _materialize_compressed_mla_scratch(
         rows=caps.max_q_rows,
         width=caps.max_width,
         max_chunks=caps.max_chunks_per_row,
+        decode_row_capacity=caps.decode_row_capacity,
     )
     scratch.set_split_chunk_config(
         kv_chunk_size=split_cfg.chunk_size,
