@@ -266,19 +266,17 @@ def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
     """
     capacity = int(capacity)
     if capacity < 1:
-        raise ValueError(
-            f"mixed Trellis warmup capacity must be positive, got {capacity}"
-        )
+        raise ValueError(f"route-pack warmup capacity must be positive, got {capacity}")
     counts: list[int] = []
     bucket = 1
-    while bucket <= capacity:
+    while True:
         first_in_bucket = 1 if bucket == 1 else bucket // 2 + 1
-        for count in (first_in_bucket, bucket):
-            if count <= capacity and (not counts or counts[-1] != count):
+        if first_in_bucket > capacity:
+            break
+        for count in (first_in_bucket, min(bucket, capacity)):
+            if not counts or counts[-1] != count:
                 counts.append(count)
         bucket *= 2
-    if counts[-1] != capacity:
-        counts.append(capacity)
     return tuple(counts)
 
 
