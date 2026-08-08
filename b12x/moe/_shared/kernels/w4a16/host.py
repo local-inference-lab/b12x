@@ -11,6 +11,10 @@ from b12x.moe._shared.kernels.activations import (
     is_gated_moe_activation,
     normalize_moe_activation,
 )
+from b12x.moe._shared.w4a16_layout import (
+    max_packed_route_slots,
+    packed_gemm_scratch_elements,
+)
 
 
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
@@ -233,16 +237,6 @@ def route_block_sizes_for_capacity(
     return _W4A16_ALLOWED_ROUTED_SIZES[first_idx : last_idx + 1]
 
 
-def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int:
-    max_packed_routes = int(numel) + int(num_experts) * (int(block_size) - 1)
-    if int(numel) < int(num_experts):
-        max_packed_routes = min(
-            int(numel) * int(block_size),
-            max_packed_routes,
-        )
-    return max_packed_routes
-
-
 def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
     topk = max(int(topk), 1)
     tokens = (max(int(numel), 1) + topk - 1) // topk
@@ -287,22 +281,6 @@ def max_w4a16_route_capacity(routed_rows: int, num_experts: int) -> tuple[int, i
             route_blocks, (slots + int(block_size) - 1) // int(block_size)
         )
     return max(route_slots, 1), max(route_blocks, 1)
-
-
-def packed_gemm_scratch_elements(
-    *,
-    size_n: int,
-    route_slots: int,
-    moe_block_size: int,
-    sms: int,
-) -> int:
-    elements = min(
-        int(size_n) * int(route_slots),
-        int(sms) * 4 * int(moe_block_size) * 256,
-    )
-    if moe_block_size == 8:
-        elements *= 2
-    return max(elements, 1)
 
 
 def plan_w4a16_buffers(
