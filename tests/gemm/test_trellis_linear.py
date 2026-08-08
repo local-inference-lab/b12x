@@ -1027,6 +1027,7 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
     scale_rows = 1 if broadcast_suh else experts
 
     prepared = SimpleNamespace(
+        activation="situ",
         hidden_size=hidden,
         num_experts=experts,
         gate_suh=(
