@@ -1010,6 +1010,10 @@ def mixed_trellis_buffer_layout(
     *,
     sms: int,
 ) -> MixedTrellisBufferLayout:
+    if int(sms) != int(launch.sms):
+        raise ValueError(
+            f"buffer SMS count {sms} does not match launch SMS count {launch.sms}"
+        )
     return plan_mixed_trellis_buffers(
         size_m=launch.size_m,
         hidden_size=launch.hidden_size,
@@ -1019,7 +1023,7 @@ def mixed_trellis_buffer_layout(
         moe_block_size=launch.moe_block_size,
         max_m_blocks=launch.max_m_blocks,
         blocks_per_sm=launch.blocks_per_sm,
-        sms=sms,
+        sms=launch.sms,
     )
 
 
