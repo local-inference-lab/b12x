@@ -311,18 +311,16 @@ def run_trellis_w4a8_moe(
                 f"prepared.{name} must be contiguous fp16 [1|E,{hidden_size}] "
                 f"on {source.device}"
             )
+    shared_suh = getattr(prepared, "shared_suh", None)
+    if type(shared_suh) is not bool:
+        raise ValueError("prepared weights omit the explicit shared_suh contract")
     gate_suh_rows = int(prepared.gate_suh.shape[0])
     up_suh_rows = int(prepared.up_suh.shape[0])
-    valid_suh_rows = (1, num_experts)
-    if gate_suh_rows not in valid_suh_rows or up_suh_rows not in valid_suh_rows:
+    expected_suh_rows = 1 if shared_suh else num_experts
+    if gate_suh_rows != expected_suh_rows or up_suh_rows != expected_suh_rows:
         raise ValueError(
-            "prepared gate_suh/up_suh rows must each be 1 or num_experts; "
-            f"got {gate_suh_rows}, {up_suh_rows}, and num_experts={num_experts}"
-        )
-    shared_suh = gate_suh_rows == 1
-    if shared_suh != (up_suh_rows == 1):
-        raise ValueError(
-            "prepared gate_suh and up_suh must both be shared or both be per-expert"
+            "prepared gate_suh/up_suh rows disagree with shared_suh; "
+            f"got {gate_suh_rows}, {up_suh_rows}, expected {expected_suh_rows}"
         )
     input_rows = m if shared_suh else routes
     _check_mxfp8_rows(

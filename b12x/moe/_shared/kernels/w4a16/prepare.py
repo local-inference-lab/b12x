@@ -163,6 +163,9 @@ class PreparedW4A16MoeWeights:
     intermediate_rotations: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
     tile_config: tuple[int, int, int, int] | None = None
+    # Explicit source rotation contract. QSRT preparation sets this to True
+    # for one shared gate/up row and False for per-expert rows.
+    shared_suh: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -2503,6 +2506,7 @@ def prepare_qsrt_pair_moe_weights(
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
+        shared_suh=gate_suh.shape[0] == 1,
         tile_config=tile_config,
     )
 
@@ -2838,6 +2842,7 @@ def prepare_qsrt_atom_moe_weights(
         intermediate_rotations=intermediate_rotations,
         down_svh=down_svh,
         tile_config=tile_config,
+        shared_suh=gate_suh.shape[0] == 1,
     )
 
 

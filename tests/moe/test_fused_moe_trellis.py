@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -27,7 +28,6 @@ from b12x.moe._shared.kernels.w4a16.host import plan_w4a16_buffers
 from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.prepare import (
-    PreparedW4A16MoeWeights,
     prepare_qsrt_atom_moe_weights,
     prepare_qsrt_pair_moe_weights,
 )
@@ -611,9 +611,6 @@ def _reference_full_rotation(
 ) -> torch.Tensor:
     device = x.device
     experts = int(w2.shape[0])
-    intermediate = int(w2.shape[1]) * 16
-    hidden = int(w2.shape[2]) * 16
-    hadamard = _hadamard_128(device)
     gate_weights = torch.stack(
         [_reconstruct_native(w13[0, expert]) for expert in range(experts)]
     ).to(device)
@@ -661,7 +658,6 @@ def _reference_full_rotation_decoded(
     mxfp8: bool = False,
 ) -> torch.Tensor:
     device = x.device
-    experts = int(down_weights.shape[0])
     intermediate = int(down_weights.shape[1])
     hidden = int(down_weights.shape[2])
     hadamard = _hadamard_128(device)
@@ -904,13 +900,13 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     w13_payloads: list[list[torch.Tensor]] = [[], []]
     w13_decoded: list[list[torch.Tensor]] = [[], []]
     for projection in range(2):
-        for expert, kind in enumerate(fc1_kinds):
+        for kind in fc1_kinds:
             payload, decoded = make_pair(kind, (hidden_tiles, 8))
             w13_payloads[projection].append(payload)
             w13_decoded[projection].append(decoded)
     w2_payloads: list[torch.Tensor] = []
     w2_decoded: list[torch.Tensor] = []
-    for expert, kind in enumerate(fc2_kinds):
+    for kind in fc2_kinds:
         payload, decoded = make_pair(kind, (8, hidden_tiles), is_fc2=True)
         w2_payloads.append(payload)
         w2_decoded.append(decoded)
@@ -991,6 +987,8 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     assert prepared.trellis_codebook == "sqg_xor_cheb_t12"
     assert prepared.activation == activation
     assert pair_prepared.activation == activation
+    assert prepared.shared_suh is (suh_rows == 1)
+    assert pair_prepared.shared_suh is (suh_rows == 1)
     assert prepared.fc1_trellis_pair_kind == "PDYNAMIC"
     assert prepared.fc2_trellis_pair_kind == "PDYNAMIC"
     assert torch.equal(prepared.fc1_trellis_pair_modes, fc1_pair_spec)
@@ -1075,6 +1073,14 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
             shared_suh=False,
         )
         assert w4a8_scratch.gate_quantized.values.shape[0] == m * topk
+        with pytest.raises(ValueError, match="disagree with shared_suh"):
+            run_trellis_w4a8_moe(
+                x,
+                replace(prepared, shared_suh=suh_rows != 1),
+                router_weights,
+                ids,
+                w4a8_scratch,
+            )
         w4a8_actual = run_trellis_w4a8_moe(
             x, prepared, router_weights, ids, w4a8_scratch
         ).clone()
@@ -1129,6 +1135,7 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     )
     public_prepared = public_weights.representation_for("w4a16")
     assert torch.equal(public_prepared.w13, prepared.w13)
+    assert public_prepared.shared_suh is (suh_rows == 1)
     public_plan = _plan(
         public_weights,
         max_tokens=m,
