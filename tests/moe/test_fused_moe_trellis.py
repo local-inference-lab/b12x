@@ -104,13 +104,15 @@ def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> 
         num_experts=experts,
         trellis_codebook="sqg_xor_cheb_t12",
         activation="silu",
+        shared_suh=True,
         gate_suh=torch.ones((1, hidden), dtype=torch.float16),
         up_suh=torch.ones((experts, hidden), dtype=torch.float16),
     )
-    with pytest.raises(ValueError, match="both be shared or both be per-expert"):
+    with pytest.raises(ValueError, match="disagree with shared_suh"):
         run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
 
     prepared.gate_suh = torch.ones((experts, hidden), dtype=torch.float16)
+    prepared.shared_suh = False
     with pytest.raises(
         ValueError, match=r"scratch\.gate_quantized\.values must have shape"
     ):

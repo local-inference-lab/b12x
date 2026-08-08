@@ -211,7 +211,6 @@ class TrellisW4A8InputRotationKernel(_Hadamard128):
         stream: cuda.CUstream,
     ) -> None:
         routes = tokens * Int32(self.topk)
-        output_rows = tokens if self.broadcast_suh else routes
         source = cute.make_tensor(
             source_ptr,
             cute.make_ordered_layout((tokens, self.hidden_size), order=(1, 0)),
