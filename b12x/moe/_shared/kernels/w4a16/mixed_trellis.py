@@ -119,7 +119,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 6
+    ABI_VERSION = 7
 
     def __init__(
         self,
@@ -328,6 +328,8 @@ class W4A16MixedTrellisKernel:
         active_size_m: Int32,
         tier0_num_experts: Int32,
         tier1_num_experts: Int32,
+        tier0_fc2_experts: Int32,
+        tier1_fc2_experts: Int32,
         route_block_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
@@ -347,12 +349,30 @@ class W4A16MixedTrellisKernel:
             )
         combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
         total_experts = tier0_num_experts + tier1_num_experts
+        # glm52-r7-projtiers: gate and up may sit in different tiers, so the
+        # descriptor row is chosen per projection. FC2 resolves at compile time;
+        # FC1 splits on the N half, which trellis3_t256_proj keeps aligned to
+        # whole CTA N tiles.
+        descriptor_row = Int32(2)
+        if cutlass.const_expr(is_fc1):
+            fc1_half_tiles = Int32(self.driver.fc1.n_tiles // 2)
+            descriptor_row = Int32(0)
+            if output_n_tile >= fc1_half_tiles:
+                descriptor_row = Int32(1)
         if combined_expert >= Int32(0) and combined_expert < total_experts:
-            descriptor = descriptor_map[combined_expert].to(Int32)
+            descriptor = descriptor_map[
+                descriptor_row * total_experts + combined_expert
+            ].to(Int32)
             if descriptor >= Int32(0):
                 tier = descriptor >> Int32(8)
                 local_expert = descriptor & Int32(0xFF)
-                if tier == Int32(0) and local_expert < tier0_num_experts:
+                # FC1 is bounded by the tier's FC1 slot count; FC2 by its own
+                # independent count, since per-projection membership lets the
+                # two differ. Both remain real bounds.
+                tier0_in_bounds = local_expert < tier0_num_experts
+                if cutlass.const_expr(not is_fc1):
+                    tier0_in_bounds = local_expert < tier0_fc2_experts
+                if tier == Int32(0) and tier0_in_bounds:
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier0.fc1
                     else:
@@ -381,7 +401,10 @@ class W4A16MixedTrellisKernel:
                         lock_slot,
                         active_size_m,
                     )
-                elif tier == Int32(1) and local_expert < tier1_num_experts:
+                tier1_in_bounds = local_expert < tier1_num_experts
+                if cutlass.const_expr(not is_fc1):
+                    tier1_in_bounds = local_expert < tier1_fc2_experts
+                if tier == Int32(1) and tier1_in_bounds:
                     if cutlass.const_expr(is_fc1):
                         gemm = self.tier1.fc1
                     else:
@@ -445,11 +468,28 @@ class W4A16MixedTrellisKernel:
         up_suh_ptr: cute.Pointer,
         tier0_num_experts: cutlass.Int32,
         tier1_num_experts: cutlass.Int32,
+        tier0_fc2_experts: cutlass.Int32,
+        tier1_fc2_experts: cutlass.Int32,
         active_m: cutlass.Int32,
         grid_x: cutlass.Int32,
         stream: cuda.CUstream,
+        # Appended LAST so every existing positional call keeps its slots;
+        # passed by keyword. No default: the CuTe DSL types every parameter
+        # when it traces, and a None default is untypeable.
+        tier0_gate_experts: cutlass.Int32,
+        tier1_gate_experts: cutlass.Int32,
     ):
         tier0_experts = cutlass.Int64(tier0_num_experts)
+        # FC2 extents are independent of the FC1 slot counts.
+        tier0_fc2 = cutlass.Int64(tier0_fc2_experts)
+        tier1_fc2 = cutlass.Int64(tier1_fc2_experts)
+        # The w13 descriptor is sized by the GATE count so the gemm's
+        # cute.size(w13)//2 up-block base lands at gate_count*proj_stride over
+        # a tight [gate|up] buffer. run_mixed_trellis defaults these to the
+        # tier expert counts when a caller supplies none, which reproduces the
+        # historical padded sizing exactly.
+        tier0_gate = cutlass.Int64(tier0_gate_experts)
+        tier1_gate = cutlass.Int64(tier1_gate_experts)
         tier1_experts = cutlass.Int64(tier1_num_experts)
         total_experts = tier0_experts + tier1_experts
 
@@ -457,7 +497,7 @@ class W4A16MixedTrellisKernel:
             t0_w13_ptr,
             layout=cute.make_layout(
                 (
-                    tier0_experts
+                    tier0_gate
                     * cutlass.Int64(self.hidden_size // 16)
                     * cutlass.Int64(self.driver.fc1_cols // 16)
                     * cutlass.Int64(8 * self.tier0.trellis_bits),
@@ -469,7 +509,7 @@ class W4A16MixedTrellisKernel:
             t0_w2_ptr,
             layout=cute.make_layout(
                 (
-                    tier0_experts
+                    tier0_fc2
                     * cutlass.Int64(self.intermediate_size // 16)
                     * cutlass.Int64(self.hidden_size // 16)
                     * cutlass.Int64(8 * self.tier0.trellis_bits),
@@ -481,7 +521,7 @@ class W4A16MixedTrellisKernel:
             t1_w13_ptr,
             layout=cute.make_layout(
                 (
-                    tier1_experts
+                    tier1_gate
                     * cutlass.Int64(self.hidden_size // 16)
                     * cutlass.Int64(self.driver.fc1_cols // 16)
                     * cutlass.Int64(8 * self.tier1.trellis_bits),
@@ -493,7 +533,7 @@ class W4A16MixedTrellisKernel:
             t1_w2_ptr,
             layout=cute.make_layout(
                 (
-                    tier1_experts
+                    tier1_fc2
                     * cutlass.Int64(self.intermediate_size // 16)
                     * cutlass.Int64(self.hidden_size // 16)
                     * cutlass.Int64(8 * self.tier1.trellis_bits),
@@ -551,7 +591,7 @@ class W4A16MixedTrellisKernel:
         )
         t0_w2_global = cute.make_tensor(
             t0_w2_global_ptr,
-            layout=cute.make_layout((tier0_experts,), stride=(1,)),
+            layout=cute.make_layout((tier0_fc2,), stride=(1,)),
         )
         t1_w13_global = cute.make_tensor(
             t1_w13_global_ptr,
@@ -559,11 +599,15 @@ class W4A16MixedTrellisKernel:
         )
         t1_w2_global = cute.make_tensor(
             t1_w2_global_ptr,
-            layout=cute.make_layout((tier1_experts,), stride=(1,)),
+            layout=cute.make_layout((tier1_fc2,), stride=(1,)),
         )
+        # glm52-r7-projtiers: rows are gate, up, down. Row 0 alone is the
+        # historical layout, so three identical rows reproduce it exactly.
         descriptor_map = cute.make_tensor(
             descriptor_map_ptr,
-            layout=cute.make_layout((total_experts,), stride=(1,)),
+            layout=cute.make_layout(
+                (cutlass.Int64(3) * total_experts,), stride=(1,)
+            ),
         )
         intermediate_rotations = cute.make_tensor(
             intermediate_rotations_ptr,
@@ -633,6 +677,8 @@ class W4A16MixedTrellisKernel:
             up_suh,
             tier0_num_experts,
             tier1_num_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
             active_m,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -676,6 +722,8 @@ class W4A16MixedTrellisKernel:
         up_suh: cute.Tensor,
         tier0_num_experts: cutlass.Int32,
         tier1_num_experts: cutlass.Int32,
+        tier0_fc2_experts: cutlass.Int32,
+        tier1_fc2_experts: cutlass.Int32,
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -718,6 +766,8 @@ class W4A16MixedTrellisKernel:
             active_m,
             tier0_num_experts,
             tier1_num_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
         )
         fc2_emit = partial(
             self._emit_tier_tile,
@@ -742,6 +792,8 @@ class W4A16MixedTrellisKernel:
             active_m * Int32(self.top_k),
             tier0_num_experts,
             tier1_num_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
         )
         total_experts = tier0_num_experts + tier1_num_experts
         self.driver._moe_body(
@@ -1015,9 +1067,16 @@ def compile_mixed_trellis(
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         Int32(tier0_num_experts),
         Int32(tier1_num_experts),
+        # FC2 counts are independent artifact data; trace with the FC1 values.
+        Int32(tier0_num_experts),
+        Int32(tier1_num_experts),
         1,
         1,
         current_cuda_stream(),
+        # Gate-count trace placeholders (keyword-only, last in the signature);
+        # real counts ride each launch.
+        Int32(tier0_num_experts),
+        Int32(tier1_num_experts),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -1164,6 +1223,10 @@ def build_ordered_maps(
     )
 
 
+# One tier-local expert index is encoded in the descriptor's low 8 bits.
+_MAX_TIER_EXPERTS = 256
+
+
 def build_tiered_maps(
     tier0_global_ids: Sequence[int],
     tier1_global_ids: Sequence[int],
@@ -1189,11 +1252,107 @@ def build_tiered_maps(
     global_to_combined = torch.tensor(
         global_to_combined_host, dtype=torch.int32, device=device
     )
-    descriptor = torch.tensor(
+    descriptor_row = torch.tensor(
         [*range(len(tier0_ids)), *((1 << 8) | i for i in range(len(tier1_ids)))],
         dtype=torch.int32,
         device=device,
     )
+    # The descriptor table carries one row per projection (gate, up, down).
+    # Per-expert tiering is the degenerate case where all three rows are
+    # identical, reproducing single-row behaviour bit-for-bit.
+    descriptor = descriptor_row.repeat(3).contiguous()
+    return global_to_combined, descriptor
+
+
+def build_projection_tiered_maps(
+    gate_tiers: Sequence[int],
+    up_tiers: Sequence[int],
+    down_tiers: Sequence[int],
+    *,
+    tier_slots: Sequence[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the route map and the three-row descriptor map for one R7 layer.
+
+    Each argument is one tier id (0 or 1) per global expert, for that
+    projection. Combined expert ids are the global ids -- with per-projection
+    tiering there is no single tier-contiguous ordering, so all tier knowledge
+    lives in the descriptor rows and global_to_combined is the identity.
+
+    Returns (global_to_combined, descriptor_map) where descriptor_map is
+    int32[3 * sum(tier_slots)] laid out gate, up, down. Real entries are
+    (tier << 8) | tier_local_index and padding entries are -1.
+    glm52-r7-projtiers.
+    """
+
+    projections = (
+        ("gate", tuple(int(t) for t in gate_tiers)),
+        ("up", tuple(int(t) for t in up_tiers)),
+        ("down", tuple(int(t) for t in down_tiers)),
+    )
+    slots = tuple(int(value) for value in tier_slots)
+    if len(slots) != 2:
+        raise ValueError("mixed Trellis tier_slots must contain exactly two counts")
+    if any(value < 0 or value > 256 for value in slots):
+        raise ValueError("mixed Trellis tier slots must be in [0, 256]")
+    num_experts = len(projections[0][1])
+    rows: list[int] = []
+    projection_counts: list[tuple[int, int]] = []
+    for name, tiers in projections:
+        if len(tiers) != num_experts:
+            raise ValueError(
+                "mixed Trellis projection tier lists must agree on expert count: "
+                f"{name} has {len(tiers)}, expected {num_experts}"
+            )
+        if any(t not in (0, 1) for t in tiers):
+            raise ValueError(f"mixed Trellis {name} tier ids must be 0 or 1")
+        counters = [0, 0]
+        row = []
+        for tier in tiers:
+            local = counters[tier]
+            counters[tier] += 1
+            if local > 0xFF:
+                raise ValueError(
+                    f"mixed Trellis {name} tier {tier} exceeds 256 experts"
+                )
+            row.append((tier << 8) | local)
+        projection_counts.append((counters[0], counters[1]))
+        rows.extend(row)
+    # The launch sizes the combined namespace as the sum of the tier slot
+    # counts, and a tier slots max(gate_count, up_count), so with per-projection
+    # tiering that sum exceeds the real expert count (257 vs 256 on this
+    # checkpoint). Both tables are laid out on the padded stride; the tail
+    # entries are -1 and the kernel skips them, since it guards on
+    # 0 <= combined_expert < total and descriptor >= 0.
+    required_fc1 = tuple(
+        max(projection_counts[0][tier], projection_counts[1][tier])
+        for tier in range(2)
+    )
+    if any(slots[tier] < required_fc1[tier] for tier in range(2)):
+        raise ValueError(
+            "mixed Trellis tier slots cannot address all gate/up locals: "
+            f"slots={slots}, required={required_fc1}"
+        )
+    stride = sum(slots)
+    if stride < num_experts:
+        raise ValueError(
+            f"mixed Trellis tier slots ({stride}) cannot address "
+            f"{num_experts} experts"
+        )
+    global_to_combined = torch.full(
+        (stride,), -1, dtype=torch.int32, device=device
+    )
+    global_to_combined[:num_experts] = torch.arange(
+        num_experts, dtype=torch.int32, device=device
+    )
+    descriptor = torch.full((3 * stride,), -1, dtype=torch.int32, device=device)
+    for row_index in range(3):
+        base = row_index * num_experts
+        descriptor[row_index * stride : row_index * stride + num_experts] = (
+            torch.tensor(
+                rows[base : base + num_experts], dtype=torch.int32, device=device
+            )
+        )
     return global_to_combined, descriptor
 
 
@@ -1224,19 +1383,62 @@ def _validate_mixed_trellis_tier_storage(
     """Fail closed before binding expert-sized storage as raw CuTe pointers."""
     expected_experts = int(expected_experts)
     bits = int(bits)
-    fc1_cols = 2 * int(intermediate_size)
+    # Per-projection membership lets a tier hold a different number of FC2
+    # (down) experts than FC1 (gate/up) slots, so the FC2 count cannot be
+    # assumed equal to expected_experts. Derive it from the W2 payload itself,
+    # which is the tensor that actually carries the data, then require the
+    # global-scale vector to agree. Deriving it from the scale vector instead
+    # would report a malformed scale as a confusing W2 extent error.
+    w2_expert_stride = (
+        (int(intermediate_size) // 16) * (int(hidden_size) // 16) * (8 * bits)
+    )
+    w2_elements = int(tier.w2.numel())
+    # The FC2 count is NOT bounded by the FC1 slot count: per-projection
+    # membership routinely gives a tier more down experts than gate/up slots
+    # (measured 231 down vs 77 gate/up on a real R7 layer). The real ceiling is
+    # the descriptor's 8-bit tier-local index.
+    if (
+        tier.w2.dtype != torch.int32
+        or w2_expert_stride <= 0
+        or w2_elements % w2_expert_stride != 0
+        or not 1 <= w2_elements // w2_expert_stride <= _MAX_TIER_EXPERTS
+    ):
+        raise ValueError(
+            f"mixed Trellis {name}.w2 must be contiguous torch.int32 on "
+            f"{device} holding 1..{_MAX_TIER_EXPERTS} whole FC2 experts of "
+            f"{w2_expert_stride} elements, got {w2_elements}"
+        )
+    fc2_experts = w2_elements // w2_expert_stride
+    # The projection-tight w13 holds gate_count + up_count planes, which lies
+    # in [expected_experts, 2*expected_experts] and is data dependent, so it is
+    # validated as a proj-stride multiple in that band rather than as a fixed
+    # padded size. The kernel receives the gate count explicitly, so the
+    # up-block base is exact rather than inferred from a padded extent.
+    _proj_stride = (
+        (int(hidden_size) // 16) * (int(intermediate_size) // 16) * (8 * bits)
+    )
+    _w13_planes = int(tier.w13.numel()) // _proj_stride if _proj_stride else 0
+    if (
+        tier.w13.dtype != torch.int32
+        or tier.w13.device != device
+        or not tier.w13.is_contiguous()
+        or _proj_stride <= 0
+        or int(tier.w13.numel()) % _proj_stride != 0
+        or not expected_experts <= _w13_planes <= 2 * expected_experts
+        or int(tier.w13.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            f"mixed Trellis {name}.w13 must be contiguous int32 on {device} "
+            f"with a proj-stride-multiple plane count in "
+            f"[{expected_experts}, {2 * expected_experts}], got "
+            f"{int(tier.w13.numel())} elements"
+        )
     expected = (
-        (
-            "w13",
-            tier.w13,
-            torch.int32,
-            expected_experts * (int(hidden_size) // 16) * (fc1_cols // 16) * (8 * bits),
-        ),
         (
             "w2",
             tier.w2,
             torch.int32,
-            expected_experts
+            fc2_experts
             * (int(intermediate_size) // 16)
             * (int(hidden_size) // 16)
             * (8 * bits),
@@ -1256,7 +1458,7 @@ def _validate_mixed_trellis_tier_storage(
             "w2_global_scale",
             tier.w2_global_scale,
             torch.float32,
-            expected_experts,
+            fc2_experts,
         ),
     )
     for field, tensor, expected_dtype, expected_elements in expected:
@@ -1285,7 +1487,18 @@ def run_mixed_trellis(
     rotations: MixedTrellisRotations,
     launch: MixedTrellisCompileResult,
     buffers: MixedTrellisBuffers,
+    gate_experts: tuple[int, int] | None = None,
 ) -> torch.Tensor:
+    # Gate counts are per layer (one compiled launch can serve layers with
+    # different gate counts at the same expert count), so they ride in here
+    # rather than in the launch plan. Absent them, fall back to the tier
+    # expert counts, i.e. today's exact padded behaviour.
+    if gate_experts is None:
+        _gate0 = int(launch.tier0_num_experts)
+        _gate1 = int(launch.tier1_num_experts)
+    else:
+        _gate0 = int(gate_experts[0])
+        _gate1 = int(gate_experts[1])
     m = int(x.shape[0])
     if m <= 0:
         raise ValueError(f"mixed Trellis requires at least one active row, got {m}")
@@ -1312,10 +1525,10 @@ def run_mixed_trellis(
         ("tier1", tier1, launch.tier1_num_experts),
     ):
         actual_experts = int(tier.num_experts)
-        if actual_experts != int(expected_experts):
+        if actual_experts > int(expected_experts):  # glm52-r7-projtiers
             raise ValueError(
-                f"mixed Trellis {name} has {actual_experts} experts, but the "
-                f"launch plan describes {int(expected_experts)}"
+                f"mixed Trellis {name} has {actual_experts} experts, which "
+                f"exceeds the {int(expected_experts)} the launch plan allows"
             )
     _validate_mixed_trellis_tier_storage(
         name="tier0",
@@ -1340,15 +1553,19 @@ def run_mixed_trellis(
         ("global_to_combined", global_to_combined),
         ("descriptor_map", descriptor_map),
     ):
+        # glm52-r7-projtiers: descriptor_map carries one row per projection.
+        expected_entries = (
+            3 * total_experts if name == "descriptor_map" else total_experts
+        )
         if (
             mapping.dtype != torch.int32
             or mapping.device != x.device
             or not mapping.is_contiguous()
-            or int(mapping.numel()) != total_experts
+            or int(mapping.numel()) != expected_entries
         ):
             raise ValueError(
                 f"mixed Trellis {name} must be contiguous int32 on {x.device} "
-                f"with {total_experts} elements"
+                f"with {expected_entries} elements"
             )
     for name, table, expected_elements in (
         (
@@ -1537,9 +1754,14 @@ def run_mixed_trellis(
         ),
         Int32(launch.tier0_num_experts),
         Int32(launch.tier1_num_experts),
+        Int32(int(tier0.w2_global_scale.numel())),
+        Int32(int(tier1.w2_global_scale.numel())),
         m,
         max(int(launch.blocks_per_sm) * int(launch.sms), 1),
         stream,
+        # Keyword, so the positional chain above stays intact.
+        tier0_gate_experts=Int32(_gate0),
+        tier1_gate_experts=Int32(_gate1),
     )
     launch.topk_sum.compiled(
         make_ptr(
@@ -1591,6 +1813,7 @@ __all__ = [
     "MixedTrellisCompileResult",
     "MixedTrellisRotations",
     "build_ordered_maps",
+    "build_projection_tiered_maps",
     "build_tiered_maps",
     "combine_trellis_rotations",
     "compile_mixed_trellis",

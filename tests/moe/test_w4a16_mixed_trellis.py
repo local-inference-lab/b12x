@@ -24,6 +24,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     W4A16MixedTrellisKernel,
     _validate_mixed_trellis_tier_storage,
     build_ordered_maps,
+    build_projection_tiered_maps,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
@@ -827,6 +828,82 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
         build_tiered_maps((0, 1), (1, 2), device=torch.device("cpu"))
     with pytest.raises(ValueError, match="disjoint partition"):
         build_tiered_maps((0, 4), (1, 2), device=torch.device("cpu"))
+
+
+def test_build_tiered_maps_repeats_the_legacy_descriptor_row() -> None:
+    route, descriptor = build_tiered_maps(
+        (2, 0), (3, 1), device=torch.device("cpu")
+    )
+    assert route.tolist() == [1, 3, 0, 2]
+    rows = descriptor.reshape(3, 4)
+    assert rows[0].tolist() == [0, 1, 1 << 8, (1 << 8) | 1]
+    assert torch.equal(rows[0], rows[1])
+    assert torch.equal(rows[0], rows[2])
+
+
+def test_build_projection_tiered_maps_pads_each_row_to_slot_stride() -> None:
+    gate = [0] * 129 + [1] * 127
+    up = [0] * 128 + [1] * 128
+    down = [0] * 77 + [1] * 179
+    route, descriptor = build_projection_tiered_maps(
+        gate,
+        up,
+        down,
+        tier_slots=(129, 128),
+        device=torch.device("cpu"),
+    )
+
+    assert route.dtype == torch.int32
+    assert route.tolist() == [*range(256), -1]
+    rows = descriptor.reshape(3, 257)
+    assert torch.equal(rows[:, -1], torch.full((3,), -1, dtype=torch.int32))
+    assert rows[0, 128].item() == 128
+    assert rows[0, 129].item() == 1 << 8
+    assert rows[1, 127].item() == 127
+    assert rows[1, 128].item() == 1 << 8
+    assert rows[2, 76].item() == 76
+    assert rows[2, 77].item() == 1 << 8
+
+
+def test_build_projection_tiered_maps_supports_an_empty_tier() -> None:
+    tiers = [0] * 256
+    route, descriptor = build_projection_tiered_maps(
+        tiers,
+        tiers,
+        tiers,
+        tier_slots=(256, 0),
+        device=torch.device("cpu"),
+    )
+    assert route.tolist() == list(range(256))
+    rows = descriptor.reshape(3, 256)
+    assert rows[:, 255].tolist() == [255, 255, 255]
+
+
+@pytest.mark.parametrize("slots", [(256,), (256, 0, 0)])
+def test_build_projection_tiered_maps_rejects_wrong_slot_arity(slots) -> None:
+    with pytest.raises(ValueError, match="exactly two"):
+        build_projection_tiered_maps(
+            [0], [0], [0], tier_slots=slots, device=torch.device("cpu")
+        )
+
+
+@pytest.mark.parametrize("slots", [(-1, 2), (300, -44)])
+def test_build_projection_tiered_maps_rejects_invalid_slots(slots) -> None:
+    with pytest.raises(ValueError, match=r"\[0, 256\]"):
+        build_projection_tiered_maps(
+            [0], [0], [0], tier_slots=slots, device=torch.device("cpu")
+        )
+
+
+def test_build_projection_tiered_maps_rejects_per_tier_underallocation() -> None:
+    with pytest.raises(ValueError, match="cannot address all gate/up locals"):
+        build_projection_tiered_maps(
+            [0] * 129 + [1] * 127,
+            [0] * 128 + [1] * 128,
+            [0] * 256,
+            tier_slots=(128, 128),
+            device=torch.device("cpu"),
+        )
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
