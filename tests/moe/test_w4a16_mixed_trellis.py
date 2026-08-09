@@ -74,12 +74,16 @@ def test_mixed_kernel_uses_runtime_expert_bounds() -> None:
 
     assert "tier0_num_experts" in call_parameters
     assert "tier1_num_experts" in call_parameters
+    assert "tier0_up_experts" in call_parameters
+    assert "tier1_up_experts" in call_parameters
     assert "self.tier0.num_experts" not in emit_source
     assert "self.tier1.num_experts" not in emit_source
     assert "self.total_experts" not in emit_source
     assert "self.total_experts" not in kernel_source
-    assert "local_expert < tier0_num_experts" in emit_source
-    assert "local_expert < tier1_num_experts" in emit_source
+    assert "local_expert < tier0_gate_experts" in emit_source
+    assert "local_expert < tier1_gate_experts" in emit_source
+    assert "local_expert < tier0_up_experts" in emit_source
+    assert "local_expert < tier1_up_experts" in emit_source
 
 
 def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
@@ -122,6 +126,51 @@ def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
         candidate = SimpleNamespace(**{**vars(tier), field: replacement})
         with pytest.raises(ValueError, match=rf"tier0\.{field}"):
             validate(candidate)
+
+
+def test_projection_tight_storage_requires_coupled_exact_counts() -> None:
+    device = torch.device("cpu")
+    experts, hidden, intermediate, bits = 4, 128, 128, 3
+    stride = (hidden // 16) * (intermediate // 16) * (8 * bits)
+
+    def tier(planes):
+        return SimpleNamespace(
+            num_experts=experts,
+            w13=torch.empty(planes * stride, dtype=torch.int32),
+            w2=torch.empty(experts * stride, dtype=torch.int32),
+            w13_scale=torch.empty(4, dtype=torch.uint8),
+            w2_scale=torch.empty(4, dtype=torch.uint8),
+            w13_global_scale=torch.empty(experts, dtype=torch.float32),
+            w2_global_scale=torch.empty(experts, dtype=torch.float32),
+        )
+
+    def validate(candidate, gate=None, up=None):
+        _validate_mixed_trellis_tier_storage(
+            name="tier0",
+            tier=candidate,
+            expected_experts=experts,
+            bits=bits,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            device=device,
+            gate_experts=gate,
+            up_experts=up,
+        )
+
+    # Physical [1 gate | 3 up] is the exact four-plane target contract.
+    validate(tier(4), gate=1, up=3)
+
+    with pytest.raises(ValueError, match="exactly 4 projection planes"):
+        validate(tier(5), gate=1, up=3)
+    with pytest.raises(ValueError, match="paired gate_experts/up_experts"):
+        validate(tier(4), gate=1)
+    with pytest.raises(ValueError, match="projection counts"):
+        validate(tier(5), gate=5, up=0)
+
+    # No explicit counts is the legacy padded contract: G=U=E, hence 2E.
+    with pytest.raises(ValueError, match="exactly 8 projection planes"):
+        validate(tier(4))
+    validate(tier(8))
 
 
 def _sm12x_available() -> bool:

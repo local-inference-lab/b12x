@@ -119,7 +119,7 @@ class MixedTrellisTier(Protocol):
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
-    ABI_VERSION = 7
+    ABI_VERSION = 8
 
     def __init__(
         self,
@@ -330,6 +330,10 @@ class W4A16MixedTrellisKernel:
         tier1_num_experts: Int32,
         tier0_fc2_experts: Int32,
         tier1_fc2_experts: Int32,
+        tier0_gate_experts: Int32,
+        tier1_gate_experts: Int32,
+        tier0_up_experts: Int32,
+        tier1_up_experts: Int32,
         route_block_idx: Int32,
         output_n_tile: Int32,
         reduce_k_tile: Int32,
@@ -369,8 +373,11 @@ class W4A16MixedTrellisKernel:
                 # FC1 is bounded by the tier's FC1 slot count; FC2 by its own
                 # independent count, since per-projection membership lets the
                 # two differ. Both remain real bounds.
-                tier0_in_bounds = local_expert < tier0_num_experts
-                if cutlass.const_expr(not is_fc1):
+                if cutlass.const_expr(is_fc1):
+                    tier0_in_bounds = local_expert < tier0_gate_experts
+                    if output_n_tile >= fc1_half_tiles:
+                        tier0_in_bounds = local_expert < tier0_up_experts
+                else:
                     tier0_in_bounds = local_expert < tier0_fc2_experts
                 if tier == Int32(0) and tier0_in_bounds:
                     if cutlass.const_expr(is_fc1):
@@ -401,8 +408,11 @@ class W4A16MixedTrellisKernel:
                         lock_slot,
                         active_size_m,
                     )
-                tier1_in_bounds = local_expert < tier1_num_experts
-                if cutlass.const_expr(not is_fc1):
+                if cutlass.const_expr(is_fc1):
+                    tier1_in_bounds = local_expert < tier1_gate_experts
+                    if output_n_tile >= fc1_half_tiles:
+                        tier1_in_bounds = local_expert < tier1_up_experts
+                else:
                     tier1_in_bounds = local_expert < tier1_fc2_experts
                 if tier == Int32(1) and tier1_in_bounds:
                     if cutlass.const_expr(is_fc1):
@@ -478,6 +488,8 @@ class W4A16MixedTrellisKernel:
         # when it traces, and a None default is untypeable.
         tier0_gate_experts: cutlass.Int32,
         tier1_gate_experts: cutlass.Int32,
+        tier0_up_experts: cutlass.Int32,
+        tier1_up_experts: cutlass.Int32,
     ):
         tier0_experts = cutlass.Int64(tier0_num_experts)
         # FC2 extents are independent of the FC1 slot counts.
@@ -679,6 +691,10 @@ class W4A16MixedTrellisKernel:
             tier1_num_experts,
             tier0_fc2_experts,
             tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
             active_m,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -724,6 +740,10 @@ class W4A16MixedTrellisKernel:
         tier1_num_experts: cutlass.Int32,
         tier0_fc2_experts: cutlass.Int32,
         tier1_fc2_experts: cutlass.Int32,
+        tier0_gate_experts: cutlass.Int32,
+        tier1_gate_experts: cutlass.Int32,
+        tier0_up_experts: cutlass.Int32,
+        tier1_up_experts: cutlass.Int32,
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -768,6 +788,10 @@ class W4A16MixedTrellisKernel:
             tier1_num_experts,
             tier0_fc2_experts,
             tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
         )
         fc2_emit = partial(
             self._emit_tier_tile,
@@ -794,6 +818,10 @@ class W4A16MixedTrellisKernel:
             tier1_num_experts,
             tier0_fc2_experts,
             tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
         )
         total_experts = tier0_num_experts + tier1_num_experts
         self.driver._moe_body(
@@ -1075,6 +1103,9 @@ def compile_mixed_trellis(
         current_cuda_stream(),
         # Gate-count trace placeholders (keyword-only, last in the signature);
         # real counts ride each launch.
+        Int32(tier0_num_experts),
+        Int32(tier1_num_experts),
+        # Up-count trace placeholders; real counts ride each launch too.
         Int32(tier0_num_experts),
         Int32(tier1_num_experts),
     )
@@ -1379,6 +1410,8 @@ def _validate_mixed_trellis_tier_storage(
     hidden_size: int,
     intermediate_size: int,
     device: torch.device,
+    gate_experts: int | None = None,
+    up_experts: int | None = None,
 ) -> None:
     """Fail closed before binding expert-sized storage as raw CuTe pointers."""
     expected_experts = int(expected_experts)
@@ -1409,28 +1442,43 @@ def _validate_mixed_trellis_tier_storage(
             f"{w2_expert_stride} elements, got {w2_elements}"
         )
     fc2_experts = w2_elements // w2_expert_stride
-    # The projection-tight w13 holds gate_count + up_count planes, which lies
-    # in [expected_experts, 2*expected_experts] and is data dependent, so it is
-    # validated as a proj-stride multiple in that band rather than as a fixed
-    # padded size. The kernel receives the gate count explicitly, so the
-    # up-block base is exact rather than inferred from a padded extent.
+    if gate_experts is None and up_experts is None:
+        gate_experts = expected_experts
+        up_experts = expected_experts
+    elif gate_experts is None or up_experts is None:
+        raise ValueError(
+            f"mixed Trellis {name} requires paired gate_experts/up_experts"
+        )
+    gate_experts = int(gate_experts)
+    up_experts = int(up_experts)
+    if not (
+        0 <= gate_experts <= expected_experts
+        and 0 <= up_experts <= expected_experts
+    ):
+        raise ValueError(
+            f"mixed Trellis {name} projection counts must both be in "
+            f"[0, {expected_experts}], got gate={gate_experts}, up={up_experts}"
+        )
+    # Legacy callers have G=U=E and therefore require the historical 2E
+    # planes. Tight callers must couple the physical payload exactly to G+U.
+    # One dummy plane is permitted only for the empty/empty tier.
     _proj_stride = (
         (int(hidden_size) // 16) * (int(intermediate_size) // 16) * (8 * bits)
     )
     _w13_planes = int(tier.w13.numel()) // _proj_stride if _proj_stride else 0
+    _expected_w13_planes = max(gate_experts + up_experts, 1)
     if (
         tier.w13.dtype != torch.int32
         or tier.w13.device != device
         or not tier.w13.is_contiguous()
         or _proj_stride <= 0
         or int(tier.w13.numel()) % _proj_stride != 0
-        or not expected_experts <= _w13_planes <= 2 * expected_experts
+        or _w13_planes != _expected_w13_planes
         or int(tier.w13.data_ptr()) % 16 != 0
     ):
         raise ValueError(
             f"mixed Trellis {name}.w13 must be contiguous int32 on {device} "
-            f"with a proj-stride-multiple plane count in "
-            f"[{expected_experts}, {2 * expected_experts}], got "
+            f"with exactly {_expected_w13_planes} projection planes, got "
             f"{int(tier.w13.numel())} elements"
         )
     expected = (
@@ -1488,17 +1536,32 @@ def run_mixed_trellis(
     launch: MixedTrellisCompileResult,
     buffers: MixedTrellisBuffers,
     gate_experts: tuple[int, int] | None = None,
+    up_experts: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    # Gate counts are per layer (one compiled launch can serve layers with
-    # different gate counts at the same expert count), so they ride in here
-    # rather than in the launch plan. Absent them, fall back to the tier
-    # expert counts, i.e. today's exact padded behaviour.
-    if gate_experts is None:
-        _gate0 = int(launch.tier0_num_experts)
-        _gate1 = int(launch.tier1_num_experts)
-    else:
-        _gate0 = int(gate_experts[0])
-        _gate1 = int(gate_experts[1])
+    def projection_counts(name, values, defaults):
+        if values is None:
+            return defaults
+        if (
+            not isinstance(values, tuple)
+            or len(values) != 2
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in values)
+        ):
+            raise TypeError(
+                f"mixed Trellis {name} must be a pair of integer counts"
+            )
+        return values
+
+    if (gate_experts is None) != (up_experts is None):
+        raise ValueError(
+            "mixed Trellis projection-tight storage requires paired "
+            "gate_experts/up_experts"
+        )
+    defaults = (
+        int(launch.tier0_num_experts),
+        int(launch.tier1_num_experts),
+    )
+    _gate0, _gate1 = projection_counts("gate_experts", gate_experts, defaults)
+    _up0, _up1 = projection_counts("up_experts", up_experts, defaults)
     m = int(x.shape[0])
     if m <= 0:
         raise ValueError(f"mixed Trellis requires at least one active row, got {m}")
@@ -1525,10 +1588,10 @@ def run_mixed_trellis(
         ("tier1", tier1, launch.tier1_num_experts),
     ):
         actual_experts = int(tier.num_experts)
-        if actual_experts > int(expected_experts):  # glm52-r7-projtiers
+        if actual_experts != int(expected_experts):
             raise ValueError(
-                f"mixed Trellis {name} has {actual_experts} experts, which "
-                f"exceeds the {int(expected_experts)} the launch plan allows"
+                f"mixed Trellis {name} has {actual_experts} experts, expected "
+                f"the launch-plan count {int(expected_experts)}"
             )
     _validate_mixed_trellis_tier_storage(
         name="tier0",
@@ -1538,6 +1601,8 @@ def run_mixed_trellis(
         hidden_size=launch.hidden_size,
         intermediate_size=launch.intermediate_size,
         device=x.device,
+        gate_experts=_gate0,
+        up_experts=_up0,
     )
     _validate_mixed_trellis_tier_storage(
         name="tier1",
@@ -1547,6 +1612,8 @@ def run_mixed_trellis(
         hidden_size=launch.hidden_size,
         intermediate_size=launch.intermediate_size,
         device=x.device,
+        gate_experts=_gate1,
+        up_experts=_up1,
     )
     total_experts = launch.tier0_num_experts + launch.tier1_num_experts
     for name, mapping in (
@@ -1762,6 +1829,8 @@ def run_mixed_trellis(
         # Keyword, so the positional chain above stays intact.
         tier0_gate_experts=Int32(_gate0),
         tier1_gate_experts=Int32(_gate1),
+        tier0_up_experts=Int32(_up0),
+        tier1_up_experts=Int32(_up1),
     )
     launch.topk_sum.compiled(
         make_ptr(
