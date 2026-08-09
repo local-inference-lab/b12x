@@ -108,6 +108,19 @@ def _copy_16b(source: cute.Pointer, destination: cute.Pointer) -> None:
     st_global_v4_u32(destination.toint(), *values)
 
 
+@cute.jit
+def _copy_16b_addr(source: Int64, destination: Int64) -> None:
+    """Copy 16B between two byte addresses already resolved by the caller.
+
+    The gather loops pick their source rank at runtime.  Selecting the address
+    first and issuing one copy keeps a single load in flight per thread; cloning
+    the copy once per peer inside a constexpr chain makes a warp that straddles
+    two source ranks issue its loads in two serialised batches.
+    """
+    values = ld_global_v4_u32(source)
+    st_global_v4_u32(destination, *values)
+
+
 @dsl_user_op
 def _fma_rn_f32(
     a: Float32,
@@ -1256,6 +1269,19 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             )
             source_rank = row_pack // first_packs
             pack = row_pack - source_rank * first_packs
+            # Default to this rank's own slice so the address is always
+            # mappable; the chain below always overwrites it, because
+            # source_rank is derived from row_pack and is in range.
+            source_address = Int64(
+                (
+                    local_first
+                    + (
+                        Int64(batch_index) * Int64(first_packs)
+                        + Int64(pack)
+                    )
+                    * Int64(4)
+                ).toint()
+            )
             for source in cutlass.range_constexpr(self._world_size):
                 if source_rank == Int32(source):
                     if cutlass.const_expr(source == self._rank):
@@ -1268,11 +1294,16 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                         source_base = (
                             Int64(batch_index) * Int64(combined_packs)
                         )
-                    _copy_16b(
-                        source_words
-                        + (source_base + Int64(pack)) * Int64(4),
-                        output_first + Int64(linear) * Int64(4),
+                    source_address = Int64(
+                        (
+                            source_words
+                            + (source_base + Int64(pack)) * Int64(4)
+                        ).toint()
                     )
+            _copy_16b_addr(
+                source_address,
+                Int64((output_first + Int64(linear) * Int64(4)).toint()),
+            )
             linear += Int32(self._threads)
 
         if cutlass.const_expr(not self._kimi_topk):
@@ -1289,6 +1320,16 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 )
                 source_rank = row_pack // second_packs
                 pack = row_pack - source_rank * second_packs
+                source_address = Int64(
+                    (
+                        local_second
+                        + (
+                            Int64(batch_index) * Int64(second_packs)
+                            + Int64(pack)
+                        )
+                        * Int64(4)
+                    ).toint()
+                )
                 for source in cutlass.range_constexpr(self._world_size):
                     if source_rank == Int32(source):
                         if cutlass.const_expr(source == self._rank):
@@ -1304,11 +1345,18 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                                 Int64(batch_index) * Int64(combined_packs)
                                 + Int64(first_packs)
                             )
-                        _copy_16b(
-                            source_words
-                            + (source_base + Int64(pack)) * Int64(4),
-                            output_second + Int64(linear) * Int64(4),
+                        source_address = Int64(
+                            (
+                                source_words
+                                + (source_base + Int64(pack)) * Int64(4)
+                            ).toint()
                         )
+                _copy_16b_addr(
+                    source_address,
+                    Int64(
+                        (output_second + Int64(linear) * Int64(4)).toint()
+                    ),
+                )
                 linear += Int32(self._threads)
         else:
             smem_alloc = cutlass.utils.SmemAllocator()
