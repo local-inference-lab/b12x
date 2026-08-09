@@ -1491,7 +1491,17 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                     selected_ids[selected] = final_expert
                     weight = unbiased_scores[final_expert]
                     selected_weights[selected] = weight
-                    weight_sum += weight
+                # The native kernel renormalises with cg::reduce over the warp,
+                # which folds by halves (lane l adds lane l+stride, stride
+                # halving from 16). Summing left to right instead lands a ULP
+                # away, so fold in the same order. Same fifteen adds.
+                eight = [
+                    selected_weights[item] + selected_weights[item + 8]
+                    for item in range(8)
+                ]
+                four = [eight[item] + eight[item + 4] for item in range(4)]
+                two = [four[item] + four[item + 2] for item in range(2)]
+                weight_sum = two[0] + two[1]
             if Int32(tidx) == Int32(0):
                 scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
                 for selected in cutlass.range_constexpr(16):
