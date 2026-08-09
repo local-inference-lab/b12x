@@ -18,6 +18,25 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
+def f32_as_u32(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Bitcast float32 to uint32 without numeric conversion."""
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_u64(addr: Int64, *, loc=None, ip=None) -> Uint64:
     return Uint64(
         llvm.inline_asm(
@@ -195,9 +214,7 @@ def unpack_bf16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32
 
 
 @dsl_user_op
-def pack_f32x2_to_f16x2(
-    lo: Float32, hi: Float32, *, loc=None, ip=None
-) -> Uint32:
+def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -217,9 +234,7 @@ def pack_f32x2_to_f16x2(
 
 
 @dsl_user_op
-def pack_f32x2_to_bf16x2(
-    lo: Float32, hi: Float32, *, loc=None, ip=None
-) -> Uint32:
+def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
     """Match two scalar ``__float2bfloat16`` conversions without saturation."""
     return Uint32(
         llvm.inline_asm(
@@ -313,9 +328,7 @@ def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def atomic_add_global_u32(
-    addr: Int64, value: Uint32, *, loc=None, ip=None
-) -> Uint32:
+def atomic_add_global_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
