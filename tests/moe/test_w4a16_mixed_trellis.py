@@ -145,8 +145,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
         "descriptor_map",
+        "cutlass.Int64(0)",
+        "cutlass.Int64(0)",
         "total_experts",
         "total_experts",
         "smem_base",

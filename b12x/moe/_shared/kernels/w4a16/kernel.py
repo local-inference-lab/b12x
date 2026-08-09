@@ -441,7 +441,17 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    ultra_wide_fc2 = (
+        int(tile_n) == 512
+        and int(tile_k) == 32
+        and int(cta_threads) == 256
+        and _scale_group_size(scale_format) == 32
+    )
+    if (
+        int(tile_n) < 64
+        or (int(tile_k) < 64 and not ultra_wide_fc2)
+        or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -1963,7 +1973,7 @@ class W4A16GemmKernel:
             reduce_slice_idx,
             lock_slot,
             active_size_m,
-            -1,
+            Int32(0),
         )
 
     @cute.jit
@@ -2466,6 +2476,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            -1,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2478,6 +2489,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            Int32(0),
+            0,
         )
         a0_regs_cur = cute.make_rmem_tensor((2,), Uint32)
         a0_regs_next = cute.make_rmem_tensor((2,), Uint32)
@@ -2524,6 +2537,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            0,
         )
 
         self._finish_tile(
@@ -2979,6 +2993,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
@@ -3000,6 +3015,7 @@ class W4A16GemmKernel:
                             kk,
                             tile_idx,
                             k_tiles,
+                            dynamic_pair_override,
                         )
 
                         self._prefetch_pipeline_step(
@@ -3028,6 +3044,7 @@ class W4A16GemmKernel:
                             a_rows_per_iter,
                             output_n_tile,
                             expert_idx,
+                            dynamic_pair_override,
                         )
 
                         for jj in cutlass.range_constexpr(4):
@@ -3068,6 +3085,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(0),
                     Int32(0),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_cur,
@@ -3856,6 +3875,7 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         self._clear_b_scale_register_bundle(b_scale_next)
         self._clear_a_register_bundle_m8(a0_regs_next)
@@ -3871,6 +3891,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(pipe),
                     Int32(kk + 1),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -3898,6 +3920,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     next_pipe,
                     Int32(0),
+                    next_tile,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
