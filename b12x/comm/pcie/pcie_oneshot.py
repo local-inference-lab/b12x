@@ -114,6 +114,45 @@ def _push_mode_enabled() -> bool:
     return os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0")
 
 
+def _tp2_remote_push_enabled() -> bool:
+    """Enable the qualified fused TP2 remote-write transport."""
+
+    return os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
+
+
+def _tp4_remote_push_enabled() -> bool:
+    """Enable the qualified fused TP4 remote-write transport."""
+
+    return os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
+
+
+def _tp8_owner_reduce_enabled() -> bool:
+    """Enable the qualified topology-scoped fused TP8 transport by default."""
+
+    return os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
+
+
+def _uses_sharded_eager_storage(world_size: int) -> bool:
+    """Return whether staged fused transport needs one shard per source."""
+
+    return _push_mode_enabled() or (
+        (world_size == 2 and _tp2_remote_push_enabled())
+        or (world_size == 4 and _tp4_remote_push_enabled())
+        or (world_size == 8 and _tp8_owner_reduce_enabled())
+    )
+
+
+def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
+    """Values that must agree across ranks before IPC storage is allocated."""
+
+    return (
+        _push_mode_enabled(),
+        _tp2_remote_push_enabled(),
+        _tp4_remote_push_enabled(),
+        _tp8_owner_reduce_enabled(),
+    )
+
+
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     if inp.is_contiguous():
         return True
@@ -569,9 +608,7 @@ def _require_full_grid_residency(
         visible_sms = int(
             torch.cuda.get_device_properties(device).multi_processor_count
         )
-        test_visible_sms = int(
-            os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0"
-        )
+        test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
         if test_visible_sms > 0:
             visible_sms = min(visible_sms, test_visible_sms)
         if visible_sms < required_sms:
@@ -1206,6 +1243,7 @@ class _CuTeOneshotState:
     registered_tables: dict[int, int]
     eager_tables: Optional[tuple[int, int]] = None
     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
+    eager_buffer_bytes: Optional[int] = None
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
@@ -1315,6 +1353,7 @@ class _CuTeOneshotBackend:
         handle: int,
         pointers0: Sequence[int],
         pointers1: Sequence[int],
+        eager_buffer_bytes: Optional[int] = None,
     ) -> None:
         state = self._state(handle)
         ptrs0 = tuple(int(pointer) for pointer in pointers0)
@@ -1323,6 +1362,9 @@ class _CuTeOneshotBackend:
         table1 = self._write_table(state, ptrs1)
         state.eager_tables = (table0, table1)
         state.eager_ptrs = (ptrs0, ptrs1)
+        state.eager_buffer_bytes = (
+            None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
         state.eager_slot = 0
@@ -1331,9 +1373,7 @@ class _CuTeOneshotBackend:
     def _launch_geometry(size_packs: int) -> tuple[int, int]:
         threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
         threads = min(512, max(64, (threads // 32) * 32))
-        block_limit = int(
-            os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8")
-        )
+        block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
             raise ValueError(
                 f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
@@ -1345,6 +1385,47 @@ class _CuTeOneshotBackend:
     def _fused_threads() -> int:
         threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
         return min(512, max(64, (threads // 32) * 32))
+
+    @staticmethod
+    def _fused_topology_mode(
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+    ) -> Optional[str]:
+        """Select only topology transports with a qualified shape contract."""
+
+        if (
+            state.eager_tables is None
+            or state.eager_buffer_bytes is None
+            or inp.dtype not in (torch.float16, torch.bfloat16)
+            or inp.ndim == 0
+        ):
+            return None
+        hidden = int(inp.shape[-1])
+        if hidden <= 0 or inp.numel() % hidden != 0:
+            return None
+        rows = inp.numel() // hidden
+        if (
+            state.world_size == 8
+            and _tp8_owner_reduce_enabled()
+            and hidden in (4096, 6144)
+            and 2 <= rows <= 8
+        ):
+            return "stage_tp8_owner"
+        if (
+            state.world_size == 4
+            and _tp4_remote_push_enabled()
+            and hidden in (4096, 6144)
+            and 1 <= rows <= 32
+        ):
+            return "stage_remote_push"
+        if (
+            state.world_size == 2
+            and _tp2_remote_push_enabled()
+            and hidden == 4096
+            and 1 <= rows <= 32
+        ):
+            return "stage_remote_push"
+        return None
 
     @classmethod
     def _fused_launch_config(
@@ -1360,15 +1441,18 @@ class _CuTeOneshotBackend:
         if override > 0:
             ctas_per_row = override
         else:
-            min_ctas = (
-                hidden_packs + threads * _REG_PACKS - 1
-            ) // (threads * _REG_PACKS)
+            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
+                threads * _REG_PACKS
+            )
             ctas_per_row = max(max(1, 3 // rows), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
-        register_normalize = (
-            hidden_packs + ctas_per_row * threads - 1
-        ) // (ctas_per_row * threads) <= _REG_PACKS
-        if state.eager_tables is None:
+        register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
+            ctas_per_row * threads
+        ) <= _REG_PACKS
+        topology_mode = cls._fused_topology_mode(state, inp)
+        if topology_mode is not None:
+            mode = topology_mode
+        elif state.eager_tables is None:
             mode = "registered"
         elif _push_mode_enabled():
             mode = "stage_push"
@@ -1378,11 +1462,7 @@ class _CuTeOneshotBackend:
 
     @staticmethod
     def _device_index(device: torch.device) -> int:
-        return (
-            device.index
-            if device.index is not None
-            else torch.cuda.current_device()
-        )
+        return device.index if device.index is not None else torch.cuda.current_device()
 
     def prepare_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
         """Compile/load every graph slot variant without launching a kernel."""
@@ -1412,7 +1492,10 @@ class _CuTeOneshotBackend:
         """Compile/load fused graph variants without launching a kernel."""
 
         state = self._state(handle)
-        if state.eager_tables is None and int(inp.data_ptr()) not in state.registered_tables:
+        if (
+            state.eager_tables is None
+            and int(inp.data_ptr()) not in state.registered_tables
+        ):
             raise RuntimeError("input buffer is not registered")
         mode, single_cta, register_normalize, threads = self._fused_launch_config(
             state, inp
@@ -1421,9 +1504,7 @@ class _CuTeOneshotBackend:
 
         device_index = self._device_index(inp.device)
         variants = (
-            ((True, 0), (True, 1))
-            if state.eager_tables is not None
-            else ((False, 0),)
+            ((True, 0), (True, 1)) if state.eager_tables is not None else ((False, 0),)
         )
         for device_slot_selection, slot_bias in variants:
             get_fused_oneshot_launcher(
@@ -1440,9 +1521,7 @@ class _CuTeOneshotBackend:
             )
 
     @staticmethod
-    def _select_table(
-        state: _CuTeOneshotState, input_pointer: int
-    ) -> tuple[int, bool]:
+    def _select_table(state: _CuTeOneshotState, input_pointer: int) -> tuple[int, bool]:
         if state.eager_tables is not None:
             if state.device_slot_selection:
                 # The two 16-entry tables are adjacent in rank_data.  A
@@ -1477,9 +1556,7 @@ class _CuTeOneshotBackend:
             capturing and state.eager_tables is not None
         )
         prospective_slot_bias = (
-            state.slot_bias
-            if state.device_slot_selection
-            else state.eager_slot & 1
+            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
         )
         if capturing:
             from ._oneshot_cute import is_oneshot_launcher_prepared
@@ -1498,7 +1575,11 @@ class _CuTeOneshotBackend:
                     "cold PCIe oneshot CUDA graph capture is not allowed; "
                     "call prepare_graph_all_reduce() before capture"
                 )
-        if capturing and state.eager_tables is not None and not state.device_slot_selection:
+        if (
+            capturing
+            and state.eager_tables is not None
+            and not state.device_slot_selection
+        ):
             # The graph epoch begins at zero.  Bias it to the host slot that
             # would have been selected for this invocation, then keep both
             # values fixed in the captured specialization.
@@ -1563,9 +1644,7 @@ class _CuTeOneshotBackend:
             capturing and state.eager_tables is not None
         )
         prospective_slot_bias = (
-            state.slot_bias
-            if state.device_slot_selection
-            else state.eager_slot & 1
+            state.slot_bias if state.device_slot_selection else state.eager_slot & 1
         )
         if capturing:
             from ._oneshot_cute import is_fused_oneshot_launcher_prepared
@@ -1602,9 +1681,9 @@ class _CuTeOneshotBackend:
         if override > 0:
             ctas_per_row = override
         else:
-            min_ctas = (
-                hidden_packs + threads * _REG_PACKS - 1
-            ) // (threads * _REG_PACKS)
+            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
+                threads * _REG_PACKS
+            )
             ctas_per_row = max(max(1, 3 // rows), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
         assert single_cta_check == (ctas_per_row == 1)
@@ -1650,7 +1729,7 @@ class _CuTeOneshotBackend:
                 hidden_packs,
                 rows,
                 ctas_per_row,
-                inp.numel() // pack_elems,
+                int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon),
                 blocks,
             )
@@ -1664,9 +1743,7 @@ class _CuTeOneshotBackend:
     def register_graph_buffers(self, handle: int, handles, offsets) -> None:
         self._state(handle)
         if any(handles) or any(offsets):
-            raise RuntimeError(
-                "CuTe oneshot graph capture requires eager IPC buffers"
-            )
+            raise RuntimeError("CuTe oneshot graph capture requires eager IPC buffers")
 
     def dispose(self, handle: int) -> None:
         with self._lock:
@@ -1993,11 +2070,19 @@ class PCIeOneshotAllReduce:
             )
             if self._pending_eager_ptrs is not None:
                 self._eager_ptrs = self._pending_eager_ptrs
-                self._ext.register_pcie_buffers(
-                    self._ptr,
-                    list(self._eager_ptrs[0]),
-                    list(self._eager_ptrs[1]),
-                )
+                if isinstance(self._ext, _CuTeOneshotBackend):
+                    self._ext.register_pcie_buffers(
+                        self._ptr,
+                        list(self._eager_ptrs[0]),
+                        list(self._eager_ptrs[1]),
+                        self.eager_buffer_bytes,
+                    )
+                else:
+                    self._ext.register_pcie_buffers(
+                        self._ptr,
+                        list(self._eager_ptrs[0]),
+                        list(self._eager_ptrs[1]),
+                    )
         except Exception as exc:
             init_error = exc
         finally:
@@ -2121,7 +2206,7 @@ class PCIeOneshotAllReduce:
                 eager_buffer_bytes,
                 max_size,
                 rank_data_bytes,
-                _push_mode_enabled(),
+                _transport_policy_contract(),
             ),
         )
 
@@ -2407,8 +2492,9 @@ class PCIeOneshotAllReduce:
             raise ValueError("signal_bytes must be positive")
         if eager_buffer_bytes <= 0:
             raise ValueError("eager_buffer_bytes must be positive")
-        if _push_mode_enabled():
-            eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
+        world_size = dist.get_world_size(group=exchange_group)
+        if _uses_sharded_eager_storage(world_size):
+            eager_buffer_bytes *= world_size
 
         signal_offset = 0
         eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
@@ -2523,7 +2609,9 @@ class PCIeOneshotAllReduce:
         if not self.should_allreduce(inp) or inp.ndim == 0:
             raise ValueError("input does not satisfy fused PCIe oneshot requirements")
         if inp.shape[-1] * inp.element_size() % 16 != 0:
-            raise ValueError("the last input dimension must occupy a multiple of 16 bytes")
+            raise ValueError(
+                "the last input dimension must occupy a multiple of 16 bytes"
+            )
         self._check_stream()
         self._prepare_input(inp, peer_input_ptrs)
         self._ext.prepare_fused_all_reduce(self._ptr, inp)
@@ -3145,7 +3233,7 @@ class PCIeOneshotAllReducePool:
                     self.rank_data_bytes,
                     self.single_channel,
                     self.max_concurrent_channels,
-                    _push_mode_enabled(),
+                    _transport_policy_contract(),
                 ),
             )
             # A genuine single-channel pool has no independent eager/graph
@@ -3486,9 +3574,7 @@ class PCIeOneshotAllReducePool:
                         inp, peer_input_ptrs=peer_input_ptrs
                     )
             else:
-                channel.prepare_graph_all_reduce(
-                    inp, peer_input_ptrs=peer_input_ptrs
-                )
+                channel.prepare_graph_all_reduce(inp, peer_input_ptrs=peer_input_ptrs)
 
     def prepare_graph_fused_add_rms_norm(
         self,

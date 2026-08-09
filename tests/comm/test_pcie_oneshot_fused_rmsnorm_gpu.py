@@ -22,9 +22,7 @@ pytestmark = pytest.mark.skipif(
         "RMSNorm GPU tests"
     ),
 )
-TEST_TIMEOUT_SECONDS = float(
-    os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
-)
+TEST_TIMEOUT_SECONDS = float(os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300"))
 
 
 def _free_port() -> int:
@@ -145,10 +143,15 @@ def _run_eager(
     rank: int,
 ) -> None:
     epsilon = 1e-6
-    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+    cases = [
+        (dtype, rows, hidden_size)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32)
         for rows, hidden_size in (
             (1, 6144),
             (1, 8192),
+            (2, 4096),
+            (4, 4096),
+            (8, 4096),
             (2, 6144),
             (3, 6144),
             (4, 6144),
@@ -156,40 +159,47 @@ def _run_eager(
             (6, 6144),
             (8, 6144),
             (3, 128),
-        ):
-            if rows * hidden_size * dtype.itemsize > 128 * 1024:
-                continue
-            inp, residual, weight = _make_inputs(
-                rows,
-                hidden_size,
-                dtype,
-                device,
-                rank,
-            )
-            expected_out, expected_residual = _reference(
-                inp,
-                residual,
-                weight,
-                epsilon,
-            )
-            torch.cuda.synchronize(device)
-            wrong_device = (rank + 1) % dist.get_world_size()
-            exercise_device_guard = dtype == torch.float16 and rows == 1 and hidden_size == 6144
-            if exercise_device_guard:
-                torch.cuda.set_device(wrong_device)
-            out, residual_out = pool.all_reduce_fused_add_rms_norm(
-                inp,
-                residual,
-                weight,
-                epsilon,
-                channel_id="eager:fused-rmsnorm",
-            )
-            if exercise_device_guard:
-                assert torch.cuda.current_device() == wrong_device
-                torch.cuda.set_device(rank)
-            torch.cuda.synchronize(device)
-            _assert_close(out, expected_out, dtype)
-            _assert_close(residual_out, expected_residual, dtype)
+        )
+        if rows * hidden_size * dtype.itemsize <= 128 * 1024
+    ]
+    if os.getenv("B12X_PCIE_ONESHOT_RMS_TOPOLOGY_ONLY", "0") not in ("", "0"):
+        hidden_size = 4096 if dist.get_world_size() == 2 else 6144
+        cases = [(torch.bfloat16, rows, hidden_size) for rows in (1, 2, 4, 8)]
+
+    for dtype, rows, hidden_size in cases:
+        inp, residual, weight = _make_inputs(
+            rows,
+            hidden_size,
+            dtype,
+            device,
+            rank,
+        )
+        expected_out, expected_residual = _reference(
+            inp,
+            residual,
+            weight,
+            epsilon,
+        )
+        torch.cuda.synchronize(device)
+        wrong_device = (rank + 1) % dist.get_world_size()
+        exercise_device_guard = (
+            dtype == torch.float16 and rows == 1 and hidden_size == 6144
+        )
+        if exercise_device_guard:
+            torch.cuda.set_device(wrong_device)
+        out, residual_out = pool.all_reduce_fused_add_rms_norm(
+            inp,
+            residual,
+            weight,
+            epsilon,
+            channel_id="eager:fused-rmsnorm",
+        )
+        if exercise_device_guard:
+            assert torch.cuda.current_device() == wrong_device
+            torch.cuda.set_device(rank)
+        torch.cuda.synchronize(device)
+        _assert_close(out, expected_out, dtype)
+        _assert_close(residual_out, expected_residual, dtype)
 
 
 def _run_graph(
@@ -197,8 +207,8 @@ def _run_graph(
     device: torch.device,
     rank: int,
 ) -> None:
-    rows = 4
-    hidden_size = 6144
+    rows = int(os.getenv("B12X_PCIE_ONESHOT_RMS_GRAPH_ROWS", "4"))
+    hidden_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_GRAPH_HIDDEN", "6144"))
     epsilon = 1e-6
     dtype = torch.bfloat16
     inp, residual, weight = _make_inputs(
@@ -227,10 +237,28 @@ def _run_graph(
     # preserves the one-kernel production topology.
     _cuda_graph_kernel_chain(graph)
     stream = torch.cuda.current_stream(device)
+    world_size = dist.get_world_size()
+    topology_remote = (
+        (
+            world_size == 2
+            and os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
+        )
+        or (
+            world_size == 4
+            and os.getenv("B12X_PCIE_TP4_REMOTE_PUSH", "0") not in ("", "0")
+        )
+        or (
+            world_size == 8
+            and os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
+        )
+    )
     offset = 0
-    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
-        remote_source = (rank + 1) % dist.get_world_size()
-        offset = remote_source * inp.numel() * inp.element_size()
+    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0") or topology_remote:
+        if world_size == 8 and topology_remote:
+            remote_source = 0 if rank < 4 else 4
+        else:
+            remote_source = (rank + 1) % world_size
+        offset = remote_source * channel.eager_buffer_bytes
     snapshots = [_local_eager_words(channel, stream, offset=offset)]
 
     for iteration in range(3):
@@ -273,6 +301,83 @@ def _run_graph(
     )
 
 
+def _run_tp8_graph_mode_transition(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+) -> None:
+    """Replay C1 fallback followed by C4 owner reduction on one channel."""
+
+    if dist.get_world_size() != 8 or os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") in (
+        "",
+        "0",
+    ):
+        return
+
+    hidden_size = 6144
+    epsilon = 1e-6
+    dtype = torch.bfloat16
+    stream = torch.cuda.Stream(device=device)
+    channel_id = "graph:fused-transition"
+    channel = pool.for_stream(stream, channel_id=channel_id)
+
+    calls = []
+    for rows, iteration in ((1, 41), (4, 43)):
+        inp, residual, weight = _make_inputs(
+            rows,
+            hidden_size,
+            dtype,
+            device,
+            rank,
+            iteration=iteration,
+        )
+        out = torch.empty_like(inp)
+        calls.append((inp, residual, weight, out))
+        with torch.cuda.stream(stream):
+            channel.prepare_graph_fused_add_rms_norm(inp)
+
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with (
+        pool.capture(stream=stream, channel_id=channel_id),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        for inp, residual, weight, out in calls:
+            pool.all_reduce_fused_add_rms_norm(
+                inp,
+                residual,
+                weight,
+                epsilon,
+                out=out,
+                residual_out=residual,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    for replay in range(3):
+        expected = []
+        for rows, (inp, residual, weight, _out) in zip((1, 4), calls, strict=True):
+            next_inp, next_residual, _ = _make_inputs(
+                rows,
+                hidden_size,
+                dtype,
+                device,
+                rank,
+                iteration=47 + replay,
+            )
+            inp.copy_(next_inp)
+            residual.copy_(next_residual)
+            expected.append(_reference(inp, residual, weight, epsilon))
+
+        graph.replay()
+        stream.synchronize()
+        for (_inp, residual, _weight, out), (
+            expected_out,
+            expected_residual,
+        ) in zip(calls, expected, strict=True):
+            _assert_close(out, expected_out, dtype)
+            _assert_close(residual, expected_residual, dtype)
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -291,11 +396,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_concurrent_channels=2,
     )
     try:
-        pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
+        pool.prepare_channels(
+            (
+                "eager:fused-rmsnorm",
+                "graph:fused-rmsnorm",
+                "graph:fused-transition",
+            )
+        )
         pool.for_stream(channel_id="eager:fused-rmsnorm")
         _run_eager(pool, device, rank)
         dist.barrier()
         _run_graph(pool, device, rank)
+        dist.barrier()
+        _run_tp8_graph_mode_transition(pool, device, rank)
         torch.cuda.synchronize(device)
     finally:
         pool.close()
