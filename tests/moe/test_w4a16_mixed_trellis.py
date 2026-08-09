@@ -914,6 +914,54 @@ def test_build_projection_tiered_maps_pads_each_row_to_slot_stride() -> None:
     assert rows[2, 77].item() == 1 << 8
 
 
+def test_descriptor_projection_count_check_fails_closed() -> None:
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
+        _check_descriptor_projection_counts,
+        build_tiered_maps,
+    )
+
+    gate = [0] * 129 + [1] * 127
+    up = [0] * 128 + [1] * 128
+    down = [0] * 77 + [1] * 179
+    _, descriptor = build_projection_tiered_maps(
+        gate,
+        up,
+        down,
+        tier_slots=(129, 128),
+        device=torch.device("cpu"),
+    )
+    total = 257
+    # The builder publishes the encoded counts; matching launch counts pass.
+    assert descriptor._mt_projection_counts == ((129, 127), (128, 128))
+    _check_descriptor_projection_counts(
+        descriptor, total, gate_counts=(129, 127), up_counts=(128, 128)
+    )
+    # A mismatched count is rejected instead of silently skipping experts.
+    with pytest.raises(ValueError, match="disagree with the descriptor"):
+        _check_descriptor_projection_counts(
+            descriptor, total, gate_counts=(1, 3), up_counts=(128, 128)
+        )
+    # Descriptors from other producers derive the counts from the map itself,
+    # then memoize them on the tensor.
+    stripped = descriptor.clone()
+    assert not hasattr(stripped, "_mt_projection_counts")
+    with pytest.raises(ValueError, match="disagree with the descriptor"):
+        _check_descriptor_projection_counts(
+            stripped, total, gate_counts=(129, 128), up_counts=(128, 128)
+        )
+    assert stripped._mt_projection_counts == ((129, 127), (128, 128))
+    _check_descriptor_projection_counts(
+        stripped, total, gate_counts=(129, 127), up_counts=(128, 128)
+    )
+    # The legacy per-expert builder publishes its tier partition for both
+    # projections, matching run_mixed_trellis's launch-count defaults.
+    _, legacy = build_tiered_maps([0, 2, 4], [1, 3], device=torch.device("cpu"))
+    assert legacy._mt_projection_counts == ((3, 2), (3, 2))
+    _check_descriptor_projection_counts(
+        legacy, 5, gate_counts=(3, 2), up_counts=(3, 2)
+    )
+
+
 def test_build_projection_tiered_maps_supports_an_empty_tier() -> None:
     tiers = [0] * 256
     route, descriptor = build_projection_tiered_maps(
