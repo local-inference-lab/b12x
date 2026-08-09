@@ -983,23 +983,31 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 * Int64(packs_per_head)
             )
             output_base = Int64(row) * Int64(packs_per_head)
+            # Resolve the peer's base address first and copy once. Cloning the
+            # whole pack loop into all sixteen arms of the constexpr chain
+            # bloats the kernel and pays the chain on every row.
+            source_address = Int64(
+                (local_input + source_base * Int64(4)).toint()
+            )
             for source in cutlass.range_constexpr(self._world_size):
                 if source_rank == Int32(source):
                     if cutlass.const_expr(source == self._rank):
                         source_words = local_input
                     else:
                         source_words = self._staging_words(staging[source])
-                    pack = lane
-                    while pack < packs_per_head:
-                        _copy_16b(
-                            source_words
-                            + source_base * Int64(4)
-                            + Int64(pack) * Int64(4),
-                            output
-                            + output_base * Int64(4)
-                            + Int64(pack) * Int64(4),
-                        )
-                        pack += Int32(32)
+                    source_address = Int64(
+                        (source_words + source_base * Int64(4)).toint()
+                    )
+            output_address = Int64(
+                (output + output_base * Int64(4)).toint()
+            )
+            pack = lane
+            while pack < packs_per_head:
+                _copy_16b_addr(
+                    source_address + Int64(pack) * Int64(16),
+                    output_address + Int64(pack) * Int64(16),
+                )
+                pack += Int32(32)
             row += warp_stride
 
         if cutlass.const_expr(self._device_slot_selection):
