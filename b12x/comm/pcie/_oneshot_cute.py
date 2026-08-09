@@ -311,6 +311,11 @@ class _FusedOneshotLaunch(_PackedMath):
             raise ValueError("fused remote push requires TP2 or TP4")
         if mode == "stage_tp8_owner" and world_size != 8:
             raise ValueError("fused owner transport requires TP8")
+        if mode == "stage_tp8_owner" and dtype_name not in (
+            "float16",
+            "bfloat16",
+        ):
+            raise ValueError("fused TP8 owner transport requires float16 or bfloat16")
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._mode = mode
@@ -424,7 +429,13 @@ class _FusedOneshotLaunch(_PackedMath):
 
     @cute.jit
     def _tp8_owner_pair_barrier(self, signal_ptrs: cute.Pointer) -> None:
-        """Publish and acquire one FP32 partial between paired owners."""
+        """Publish and acquire one FP32 partial between paired owners.
+
+        This barrier must remain mutual so paired owners can skew by at most
+        one invocation. Eager slots alternate between invocations, making
+        that bounded skew use different storage. Both properties are safety
+        requirements for local-partial publication and final consumption.
+        """
 
         tidx, _, _ = cute.arch.thread_idx()
         cute.arch.sync_threads()
