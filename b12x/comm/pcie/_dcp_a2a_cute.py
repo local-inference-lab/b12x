@@ -23,6 +23,8 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from ._dcp_cute_common import block_pair_barrier
 from ._cute_intrinsics import (
+    float_order_key,
+    redux_max_u32,
     ld_generic_f32,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
@@ -187,6 +189,72 @@ def _add_u64_opaque(
         )
     )
 
+
+
+_KIMI_NEG_INF = float("-inf")
+
+
+@cute.jit
+def _kimi_pack_key(score: Float32, expert: Int32) -> cutlass.Uint64:
+    """Pack (score, expert) so that a plain integer max picks the winner.
+
+    The expert index goes in complemented, so a tie on score resolves to the
+    lower index -- the same order the native reference produces, without a
+    second comparison at every step.
+    """
+    return (cutlass.Uint64(float_order_key(score)) << cutlass.Uint64(32)) | (
+        cutlass.Uint64(0xFFFF) - cutlass.Uint64(expert)
+    )
+
+
+@cute.jit
+def _kimi_key_expert(key: cutlass.Uint64) -> Int32:
+    return Int32(cutlass.Uint64(0xFFFF) - (key & cutlass.Uint64(0xFFFF)))
+
+
+@cute.jit
+def _kimi_warp_max_key(key: cutlass.Uint64) -> cutlass.Uint64:
+    """Warp-wide max of a 64-bit key in two instructions.
+
+    Reduces the high words, then only the low words of the lanes that tied on
+    the high word, which is cheaper than carrying a 64-bit value through a
+    shuffle chain.
+    """
+    hi = cutlass.Uint32(key >> cutlass.Uint64(32))
+    lo = cutlass.Uint32(key & cutlass.Uint64(0xFFFFFFFF))
+    max_hi = redux_max_u32(hi)
+    contribution = cutlass.Uint32(0)
+    if hi == max_hi:
+        contribution = lo
+    max_lo = redux_max_u32(contribution)
+    return (cutlass.Uint64(max_hi) << cutlass.Uint64(32)) | cutlass.Uint64(max_lo)
+
+
+def _kimi_sort_desc(keys, count: int) -> None:
+    """Descending bitonic sort over a compile-time number of packed keys.
+
+    Every index is a Python constant, so the whole network unrolls and the
+    per-round selection can just read ``keys[0]``.
+    """
+    width = 2
+    while width <= count:
+        stride = width // 2
+        while stride > 0:
+            for index in range(count):
+                peer = index ^ stride
+                if peer <= index:
+                    continue
+                descending = (index & width) == 0
+                lower = keys[index]
+                upper = keys[peer]
+                if descending:
+                    keys[index] = cutlass.max(lower, upper)
+                    keys[peer] = cutlass.min(lower, upper)
+                else:
+                    keys[index] = cutlass.min(lower, upper)
+                    keys[peer] = cutlass.max(lower, upper)
+            stride //= 2
+        width *= 2
 
 class _DCPA2ABase:
     def __init__(
@@ -1253,12 +1321,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 unbiased_scores: cute.struct.Align[
                     cute.struct.MemRange[Float32, 896], 16
                 ]
-                # Per-thread partial argmax for the block-wide top-16 below.
-                reduce_scores: cute.struct.Align[
-                    cute.struct.MemRange[Float32, 512], 16
-                ]
-                reduce_ids: cute.struct.Align[
-                    cute.struct.MemRange[Int32, 512], 16
+                # The 64 survivors of the warp-local rounds, as packed keys.
+                reduce_keys: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint64, 64], 16
                 ]
 
             storage = smem_alloc.allocate(SharedStorage)
@@ -1268,11 +1333,8 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             unbiased_scores = storage.unbiased_scores.get_tensor(
                 cute.make_layout((896,), stride=(1,))
             )
-            reduce_scores = storage.reduce_scores.get_tensor(
-                cute.make_layout((512,), stride=(1,))
-            )
-            reduce_ids = storage.reduce_ids.get_tensor(
-                cute.make_layout((512,), stride=(1,))
+            reduce_keys = storage.reduce_keys.get_tensor(
+                cute.make_layout((64,), stride=(1,))
             )
 
             expert = Int32(tidx)
@@ -1325,101 +1387,63 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             # survivors. A round costs two warp reductions instead of a
             # shared-memory scan, and the selection needs one block barrier
             # rather than two per round.
-            _NONE = Int32(0x7FFFFFFF)
+            # Two-level top-16 over packed (score, expert) keys, mirroring the
+            # kernel this path replaced. Four warps each reduce 256 experts held
+            # in registers (8 per lane); warp 0 then merges the 64 survivors.
+            # A round costs one warp reduction -- two instructions -- because the
+            # tie-break lives in the key rather than in a second comparison.
             lane = Int32(tidx) % Int32(32)
             warp = Int32(tidx) // Int32(32)
-            won_score = Float32(float("-inf"))
-            won_expert = _NONE
-            cand_scores = cute.make_rmem_tensor((8,), Float32)
-            cand_experts = cute.make_rmem_tensor((8,), Int32)
+            lane_key = cutlass.Uint64(0)
+            keys = cute.make_rmem_tensor((8,), cutlass.Uint64)
             if warp < Int32(4):
                 for item in cutlass.range_constexpr(8):
                     expert_id = warp * Int32(256) + Int32(item * 32) + lane
-                    value = Float32(float("-inf"))
+                    value = Float32(_KIMI_NEG_INF)
                     if expert_id < Int32(896):
                         value = selection_scores[expert_id]
-                    cand_scores[item] = value
-                    cand_experts[item] = expert_id
+                    keys[item] = _kimi_pack_key(value, expert_id)
+                _kimi_sort_desc(keys, 8)
+                previous = cutlass.Uint64(0)
                 for selected in cutlass.range_constexpr(16):
-                    local_best = Float32(float("-inf"))
-                    local_id = _NONE
-                    for item in cutlass.range_constexpr(8):
-                        if cand_scores[item] > local_best or (
-                            cand_scores[item] == local_best
-                            and cand_experts[item] < local_id
-                        ):
-                            local_best = cand_scores[item]
-                            local_id = cand_experts[item]
-                    offset = Int32(16)
-                    while offset > Int32(0):
-                        peer_best = cute.arch.shuffle_sync_bfly(
-                            local_best, offset
-                        )
-                        peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
-                        if peer_best > local_best or (
-                            peer_best == local_best and peer_id < local_id
-                        ):
-                            local_best = peer_best
-                            local_id = peer_id
-                        offset = offset // Int32(2)
-                    round_best = local_best
-                    round_expert = local_id
+                    if cutlass.const_expr(selected > 0):
+                        if previous == keys[0]:
+                            tail_expert = _kimi_key_expert(keys[7])
+                            for item in cutlass.range_constexpr(7):
+                                keys[item] = keys[item + 1]
+                            keys[7] = _kimi_pack_key(
+                                Float32(_KIMI_NEG_INF), tail_expert
+                            )
+                    previous = _kimi_warp_max_key(keys[0])
                     if lane == Int32(selected):
-                        won_score = round_best
-                        won_expert = round_expert
-                    for item in cutlass.range_constexpr(8):
-                        if cand_experts[item] == round_expert:
-                            cand_scores[item] = Float32(float("-inf"))
+                        lane_key = previous
                 if lane < Int32(16):
-                    reduce_scores[warp * Int32(16) + lane] = won_score
-                    reduce_ids[warp * Int32(16) + lane] = won_expert
+                    reduce_keys[warp * Int32(16) + lane] = lane_key
             cute.arch.sync_threads()
             selected_ids = cute.make_rmem_tensor((16,), Int32)
             selected_weights = cute.make_rmem_tensor((16,), Float32)
             weight_sum = Float32(0.0)
             if warp == Int32(0):
-                merge_scores = cute.make_rmem_tensor((2,), Float32)
-                merge_experts = cute.make_rmem_tensor((2,), Int32)
+                merge_keys = cute.make_rmem_tensor((2,), cutlass.Uint64)
                 for item in cutlass.range_constexpr(2):
-                    merge_slot = Int32(item * 32) + lane
-                    merge_scores[item] = reduce_scores[merge_slot]
-                    merge_experts[item] = reduce_ids[merge_slot]
+                    merge_keys[item] = reduce_keys[Int32(item * 32) + lane]
+                _kimi_sort_desc(merge_keys, 2)
+                previous = cutlass.Uint64(0)
                 for selected in cutlass.range_constexpr(16):
-                    local_best = Float32(float("-inf"))
-                    local_id = _NONE
-                    for item in cutlass.range_constexpr(2):
-                        if merge_scores[item] > local_best or (
-                            merge_scores[item] == local_best
-                            and merge_experts[item] < local_id
-                        ):
-                            local_best = merge_scores[item]
-                            local_id = merge_experts[item]
-                    offset = Int32(16)
-                    while offset > Int32(0):
-                        peer_best = cute.arch.shuffle_sync_bfly(
-                            local_best, offset
-                        )
-                        peer_id = cute.arch.shuffle_sync_bfly(local_id, offset)
-                        if peer_best > local_best or (
-                            peer_best == local_best and peer_id < local_id
-                        ):
-                            local_best = peer_best
-                            local_id = peer_id
-                        offset = offset // Int32(2)
-                    round_best = local_best
-                    round_expert = local_id
-                    final_expert = Int32(-1)
-                    if round_expert != _NONE:
-                        final_expert = round_expert
+                    if cutlass.const_expr(selected > 0):
+                        if previous == merge_keys[0]:
+                            tail_expert = _kimi_key_expert(merge_keys[1])
+                            merge_keys[0] = merge_keys[1]
+                            merge_keys[1] = _kimi_pack_key(
+                                Float32(_KIMI_NEG_INF), tail_expert
+                            )
+                    previous = _kimi_warp_max_key(merge_keys[0])
+                    # The reduction broadcasts, so every lane agrees here.
+                    final_expert = _kimi_key_expert(previous)
                     selected_ids[selected] = final_expert
-                    weight = Float32(0.0)
-                    if final_expert >= Int32(0):
-                        weight = unbiased_scores[final_expert]
+                    weight = unbiased_scores[final_expert]
                     selected_weights[selected] = weight
                     weight_sum += weight
-                    for item in cutlass.range_constexpr(2):
-                        if merge_experts[item] == round_expert:
-                            merge_scores[item] = Float32(float("-inf"))
             if Int32(tidx) == Int32(0):
                 scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
                 for selected in cutlass.range_constexpr(16):
