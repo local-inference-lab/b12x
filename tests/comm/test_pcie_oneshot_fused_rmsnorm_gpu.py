@@ -12,7 +12,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
-from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import (
+    PCIeOneshotAllReducePool,
+    _CuTeOneshotBackend,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -255,6 +258,8 @@ def _run_graph(
     offset = 0
     if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0") or topology_remote:
         if world_size == 8 and topology_remote:
+            # TP8 owner mode publishes owner data into each rank's staging
+            # slot, so probe the island owner rather than a neighboring rank.
             remote_source = 0 if rank < 4 else 4
         else:
             remote_source = (rank + 1) % world_size
@@ -322,6 +327,8 @@ def _run_tp8_graph_mode_transition(
     channel = pool.for_stream(stream, channel_id=channel_id)
 
     calls = []
+    modes = []
+    state = channel._ext._state(channel._ptr)
     for rows, iteration in ((1, 41), (4, 43)):
         inp, residual, weight = _make_inputs(
             rows,
@@ -333,8 +340,10 @@ def _run_tp8_graph_mode_transition(
         )
         out = torch.empty_like(inp)
         calls.append((inp, residual, weight, out))
+        modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
         with torch.cuda.stream(stream):
             channel.prepare_graph_fused_add_rms_norm(inp)
+    assert modes == ["stage_pull", "stage_tp8_owner"]
 
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with (

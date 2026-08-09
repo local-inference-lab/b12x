@@ -132,13 +132,19 @@ def _tp8_owner_reduce_enabled() -> bool:
     return os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
 
 
-def _uses_sharded_eager_storage(world_size: int) -> bool:
+def _uses_sharded_eager_storage(
+    world_size: int,
+    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+) -> bool:
     """Return whether staged fused transport needs one shard per source."""
 
-    return _push_mode_enabled() or (
-        (world_size == 2 and _tp2_remote_push_enabled())
-        or (world_size == 4 and _tp4_remote_push_enabled())
-        or (world_size == 8 and _tp8_owner_reduce_enabled())
+    push, tp2_remote, tp4_remote, tp8_owner = (
+        _transport_policy_contract() if transport_policy is None else transport_policy
+    )
+    return push or (
+        (world_size == 2 and tp2_remote)
+        or (world_size == 4 and tp4_remote)
+        or (world_size == 8 and tp8_owner)
     )
 
 
@@ -1244,6 +1250,8 @@ class _CuTeOneshotState:
     eager_tables: Optional[tuple[int, int]] = None
     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
     eager_buffer_bytes: Optional[int] = None
+    transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
+    sharded_eager_storage: bool = False
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
@@ -1273,6 +1281,8 @@ class _CuTeOneshotBackend:
         self._lock = RLock()
         self._next_handle = 1
         self._states: dict[int, _CuTeOneshotState] = {}
+
+    supports_eager_storage_contract = True
 
     @staticmethod
     def meta_size() -> int:
@@ -1354,6 +1364,7 @@ class _CuTeOneshotBackend:
         pointers0: Sequence[int],
         pointers1: Sequence[int],
         eager_buffer_bytes: Optional[int] = None,
+        transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
     ) -> None:
         state = self._state(handle)
         ptrs0 = tuple(int(pointer) for pointer in pointers0)
@@ -1364,6 +1375,15 @@ class _CuTeOneshotBackend:
         state.eager_ptrs = (ptrs0, ptrs1)
         state.eager_buffer_bytes = (
             None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
+        state.transport_policy = (
+            _transport_policy_contract()
+            if transport_policy is None
+            else tuple(bool(value) for value in transport_policy)
+        )
+        state.sharded_eager_storage = _uses_sharded_eager_storage(
+            state.world_size,
+            state.transport_policy,
         )
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
@@ -1404,26 +1424,22 @@ class _CuTeOneshotBackend:
         if hidden <= 0 or inp.numel() % hidden != 0:
             return None
         rows = inp.numel() // hidden
+        _, tp2_remote, tp4_remote, tp8_owner = state.transport_policy
         if (
             state.world_size == 8
-            and _tp8_owner_reduce_enabled()
+            and tp8_owner
             and hidden in (4096, 6144)
             and 2 <= rows <= 8
         ):
             return "stage_tp8_owner"
         if (
             state.world_size == 4
-            and _tp4_remote_push_enabled()
+            and tp4_remote
             and hidden in (4096, 6144)
             and 1 <= rows <= 32
         ):
             return "stage_remote_push"
-        if (
-            state.world_size == 2
-            and _tp2_remote_push_enabled()
-            and hidden == 4096
-            and 1 <= rows <= 32
-        ):
+        if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
             return "stage_remote_push"
         return None
 
@@ -1454,7 +1470,7 @@ class _CuTeOneshotBackend:
             mode = topology_mode
         elif state.eager_tables is None:
             mode = "registered"
-        elif _push_mode_enabled():
+        elif state.transport_policy[0]:
             mode = "stage_push"
         else:
             mode = "stage_pull"
@@ -1843,6 +1859,7 @@ class PCIeOneshotAllReduce:
             normalized_eager_bytes = (
                 None if eager_buffer_bytes is None else int(eager_buffer_bytes)
             )
+            normalized_transport_policy = _transport_policy_contract()
             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {normalized_world_size}")
             if not 0 <= normalized_rank < normalized_world_size:
@@ -1909,6 +1926,7 @@ class PCIeOneshotAllReduce:
                 normalized_eager0,
                 normalized_eager1,
                 normalized_eager_bytes,
+                normalized_transport_policy,
                 normalized_max_size,
                 normalized_rank_data_bytes,
             )
@@ -1930,6 +1948,7 @@ class PCIeOneshotAllReduce:
             normalized_eager0,
             normalized_eager1,
             normalized_eager_bytes,
+            normalized_transport_policy,
             normalized_max_size,
             normalized_rank_data_bytes,
         ) = normalized
@@ -1942,6 +1961,7 @@ class PCIeOneshotAllReduce:
             eager_buffer_ptrs0=normalized_eager0,
             eager_buffer_ptrs1=normalized_eager1,
             eager_buffer_bytes=normalized_eager_bytes,
+            transport_policy=normalized_transport_policy,
             exchange_group=resolved_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
@@ -1988,6 +2008,7 @@ class PCIeOneshotAllReduce:
                     self.rank_data_bytes,
                     self.eager_buffer_bytes,
                     self._pending_eager_ptrs is not None,
+                    self._transport_policy,
                 ),
             )
 
@@ -2018,6 +2039,7 @@ class PCIeOneshotAllReduce:
         eager_buffer_ptrs0: Optional[Sequence[int]],
         eager_buffer_ptrs1: Optional[Sequence[int]],
         eager_buffer_bytes: Optional[int],
+        transport_policy: tuple[bool, bool, bool, bool],
         exchange_group: Optional[ProcessGroup],
         ipc: Optional[CudaRTLibrary],
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
@@ -2035,6 +2057,11 @@ class PCIeOneshotAllReduce:
         self.rank_data_bytes = int(rank_data_bytes)
         self.eager_buffer_bytes = (
             None if eager_buffer_bytes is None else int(eager_buffer_bytes)
+        )
+        self._transport_policy = tuple(bool(value) for value in transport_policy)
+        self._sharded_eager_storage = _uses_sharded_eager_storage(
+            self.world_size,
+            self._transport_policy,
         )
         self._ipc = ipc
         self._ext = ext_module
@@ -2070,12 +2097,17 @@ class PCIeOneshotAllReduce:
             )
             if self._pending_eager_ptrs is not None:
                 self._eager_ptrs = self._pending_eager_ptrs
-                if isinstance(self._ext, _CuTeOneshotBackend):
+                if getattr(
+                    self._ext,
+                    "supports_eager_storage_contract",
+                    False,
+                ):
                     self._ext.register_pcie_buffers(
                         self._ptr,
                         list(self._eager_ptrs[0]),
                         list(self._eager_ptrs[1]),
                         self.eager_buffer_bytes,
+                        self._transport_policy,
                     )
                 else:
                     self._ext.register_pcie_buffers(
@@ -2153,6 +2185,7 @@ class PCIeOneshotAllReduce:
             normalized_eager_bytes = int(eager_buffer_bytes)
             normalized_max_size = int(max_size)
             normalized_rank_data_bytes = int(rank_data_bytes)
+            normalized_transport_policy = _transport_policy_contract()
             if world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {world_size}")
             if device_obj.type != "cuda":
@@ -2170,14 +2203,19 @@ class PCIeOneshotAllReduce:
                 normalized_eager_bytes,
                 normalized_max_size,
                 normalized_rank_data_bytes,
+                normalized_transport_policy,
             )
 
-        device_obj, eager_buffer_bytes, max_size, rank_data_bytes = (
-            _run_collective_preallocation_setup(
-                owner="PCIe oneshot argument validation",
-                exchange_group=exchange_group,
-                setup=validate_factory_arguments,
-            )
+        (
+            device_obj,
+            eager_buffer_bytes,
+            max_size,
+            rank_data_bytes,
+            transport_policy,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe oneshot argument validation",
+            exchange_group=exchange_group,
+            setup=validate_factory_arguments,
         )
 
         _require_full_grid_residency(
@@ -2206,7 +2244,7 @@ class PCIeOneshotAllReduce:
                 eager_buffer_bytes,
                 max_size,
                 rank_data_bytes,
-                _transport_policy_contract(),
+                transport_policy,
             ),
         )
 
@@ -2214,6 +2252,10 @@ class PCIeOneshotAllReduce:
             exchange_group,
             signal_bytes=signal_bytes,
             eager_buffer_bytes=eager_buffer_bytes,
+            sharded_eager_storage=_uses_sharded_eager_storage(
+                world_size,
+                transport_policy,
+            ),
             ipc=ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
@@ -2225,6 +2267,7 @@ class PCIeOneshotAllReduce:
             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
             eager_buffer_bytes=eager_buffer_bytes,
+            transport_policy=transport_policy,
             exchange_group=exchange_group,
             ipc=ipc,
             owned_buffers=owned_buffers,
@@ -2484,6 +2527,7 @@ class PCIeOneshotAllReduce:
         *,
         signal_bytes: int,
         eager_buffer_bytes: int,
+        sharded_eager_storage: bool,
         ipc: CudaRTLibrary,
     ) -> _ChannelSharedBuffers:
         signal_bytes = int(signal_bytes)
@@ -2492,9 +2536,8 @@ class PCIeOneshotAllReduce:
             raise ValueError("signal_bytes must be positive")
         if eager_buffer_bytes <= 0:
             raise ValueError("eager_buffer_bytes must be positive")
-        world_size = dist.get_world_size(group=exchange_group)
-        if _uses_sharded_eager_storage(world_size):
-            eager_buffer_bytes *= world_size
+        if sharded_eager_storage:
+            eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
 
         signal_offset = 0
         eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
@@ -3118,6 +3161,7 @@ class PCIeOneshotAllReducePool:
             normalized_rank_data_bytes = int(rank_data_bytes)
             normalized_single_channel = bool(single_channel)
             normalized_max_concurrent_channels = int(max_concurrent_channels)
+            normalized_transport_policy = _transport_policy_contract()
             if normalized_world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(f"unsupported world size {normalized_world_size}")
             if not 0 <= normalized_rank < normalized_world_size:
@@ -3163,6 +3207,7 @@ class PCIeOneshotAllReducePool:
                 normalized_rank_data_bytes,
                 normalized_single_channel,
                 normalized_max_concurrent_channels,
+                normalized_transport_policy,
             )
 
         if channel_factory is None and resolved_group is not None:
@@ -3183,7 +3228,12 @@ class PCIeOneshotAllReducePool:
             self.rank_data_bytes,
             self.single_channel,
             self.max_concurrent_channels,
+            self._transport_policy,
         ) = normalized
+        self._sharded_eager_storage = _uses_sharded_eager_storage(
+            self.world_size,
+            self._transport_policy,
+        )
         self.exchange_group = resolved_group
         self.process_group = self.exchange_group
         self._channel_factory = channel_factory
@@ -3233,7 +3283,7 @@ class PCIeOneshotAllReducePool:
                     self.rank_data_bytes,
                     self.single_channel,
                     self.max_concurrent_channels,
-                    _transport_policy_contract(),
+                    self._transport_policy,
                 ),
             )
             # A genuine single-channel pool has no independent eager/graph
@@ -3311,6 +3361,7 @@ class PCIeOneshotAllReducePool:
             self.exchange_group,
             signal_bytes=self._signal_bytes,
             eager_buffer_bytes=self.eager_buffer_bytes,
+            sharded_eager_storage=self._sharded_eager_storage,
             ipc=self._ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
@@ -3322,6 +3373,7 @@ class PCIeOneshotAllReducePool:
             eager_buffer_ptrs0=channel_buffers.eager0_ptrs,
             eager_buffer_ptrs1=channel_buffers.eager1_ptrs,
             eager_buffer_bytes=self.eager_buffer_bytes,
+            transport_policy=self._transport_policy,
             exchange_group=self.exchange_group,
             ipc=self._ipc,
             owned_buffers=owned_buffers,

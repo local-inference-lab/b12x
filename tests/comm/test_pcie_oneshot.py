@@ -27,6 +27,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
+from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch
 
 
 @pytest.fixture(autouse=True)
@@ -256,6 +257,7 @@ def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
 
 
 def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotState:
+    transport_policy = _transport_policy_contract()
     return _CuTeOneshotState(
         rank=0,
         world_size=world_size,
@@ -266,7 +268,27 @@ def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotStat
         registered_tables={},
         eager_tables=(300, 400) if eager else None,
         eager_buffer_bytes=128 * 1024 if eager else None,
+        transport_policy=transport_policy,
+        sharded_eager_storage=_uses_sharded_eager_storage(
+            world_size,
+            transport_policy,
+        ),
     )
+
+
+def test_tp8_owner_launcher_rejects_float32() -> None:
+    with pytest.raises(ValueError, match="requires float16 or bfloat16"):
+        _FusedOneshotLaunch(
+            "float32",
+            world_size=8,
+            rank=0,
+            mode="stage_tp8_owner",
+            single_cta=True,
+            register_normalize=True,
+            device_slot_selection=False,
+            slot_bias=0,
+            threads=256,
+        )
 
 
 @pytest.mark.parametrize(
@@ -297,6 +319,7 @@ def test_tp8_owner_reduce_default_has_a_bounded_shape_contract(
 
 
 def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
     mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
         _make_cute_state(8), torch.empty((4, 6144), dtype=torch.bfloat16)
@@ -333,6 +356,20 @@ def test_tp2_tp4_remote_push_is_opt_in(
     assert mode == expected_when_enabled
 
 
+def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    state = _make_cute_state(4)
+
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        state,
+        torch.empty((4, 6144), dtype=torch.bfloat16),
+    )
+
+    assert mode == "stage_remote_push"
+
+
 @pytest.mark.parametrize(
     ("world_size", "env_name", "shape"),
     (
@@ -348,6 +385,7 @@ def test_tp2_tp4_remote_push_falls_back_outside_qualified_shapes(
     env_name: str,
     shape: tuple[int, int],
 ) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv(env_name, "1")
     mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
         _make_cute_state(world_size),
@@ -1356,6 +1394,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
         exchange_group,
         signal_bytes=signal_bytes,
         eager_buffer_bytes=eager_bytes,
+        sharded_eager_storage=False,
         ipc=ipc,
     )
 
@@ -1419,6 +1458,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
             object(),
             signal_bytes=300,
             eager_buffer_bytes=128,
+            sharded_eager_storage=False,
             ipc=ipc,
         )
 
