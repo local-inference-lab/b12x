@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from contextlib import ExitStack, contextmanager, suppress
@@ -63,6 +64,9 @@ def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -
     if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() != "hierarchical":
         return max(default, ISLAND_RS_MAX_BYTES)
     return default
+
+
+logger = logging.getLogger(__name__)
 
 
 MAX_DIRECT_WORLD_SIZE = 8
@@ -172,13 +176,29 @@ class PCIeAllReduce:
         capacity = max(int(max_size), ISLAND_RS_MAX_BYTES)
         elements = capacity // torch.bfloat16.itemsize
         try:
-            return PCIeIslandRSAllReduce(
+            runtime = PCIeIslandRSAllReduce(
                 exchange_group=exchange_group,
                 device=device,
                 max_elements=elements - (elements % 2),
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "PCIe island reduce-scatter unavailable (%s); TP%d all-reduces "
+                "stay on the leader-gather hierarchy.",
+                exc,
+                world_size,
+            )
             return None
+        # Whether the fast path is attached is otherwise only visible as a
+        # throughput difference, which is a poor way to find out.
+        logger.info(
+            "PCIe island reduce-scatter attached for TP%d: routing all-reduces "
+            "above %d elements, up to %d bytes.",
+            world_size,
+            ISLAND_RS_CROSSOVER_ELEMENTS,
+            capacity,
+        )
+        return runtime
 
     @classmethod
     def from_process_group(
