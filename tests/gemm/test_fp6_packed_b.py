@@ -7,12 +7,26 @@ streaming format differs.
 """
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
 cuda_required = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
+
+
+def test_dense_gemm_preserves_fp6_api_contracts():
+    """Keep the FP6 caller and dense GEMM implementation contracts in sync."""
+    from b12x._lib.dense_gemm import DenseGemmKernel, dense_gemm
+
+    parameter = inspect.signature(dense_gemm).parameters["row_scale"]
+    assert parameter.default is None
+    kernel_parameter = inspect.signature(DenseGemmKernel).parameters[
+        "fused_quant_bf16"
+    ]
+    assert kernel_parameter.default is None
 
 
 def _gemm_operands(m: int, n: int, k: int, source_format: str):
