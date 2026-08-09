@@ -11239,6 +11239,28 @@ def _trellis_dense_buffer(
     return buffer
 
 
+def _use_k6_mcg_small(
+    *,
+    device: torch.device,
+    m: int,
+    trellis_bits: int,
+    trellis_codebook: str,
+    trellis_pair_kind,
+    compute_dtype: torch.dtype,
+    external_hadamard_128,
+) -> bool:
+    """Select the capture-safe K6/MCG kernel only on its compiled target."""
+    return (
+        tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and m <= 128
+        and trellis_bits == 6
+        and trellis_codebook == "mcg"
+        and trellis_pair_kind is None
+        and compute_dtype == torch.float16
+        and external_hadamard_128 is None
+    )
+
+
 def _run_trellis256_dense_current_device(
     x: torch.Tensor,
     prepared_dense,
@@ -11326,13 +11348,14 @@ def _run_trellis256_dense_current_device(
     # Trellis scheduler. It owns both H128 rotations, needs no GEMM scratch,
     # and is safe to capture with only caller-owned output/rotation storage.
     # Compact pair payloads and the newer SQG codebooks use the generic path.
-    use_k6_mcg_small = (
-        m <= 128
-        and trellis_bits == 6
-        and trellis_codebook == "mcg"
-        and trellis_pair_kind is None
-        and compute_dtype == torch.float16
-        and external_hadamard_128 is None
+    use_k6_mcg_small = _use_k6_mcg_small(
+        device=x.device,
+        m=m,
+        trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind,
+        compute_dtype=compute_dtype,
+        external_hadamard_128=external_hadamard_128,
     )
     if use_k6_mcg_small:
         if x.dtype == torch.float16:
