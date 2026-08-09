@@ -4199,12 +4199,10 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
-                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
-                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
-                        b_region, tile_base, lane, low_bits
-                    )
-                elif logical_k16 < Int32(8):
+                if (
+                    cutlass.const_expr(int(low_bits) == int(high_bits))
+                    or logical_k16 < Int32(8)
+                ):
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits
@@ -11323,6 +11321,69 @@ def _run_trellis256_dense_current_device(
     external_hadamard_128 = (
         None if hadamard_128 is None else _resolve_exl3_hadamard_128(hadamard_128)
     )
+
+    # Keep the established K6/MCG decode path independent from the generic
+    # Trellis scheduler. It owns both H128 rotations, needs no GEMM scratch,
+    # and is safe to capture with only caller-owned output/rotation storage.
+    # Compact pair payloads and the newer SQG codebooks use the generic path.
+    use_k6_mcg_small = (
+        m <= 128
+        and trellis_bits == 6
+        and trellis_codebook == "mcg"
+        and trellis_pair_kind is None
+        and compute_dtype == torch.float16
+        and external_hadamard_128 is None
+    )
+    if use_k6_mcg_small:
+        if x.dtype == torch.float16:
+            x_f16 = x
+        else:
+            input_f16 = _trellis_dense_buffer(
+                "input_f16",
+                input_f16,
+                shape=(m, size_k),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            input_f16.copy_(x)
+            x_f16 = input_f16
+        rotated_f16 = _trellis_dense_buffer(
+            "rotated_f16",
+            rotated_f16,
+            shape=(m, size_k),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        if output.dtype == torch.float16:
+            small_output = output
+        else:
+            output_f16 = _trellis_dense_buffer(
+                "output_f16",
+                output_f16,
+                shape=(m, size_n),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            small_output = output_f16
+        from b12x.gemm.trellis_linear._small_m import run_k6_mcg
+
+        trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
+            size_k // 16,
+            size_n // 16,
+            96,
+        )
+        run_k6_mcg(
+            x_f16,
+            trellis_i16,
+            small_output,
+            prepared_dense.suh,
+            rotated_f16,
+            prepared_dense.svh,
+            prepared_dense.workspace,
+        )
+        if output.dtype != torch.float16:
+            output.copy_(small_output)
+        return output
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
