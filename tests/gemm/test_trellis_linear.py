@@ -36,6 +36,7 @@ from b12x.moe._shared.kernels.trellis_w4a8_transform import (
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
     _trellis256_dense_launch_geometry,
+    _use_k6_mcg_small,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_qsrt_pair_moe_weights,
@@ -411,6 +412,39 @@ def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
 
     with pytest.raises(NotImplementedError, match="built for sm_120 only"):
         _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((12, 0), True),
+        ((12, 1), False),
+        ((9, 0), False),
+    ],
+)
+def test_k6_small_m_dispatch_requires_compiled_target(
+    monkeypatch,
+    capability: tuple[int, int],
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: capability,
+    )
+
+    assert (
+        _use_k6_mcg_small(
+            device=torch.device("cuda"),
+            m=128,
+            trellis_bits=6,
+            trellis_codebook="mcg",
+            trellis_pair_kind=None,
+            compute_dtype=torch.float16,
+            external_hadamard_128=None,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
