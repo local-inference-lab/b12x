@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention.dsa_indexer._impl import clear_indexer_caches
 from b12x.attention.dsa_indexer.paged import (
+    _paged_carry_halves_are_contiguous,
     _paged_indexer_chunk_geometry,
     _plan_two_level_fold,
     index_topk_fp8,
@@ -833,6 +834,15 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
     # Fold carry double-buffer: exactly two halves, decoupled from chunk_count.
     assert candidate_values.shape[0] == 2
     assert candidate_indices.shape[0] == 2
+
+    # A small capture bucket retains the max-row stride between its two halves,
+    # so the combined 3-D prefix is not contiguous.  Each independently
+    # launched half remains contiguous and is the actual kernel contract.
+    active_values = candidate_values[:, :1, :]
+    active_indices = candidate_indices[:, :1, :]
+    assert not active_values.is_contiguous()
+    assert not active_indices.is_contiguous()
+    assert _paged_carry_halves_are_contiguous(active_values, active_indices)
 
 
 def test_paged_index_supertile_plan_records_launch_contract() -> None:
