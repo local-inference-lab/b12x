@@ -1526,12 +1526,6 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 expert += Int32(self._threads)
             cute.arch.sync_threads()
 
-            # Two-level warp-local top-16, mirroring the C++ kernel this path
-            # replaced. Four warps each reduce 256 experts held in registers
-            # (8 per lane) with warp reductions, then warp 0 merges the 64
-            # survivors. A round costs two warp reductions instead of a
-            # shared-memory scan, and the selection needs one block barrier
-            # rather than two per round.
             # Two-level top-16 over packed (score, expert) keys, mirroring the
             # kernel this path replaced. Four warps each reduce 256 experts held
             # in registers (8 per lane); warp 0 then merges the 64 survivors.
