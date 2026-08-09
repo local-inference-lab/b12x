@@ -1292,6 +1292,11 @@ def build_tiered_maps(
     # Per-expert tiering is the degenerate case where all three rows are
     # identical, reproducing single-row behaviour bit-for-bit.
     descriptor = descriptor_row.repeat(3).contiguous()
+    # Publish the per-tier gate/up counts this descriptor encodes so
+    # run_mixed_trellis can fail closed on mismatched caller counts without a
+    # device sync. Per-expert tiering has gate == up == the tier partition.
+    counts = (len(tier0_ids), len(tier1_ids))
+    descriptor._mt_projection_counts = (counts, counts)
     return global_to_combined, descriptor
 
 
@@ -1384,7 +1389,56 @@ def build_projection_tiered_maps(
                 rows[base : base + num_experts], dtype=torch.int32, device=device
             )
         )
+    # Publish the gate/up counts this descriptor encodes so run_mixed_trellis
+    # can fail closed on mismatched caller counts without a device sync.
+    descriptor._mt_projection_counts = (
+        projection_counts[0],
+        projection_counts[1],
+    )
     return global_to_combined, descriptor
+
+
+def _check_descriptor_projection_counts(
+    descriptor_map: torch.Tensor,
+    total_experts: int,
+    *,
+    gate_counts: tuple[int, int],
+    up_counts: tuple[int, int],
+) -> None:
+    """Fail closed when launch counts disagree with the descriptor map.
+
+    The device dispatch bounds gate/up locals by the launch counts, so a
+    descriptor entry at or beyond its projection's count is silently skipped
+    and the corresponding FC1 half stays zero. The in-tree builders publish
+    the counts their descriptor encodes; descriptors from other producers pay
+    one host copy here, memoized on the tensor, so steady-state launches
+    never synchronize.
+    """
+
+    encoded = getattr(descriptor_map, "_mt_projection_counts", None)
+    if encoded is None:
+        rows = descriptor_map.detach().cpu().view(3, total_experts)
+        derived = []
+        for row in rows[:2]:
+            live = row[row >= 0]
+            derived.append(
+                (
+                    int(((live >> 8) == 0).sum()),
+                    int(((live >> 8) == 1).sum()),
+                )
+            )
+        encoded = (tuple(derived[0]), tuple(derived[1]))
+        descriptor_map._mt_projection_counts = encoded
+    expected_gate = (int(encoded[0][0]), int(encoded[0][1]))
+    expected_up = (int(encoded[1][0]), int(encoded[1][1]))
+    got_gate = (int(gate_counts[0]), int(gate_counts[1]))
+    got_up = (int(up_counts[0]), int(up_counts[1]))
+    if got_gate != expected_gate or got_up != expected_up:
+        raise ValueError(
+            "mixed Trellis projection counts disagree with the descriptor "
+            f"map: gate {got_gate} vs encoded {expected_gate}, up {got_up} "
+            f"vs encoded {expected_up}"
+        )
 
 
 def combine_trellis_rotations(
@@ -1437,8 +1491,8 @@ def _validate_mixed_trellis_tier_storage(
         or not 1 <= w2_elements // w2_expert_stride <= _MAX_TIER_EXPERTS
     ):
         raise ValueError(
-            f"mixed Trellis {name}.w2 must be contiguous torch.int32 on "
-            f"{device} holding 1..{_MAX_TIER_EXPERTS} whole FC2 experts of "
+            f"mixed Trellis {name}.w2 must be torch.int32 holding "
+            f"1..{_MAX_TIER_EXPERTS} whole FC2 experts of "
             f"{w2_expert_stride} elements, got {w2_elements}"
         )
     fc2_experts = w2_elements // w2_expert_stride
@@ -1634,6 +1688,12 @@ def run_mixed_trellis(
                 f"mixed Trellis {name} must be contiguous int32 on {x.device} "
                 f"with {expected_entries} elements"
             )
+    _check_descriptor_projection_counts(
+        descriptor_map,
+        total_experts,
+        gate_counts=(_gate0, _gate1),
+        up_counts=(_up0, _up1),
+    )
     for name, table, expected_elements in (
         (
             "intermediate rotations",
