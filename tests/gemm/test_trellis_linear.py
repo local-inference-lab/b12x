@@ -343,6 +343,8 @@ def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
     assert seen["kwargs"]["rotated_compute"] is rotated_compute
     assert seen["kwargs"]["gemm_output_f16"] is gemm_output_f16
     assert seen["kwargs"]["output_f16"] is output_f16
+    assert seen["kwargs"]["_moe_block_size"] is None
+    assert seen["kwargs"]["_force_tile_config"] is None
 
 
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
@@ -397,16 +399,18 @@ def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("capability", "expected"),
+    ("capability", "explicit_launch_config", "expected"),
     [
-        ((12, 0), True),
-        ((12, 1), False),
-        ((9, 0), False),
+        ((12, 0), False, True),
+        ((12, 0), True, False),
+        ((12, 1), False, False),
+        ((9, 0), False, False),
     ],
 )
 def test_k6_small_m_dispatch_requires_compiled_target(
     monkeypatch,
     capability: tuple[int, int],
+    explicit_launch_config: bool,
     expected: bool,
 ) -> None:
     monkeypatch.setattr(
@@ -424,6 +428,7 @@ def test_k6_small_m_dispatch_requires_compiled_target(
             trellis_pair_kind=None,
             compute_dtype=torch.float16,
             external_hadamard_128=None,
+            explicit_launch_config=explicit_launch_config,
         )
         is expected
     )

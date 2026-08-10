@@ -1972,7 +1972,7 @@ class W4A16GemmKernel:
             reduce_slice_idx,
             lock_slot,
             active_size_m,
-            Int32(0),
+            -1,
         )
 
     @cute.jit
@@ -11219,10 +11219,12 @@ def _use_k6_mcg_small(
     trellis_pair_kind,
     compute_dtype: torch.dtype,
     external_hadamard_128,
+    explicit_launch_config: bool,
 ) -> bool:
     """Select the capture-safe K6/MCG kernel only on its compiled target."""
     return (
-        tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        not explicit_launch_config
+        and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
         and m <= 128
         and trellis_bits == 6
         and trellis_codebook == "mcg"
@@ -11246,7 +11248,7 @@ def _run_trellis256_dense_current_device(
     output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
-    _moe_block_size: int = 64,
+    _moe_block_size: int | None = None,
     _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run one native EXL3 linear on the already-selected CUDA device.
@@ -11324,6 +11326,9 @@ def _run_trellis256_dense_current_device(
         trellis_pair_kind=trellis_pair_kind,
         compute_dtype=compute_dtype,
         external_hadamard_128=external_hadamard_128,
+        explicit_launch_config=(
+            _moe_block_size is not None or _force_tile_config is not None
+        ),
     )
     if use_k6_mcg_small:
         if x.dtype == torch.float16:
@@ -11361,7 +11366,7 @@ def _run_trellis256_dense_current_device(
         trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
             size_k // 16,
             size_n // 16,
-            96,
+            trellis_bits * 16,
         )
         run_k6_mcg(
             x_f16,
@@ -11428,8 +11433,8 @@ def _run_trellis256_dense_current_device(
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
     )
-    moe_block_size = int(_moe_block_size)
-    if _force_tile_config is None and moe_block_size == 64:
+    moe_block_size = 64 if _moe_block_size is None else int(_moe_block_size)
+    if _force_tile_config is None and _moe_block_size is None:
         moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
             size_m=m,
             size_k=size_k,
@@ -11570,7 +11575,7 @@ def run_trellis256_dense(
     output_f16: torch.Tensor | None = None,
     hadamard_128=None,
     stream: cuda.CUstream | None = None,
-    _moe_block_size: int = 64,
+    _moe_block_size: int | None = None,
     _force_tile_config: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run one native or compact P24/P33 EXL3 linear through the t256 GEMM.

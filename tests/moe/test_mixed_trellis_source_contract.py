@@ -143,3 +143,17 @@ def test_w4a16_internal_calls_supply_required_arguments() -> None:
                 )
 
     assert not mismatches, "\n".join(mismatches)
+
+
+def test_static_trellis_pair_keeps_the_configured_decode_mode() -> None:
+    path = ROOT / "b12x/moe/_shared/kernels/w4a16/kernel.py"
+    method = _method(path, "W4A16GemmKernel", "_run_tile")
+    calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_run_tile_with_pair_override"
+    ]
+
+    assert sorted(ast.unparse(call.args[-1]) for call in calls) == ["-1", "0", "1"]
