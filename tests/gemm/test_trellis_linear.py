@@ -107,10 +107,6 @@ def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
     )
 
 
-
-
-
-
 @lru_cache(maxsize=None)
 def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
@@ -122,9 +118,7 @@ def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_cheb_normal_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_cheb_normal_e4m3_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_cheb_normal_e4m3_table(bits)[indices]
 
@@ -140,9 +134,7 @@ def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_xor_cheb_t12_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_xor_cheb_t12_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_xor_cheb_t12_table(bits)[indices]
 
@@ -165,9 +157,7 @@ def _decode_lane(
         first = tile_words[..., first_word % width].astype(np.uint64)
         last = tile_words[..., last_word % width].astype(np.uint64)
         merged = (first << np.uint64(32)) | last
-        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(
-            np.uint32
-        )
+        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
         elif codebook == "mul1-e4m3":
@@ -196,9 +186,7 @@ def _reconstruct_native(
         for n_tile in range(n_tiles):
             lanes = np.stack(
                 [
-                    _decode_lane(
-                        words[k_tile, n_tile], lane, bits, codebook=codebook
-                    )
+                    _decode_lane(words[k_tile, n_tile], lane, bits, codebook=codebook)
                     for lane in range(32)
                 ]
             )
@@ -230,13 +218,7 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
     scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
     scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
-    return (
-        (blocks / scale)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .mul(scale)
-        .reshape(m, k)
-    )
+    return (blocks / scale).to(torch.float8_e4m3fn).float().mul(scale).reshape(m, k)
 
 
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
@@ -676,15 +658,11 @@ def test_dense_mul1_e4m3_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        mul1_e4m3=torch.tensor(
-            0x83DCD12D, dtype=torch.uint32, device=device
-        ),
+        mul1_e4m3=torch.tensor(0x83DCD12D, dtype=torch.uint32, device=device),
         params_dtype=torch.float16,
     )
     assert weight.trellis_codebook == "mul1-e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="mul1-e4m3"
-    ).to(device)
+    reference_weight = _reconstruct_native(trellis, codebook="mul1-e4m3").to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
     def identity_hadamard(
@@ -745,9 +723,9 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
         params_dtype=torch.float16,
     )
     assert weight.trellis_codebook == "sqg-cheb-normal-e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="sqg-cheb-normal-e4m3"
-    ).to(device)
+    reference_weight = _reconstruct_native(trellis, codebook="sqg-cheb-normal-e4m3").to(
+        device
+    )
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
     def identity_hadamard(
@@ -850,11 +828,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
     suh = torch.ones(reference_weight.shape[0], dtype=torch.float16, device=device)
     svh = torch.ones(reference_weight.shape[1], dtype=torch.float16, device=device)
     codebook_kwargs = (
-        {
-            "mcg": torch.tensor(
-                0xCBAC1FED, dtype=torch.uint32, device=device
-            )
-        }
+        {"mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device)}
         if codebook == "mcg"
         else {"codebook": codebook}
     )
@@ -994,11 +968,7 @@ def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
     payload = torch.cat((low.reshape(-1), high.reshape(-1))).contiguous()
     size_k, size_n = reference_weight.shape
     codebook_kwargs = (
-        {
-            "mul1_e4m3": torch.tensor(
-                0x83DCD12D, dtype=torch.uint32, device=device
-            )
-        }
+        {"mul1_e4m3": torch.tensor(0x83DCD12D, dtype=torch.uint32, device=device)}
         if codebook == "mul1-e4m3"
         else {"codebook": codebook}
     )
@@ -1063,25 +1033,15 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
     prepared = SimpleNamespace(
         hidden_size=hidden,
         num_experts=experts,
-        gate_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
-        up_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
+        gate_suh=(0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)).half(),
+        up_suh=(0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)).half(),
         intermediate_rotations=(
-            0.75
-            + 0.5
-            * torch.rand((experts, 3 * intermediate), device=device)
+            0.75 + 0.5 * torch.rand((experts, 3 * intermediate), device=device)
         ).half(),
     )
     source = torch.randn((tokens, hidden), device=device).bfloat16()
-    route_experts = torch.tensor(
-        [0, 2, 1, 0], dtype=torch.int32, device=device
-    )
-    gate_rot = torch.empty(
-        (routes, hidden), dtype=torch.float16, device=device
-    )
+    route_experts = torch.tensor([0, 2, 1, 0], dtype=torch.int32, device=device)
+    gate_rot = torch.empty((routes, hidden), dtype=torch.float16, device=device)
     up_rot = torch.empty_like(gate_rot)
     run_trellis_w4a8_input_rotation(
         source,
@@ -1108,14 +1068,11 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
     gate = (torch.randn((routes, intermediate), device=device) * 0.25).half()
     up = (torch.randn_like(gate) * 0.25).half()
     activated = torch.empty_like(gate)
-    run_trellis_w4a8_activation_rotation(
-        gate, up, route_experts, prepared, activated
-    )
+    run_trellis_w4a8_activation_rotation(gate, up, route_experts, prepared, activated)
     rotations = prepared.intermediate_rotations[route_experts.long()]
     gate_canonical = _hadamard128_reference(gate) * rotations[:, :intermediate]
     up_canonical = (
-        _hadamard128_reference(up)
-        * rotations[:, intermediate : 2 * intermediate]
+        _hadamard128_reference(up) * rotations[:, intermediate : 2 * intermediate]
     )
     situ_gate = (
         SITU_DEFAULT_BETA
@@ -1126,13 +1083,9 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
         up_canonical / SITU_DEFAULT_LINEAR_BETA
     )
     expected_activated = _hadamard128_reference(
-        situ_gate
-        * situ_up
-        * rotations[:, 2 * intermediate : 3 * intermediate]
+        situ_gate * situ_up * rotations[:, 2 * intermediate : 3 * intermediate]
     ).half()
-    torch.testing.assert_close(
-        activated, expected_activated, rtol=3.0e-3, atol=3.0e-3
-    )
+    torch.testing.assert_close(activated, expected_activated, rtol=3.0e-3, atol=3.0e-3)
 
     gate_before = gate_rot.clone()
     up_before = up_rot.clone()
@@ -1235,9 +1188,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
             dtype=torch.int16,
             device=device,
         )
-        w2_payload[expert].copy_(
-            torch.cat((low.reshape(-1), high.reshape(-1)))
-        )
+        w2_payload[expert].copy_(torch.cat((low.reshape(-1), high.reshape(-1))))
         w2_reference[expert].copy_(
             torch.cat(
                 (
@@ -1304,10 +1255,16 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     gate_xq = _reference_mxfp8_rows(gate_x)
     up_xq = _reference_mxfp8_rows(up_x)
     expected_gate = torch.stack(
-        [gate_xq[r] @ w13_reference[0, int(route_experts[r])].float() for r in range(routes)]
+        [
+            gate_xq[r] @ w13_reference[0, int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     expected_up = torch.stack(
-        [up_xq[r] @ w13_reference[1, int(route_experts[r])].float() for r in range(routes)]
+        [
+            up_xq[r] @ w13_reference[1, int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     torch.testing.assert_close(gate_out, expected_gate, rtol=2.0e-3, atol=2.0e-2)
     torch.testing.assert_close(up_out, expected_up, rtol=2.0e-3, atol=2.0e-2)
@@ -1327,7 +1284,10 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     )
     down_xq = _reference_mxfp8_rows(down_x)
     expected_down = torch.stack(
-        [down_xq[r] @ w2_reference[int(route_experts[r])].float() for r in range(routes)]
+        [
+            down_xq[r] @ w2_reference[int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     torch.testing.assert_close(down_out, expected_down, rtol=2.0e-3, atol=2.0e-2)
 
@@ -1358,9 +1318,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     # and the route-weighted inverse rotation into one graph-safe MoE path.
     source = (torch.randn((1, hidden), device=device) * 0.125).bfloat16()
     topk_ids = route_experts.reshape(1, -1)
-    topk_weights = torch.tensor(
-        [[0.625, 0.375]], dtype=torch.float32, device=device
-    )
+    topk_weights = torch.tensor([[0.625, 0.375]], dtype=torch.float32, device=device)
     scratch = make_trellis_w4a8_moe_scratch(
         m=1,
         topk=2,
@@ -1384,8 +1342,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     up_quant_ref = _reference_mxfp8_rows(up_rot_ref)
     gate_fc1_ref = torch.stack(
         [
-            gate_quant_ref[r]
-            @ w13_reference[0, int(route_experts[r])].float()
+            gate_quant_ref[r] @ w13_reference[0, int(route_experts[r])].float()
             for r in range(routes)
         ]
     ).half()
@@ -1397,8 +1354,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     ).half()
     rotations = prepared.intermediate_rotations[route_experts.long()]
     gate_canonical = (
-        _hadamard128_reference(gate_fc1_ref)
-        * rotations[:, :intermediate].float()
+        _hadamard128_reference(gate_fc1_ref) * rotations[:, :intermediate].float()
     )
     up_canonical = (
         _hadamard128_reference(up_fc1_ref)
@@ -1415,16 +1371,13 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     activated_quant_ref = _reference_mxfp8_rows(activated_ref)
     fc2_ref = torch.stack(
         [
-            activated_quant_ref[r]
-            @ w2_reference[int(route_experts[r])].float()
+            activated_quant_ref[r] @ w2_reference[int(route_experts[r])].float()
             for r in range(routes)
         ]
     ).half()
     canonical_routes = _hadamard128_reference(fc2_ref)
     expected = (
-        canonical_routes
-        * prepared.down_svh[0].float()
-        * topk_weights.reshape(-1, 1)
+        canonical_routes * prepared.down_svh[0].float() * topk_weights.reshape(-1, 1)
     ).sum(dim=0, keepdim=True)
     torch.testing.assert_close(actual, expected, rtol=4.0e-3, atol=3.0e-2)
 
@@ -1454,9 +1407,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     assert torch.equal(mapped, actual)
 
     # A route owned by the other hybrid tier maps to -1 and contributes zero.
-    partial_global_ids = torch.tensor(
-        [[4, 3]], dtype=torch.int32, device=device
-    )
+    partial_global_ids = torch.tensor([[4, 3]], dtype=torch.int32, device=device)
     partial = run_trellis_w4a8_moe(
         source,
         prepared,
@@ -1466,13 +1417,9 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
         expert_map=expert_map,
     ).clone()
     partial_expected = (
-        canonical_routes[0]
-        * prepared.down_svh[0].float()
-        * topk_weights[0, 0]
+        canonical_routes[0] * prepared.down_svh[0].float() * topk_weights[0, 0]
     ).reshape(1, -1)
-    torch.testing.assert_close(
-        partial, partial_expected, rtol=4.0e-3, atol=3.0e-2
-    )
+    torch.testing.assert_close(partial, partial_expected, rtol=4.0e-3, atol=3.0e-2)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
