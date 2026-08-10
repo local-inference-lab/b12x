@@ -91,8 +91,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -2575,7 +2574,7 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
-        route_E = requested_route_E if full_rotation else int(weight_E)
+        route_E = max(requested_route_E, int(weight_E))
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
@@ -5002,6 +5001,9 @@ def prepare_b12x_fp4_moe_weights(
     qsrt_expert_ids: torch.Tensor | None = None,
     qsrt_format_codes: torch.Tensor | None = None,
     qsrt_rotation_draws: torch.Tensor | None = None,
+    qsrt_atom_slots: int | None = None,
+    qsrt_experts_per_layer: int | None = None,
+    qsrt_rotation_multiplier: int | None = None,
     dummy_scale: torch.Tensor | None = None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner."""
@@ -5096,6 +5098,9 @@ def prepare_b12x_fp4_moe_weights(
                 qsrt_layer_index,
                 qsrt_expert_ids,
                 qsrt_format_codes,
+                qsrt_atom_slots,
+                qsrt_experts_per_layer,
+                qsrt_rotation_multiplier,
                 gate_suh,
                 up_suh,
                 down_svh,
@@ -5109,6 +5114,9 @@ def prepare_b12x_fp4_moe_weights(
         assert qsrt_first_atom_slot is not None
         assert qsrt_layer_index is not None
         assert qsrt_expert_ids is not None and qsrt_format_codes is not None
+        assert qsrt_atom_slots is not None
+        assert qsrt_experts_per_layer is not None
+        assert qsrt_rotation_multiplier is not None
         assert gate_suh is not None and up_suh is not None
         assert down_svh is not None
         h_side_shapes = (
@@ -5156,6 +5164,9 @@ def prepare_b12x_fp4_moe_weights(
             hidden_size=plan.hidden_size,
             intermediate_size=plan.intermediate_size,
             num_experts=plan.num_experts,
+            atom_slots=qsrt_atom_slots,
+            experts_per_layer=qsrt_experts_per_layer,
+            rotation_multiplier=qsrt_rotation_multiplier,
             activation=plan.activation,
             gate_suh=gate_suh,
             up_suh=up_suh,
@@ -6674,6 +6685,9 @@ def _plan_full_rotation_w4a16_launches(
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
     w13_layout = "trellis3_t256_proj"
+    trellis_pair_kind = (
+        "PDYNAMIC" if core_plan.qsrt_storage_format == "qsrt_atoms_v1" else None
+    )
     _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
@@ -6728,6 +6742,8 @@ def _plan_full_rotation_w4a16_launches(
                 scale_format=scale_format,
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
+                fc1_trellis_pair_kind=trellis_pair_kind,
+                fc2_trellis_pair_kind=trellis_pair_kind,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -10909,8 +10925,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -11268,9 +11283,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

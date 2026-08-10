@@ -607,6 +607,97 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     assert 4096 not in plan.layout.core_token_counts
 
 
+def test_qsrt_atom_launch_planner_prewarms_pdynamic_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import nullcontext
+
+    from b12x.moe._shared.kernels.w4a16 import host as w4a16_host
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    fused_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(tp_moe_impl.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        tp_moe_impl.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        tp_moe_impl.torch.cuda,
+        "device",
+        lambda _device: nullcontext(),
+    )
+    monkeypatch.setattr(tp_moe_impl.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        tp_moe_impl.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            multi_processor_count=120,
+            shared_memory_per_block_optin=64 * 1024,
+        ),
+    )
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_W4A16_ROUTE_PACK_PREWARMED",
+        {
+            ("cuda", 0, 2, 8, 4, False),
+            ("cuda", 0, 2, 8, 4, True),
+        },
+    )
+    monkeypatch.setattr(
+        w4a16_host,
+        "route_pack_capacity",
+        lambda *_args, **_kwargs: (2, 8, 1),
+    )
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "compile_w4a16_fused_moe",
+        lambda **kwargs: fused_calls.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "compile_w4a16_topk_sum",
+        lambda **_kwargs: object(),
+    )
+    caps = SimpleNamespace(
+        quant_mode="w4a16",
+        w4a16_weight_layout="trellis3_t256",
+        source_format="qsrt_sqg_e4m3",
+        w4a16_scale_format="e4m3_k32",
+        apply_router_weight_on_input=False,
+        w4a16_fast_math=True,
+    )
+    core_plan = SimpleNamespace(
+        full_rotation=True,
+        device=torch.device("cuda"),
+        route_block_size_m=8,
+        num_topk=2,
+        route_E=4,
+        weight_E=4,
+        k=128,
+        n=256,
+        dtype=torch.bfloat16,
+        activation="silu",
+        swiglu_limit=None,
+        swiglu_alpha=1.0,
+        swiglu_beta=0.0,
+        trellis_bits=3,
+        trellis_tile_config=(64, 256, 64, 128),
+        qsrt_storage_format="qsrt_atoms_v1",
+        coupled_hadamard=False,
+    )
+
+    tp_moe_impl._plan_full_rotation_w4a16_launches(
+        caps=caps,
+        core_plan=core_plan,
+        capacity_tokens=1,
+    )
+
+    assert len(fused_calls) == 1
+    assert fused_calls[0]["fc1_trellis_pair_kind"] == "PDYNAMIC"
+    assert fused_calls[0]["fc2_trellis_pair_kind"] == "PDYNAMIC"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""

@@ -22,6 +22,7 @@ import statistics
 import sys
 
 import torch
+from cuda.bindings import runtime as cudart
 
 try:
     from benchmarks.benchmark_trellis_pair_moe_tp12 import (
@@ -61,7 +62,7 @@ from b12x.moe._shared.kernels.trellis_w4a8 import (
 
 _SCENARIOS = ("P33", "P24", "sparse", "mixed")
 _RESULT_KIND = "b12x_trellis_w4a8_vs_w4a16_moe_tp12_benchmark"
-_RESULT_SCHEMA_VERSION = 1
+_RESULT_SCHEMA_VERSION = 2
 
 
 def _parse_scenarios(value: str) -> list[str]:
@@ -94,6 +95,37 @@ def _summary(samples: list[float]) -> dict[str, float]:
     }
 
 
+def _graph_structure(graph: torch.cuda.CUDAGraph) -> dict[str, object]:
+    graph_handle = graph.raw_cuda_graph()
+    result, _, node_count = cudart.cudaGraphGetNodes(graph_handle)
+    if result != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaGraphGetNodes(size) failed: {result}")
+    result, nodes, returned_nodes = cudart.cudaGraphGetNodes(
+        graph_handle,
+        node_count,
+    )
+    if result != cudart.cudaError_t.cudaSuccess or returned_nodes != node_count:
+        raise RuntimeError(
+            f"cudaGraphGetNodes(data) failed: {result}, "
+            f"{returned_nodes=}, {node_count=}"
+        )
+    kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    kernel_count = 0
+    node_types: dict[str, int] = {}
+    for node in nodes[:node_count]:
+        result, node_type = cudart.cudaGraphNodeGetType(node)
+        if result != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaGraphNodeGetType failed: {result}")
+        kernel_count += node_type == kernel_type
+        node_type_name = str(node_type)
+        node_types[node_type_name] = node_types.get(node_type_name, 0) + 1
+    return {
+        "node_count": int(node_count),
+        "kernel_node_count": int(kernel_count),
+        "node_types": node_types,
+    }
+
+
 def _time_graphs(
     graphs: dict[str, torch.cuda.CUDAGraph], *, replays: int
 ) -> dict[str, list[float]]:
@@ -115,9 +147,7 @@ def _time_graphs(
     return samples
 
 
-def _numerical_comparison(
-    w4a8: torch.Tensor, w4a16: torch.Tensor
-) -> dict[str, float]:
+def _numerical_comparison(w4a8: torch.Tensor, w4a16: torch.Tensor) -> dict[str, float]:
     reference = w4a16.float()
     candidate = w4a8.float()
     difference = candidate - reference
@@ -134,8 +164,7 @@ def _numerical_comparison(
         "rmse": float(difference.square().mean().sqrt()),
         "mean_abs": float(difference.abs().mean()),
         "max_abs": float(difference.abs().max()),
-        "cosine_similarity": float((reference * candidate).sum())
-        / cosine_denominator,
+        "cosine_similarity": float((reference * candidate).sum()) / cosine_denominator,
     }
 
 
@@ -226,10 +255,10 @@ def _capture_case(
     ):
         raise RuntimeError(f"{scenario} produced non-finite output")
 
-    graph_w4a16 = torch.cuda.CUDAGraph()
+    graph_w4a16 = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph_w4a16):
         w4a16_captured = binding.run()
-    graph_w4a8 = torch.cuda.CUDAGraph()
+    graph_w4a8 = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph_w4a8):
         w4a8_captured = run_trellis_w4a8_moe(
             source,
@@ -401,6 +430,9 @@ def main() -> None:
                 replicates=args.bootstrap_replicates,
                 seed=args.seed + 10_000 * tokens + scenario_index,
             )
+            graph_structure = {
+                name: _graph_structure(graph) for name, graph in graphs.items()
+            }
             cases.append(
                 {
                     "tokens": tokens,
@@ -409,6 +441,7 @@ def main() -> None:
                     "timings": summaries,
                     "raw_us": raw,
                     "w4a8_over_w4a16": ratio,
+                    "graph_structure": graph_structure,
                 }
             )
 
