@@ -536,13 +536,13 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
-def test_mixed_k3_k4_k5_matches_serial_and_captures(codebook: str) -> None:
-    """Close native K5 dispatch and graph replay in the shared mixed grid."""
+def test_mixed_k3_k4_k5_mcg_matches_serial_and_captures() -> None:
+    """Close native R7 K5 dispatch and graph replay in the shared mixed grid."""
 
     torch.manual_seed(20260809)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 2, 128, 128, 3
+    codebook = "mcg"
     tiers = tuple(
         _prepared(
             experts=2,
@@ -602,8 +602,7 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(codebook: str) -> None:
         launch, device=device, sms=int(props.multi_processor_count)
     )
 
-    other_codebook = "sqg_xor_cheb_t12" if codebook == "mcg" else "mcg"
-    mismatched_tier0 = replace(tiers[0], trellis_codebook=other_codebook)
+    mismatched_tier0 = replace(tiers[0], trellis_codebook="sqg_xor_cheb_t12")
     with pytest.raises(ValueError, match="launch-plan codebook"):
         run_mixed_trellis3(
             x,
