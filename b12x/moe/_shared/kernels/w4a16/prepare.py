@@ -41,12 +41,16 @@ _QSRT_MATRIX_SCALE_OFFSETS = (129_024, 129_088, 129_152)
 _QSRT_EXPERT_ROTATION_MULTIPLIER = 5
 _QSRT_V2_P33_MATRIX_TRELLIS_BYTES = 43_008
 _QSRT_V2_P43_MATRIX_TRELLIS_BYTES = 50_176
+_QSRT_V2_P44_MATRIX_TRELLIS_BYTES = 57_344
 _QSRT_V2_P33_ATOM_BUNDLE_BYTES = 129_216
 _QSRT_V2_P43_ATOM_BUNDLE_BYTES = 150_720
+_QSRT_V2_COUPLED_H308_P43_P33_ATOM_BUNDLE_BYTES = 143_552
+_QSRT_V2_COUPLED_H308_P43_P44_ATOM_BUNDLE_BYTES = 157_888
 _QSRT_V2_P22_MATRIX_TRELLIS_BYTES = 28_672
 _QSRT_V2_P22_ATOM_BUNDLE_BYTES = 86_208
 _QSRT_V2_PROFILE_H308 = "k3x22_k4x2"
 _QSRT_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
+_QSRT_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
 # Canonical W13 layout names are "w13"/"w31"; accept the physical FC1-half
 # spellings as aliases. Logical checkpoint order "w13" arrives up/gate and
 # needs a swap before the kernel's SwiGLU; "w31" is already kernel-native
@@ -2978,6 +2982,266 @@ def _prepare_qsrt_p22_atom_v2_moe_weights(
     )
 
 
+def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
+    atom_payload: torch.Tensor,
+    *,
+    first_atom_slot: int,
+    rotation_draws: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+    params_dtype: torch.dtype,
+    codebook: str,
+    tile_config: tuple[int, int, int, int],
+    dummy_scale: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+) -> PreparedW4A16MoeWeights:
+    """Restore one balanced coupled-Hadamard H308 atom extent."""
+
+    atom_count = int(atom_payload.shape[0])
+    if atom_count != 8 or first_atom_slot % 8 or not 0 <= first_atom_slot <= 88:
+        raise ValueError(
+            "coupled H308 extents must contain one aligned eight-atom pair"
+        )
+    if intermediate_size != 256:
+        raise ValueError("coupled H308 requires local intermediate_size=256")
+    physical_pair = first_atom_slot // 8
+    if physical_pair == 5:
+        fc1_kind, fc2_kind = "P43", "P33"
+        fc1_matrix_bytes = _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+        fc2_matrix_bytes = _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_COUPLED_H308_P43_P33_ATOM_BUNDLE_BYTES
+    elif physical_pair == 11:
+        fc1_kind, fc2_kind = "P43", "P44"
+        fc1_matrix_bytes = _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+        fc2_matrix_bytes = _QSRT_V2_P44_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_COUPLED_H308_P43_P44_ATOM_BUNDLE_BYTES
+    else:
+        fc1_kind = fc2_kind = "P33"
+        fc1_matrix_bytes = fc2_matrix_bytes = _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_P33_ATOM_BUNDLE_BYTES
+    if atom_payload.shape[1] < num_experts * bundle_bytes:
+        raise ValueError("coupled H308 atom row is shorter than its expert bundles")
+    payload_bytes = num_experts * bundle_bytes
+    if bool(torch.any(atom_payload[:, payload_bytes:] != 0)):
+        raise ValueError("coupled H308 atom-row padding must be zero")
+    if (
+        rotation_draws.dtype != torch.uint8
+        or tuple(rotation_draws.shape) != (num_experts,)
+        or not rotation_draws.is_contiguous()
+        or rotation_draws.device.type != "cpu"
+        or bool(torch.any(rotation_draws > 7))
+    ):
+        raise ValueError(
+            "coupled H308 rotation_draws must be contiguous CPU uint8[num_experts]"
+        )
+    if tuple(int(value) for value in tile_config) != (64, 256, 64, 256):
+        raise ValueError(
+            "coupled H308 currently requires tile_config=(64, 256, 64, 256)"
+        )
+
+    device = gate_suh.device
+    if device.type != "cuda":
+        raise ValueError("coupled H308 preparation requires CUDA output tensors")
+    for name, value, shapes in (
+        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
+    ):
+        if (
+            value.device != device
+            or value.dtype != torch.float16
+            or tuple(value.shape) not in shapes
+            or not value.is_contiguous()
+            or not bool(torch.all(torch.isfinite(value)))
+        ):
+            raise ValueError(
+                f"{name} must be finite contiguous fp16 {shapes} on {device}"
+            )
+    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
+
+    source = atom_payload[:, :payload_bytes].reshape(
+        atom_count, num_experts, bundle_bytes
+    )
+    hidden_tiles = hidden_size // 16
+    pair_bits = {"P33": (3, 3), "P43": (4, 3), "P44": (4, 4)}
+
+    def restore_matrix(
+        begin: int,
+        matrix_bytes: int,
+        kind: str,
+        *,
+        fc1: bool,
+    ) -> torch.Tensor:
+        low_bits, high_bits = pair_bits[kind]
+        low_bytes = hidden_tiles * 32 * low_bits
+        if low_bytes + hidden_tiles * 32 * high_bits != matrix_bytes:
+            raise AssertionError("coupled H308 matrix geometry drifted")
+        parts: list[torch.Tensor] = []
+        for first_expert in range(0, num_experts, 64):
+            count = min(64, num_experts - first_expert)
+            raw = source[
+                :,
+                first_expert : first_expert + count,
+                begin : begin + matrix_bytes,
+            ]
+            low = (
+                raw[..., :low_bytes]
+                .contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(atom_count, count, hidden_tiles, 16 * low_bits)
+            )
+            high = (
+                raw[..., low_bytes:]
+                .contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(atom_count, count, hidden_tiles, 16 * high_bits)
+            )
+            if fc1:
+                low = low.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
+                high = high.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
+                restored = torch.cat((low, high), dim=2).reshape(count, -1)
+            else:
+                low = low.permute(1, 0, 2, 3).reshape(count, -1)
+                high = high.permute(1, 0, 2, 3).reshape(count, -1)
+                restored = torch.cat((low, high), dim=1)
+            parts.append(restored)
+        return torch.cat(parts, dim=0).contiguous()
+
+    matrix_offsets = (0, fc1_matrix_bytes, 2 * fc1_matrix_bytes)
+    w13 = torch.stack(
+        (
+            restore_matrix(
+                matrix_offsets[0], fc1_matrix_bytes, fc1_kind, fc1=True
+            ),
+            restore_matrix(
+                matrix_offsets[1], fc1_matrix_bytes, fc1_kind, fc1=True
+            ),
+        )
+    ).reshape(-1)
+    w2 = restore_matrix(
+        matrix_offsets[2], fc2_matrix_bytes, fc2_kind, fc1=False
+    ).reshape(-1)
+
+    scale_base = 2 * fc1_matrix_bytes + fc2_matrix_bytes
+    intermediate_scales = torch.empty(
+        (num_experts, 3 * intermediate_size),
+        dtype=torch.float16,
+        device=device,
+    )
+    for matrix_index in range(3):
+        begin = scale_base + matrix_index * 64
+        for first_expert in range(0, num_experts, 64):
+            count = min(64, num_experts - first_expert)
+            values = (
+                source[
+                    :,
+                    first_expert : first_expert + count,
+                    begin : begin + 64,
+                ]
+                .contiguous()
+                .to(device=device)
+                .view(torch.float16)
+                .reshape(atom_count, count, 32)
+            )
+            restored = torch.cat(
+                (
+                    values[:, :, :16].permute(1, 0, 2).reshape(count, 128),
+                    values[:, :, 16:].permute(1, 0, 2).reshape(count, 128),
+                ),
+                dim=1,
+            )
+            intermediate_scales[
+                first_expert : first_expert + count,
+                matrix_index
+                * intermediate_size : (matrix_index + 1)
+                * intermediate_size,
+            ].copy_(restored)
+
+    pre_begin = 2 * first_atom_slot * 32
+    post_begin = first_atom_slot * 32
+    signs = torch.empty((num_experts, 3 * intermediate_size), dtype=torch.float16)
+    for draw in sorted(set(int(value) for value in rotation_draws.tolist())):
+        rows = torch.nonzero(rotation_draws == draw, as_tuple=False).flatten()
+        pre = _qsrt_coupled_rotation_signs(6144, draw=draw, axis=1)[
+            pre_begin : pre_begin + 2 * intermediate_size
+        ]
+        post = _qsrt_coupled_rotation_signs(3072, draw=draw, axis=2)[
+            post_begin : post_begin + intermediate_size
+        ]
+        signs.index_copy_(
+            0,
+            rows,
+            torch.cat((pre, post)).to(torch.float16).expand(rows.numel(), -1),
+        )
+    rotations = torch.cat(
+        (intermediate_scales, signs.to(device=device, non_blocking=True)), dim=1
+    ).contiguous()
+
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    if (
+        dummy_scale.device != device
+        or dummy_scale.dtype != torch.uint8
+        or tuple(dummy_scale.shape) != (4,)
+        or not dummy_scale.is_contiguous()
+        or dummy_scale.data_ptr() % 16
+    ):
+        raise ValueError(
+            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
+        )
+    if workspace is None:
+        workspace = _make_workspace(device, max_blocks_per_sm=4)
+    if (
+        workspace.device != device
+        or workspace.dtype != torch.int32
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError("workspace must be contiguous int32 on the weight device")
+    normalized_codebook = _trellis256_marker_codebook(
+        mcg=None, mul1_e4m3=None, codebook=codebook
+    )
+    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
+    source_suh = gate_suh if physical_pair < 6 else up_suh
+    return PreparedW4A16MoeWeights(
+        w13=w13.view(torch.int32),
+        w13_scale=dummy_scale,
+        w13_global_scale=global_scale,
+        w2=w2.view(torch.int32),
+        w2_scale=dummy_scale,
+        w2_global_scale=global_scale,
+        workspace=workspace,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=True,
+        params_dtype=params_dtype,
+        fc1_tile_n=256,
+        fc2_tile_n=256,
+        source_format="qsrt_sqg_e4m3",
+        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        trellis_codebook=normalized_codebook,
+        trellis_bits=3,
+        fc1_trellis_pair_kind=fc1_kind,
+        fc2_trellis_pair_kind=fc2_kind,
+        gate_suh=source_suh,
+        up_suh=source_suh,
+        intermediate_rotations=rotations,
+        down_svh=down_svh,
+        coupled_hadamard=True,
+        tile_config=(64, 256, 64, 256),
+    )
+
+
 def prepare_qsrt_atom_v2_moe_weights(
     atom_payload: torch.Tensor,
     *,
@@ -3009,7 +3273,11 @@ def prepare_qsrt_atom_v2_moe_weights(
         raise ValueError("QSRT atoms-v2 currently requires all 896 experts")
     if hidden_size != 3584:
         raise ValueError("QSRT atoms-v2 currently requires hidden_size=3584")
-    if profile not in {_QSRT_V2_PROFILE_H308, _QSRT_V2_PROFILE_COUPLED_K2}:
+    if profile not in {
+        _QSRT_V2_PROFILE_H308,
+        _QSRT_V2_PROFILE_COUPLED_K2,
+        _QSRT_V2_PROFILE_COUPLED_H308,
+    }:
         raise ValueError(f"unsupported QSRT atoms-v2 profile {profile!r}")
     if not validate_activation(activation) or params_dtype != torch.float16:
         raise ValueError("QSRT atoms-v2 requires gated fp16 preparation")
@@ -3032,6 +3300,26 @@ def prepare_qsrt_atom_v2_moe_weights(
         if rotation_draws is None:
             raise ValueError("pure-K2 atoms-v2 requires coupled rotation draws")
         return _prepare_qsrt_p22_atom_v2_moe_weights(
+            atom_payload,
+            first_atom_slot=first_atom_slot,
+            rotation_draws=rotation_draws,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            activation=activation,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=down_svh,
+            params_dtype=params_dtype,
+            codebook=codebook,
+            tile_config=tile_config,
+            dummy_scale=dummy_scale,
+            workspace=workspace,
+        )
+    if profile == _QSRT_V2_PROFILE_COUPLED_H308:
+        if rotation_draws is None:
+            raise ValueError("coupled H308 atoms-v2 requires rotation draws")
+        return _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
             atom_payload,
             first_atom_slot=first_atom_slot,
             rotation_draws=rotation_draws,

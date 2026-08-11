@@ -840,10 +840,17 @@ class W4A16GemmKernel:
         if trellis_pair_kind is not None:
             if weight_layout != "trellis3_t256":
                 raise ValueError("trellis pairs require trellis3_t256 weights")
-            if trellis_pair_kind not in {"P24", "P33", "PDYNAMIC", "P33_P43"}:
+            if trellis_pair_kind not in {
+                "P24",
+                "P33",
+                "P43",
+                "P44",
+                "PDYNAMIC",
+                "P33_P43",
+            }:
                 raise ValueError(
-                    "trellis_pair_kind must be P24, P33, PDYNAMIC, or "
-                    "P33_P43, got "
+                    "trellis_pair_kind must be P24, P33, P43, P44, "
+                    "PDYNAMIC, or P33_P43, got "
                     f"{trellis_pair_kind!r}"
                 )
             if trellis_rate_axis not in {"k", "n"}:
@@ -946,6 +953,15 @@ class W4A16GemmKernel:
         self.weight_layout_trellis256_pair = trellis_pair_kind is not None
         self.trellis_pair_dynamic = trellis_pair_kind in {"PDYNAMIC", "P33_P43"}
         self.trellis_pair_compact_offsets = trellis_pair_kind == "P33_P43"
+        static_pair_rates = {
+            "P24": (2, 4),
+            "P33": (3, 3),
+            "P43": (4, 3),
+            "P44": (4, 4),
+        }
+        self.trellis_pair_low_bits, self.trellis_pair_high_bits = (
+            static_pair_rates.get(trellis_pair_kind, (3, 3))
+        )
         self.sqg_xor_cheb_t12_smem = False
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
@@ -1102,17 +1118,18 @@ class W4A16GemmKernel:
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
         # Native t256 uses 4*bits bytes per 32 codes;
         # packed/modelopt use 16 bytes for the same logical unit.
-        self.b_unit_bytes = (
-            16
-            if self.weight_layout_trellis256_pair
-            and self.trellis_rate_axis == "k"
-            else 14
-            if self.trellis_pair_compact_offsets
-            and self.trellis_rate_axis == "n"
-            else 4 * self.trellis_bits
-            if self.weight_layout_trellis256
-            else 16
-        )
+        self.b_unit_bytes = 16
+        if self.weight_layout_trellis256:
+            self.b_unit_bytes = 4 * self.trellis_bits
+            if self.weight_layout_trellis256_pair:
+                if self.trellis_rate_axis == "k":
+                    self.b_unit_bytes = 16
+                elif self.trellis_pair_compact_offsets:
+                    self.b_unit_bytes = 14
+                elif not self.trellis_pair_dynamic:
+                    self.b_unit_bytes = 2 * (
+                        self.trellis_pair_low_bits + self.trellis_pair_high_bits
+                    )
         self.b_sh_stage_bytes = self.b_sh_stage * self.b_unit_bytes
         if self.b_region_variable:
             if self.b_sh_stage_bytes % 16 != 0:
@@ -3141,7 +3158,7 @@ class W4A16GemmKernel:
             and self.weight_layout_trellis256_pair
             and self.trellis_rate_axis == "k"
             and (
-                self.trellis_pair_kind == "P24"
+                self.trellis_pair_kind in {"P24", "P43", "P44"}
                 or (
                     self.trellis_pair_dynamic
                     and int(dynamic_pair_override) in (1, 2)
@@ -3151,9 +3168,16 @@ class W4A16GemmKernel:
             # FC2 assigns an entire warp/kk fragment to one side of an
             # asymmetric pair.  Select the record bitrate once, outside the
             # four unrolled N16 fragments.
-            low_bits = 2
-            high_bits = 4
-            if cutlass.const_expr(int(dynamic_pair_override) == 2):
+            low_bits = self.trellis_pair_low_bits
+            high_bits = self.trellis_pair_high_bits
+            if cutlass.const_expr(
+                self.trellis_pair_dynamic and int(dynamic_pair_override) == 1
+            ):
+                low_bits = 2
+                high_bits = 4
+            elif cutlass.const_expr(
+                self.trellis_pair_dynamic and int(dynamic_pair_override) == 2
+            ):
                 low_bits = 4
                 high_bits = 3
             warp_id = tid >> Int32(5)
@@ -4099,15 +4123,23 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
     ):
         # Dynamic pair kernels dispatch to bitrate-specific arms before entering
-        # the MMA loop.  This fallback therefore serves only static P33/P24
-        # specializations and contains no runtime mode branch.
+        # the MMA loop. This fallback serves compile-time static pair rates.
         if cutlass.const_expr(self.trellis_pair_kind == "P33"):
             self._scaled_dequant_b_fragment_trellis256_bits(
                 frag, win_a, win_b, trellis_lut_addr, 3
             )
             return
-        self._scaled_dequant_b_fragment_trellis256_p24(
-            frag, win_a, win_b, trellis_lut_addr, tid, jj, tile_idx, kk
+        self._scaled_dequant_b_fragment_trellis256_pair_rates(
+            frag,
+            win_a,
+            win_b,
+            trellis_lut_addr,
+            tid,
+            jj,
+            tile_idx,
+            kk,
+            self.trellis_pair_low_bits,
+            self.trellis_pair_high_bits,
         )
 
     @cute.jit
@@ -4221,10 +4253,15 @@ class W4A16GemmKernel:
                 regs, smem_base, tid, pipe, kk, tile_idx, 2, 4
             )
         elif cutlass.const_expr(
-            self.trellis_pair_dynamic and int(dynamic_pair_override) == 2
+            self.trellis_pair_kind == "P43"
+            or (self.trellis_pair_dynamic and int(dynamic_pair_override) == 2)
         ):
             self._load_b_registers_trellis256_pair_bits(
                 regs, smem_base, tid, pipe, kk, tile_idx, 4, 3
+            )
+        elif cutlass.const_expr(self.trellis_pair_kind == "P44"):
+            self._load_b_registers_trellis256_pair_bits(
+                regs, smem_base, tid, pipe, kk, tile_idx, 4, 4
             )
         else:
             self._load_b_registers_trellis256_pair_bits(
@@ -4774,11 +4811,17 @@ class W4A16GemmKernel:
                     low_bits = 2
                     high_bits = 4
                 elif cutlass.const_expr(
-                    self.trellis_pair_dynamic
-                    and int(dynamic_pair_override) == 2
+                    self.trellis_pair_kind == "P43"
+                    or (
+                        self.trellis_pair_dynamic
+                        and int(dynamic_pair_override) == 2
+                    )
                 ):
                     low_bits = 4
                     high_bits = 3
+                elif cutlass.const_expr(self.trellis_pair_kind == "P44"):
+                    low_bits = 4
+                    high_bits = 4
                 if cutlass.const_expr(self.trellis_rate_axis == "n"):
                     # Preparation swizzles the reference record-major payload
                     # into one fixed-size compact pair span per K16 row.
@@ -4850,7 +4893,12 @@ class W4A16GemmKernel:
                     # each compact K2/K3/K4 source tile into its K16 slot's
                     # prefix.
                     max_chunks_per_kt = self.cta_n_blocks * 8
-                    t256_expert_u32 = (self.size_k // 16) * t256_n16 * 24
+                    t256_expert_u32 = (
+                        (self.size_k // 16)
+                        * t256_n16
+                        * 4
+                        * (low_bits + high_bits)
+                    )
                     low_record_u32 = Int32(8 * t256_n16 * 8 * low_bits)
                     for i in cutlass.range_constexpr(self.b_sh_wr_iters_var):
                         t256_chunk = Int32(i * self.cta_threads) + tid
@@ -6245,13 +6293,21 @@ class W4A16FusedMoeKernel:
                     "fused QSRT pairs require the trellis_bits=3 base "
                     "specialization"
                 )
-            if self.fc1_trellis_pair_kind != self.fc2_trellis_pair_kind or (
-                self.fc1_trellis_pair_kind not in {"PDYNAMIC", "P33_P43"}
+            dynamic_kinds = {"PDYNAMIC", "P33_P43"}
+            static_kinds = {"P24", "P33", "P43", "P44"}
+            if (
+                self.fc1_trellis_pair_kind in dynamic_kinds
+                or self.fc2_trellis_pair_kind in dynamic_kinds
             ):
-                raise ValueError(
-                    "fused trellis pairs require matching runtime mode tables "
-                    "or matching compact P33/P43 descriptors"
-                )
+                if self.fc1_trellis_pair_kind != self.fc2_trellis_pair_kind:
+                    raise ValueError(
+                        "dynamic fused trellis pair kinds must match"
+                    )
+            elif (
+                self.fc1_trellis_pair_kind not in static_kinds
+                or self.fc2_trellis_pair_kind not in static_kinds
+            ):
+                raise ValueError("unsupported static fused trellis pair kind")
         self.scale_format = scale_format
         self.w13_layout = w13_layout
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
@@ -7485,6 +7541,11 @@ class W4A16FusedMoeKernel:
         chunk = lane >> Int32(3)
         chunk_lane = lane & Int32(7)
         atom = pre_block * Int32(2) + (chunk >> Int32(1))
+        if cutlass.const_expr(self.fc1_trellis_pair_kind == "P43"):
+            # P43 stores the funded K4 record first.  Coupled H308 places the
+            # logical first preactivation record in the high K3 half, so undo
+            # that storage order before cancelling the H128 boundary.
+            atom = atom ^ Int32(4)
         slot = chunk & Int32(1)
         coord = atom * Int32(32) + chunk_lane * Int32(4)
         isz = Int32(self.intermediate_size)
@@ -12469,13 +12530,22 @@ def run_w4a16_moe(
         if fc1_trellis_pair_kind is not None:
             fc1_trellis_pair_kind = str(fc1_trellis_pair_kind).upper()
             fc2_trellis_pair_kind = str(fc2_trellis_pair_kind).upper()
-            if fc1_trellis_pair_kind != fc2_trellis_pair_kind or (
-                fc1_trellis_pair_kind not in {"PDYNAMIC", "P33_P43"}
+            dynamic_kinds = {"PDYNAMIC", "P33_P43"}
+            static_kinds = {"P24", "P33", "P43", "P44"}
+            dynamic_pairs = (
+                fc1_trellis_pair_kind in dynamic_kinds
+                or fc2_trellis_pair_kind in dynamic_kinds
+            )
+            if dynamic_pairs:
+                if fc1_trellis_pair_kind != fc2_trellis_pair_kind:
+                    raise ValueError(
+                        "prepared dynamic fused trellis pair kinds must match"
+                    )
+            elif (
+                fc1_trellis_pair_kind not in static_kinds
+                or fc2_trellis_pair_kind not in static_kinds
             ):
-                raise ValueError(
-                    "prepared fused trellis pair kinds must be matching "
-                    "PDYNAMIC or P33_P43 values"
-                )
+                raise ValueError("unsupported prepared static trellis pair kind")
             pair_metadata_dtype = (
                 torch.int64
                 if fc1_trellis_pair_kind == "P33_P43"
@@ -12486,22 +12556,23 @@ def run_w4a16_moe(
                     "prepared QSRT pairs require the trellis_bits=3 base "
                     "specialization"
                 )
-            for name, modes in (
-                ("fc1", fc1_trellis_pair_modes),
-                ("fc2", fc2_trellis_pair_modes),
-            ):
-                if (
-                    modes is None
-                    or modes.dtype != pair_metadata_dtype
-                    or modes.device != a_input.device
-                    or tuple(modes.shape) != (int(prepared.num_experts),)
-                    or not modes.is_contiguous()
+            if dynamic_pairs:
+                for name, modes in (
+                    ("fc1", fc1_trellis_pair_modes),
+                    ("fc2", fc2_trellis_pair_modes),
                 ):
-                    raise ValueError(
-                        f"prepared dynamic {name} trellis pair metadata must be "
-                        f"contiguous {pair_metadata_dtype}[num_experts] on the "
-                        "input device"
-                    )
+                    if (
+                        modes is None
+                        or modes.dtype != pair_metadata_dtype
+                        or modes.device != a_input.device
+                        or tuple(modes.shape) != (int(prepared.num_experts),)
+                        or not modes.is_contiguous()
+                    ):
+                        raise ValueError(
+                            f"prepared dynamic {name} trellis pair metadata must be "
+                            f"contiguous {pair_metadata_dtype}[num_experts] on the "
+                            "input device"
+                        )
         if activation_amax is not None:
             raise NotImplementedError(
                 "trellis3_t256 activation-amax collection is not exposed through "

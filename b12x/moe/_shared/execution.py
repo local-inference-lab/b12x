@@ -162,6 +162,7 @@ _TRELLIS_SOURCE_FORMATS = frozenset(
 )
 _QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
 _QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
+_QSRT_ATOMS_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -355,6 +356,7 @@ class MoEWeightPreparationPlan:
                     if profile not in {
                         _QSRT_ATOMS_V2_PROFILE_H308,
                         _QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+                        _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
                     }:
                         raise ValueError(
                             f"unsupported QSRT atoms-v2 profile {profile!r}"
@@ -398,10 +400,12 @@ class MoEWeightPreparationPlan:
                             "the fixed high-rate QSRT pair kernel requires "
                             "FC1 tile_n=256"
                         )
-                    if self.coupled_hadamard:
+                    if (
+                        profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_H308
+                    ) != self.coupled_hadamard:
                         raise ValueError(
-                            "the fixed high-rate QSRT profile does not store "
-                            "coupled-Hadamard metadata"
+                            "the fixed high-rate coupled profile and "
+                            "coupled_hadamard flag must agree"
                         )
                 object.__setattr__(self, "qsrt_profile", profile)
             elif storage_format is not None:
@@ -895,7 +899,10 @@ def plan_moe_weight_preparation(
         storage_policy = WeightStoragePolicy.KEEP_SOURCE
 
     if coupled_hadamard is None:
-        coupled_hadamard = qsrt_profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2
+        coupled_hadamard = qsrt_profile in {
+            _QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+            _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
+        }
     return MoEWeightPreparationPlan(
         specs=normalized_specs,
         num_experts=num_experts,
