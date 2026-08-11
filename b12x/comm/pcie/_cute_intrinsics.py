@@ -488,3 +488,57 @@ def rsqrt_approx_f32(value: Float32, *, loc=None, ip=None) -> Float32:
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def float_order_key(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Map a float onto a u32 whose unsigned order matches float order.
+
+    Lets a (score, expert) pair be packed into one integer key, so "better
+    candidate" becomes a plain integer max and the tie-break stops costing a
+    second comparison.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .u32 bits, mask;
+                mov.b32 bits, $1;
+                shr.u32 mask, bits, 31;
+                mul.lo.u32 mask, mask, 0x7fffffff;
+                or.b32 mask, mask, 0x80000000;
+                xor.b32 $0, bits, mask;
+            }
+            """,
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def redux_max_u32(value: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Warp-wide unsigned max in one instruction.
+
+    ``cute.arch.warp_redux_sync`` exposes the float variant, which libNVVM
+    rejects for sm_120a; the integer one is what the kernel actually needs.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            "redux.sync.max.u32 $0, $1, 0xffffffff;",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
