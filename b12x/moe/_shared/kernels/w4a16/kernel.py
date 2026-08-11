@@ -462,7 +462,17 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    ultra_wide_fc2 = (
+        int(tile_n) == 512
+        and int(tile_k) == 32
+        and int(cta_threads) == 256
+        and _scale_group_size(scale_format) == 32
+    )
+    if (
+        int(tile_n) < 64
+        or (int(tile_k) < 64 and not ultra_wide_fc2)
+        or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -2518,6 +2528,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            Int32(0),
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2530,6 +2541,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            Int32(0),
+            0,
         )
         a0_regs_cur = cute.make_rmem_tensor((2,), Uint32)
         a0_regs_next = cute.make_rmem_tensor((2,), Uint32)
@@ -2576,6 +2589,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            0,
         )
 
         self._finish_tile(
@@ -3031,6 +3045,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
@@ -3052,6 +3067,7 @@ class W4A16GemmKernel:
                             kk,
                             tile_idx,
                             k_tiles,
+                            dynamic_pair_override,
                         )
 
                         self._prefetch_pipeline_step(
@@ -3080,6 +3096,7 @@ class W4A16GemmKernel:
                             a_rows_per_iter,
                             output_n_tile,
                             expert_idx,
+                            dynamic_pair_override,
                         )
 
                         for jj in cutlass.range_constexpr(4):
@@ -3120,6 +3137,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(0),
                     Int32(0),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_cur,
@@ -3930,6 +3949,7 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         self._clear_b_scale_register_bundle(b_scale_next)
         self._clear_a_register_bundle_m8(a0_regs_next)
@@ -3945,6 +3965,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(pipe),
                     Int32(kk + 1),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -3972,6 +3994,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     next_pipe,
                     Int32(0),
+                    next_tile,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -4335,12 +4359,10 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
-                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
-                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
-                        b_region, tile_base, lane, low_bits
-                    )
-                elif logical_k16 < Int32(8):
+                if (
+                    cutlass.const_expr(int(low_bits) == int(high_bits))
+                    or logical_k16 < Int32(8)
+                ):
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits
@@ -6143,6 +6165,8 @@ class W4A16FusedMoeKernel:
         fc2_tile_k: int,
         moe_block_size: int,
         max_m_blocks: int,
+        fc1_moe_block_size: int | None = None,
+        fc1_schedule_route_block_factor: int = 1,
         fc2_moe_block_size: int | None = None,
         fc2_schedule_route_block_factor: int = 1,
         element_dtype: str = "bf16",
@@ -6228,30 +6252,45 @@ class W4A16FusedMoeKernel:
         self.small_m_splitk = _w4a16_small_m_splitk_enabled()
         if self.small_m_splitk:
             schedule_whole_tiles = False
+            fc1_moe_block_size = moe_block_size
+            fc1_schedule_route_block_factor = 1
+            fc2_moe_block_size = moe_block_size
             fc2_schedule_route_block_factor = 1
+        self.fc1_moe_block_size = int(
+            moe_block_size if fc1_moe_block_size is None else fc1_moe_block_size
+        )
+        self.fc1_schedule_route_block_factor = int(fc1_schedule_route_block_factor)
         self.fc2_moe_block_size = int(
             moe_block_size if fc2_moe_block_size is None else fc2_moe_block_size
         )
         self.fc2_schedule_route_block_factor = int(fc2_schedule_route_block_factor)
-        if (
-            self.fc2_moe_block_size not in _ALLOWED_ROUTED_SIZES
-            or self.moe_block_size % self.fc2_moe_block_size != 0
+        for phase, subtile, factor in (
+            (
+                "FC1",
+                self.fc1_moe_block_size,
+                self.fc1_schedule_route_block_factor,
+            ),
+            (
+                "FC2",
+                self.fc2_moe_block_size,
+                self.fc2_schedule_route_block_factor,
+            ),
         ):
-            raise ValueError(
-                "FC2 route subtile must be an allowed divisor of the packed "
-                f"route block: packed={self.moe_block_size}, "
-                f"fc2={self.fc2_moe_block_size}"
-            )
-        expected_fc2_schedule_factor = self.moe_block_size // self.fc2_moe_block_size
-        if (
-            self.fc2_schedule_route_block_factor < 1
-            or expected_fc2_schedule_factor % self.fc2_schedule_route_block_factor != 0
-        ):
-            raise ValueError(
-                "FC2 schedule factor must divide one packed route block: "
-                f"factor={self.fc2_schedule_route_block_factor}, "
-                f"maximum={expected_fc2_schedule_factor}"
-            )
+            if (
+                subtile not in _ALLOWED_ROUTED_SIZES
+                or self.moe_block_size % subtile != 0
+            ):
+                raise ValueError(
+                    f"{phase} route subtile must be an allowed divisor of the "
+                    f"packed route block: packed={self.moe_block_size}, "
+                    f"{phase.lower()}={subtile}"
+                )
+            expected_schedule_factor = self.moe_block_size // subtile
+            if factor < 1 or expected_schedule_factor % factor != 0:
+                raise ValueError(
+                    f"{phase} schedule factor must divide one packed route block: "
+                    f"factor={factor}, maximum={expected_schedule_factor}"
+                )
         self.activation = activation
         self.activation_is_gated = is_gated
         self.activation_is_situ = activation == SITU
@@ -6388,8 +6427,10 @@ class W4A16FusedMoeKernel:
             mul_topk_weights=bool(apply_router_weight_on_input),
             tile_n=fc1_tile_n,
             tile_k=fc1_tile_k,
-            moe_block_size=moe_block_size,
-            max_m_blocks=max_m_blocks,
+            moe_block_size=self.fc1_moe_block_size,
+            max_m_blocks=(
+                max_m_blocks * self.moe_block_size // self.fc1_moe_block_size
+            ),
             element_dtype=element_dtype,
             epilogue_activation=None if is_gated else "relu2",
             weight_layout=weight_layout,
@@ -6408,6 +6449,7 @@ class W4A16FusedMoeKernel:
             route_major_a=self.full_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
+            schedule_route_block_factor=self.fc1_schedule_route_block_factor,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,

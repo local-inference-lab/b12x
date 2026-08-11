@@ -12,16 +12,14 @@ from b12x.gemm.trellis_linear import api
 from b12x.gemm.trellis_linear import _small_m
 from b12x.gemm.trellis_linear._small_m import _default_num_sms
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
-from b12x._lib.quant.sqg_e4m3 import (
-    sqg_cheb_normal_e4m3_direct_lut_cpu,
-    sqg_xor_cheb_t12_direct_lut_cpu,
-)
+from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
 from b12x.moe._shared.kernels.trellis_w4a8_pair import (
+    TrellisW4A8FC1RoutesKernel,
     run_trellis_w4a8_fc1_routes,
     run_trellis_w4a8_fc2_routes,
 )
@@ -47,7 +45,6 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 
 
 _MCG = np.uint64(0xCBAC1FED)
-_MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)
 _ORC = np.uint32(0x3B603B60)
 
@@ -57,6 +54,11 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability()
     return major == 12 and minor in (0, 1)
+
+
+def test_route_major_fc1_rejects_incomplete_k_slice_geometry() -> None:
+    with pytest.raises(ValueError, match="positive multiple of 256"):
+        TrellisW4A8FC1RoutesKernel(hidden_size=128, sqg_direct_lut=True)
 
 
 def _hadamard128_reference(source: torch.Tensor) -> torch.Tensor:
@@ -86,52 +88,6 @@ def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
     return (low.astype(np.float16) + high.astype(np.float16)).astype(np.float16)
 
 
-def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
-    product = ((window.astype(np.uint64) * _MUL1) & np.uint64(0xFFFFFFFF)).astype(
-        np.uint32
-    )
-    byte_sum = (
-        (product & np.uint32(0xFF)).astype(np.uint32)
-        + ((product >> np.uint32(8)) & np.uint32(0xFF))
-        + ((product >> np.uint32(16)) & np.uint32(0xFF))
-        + ((product >> np.uint32(24)) & np.uint32(0xFF))
-    )
-    accumulator = (byte_sum + np.uint32(0x6400)).astype(np.uint16).view(np.float16)
-    inv = np.array([0x1EEE], dtype=np.uint16).view(np.float16)[0]
-    bias = np.array([0xC931], dtype=np.uint16).view(np.float16)[0]
-    reconstructed = (
-        accumulator.astype(np.float64) * np.float64(inv) + np.float64(bias)
-    ).astype(np.float16)
-    return (
-        torch.from_numpy(np.asarray(reconstructed))
-        .to(torch.float8_e4m3fn)
-        .to(torch.float16)
-        .numpy()
-    )
-
-
-
-
-
-
-@lru_cache(maxsize=None)
-def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
-    if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported SQG-Cheb test rate K{bits}")
-    rate_index = bits - 2
-    labels = sqg_cheb_normal_e4m3_direct_lut_cpu()[
-        rate_index << 16 : (rate_index + 1) << 16
-    ]
-    return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
-
-
-def _decode_sqg_cheb_normal_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
-    indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
-    return _sqg_cheb_normal_e4m3_table(bits)[indices]
-
-
 @lru_cache(maxsize=None)
 def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
@@ -143,9 +99,7 @@ def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_xor_cheb_t12_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_xor_cheb_t12_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_xor_cheb_t12_table(bits)[indices]
 
@@ -168,15 +122,9 @@ def _decode_lane(
         first = tile_words[..., first_word % width].astype(np.uint64)
         last = tile_words[..., last_word % width].astype(np.uint64)
         merged = (first << np.uint64(32)) | last
-        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(
-            np.uint32
-        )
+        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
-        elif codebook == "mul1-e4m3":
-            values.append(_decode_mul1_e4m3_fp16(window))
-        elif codebook == "sqg-cheb-normal-e4m3":
-            values.append(_decode_sqg_cheb_normal_e4m3_fp16(window, bits))
         elif codebook == "sqg_xor_cheb_t12":
             values.append(_decode_sqg_xor_cheb_t12_fp16(window, bits))
         else:
@@ -199,9 +147,7 @@ def _reconstruct_native(
         for n_tile in range(n_tiles):
             lanes = np.stack(
                 [
-                    _decode_lane(
-                        words[k_tile, n_tile], lane, bits, codebook=codebook
-                    )
+                    _decode_lane(words[k_tile, n_tile], lane, bits, codebook=codebook)
                     for lane in range(32)
                 ]
             )
@@ -233,13 +179,7 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
     scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
     scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
-    return (
-        (blocks / scale)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .mul(scale)
-        .reshape(m, k)
-    )
+    return (blocks / scale).to(torch.float8_e4m3fn).float().mul(scale).reshape(m, k)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -698,6 +638,7 @@ def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
     output = torch.empty_like(x)
     gemm_output = torch.empty_like(x)
     rotated_f16 = torch.empty_like(x)
+
     c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
     kwargs = {
         "output": output,
@@ -911,11 +852,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
     suh = torch.ones(reference_weight.shape[0], dtype=torch.float16, device=device)
     svh = torch.ones(reference_weight.shape[1], dtype=torch.float16, device=device)
     codebook_kwargs = (
-        {
-            "mcg": torch.tensor(
-                0xCBAC1FED, dtype=torch.uint32, device=device
-            )
-        }
+        {"mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device)}
         if codebook == "mcg"
         else {"codebook": codebook}
     )
@@ -995,6 +932,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize(("pair_kind", "bits"), [("P24", (2, 4)), ("P33", (3, 3))])
 @pytest.mark.parametrize("rate_axis", ["k", "n"])
+
 def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
@@ -1053,6 +991,7 @@ def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
 
     payload = torch.cat((low.reshape(-1), high.reshape(-1))).contiguous()
     size_k, size_n = reference_weight.shape
+
     weight = trellis_linear.prepare_pair_weight(
         payload,
         torch.ones(size_k, dtype=torch.float16, device=device),
@@ -1112,27 +1051,18 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
     scale_rows = 1 if broadcast_suh else experts
 
     prepared = SimpleNamespace(
+        activation="situ",
         hidden_size=hidden,
         num_experts=experts,
-        gate_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
-        up_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
+        gate_suh=(0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)).half(),
+        up_suh=(0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)).half(),
         intermediate_rotations=(
-            0.75
-            + 0.5
-            * torch.rand((experts, 3 * intermediate), device=device)
+            0.75 + 0.5 * torch.rand((experts, 3 * intermediate), device=device)
         ).half(),
     )
     source = torch.randn((tokens, hidden), device=device).bfloat16()
-    route_experts = torch.tensor(
-        [0, 2, 1, 0], dtype=torch.int32, device=device
-    )
-    gate_rot = torch.empty(
-        (routes, hidden), dtype=torch.float16, device=device
-    )
+    route_experts = torch.tensor([0, 2, 1, 0], dtype=torch.int32, device=device)
+    gate_rot = torch.empty((routes, hidden), dtype=torch.float16, device=device)
     up_rot = torch.empty_like(gate_rot)
     run_trellis_w4a8_input_rotation(
         source,
@@ -1159,14 +1089,11 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
     gate = (torch.randn((routes, intermediate), device=device) * 0.25).half()
     up = (torch.randn_like(gate) * 0.25).half()
     activated = torch.empty_like(gate)
-    run_trellis_w4a8_activation_rotation(
-        gate, up, route_experts, prepared, activated
-    )
+    run_trellis_w4a8_activation_rotation(gate, up, route_experts, prepared, activated)
     rotations = prepared.intermediate_rotations[route_experts.long()]
     gate_canonical = _hadamard128_reference(gate) * rotations[:, :intermediate]
     up_canonical = (
-        _hadamard128_reference(up)
-        * rotations[:, intermediate : 2 * intermediate]
+        _hadamard128_reference(up) * rotations[:, intermediate : 2 * intermediate]
     )
     situ_gate = (
         SITU_DEFAULT_BETA
@@ -1177,13 +1104,9 @@ def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
         up_canonical / SITU_DEFAULT_LINEAR_BETA
     )
     expected_activated = _hadamard128_reference(
-        situ_gate
-        * situ_up
-        * rotations[:, 2 * intermediate : 3 * intermediate]
+        situ_gate * situ_up * rotations[:, 2 * intermediate : 3 * intermediate]
     ).half()
-    torch.testing.assert_close(
-        activated, expected_activated, rtol=3.0e-3, atol=3.0e-3
-    )
+    torch.testing.assert_close(activated, expected_activated, rtol=3.0e-3, atol=3.0e-3)
 
     gate_before = gate_rot.clone()
     up_before = up_rot.clone()
@@ -1215,7 +1138,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     torch.manual_seed(20260803)
     device = torch.device("cuda", torch.cuda.current_device())
     experts = 2
-    hidden = 128
+    hidden = 256
     intermediate = 256
     hidden_tiles = hidden // 16
     n_tiles = hidden // 16
@@ -1286,9 +1209,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
             dtype=torch.int16,
             device=device,
         )
-        w2_payload[expert].copy_(
-            torch.cat((low.reshape(-1), high.reshape(-1)))
-        )
+        w2_payload[expert].copy_(torch.cat((low.reshape(-1), high.reshape(-1))))
         w2_reference[expert].copy_(
             torch.cat(
                 (
@@ -1355,10 +1276,16 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     gate_xq = _reference_mxfp8_rows(gate_x)
     up_xq = _reference_mxfp8_rows(up_x)
     expected_gate = torch.stack(
-        [gate_xq[r] @ w13_reference[0, int(route_experts[r])].float() for r in range(routes)]
+        [
+            gate_xq[r] @ w13_reference[0, int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     expected_up = torch.stack(
-        [up_xq[r] @ w13_reference[1, int(route_experts[r])].float() for r in range(routes)]
+        [
+            up_xq[r] @ w13_reference[1, int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     torch.testing.assert_close(gate_out, expected_gate, rtol=2.0e-3, atol=2.0e-2)
     torch.testing.assert_close(up_out, expected_up, rtol=2.0e-3, atol=2.0e-2)
@@ -1378,7 +1305,10 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     )
     down_xq = _reference_mxfp8_rows(down_x)
     expected_down = torch.stack(
-        [down_xq[r] @ w2_reference[int(route_experts[r])].float() for r in range(routes)]
+        [
+            down_xq[r] @ w2_reference[int(route_experts[r])].float()
+            for r in range(routes)
+        ]
     ).half()
     torch.testing.assert_close(down_out, expected_down, rtol=2.0e-3, atol=2.0e-2)
 
@@ -1409,9 +1339,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     # and the route-weighted inverse rotation into one graph-safe MoE path.
     source = (torch.randn((1, hidden), device=device) * 0.125).bfloat16()
     topk_ids = route_experts.reshape(1, -1)
-    topk_weights = torch.tensor(
-        [[0.625, 0.375]], dtype=torch.float32, device=device
-    )
+    topk_weights = torch.tensor([[0.625, 0.375]], dtype=torch.float32, device=device)
     scratch = make_trellis_w4a8_moe_scratch(
         m=1,
         topk=2,
@@ -1423,6 +1351,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
         source, prepared, topk_weights, topk_ids, scratch
     ).clone()
     torch.cuda.synchronize(device)
+    assert torch.equal(scratch.route_experts, route_experts)
 
     source_routes = source.to(torch.float16).repeat_interleave(2, dim=0)
     gate_rot_ref = _hadamard128_reference(
@@ -1435,8 +1364,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     up_quant_ref = _reference_mxfp8_rows(up_rot_ref)
     gate_fc1_ref = torch.stack(
         [
-            gate_quant_ref[r]
-            @ w13_reference[0, int(route_experts[r])].float()
+            gate_quant_ref[r] @ w13_reference[0, int(route_experts[r])].float()
             for r in range(routes)
         ]
     ).half()
@@ -1448,8 +1376,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     ).half()
     rotations = prepared.intermediate_rotations[route_experts.long()]
     gate_canonical = (
-        _hadamard128_reference(gate_fc1_ref)
-        * rotations[:, :intermediate].float()
+        _hadamard128_reference(gate_fc1_ref) * rotations[:, :intermediate].float()
     )
     up_canonical = (
         _hadamard128_reference(up_fc1_ref)
@@ -1466,16 +1393,13 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     activated_quant_ref = _reference_mxfp8_rows(activated_ref)
     fc2_ref = torch.stack(
         [
-            activated_quant_ref[r]
-            @ w2_reference[int(route_experts[r])].float()
+            activated_quant_ref[r] @ w2_reference[int(route_experts[r])].float()
             for r in range(routes)
         ]
     ).half()
     canonical_routes = _hadamard128_reference(fc2_ref)
     expected = (
-        canonical_routes
-        * prepared.down_svh[0].float()
-        * topk_weights.reshape(-1, 1)
+        canonical_routes * prepared.down_svh[0].float() * topk_weights.reshape(-1, 1)
     ).sum(dim=0, keepdim=True)
     torch.testing.assert_close(actual, expected, rtol=4.0e-3, atol=3.0e-2)
 
@@ -1503,11 +1427,36 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     ).clone()
     torch.cuda.synchronize(device)
     assert torch.equal(mapped, actual)
+    assert torch.equal(scratch.route_experts, route_experts)
+    mapped_i64 = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        global_ids.to(torch.int64),
+        scratch,
+        expert_map=expert_map,
+    ).clone()
+    assert torch.equal(mapped_i64, actual)
+    assert torch.equal(scratch.route_experts, route_experts)
+    sliced_ids = torch.tensor([[0, 0], [4, 7]], dtype=torch.int32, device=device)[1:]
+    sliced_map = torch.full((9,), -1, dtype=torch.int32, device=device)[1:]
+    sliced_map[4] = 0
+    sliced_map[7] = 1
+    assert sliced_ids.is_contiguous() and sliced_ids.data_ptr() % 16 == 8
+    assert sliced_map.is_contiguous() and sliced_map.data_ptr() % 16 == 4
+    sliced = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        sliced_ids,
+        scratch,
+        expert_map=sliced_map,
+    ).clone()
+    assert torch.equal(sliced, actual)
+    assert torch.equal(scratch.route_experts, route_experts)
 
     # A route owned by the other hybrid tier maps to -1 and contributes zero.
-    partial_global_ids = torch.tensor(
-        [[4, 3]], dtype=torch.int32, device=device
-    )
+    partial_global_ids = torch.tensor([[4, 3]], dtype=torch.int32, device=device)
     partial = run_trellis_w4a8_moe(
         source,
         prepared,
@@ -1516,14 +1465,44 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
         scratch,
         expert_map=expert_map,
     ).clone()
-    partial_expected = (
-        canonical_routes[0]
-        * prepared.down_svh[0].float()
-        * topk_weights[0, 0]
-    ).reshape(1, -1)
-    torch.testing.assert_close(
-        partial, partial_expected, rtol=4.0e-3, atol=3.0e-2
+    assert torch.equal(
+        scratch.route_experts,
+        torch.tensor([0, -1], dtype=torch.int32, device=device),
     )
+    partial_expected = (
+        canonical_routes[0] * prepared.down_svh[0].float() * topk_weights[0, 0]
+    ).reshape(1, -1)
+    torch.testing.assert_close(partial, partial_expected, rtol=4.0e-3, atol=3.0e-2)
+    invalid_global_ids = torch.tensor(
+        [[-1, expert_map.numel()]], dtype=torch.int64, device=device
+    )
+    invalid = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        invalid_global_ids,
+        scratch,
+        expert_map=expert_map,
+    ).clone()
+    assert torch.equal(
+        scratch.route_experts,
+        torch.full((2,), -1, dtype=torch.int32, device=device),
+    )
+    assert int(torch.count_nonzero(invalid)) == 0
+
+    overflow_ids = torch.tensor([[2**32, -(2**32)]], dtype=torch.int64, device=device)
+    overflow = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        overflow_ids,
+        scratch,
+    ).clone()
+    assert torch.equal(
+        scratch.route_experts,
+        torch.full((2,), -1, dtype=torch.int32, device=device),
+    )
+    assert int(torch.count_nonzero(overflow)) == 0
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

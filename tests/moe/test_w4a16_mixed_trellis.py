@@ -53,6 +53,8 @@ def _mixed_cache_key(tier0_experts: int, tier1_experts: int) -> tuple[object, ..
     )
     kernel.blocks_per_sm = 1
     kernel.shared_words = 1
+    kernel.sqg_xor_cheb_t12_smem = True
+    kernel.sqg_xor_cheb_t12_smem_off = 16
     return kernel.__cache_key__
 
 
@@ -85,6 +87,7 @@ def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
     device = torch.device("cpu")
     experts, hidden, intermediate, bits = 2, 128, 128, 3
     tier = SimpleNamespace(
+        trellis_codebook="sqg_xor_cheb_t12",
         num_experts=experts,
         w13=torch.empty(
             experts * (hidden // 16) * ((2 * intermediate) // 16) * (8 * bits),
@@ -145,8 +148,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
         "descriptor_map",
+        "phase_lut_addr",
+        "phase_lut_addr",
         "total_experts",
         "total_experts",
         "smem_base",
@@ -222,6 +227,7 @@ def _prepared(
         params_dtype=torch.float16,
         w13_layout="trellis3_t256_proj",
         trellis_bits=bits,
+        codebook="sqg_xor_cheb_t12",
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=intermediate_rotations,

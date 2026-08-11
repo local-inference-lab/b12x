@@ -89,7 +89,6 @@ from b12x._lib.intrinsics import (
     scatter_add_bf16,
     scatter_add_bf16x2,
     shared_ptr_to_u32,
-    st_global_u32,
     st_global_u64,
     st_shared_u16,
     st_shared_u8,
@@ -125,8 +124,7 @@ def _dense_spark_policy_for_sm_count(sm_count: int) -> bool:
 
 
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -134,16 +132,12 @@ _B12X_TIMING_THRESHOLD_MS = float(
         os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
     )
 )
-_B12X_DENSE_SPLITK_TURBO = (
-    os.getenv("B12X_DENSE_SPLITK_TURBO", "1") == "1"
-)
+_B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "1") == "1"
 
 # MX-FP6 decode uses at most three mainloop stages when two CTAs share an SM.
 _FP6_DECODE_TILE = (16, 64)
 _FP6_PREFILL_TILE = (128, 128)
-_B12X_DENSE_ATOM_24 = (
-    os.getenv("B12X_DENSE_ATOM_24", "0") == "1"
-)
+_B12X_DENSE_ATOM_24 = os.getenv("B12X_DENSE_ATOM_24", "0") == "1"
 _DENSE_LOAD_PATHS = ("tma", "cpasync")
 
 # Expand-ahead for packed-B: at k_block 0 the MMA warps wait for stage s+1 and
@@ -160,9 +154,11 @@ _PACKED_B_EXPAND_AHEAD = os.environ.get(
 # hot path). The GEMM's producer warp does a full-row amax scan, derives
 # gs/alpha, then quantizes each K-tile's 32-element blocks directly into
 # sA/sSFA smem. Distinct from the MXFP8 ``fused_quant_a`` machinery.
-_DENSE_FUSED_QUANT = os.environ.get(
-    "B12X_DENSE_FUSED_QUANT", "0"
-).lower() not in ("0", "false")
+_DENSE_FUSED_QUANT = os.environ.get("B12X_DENSE_FUSED_QUANT", "0").lower() not in (
+    "0",
+    "false",
+)
+
 
 @dataclass(frozen=True)
 class _DenseGemmPlan:
@@ -643,7 +639,9 @@ class DenseGemmKernel:
             mxfp6_fmt_a = mxfp6_fmt
             mxfp6_fmt_b = mxfp6_fmt
         elif mxfp6_fmt_a is None or mxfp6_fmt_b is None:
-            raise ValueError("mxfp6_fmt_a and mxfp6_fmt_b must both be set or both None")
+            raise ValueError(
+                "mxfp6_fmt_a and mxfp6_fmt_b must both be set or both None"
+            )
         self.mxfp6_fmt_a = mxfp6_fmt_a
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.block_fp8 = bool(block_fp8)
@@ -850,9 +848,7 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
-        mma_sf_dtype = (
-            cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
-        )
+        mma_sf_dtype = cutlass.Float8E8M0FNU if self.block_fp8 else self.sf_dtype
         if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
             mma_op = cute.nvgpu.warp.MmaMXF8Op(
                 self.a_dtype,
@@ -860,8 +856,7 @@ class DenseGemmKernel:
                 mma_sf_dtype,
             )
         elif cutlass.const_expr(
-            self.a_dtype == cutlass.Float6E3M2FN
-            or self.a_dtype == cutlass.Float6E2M3FN
+            self.a_dtype == cutlass.Float6E3M2FN or self.a_dtype == cutlass.Float6E2M3FN
         ):
             # MX-FP6 uses inline ``mxf8f6f4`` MMA in the mainloop. Build tiled_mma
             # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
@@ -925,6 +920,7 @@ class DenseGemmKernel:
         # shared memory. The explicit format is therefore the reliable policy
         # discriminator; ``a_dtype`` alone also matches ordinary MXFP8.
         if self.mxfp6_fmt_a is not None:
+
             def _probe_stages(epi_tile: tuple, epi_stage_cap: int) -> tuple:
                 return self._compute_stages(
                     self.tile_shape_mnk,
@@ -948,9 +944,7 @@ class DenseGemmKernel:
                 _probe_stages,
                 stages_through_smem=not self.use_m1_non_tma_c,
             )
-            self.ab_stage, self.epi_stage = _probe_stages(
-                self.epi_tile, epi_stage_cap
-            )
+            self.ab_stage, self.epi_stage = _probe_stages(self.epi_tile, epi_stage_cap)
         else:
             # Non-FP6 families use the generic stage policy.
             self.ab_stage, self.epi_stage = self._compute_stages(
@@ -1325,17 +1319,11 @@ class DenseGemmKernel:
     ) -> None:
         accum_mn = _reshape_acc_to_mn(accumulators)
         stage_accum_mn = _reshape_acc_to_mn(stage_accumulators)
-        scale_n = (
-            tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
-        ) // Int32(128)
-        scale_b = cutlass.Float32(
-            sfb[(scale_n, k_tile_global, tile_coord_mnl[2])]
-        )
+        scale_n = (tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])) // Int32(128)
+        scale_b = cutlass.Float32(sfb[(scale_n, k_tile_global, tile_coord_mnl[2])])
         for acc_m in cutlass.range_constexpr(cute.size(accum_mn.shape[0])):
             coord = coord_mn[acc_m, 0]
-            m_coord = (
-                tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
-            )
+            m_coord = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0]) + coord[0]
             scale_a = cutlass.Float32(0.0)
             if m_coord < Int32(sfa.shape[0]):
                 scale_a = cutlass.Float32(
@@ -1343,9 +1331,7 @@ class DenseGemmKernel:
                 )
             scale_ab = scale_a * scale_b
             for acc_n in cutlass.range_constexpr(cute.size(accum_mn.shape[1])):
-                accum_mn[acc_m, acc_n] += (
-                    stage_accum_mn[acc_m, acc_n] * scale_ab
-                )
+                accum_mn[acc_m, acc_n] += stage_accum_mn[acc_m, acc_n] * scale_ab
                 stage_accum_mn[acc_m, acc_n] = 0.0
 
     @cute.jit
@@ -2172,12 +2158,8 @@ class DenseGemmKernel:
                 if cutlass.const_expr(not self.block_fp8):
                     tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
                     tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                    tCrSFA_copy_view_filtered = cute.filter_zeros(
-                        tCrSFA_tile_copy_view
-                    )
-                    tCrSFB_copy_view_filtered = cute.filter_zeros(
-                        tCrSFB_tile_copy_view
-                    )
+                    tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
+                    tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
 
                     # Whole-stage SF copy: scale bytes for all k blocks of the
                     # acquired stage load in one bulk copy.
@@ -2231,10 +2213,8 @@ class DenseGemmKernel:
                                 # boundary. The matching write->ldmatrix fence
                                 # is the deferred barrier after the last
                                 # k-block's MMA below.
-                                lookahead_peek = (
-                                    mainloop_pipeline.consumer_try_wait(
-                                        packed_b_lookahead_state
-                                    )
+                                lookahead_peek = mainloop_pipeline.consumer_try_wait(
+                                    packed_b_lookahead_state
                                 )
                                 mainloop_pipeline.consumer_wait(
                                     packed_b_lookahead_state, lookahead_peek
@@ -2245,8 +2225,7 @@ class DenseGemmKernel:
                                     Int32(tidx),
                                     self.tile_shape_mnk[1],
                                     self.tile_shape_mnk[2],
-                                    self.num_mma_warps
-                                    * self.num_threads_per_warp,
+                                    self.num_mma_warps * self.num_threads_per_warp,
                                     self.mma_sync_barrier,
                                 )
                                 packed_b_lookahead_state.advance()
@@ -2299,8 +2278,7 @@ class DenseGemmKernel:
                                     Int32(tidx),
                                     self.tile_shape_mnk[1],
                                     self.tile_shape_mnk[2],
-                                    self.num_mma_warps
-                                    * self.num_threads_per_warp,
+                                    self.num_mma_warps * self.num_threads_per_warp,
                                     self.mma_sync_barrier,
                                 )
 
@@ -2346,7 +2324,9 @@ class DenseGemmKernel:
                                     else:
                                         mma_atom.set(
                                             WarpField.SFB,
-                                            tCrSFB_tile[None, _nt, k_block_idx].iterator,
+                                            tCrSFB_tile[
+                                                None, _nt, k_block_idx
+                                            ].iterator,
                                         )
                                     cute.gemm(
                                         mma_atom,
@@ -2400,9 +2380,7 @@ class DenseGemmKernel:
                                     tCsSFA_p_filtered,
                                     tCrSFA_copy_view_filtered,
                                 )
-                                if cutlass.const_expr(
-                                    self.direct_sfb_representative
-                                ):
+                                if cutlass.const_expr(self.direct_sfb_representative):
                                     self._fill_replicated_sfb_fragment(
                                         tCrSFB_tile[None, None, 0],
                                         sSFB[
@@ -2667,9 +2645,7 @@ class DenseGemmKernel:
                                             elem_idx
                                         ]
                                     if cutlass.const_expr(self.row_scale):
-                                        tRS_cAcc_slice = tRS_cAcc[
-                                            (None, mma_m, mma_n)
-                                        ]
+                                        tRS_cAcc_slice = tRS_cAcc[(None, mma_m, mma_n)]
                                         tRS_rRowScale_slice = tRS_rRowScale[
                                             (None, mma_m_in_epi, mma_n_in_epi)
                                         ]
@@ -3229,20 +3205,12 @@ class DenseGemmKernel:
                         )
                         for w in (w0, w1, w2, w3):
                             hi = u32_as_f32(w & Uint32(0x7FFF0000))
-                            lo = u32_as_f32(
-                                (w << Uint32(16)) & Uint32(0x7FFF0000)
-                            )
-                            local_amax = fmax_f32(
-                                local_amax, fmax_f32(hi, lo)
-                            )
+                            lo = u32_as_f32((w << Uint32(16)) & Uint32(0x7FFF0000))
+                            local_amax = fmax_f32(local_amax, fmax_f32(hi, lo))
                         i_vec += Int32(self.num_threads_per_warp)
                     fused_amax = warp_reduce(local_amax, fmax_f32)
-                    fused_amax_c = fmax_f32(
-                        fused_amax, cutlass.Float32(1e-6)
-                    )
-                    fused_gs = (
-                        cutlass.Float32(self._fused_gs_num) / fused_amax_c
-                    )
+                    fused_amax_c = fmax_f32(fused_amax, cutlass.Float32(1e-6))
+                    fused_gs = cutlass.Float32(self._fused_gs_num) / fused_amax_c
                     _fq_k_base = Int32(0)
                     _fq_sa_stage = Int32(0)
                     _fq_packed_scales = Uint32(0)
@@ -3265,7 +3233,7 @@ class DenseGemmKernel:
                     _fq_sg = 0
                     _fq_si = 0
 
-                for k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
+                for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
@@ -3744,16 +3712,9 @@ class DenseGemmKernel:
                         # quantize this K-tile's 32-element blocks from the
                         # BF16 row straight into sA/sSFA using the row-wide
                         # gs derived in the work-tile prologue above.
-                        _fq_k_base = (
-                            k_tile_global
-                            * Int32(self.tile_shape_mnk[2])
-                        )
-                        _fq_sa_stage = (
-                            mainloop_producer_state.index
-                            * Int32(
-                                self.tile_shape_mnk[0]
-                                * self.tile_shape_mnk[2]
-                            )
+                        _fq_k_base = k_tile_global * Int32(self.tile_shape_mnk[2])
+                        _fq_sa_stage = mainloop_producer_state.index * Int32(
+                            self.tile_shape_mnk[0] * self.tile_shape_mnk[2]
                         )
                         _fq_packed_scales = Uint32(0)
 
@@ -3761,34 +3722,24 @@ class DenseGemmKernel:
                             self.tile_shape_mnk[2] // self.sf_vec_size
                         ):
                             _fq_k_abs = (
-                                _fq_k_base
-                                + Int32(_fq_sg * self.sf_vec_size)
-                                + fq_lane
+                                _fq_k_base + Int32(_fq_sg * self.sf_vec_size) + fq_lane
                             )
                             _fq_val = cutlass.Float32(
                                 directX_bf16[(Int32(0), _fq_k_abs)]
                             )
-                            _fq_bmax = warp_reduce(
-                                fabs_f32(_fq_val), fmax_f32
-                            )
+                            _fq_bmax = warp_reduce(fabs_f32(_fq_val), fmax_f32)
                             _fq_su32 = fp6_block_ue8m0_exact(
                                 _fq_bmax,
                                 fused_gs,
                                 cutlass.Float32(self._fused_fmt_max),
                             )
-                            _fq_inv = ue8m0_output_scale_exact(
-                                _fq_su32, fused_gs
-                            )
+                            _fq_inv = ue8m0_output_scale_exact(_fq_su32, fused_gs)
                             _fq_scaled = _fq_val * _fq_inv
-                            if cutlass.const_expr(
-                                self._fused_act_fmt == "e4m3"
-                            ):
+                            if cutlass.const_expr(self._fused_act_fmt == "e4m3"):
                                 _fq_pair = cvt_f32_to_e4m3x2(
                                     cutlass.Float32(0.0), _fq_scaled
                                 )
-                            elif cutlass.const_expr(
-                                self._fused_act_fmt == "e3m2"
-                            ):
+                            elif cutlass.const_expr(self._fused_act_fmt == "e3m2"):
                                 _fq_pair = cvt_f32_to_e3m2x2(
                                     cutlass.Float32(0.0), _fq_scaled
                                 )
@@ -3808,8 +3759,7 @@ class DenseGemmKernel:
                             )
 
                             _fq_packed_scales = _fq_packed_scales | (
-                                (_fq_su32 & Uint32(0xFF))
-                                << Uint32(_fq_sg * 8)
+                                (_fq_su32 & Uint32(0xFF)) << Uint32(_fq_sg * 8)
                             )
 
                         # Broadcast scale bytes to all 128 SFA M-rows.
@@ -3817,12 +3767,8 @@ class DenseGemmKernel:
                         # for (m_row, sg) = (m%32)*16 + (m//32)*4 + sg.
                         _fq_sfa_sg = self.tile_shape_mnk[2] // self.sf_vec_size
                         _fq_sfa_slots = self.sfa_tile_shape_mk[0] * _fq_sfa_sg
-                        _fq_ssfa_stage = (
-                            mainloop_producer_state.index
-                            * Int32(
-                                (self.sfa_tile_shape_mk[0] // 128) * 128
-                                * _fq_sfa_sg
-                            )
+                        _fq_ssfa_stage = mainloop_producer_state.index * Int32(
+                            (self.sfa_tile_shape_mk[0] // 128) * 128 * _fq_sfa_sg
                         )
                         for _fq_si in cutlass.range_constexpr(
                             (_fq_sfa_slots + self.num_threads_per_warp - 1)
@@ -3833,23 +3779,21 @@ class DenseGemmKernel:
                             )
                             if _fq_lin < Int32(_fq_sfa_slots):
                                 _fq_m = _fq_lin // Int32(_fq_sfa_sg)
-                                _fq_sg_idx = _fq_lin - _fq_m * Int32(
-                                    _fq_sfa_sg
-                                )
+                                _fq_sg_idx = _fq_lin - _fq_m * Int32(_fq_sfa_sg)
                                 _fq_sf_off = (
                                     (_fq_m & Int32(31)) * Int32(16)
                                     + (_fq_m >> Int32(5)) * Int32(4)
                                     + _fq_sg_idx
                                 )
                                 _fq_sb = Uint8(
-                                    (_fq_packed_scales
-                                     >> (Uint32(_fq_sg_idx) * Uint32(8)))
+                                    (
+                                        _fq_packed_scales
+                                        >> (Uint32(_fq_sg_idx) * Uint32(8))
+                                    )
                                     & Uint32(0xFF)
                                 )
                                 st_shared_u8(
-                                    ssfa_base_addr
-                                    + _fq_ssfa_stage
-                                    + _fq_sf_off,
+                                    ssfa_base_addr + _fq_ssfa_stage + _fq_sf_off,
                                     _fq_sb,
                                 )
 
@@ -4375,9 +4319,7 @@ class DenseGemmKernel:
             num_ctas_mnl,
             cluster_shape_mnl,
             swizzle_size=(
-                16
-                if tile_shape_mnk == (128, 128, 64) and not large_m_unroll
-                else 1
+                16 if tile_shape_mnk == (128, 128, 64) and not large_m_unroll else 1
             ),
         )
         if cutlass.const_expr(split_k_slices > 1):
@@ -4530,9 +4472,7 @@ class DenseGemmKernel:
             tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
         else:
             tile_k = sf_vec_size * 8
-        if k % tile_k != 0:
-            return False
-        return True
+        return k % tile_k == 0
 
 
 class _DenseGemmLaunch:
@@ -5073,9 +5013,7 @@ def _get_compiled_dense_gemm_mxfp6(
                 alpha_tensor_gpu.data_ptr(),
             )
             x_bf16_data_ptr = (
-                x_bf16_tensor_gpu.data_ptr()
-                if x_bf16_tensor_gpu is not None
-                else 16
+                x_bf16_tensor_gpu.data_ptr() if x_bf16_tensor_gpu is not None else 16
             )
             w_gscale_data_ptr = (
                 w_gscale_tensor_gpu.data_ptr()
@@ -7152,7 +7090,9 @@ def dense_gemm(
     and weight dequantization scale.
 
     ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
-    per output row in the epilogue. MX-FP6 only.
+    per output row in the epilogue. It replaces a separate ``out.mul_(v)``
+    launch and reproduces that multiply bit-for-bit, including its second
+    rounding to the C dtype. MX-FP6 only.
 
     ``block_fp8``: accumulate ordinary E4M3 MMA over each K128 block, then
     apply compact FP32 activation ``[M,K/128]`` and weight
@@ -7184,9 +7124,7 @@ def dense_gemm(
         is_mxfp6 = False
         mma_k = 32
         tile_k = (
-            128
-            if block_fp8
-            else _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
+            128 if block_fp8 else _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
         )
     elif ab_dtype in ("float6_e3m2fn", "float6_e2m3fn"):
         is_mxfp8 = False
@@ -7342,8 +7280,7 @@ def dense_gemm(
             raise ValueError("MX-FP6 dense_gemm does not support swap_ab")
         if load_path != "tma":
             raise ValueError(
-                "MX-FP6 dense_gemm only supports load_path='tma', got "
-                f"{load_path!r}"
+                f"MX-FP6 dense_gemm only supports load_path='tma', got {load_path!r}"
             )
         if _quantized_c is not None:
             raise ValueError("MX-FP6 dense_gemm does not support quantized C output")
@@ -7675,9 +7612,7 @@ def dense_gemm(
         alpha = _cached_alpha_one(a_torch.device)
 
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
-    cache_before = (
-        _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None
-    )
+    cache_before = _get_compiled_dense_gemm.cache_info() if _B12X_TIMING else None
     t_compiled = t0
     kernel_c_dtype_name = (
         "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype

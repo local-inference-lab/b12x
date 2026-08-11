@@ -20,15 +20,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint16, Uint32
+from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     get_ptr_as_int64,
-    ld_global_b16,
     mxfp8_mma_m16n8k32_f32_e4m3,
-    packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
-    shared_ptr_to_u32,
 )
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_xor_cheb_t12_lut,
@@ -72,6 +69,10 @@ class TrellisW4A8FC1RoutesKernel(_NativeTrellisDecode):
         trellis_codebook: str = "sqg_xor_cheb_t12",
     ) -> None:
         self.hidden_size = int(hidden_size)
+        if self.hidden_size <= 0 or self.hidden_size % 256 != 0:
+            raise ValueError(
+                "FC1 route kernel hidden_size must be a positive multiple of 256"
+            )
         self.topk = int(topk)
         self.shared_input = bool(shared_input)
         self.decode_both = bool(decode_both)
@@ -437,13 +438,6 @@ class TrellisW4A8FC1RoutesKernel(_NativeTrellisDecode):
         elif cutlass.const_expr(self.pair_mode_filter == 1):
             selected = valid & (pair_mode != Int32(0)).to(Int32)
 
-        rank_lut_smem_ptr = cute.arch.alloc_smem(
-            Uint16, self.sqg_rank_lut_entries
-        )
-        rank_lut_smem = cute.make_tensor(
-            rank_lut_smem_ptr,
-            cute.make_layout((self.sqg_rank_lut_entries,)),
-        )
         rank_lut_smem_addr = get_ptr_as_int64(rank_lut, Int32(0))
         input_row = route
         if cutlass.const_expr(self.shared_input):
@@ -935,13 +929,6 @@ class TrellisW4A8FC2RoutesKernel(_NativeTrellisDecode):
         elif cutlass.const_expr(self.pair_mode_filter == 1):
             selected = valid & (pair_mode != Int32(0)).to(Int32)
 
-        rank_lut_smem_ptr = cute.arch.alloc_smem(
-            Uint16, self.sqg_rank_lut_entries
-        )
-        rank_lut_smem = cute.make_tensor(
-            rank_lut_smem_ptr,
-            cute.make_layout((self.sqg_rank_lut_entries,)),
-        )
         rank_lut_smem_addr = get_ptr_as_int64(rank_lut, Int32(0))
         acc = tuple(cute.make_rmem_tensor((4,), Float32) for _ in range(4))
         for nt in cutlass.range_constexpr(4):
