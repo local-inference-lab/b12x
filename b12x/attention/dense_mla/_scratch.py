@@ -673,10 +673,17 @@ class Plan:
         validate: bool = True,
     ) -> Binding:
         if not validate and isinstance(scratch, torch.Tensor):
-            # Framework integrations hand us the exact planned 1-D uint8
-            # tensor.  They validated it when constructing attention metadata;
-            # mapping it directly is the hot decode path.  Non-tensor adapters
-            # and the checked public path retain the generic validator below.
+            # The unchecked binding path omits dtype, layout, and device
+            # queries after the framework validates capture-static metadata.
+            # Capacity remains a memory-safety invariant because as_strided
+            # does not reject a view that extends beyond the allocation.
+            required_bytes = int(self.layout.nbytes)
+            available_bytes = int(scratch.numel()) * scratch.element_size()
+            if available_bytes < required_bytes:
+                raise ValueError(
+                    "prevalidated dense MLA scratch is smaller than required: "
+                    f"need {required_bytes} bytes, got {available_bytes}"
+                )
             storage = scratch
             scratch_views = _materialize_prevalidated(
                 self.caps,

@@ -148,10 +148,12 @@ def test_prevalidated_bind_is_fresh_and_caller_scratch_owned() -> None:
     assert first.output is kwargs["output"]
     with pytest.raises(ValueError, match="active_splits"):
         dense_mla.bind(plan, **{**kwargs, "active_splits": 0})
+    with pytest.raises(ValueError, match="scratch is smaller"):
+        dense_mla.bind(plan, **{**kwargs, "scratch": scratch[:-1]})
 
 
 def test_runtime_launch_does_not_rebuild_compile_template(monkeypatch) -> None:
-    from sparkinfer.attention.dense_mla import _kernel
+    from b12x.attention.dense_mla import _kernel
 
     signature = ("already-compiled",)
     compiled = object()
@@ -752,7 +754,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
 @torch.inference_mode()
 def test_fp8_dcp16_fresh_bind_matches_reference() -> None:
     """Exercise the exact 96-head/65,536-local-token DCP16 decode plan."""
-    device = require_sparkinfer()
+    device = require_b12x()
     torch.manual_seed(20260806)
     page_size = 768
     max_cache_tokens = 65_536

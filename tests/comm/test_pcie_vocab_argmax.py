@@ -5,10 +5,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from sparkinfer.comm.pcie.pcie_hierarchical import (
+from b12x.comm.pcie import pcie_vocab_argmax as vocab_argmax_module
+from b12x.comm.pcie.pcie_hierarchical import (
     _selected_peers as _allreduce_peers,
 )
-from sparkinfer.comm.pcie.pcie_vocab_argmax import (
+from b12x.comm.pcie.pcie_vocab_argmax import (
     PCIeVocabParallelArgmax,
     _exchange_ipc_handles,
     _selected_peers,
@@ -88,7 +89,7 @@ def test_vocab_argmax_wait_cycles(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
+    monkeypatch.setenv("B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
     assert _wait_nanosleep_cycles_from_env() == int(value)
 
 
@@ -97,7 +98,7 @@ def test_vocab_argmax_rejects_invalid_wait_cycles(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
+    monkeypatch.setenv("B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES", value)
     with pytest.raises(ValueError):
         _wait_nanosleep_cycles_from_env()
 
@@ -110,7 +111,65 @@ def _fake_runtime() -> PCIeVocabParallelArgmax:
     runtime._closed = False
     runtime._runtime = 123
     runtime._ext = MagicMock()
+    runtime._ipc = MagicMock()
+    runtime._remote_ptrs = [456]
+    runtime._local_ptr = 789
     return runtime
+
+
+def test_vocab_argmax_resolves_implicit_cuda_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = MagicMock()
+    extension = MagicMock()
+    extension.slab_bytes.return_value = 4096
+    extension.init_runtime.return_value = 123
+    ipc = MagicMock()
+    ipc.cudaMalloc.return_value = 1000
+    ipc.cudaIpcGetMemHandleBytes.return_value = b"local"
+    ipc.cudaIpcOpenMemHandleBytes.side_effect = range(2000, 2006)
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 7)
+    monkeypatch.setattr(vocab_argmax_module, "CudaRTLibrary", lambda: ipc)
+    monkeypatch.setattr(
+        vocab_argmax_module,
+        "_exchange_ipc_handles",
+        lambda local_handle, group: [local_handle] * 16,
+    )
+
+    runtime = PCIeVocabParallelArgmax(
+        exchange_group=group,
+        device="cuda",
+        local_vocab_size=16,
+        ext_module=extension,
+    )
+
+    assert runtime.device == torch.device("cuda:7")
+    ipc.cudaSetDevice.assert_called_once_with(7)
+    runtime._closed = True
+
+
+def test_vocab_argmax_destructor_never_enters_collective_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _fake_runtime()
+    runtime.group = MagicMock()
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+
+    with pytest.warns(ResourceWarning, match="without close"):
+        runtime.__del__()
+
+    barrier.assert_not_called()
+    runtime._ext.destroy_runtime.assert_called_once_with(123)
+    runtime._ipc.cudaIpcCloseMemHandle.assert_called_once_with(456)
+    runtime._ipc.cudaFree.assert_called_once_with(789)
+    assert runtime._closed
+    assert runtime._runtime == 0
+    assert runtime._remote_ptrs == []
+    assert runtime._local_ptr == 0
 
 
 def test_vocab_argmax_allocates_int64_output_and_dispatches() -> None:

@@ -7,6 +7,7 @@ from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+from warnings import warn
 
 import torch
 import torch.distributed as dist
@@ -55,9 +56,7 @@ def _wait_nanosleep_cycles_from_env() -> int:
             "B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES must be an integer"
         ) from exc
     if not 0 <= cycles <= 1024:
-        raise ValueError(
-            "B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES must be in [0, 1024]"
-        )
+        raise ValueError("B12X_PCIE_VOCAB_ARGMAX_NANOSLEEP_CYCLES must be in [0, 1024]")
     return cycles
 
 
@@ -118,6 +117,10 @@ class PCIeVocabParallelArgmax:
             )
         if self.device.type != "cuda":
             raise ValueError("vocabulary argmax requires a CUDA device")
+        device_index = self.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+            self.device = torch.device("cuda", device_index)
         if local_vocab_size <= 0 or local_vocab_size * self.world_size >= 1 << 31:
             raise ValueError("global vocabulary must fit a positive int32 index")
         if not 0 < max_batch_size <= MAX_BATCH_SIZE:
@@ -127,7 +130,7 @@ class PCIeVocabParallelArgmax:
         self.max_batch_size = int(max_batch_size)
         self._ext = ext_module or _load_extension()
         self._ipc = CudaRTLibrary()
-        self._ipc.cudaSetDevice(self.device.index or 0)
+        self._ipc.cudaSetDevice(device_index)
         self._runtime = 0
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
@@ -154,6 +157,9 @@ class PCIeVocabParallelArgmax:
                 )
             )
         except Exception:
+            # Construction cleanup is rank-local. Mark the object closed so
+            # garbage collection cannot enter the collective close protocol.
+            self._closed = True
             for ptr in self._remote_ptrs:
                 with suppress(Exception):
                     self._ipc.cudaIpcCloseMemHandle(ptr)
@@ -282,9 +288,39 @@ class PCIeVocabParallelArgmax:
         self.close()
 
     def __del__(self) -> None:
-        if not getattr(self, "_closed", True):
+        if getattr(self, "_closed", True):
+            return
+
+        # Python garbage collection is not ordered across distributed ranks.
+        # Calling close() here could deadlock on its collective barriers, so
+        # finalization releases only resources owned by this rank. Callers
+        # must use close() or the context manager for coordinated teardown.
+        self._closed = True
+        with suppress(Exception):
+            warn(
+                "PCIeVocabParallelArgmax was garbage-collected without close(); "
+                "releasing rank-local CUDA resources without collective teardown",
+                ResourceWarning,
+                stacklevel=2,
+            )
+
+        runtime = getattr(self, "_runtime", 0)
+        self._runtime = 0
+        if runtime:
             with suppress(Exception):
-                self.close()
+                self._ext.destroy_runtime(runtime)
+
+        remote_ptrs = list(getattr(self, "_remote_ptrs", ()))
+        self._remote_ptrs = []
+        for ptr in remote_ptrs:
+            with suppress(Exception):
+                self._ipc.cudaIpcCloseMemHandle(ptr)
+
+        local_ptr = getattr(self, "_local_ptr", 0)
+        self._local_ptr = 0
+        if local_ptr:
+            with suppress(Exception):
+                self._ipc.cudaFree(local_ptr)
 
 
 __all__ = ["PCIeVocabParallelArgmax"]
