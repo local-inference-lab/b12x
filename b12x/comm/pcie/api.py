@@ -45,8 +45,8 @@ from .pcie_vocab_argmax import (
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with >= 2 visible CUDA devices.
 
-    Device kernels are compiled from the Python CuTe DSL sources on first use;
-    no repo-authored C++/CUDA extension or runtime nvcc build is involved.
+    CuTe device kernels compile from Python sources. ``VocabParallelArgmax``
+    JIT-builds its bundled CUDA extension on first use.
     """
     import torch
 

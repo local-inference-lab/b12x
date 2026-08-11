@@ -17,9 +17,9 @@ pools via ``<Class>Pool``.
 - ``DcpTopKOwnerExchange``: exact DCP candidate owner staging.
 - ``VocabParallelArgmax``: TP16 fused BF16 add and exact global greedy argmax.
 
-Every device kernel is authored in Python with CuTe DSL.  Host-side CUDA
-Runtime/Driver calls are also made from Python; this package contains no
-repo-authored C++ or CUDA source and never invokes a native extension build.
+Most device kernels are authored in Python with CuTe DSL. Vocabulary-parallel
+argmax JIT-builds the bundled ``pcie_vocab_argmax.cu`` extension on first use.
+Host-side CUDA Runtime and Driver calls are made from Python.
 """
 
 from __future__ import annotations
