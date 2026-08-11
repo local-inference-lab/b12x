@@ -58,18 +58,31 @@ def test_vocab_argmax_peer_graph_is_reciprocal_and_connected() -> None:
 def test_vocab_argmax_exchanges_metadata_over_gloo(monkeypatch) -> None:
     group = MagicMock()
     monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
-    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
-    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    exchanges = []
 
-    def fake_broadcast(objects, src, group):
-        broadcasts.append((objects, src, group))
+    def fake_all_gather(objects, local_handle, group):
+        exchanges.append((objects, local_handle, group))
+        objects[:] = [b"rank-0", b"rank-1"]
 
-    monkeypatch.setattr(torch.distributed, "broadcast_object_list", fake_broadcast)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather)
 
-    assert _exchange_ipc_handles(b"handle", group) == [b"handle"]
-    assert broadcasts == [([b"handle"], 0, group)]
+    assert _exchange_ipc_handles(b"rank-0", group) == [b"rank-0", b"rank-1"]
+    assert exchanges == [([b"rank-0", b"rank-1"], b"rank-0", group)]
+
+
+def test_vocab_argmax_rejects_missing_gloo_handle(monkeypatch) -> None:
+    group = MagicMock()
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def fake_all_gather(objects, local_handle, group):
+        objects[:] = [local_handle, None]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather)
+
+    with pytest.raises(RuntimeError, match="empty handle"):
+        _exchange_ipc_handles(b"rank-0", group)
 
 
 @pytest.mark.parametrize("rank", [-1, 16])
