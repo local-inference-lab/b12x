@@ -39,12 +39,11 @@ def _exchange_ipc_handles(
         )
 
     world_size = dist.get_world_size(group=group)
-    rank = dist.get_rank(group=group)
-    all_objects: list[list[object | None]] = [[None] for _ in range(world_size)]
-    all_objects[rank][0] = local_handle
-    for index, src_rank in enumerate(dist.get_process_group_ranks(group)):
-        dist.broadcast_object_list(all_objects[index], src=src_rank, group=group)
-    return [entry[0] for entry in all_objects]
+    handles: list[object | None] = [None] * world_size
+    dist.all_gather_object(handles, local_handle, group=group)
+    if any(handle is None for handle in handles):
+        raise RuntimeError("vocabulary argmax IPC exchange returned an empty handle")
+    return list(handles)
 
 
 def _wait_nanosleep_cycles_from_env() -> int:
