@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -97,6 +98,94 @@ def test_public_types_are_module_scoped_names() -> None:
     assert dense_mla.Binding.__name__ == "Binding"
     assert dense_mla.Scratch.__name__ == "Scratch"
     assert dense_mla.Budget.__name__ == "Budget"
+
+
+def test_prevalidated_bind_is_fresh_and_caller_scratch_owned() -> None:
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device="cpu",
+            mode="verify",
+            kv_dtype=torch.bfloat16,
+            num_q_heads=HEADS,
+            page_size=16,
+            max_total_q=8,
+            max_batch=1,
+            max_cache_tokens=128,
+            max_page_table_width=8,
+            num_cache_pages=8,
+        )
+    )
+    scratch = _scratch(plan)
+    kwargs = {
+        "scratch": scratch,
+        "q": torch.empty(8, HEADS, QK_DIM, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(8, 16, QK_DIM, dtype=torch.bfloat16),
+        "output": torch.empty(8, HEADS, VALUE_DIM, dtype=torch.bfloat16),
+        "page_table": torch.zeros(1, 8, dtype=torch.int32),
+        "cache_seqlens": torch.tensor([128], dtype=torch.int32),
+        "cu_seqlens_q": torch.tensor([0, 8], dtype=torch.int32),
+        "active_splits": plan.num_splits,
+        "validate": False,
+    }
+
+    first = dense_mla.bind(plan, **kwargs)
+    second = dense_mla.bind(plan, **kwargs)
+
+    assert first is not second
+    assert first.scratch is not second.scratch
+    assert first.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
+    assert second.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
+    assert first.scratch.final_lse is not second.scratch.final_lse
+    assert first.scratch.final_lse.data_ptr() == second.scratch.final_lse.data_ptr()
+    if first.scratch.partial_output is not None:
+        assert second.scratch.partial_output is not None
+        assert first.scratch.partial_output is not second.scratch.partial_output
+        assert (
+            first.scratch.partial_output.data_ptr()
+            == second.scratch.partial_output.data_ptr()
+        )
+    assert first.q is kwargs["q"]
+    assert first.output is kwargs["output"]
+    with pytest.raises(ValueError, match="active_splits"):
+        dense_mla.bind(plan, **{**kwargs, "active_splits": 0})
+    with pytest.raises(ValueError, match="scratch is smaller"):
+        dense_mla.bind(plan, **{**kwargs, "scratch": scratch[:-1]})
+
+
+def test_runtime_launch_does_not_rebuild_compile_template(monkeypatch) -> None:
+    from b12x.attention.dense_mla import _kernel
+
+    signature = ("already-compiled",)
+    compiled = object()
+    launches: list[tuple[object, tuple[object, ...]]] = []
+    binding = SimpleNamespace(
+        q=SimpleNamespace(is_cuda=True, shape=(1,)),
+        scratch=SimpleNamespace(
+            num_splits=1,
+            final_lse=torch.empty(1, HEADS),
+        ),
+        output=torch.empty(1, HEADS, VALUE_DIM),
+    )
+    monkeypatch.setattr(_kernel, "_signature", lambda _: signature)
+    monkeypatch.setattr(_kernel, "_forward_args", lambda _: ("runtime",))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        _kernel,
+        "_forward_compile_template",
+        lambda _: pytest.fail("runtime rebuilt immutable compile metadata"),
+    )
+    monkeypatch.setattr(
+        _kernel,
+        "run_compiled",
+        lambda entry, args: launches.append((entry, args)),
+    )
+    monkeypatch.setitem(_kernel._FORWARD_CACHE, signature, compiled)
+
+    output, lse = _kernel.run_dense_mla(binding=binding)
+
+    assert launches == [(compiled, ("runtime",))]
+    assert output is binding.output
+    assert lse.data_ptr() == binding.scratch.final_lse.data_ptr()
 
 
 def test_partial_row_budget_changes_native_split_policy() -> None:
@@ -665,6 +754,76 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
 
 
 @torch.inference_mode()
+def test_fp8_dcp16_fresh_bind_matches_reference() -> None:
+    """Exercise the exact 96-head/65,536-local-token DCP16 decode plan."""
+    device = require_b12x()
+    torch.manual_seed(20260806)
+    page_size = 768
+    max_cache_tokens = 65_536
+    page_width = (max_cache_tokens + page_size - 1) // page_size
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=FP8,
+            num_q_heads=96,
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=max_cache_tokens,
+            max_page_table_width=page_width,
+            num_cache_pages=1,
+            use_cuda_graph=True,
+        )
+    )
+    assert plan.num_splits == 47
+
+    q_float = torch.randn(1, 96, QK_DIM, device=device) * 0.1
+    cache_float = torch.randn(1, page_size, QK_DIM, device=device) * 0.1
+    q_scale = (q_float.abs().max() / 400).reshape(1).float()
+    kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
+    q = (q_float / q_scale).to(FP8)
+    cache = (cache_float / kv_scale).to(FP8)
+    output = torch.empty(1, 96, VALUE_DIM, dtype=torch.bfloat16, device=device)
+    scratch = _scratch(plan)
+    kwargs = {
+        "scratch": scratch,
+        "q": q,
+        "kv_cache": cache,
+        "output": output,
+        "page_table": torch.zeros(1, 1, dtype=torch.int32, device=device),
+        "cache_seqlens": torch.tensor([257], dtype=torch.int32, device=device),
+        "cu_seqlens_q": torch.tensor([0, 1], dtype=torch.int32, device=device),
+        "q_scale": q_scale,
+        "kv_scale": kv_scale,
+        "active_splits": 1,
+        "validate": False,
+    }
+    first = dense_mla.bind(plan, **kwargs)
+    binding = dense_mla.bind(plan, **kwargs)
+    assert first is not binding
+    assert first.scratch is not binding.scratch
+    assert first.scratch.partial_output is not binding.scratch.partial_output
+    assert (
+        first.scratch.partial_output.data_ptr()
+        == binding.scratch.partial_output.data_ptr()
+    )
+
+    dense_mla.compile(binding=binding)
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache,
+        kwargs["page_table"],
+        kwargs["cache_seqlens"],
+        kwargs["cu_seqlens_q"],
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+    _assert_matches(actual_output, actual_lse, expected_output, expected_lse)
+
+
+@torch.inference_mode()
 def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
     device = require_b12x()
     torch.manual_seed(20260803)
@@ -776,12 +935,15 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=FP8,
         device=device,
     )
-    cache_float = torch.randn(
-        live_pages,
-        page_size,
-        QK_DIM,
-        device=device,
-    ) * 0.1
+    cache_float = (
+        torch.randn(
+            live_pages,
+            page_size,
+            QK_DIM,
+            device=device,
+        )
+        * 0.1
+    )
     kv_scale = (cache_float.abs().max() / 400).reshape(1).float()
     cache[high_page:] = (cache_float / kv_scale).to(FP8)
     page_table = torch.arange(

@@ -37,13 +37,16 @@ from .pcie_oneshot import (
 from .pcie_twoshot import (
     PCIeTwoShotSP as TwoShotReduceScatter,
 )
+from .pcie_vocab_argmax import (
+    PCIeVocabParallelArgmax as VocabParallelArgmax,
+)
 
 
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with >= 2 visible CUDA devices.
 
-    Device kernels are compiled from the Python CuTe DSL sources on first use;
-    no repo-authored C++/CUDA extension or runtime nvcc build is involved.
+    CuTe device kernels compile from Python sources. ``VocabParallelArgmax``
+    JIT-builds its bundled CUDA extension on first use.
     """
     import torch
 
@@ -59,6 +62,7 @@ __all__ = [
     "DcpAllToAll",
     "DcpAllToAllPool",
     "DcpTopKOwnerExchange",
+    "VocabParallelArgmax",
     "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",
