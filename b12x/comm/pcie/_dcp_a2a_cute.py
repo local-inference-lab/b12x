@@ -153,11 +153,10 @@ def _select_if_eq_u64(
 ) -> cutlass.Uint64:
     """``lhs == rhs ? on_equal : otherwise`` as one predicated select.
 
-    A Python ``if`` on a runtime condition becomes a real branch region, and
-    the top-16 rounds update a register-held key array inside one. That
-    diverges the warp on every round and pushes the array to local memory. The
-    kernel this path replaced writes the same update as a ternary chain, which
-    is straight-line predicated code; ptxas folds the repeated setp.
+    A Python ``if`` on a runtime condition becomes a branch region. The top-16
+    rounds update a register-held key array, so a divergent branch can spill the
+    array to local memory. A ternary chain emits straight-line predicated code
+    and lets ptxas fold repeated ``setp`` operations.
     """
 
     return cutlass.Uint64(
@@ -255,7 +254,7 @@ def _add_u64_opaque(
     loc=None,
     ip=None,
 ) -> Int64:
-    """Add a payload offset without CSE into the earlier LSE address phase."""
+    """Add a payload offset without CSE into the LSE-address calculation."""
 
     return Int64(
         llvm.inline_asm(
@@ -1463,10 +1462,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 cute.make_layout((64,), stride=(1,))
             )
 
-            # Pull the router in 16B packs, the way the kernel this path
-            # replaced does. Reading it one float per expert costs 896 peer
-            # transactions instead of 224 for the same 3584 bytes, and over
-            # PCIe the transaction count is what the phase pays for.
+            # Pull the 3,584-byte router row in 16-byte packs. This uses 224
+            # peer transactions instead of 896 scalar transactions; PCIe
+            # transaction count dominates this phase.
             router_pack = Int32(tidx)
             router_packs_total = Int32(self._world_size) * second_packs
             while router_pack < router_packs_total:
@@ -1526,9 +1524,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 expert += Int32(self._threads)
             cute.arch.sync_threads()
 
-            # Two-level top-16 over packed (score, expert) keys, mirroring the
-            # kernel this path replaced. Four warps each reduce 256 experts held
-            # in registers (8 per lane); warp 0 then merges the 64 survivors.
+            # Two-level top-16 over packed (score, expert) keys. Four warps each
+            # reduce 256 experts held in registers (8 per lane); warp 0 then
+            # merges the 64 survivors.
             # A round costs one warp reduction -- two instructions -- because the
             # tie-break lives in the key rather than in a second comparison.
             lane = Int32(tidx) % Int32(32)
