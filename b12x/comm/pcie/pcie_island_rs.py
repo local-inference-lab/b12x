@@ -31,7 +31,11 @@ def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
 
 
 def _threads_from_env() -> int:
-    raw = os.getenv("B12X_PCIE_ISLAND_RS_THREADS", "128")
+    # 512 is the measured TP16 optimum: each phase moves only about 86KB, so
+    # the kernel needs enough concurrent reads to cover the PCIe round trip.
+    # At [8, 7168] the same kernel costs 49.8 us with 128 threads and 25.9 with
+    # 512; 1024 gives nothing back.
+    raw = os.getenv("B12X_PCIE_ISLAND_RS_THREADS", "512")
     threads = int(raw)
     if not 32 <= threads <= 1024 or threads % 32:
         raise ValueError(
@@ -50,9 +54,19 @@ def _wait_nanosleep_cycles_from_env() -> int:
 
 
 def _pick_blocks(elements: int) -> int:
+    """Measured TP16 launch geometry; 32 blocks regress, 8 under-fill."""
+
     if elements <= 4096:
         return 8
     return 16
+
+
+# Below this the leader-gather hierarchy is still ahead (18.16 vs 20.51 us at
+# one row of 7168), because it has a shorter critical path for the ranks that
+# are not the leader. Above it the leader's link is the bottleneck and the
+# equal-quarter split wins: 22.44 vs 30.36 us at four rows, 26.03 vs 46.79 at
+# eight. Expressed in elements so it does not depend on the model's hidden size.
+CROSSOVER_ELEMENTS = 14_336
 
 
 class PCIeIslandRSAllReduce:
