@@ -157,12 +157,12 @@ def test_recipe_ops_build_the_existing_dense_gemm_contract(monkeypatch) -> None:
 def test_recipe_ops_match_the_generic_execution_path() -> None:
     require_b12x()
     torch.manual_seed(71)
-    m, n, k = 6, 128, 128
+    m, n, k = 6, 128, 256
 
     fp4_lhs = torch.randint(0, 256, (m, k // 2), device="cuda", dtype=torch.uint8)
     fp4_rhs = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
-    mx_lhs_scale_storage = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
-    mx_rhs_scale_storage = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
+    mx_lhs_scale_storage = torch.full((128, 8), 127, device="cuda", dtype=torch.uint8)
+    mx_rhs_scale_storage = torch.full((128, 8), 127, device="cuda", dtype=torch.uint8)
     mx_lhs_scale = as_grouped_scale_view_mx(mx_lhs_scale_storage.unsqueeze(0), m, k)
     mx_rhs_scale = as_grouped_scale_view_mx(mx_rhs_scale_storage.unsqueeze(0), n, k)
     mx_ref = blockscaled.mm(
@@ -183,10 +183,10 @@ def test_recipe_ops_match_the_generic_execution_path() -> None:
     torch.testing.assert_close(mx_actual, mx_ref, rtol=0, atol=0)
 
     nv_lhs_scale_storage = torch.ones(
-        (128, 8), device="cuda", dtype=torch.float8_e4m3fn
+        (128, 16), device="cuda", dtype=torch.float8_e4m3fn
     )
     nv_rhs_scale_storage = torch.ones(
-        (128, 8), device="cuda", dtype=torch.float8_e4m3fn
+        (128, 16), device="cuda", dtype=torch.float8_e4m3fn
     )
     nv_lhs_scale = as_grouped_scale_view(
         nv_lhs_scale_storage.view(torch.uint8).unsqueeze(0), m, k
@@ -220,8 +220,8 @@ def test_recipe_ops_match_the_generic_execution_path() -> None:
     fp8_rhs = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    fp8_lhs_scale = torch.rand((m, 1), device="cuda", dtype=torch.float32)
-    fp8_rhs_scale = torch.rand((1, 1), device="cuda", dtype=torch.float32)
+    fp8_lhs_scale = torch.rand((m, 2), device="cuda", dtype=torch.float32)
+    fp8_rhs_scale = torch.rand((1, 2), device="cuda", dtype=torch.float32)
     fp8_ref = blockscaled.mm(
         (fp8_lhs.unsqueeze(-1), fp8_lhs_scale),
         (fp8_rhs.unsqueeze(-1), fp8_rhs_scale),
@@ -239,6 +239,65 @@ def test_recipe_ops_match_the_generic_execution_path() -> None:
         fp8_rhs_scale,
     )
     torch.testing.assert_close(fp8_actual, fp8_ref, rtol=0, atol=0)
+
+    def run_recipe_ops(
+        fp4_lhs,
+        mx_lhs_scale_storage,
+        fp4_rhs,
+        mx_rhs_scale_storage,
+        nv_lhs_scale_storage,
+        nv_rhs_scale_storage,
+        alpha,
+        fp8_lhs,
+        fp8_lhs_scale,
+        fp8_rhs,
+        fp8_rhs_scale,
+    ):
+        return (
+            blockscaled.mm_mxfp4(
+                fp4_lhs,
+                mx_lhs_scale_storage,
+                fp4_rhs,
+                mx_rhs_scale_storage,
+            ),
+            blockscaled.mm_nvfp4(
+                fp4_lhs,
+                nv_lhs_scale_storage,
+                fp4_rhs,
+                nv_rhs_scale_storage,
+                alpha,
+            ),
+            blockscaled.mm_block_fp8(
+                fp8_lhs,
+                fp8_lhs_scale,
+                fp8_rhs,
+                fp8_rhs_scale,
+            ),
+        )
+
+    compiled_recipe_ops = torch.compile(
+        run_recipe_ops,
+        fullgraph=True,
+    )
+    compiled_actual = compiled_recipe_ops(
+        fp4_lhs,
+        mx_lhs_scale_storage,
+        fp4_rhs,
+        mx_rhs_scale_storage,
+        nv_lhs_scale_storage,
+        nv_rhs_scale_storage,
+        alpha,
+        fp8_lhs,
+        fp8_lhs_scale,
+        fp8_rhs,
+        fp8_rhs_scale,
+    )
+    for actual, expected in zip(
+        compiled_actual,
+        (mx_actual, nv_actual, fp8_actual),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _require_cudnn_fp4_oracle():

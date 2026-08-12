@@ -569,7 +569,7 @@ class DenseGemmKernel:
 
     Key architectural differences from the tcgen05 donor path:
     - No TMEM, no tcgen05, no 2-CTA instructions, no multi-cluster
-    - Warp-level MMA: MmaMXF4NVF4Op atom m16n8k64, atom_layout=(4,2,1)
+    - Warp-level FP4 MMA: m16n8k64, atom_layout=(4,2,1)
     - 256 MMA threads + 32 DMA = 288 total threads
     - PipelineTmaAsync (not PipelineTmaUmma)
     - Manual atom unroll workaround for CuTe DSL compiler SF address space bug
@@ -867,6 +867,12 @@ class DenseGemmKernel:
             # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
             mma_op = cute.nvgpu.warp.MmaMXF8Op(
                 cutlass.Float8E4M3FN,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        elif cutlass.const_expr(self.sf_vec_size == 32):
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
                 self.acc_dtype,
                 self.sf_dtype,
             )
@@ -2115,6 +2121,20 @@ class DenseGemmKernel:
                         tCsSFB_tile_copy_view = tCsSFB_copy_view_full
                         tCrSFB_tile = tCrSFB_full
                         tCrSFB_tile_copy_view = tCrSFB_copy_view_full
+                if cutlass.const_expr(
+                    self.a_dtype == cutlass.Float4E2M1FN
+                    and self.sf_vec_size == 32
+                ):
+                    # MXFP4 exposes K blocks as two fragment modes. Fold them
+                    # into the single K-block mode consumed by this mainloop.
+                    tCrSFA_tile = cute.group_modes(tCrSFA_tile, 2, 4)
+                    tCrSFB_tile = cute.group_modes(tCrSFB_tile, 2, 4)
+                    tCrSFA_tile_copy_view = cute.group_modes(
+                        tCrSFA_tile_copy_view, 2, 4
+                    )
+                    tCrSFB_tile_copy_view = cute.group_modes(
+                        tCrSFB_tile_copy_view, 2, 4
+                    )
                 accumulators.fill(0.0)
                 if cutlass.const_expr(self.block_fp8):
                     stage_accumulators.fill(0.0)
