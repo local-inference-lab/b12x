@@ -442,6 +442,7 @@ def _candidate_tile_fits(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
+    allow_qualified_fc2_tile: bool = False,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -466,7 +467,10 @@ def _candidate_tile_fits(
     # Keep the generic tile floor while allowing that exact geometry to pass
     # through the explicit-pin path used by the Torch custom-op boundary.
     wide_n_fc2_tile = (
-        int(tile_k) == 32 and int(tile_n) == 512 and int(cta_threads) == 256
+        allow_qualified_fc2_tile
+        and int(tile_k) == 32
+        and int(tile_n) == 512
+        and int(cta_threads) == 256
     )
     if (
         int(tile_n) < 64
@@ -4345,9 +4349,7 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                # CuTe resolves the equal-rate branch during specialization;
-                # keep it separate from the runtime K-region predicate.
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):  # noqa: SIM114
+                if cutlass.const_expr(int(low_bits) == int(high_bits)):
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits
@@ -9949,6 +9951,7 @@ def compile_w4a16_fused_moe(
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
+            allow_qualified_fc2_tile=True,
         ):
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
@@ -9984,6 +9987,7 @@ def compile_w4a16_fused_moe(
                 weight_layout=weight_layout,
                 weight_bits=weight_bits,
                 allow_logical_tail=allow_native_logical_tail,
+                allow_qualified_fc2_tile=name == "fc2",
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
