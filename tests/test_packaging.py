@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 try:
@@ -11,6 +10,22 @@ except ModuleNotFoundError:  # Python 3.10
 
 ROOT = Path(__file__).parents[1]
 PCIE_SOURCE = ROOT / "b12x" / "comm" / "pcie"
+CUTLASS_DSL_VERSION = "4.6.2"
+
+
+def test_cutlass_dsl_packages_use_one_qualified_version() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    dependencies = set(config["project"]["dependencies"])
+    packages = (
+        "nvidia-cutlass-dsl",
+        "nvidia-cutlass-dsl-libs-base",
+        "nvidia-cutlass-dsl-libs-core",
+        "nvidia-cutlass-dsl-libs-cu12",
+        "nvidia-cutlass-dsl-libs-cu13",
+    )
+
+    for package in packages:
+        assert f"{package}=={CUTLASS_DSL_VERSION}" in dependencies
 
 
 def test_pcie_collectives_are_python_only() -> None:
