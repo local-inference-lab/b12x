@@ -1,10 +1,12 @@
 """Dense block-scaled GEMM for SM12x: ``C = (A·SFA) @ (B·SFB)``.
 
-One-shot functional op over the shared SM120 warp-MMA engine (no TMEM, no
-tcgen05, no 2-CTA).  Recipes: NVFP4 (Float4E2M1 values, e4m3 scales, vec 16),
-MXFP4 (e8m0 scales, vec 32), MXFP8 (e4m3 values, e8m0 scales, vec 32).
-``expected_m`` is a DeepGEMM-style regime hint (decode vs prefill tiles).
-Fused variants quantize the A operand inline (optionally grouped).
+One-shot functional ops over the shared SM120 warp-MMA engine (no TMEM, no
+tcgen05, no 2-CTA). Recipes: NVFP4 (Float4E2M1 values, e4m3 scales, vec 16),
+MXFP4 (e8m0 scales, vec 32), MXFP8 (e4m3 values, e8m0 scales, vec 32), and
+128x128 block FP8. ``expected_m`` is a DeepGEMM-style regime hint (decode vs
+prefill tiles). The recipe-specific ``mm_*`` entry points keep scale-layout
+construction and kernel planning opaque to ``torch.compile``. Fused variants
+quantize the A operand inline (optionally grouped).
 
 Example:
     from b12x.gemm import blockscaled
@@ -28,6 +30,9 @@ META = OpMeta(
     api_style="oneshot",
     entry_points=(
         "mm",
+        "mm_mxfp4",
+        "mm_nvfp4",
+        "mm_block_fp8",
         "mm_fused_quant_a",
         "mm_fused_quant_a_grouped",
         "is_supported",
@@ -48,8 +53,11 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         is_supported,
         mm,
+        mm_block_fp8,
         mm_fused_quant_a,
         mm_fused_quant_a_grouped,
+        mm_mxfp4,
+        mm_nvfp4,
     )
 
 install_lazy_api(globals(), META)

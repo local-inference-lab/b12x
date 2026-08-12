@@ -1,4 +1,4 @@
-"""gemm.blockscaled: NVFP4/MXFP8 dense block-scaled GEMM.
+"""gemm.blockscaled: FP4/MXFP8/block-FP8 dense block-scaled GEMM.
 
 Curated from b12x tests/test_gemm_stack.py: flashinfer-core cuDNN oracle
 parity (NVFP4), grouped MXFP8 per-batch scale correctness, and CUDA-graph
@@ -11,7 +11,12 @@ import pytest
 import torch
 
 from b12x._lib import dense_gemm as dense_module
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x.gemm.blockscaled import api as blockscaled_api
+from b12x._lib.intrinsics import (
+    as_grouped_scale_view,
+    as_grouped_scale_view_mx,
+    quantize_grouped_nvfp4_torch,
+)
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import blockscaled
 from b12x.gemm._shared.wo_mxfp8 import (
@@ -21,6 +26,219 @@ from b12x.gemm._shared.wo_mxfp8 import (
 )
 
 from ..conftest import require_b12x
+
+
+def test_recipe_ops_keep_dense_planning_opaque_to_dynamo() -> None:
+    mx_lhs = torch.empty((6, 64), dtype=torch.uint8)
+    mx_rhs = torch.empty((48, 64), dtype=torch.uint8)
+    mx_lhs_scale = torch.empty((128, 4), dtype=torch.uint8)
+    mx_rhs_scale = torch.empty((128, 4), dtype=torch.uint8)
+    nv_lhs_scale = torch.empty((128, 8), dtype=torch.float8_e4m3fn)
+    nv_rhs_scale = torch.empty((128, 8), dtype=torch.float8_e4m3fn)
+    alpha = torch.ones(1, dtype=torch.float32)
+    fp8_lhs = torch.empty((6, 128), dtype=torch.float8_e4m3fn)
+    fp8_rhs = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
+    fp8_lhs_scale = torch.empty((6, 1), dtype=torch.float32)
+    fp8_rhs_scale = torch.empty((2, 1), dtype=torch.float32)
+
+    def run(
+        mx_lhs,
+        mx_lhs_scale,
+        mx_rhs,
+        mx_rhs_scale,
+        nv_lhs_scale,
+        nv_rhs_scale,
+        alpha,
+        fp8_lhs,
+        fp8_lhs_scale,
+        fp8_rhs,
+        fp8_rhs_scale,
+    ):
+        return (
+            blockscaled.mm_mxfp4(mx_lhs, mx_lhs_scale, mx_rhs, mx_rhs_scale),
+            blockscaled.mm_nvfp4(
+                mx_lhs,
+                nv_lhs_scale,
+                mx_rhs,
+                nv_rhs_scale,
+                alpha,
+            ),
+            blockscaled.mm_block_fp8(fp8_lhs, fp8_lhs_scale, fp8_rhs, fp8_rhs_scale),
+        )
+
+    graph, _ = torch._dynamo.export(run)(
+        mx_lhs,
+        mx_lhs_scale,
+        mx_rhs,
+        mx_rhs_scale,
+        nv_lhs_scale,
+        nv_rhs_scale,
+        alpha,
+        fp8_lhs,
+        fp8_lhs_scale,
+        fp8_rhs,
+        fp8_rhs_scale,
+    )
+    targets = {node.target for node in graph.graph.nodes if node.op == "call_function"}
+
+    assert torch.ops.b12x.blockscaled_mxfp4 in targets
+    assert torch.ops.b12x.blockscaled_nvfp4 in targets
+    assert torch.ops.b12x.blockscaled_block_fp8 in targets
+    assert torch.ops.b12x.dense_gemm_launch not in targets
+
+
+def test_recipe_ops_build_the_existing_dense_gemm_contract(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    def mm(lhs, rhs, **kwargs):
+        calls.append((lhs, rhs, kwargs))
+        return torch.empty(
+            (lhs[0].shape[0], rhs[0].shape[0], 1),
+            dtype=torch.bfloat16,
+        )
+
+    monkeypatch.setattr(blockscaled_api, "mm", mm)
+    mx_lhs = torch.empty((6, 64), dtype=torch.uint8)
+    mx_rhs = torch.empty((48, 64), dtype=torch.uint8)
+
+    torch.ops.b12x.blockscaled_mxfp4(
+        mx_lhs,
+        torch.empty((128, 4), dtype=torch.uint8),
+        mx_rhs,
+        torch.empty((128, 4), dtype=torch.uint8),
+        torch.bfloat16,
+        6,
+        None,
+    )
+    torch.ops.b12x.blockscaled_nvfp4(
+        mx_lhs,
+        torch.empty((128, 8), dtype=torch.float8_e4m3fn),
+        mx_rhs,
+        torch.empty((128, 8), dtype=torch.float8_e4m3fn),
+        torch.ones(1, dtype=torch.float32),
+        torch.bfloat16,
+        6,
+        None,
+    )
+    torch.ops.b12x.blockscaled_block_fp8(
+        torch.empty((6, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((6, 1), dtype=torch.float32),
+        torch.empty((256, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((2, 1), dtype=torch.float32),
+        torch.bfloat16,
+        6,
+        None,
+    )
+
+    assert len(calls) == 3
+    assert calls[0][2] == {
+        "ab_dtype": "float4_e2m1fn",
+        "sf_dtype": "float8_e8m0fnu",
+        "c_dtype": "bfloat16",
+        "sf_vec_size": 32,
+        "expected_m": 6,
+        "stream": None,
+    }
+    assert calls[1][2]["ab_dtype"] == "float4_e2m1fn"
+    assert calls[1][2]["sf_dtype"] == "float8_e4m3fn"
+    assert calls[1][2]["sf_vec_size"] == 16
+    assert calls[1][2]["alpha"].shape == (1,)
+    assert calls[2][2] == {
+        "ab_dtype": "float8_e4m3fn",
+        "sf_dtype": "float32",
+        "c_dtype": "bfloat16",
+        "sf_vec_size": 128,
+        "block_fp8": True,
+        "expected_m": 6,
+        "stream": None,
+    }
+
+
+def test_recipe_ops_match_the_generic_execution_path() -> None:
+    require_b12x()
+    torch.manual_seed(71)
+    m, n, k = 6, 128, 128
+
+    fp4_lhs = torch.randint(0, 256, (m, k // 2), device="cuda", dtype=torch.uint8)
+    fp4_rhs = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+    mx_lhs_scale_storage = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
+    mx_rhs_scale_storage = torch.full((128, 4), 127, device="cuda", dtype=torch.uint8)
+    mx_lhs_scale = as_grouped_scale_view_mx(mx_lhs_scale_storage.unsqueeze(0), m, k)
+    mx_rhs_scale = as_grouped_scale_view_mx(mx_rhs_scale_storage.unsqueeze(0), n, k)
+    mx_ref = blockscaled.mm(
+        (fp4_lhs.unsqueeze(-1), mx_lhs_scale),
+        (fp4_rhs.unsqueeze(-1), mx_rhs_scale),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype="bfloat16",
+        sf_vec_size=32,
+        expected_m=m,
+    )[:, :, 0]
+    mx_actual = blockscaled.mm_mxfp4(
+        fp4_lhs,
+        mx_lhs_scale_storage,
+        fp4_rhs,
+        mx_rhs_scale_storage,
+    )
+    torch.testing.assert_close(mx_actual, mx_ref, rtol=0, atol=0)
+
+    nv_lhs_scale_storage = torch.ones(
+        (128, 8), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    nv_rhs_scale_storage = torch.ones(
+        (128, 8), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    nv_lhs_scale = as_grouped_scale_view(
+        nv_lhs_scale_storage.view(torch.uint8).unsqueeze(0), m, k
+    )
+    nv_rhs_scale = as_grouped_scale_view(
+        nv_rhs_scale_storage.view(torch.uint8).unsqueeze(0), n, k
+    )
+    alpha = torch.ones(1, device="cuda", dtype=torch.float32)
+    nv_ref = blockscaled.mm(
+        (fp4_lhs.unsqueeze(-1), nv_lhs_scale),
+        (fp4_rhs.unsqueeze(-1), nv_rhs_scale),
+        alpha=alpha,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        expected_m=m,
+    )[:, :, 0]
+    nv_actual = blockscaled.mm_nvfp4(
+        fp4_lhs,
+        nv_lhs_scale_storage,
+        fp4_rhs,
+        nv_rhs_scale_storage,
+        alpha,
+    )
+    torch.testing.assert_close(nv_actual, nv_ref, rtol=0, atol=0)
+
+    fp8_lhs = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    fp8_rhs = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    fp8_lhs_scale = torch.rand((m, 1), device="cuda", dtype=torch.float32)
+    fp8_rhs_scale = torch.rand((1, 1), device="cuda", dtype=torch.float32)
+    fp8_ref = blockscaled.mm(
+        (fp8_lhs.unsqueeze(-1), fp8_lhs_scale),
+        (fp8_rhs.unsqueeze(-1), fp8_rhs_scale),
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float32",
+        c_dtype="bfloat16",
+        sf_vec_size=128,
+        block_fp8=True,
+        expected_m=m,
+    )[:, :, 0]
+    fp8_actual = blockscaled.mm_block_fp8(
+        fp8_lhs,
+        fp8_lhs_scale,
+        fp8_rhs,
+        fp8_rhs_scale,
+    )
+    torch.testing.assert_close(fp8_actual, fp8_ref, rtol=0, atol=0)
 
 
 def _require_cudnn_fp4_oracle():
