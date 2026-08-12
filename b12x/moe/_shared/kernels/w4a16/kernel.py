@@ -443,7 +443,6 @@ def _candidate_tile_fits(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
-    allow_ultra_wide_k32: bool = False,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -464,18 +463,7 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    ultra_wide_k32 = (
-        bool(allow_ultra_wide_k32)
-        and int(tile_n) == 512
-        and int(tile_k) == 32
-        and int(cta_threads) == 256
-        and scale_group_size == 32
-    )
-    if (
-        int(tile_n) < 64
-        or (int(tile_k) < 64 and not ultra_wide_k32)
-        or int(cta_threads) < 128
-    ):
+    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -9902,7 +9890,6 @@ def compile_w4a16_fused_moe(
                 weight_layout=weight_layout,
                 weight_bits=weight_bits,
                 allow_logical_tail=allow_native_logical_tail,
-                allow_ultra_wide_k32=(name == "fc2"),
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
