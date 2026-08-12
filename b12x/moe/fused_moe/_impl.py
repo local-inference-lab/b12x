@@ -92,8 +92,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -2604,9 +2603,7 @@ def _plan_core_workspace(
             if qsrt_storage_format == "qsrt_atoms_v1" and (
                 int(trellis_bits) != 3 or int(n) != 256
             ):
-                raise ValueError(
-                    "QSRT atoms-v1 requires n=256 and trellis_bits=3"
-                )
+                raise ValueError("QSRT atoms-v1 requires n=256 and trellis_bits=3")
             if qsrt_storage_format == "qsrt_atoms_v2":
                 if int(trellis_bits) == 3 and int(n) != 256:
                     raise ValueError(
@@ -5143,9 +5140,7 @@ def prepare_b12x_fp4_moe_weights(
             # the unit activation-scale placeholders colocated with the
             # prepared weights so later binding and validation never inherit
             # the source extent's device.
-            input_scale = torch.ones(
-                (), dtype=torch.float32, device=value.w13.device
-            )
+            input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
             return B12XFP4ExpertWeights(
                 plan=plan,
                 a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
@@ -5241,9 +5236,7 @@ def prepare_b12x_fp4_moe_weights(
             layout=PreparedWeightLayout.TRELLIS_NATIVE,
             value=value,
         )
-        input_scale = torch.ones(
-            (), dtype=torch.float32, device=value.w13.device
-        )
+        input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
         return B12XFP4ExpertWeights(
             plan=plan,
             a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
@@ -6744,7 +6737,10 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+    from b12x.moe._shared.kernels.w4a16.host import (
+        route_pack_capacity,
+        route_pack_warmup_token_counts,
+    )
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         compile_w4a16_fused_moe,
@@ -6856,68 +6852,80 @@ def _plan_full_rotation_w4a16_launches(
             for ids_dtype in (torch.int32, torch.int64)
             for mapped in (False, True)
         )
-        for mapped in (False, True):
-            route_pack_key = (
-                core_plan.device.type,
-                int(torch.cuda.current_device()),
-                capacity_tokens * core_plan.num_topk,
-                int(block_size_m),
-                int(core_plan.route_E),
-                mapped,
-            )
-            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
-                continue
+        packed_route_indices = torch.empty(
+            capacity_route_slots,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        block_expert_ids = torch.empty(
+            capacity_m_blocks,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        packed_route_count = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_offsets = torch.empty(
+            core_plan.route_E + 1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_counts = torch.empty(
+            core_plan.route_E,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        pending_route_pack_keys: list[tuple[object, ...]] = []
+        for route_ids_dtype in (torch.int32, torch.int64):
             dummy_topk_ids = torch.zeros(
                 capacity_tokens,
                 core_plan.num_topk,
-                dtype=torch.int32,
+                dtype=route_ids_dtype,
                 device=core_plan.device,
             )
-            packed_route_indices = torch.empty(
-                capacity_route_slots,
-                dtype=torch.int32,
-                device=core_plan.device,
+            for mapped in (False, True):
+                expert_map = None
+                if mapped:
+                    expert_map = torch.arange(
+                        core_plan.route_E,
+                        dtype=torch.int32,
+                        device=core_plan.device,
+                    )
+                for token_count in route_pack_warmup_token_counts(capacity_tokens):
+                    route_pack_key = (
+                        core_plan.device.type,
+                        int(torch.cuda.current_device()),
+                        str(route_ids_dtype),
+                        token_count * core_plan.num_topk,
+                        int(block_size_m),
+                        int(core_plan.route_E),
+                        mapped,
+                    )
+                    if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                        continue
+                    pack_topk_routes_by_expert(
+                        dummy_topk_ids[:token_count],
+                        block_size_m,
+                        core_plan.route_E,
+                        expert_map=expert_map,
+                        packed_route_indices=packed_route_indices,
+                        block_expert_ids=block_expert_ids,
+                        packed_route_count=packed_route_count,
+                        expert_offsets=expert_offsets,
+                        expert_counts=expert_counts,
+                    )
+                    pending_route_pack_keys.append(route_pack_key)
+        torch.cuda.current_stream(core_plan.device).synchronize()
+        _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
+        if pending_route_pack_keys:
+            logger.info(
+                "Prewarmed %d full-rotation W4A16 route-pack variant(s) "
+                "for token capacity %d.",
+                len(pending_route_pack_keys),
+                capacity_tokens,
             )
-            block_expert_ids = torch.empty(
-                capacity_m_blocks,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            packed_route_count = torch.empty(
-                1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_offsets = torch.empty(
-                core_plan.route_E + 1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_counts = torch.empty(
-                core_plan.route_E,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_map = None
-            if mapped:
-                expert_map = torch.arange(
-                    core_plan.route_E,
-                    dtype=torch.int32,
-                    device=core_plan.device,
-                )
-            pack_topk_routes_by_expert(
-                dummy_topk_ids,
-                block_size_m,
-                core_plan.route_E,
-                expert_map=expert_map,
-                packed_route_indices=packed_route_indices,
-                block_expert_ids=block_expert_ids,
-                packed_route_count=packed_route_count,
-                expert_offsets=expert_offsets,
-                expert_counts=expert_counts,
-            )
-            torch.cuda.current_stream(core_plan.device).synchronize()
-            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
     return fused_launches, topk_sum_launches
 
 
@@ -7267,6 +7275,7 @@ def _prewarm_w4a16_planned_launches(
             route_pack_key = (
                 workspace.device.type,
                 int(torch.cuda.current_device()),
+                str(torch.int32),
                 int(token_count) * int(workspace.num_topk),
                 int(block_size_m),
                 int(workspace.route_E),
@@ -8767,21 +8776,15 @@ class _DynamicMoEW4A8Launch:
             # [E][K16(I)][N16(K)]. SFB tensors are compile-time dead
             # (identity UE8M0 word).
             _tr_bits = int(self._kernel.trellis_bits)
-            _tr_w13_u32 = (
-                2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
-            )
+            _tr_w13_u32 = 2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
             _tr_down_u32 = (self._n // 16) * (self._k // 16) * 8 * _tr_bits
             w13_rp = cute.make_tensor(
                 w13_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_w13_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_w13_u32,), stride=(1,)),
             )
             down_rp = cute.make_tensor(
                 down_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_down_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_down_u32,), stride=(1,)),
             )
             _tr_sentinel = cute.make_layout((1,), stride=(1,))
             w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
@@ -8915,9 +8918,7 @@ class _DynamicMoEW4A8Launch:
                             row_counts.shape[0]
                             * (
                                 6
-                                if getattr(
-                                    self._kernel, "trellis_coupled", False
-                                )
+                                if getattr(self._kernel, "trellis_coupled", False)
                                 else 3
                             )
                             * self._n,
@@ -9334,9 +9335,7 @@ def _get_dynamic_kernel(
         current_cuda_stream(),
         *(
             (
-                make_ptr(
-                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),
+                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(
                     cutlass.Float16,
                     16,
@@ -9432,9 +9431,7 @@ def _launch_dynamic_flat(
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
-    w4a8_trellis = (
-        _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
-    )
+    w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
     trellis_bits = 0
     trellis_coupled = False
     trellis_lut_tensor = None
@@ -9443,16 +9440,11 @@ def _launch_dynamic_flat(
             _trellis256_execution_lut,
         )
 
-        trellis_lut_tensor = _trellis256_execution_lut(
-            a.device, "sqg_xor_cheb_t12"
-        )
+        trellis_lut_tensor = _trellis256_execution_lut(a.device, "sqg_xor_cheb_t12")
         payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
         window_words = 2 * E * (k // 16) * (n // 16) * 8
         trellis_bits = payload_u32 // window_words
-        if (
-            trellis_bits not in (2, 3, 4)
-            or trellis_bits * window_words != payload_u32
-        ):
+        if trellis_bits not in (2, 3, 4) or trellis_bits * window_words != payload_u32:
             raise RuntimeError(
                 "w4a8 trellis payload extent does not match the launch "
                 f"shape (E={E}, k={k}, n={n}, payload_u32={payload_u32})"
@@ -10594,9 +10586,7 @@ def _launch_micro(
     # activation wrappers such as SiTU keep is_supported False to hold the
     # nvfp4-family compact path closed while serving the trellis arm.
     shape_supported = (
-        MoEMicroKernelBackend.is_supported
-        if w4a8_trellis
-        else micro_cls.is_supported
+        MoEMicroKernelBackend.is_supported if w4a8_trellis else micro_cls.is_supported
     )
     use_micro_direct = (
         quant_mode == "nvfp4" or _is_w4a8_quant_mode(quant_mode)
@@ -11023,8 +11013,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
         micro_w4a8_trellis = (
             quant_mode == "w4a8_mx"
-            and getattr(prepared_payload, "weight_layout", None)
-            == "trellis3_t256"
+            and getattr(prepared_payload, "weight_layout", None) == "trellis3_t256"
         )
         if micro_w4a8_trellis:
             wv = _w4a8_trellis_weight_views(
@@ -11214,8 +11203,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -11574,9 +11562,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

@@ -11,22 +11,14 @@ from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
 from b12x.gemm.trellis_linear import _small_m
 from b12x.gemm.trellis_linear._small_m import _default_num_sms
-from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_cheb_normal_e4m3_direct_lut_cpu,
     sqg_xor_cheb_t12_direct_lut_cpu,
 )
-from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
-from b12x.moe._shared.kernels.activations import (
-    SITU_DEFAULT_BETA,
-    SITU_DEFAULT_LINEAR_BETA,
-)
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
     _trellis256_dense_launch_geometry,
-)
-from b12x.moe._shared.kernels.w4a16.prepare import (
-    prepare_qsrt_pair_moe_weights,
+    _use_k6_mcg_small,
 )
 
 
@@ -94,10 +86,6 @@ def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
     )
 
 
-
-
-
-
 @lru_cache(maxsize=None)
 def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
@@ -109,9 +97,7 @@ def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_cheb_normal_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_cheb_normal_e4m3_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_cheb_normal_e4m3_table(bits)[indices]
 
@@ -127,9 +113,7 @@ def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_xor_cheb_t12_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_xor_cheb_t12_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_xor_cheb_t12_table(bits)[indices]
 
@@ -152,9 +136,7 @@ def _decode_lane(
         first = tile_words[..., first_word % width].astype(np.uint64)
         last = tile_words[..., last_word % width].astype(np.uint64)
         merged = (first << np.uint64(32)) | last
-        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(
-            np.uint32
-        )
+        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
         elif codebook == "mul1-e4m3":
@@ -183,9 +165,7 @@ def _reconstruct_native(
         for n_tile in range(n_tiles):
             lanes = np.stack(
                 [
-                    _decode_lane(
-                        words[k_tile, n_tile], lane, bits, codebook=codebook
-                    )
+                    _decode_lane(words[k_tile, n_tile], lane, bits, codebook=codebook)
                     for lane in range(32)
                 ]
             )
@@ -217,15 +197,7 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
     scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
     scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
-    return (
-        (blocks / scale)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .mul(scale)
-        .reshape(m, k)
-    )
-
-
+    return (blocks / scale).to(torch.float8_e4m3fn).float().mul(scale).reshape(m, k)
 
 
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
@@ -350,6 +322,8 @@ def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
     assert seen["kwargs"]["rotated_compute"] is rotated_compute
     assert seen["kwargs"]["gemm_output_f16"] is gemm_output_f16
     assert seen["kwargs"]["output_f16"] is output_f16
+    assert seen["kwargs"]["_moe_block_size"] is None
+    assert seen["kwargs"]["_force_tile_config"] is None
 
 
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
@@ -401,6 +375,42 @@ def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
 
     with pytest.raises(NotImplementedError, match="built for sm_120 only"):
         _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
+
+
+@pytest.mark.parametrize(
+    ("capability", "explicit_launch_config", "expected"),
+    [
+        ((12, 0), False, True),
+        ((12, 0), True, False),
+        ((12, 1), False, False),
+        ((9, 0), False, False),
+    ],
+)
+def test_k6_small_m_dispatch_requires_compiled_target(
+    monkeypatch,
+    capability: tuple[int, int],
+    explicit_launch_config: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: capability,
+    )
+
+    assert (
+        _use_k6_mcg_small(
+            device=torch.device("cuda"),
+            m=128,
+            trellis_bits=6,
+            trellis_codebook="mcg",
+            trellis_pair_kind=None,
+            compute_dtype=torch.float16,
+            external_hadamard_128=None,
+            explicit_launch_config=explicit_launch_config,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -645,9 +655,9 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
         params_dtype=torch.float16,
     )
     assert weight.trellis_codebook == "sqg_xor_cheb_t12"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="sqg_xor_cheb_t12"
-    ).to(device)
+    reference_weight = _reconstruct_native(trellis, codebook="sqg_xor_cheb_t12").to(
+        device
+    )
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
     def identity_hadamard(
@@ -750,11 +760,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
     suh = torch.ones(reference_weight.shape[0], dtype=torch.float16, device=device)
     svh = torch.ones(reference_weight.shape[1], dtype=torch.float16, device=device)
     codebook_kwargs = (
-        {
-            "mcg": torch.tensor(
-                0xCBAC1FED, dtype=torch.uint32, device=device
-            )
-        }
+        {"mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device)}
         if codebook == "mcg"
         else {"codebook": codebook}
     )
@@ -829,12 +835,6 @@ def test_dense_pair_matches_independent_reference_and_captures(
     graph.replay()
     torch.cuda.synchronize(device)
     assert torch.equal(captured, actual)
-
-
-
-
-
-
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
