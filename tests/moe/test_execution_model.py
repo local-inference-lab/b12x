@@ -240,6 +240,49 @@ def test_workspace_plan_uses_weight_plan_source_contract() -> None:
     assert plan.spec.source_weight_scale is ScaleEncoding.E8M0_K32
 
 
+@pytest.mark.parametrize(
+    "qsrt_profile",
+    ["k3x22_k4x2", "k3x22_k4x2_coupled_h512_h128"],
+)
+def test_w4a8_mx_rejects_mixed_rate_qsrt_profiles(qsrt_profile: str) -> None:
+    """W4A8 kernels cannot interpret per-pair QSRT rate selectors."""
+
+    with pytest.raises(ValueError, match="supports only uniform-rate profiles"):
+        fused_moe.plan_weights(
+            quant_modes="w4a8_mx",
+            source_format="qsrt_sqg_e4m3",
+            activation="situ",
+            params_dtype=torch.bfloat16,
+            num_experts=256,
+            hidden_size=6144,
+            intermediate_size=256,
+            trellis_bits=3,
+            trellis_tile_config=(64, 256, 64, 256),
+            qsrt_storage_format="qsrt_atoms_v2",
+            qsrt_profile=qsrt_profile,
+            coupled_hadamard=qsrt_profile.endswith("coupled_h512_h128"),
+        )
+
+
+def test_w4a8_mx_accepts_uniform_rate_qsrt_profile() -> None:
+    plan = fused_moe.plan_weights(
+        quant_modes="w4a8_mx",
+        source_format="qsrt_sqg_e4m3",
+        activation="situ",
+        params_dtype=torch.bfloat16,
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=256,
+        trellis_bits=2,
+        trellis_tile_config=(128, 128, 128, 128),
+        qsrt_storage_format="qsrt_atoms_v2",
+        qsrt_profile="k2_coupled_h512_h128",
+        coupled_hadamard=True,
+    )
+
+    assert plan.required_weight_layout("w4a8_mx") is PreparedWeightLayout.TRELLIS_NATIVE
+
+
 def test_glm52_tp8_nvfp4_crosses_from_micro_to_dynamic_at_m8(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
