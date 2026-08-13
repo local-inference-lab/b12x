@@ -8,6 +8,7 @@ import torch
 from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
+    route_pack_capacity,
     select_route_block_size_m,
 )
 
@@ -159,6 +160,88 @@ def test_pack_topk_routes_by_expert_groups_and_pads_routes(
         payload = block_routes[block_routes < sentinel]
         if payload.numel() > 0:
             assert bool(torch.all(expected_ids[payload] == expert).item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_route_pack_partial_bucket_uses_fixed_plan_capacity() -> None:
+    tokens = 2050
+    max_tokens = 3072
+    topk = 8
+    num_experts = 32
+    block_size = 64
+    topk_ids = (
+        torch.arange(tokens * topk, dtype=torch.int64, device="cuda")
+        .reshape(tokens, topk)
+        .remainder_(num_experts)
+    )
+    expert_map = torch.arange(
+        num_experts - 1,
+        -1,
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    _, packed_capacity, block_capacity = route_pack_capacity(
+        max_tokens * topk,
+        block_size,
+        num_experts,
+        topk=topk,
+        bucket_tokens=False,
+    )
+
+    packed_routes, block_experts, packed_count = pack_topk_routes_by_expert(
+        topk_ids,
+        block_size,
+        num_experts,
+        expert_map=expert_map,
+        packed_route_indices=torch.empty(
+            packed_capacity,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        block_expert_ids=torch.empty(
+            block_capacity,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        packed_route_count=torch.empty(1, dtype=torch.int32, device="cuda"),
+        expert_offsets=torch.empty(
+            num_experts + 1,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        expert_counts=torch.empty(
+            num_experts,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        max_tokens=max_tokens,
+    )
+    expected_ids, expected_valid, expected_count, expected_blocks = (
+        _expected_route_pack(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+        )
+    )
+
+    assert packed_routes.numel() == packed_capacity
+    assert block_experts.numel() == block_capacity
+    assert torch.equal(packed_count.cpu(), expected_count)
+    valid = int(expected_count.item())
+    valid_blocks = valid // block_size
+    assert torch.equal(block_experts[:valid_blocks].cpu(), expected_blocks)
+    payload = packed_routes[:valid].cpu().to(torch.int64)
+    payload = payload[payload < topk_ids.numel()]
+    assert payload.numel() == int(expected_valid.sum().item())
+    for expert in range(num_experts):
+        actual = payload[expected_ids[payload] == expert].sort().values
+        expected = torch.nonzero(
+            expected_valid & (expected_ids == expert),
+            as_tuple=False,
+        ).flatten()
+        assert torch.equal(actual, expected.sort().values), expert
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
