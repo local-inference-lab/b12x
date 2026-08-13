@@ -248,3 +248,336 @@ def test_export_dense_safetensors(tmp_path) -> None:
     assert w.dtype == torch.uint8 and tuple(w.shape) == (128, 128 * 3 // 4)
     assert "model.language_model.layers.0.mlp.gate_proj.weight_scale" in state
     assert config["quantization_config"]["quant_algo"] == "W6A6"
+
+
+# ---------------------------------------------------------------------------
+# Issue #171: safetensors shard path containment contract tests
+# ---------------------------------------------------------------------------
+
+
+def _save_safetensors(path: pathlib.Path, tensors: dict[str, torch.Tensor]) -> None:
+    """Write a single safetensors file (no config, no index)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safetensors_torch.save_file(
+        {k: v.contiguous() for k, v in tensors.items()}, str(path)
+    )
+
+
+def _make_index(
+    root: pathlib.Path, weight_map: dict[str, str], *, with_config: bool = True
+) -> None:
+    """Write a model.safetensors.index.json with an arbitrary weight_map."""
+    root.mkdir(parents=True, exist_ok=True)
+    if with_config:
+        (root / "config.json").write_text(json.dumps({"model_type": "test"}))
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map})
+    )
+
+
+# --- accepted layouts -------------------------------------------------------
+
+
+def test_accept_regular_in_root_shard(tmp_path) -> None:
+    """A normal basename index loads its tensor."""
+    root = tmp_path / "model"
+    shard = root / "model-00001-of-00001.safetensors"
+    sentinel = torch.tensor([1.0, 2.0, 3.0])
+    _save_safetensors(shard, {"weight": sentinel})
+    _make_index(root, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(root)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+def test_accept_in_root_symlink(tmp_path) -> None:
+    """An in-root basename symlink whose target stays inside root loads."""
+    root = tmp_path / "model"
+    real = root / "real-00001.safetensors"
+    sentinel = torch.tensor([5.0])
+    _save_safetensors(real, {"weight": sentinel})
+    (root / "model-00001-of-00001.safetensors").symlink_to(real.name)
+    _make_index(root, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(root)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+def test_accept_symlinked_root(tmp_path) -> None:
+    """A symlinked model root is canonicalized and loads normally."""
+    real_root = tmp_path / "real_model"
+    shard = real_root / "model-00001-of-00001.safetensors"
+    sentinel = torch.tensor([8.0])
+    _save_safetensors(shard, {"weight": sentinel})
+    _make_index(real_root, {"weight": "model-00001-of-00001.safetensors"})
+    link = tmp_path / "link_to_model"
+    link.symlink_to(real_root)
+    model = SafetensorsModel(link)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+def test_accept_standard_hf_same_repo_blob_link(tmp_path) -> None:
+    """Synthetic models--repo/snapshots/rev/shard -> ../../blobs/digest loads."""
+    repo = tmp_path / "models--org--model"
+    blobs = repo / "blobs"
+    snap = repo / "snapshots" / "abc123"
+    blobs.mkdir(parents=True)
+    snap.mkdir(parents=True)
+    digest = "deadbeef"
+    sentinel = torch.tensor([42.0])
+    _save_safetensors(blobs / digest, {"weight": sentinel})
+    # Standard HF layout: snapshot basename -> ../../blobs/<digest>
+    (snap / "model-00001-of-00001.safetensors").symlink_to(
+        pathlib.Path("..", "..", "blobs", digest)
+    )
+    _make_index(snap, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(snap)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+def test_accept_single_file_fallback(tmp_path) -> None:
+    """Plain model.safetensors (no index) still loads."""
+    root = tmp_path / "model"
+    root.mkdir(parents=True, exist_ok=True)
+    sentinel = torch.tensor([7.0])
+    _save_safetensors(root / "model.safetensors", {"weight": sentinel})
+    (root / "config.json").write_text(json.dumps({"model_type": "test"}))
+    model = SafetensorsModel(root)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+def test_accept_single_file_hf_blob_link(tmp_path) -> None:
+    """Single-file fallback with a recognized HF same-repo blob link loads."""
+    repo = tmp_path / "models--org--model"
+    blobs = repo / "blobs"
+    snap = repo / "snapshots" / "abc123"
+    blobs.mkdir(parents=True)
+    snap.mkdir(parents=True)
+    digest = "cafef00d"
+    sentinel = torch.tensor([99.0])
+    _save_safetensors(blobs / digest, {"weight": sentinel})
+    (snap / "model.safetensors").symlink_to(
+        pathlib.Path("..", "..", "blobs", digest)
+    )
+    (snap / "config.json").write_text(json.dumps({"model_type": "test"}))
+    model = SafetensorsModel(snap)
+    assert torch.equal(model.get_tensor("weight"), sentinel)
+
+
+# --- lexical rejections (fail at construction, before safe_open) -----------
+
+
+def test_reject_posix_absolute_shard(tmp_path) -> None:
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    _make_index(root, {"weight": "/etc/passwd.safetensors"})
+    with pytest.raises(ValueError, match="invalid shard name"):
+        SafetensorsModel(root)
+
+
+def test_reject_windows_absolute_unc_and_backslash_shards(tmp_path) -> None:
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    for bad in [
+        r"C:\Users\secret.safetensors",
+        r"\\server\share\secret.safetensors",
+        r"subdir\file.safetensors",
+    ]:
+        _make_index(root, {"weight": bad})
+        with pytest.raises(ValueError, match="invalid shard name"):
+            SafetensorsModel(root)
+
+
+def test_reject_windows_drive_separator_free(tmp_path) -> None:
+    """Separator-free ``C:`` and ``1:`` drive forms are rejected (ntpath rule)."""
+    root = tmp_path / "model"
+    _save_safetensors(root / "model.safetensors", {"weight": torch.tensor([1.0])})
+    for bad in ["C:model.safetensors", "1:model.safetensors"]:
+        _make_index(root, {"weight": bad})
+        with pytest.raises(ValueError, match="Windows drive form"):
+            SafetensorsModel(root)
+
+
+def test_reject_parent_traversal_shard(tmp_path) -> None:
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    for bad in ["../outside.safetensors", "../../etc/passwd.safetensors"]:
+        _make_index(root, {"weight": bad})
+        with pytest.raises(ValueError, match="invalid shard name"):
+            SafetensorsModel(root)
+
+
+def test_reject_nested_component(tmp_path) -> None:
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    _make_index(root, {"weight": "subdir/shard.safetensors"})
+    with pytest.raises(ValueError, match="invalid shard name"):
+        SafetensorsModel(root)
+
+
+def test_reject_non_safetensors_suffix(tmp_path) -> None:
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    _make_index(root, {"weight": "model.bin"})
+    with pytest.raises(ValueError, match="invalid shard name"):
+        SafetensorsModel(root)
+
+
+# --- type / structure rejections --------------------------------------------
+
+
+def test_reject_non_dict_weight_map(tmp_path) -> None:
+    root = tmp_path / "model"
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps({"model_type": "test"}))
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": [1, 2, 3]})
+    )
+    with pytest.raises(ValueError, match="weight_map.*not a JSON object"):
+        SafetensorsModel(root)
+
+
+def test_reject_malformed_weight_map_types_eagerly(tmp_path) -> None:
+    """Non-string shard values (int, list, null) fail at construction."""
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    for bad_val in [123, ["model.safetensors"], None, True]:
+        _make_index(root, {"weight": bad_val})
+        with pytest.raises(ValueError, match="expected string"):
+            SafetensorsModel(root)
+
+
+def test_reject_bad_map_entry_eagerly_even_if_unused(tmp_path) -> None:
+    """A lexically invalid shard in an unused entry still fails at construction."""
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"good": torch.tensor([1.0])})
+    _make_index(
+        root,
+        {"good": "model.safetensors", "bad": "../escape.safetensors"},
+    )
+    with pytest.raises(ValueError, match="invalid shard name"):
+        SafetensorsModel(root)
+
+
+# --- symlink / resolution rejections (lazy — triggered on get_tensor) -------
+
+
+def test_reject_external_leaf_symlink(tmp_path) -> None:
+    """An in-root basename symlink to an external safetensors file fails."""
+    root = tmp_path / "model"
+    root.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    _save_safetensors(outside, {"weight": torch.tensor([1.0])})
+    (root / "model-00001-of-00001.safetensors").symlink_to(outside)
+    _make_index(root, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(root)
+    with pytest.raises(ValueError, match="outside the model root"):
+        model.get_tensor("weight")
+
+
+def test_reject_hf_cross_repo_blob_link(tmp_path) -> None:
+    """A snapshot basename link resolving outside the same repo blobs fails."""
+    repo_a = tmp_path / "models--org--modelA"
+    repo_b = tmp_path / "models--org--modelB"
+    blobs_a = repo_a / "blobs"
+    blobs_b = repo_b / "blobs"
+    snap_a = repo_a / "snapshots" / "rev"
+    blobs_a.mkdir(parents=True)
+    blobs_b.mkdir(parents=True)
+    snap_a.mkdir(parents=True)
+    digest = "cross1234"
+    _save_safetensors(blobs_b / digest, {"weight": torch.tensor([1.0])})
+    # Link points to a *different* repo's blobs — outside same-repo boundary.
+    (snap_a / "model-00001-of-00001.safetensors").symlink_to(blobs_b / digest)
+    _make_index(snap_a, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(snap_a)
+    with pytest.raises(ValueError, match="outside the model root"):
+        model.get_tensor("weight")
+
+
+def test_reject_broken_symlink(tmp_path) -> None:
+    root = tmp_path / "model"
+    root.mkdir()
+    (root / "model-00001-of-00001.safetensors").symlink_to(
+        tmp_path / "nonexistent.safetensors"
+    )
+    _make_index(root, {"weight": "model-00001-of-00001.safetensors"})
+    model = SafetensorsModel(root)
+    with pytest.raises(ValueError, match="not found|not a regular file"):
+        model.get_tensor("weight")
+
+
+def test_reject_directory_as_shard(tmp_path) -> None:
+    root = tmp_path / "model"
+    (root / "subdir.safetensors").mkdir(parents=True)
+    _make_index(root, {"weight": "subdir.safetensors"})
+    model = SafetensorsModel(root)
+    with pytest.raises(ValueError, match="not a regular file"):
+        model.get_tensor("weight")
+
+
+def test_reject_missing_shard_file(tmp_path) -> None:
+    root = tmp_path / "model"
+    _make_index(root, {"weight": "nonexistent-00001-of-00001.safetensors"})
+    model = SafetensorsModel(root)
+    with pytest.raises(ValueError, match="not found"):
+        model.get_tensor("weight")
+
+
+# --- single-file fallback symlink escape (construction-time) ----------------
+
+
+def test_confine_single_file_fallback_symlink_escape(tmp_path) -> None:
+    """A model.safetensors symlink escape receives the same rejection."""
+    root = tmp_path / "model"
+    root.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    _save_safetensors(outside, {"weight": torch.tensor([1.0])})
+    (root / "model.safetensors").symlink_to(outside)
+    (root / "config.json").write_text(json.dumps({"model_type": "test"}))
+    with pytest.raises(ValueError, match="outside the model root"):
+        SafetensorsModel(root)
+
+
+# --- no partial export on invalid index -------------------------------------
+
+
+def test_no_partial_export_on_invalid_index(tmp_path) -> None:
+    """Full exporter raises before creating output or emitting any shard."""
+    root = tmp_path / "model"
+    shard = root / "model.safetensors"
+    _save_safetensors(shard, {"weight": torch.tensor([1.0])})
+    _make_index(
+        root,
+        {"weight": "model.safetensors", "bad": "../escape.safetensors"},
+    )
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="invalid shard name"):
+        export_dense_model_to_fp6_safetensors(
+            root, out, device="cpu", use_gpu=False, verbose=False
+        )
+    assert not out.exists()
+
+
+# --- handle caching by validated identity -----------------------------------
+
+
+def test_cache_validated_identity(tmp_path) -> None:
+    """Multiple keys for one validated shard reuse a single handle."""
+    root = tmp_path / "model"
+    shard = root / "model-00001-of-00001.safetensors"
+    _save_safetensors(shard, {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])})
+    _make_index(
+        root,
+        {"a": "model-00001-of-00001.safetensors", "b": "model-00001-of-00001.safetensors"},
+    )
+    model = SafetensorsModel(root)
+    model.get_tensor("a")
+    model.get_tensor("b")
+    # Both keys should share the same cached handle (one entry).
+    assert len(model._handles) == 1
