@@ -243,15 +243,35 @@ def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int
     return max_packed_routes
 
 
-def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
+def route_pack_numel_capacity(
+    numel: int,
+    topk: int = 1,
+    *,
+    max_tokens: int | None = None,
+) -> int:
     topk = max(int(topk), 1)
     tokens = (max(int(numel), 1) + topk - 1) // topk
-    return route_pack_token_capacity(tokens, topk) * topk
+    return route_pack_token_capacity(tokens, topk, max_tokens=max_tokens) * topk
 
 
-def route_pack_token_capacity(tokens: int, topk: int) -> int:
+def route_pack_token_capacity(
+    tokens: int,
+    topk: int,
+    *,
+    max_tokens: int | None = None,
+) -> int:
     del topk
-    return 1 << (max(int(tokens), 1) - 1).bit_length()
+    tokens = max(int(tokens), 1)
+    capacity = 1 << (tokens - 1).bit_length()
+    if max_tokens is None:
+        return capacity
+    max_tokens = int(max_tokens)
+    if max_tokens < tokens:
+        raise ValueError(
+            "route-pack max token capacity is below the live token count: "
+            f"{max_tokens} < {tokens}"
+        )
+    return min(capacity, max_tokens)
 
 
 def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
@@ -287,10 +307,11 @@ def route_pack_capacity(
     *,
     topk: int = 1,
     bucket_tokens: bool = True,
+    max_tokens: int | None = None,
 ) -> tuple[int, int, int]:
     """Return the canonical routed-row, packed-slot, and block capacities."""
     numel_capacity = (
-        route_pack_numel_capacity(numel, topk=topk)
+        route_pack_numel_capacity(numel, topk=topk, max_tokens=max_tokens)
         if bucket_tokens
         else max(int(numel), 1)
     )

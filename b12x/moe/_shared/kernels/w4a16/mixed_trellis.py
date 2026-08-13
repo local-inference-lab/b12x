@@ -30,6 +30,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 from .host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
+    route_pack_token_capacity,
     route_pack_warmup_token_counts,
 )
 from .kernel import (
@@ -798,19 +799,27 @@ def warmup_mixed_trellis_route_pack(
     device = buffers.packed_route_indices.device
     if device.type != "cuda":
         raise RuntimeError("mixed Trellis route-pack warmup requires CUDA buffers")
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("mixed Trellis route-pack warmup cannot run during capture")
 
     total_experts = int(launch.tier0_num_experts) + int(launch.tier1_num_experts)
     warmed = 0
     pending_keys: list[tuple[object, ...]] = []
     with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "mixed Trellis route-pack warmup cannot run during capture"
+            )
         device_index = int(torch.cuda.current_device())
         for token_count in route_pack_warmup_token_counts(launch.size_m):
+            token_capacity = route_pack_token_capacity(
+                token_count,
+                launch.top_k,
+                max_tokens=launch.size_m,
+            )
             key = (
                 device_index,
                 str(launch.route_ids_dtype),
                 int(token_count),
+                int(token_capacity),
                 int(launch.top_k),
                 total_experts,
                 int(launch.moe_block_size),
@@ -833,6 +842,7 @@ def warmup_mixed_trellis_route_pack(
                 packed_route_count=buffers.packed_route_count,
                 expert_offsets=buffers.expert_offsets,
                 expert_counts=buffers.expert_counts,
+                max_tokens=launch.size_m,
             )
             pending_keys.append(key)
             warmed += 1
@@ -1403,6 +1413,7 @@ def run_mixed_trellis(
         packed_route_count=buffers.packed_route_count,
         expert_offsets=buffers.expert_offsets,
         expert_counts=buffers.expert_counts,
+        max_tokens=launch.size_m,
     )
     stream = current_cuda_stream()
     launch.compiled(

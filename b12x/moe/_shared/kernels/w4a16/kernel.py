@@ -10640,6 +10640,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    max_tokens: int | None = None,
     stream: cuda.CUstream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Group top-k routes by expert and pad each group to the GEMM M-block size."""
@@ -10660,6 +10661,7 @@ def pack_topk_routes_by_expert(
         packed_route_count=packed_route_count,
         expert_offsets=expert_offsets,
         expert_counts=expert_counts,
+        max_tokens=max_tokens,
     )
 
 
@@ -11705,6 +11707,11 @@ def run_w4a16_moe(
                 packed_route_count=packed_route_count,
                 expert_offsets=expert_offsets,
                 expert_counts=expert_counts,
+                max_tokens=(
+                    int(fused_launch.size_m)
+                    if fused_launch is not None and fused_launch.full_rotation
+                    else None
+                ),
                 stream=stream,
             )
         )
