@@ -105,14 +105,25 @@ case "${mode}" in
     ;;
 esac
 
+_RESPONSE_FILE=""
+
+_cleanup_response_file() {
+  [[ -n "${_RESPONSE_FILE}" ]] && rm -f "${_RESPONSE_FILE}"
+  return 0
+}
+
 curl_post() {
   local url="$1"
   local body="$2"
   local http_code
 
+  trap _cleanup_response_file EXIT
+  _RESPONSE_FILE="$(mktemp "${TMPDIR:-/tmp}/sglang_prof_resp.XXXXXXXX")"
+  chmod 600 "${_RESPONSE_FILE}"
+
   http_code="$(
     curl -sS \
-      -o /tmp/sglang_profile_response.$$ \
+      -o "${_RESPONSE_FILE}" \
       -w '%{http_code}' \
       -X POST \
       -H 'Content-Type: application/json' \
@@ -120,8 +131,9 @@ curl_post() {
       "${url}"
   )"
 
-  cat /tmp/sglang_profile_response.$$
-  rm -f /tmp/sglang_profile_response.$$
+  cat "${_RESPONSE_FILE}"
+  rm -f "${_RESPONSE_FILE}"
+  _RESPONSE_FILE=""
 
   if [[ "${http_code}" != 2* ]]; then
     echo >&2

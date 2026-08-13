@@ -2,15 +2,144 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
+import stat
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Optional
+
+
+def _open_dir_fd(path, dir_fd: Optional[int] = None) -> int:
+    """Open a directory file descriptor with O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC.
+
+    O_NOFOLLOW rejects a *final-component* symlink (raises ELOOP).
+    Intermediate path components are not directly controlled here, but
+    their risk is bounded by the caller: the parent is opened and
+    verified (owned by euid, not group/world-writable) before the leaf
+    is created or pinned relative to it.
+    """
+    flags = os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        return os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise RuntimeError(f"refusing to follow symlink: {path}") from exc
+        raise
+
+
+def _verify_parent_fd(fd: int, parent) -> None:
+    """Verify a pinned parent directory fd is owned by euid and not group/world-writable."""
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"parent is not a directory: {parent}")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"parent not owned by current user: {parent} "
+            f"(use a home or private parent directory, or omit --out-dir)"
+        )
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(
+            f"parent is group or world writable: {parent} "
+            f"(use a home or private parent directory, or omit --out-dir)"
+        )
+
+
+def _verify_leaf_fd(fd: int, path) -> None:
+    """Verify a pinned leaf directory fd is a directory, owned by euid, mode 0700."""
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"output is not a directory: {path}")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(f"output not owned by current user: {path}")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        raise RuntimeError(f"output directory mode is {oct(stat.S_IMODE(st.st_mode))}, expected 0700: {path}")
+
+
+def _prepare_output_dir(out_arg: Optional[str], prefix: str) -> tuple[Path, int]:
+    """Return (path, pinned_dir_fd) for a private, mode-0700 output directory.
+
+    When *out_arg* is ``None`` an unpredictable directory is created via
+    :func:`tempfile.mkdtemp`, then pinned and verified.
+
+    When *out_arg* is provided the parent directory must already exist, be
+    owned by the current user, and not be group/world-writable.  The leaf
+    must not already exist (no directory, file, or symlink).  It is created
+    with mode 0700 via the pinned parent fd, then pinned and verified.
+    """
+    if out_arg is None:
+        path = Path(tempfile.mkdtemp(prefix=prefix))
+        fd = _open_dir_fd(path)
+    else:
+        path = Path(out_arg).absolute()
+        # Leaf must not exist or be a symlink.
+        if path.is_symlink() or path.exists():
+            raise RuntimeError(f"refusing to use existing path as output directory: {path}")
+        parent = path.parent
+        if not parent.is_dir():
+            raise RuntimeError(f"parent directory does not exist: {parent}")
+        parent_fd = _open_dir_fd(parent)
+        try:
+            _verify_parent_fd(parent_fd, parent)
+            os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+            # Pin the newly created leaf via the parent fd before closing it,
+            # so the fd refers to the exact inode we just created, not a
+            # path that could be swapped before reopening.
+            fd = _open_dir_fd(path.name, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    # Enforce mode 0700 and verify the pinned leaf.
+    try:
+        os.fchmod(fd, 0o700)
+        _verify_leaf_fd(fd, path)
+    except Exception:
+        os.close(fd)
+        raise
+    return path, fd
+
+
+def _secure_open(basename: str, dir_fd: int):
+    """Open a new file for writing relative to *dir_fd* with exclusive, no-follow, mode-0600 semantics.
+
+    The file must not already exist; symlinks are never followed.  The raw
+    fd is fchmod'd to exactly 0600 (undoing any umask) and then wrapped via
+    :func:`os.fdopen`.  The raw fd is closed if fdopen fails.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(basename, flags, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.EEXIST, errno.ELOOP):
+            raise RuntimeError(
+                f"refusing to overwrite existing file or follow symlink: {basename}"
+            ) from exc
+        raise
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _secure_write_text(basename: str, dir_fd: int, content: str) -> None:
+    """Write *content* to a brand-new file relative to *dir_fd* with exclusive, no-follow, mode-0600 semantics."""
+    with _secure_open(basename, dir_fd) as f:
+        f.write(content)
 
 
 class StreamRequest:
@@ -20,15 +149,18 @@ class StreamRequest:
         url: str,
         headers: dict[str, str],
         payload: dict[str, Any],
-        log_path: Path,
-        error_path: Path,
+        log_basename: str,
+        error_basename: str,
+        dir_fd: int,
         timeout_s: int = 3600,
     ) -> None:
         self.url = url
         self.headers = headers
         self.payload = payload
-        self.log_path = log_path
-        self.error_path = error_path
+        self.log_basename = log_basename
+        self.error_basename = error_basename
+        self._caller_fd = dir_fd
+        self._owned_fd: Optional[int] = None
         self.timeout_s = timeout_s
         self.first_token_event = threading.Event()
         self.finished_event = threading.Event()
@@ -38,16 +170,25 @@ class StreamRequest:
         self.error: Optional[str] = None
 
     def start(self) -> None:
-        self._thread.start()
+        # Dup the caller's dir_fd so the stream owns an independent directory
+        # capability that survives even if main() closes its fd while the
+        # daemon thread is still running.
+        self._owned_fd = os.dup(self._caller_fd)
+        os.set_inheritable(self._owned_fd, False)
+        try:
+            self._thread.start()
+        except Exception:
+            os.close(self._owned_fd)
+            self._owned_fd = None
+            raise
 
     def stop(self) -> None:
         self._stop_event.set()
         if self._response is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._response.close()
-            except Exception:
-                pass
         self._thread.join(timeout=5)
+
 
     def wait_for_first_token(self, timeout_s: float) -> bool:
         return self.first_token_event.wait(timeout_s)
@@ -63,7 +204,7 @@ class StreamRequest:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                 self._response = response
-                with self.log_path.open("w", encoding="utf-8") as log_file:
+                with _secure_open(self.log_basename, self._owned_fd) as log_file:
                     while not self._stop_event.is_set():
                         line = response.readline()
                         if not line:
@@ -75,8 +216,12 @@ class StreamRequest:
                             self.first_token_event.set()
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
-            self.error_path.write_text(self.error + "\n", encoding="utf-8")
+            try:
+                _secure_write_text(self.error_basename, self._owned_fd, self.error + "\n")
+            except Exception as write_exc:
+                self.error += f" (additionally failed to write error log: {write_exc})"
         finally:
+            os.close(self._owned_fd)
             self.finished_event.set()
 
 
@@ -132,7 +277,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file.")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--capture-seconds", type=float, default=10.0)
-    parser.add_argument("--out-dir", default=None, help="Local output directory for logs and metadata.")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Local output directory for logs and metadata. "
+            "The parent directory must already exist, be owned by you, "
+            "and not be group/world-writable.  The directory itself is "
+            "created fresh with mode 0700; an existing path is rejected."
+        ),
+    )
     parser.add_argument("--api-key", default=None, help="Optional bearer token. Falls back to OPENAI_API_KEY.")
     parser.add_argument("--first-token-timeout", type=float, default=60.0)
     return parser.parse_args()
@@ -158,94 +312,90 @@ def main() -> None:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    out_dir = Path(args.out_dir or f"/tmp/vllm-native-{args.mode}-{time.strftime('%Y%m%d-%H%M%S')}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir, dir_fd = _prepare_output_dir(args.out_dir, f"vllm-native-{args.mode}-")
+    try:
+        prompt = load_prompt(args)
+        model = args.model or resolve_model(base_url, headers)
+        request_body = build_request(model, prompt, args.max_tokens)
 
-    prompt = load_prompt(args)
-    model = args.model or resolve_model(base_url, headers)
-    request_body = build_request(model, prompt, args.max_tokens)
+        _secure_write_text("request.json", dir_fd, json.dumps(request_body, indent=2) + "\n")
 
-    request_path = out_dir / "request.json"
-    stream_log = out_dir / "stream.log"
-    error_log = out_dir / "request.error.txt"
-    start_response = out_dir / "start_profile.response"
-    stop_response = out_dir / "stop_profile.response"
-    manifest_path = out_dir / "manifest.json"
-    request_path.write_text(json.dumps(request_body, indent=2) + "\n", encoding="utf-8")
+        print(f"output dir: {out_dir}")
+        print(f"model: {model}")
+        print(f"mode: {args.mode}")
+        print("starting streaming request...")
 
-    print(f"output dir: {out_dir}")
-    print(f"model: {model}")
-    print(f"mode: {args.mode}")
-    print("starting streaming request...")
-
-    stream = StreamRequest(
-        url=f"{base_url}/v1/completions",
-        headers=headers,
-        payload=request_body,
-        log_path=stream_log,
-        error_path=error_log,
-    )
-    stream.start()
-    started_at = time.time()
-
-    if not stream.wait_for_first_token(args.first_token_timeout):
-        stream.stop()
-        detail = ""
-        if stream.error:
-            detail = f" request error: {stream.error}"
-        raise RuntimeError(f"timed out waiting for the first streamed token.{detail}")
-
-    first_token_at = time.time()
-    print("first streamed token observed; starting native profile...")
-
-    status, body = http_json(f"{base_url}/start_profile", headers=headers, payload={})
-    start_response.write_text(body, encoding="utf-8")
-    if status == 404:
-        stream.stop()
-        raise RuntimeError(
-            "/start_profile is not available on this server. "
-            "For vLLM this usually means the server was not launched with --profiler-config."
+        stream = StreamRequest(
+            url=f"{base_url}/v1/completions",
+            headers=headers,
+            payload=request_body,
+            log_basename="stream.log",
+            error_basename="request.error.txt",
+            dir_fd=dir_fd,
         )
-    if status != 200:
+        stream.start()
+        started_at = time.time()
+
+        if not stream.wait_for_first_token(args.first_token_timeout):
+            stream.stop()
+            detail = ""
+            if stream.error:
+                detail = f" request error: {stream.error}"
+            raise RuntimeError(f"timed out waiting for the first streamed token.{detail}")
+
+        first_token_at = time.time()
+        print("first streamed token observed; starting native profile...")
+
+        status, body = http_json(f"{base_url}/start_profile", headers=headers, payload={})
+        _secure_write_text("start_profile.response", dir_fd, body)
+        if status == 404:
+            stream.stop()
+            raise RuntimeError(
+                "/start_profile is not available on this server. "
+                "For vLLM this usually means the server was not launched with --profiler-config."
+            )
+        if status != 200:
+            stream.stop()
+            raise RuntimeError(f"/start_profile failed with status {status}: {body.strip()}")
+
+        deadline = time.time() + args.capture_seconds
+        while time.time() < deadline:
+            if stream.finished_event.wait(timeout=0.2):
+                break
+
+        print("stopping native profile...")
+        status, body = http_json(f"{base_url}/stop_profile", headers=headers, payload={})
+        _secure_write_text("stop_profile.response", dir_fd, body)
+        if status != 200:
+            stream.stop()
+            raise RuntimeError(f"/stop_profile failed with status {status}: {body.strip()}")
+
+        finished_at = time.time()
         stream.stop()
-        raise RuntimeError(f"/start_profile failed with status {status}: {body.strip()}")
 
-    deadline = time.time() + args.capture_seconds
-    while time.time() < deadline:
-        if stream.finished_event.wait(timeout=0.2):
-            break
+        manifest = {
+            "base_url": base_url,
+            "mode": args.mode,
+            "model": model,
+            "out_dir": str(out_dir),
+            "started_at_epoch_s": started_at,
+            "first_token_at_epoch_s": first_token_at,
+            "profile_stopped_at_epoch_s": finished_at,
+            "capture_seconds": args.capture_seconds,
+            "request_body": request_body,
+            "notes": [
+                "The background request was started before profiling and profiling began after the first streamed token.",
+                "vLLM native HTTP profiling is window-based and does not provide a stage filter over the server API.",
+                "For speculative servers, draft or verify regions should show up in the same trace window.",
+            ],
+        }
+        _secure_write_text("manifest.json", dir_fd, json.dumps(manifest, indent=2) + "\n")
 
-    print("stopping native profile...")
-    status, body = http_json(f"{base_url}/stop_profile", headers=headers, payload={})
-    stop_response.write_text(body, encoding="utf-8")
-    if status != 200:
-        stream.stop()
-        raise RuntimeError(f"/stop_profile failed with status {status}: {body.strip()}")
-
-    finished_at = time.time()
-    stream.stop()
-
-    manifest = {
-        "base_url": base_url,
-        "mode": args.mode,
-        "model": model,
-        "out_dir": str(out_dir),
-        "started_at_epoch_s": started_at,
-        "first_token_at_epoch_s": first_token_at,
-        "profile_stopped_at_epoch_s": finished_at,
-        "capture_seconds": args.capture_seconds,
-        "request_body": request_body,
-        "notes": [
-            "The background request was started before profiling and profiling began after the first streamed token.",
-            "vLLM native HTTP profiling is window-based and does not provide a stage filter over the server API.",
-            "For speculative servers, draft or verify regions should show up in the same trace window.",
-        ],
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-    print("native profiling completed.")
-    print(f"stream log: {stream_log}")
-    print(f"manifest: {manifest_path}")
+        print("native profiling completed.")
+        print(f"stream log: {out_dir / 'stream.log'}")
+        print(f"manifest: {out_dir / 'manifest.json'}")
+    finally:
+        os.close(dir_fd)
 
 
 if __name__ == "__main__":
