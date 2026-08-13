@@ -1094,3 +1094,160 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
         torch.sort(actual, dim=1).values,
         torch.sort(expected_raw1, dim=1).values,
     )
+
+
+
+_ROWS = 2
+_NUM_HEADS = 64
+_WIDTH_BLOCKS = 16
+_TOPK = 512
+
+
+def _make_device_test_case(
+    *,
+    device: torch.device,
+    route: str = "paged_fused",
+):
+    """Build the minimal tensors + binding for an ``index_topk_fp8`` device test.
+
+    Fixed two-row fixture; all shapes derive from ``_ROWS``.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(91_100)
+    seqlens_list = [900, 960]
+    real_page_table = _make_real_page_table(
+        page_starts=[2, 40],
+        seqlens=seqlens_list,
+        width_blocks=_WIDTH_BLOCKS,
+        device=device,
+    )
+    seqlens = torch.tensor(seqlens_list, dtype=torch.int32, device=device)
+    q_fp8 = _rand_fp8_q((_ROWS, _NUM_HEADS, 128), gen=gen, device=device)
+    weights = torch.randn(
+        (_ROWS, _NUM_HEADS), generator=gen, dtype=torch.float32
+    ).to(device=device)
+    api_weights = weights.unsqueeze(-1)
+    index_k_cache = pack_paged_index_k_cache_reference(
+        torch.randn(
+            (80 * 64, 128), generator=gen, dtype=torch.float32
+        ).to(device=device)
+        / 3
+    )
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=_NUM_HEADS,
+        rows=_ROWS,
+        width_blocks=_WIDTH_BLOCKS,
+        topk=_TOPK,
+        real_page_table=real_page_table,
+        seqlens=seqlens,
+        route=route,
+    )
+    return q_fp8, api_weights, index_k_cache, binding
+
+
+def _fused_sentinel(**_kwargs):
+    raise AssertionError(
+        "device guard regressed: run_fused_paged_indexer reached "
+        "with a wrong-device output"
+    )
+
+
+def _fused_output_passthrough(**kwargs):
+    """Stand in for the raw kernel after public-boundary validation."""
+    out_indices = kwargs["out_indices"]
+    if out_indices is None:
+        raise AssertionError("public wrapper failed to provide out_indices")
+    out_values = kwargs["out_values"]
+    if out_values is None:
+        out_values = torch.empty_like(out_indices, dtype=torch.float32)
+    return out_indices, out_values
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("route", ["paged_fused", "paged_tiled", "packed_contiguous"])
+def test_index_topk_fp8_rejects_cpu_out_indices(route, monkeypatch) -> None:
+    """A CPU ``out_indices`` must be rejected before any route dispatch/kernel launch.
+
+    The public boundary check fires before route selection, so the rejection is
+    identical for fused, tiled, and packed routes.  For the fused route a
+    sentinel replaces ``run_fused_paged_indexer`` so that a guard regression
+    fails safely without enqueuing the vulnerable kernel.
+    """
+    device = torch.device("cuda")
+    q_fp8, api_weights, index_k_cache, binding = _make_device_test_case(
+        device=device, route=route
+    )
+    if route == "paged_fused":
+        import b12x.attention.nsa_indexer.fused_indexer as _fi
+
+        monkeypatch.setattr(_fi, "run_fused_paged_indexer", _fused_sentinel)
+    bad_out = torch.empty((_ROWS, _TOPK), dtype=torch.int32, device="cpu")
+    with pytest.raises(ValueError, match="out_indices device must match q_fp8"):
+        index_topk_fp8(
+            q_fp8=q_fp8,
+            weights=api_weights,
+            index_k_cache=index_k_cache,
+            topk=_TOPK,
+            expected_num_q_heads=_NUM_HEADS,
+            binding=binding,
+            out_indices=bad_out,
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= 2),
+    reason="Two CUDA devices required",
+)
+@pytest.mark.parametrize("route", ["paged_fused", "paged_tiled", "packed_contiguous"])
+def test_index_topk_fp8_rejects_wrong_cuda_device_out_indices(
+    route, monkeypatch
+) -> None:
+    """An ``out_indices`` on a different CUDA device must be rejected before launch."""
+    device = torch.device("cuda", 0)
+    q_fp8, api_weights, index_k_cache, binding = _make_device_test_case(
+        device=device, route=route
+    )
+    if route == "paged_fused":
+        import b12x.attention.nsa_indexer.fused_indexer as _fi
+
+        monkeypatch.setattr(_fi, "run_fused_paged_indexer", _fused_sentinel)
+    bad_out = torch.empty(
+        (_ROWS, _TOPK), dtype=torch.int32, device=torch.device("cuda", 1)
+    )
+    with pytest.raises(ValueError, match="out_indices device must match q_fp8"):
+        index_topk_fp8(
+            q_fp8=q_fp8,
+            weights=api_weights,
+            index_k_cache=index_k_cache,
+            topk=_TOPK,
+            expected_num_q_heads=_NUM_HEADS,
+            binding=binding,
+            out_indices=bad_out,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_index_topk_fp8_accepts_correct_device_out_indices_and_preserves_ptr(
+    monkeypatch,
+) -> None:
+    """A correct-device caller output is forwarded without reallocation."""
+    device = torch.device("cuda")
+    q_fp8, api_weights, index_k_cache, binding = _make_device_test_case(
+        device=device, route="paged_fused"
+    )
+    monkeypatch.setattr(
+        "b12x.attention.nsa_indexer.fused_indexer.run_fused_paged_indexer",
+        _fused_output_passthrough,
+    )
+    out_indices = torch.empty((_ROWS, _TOPK), dtype=torch.int32, device=device)
+    result = index_topk_fp8(
+        q_fp8=q_fp8,
+        weights=api_weights,
+        index_k_cache=index_k_cache,
+        topk=_TOPK,
+        expected_num_q_heads=_NUM_HEADS,
+        binding=binding,
+        out_indices=out_indices,
+    )
+    assert result.data_ptr() == out_indices.data_ptr()
