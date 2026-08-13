@@ -115,6 +115,14 @@ def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
 def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(block_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
     monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    recorded: list[torch.Tensor] = []
+
+    def record_tensors(tensors, _device):
+        recorded.extend(tensor for tensor in tensors if tensor is not None)
+
+    monkeypatch.setattr(
+        block_impl, "record_tensors_on_current_stream", record_tensors
+    )
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",
@@ -136,27 +144,34 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     )
     calls = {}
 
-    def fake_quantize(source_tk, *, out=None):
+    def fake_fused(source_tk, weight_values, weight_scale_mma, **kwargs):
         calls["source_tk"] = source_tk
-        calls["x_q_out"] = out
-        return out
-
-    def fake_dense_gemm(a, b, **kwargs):
-        calls["a"] = a
-        calls["b"] = b
+        calls["weight_values"] = weight_values
+        calls["weight_scale_mma"] = weight_scale_mma
         calls["dense_out"] = kwargs["out"]
         kwargs["out"].zero_()
         return kwargs["out"]
 
-    monkeypatch.setattr(block_impl, "quantize_block_fp8_linear_input_mxfp8", fake_quantize)
-    monkeypatch.setattr(block_impl, "dense_gemm", fake_dense_gemm)
+    monkeypatch.setattr(block_impl, "dense_gemm_fused_quant_a", fake_fused)
 
     out = block_impl.block_fp8_linear_mxfp8(binding=binding)
 
     assert calls["source_tk"].data_ptr() == source.data_ptr()
-    assert calls["x_q_out"] is binding.x_q
+    assert calls["weight_values"].data_ptr() == packed.weight.values.data_ptr()
+    assert calls["weight_scale_mma"] is packed.weight.scale_mma
     assert calls["dense_out"] is output
     assert out.shape == (3, 256)
+    for tensor in (
+        source,
+        packed.weight.values,
+        packed.weight.scale_rows,
+        packed.weight.scale_mma,
+        binding.x_q.values,
+        binding.x_q.scale_rows,
+        binding.x_q.scale_mma,
+        output,
+    ):
+        assert any(recorded_tensor is tensor for recorded_tensor in recorded)
 
 
 def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:

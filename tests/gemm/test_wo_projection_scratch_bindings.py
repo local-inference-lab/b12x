@@ -101,6 +101,14 @@ def test_wo_projection_plan_binding_maps_scratch_views(monkeypatch) -> None:
 
 def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
+    recorded: list[torch.Tensor] = []
+
+    def record_tensors(tensors, _device):
+        recorded.extend(tensor for tensor in tensors if tensor is not None)
+
+    monkeypatch.setattr(
+        wo_impl, "record_tensors_on_current_stream", record_tensors
+    )
     plan = _plan()
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -143,10 +151,36 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
     assert calls["tmp"] is binding.tmp
     assert calls["output_out"] is binding.output
     assert out.shape == (3, 256)
+    for tensor in (
+        source,
+        weights.wo_a.values,
+        weights.wo_a.scale_rows,
+        weights.wo_a.scale_mma,
+        weights.wo_b.values,
+        weights.wo_b.scale_rows,
+        weights.wo_b.scale_mma,
+        binding.x_q.values,
+        binding.x_q.scale_rows,
+        binding.x_q.scale_mma,
+        binding.tmp,
+        binding.tmp_q.values,
+        binding.tmp_q.scale_rows,
+        binding.tmp_q.scale_mma,
+        binding.output,
+    ):
+        assert any(recorded_tensor is tensor for recorded_tensor in recorded)
 
 
 def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(wo_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
+    recorded: list[torch.Tensor] = []
+
+    def record_tensors(tensors, _device):
+        recorded.extend(tensor for tensor in tensors if tensor is not None)
+
+    monkeypatch.setattr(
+        wo_impl, "record_tensors_on_current_stream", record_tensors
+    )
     plan = _plan()
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -218,7 +252,7 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         fake_fused,
     )
 
-    out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding, stream=123)
+    out = wo_impl.wo_projection_inv_rope_mxfp8(binding=binding)
 
     assert isinstance(binding, WOProjectionInvRopeBinding)
     assert not hasattr(binding, "workspace")
@@ -240,8 +274,20 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
     assert calls["rope_dim"] == 32
     assert calls["expected_m"] == 3
     assert calls["sfb_k_replicated"] == weights.sfb_k_replicated
-    assert calls["stream_int"] == 123
+    assert calls["stream_int"] is None
     assert out.shape == (3, 256, 1)
+    for tensor in (
+        o,
+        positions,
+        cos_sin_cache,
+        weights.wo_a.values,
+        weights.wo_a.scale_rows,
+        weights.wo_a.scale_mma,
+        weights.wo_b.values,
+        weights.wo_b.scale_rows,
+        weights.wo_b.scale_mma,
+    ):
+        assert any(recorded_tensor is tensor for recorded_tensor in recorded)
 
 
 def test_wo_projection_binding_owns_runtime_tensors(monkeypatch) -> None:
