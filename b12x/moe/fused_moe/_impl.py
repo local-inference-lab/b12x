@@ -2783,12 +2783,12 @@ def _plan_core_workspace(
             _TensorAllocSpec("block_expert_ids", (route_blocks_capacity,), torch.int32),
             _TensorAllocSpec("packed_route_count", (1,), torch.int32),
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
+            _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
         ]
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
             tensor_specs.extend(
                 (
-                    _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
                     _TensorAllocSpec(
                         "full_rotation_output",
                         (max_tokens, int(k)),
@@ -9303,7 +9303,9 @@ def _get_dynamic_kernel(
         *(
             (
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(
+                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
+                ),
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -9334,9 +9336,7 @@ def _get_dynamic_kernel(
         current_cuda_stream(),
         *(
             (
-                make_ptr(
-                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),
+                make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
                 make_ptr(
                     cutlass.Float16,
                     16,
@@ -10948,11 +10948,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             block_expert_ids=block_expert_ids,
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
-            expert_counts=(
-                _require_binding_field(binding, "expert_counts")
-                if full_rotation
-                else None
-            ),
+            expert_counts=_require_binding_field(binding, "expert_counts"),
             expert_map=binding.route_expert_map,
             output_expert_map=binding.output_expert_map,
             activation_amax=activation_amax,

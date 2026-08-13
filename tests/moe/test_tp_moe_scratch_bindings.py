@@ -893,6 +893,8 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
         activation_amax=activation_amax,
         layer_idx=2,
     )
+    assert binding.expert_counts is not None
+    assert tuple(binding.expert_counts.shape) == (8,)
     calls = {}
 
     import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
@@ -908,6 +910,7 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     assert result is output
     assert calls["activation_amax"] is activation_amax
     assert calls["layer_idx"] == 2
+    assert calls["expert_counts"] is binding.expert_counts
 
 
 def test_activation_amax_is_w4a16_only() -> None:
