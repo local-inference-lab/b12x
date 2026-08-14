@@ -84,8 +84,9 @@ class PCIeAllReduce:
                 single_channel=single_channel,
             )
         else:
-            if max_size < torch.bfloat16.itemsize:
-                raise ValueError("max_size must hold at least one BF16 element")
+            # max_size validation is handled by the constructor's collective
+            # preflight so that one rank's invalid argument does not strand
+            # peers in the contract exchange.
             runtime = PCIeHierarchicalAllReduce(
                 exchange_group=exchange_group,
                 device=device,
@@ -142,10 +143,14 @@ class PCIeAllReduce:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"
                 )
+            if blocks is not None:
+                raise ValueError(
+                    "blocks override is not supported for hierarchical "
+                    "all-reduce; the schedule is frozen in the catalog"
+                )
             return self._runtime.all_reduce(
                 inp,
                 out=out,
-                blocks=blocks,
                 stream=stream,
             )
         if blocks is not None:

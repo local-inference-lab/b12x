@@ -8,7 +8,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.comm.pcie.pcie_hierarchical import PCIeHierarchicalAllReduce
+from b12x.comm.pcie.pcie_hierarchical import (
+    OpCatalog,
+    OpCatalogEntry,
+    PCIeHierarchicalAllReduce,
+    _pick_blocks,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -53,10 +58,23 @@ def _worker(rank: int, world_size: int, port: int, mode: str) -> None:
         rank=rank,
         world_size=world_size,
     )
+    # Build a catalog with all element counts used in the test.
+    catalog_entries = tuple(
+        OpCatalogEntry(
+            op_id=f"op_{elements}",
+            order=order,
+            elements=elements,
+            blocks=_pick_blocks(elements),
+        )
+        for order, elements in enumerate(
+            sorted(set([3583, 3584, 7168, 7169]))
+        )
+    )
     runtime = PCIeHierarchicalAllReduce(
         exchange_group=dist.group.WORLD,
         device=device,
         max_elements=7169,
+        catalog=OpCatalog(entries=catalog_entries),
     )
     try:
         # Odd/even BF16x2 tails and the scalar path above the vector threshold.
