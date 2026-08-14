@@ -53,6 +53,25 @@ __device__ inline half decode_3inst(uint32_t x)
         half_uint16 h((uint16_t) sum);
         return __hfma(h.as_half, k_inv_h, k_bias_h);
     }
+    if constexpr (cb == 3)
+    {
+        // K6 leaves ten history bits.  At this rate the frozen XOR graph's
+        // two width-limited xorshifts are identities, so the exact T12 rank
+        // bucket needs one wrapping IMAD plus the six-bit branch reversal.
+        // The 4,096-entry FP16 table is the checkpoint-independent modal
+        // E4M3 staircase.  It avoids random reads from a 65,536-entry direct
+        // table while preserving every codeword's reconstruction exactly.
+        const uint32_t codeword = x & 0xffffu;
+        const uint32_t history = codeword >> 6;
+        const uint32_t branch = codeword & 0x3fu;
+        const uint32_t product = history * 0x3fa7d929u + 0xc928fd8eu;
+        const uint32_t phase_bucket = (product & 0x3ffu) >> 4;
+        const uint32_t syndrome = product >> 26;
+        const uint32_t reversed_branch = __brev(branch) >> 26;
+        const uint32_t t12_index =
+            ((reversed_branch ^ syndrome) << 6) | phase_bucket;
+        return __ldg(b12x_sqg_k6_t12_lut + t12_index);
+    }
 }
 
 template <int cb>
@@ -100,6 +119,10 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
         half_uint16 h0((uint16_t) sum0);
         half_uint16 h1((uint16_t) sum1);
         return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+    }
+    if constexpr (cb == 3)
+    {
+        return __halves2half2(decode_3inst<cb>(x0), decode_3inst<cb>(x1));
     }
 }
 

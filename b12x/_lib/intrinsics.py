@@ -6262,6 +6262,7 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
     t12_lut_addr,
     bits: int = 3,
     t12_in_shared: bool = False,
+    stream_layout: bool = False,
     *,
     loc=None,
     ip=None,
@@ -6276,10 +6277,17 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
 
     bits = int(bits)
     t12_in_shared = bool(t12_in_shared)
-    if bits not in (2, 3, 4):
+    stream_layout = bool(stream_layout)
+    if bits not in (2, 3, 4, 5, 6):
         raise ValueError(
-            f"unsupported SQG-XOR-Cheb-T12 bitrate {bits}; expected 2, 3, or 4"
+            f"unsupported SQG-XOR-Cheb-T12 bitrate {bits}; expected 2, 3, 4, 5, or 6"
         )
+    if bits == 6 and not stream_layout:
+        raise ValueError(
+            "K6 SQG-XOR-Cheb-T12 requires the contiguous 64-bit stream layout"
+        )
+    if stream_layout and bits != 6:
+        raise ValueError("the contiguous SQG stream layout is valid only for K6")
     width = 16 - bits
     phase_table_mask = (1 << (width - 4)) - 1
     decode_blocks: list[str] = []
@@ -6291,21 +6299,41 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
         load_lines: list[str] = []
         pack_lines: list[str] = []
         for slot, index in enumerate(indices):
-            source = "$3" if index < 4 else "$2"
-            shift = (3 - (index & 3)) * bits
             target = "out0" if index < 4 else "out1"
             byte_shift = 8 * (index & 3)
-            extract_lines.append(
-                f"""
+            if stream_layout:
+                shift = (7 - index) * bits
+                if shift == 0:
+                    extract = f"mov.b32 w{slot}, $2;"
+                elif shift < 32:
+                    extract = f"shf.r.wrap.b32 w{slot}, $2, $3, {shift};"
+                else:
+                    extract = f"shr.u32 w{slot}, $3, {shift - 32};"
+                extract_lines.append(
+                    f"""
+                    {extract}
+                    and.b32 w{slot}, w{slot}, 0xffff;
+                    """
+                )
+            else:
+                source = "$3" if index < 4 else "$2"
+                shift = (3 - (index & 3)) * bits
+                extract_lines.append(
+                    f"""
                     bfe.u32 w{slot}, {source}, {shift}, 16;
-                """
-            )
-            product_lines.append(
-                f"""
-                    shr.u32 p{slot}, w{slot}, {bits};
+                    """
+                )
+            history_mix = ""
+            if width > 11:
+                history_mix = f"""
                     shr.u32 t{slot}, p{slot}, 11;
                     bfi.b32 p{slot}, p{slot}, p{slot}, 11, {width - 11};
                     xor.b32 p{slot}, p{slot}, t{slot};
+                """
+            product_lines.append(
+                f"""
+                    shr.u32 p{slot}, w{slot}, {bits};
+                    {history_mix}
                     mad.lo.u32 p{slot}, p{slot}, 0x3fa7d929, 0xc928fd8e;
                 """
             )
@@ -6347,18 +6375,12 @@ def packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
             )
         decode_blocks.append(
             "\n".join(
-                extract_lines
-                + product_lines
-                + rank_lines
-                + load_lines
-                + pack_lines
+                extract_lines + product_lines + rank_lines + load_lines + pack_lines
             )
         )
 
     address_reg = (
-        ".reg .b32 addr0,addr1;"
-        if t12_in_shared
-        else ".reg .b64 addr0,addr1;"
+        ".reg .b32 addr0,addr1;" if t12_in_shared else ".reg .b64 addr0,addr1;"
     )
     asm = (
         """
@@ -6447,9 +6469,7 @@ def packed_decode_sqg_fp16_d3l_to_half2x4(
             else:
                 source = "$5" if index < 4 else "$4"
                 bit_shift = (3 - (index & 3)) * bits
-                extract_lines.append(
-                    f"bfe.u32 w{slot}, {source}, {bit_shift}, 16;"
-                )
+                extract_lines.append(f"bfe.u32 w{slot}, {source}, {bit_shift}, 16;")
             graph_lines.append(
                 f"""
                 shr.u32 p{slot}, w{slot}, {bits};
@@ -6589,9 +6609,9 @@ def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
     if k2_q8h4 and bits != 2:
         raise ValueError("the virtual-octile graph is valid only for K2")
     if not global_lut:
-        # The packed form uses a 64-bit global pointer.  Keep the scalar shared
-        # implementation available for the later staging experiment rather
-        # than mixing generic and shared address spaces in one PTX template.
+        # The packed form uses a 64-bit global pointer. Keep the scalar shared
+        # implementation separate so generic and shared address spaces do not
+        # enter the same PTX template.
         mask = Uint32(0xFFFF)
         source_a = Uint32(win_a)
         source_b = Uint32(win_b)
@@ -6724,7 +6744,8 @@ def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
             """
         )
 
-    asm = """
+    asm = (
+        """
         {
             .reg .b16 entry16;
             .reg .b32 w,h,b,phase,syndrome,syn,rev,stratum,rank;
@@ -6733,7 +6754,10 @@ def packed_decode_trellis_sqg_cheb_normal_e4m3_rank_lut_to_e4m3x8(
             .reg .pred pneg,pnz,ptest;
             mov.b32 $0, 0;
             mov.b32 $1, 0;
-    """ + "\n".join(decode_blocks) + "\n}"
+    """
+        + "\n".join(decode_blocks)
+        + "\n}"
+    )
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32()]),
         [
@@ -6985,9 +7009,7 @@ def packed_decode_trellis_sqg_state_smem_to_e4m3x8(
     stratum_mask = (branch_mask << width) & 0xFFFF
     stratum_mult = (7 << width) & 0xFFFF
     state_global = graph_bits != 3
-    state_blob_off = (
-        SQG_STATE_BLOB_K4_OFF if graph_bits == 4 else SQG_STATE_BLOB_K2_OFF
-    )
+    state_blob_off = SQG_STATE_BLOB_K4_OFF if graph_bits == 4 else SQG_STATE_BLOB_K2_OFF
     # PRMT byte tables giving the bit-reversed branch for selector values 0-7.
     # K4 falls back to BREV because PRMT indexes at most eight byte slots.
     if graph_bits == 2:
@@ -7174,9 +7196,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
         target = "out0" if index < 4 else "out1"
         byte_shift = 8 * (index & 3)
         if shift:
-            extract_lines.append(
-                f"bfe.u32 w{index}, {source}, {shift}, 16;"
-            )
+            extract_lines.append(f"bfe.u32 w{index}, {source}, {shift}, 16;")
         else:
             extract_lines.append(f"and.b32 w{index}, {source}, 0xffff;")
         load_lines.append(
@@ -7187,9 +7207,7 @@ def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
             """
         )
         if byte_shift:
-            pack_lines.append(
-                f"shl.b32 w{index}, w{index}, {byte_shift};"
-            )
+            pack_lines.append(f"shl.b32 w{index}, w{index}, {byte_shift};")
         pack_lines.append(f"or.b32 {target}, {target}, w{index};")
     asm = (
         """

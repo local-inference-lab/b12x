@@ -6,6 +6,8 @@
   ``qsrt_sqg_e4m3`` plus uniform-K5/K6 ``sqg_fp16_d3l`` W4A16 source formats.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
+- ``glm_sqg_w4a8``: graph-safe mixed-K3/K4 W4A8 routed execution for the
+  ``glm52_sqg_atoms_v2`` checkpoint format on SM120/SM121.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("fused_moe", "ep_moe")
+_OP_MODULES = ("fused_moe", "ep_moe", "glm_sqg_w4a8")
 
 
 def __getattr__(name: str) -> Any:

@@ -30,10 +30,9 @@ import torch
 
 SQG_E4M3_RANK_LUT_ENTRIES = 1024
 SQG_E4M3_DIRECT_LUT_ENTRIES = 3 * (1 << 16)
+SQG_XOR_CHEB_T12_DIRECT_LUT_ENTRIES = 5 * (1 << 16)
 SQG_E4M3_STATE_ENTRIES = (1 << 14) + (1 << 13) + (1 << 12)
-SQG_E4M3_STATE_LUT_ENTRIES = (
-    SQG_E4M3_STATE_ENTRIES + SQG_E4M3_RANK_LUT_ENTRIES
-)
+SQG_E4M3_STATE_LUT_ENTRIES = SQG_E4M3_STATE_ENTRIES + SQG_E4M3_RANK_LUT_ENTRIES
 
 # Positive-half transition ranks for the E4M3-aware, full-tail normal
 # SQG-Cheb staircase.  Its last 32-rank bucket contains three transitions.
@@ -231,9 +230,9 @@ def _sqg_xor_cheb_t12_direct_lut_device(
 
 
 def sqg_xor_cheb_t12_direct_lut(device: torch.device | str) -> torch.Tensor:
-    """Return the process-lifetime rate-indexed 192 KiB direct state table.
+    """Return the process-lifetime rate-indexed direct state table.
 
-    Rows are the K2/K3/K4 slices in rate order: byte(state, bits) =
+    Rows are the K2-K6 slices in rate order: byte(state, bits) =
     table[((bits - 2) << 16) | state]. Each byte precomposes the frozen
     XOR-Cheb rank map with the modal T12 staircase, so lookups are
     bit-identical to the in-kernel T12 decode.
@@ -251,7 +250,7 @@ def _sqg_xor_cheb_t12_rank_for_codewords(
 ) -> torch.Tensor:
     """Apply the frozen SQG-XOR graph to L16 codewords."""
 
-    if bits not in (2, 3, 4):
+    if bits not in (2, 3, 4, 5, 6):
         raise ValueError(f"unsupported SQG-XOR-Cheb-T12 rate K{bits}")
     width = 16 - bits
     history_mask = (1 << width) - 1
@@ -275,14 +274,14 @@ def _sqg_xor_cheb_t12_rank_for_codewords(
 
 @functools.cache
 def sqg_xor_cheb_t12_direct_lut_cpu() -> torch.Tensor:
-    """Build independent K2/K3/K4 codeword tables for SQG-XOR-Cheb-T12."""
+    """Build independent K2-K6 codeword tables for SQG-XOR-Cheb-T12."""
 
     codewords = torch.arange(1 << 16, dtype=torch.int64)
     t12 = sqg_xor_cheb_t12_lut_cpu()
     return torch.cat(
         [
             t12[_sqg_xor_cheb_t12_rank_for_codewords(codewords, bits) >> 4]
-            for bits in (2, 3, 4)
+            for bits in (2, 3, 4, 5, 6)
         ]
     ).contiguous()
 
@@ -364,9 +363,7 @@ def sqg_cheb_normal_e4m3_state_lut_cpu() -> torch.Tensor:
         )
         for bits in (2, 3, 4)
     ]
-    return torch.cat(
-        (*states, sqg_cheb_normal_e4m3_rank_lut_cpu())
-    ).contiguous()
+    return torch.cat((*states, sqg_cheb_normal_e4m3_rank_lut_cpu())).contiguous()
 
 
 @functools.cache
@@ -523,9 +520,9 @@ def _sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_device(
     device_index: int | None,
 ) -> torch.Tensor:
     device = torch.device(device_type, device_index)
-    return sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_cpu().to(
-        device=device
-    ).contiguous()
+    return (
+        sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_cpu().to(device=device).contiguous()
+    )
 
 
 def sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut(
@@ -537,13 +534,12 @@ def sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut(
     index = resolved.index
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
-    return _sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_device(
-        resolved.type, index
-    )
+    return _sqg_cheb_normal_k2_q8h4_w2_e4m3_direct_lut_device(resolved.type, index)
 
 
 __all__ = [
     "SQG_E4M3_DIRECT_LUT_ENTRIES",
+    "SQG_XOR_CHEB_T12_DIRECT_LUT_ENTRIES",
     "SQG_E4M3_EXEC_LUT_ENTRIES",
     "SQG_E4M3_EXEC_LUT_K3_DIRECT_OFF",
     "SQG_E4M3_RANK_LUT_ENTRIES",

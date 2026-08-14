@@ -186,8 +186,8 @@ _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 
 
 def _validate_trellis256_codebook_bits(codebook: str, bits: int) -> None:
-    if codebook == "sqg_xor_cheb_t12" and bits not in (2, 3, 4):
-        raise ValueError("sqg_xor_cheb_t12 is defined only for K2/K3/K4")
+    if codebook == "sqg_xor_cheb_t12" and bits not in (2, 3, 4, 6):
+        raise ValueError("sqg_xor_cheb_t12 is defined for K2/K3/K4/K6")
     if codebook == SQG_FP16_D3L and bits not in (5, 6):
         raise ValueError("sqg_fp16_d3l is defined only for uniform K5/K6")
 
@@ -4096,6 +4096,7 @@ class W4A16GemmKernel:
                 trellis_lut_addr,
                 int(bits),
                 t12_in_shared=self.sqg_xor_cheb_t12_smem,
+                stream_layout=int(bits) == 6,
             )
             if cutlass.const_expr(self.is_fp16):
                 o0, o1 = fp8x4_e4m3_to_half2x2(e_lo)
@@ -12016,7 +12017,7 @@ def _trellis_dense_buffer(
     return buffer
 
 
-def _use_k6_mcg_small(
+def _use_k6_small(
     *,
     device: torch.device,
     m: int,
@@ -12027,13 +12028,13 @@ def _use_k6_mcg_small(
     external_hadamard_128,
     explicit_launch_config: bool,
 ) -> bool:
-    """Select the capture-safe K6/MCG kernel only on its compiled target."""
+    """Select a capture-safe K6 small-M kernel on its compiled target."""
     return (
         not explicit_launch_config
         and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
         and m <= 128
         and trellis_bits == 6
-        and trellis_codebook == "mcg"
+        and trellis_codebook in ("mcg", "sqg_xor_cheb_t12")
         and trellis_pair_kind is None
         and compute_dtype == torch.float16
         and external_hadamard_128 is None
@@ -12120,11 +12121,10 @@ def _run_trellis256_dense_current_device(
         None if hadamard_128 is None else _resolve_exl3_hadamard_128(hadamard_128)
     )
 
-    # Keep the established K6/MCG decode path independent from the generic
-    # Trellis scheduler. It owns both H128 rotations, needs no GEMM scratch,
-    # and is safe to capture with only caller-owned output/rotation storage.
-    # Compact pair payloads and the newer SQG codebooks use the generic path.
-    use_k6_mcg_small = _use_k6_mcg_small(
+    # K6 small-M kernels own both H128 rotations and need no GEMM scratch.
+    # Each accepted codebook has a distinct decoder; compact pair payloads and
+    # larger row counts remain on the generic Trellis scheduler.
+    use_k6_small = _use_k6_small(
         device=x.device,
         m=m,
         trellis_bits=trellis_bits,
@@ -12136,7 +12136,7 @@ def _run_trellis256_dense_current_device(
             _moe_block_size is not None or _force_tile_config is not None
         ),
     )
-    if use_k6_mcg_small:
+    if use_k6_small:
         if x.dtype == torch.float16:
             x_f16 = x
         else:
@@ -12167,14 +12167,15 @@ def _run_trellis256_dense_current_device(
                 device=x.device,
             )
             small_output = output_f16
-        from b12x.gemm.trellis_linear._small_m import run_k6_mcg
+        from b12x.gemm.trellis_linear._small_m import run_k6_mcg, run_k6_sqg
 
         trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
             size_k // 16,
             size_n // 16,
             trellis_bits * 16,
         )
-        run_k6_mcg(
+        run_small = run_k6_mcg if trellis_codebook == "mcg" else run_k6_sqg
+        run_small(
             x_f16,
             trellis_i16,
             small_output,
@@ -12186,6 +12187,13 @@ def _run_trellis256_dense_current_device(
         if output.dtype != torch.float16:
             output.copy_(small_output)
         return output
+
+    if (
+        _moe_block_size is None
+        and trellis_bits == 6
+        and trellis_codebook == "sqg_xor_cheb_t12"
+    ):
+        _moe_block_size = 64
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",

@@ -18,9 +18,8 @@ from b12x._lib.quant.sqg_e4m3 import (
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
     _trellis256_dense_launch_geometry,
-    _use_k6_mcg_small,
+    _use_k6_small,
 )
-
 
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
@@ -326,6 +325,73 @@ def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
     assert seen["kwargs"]["_force_tile_config"] is None
 
 
+def test_prepare_weight_reuses_caller_owned_persistent_storage(monkeypatch) -> None:
+    trellis = torch.empty(0)
+    suh = torch.empty(0)
+    svh = torch.empty(0)
+    dummy_scale = torch.empty(0)
+    global_scale = torch.empty(0)
+    workspace = torch.empty(0)
+    prepared = object()
+    seen = {}
+
+    def fake_prepare(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return prepared
+
+    monkeypatch.setattr(api, "prepare_trellis256_dense_weight", fake_prepare)
+
+    actual = trellis_linear.prepare_weight(
+        trellis,
+        suh,
+        svh,
+        codebook="sqg_xor_cheb_t12",
+        params_dtype=torch.float16,
+        dummy_scale=dummy_scale,
+        global_scale=global_scale,
+        workspace=workspace,
+    )
+
+    assert actual is prepared
+    assert seen["args"] == (trellis, suh, svh)
+    assert seen["kwargs"]["dummy_scale"] is dummy_scale
+    assert seen["kwargs"]["global_scale"] is global_scale
+    assert seen["kwargs"]["workspace"] is workspace
+
+
+def test_sqg_k6_endpoint_rejects_other_weight_contracts(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(x, weight, **kwargs):
+        calls.append((x, weight, kwargs))
+        return "output"
+
+    monkeypatch.setattr(api, "run_trellis256_dense", fake_run)
+    x = object()
+    weight = SimpleNamespace(
+        trellis_codebook="sqg_xor_cheb_t12",
+        trellis_bits=6,
+        trellis_pair_kind=None,
+        mcg=None,
+        mul1_e4m3=None,
+    )
+
+    assert trellis_linear.run_sqg_k6_w6a16(x, weight) == "output"
+    for override in (
+        {"trellis_codebook": "mcg"},
+        {"trellis_bits": 4},
+        {"trellis_pair_kind": "P33"},
+        {"mcg": object()},
+        {"mul1_e4m3": object()},
+    ):
+        invalid = SimpleNamespace(**(vars(weight) | override))
+        with pytest.raises(ValueError):
+            trellis_linear.run_sqg_k6_w6a16(x, invalid)
+
+    assert len(calls) == 1
+
+
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
     seen = {}
 
@@ -346,6 +412,8 @@ def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
         (2048, 4096, 120, 120),
         (6144, 1024, 188, 64),
         (6144, 1024, 48, 48),
+        (6144, 512, 188, 48),
+        (6144, 512, 32, 32),
         (512, 6144, 188, 96),
         (512, 6144, 80, 80),
         # The unsharded dimensions are deliberately not inferred from TP4.
@@ -365,7 +433,11 @@ def test_k6_small_m_default_sms_preserves_glm_decode_overlap(
     assert _default_num_sms(size_k, size_n, available_sms) == expected
 
 
-def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
+@pytest.mark.parametrize("runner", (_small_m.run_k6_mcg, _small_m.run_k6_sqg))
+def test_k6_small_m_rejects_unsupported_arch_before_jit(
+    monkeypatch,
+    runner,
+) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
     monkeypatch.setattr(
         _small_m,
@@ -374,21 +446,25 @@ def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
     )
 
     with pytest.raises(NotImplementedError, match="built for sm_120 only"):
-        _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
+        runner(*(torch.empty(0) for _ in range(7)))
 
 
 @pytest.mark.parametrize(
-    ("capability", "explicit_launch_config", "expected"),
+    ("capability", "codebook", "rows", "explicit_launch_config", "expected"),
     [
-        ((12, 0), False, True),
-        ((12, 0), True, False),
-        ((12, 1), False, False),
-        ((9, 0), False, False),
+        ((12, 0), "mcg", 128, False, True),
+        ((12, 0), "sqg_xor_cheb_t12", 128, False, True),
+        ((12, 0), "sqg_xor_cheb_t12", 129, False, False),
+        ((12, 0), "sqg_xor_cheb_t12", 128, True, False),
+        ((12, 1), "mcg", 128, False, False),
+        ((9, 0), "mcg", 128, False, False),
     ],
 )
 def test_k6_small_m_dispatch_requires_compiled_target(
     monkeypatch,
     capability: tuple[int, int],
+    codebook: str,
+    rows: int,
     explicit_launch_config: bool,
     expected: bool,
 ) -> None:
@@ -399,11 +475,11 @@ def test_k6_small_m_dispatch_requires_compiled_target(
     )
 
     assert (
-        _use_k6_mcg_small(
+        _use_k6_small(
             device=torch.device("cuda"),
-            m=128,
+            m=rows,
             trellis_bits=6,
-            trellis_codebook="mcg",
+            trellis_codebook=codebook,
             trellis_pair_kind=None,
             compute_dtype=torch.float16,
             external_hadamard_128=None,

@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cuda_fp16.h>
 #include <cooperative_groups.h>
+#include <limits>
 #include <mutex>
+#include <set>
 #include <torch/extension.h>
 
 #include "vendor/util.h"
@@ -17,12 +19,15 @@
 
 namespace cg = cooperative_groups;
 
+__device__ const half* b12x_sqg_k6_t12_lut = nullptr;
+
 #include "vendor/quant/exl3_gemm_kernel.cuh"
 
 namespace {
 
 constexpr int kBits = 6;
 constexpr int kCodebookMcg = 1;
+constexpr int kCodebookSqg = 3;
 constexpr int kTileM = 16;
 constexpr int kTileK = 32;
 constexpr int kTileN = 128;
@@ -44,11 +49,66 @@ constexpr int kDynamicSmem =
 static_assert(kDynamicSmem <= EXL3_SMEM_MAX_BYTES,
               "Trellis K6 kernel exceeds the vendored shared-memory limit");
 
+std::mutex sqg_lut_mutex;
+std::set<int> sqg_lut_devices;
+
 void check_cuda(cudaError_t status, const char* operation) {
   TORCH_CHECK(status == cudaSuccess, operation, ": ", cudaGetErrorString(status));
 }
 
-void launch_k6_mcg(
+void configure_k6_sqg_lut(const torch::Tensor& lut) {
+  TORCH_CHECK(lut.is_cuda() && lut.scalar_type() == at::kHalf &&
+                  lut.is_contiguous() && lut.numel() == (1 << 12),
+              "SQG K6 T12 LUT must be a contiguous CUDA FP16 tensor with "
+              "4,096 entries");
+  const int device = lut.get_device();
+  const c10::cuda::CUDAGuard device_guard(lut.device());
+  const half* lut_ptr =
+      reinterpret_cast<const half*>(lut.data_ptr<at::Half>());
+  check_cuda(cudaMemcpyToSymbol(b12x_sqg_k6_t12_lut, &lut_ptr,
+                               sizeof(lut_ptr), 0, cudaMemcpyHostToDevice),
+             "cudaMemcpyToSymbol(SQG K6 T12 LUT)");
+  std::lock_guard<std::mutex> guard(sqg_lut_mutex);
+  sqg_lut_devices.insert(device);
+}
+
+__global__ void decode_k6_sqg_codewords_kernel(const uint16_t* codewords,
+                                                half* output, int count) {
+  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index < count) {
+    output[index] = decode_3inst<kCodebookSqg>(codewords[index]);
+  }
+}
+
+torch::Tensor decode_k6_sqg_codewords(const torch::Tensor& codewords) {
+  TORCH_CHECK(codewords.is_cuda() && codewords.scalar_type() == at::kShort &&
+                  codewords.is_contiguous(),
+              "SQG K6 codewords must be a contiguous CUDA int16 tensor");
+  const int device = codewords.get_device();
+  const c10::cuda::CUDAGuard device_guard(codewords.device());
+  {
+    std::lock_guard<std::mutex> guard(sqg_lut_mutex);
+    TORCH_CHECK(sqg_lut_devices.count(device) != 0,
+                "SQG K6 T12 LUT is not configured on CUDA device ", device);
+  }
+  auto output = torch::empty(codewords.sizes(),
+                             codewords.options().dtype(at::kHalf));
+  const int64_t count64 = codewords.numel();
+  TORCH_CHECK(count64 <= std::numeric_limits<int>::max(),
+              "SQG K6 decoder test input is too large");
+  const int count = static_cast<int>(count64);
+  constexpr int threads = 256;
+  const int blocks = (count + threads - 1) / threads;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
+  decode_k6_sqg_codewords_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(codewords.data_ptr<int16_t>()),
+      reinterpret_cast<half*>(output.data_ptr<at::Half>()), count);
+  check_cuda(cudaPeekAtLastError(), "SQG K6 codeword decoder launch");
+  return output;
+}
+
+template <int Codebook>
+void launch_k6(
     const torch::Tensor& input,
     const torch::Tensor& trellis,
     torch::Tensor& output,
@@ -104,6 +164,11 @@ void launch_k6_mcg(
               " N=", size_n);
   TORCH_CHECK(locks.numel() >= size_n / 16,
               "Trellis K6 lock workspace is too small");
+  if constexpr (Codebook == kCodebookSqg) {
+    std::lock_guard<std::mutex> guard(sqg_lut_mutex);
+    TORCH_CHECK(sqg_lut_devices.count(device) != 0,
+                "SQG K6 direct LUT is not configured on CUDA device ", device);
+  }
 
   int available_sms = 0;
   check_cuda(cudaDeviceGetAttribute(&available_sms, cudaDevAttrMultiProcessorCount,
@@ -113,7 +178,7 @@ void launch_k6_mcg(
   int num_sms = requested_sms > 0 ? static_cast<int>(requested_sms) : available_sms;
   num_sms = std::max(1, std::min(num_sms, std::min(available_sms, tiles)));
 
-  auto kernel = exl3_gemm_kernel<kBits, false, kCodebookMcg, kTileM, kTileK,
+  auto kernel = exl3_gemm_kernel<kBits, false, Codebook, kTileM, kTileK,
                                  kTileN, kSharedStages, kFragmentStages>;
   static std::once_flag smem_attribute_once;
   std::call_once(smem_attribute_once, [&] {
@@ -144,9 +209,41 @@ void launch_k6_mcg(
   check_cuda(cudaPeekAtLastError(), "Trellis K6 kernel launch");
 }
 
+void launch_k6_mcg(
+    const torch::Tensor& input,
+    const torch::Tensor& trellis,
+    torch::Tensor& output,
+    const torch::Tensor& suh,
+    torch::Tensor& rotated_input,
+    const torch::Tensor& svh,
+    torch::Tensor& locks,
+    int64_t requested_sms) {
+  launch_k6<kCodebookMcg>(input, trellis, output, suh, rotated_input, svh,
+                          locks, requested_sms);
+}
+
+void launch_k6_sqg(
+    const torch::Tensor& input,
+    const torch::Tensor& trellis,
+    torch::Tensor& output,
+    const torch::Tensor& suh,
+    torch::Tensor& rotated_input,
+    const torch::Tensor& svh,
+    torch::Tensor& locks,
+    int64_t requested_sms) {
+  launch_k6<kCodebookSqg>(input, trellis, output, suh, rotated_input, svh,
+                          locks, requested_sms);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("configure_k6_sqg_lut", &configure_k6_sqg_lut,
+             "Configure the process-lifetime SQG K6 T12 LUT");
+  module.def("decode_k6_sqg_codewords", &decode_k6_sqg_codewords,
+             "Decode SQG K6 codewords for exhaustive validation");
   module.def("launch_k6_mcg", &launch_k6_mcg,
              "B12X K6/MCG small-M dense GEMM");
+  module.def("launch_k6_sqg", &launch_k6_sqg,
+             "B12X K6/SQG small-M dense GEMM");
 }

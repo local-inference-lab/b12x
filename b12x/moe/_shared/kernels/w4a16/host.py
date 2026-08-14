@@ -267,6 +267,32 @@ def packed_gemm_scratch_elements(
     return max(elements, 1)
 
 
+def dense_trellis_gemm_scratch_elements_upper_bound(
+    *,
+    rows: int,
+    size_n: int,
+    sms: int,
+) -> int:
+    """Bound dense-Trellis scratch for every supported row-block schedule.
+
+    Dense launch policy may select a different row block for the same matrix
+    geometry at different row counts. Caller-owned CUDA-graph storage must
+    cover every supported selection rather than one observed warmup decision.
+    """
+
+    if int(rows) <= 0 or int(size_n) <= 0 or int(sms) <= 0:
+        raise ValueError("rows, size_n, and sms must be positive")
+    return max(
+        packed_gemm_scratch_elements(
+            size_n=int(size_n),
+            route_slots=((int(rows) + block_size - 1) // block_size) * block_size,
+            moe_block_size=block_size,
+            sms=int(sms),
+        )
+        for block_size in _W4A16_ALLOWED_ROUTED_SIZES
+    )
+
+
 def plan_w4a16_buffers(
     prepared,
     *,

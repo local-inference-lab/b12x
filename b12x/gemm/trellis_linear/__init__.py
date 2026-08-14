@@ -23,6 +23,8 @@ META = OpMeta(
         "prepare_weight",
         "prepare_pair_weight",
         "run",
+        "run_sqg_k6_w6a16",
+        "sqg_k6_w6a16_scratch_elements",
         "is_supported",
         "clear_caches",
     ),
@@ -55,6 +57,8 @@ if TYPE_CHECKING:
         prepare_weight,
         prepare_pair_weight,
         run,
+        run_sqg_k6_w6a16,
+        sqg_k6_w6a16_scratch_elements,
     )
 
 install_lazy_api(globals(), META)
