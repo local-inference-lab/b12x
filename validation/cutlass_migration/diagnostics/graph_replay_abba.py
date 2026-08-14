@@ -25,7 +25,7 @@ _CUTLASS_PACKAGES = (
     "nvidia-cutlass-dsl-libs-cu13",
 )
 _CASE_CONTRACT_SCHEMA = "b12x.graph_replay_case_contract.v1"
-_RUNTIME_ENVIRONMENT_SCHEMA = "b12x-runtime-environment-v1"
+_RUNTIME_ENVIRONMENT_SCHEMA = "b12x-runtime-environment-v2"
 _RUNTIME_ENVIRONMENT_PREFIXES = (
     "B12X_",
     "CUTE_",
@@ -78,6 +78,88 @@ def _case_key(case: dict[str, Any]) -> str:
 def _json_sha256(payload: object) -> str:
     return hashlib.sha256(_case_key(payload).encode("utf-8")).hexdigest()
 
+def _validate_v2_env_entry(name: str, value: Any) -> bool:
+    """Validate a single v2 tagged environment entry against its variable name."""
+    from b12x._lib.provenance import is_secret_name, _canonicalize, DIGEST_DOMAIN, DIGEST_ALGORITHM
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    is_secret = is_secret_name(name)
+    if status == "redacted-set":
+        # Only valid for secret-like names.
+        if not is_secret:
+            return False
+        return set(value) == {"status", "reason"} and value["reason"] == "secret-like-name"
+    if status == "set-safe":
+        # Forbidden for secret names.
+        if is_secret:
+            return False
+        if set(value) != {"status", "value"} or not isinstance(value["value"], str):
+            return False
+        # Value must be canonical for this exact name.
+        return _canonicalize(name, value["value"]) == value["value"]
+    if status == "set-digest":
+        # Forbidden for secret names (secrets must be redacted, not digested).
+        if is_secret:
+            return False
+        if set(value) != {"status", "digest"}:
+            return False
+        digest = value["digest"]
+        return (
+            isinstance(digest, dict)
+            and set(digest) == {"algorithm", "domain", "value"}
+            and digest["algorithm"] == DIGEST_ALGORITHM
+            and digest["domain"] == DIGEST_DOMAIN
+            and isinstance(digest["value"], str)
+            and bool(_SHA256_RE.fullmatch(digest["value"]))
+        )
+    if status == "unset":
+        return set(value) == {"status"}
+    return False
+
+
+def _sanitize_v1_to_v2(environment: dict[str, Any]) -> dict[str, Any]:
+    """Convert a legacy v1 environment to internal v2 form for read compatibility.
+
+    v1 entries were bare strings (raw values).  This parser digests every
+    entry because we cannot safely canonicalize legacy plaintext.  It never
+    re-emits raw values.
+    """
+    from b12x._lib.provenance import sanitize_value
+    sanitized = dict(environment)
+    sanitized["schema"] = "b12x-runtime-environment-v2"
+    for section in ("set_variables", "explicit_controls"):
+        section_dict = sanitized.get(section, {})
+        if not isinstance(section_dict, dict):
+            continue
+        converted: dict[str, Any] = {}
+        for name, value in section_dict.items():
+            if isinstance(value, str):
+                converted[name] = sanitize_value(name, value)
+            elif isinstance(value, dict) and value.get("status") in ("set", "missing"):
+                # v1 explicit_controls used {status: set/missing, value: raw}
+                if value.get("status") == "missing":
+                    converted[name] = {"status": "unset"}
+                else:
+                    converted[name] = sanitize_value(name, str(value.get("value", "")))
+            else:
+                converted[name] = value
+        sanitized[section] = converted
+    sanitized["nvidia_enumeration"] = {
+        "policy": "explicit-only",
+        "included": [
+            "NVIDIA_VISIBLE_DEVICES",
+            "NVIDIA_DRIVER_CAPABILITIES",
+            "NVIDIA_TF32_OVERRIDE",
+        ],
+        "reason": "avoid collecting unrelated NVIDIA_ variables that may contain secrets",
+    }
+    # Recompute sha256 for the sanitized form.
+    unhashed = dict(sanitized)
+    unhashed.pop("sha256", None)
+    sanitized["sha256"] = _json_sha256(unhashed)
+    return sanitized
+
 
 def _validate_runtime_environment(
     path: Path,
@@ -87,12 +169,8 @@ def _validate_runtime_environment(
     if not isinstance(environment, dict):
         raise ValueError(f"{path}: runtime environment provenance is missing")
     expected_fields = {
-        "schema",
-        "complete_set_variable_prefixes",
-        "set_variables",
-        "explicit_controls",
-        "nvidia_enumeration",
-        "sha256",
+        "schema", "complete_set_variable_prefixes", "set_variables",
+        "explicit_controls", "nvidia_enumeration", "sha256",
     }
     if set(environment) != expected_fields:
         raise ValueError(
@@ -100,8 +178,15 @@ def _validate_runtime_environment(
             f"missing={sorted(expected_fields - set(environment))}, "
             f"unexpected={sorted(set(environment) - expected_fields)}"
         )
-    if environment.get("schema") != _RUNTIME_ENVIRONMENT_SCHEMA:
+
+    schema = environment.get("schema")
+    if schema == "b12x-runtime-environment-v1":
+        # Legacy v1: sanitize to v2 for internal read compatibility.
+        environment = _sanitize_v1_to_v2(environment)
+        provenance["runtime_environment"] = environment
+    elif schema != _RUNTIME_ENVIRONMENT_SCHEMA:
         raise ValueError(f"{path}: unsupported runtime environment schema")
+
     if environment.get("complete_set_variable_prefixes") != list(
         _RUNTIME_ENVIRONMENT_PREFIXES
     ):
@@ -111,7 +196,7 @@ def _validate_runtime_environment(
     if not isinstance(set_variables, dict) or any(
         not isinstance(name, str)
         or not name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES)
-        or not isinstance(value, str)
+        or not _validate_v2_env_entry(name, value)
         for name, value in set_variables.items()
     ):
         raise ValueError(f"{path}: runtime environment set-variable map is invalid")
@@ -123,26 +208,23 @@ def _validate_runtime_environment(
         raise ValueError(f"{path}: runtime environment explicit-control map is incomplete")
     for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS:
         entry = explicit_controls[name]
-        if not isinstance(entry, dict) or entry.get("status") not in {"set", "missing"}:
+        if not _validate_v2_env_entry(name, entry):
             raise ValueError(f"{path}: invalid explicit environment control {name!r}")
-        if entry["status"] == "set":
-            if set(entry) != {"status", "value"} or not isinstance(
-                entry["value"], str
-            ):
-                raise ValueError(f"{path}: invalid set environment control {name!r}")
-            if name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES) and set_variables.get(
-                name
-            ) != entry["value"]:
+        status = entry.get("status")
+        if status == "unset":
+            if name in set_variables:
+                raise ValueError(f"{path}: unset control {name!r} appears in set_variables")
+        elif name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES):
+            sv = set_variables.get(name)
+            if sv != entry:
                 raise ValueError(
                     f"{path}: explicit control {name!r} disagrees with set_variables"
                 )
-        else:
-            if set(entry) != {"status"} or name in set_variables:
-                raise ValueError(f"{path}: invalid missing environment control {name!r}")
 
     nvidia_enumeration = environment.get("nvidia_enumeration")
     if (
         not isinstance(nvidia_enumeration, dict)
+        or set(nvidia_enumeration) != {"policy", "included", "reason"}
         or nvidia_enumeration.get("policy") != "explicit-only"
         or nvidia_enumeration.get("included")
         != [
@@ -150,8 +232,8 @@ def _validate_runtime_environment(
             "NVIDIA_DRIVER_CAPABILITIES",
             "NVIDIA_TF32_OVERRIDE",
         ]
-        or not isinstance(nvidia_enumeration.get("reason"), str)
-        or not nvidia_enumeration["reason"]
+        or nvidia_enumeration.get("reason")
+        != "avoid collecting unrelated NVIDIA_ variables that may contain secrets"
     ):
         raise ValueError(f"{path}: NVIDIA environment enumeration policy is invalid")
 
@@ -181,25 +263,18 @@ def _runtime_environment_comparison_payload(run: Run) -> dict[str, Any]:
     set_variables = environment["set_variables"]
     path_states: dict[str, dict[str, Any]] = {}
     for name in _RUNTIME_ENVIRONMENT_OPERATIONAL_PATH_EXCEPTIONS:
-        raw_value = set_variables.pop(name, None)
-        if raw_value is None:
-            path_states[name] = {"status": "missing"}
+        popped = set_variables.pop(name, None)
+        if popped is None:
+            path_states[name] = {"status": "unset"}
         elif name == "CUTE_DSL_LIBS":
-            path_states[name] = {
-                "status": "set",
-                "library_basenames": [
-                    Path(component).name
-                    for component in raw_value.split(":")
-                    if component
-                ],
-            }
+            # Retain the CUTE_DSL_LIBS digest in the comparison payload.
+            # The digest already encodes the ordered custom library list;
+            # removing it would make different custom runtimes compare equal.
+            set_variables[name] = popped
+            path_states[name] = {"status": "retained"}
         else:
+            # Cache directory paths differ across venvs; collapse to set/missing.
             path_states[name] = {"status": "set"}
-    environment["operational_path_exceptions"] = {
-        "policy": "values-normalized; set/missing state remains exact",
-        "names": list(_RUNTIME_ENVIRONMENT_OPERATIONAL_PATH_EXCEPTIONS),
-        "states": path_states,
-    }
     return environment
 
 

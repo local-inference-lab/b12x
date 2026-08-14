@@ -32,8 +32,10 @@ import torch
 import torch.distributed as dist
 from cuda.bindings import runtime as cudart
 
+from b12x._lib.provenance import sanitize_environment_map, sanitize_value
+
 SCHEMA_NAME = "b12x.pcie_oneshot_control_node.run"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DTYPE_NAME = "bfloat16"
 TOP_LEVEL_KEYS = {
     "schema",
@@ -79,13 +81,9 @@ IDENTITY_KEYS = {
     "started_at_utc",
 }
 PROVENANCE_KEYS = {
-    "module_path",
-    "module_sha256",
-    "cuda_source_path",
-    "cuda_source_sha256",
-    "extension_path",
-    "extension_sha256",
-    "extension_build_root",
+    "module_path_sha256",
+    "cuda_source_path_sha256",
+    "extension_path_sha256",
     "extension_build_manifest",
     "extension_build_manifest_sha256",
     "fresh_extension_cache",
@@ -277,18 +275,19 @@ def _verified_implementation(
         )
     manifest = _extension_build_manifest(build_root)
     provenance = {
-        "module_path": str(module_path),
-        "module_sha256": _sha256(module_path),
-        "cuda_source_path": str(cuda_source),
-        "cuda_source_sha256": _sha256(cuda_source),
-        "extension_path": str(extension_path),
-        "extension_sha256": _sha256(extension_path),
-        "extension_build_root": str(build_root),
+        "module_path_sha256": _sha256(module_path),
+        "cuda_source_path_sha256": _sha256(cuda_source),
+        "extension_path_sha256": _sha256(extension_path),
         "extension_build_manifest": manifest,
         "extension_build_manifest_sha256": _json_sha256(manifest),
         "fresh_extension_cache": True,
         "post_run_verified": False,
     }
+    # Private paths retained for post-run verification, never serialized.
+    provenance["_module_path"] = str(module_path)
+    provenance["_cuda_source_path"] = str(cuda_source)
+    provenance["_extension_path"] = str(extension_path)
+    provenance["_extension_build_root"] = str(build_root)
     return module, module.PCIeOneshotAllReducePool, provenance
 
 
@@ -302,14 +301,14 @@ def _verify_post_run_provenance(
     if git_sha != expected_git_sha or git_dirty:
         raise RuntimeError("implementation Git identity changed during benchmark")
     checks = (
-        ("module_path", "module_sha256"),
-        ("cuda_source_path", "cuda_source_sha256"),
-        ("extension_path", "extension_sha256"),
+        ("_module_path", "module_path_sha256"),
+        ("_cuda_source_path", "cuda_source_path_sha256"),
+        ("_extension_path", "extension_path_sha256"),
     )
     for path_key, digest_key in checks:
         if _sha256(Path(provenance[path_key])) != provenance[digest_key]:
             raise RuntimeError(f"{path_key} changed during benchmark")
-    manifest = _extension_build_manifest(Path(provenance["extension_build_root"]))
+    manifest = _extension_build_manifest(Path(provenance["_extension_build_root"]))
     if manifest != provenance["extension_build_manifest"]:
         raise RuntimeError("extension build manifest changed during benchmark")
     if _json_sha256(manifest) != provenance["extension_build_manifest_sha256"]:
@@ -425,15 +424,16 @@ class _NvidiaSmiSampler:
         return self._thread.is_alive()
 
 
-def _environment_toggles() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in sorted(os.environ.items())
-        if key in EXPLICIT_ENV_KEYS
-        or key.startswith("B12X_")
-        or key.startswith("NCCL_")
-        or key.startswith("TORCH_NCCL_")
-    }
+def _environment_toggles() -> dict[str, object]:
+    # Collect explicit keys plus B12X_/NCCL_/TORCH_NCCL_ prefixed vars,
+    # sanitizing values via the shared provenance helper.
+    prefixes = ("B12X_", "NCCL_", "TORCH_NCCL_")
+    sanitized = sanitize_environment_map(prefixes=prefixes)
+    # Merge explicit keys that may not match any prefix (e.g. OMP_NUM_THREADS).
+    for key in sorted(EXPLICIT_ENV_KEYS):
+        if key not in sanitized and key in os.environ:
+            sanitized[key] = sanitize_value(key, os.environ[key])
+    return sanitized
 
 
 def _dim3_list(value: object) -> list[int]:
@@ -1144,7 +1144,9 @@ def main() -> None:
                     "worker_argv_sha256": _json_sha256(worker_argv),
                     "started_at_utc": started_at,
                 },
-                "provenance": provenance,
+                "provenance": {
+                    k: v for k, v in provenance.items() if not k.startswith("_")
+                },
                 "software": {
                     "python": platform.python_version(),
                     "platform": platform.platform(),

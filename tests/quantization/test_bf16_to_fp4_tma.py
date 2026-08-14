@@ -156,15 +156,12 @@ assert len(manifests) == 1
 manifest = manifests[0]
 raw_environment = dict(manifest["semantic_payload"]["compile_environment"])
 assert raw_environment == dict(manifest["compile_environment"])
-package_runtime_components = []
-for component in raw_environment.get("CUTE_DSL_LIBS", "").split(os.pathsep):
-    candidate = Path(component)
-    if (
-        candidate.name == "libcute_dsl_runtime.so"
-        and "nvidia_cutlass_dsl" in candidate.parts
-    ):
-        package_runtime_components.append(component)
-assert package_runtime_components
+# CUTE_DSL_LIBS is now digested (not a raw path).  Verify it's present
+# and that the manifest also carries a comparison_compile_environment.
+assert "CUTE_DSL_LIBS" in raw_environment
+cute_dsl_libs = raw_environment["CUTE_DSL_LIBS"]
+assert not cute_dsl_libs.startswith("/"), "CUTE_DSL_LIBS must not be a raw path"
+assert "comparison_compile_environment" in manifest, "manifest must carry comparison_compile_environment"
 assert "rdc=false" in manifest["compile_options"]
 assert manifest["semantic_payload"]["compile_options"] == manifest["compile_options"]
 raw_semantic_json = json.dumps(

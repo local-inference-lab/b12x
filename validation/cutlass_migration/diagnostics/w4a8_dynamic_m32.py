@@ -20,6 +20,7 @@ from typing import Callable, Mapping
 import torch
 
 from b12x.cute import b12x_package_fingerprint
+from b12x._lib.provenance import sanitize_environment_map, sanitize_value
 from benchmarks.common import make_l2_flush_fn, resolve_l2_flush_bytes
 from validation.cutlass_migration.core.gpu_scope import (
     add_target_gpu_argument,
@@ -366,21 +367,15 @@ def _git_value(*args: str) -> str:
 
 
 def _runtime_environment_provenance() -> dict[str, object]:
-    set_variables = {
-        name: value
-        for name, value in sorted(os.environ.items())
-        if name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES)
-    }
-    explicit_controls = {
-        name: (
-            {"status": "set", "value": os.environ[name]}
-            if name in os.environ
-            else {"status": "missing"}
-        )
-        for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
-    }
+    set_variables = sanitize_environment_map(prefixes=_RUNTIME_ENVIRONMENT_PREFIXES)
+    explicit_controls: dict[str, object] = {}
+    for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS:
+        if name not in os.environ:
+            explicit_controls[name] = {"status": "unset"}
+        else:
+            explicit_controls[name] = sanitize_value(name, os.environ[name])
     payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "b12x-runtime-environment-v2",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -502,7 +497,9 @@ def _initialize_log(
             for package in ("cuda-python", "cuda-bindings")
         },
         "gpu": {
-            "cuda_visible_devices": visible_devices,
+            "cuda_visible_devices": sanitize_value(
+                "CUDA_VISIBLE_DEVICES", visible_devices
+            ) if visible_devices else {"status": "unset"},
             "logical_index": logical_device,
             "physical_index": physical_device,
             "name": torch.cuda.get_device_name(logical_device),

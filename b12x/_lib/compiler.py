@@ -19,9 +19,11 @@ from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
+from collections.abc import Mapping
 from typing import Any
 
 from .runtime_patches import apply_cutlass_runtime_patches
+from .provenance import safe_env_string, comparison_safe_cute_dsl_libs
 
 apply_cutlass_runtime_patches()
 
@@ -1072,7 +1074,9 @@ def _toolchain_log_value(toolchain: tuple[object, ...]) -> dict[str, Any]:
 
 
 def _environment_log_value(env: tuple[tuple[str, str], ...]) -> dict[str, str]:
-    return {name: value for name, value in env if value}
+    # Include all set variables, even empty strings.  Filtering falsey
+    # values would conflate set-empty with unset.
+    return {name: value for name, value in env}
 
 
 def _compile_cache_payload_log_value(
@@ -1595,7 +1599,15 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         if name.startswith(("B12X_", "CUTE_", "CUTLASS_")):
             if name not in operational_env_vars:
                 compile_env_vars.add(name)
-    return tuple((name, os.environ.get(name, "")) for name in sorted(compile_env_vars))
+    # Only collect variables that are actually SET.  Unset (absent from the
+    # tuple) is now distinct from set-to-empty (present with value "").
+    result: list[tuple[str, str]] = []
+    for name in sorted(compile_env_vars):
+        if name not in os.environ:
+            continue
+        value = os.environ[name]
+        result.append((name, safe_env_string(name, value)))
+    return tuple(result)
 
 
 @lru_cache(maxsize=16)
@@ -2132,6 +2144,33 @@ def _semantic_compile_manifest_payload(
     return semantic
 
 
+def _comparison_compile_environment(
+    env_tuple: tuple[tuple[str, str], ...],
+    *,
+    raw_env: Mapping[str, str] | None = None,
+) -> list[list[str]]:
+    """Build a comparison-safe compile environment for A/B identity.
+
+    For CUTE_DSL_LIBS, the production digest includes the full path list.
+    This function recomputes a comparison-safe digest with the package-owned
+    runtime removed, preserving cross-toolchain A/B identity.
+
+    The raw environment must be passed explicitly (not reread from os.environ)
+    so the comparison identity is derived atomically from the same snapshot
+    as the production identity.
+    """
+    source = raw_env if raw_env is not None else os.environ
+    result: list[list[str]] = []
+    for name, value in env_tuple:
+        if name == "CUTE_DSL_LIBS":
+            raw_value = source.get(name, "")
+            normalized = comparison_safe_cute_dsl_libs(raw_value)
+            result.append([name, safe_env_string(name, normalized)])
+        else:
+            result.append([name, value])
+    return result
+
+
 _LLVM_SSA_NAME = r"%[-a-zA-Z$._0-9]+"
 _LLVM_I64_CONSTANT_RE = re.compile(
     rf"^\s*(?P<result>{_LLVM_SSA_NAME}) = "
@@ -2404,6 +2443,12 @@ def _build_compile_manifest(
         "toolchain": _manifest_json_value(cache_payload[3]),
         "compile_options": _manifest_json_value(cache_payload[options_index]),
         "compile_environment": _manifest_json_value(cache_payload[environment_index]),
+        "comparison_compile_environment": _comparison_compile_environment(
+            cache_payload[environment_index]
+            if isinstance(cache_payload[environment_index], tuple)
+            else (),
+            raw_env=dict(os.environ),
+        ),
         "launch_metadata": launch_metadata,
         "artifact_evidence_sha256": hashlib.sha256(
             artifact_evidence_json.encode("utf-8")
