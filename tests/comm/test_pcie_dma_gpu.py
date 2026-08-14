@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 import socket
 from math import gcd
 
@@ -68,6 +69,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=timedelta(seconds=120),
     )
     hidden = 6144
     max_rows = 512
@@ -128,14 +130,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         inp = _make_input(rows, hidden, dtype, device, rank, 0)
         out = torch.empty_like(inp)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            ring.all_reduce(inp, out=out)
-        for iteration in range(1, 4):
-            inp.copy_(_make_input(rows, hidden, dtype, device, rank, iteration))
-            ref = _reference(inp)
-            graph.replay()
-            torch.cuda.synchronize(device)
-            _assert_close(out, ref, world_size)
+        ring.begin_capture()
+        try:
+            with torch.cuda.graph(graph):
+                ring.all_reduce(inp, out=out)
+            for iteration in range(1, 4):
+                inp.copy_(_make_input(rows, hidden, dtype, device, rank, iteration))
+                ref = _reference(inp)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                _assert_close(out, ref, world_size)
+        finally:
+            ring.end_capture()
 
         dist.barrier()
     finally:

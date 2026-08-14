@@ -1036,16 +1036,23 @@ def _coordinated_close_channels(
     *,
     exchange_group: Optional[ProcessGroup],
     device: torch.device,
+    already_quiesced: bool = False,
 ) -> None:
-    """Strictly release exports only after every peer reports successful unmap."""
+    """Strictly release exports only after every peer reports successful unmap.
+
+    When *already_quiesced* is True the caller has already synchronized the
+    device and exchanged the quiesce verdict across ranks, so this helper
+    skips its own synchronize+barrier to avoid a second uncoordinated sync.
+    """
     unique_channels = tuple(dict.fromkeys(channels))
     if not unique_channels:
         return
 
-    if exchange_group is not None:
+    if exchange_group is not None and not already_quiesced:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         dist.barrier(group=exchange_group)
+
 
     # Channels with strict cleanup report local unmap status before any rank
     # releases exports. Legacy channels retain their original ordered close.
@@ -1068,11 +1075,15 @@ def _coordinated_close_channels(
         strict_method="_close_ipc_imports_strict",
         legacy_method="_close_ipc_imports",
     )
-    unmap_status = _exchange_close_failures(
-        tuple(_format_close_error(index, error) for index, error in unmap_errors),
-        exchange_group=exchange_group,
-        phase="IPC unmap",
-    )
+    try:
+        unmap_status = _exchange_close_failures(
+            tuple(_format_close_error(index, error) for index, error in unmap_errors),
+            exchange_group=exchange_group,
+            phase="IPC unmap",
+        )
+    except Exception as exc:
+        exc._ipc_close_retry_state = "unmap"  # type: ignore[attr-defined]
+        raise
     if any(unmap_status):
         _raise_coordinated_close_error(
             "IPC unmap",
@@ -1082,18 +1093,26 @@ def _coordinated_close_channels(
         )
 
     if exchange_group is not None:
-        dist.barrier(group=exchange_group)
+        try:
+            dist.barrier(group=exchange_group)
+        except Exception as exc:
+            exc._ipc_close_retry_state = "unmap"  # type: ignore[attr-defined]
+            raise
 
     free_errors = _run_close_phase(
         unique_channels,
         strict_method="_free_ipc_exports_strict",
         legacy_method="_free_ipc_exports",
     )
-    free_status = _exchange_close_failures(
-        tuple(_format_close_error(index, error) for index, error in free_errors),
-        exchange_group=exchange_group,
-        phase="IPC export free",
-    )
+    try:
+        free_status = _exchange_close_failures(
+            tuple(_format_close_error(index, error) for index, error in free_errors),
+            exchange_group=exchange_group,
+            phase="IPC export free",
+        )
+    except Exception as exc:
+        exc._ipc_close_retry_state = "free"  # type: ignore[attr-defined]
+        raise
     if any(free_status):
         _raise_coordinated_close_error(
             "IPC export free",
@@ -1103,7 +1122,11 @@ def _coordinated_close_channels(
         )
 
     if exchange_group is not None:
-        dist.barrier(group=exchange_group)
+        try:
+            dist.barrier(group=exchange_group)
+        except Exception as exc:
+            exc._ipc_close_retry_state = "free"  # type: ignore[attr-defined]
+            raise
     for channel in unique_channels:
         if hasattr(channel, "_close_ipc_imports_strict"):
             channel._coordinated_close_complete = True
@@ -1173,6 +1196,9 @@ def _raise_coordinated_close_error(
     error = RuntimeError(
         f"coordinated PCIe close failed during {phase}{retention}: "
         + "; ".join(peer_details)
+    )
+    error._ipc_close_retry_state = (  # type: ignore[attr-defined]
+        "free" if phase == "IPC export free" else "unmap"
     )
     if local_errors:
         raise error from local_errors[0][1]

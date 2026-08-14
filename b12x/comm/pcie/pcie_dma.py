@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import suppress
+import threading
 from functools import lru_cache
 from statistics import median
 from typing import Optional
@@ -24,7 +24,20 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
-from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
+from .pcie_oneshot import (
+    PCIeOneshotAllReduce,
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+    _attach_retryable_setup,
+    _coordinated_close_channels,
+    _exchange_setup_failures,
+    _finish_collective_runtime_setup,
+    _normalize_device,
+    _raise_local_cleanup_errors,
+    _require_collective_contract,
+    _retain_failed_ipc_setup,
+    _run_collective_preallocation_setup,
+    _setup_failure_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +153,109 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+# Bumped whenever a field is added, removed, reordered, or reinterpreted in
+# the DMA IPC layout contract below.  A rank built against a different
+# schema version can never interpret a peer's exported pointers safely, so
+# the version is the first element compared by the collective agreement.
+# v2: bind dtype name→code→width associations; add frozen scheduling knobs.
+_DMA_CONTRACT_VERSION = 2
+
+
+def _parse_pieces_override() -> int:
+    """Parse ``B12X_PCIE_DMA_PIECES`` once at construction time.
+
+    Returns 0 (use the default selection) when unset or out of range so the
+    frozen value is always a valid canonical integer.
+    """
+
+    try:
+        override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
+    except ValueError:
+        return 0
+    return override if 1 <= override <= MAX_PIECES else 0
+
+
+def _parse_a2a_chunks_override() -> int:
+    """Parse ``B12X_PCIE_DMA_A2A_CHUNKS`` once at construction time.
+
+    Returns 0 (use the default selection) when unset or out of range so the
+    frozen value is always a valid canonical integer.
+    """
+
+    try:
+        override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
+    except ValueError:
+        return 0
+    return override if 1 <= override <= MAX_PIECES else 0
+
+
+def _dtype_abi_signature() -> tuple[tuple[str, int, int], ...]:
+    """Canonical ``(dtype_name, kernel_code, element_bytes)`` entries.
+
+    This binds each dtype identity to its kernel code and the element width
+    used in pointer arithmetic, not merely the multiset of codes.  A rank
+    that permutes the mapping (e.g. bf16→2, fp32→0) produces a different
+    signature and is rejected.
+    """
+
+    return tuple(
+        (str(dt), code, dt.itemsize)
+        for dt, code in sorted(SUPPORTED_DTYPES.items(), key=lambda kv: kv[1])
+    )
+
+
+def _dma_ipc_layout_contract(
+    *,
+    world_size: int,
+    max_bytes: int,
+    shard_capacity: int,
+    flags_bytes: int,
+    slab_bytes: int,
+    fp8: str,
+    fp8_stage_stride: int,
+    pieces_override: int,
+    a2a_chunks_override: int,
+) -> tuple:
+    """Versioned tuple of every field a peer needs to interpret our shared
+    IPC scratch/flag slab and the wire transport protocol.
+
+    This is gathered and compared across all ranks *before* any rank opens a
+    peer CUDA IPC memory handle (``cudaIpcOpenMemHandle``).  A divergent or
+    malicious rank that interprets remote pointers with different
+    offsets/capacities/codecs would issue out-of-bounds peer GPU accesses,
+    corrupt the all-reduce result, or deadlock the ring.  Every field that
+    feeds remote-pointer arithmetic, allocation sizing, or the launch
+    schedule is included so the agreement is complete, not merely a
+    cross-check of the caller-facing arguments.
+    """
+    steps = 2 * (world_size - 1)
+    return (
+        _DMA_CONTRACT_VERSION,
+        # topology / world
+        int(world_size),
+        # allocation bytes
+        int(max_bytes),
+        int(slab_bytes),
+        # region offsets / capacities (remote-pointer interpretation)
+        int(flags_bytes),
+        int(shard_capacity),
+        int(steps),
+        # wire mode / codec
+        fp8,
+        int(fp8_stage_stride),
+        # dtype codec ABI: (name, code, element_bytes) per dtype
+        _dtype_abi_signature(),
+        # chunk / schedule / launch policy
+        int(pieces_override),
+        int(a2a_chunks_override),
+        FLAG_STRIDE,
+        FLAG_SLOTS,
+        MAX_PIECES,
+        SCRATCH_ALIGN,
+        FP8_QUANT_BLOCK,
+    )
+
+
 class PCIeDmaAllReduce:
     """Single-channel ring allreduce over IPC scratch buffers.
 
@@ -162,20 +278,87 @@ class PCIeDmaAllReduce:
         del ext_module
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
-        self.world_size = dist.get_world_size(group=exchange_group)
-        self.device = _normalize_device(device)
-        if self.world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(
-                "PCIe DMA all-reduce supports only the reviewed world sizes "
-                f"{SUPPORTED_WORLD_SIZES}, got {self.world_size}"
-            )
-        if self.device.type != "cuda":
-            raise ValueError("PCIe ring allreduce requires a CUDA device")
-        self.max_bytes = int(max_bytes)
-        self._kernels = _load_kernels()
-        self._ipc = CudaRTLibrary()
-        self._ipc.cudaSetDevice(self.device.index or 0)
         self._closed = False
+        # Lifecycle lock/condition/state: OPEN → CLOSING → CLOSED (or FAILED).
+        # all_reduce holds the lock through admission + host enqueue so a
+        # concurrent close cannot unmap peer pointers while work is still
+        # being enqueued.  close acquires the lock, marks CLOSING before
+        # synchronizing, and releases it during the coordinated protocol so
+        self._lifecycle_lock = threading.Condition()
+        self._lifecycle_state = "OPEN"
+        self._launch_count = 0
+        self._capture_count = 0
+        self._close_error: BaseException | None = None
+
+        # ------------------------------------------------------------------
+        # Phase 1 — coordinated preflight.
+        #
+        # Every fallible rank-local operation (argument parsing/validation,
+        # kernel loading, IPC library creation, device selection) runs inside
+        # a single coordinated setup so that a failure on one rank produces
+        # one all-rank verdict before any peer enters the contract exchange
+        # and blocks.  This follows the established _run_collective_preallocation_setup
+        # convention: a local exception is exchanged across all ranks and
+        # re-raised collectively.
+        # ------------------------------------------------------------------
+        def preflight():
+            device_obj = _normalize_device(device)
+            if device_obj.type != "cuda":
+                raise ValueError("PCIe ring allreduce requires a CUDA device")
+            ws = dist.get_world_size(group=exchange_group)
+            if ws not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(
+                    "PCIe DMA all-reduce supports only the reviewed world sizes "
+                    f"{SUPPORTED_WORLD_SIZES}, got {ws}"
+                )
+            canonical_max_bytes = int(max_bytes)
+            fp8_mode = (
+                _normalize_fp8_mode(fp8) if fp8 is not None else _fp8_mode()
+            )
+            pieces_override = _parse_pieces_override()
+            a2a_chunks_override = _parse_a2a_chunks_override()
+            kernels = _load_kernels()
+            ipc = CudaRTLibrary()
+            ipc.cudaSetDevice(device_obj.index or 0)
+            return (
+                device_obj,
+                ws,
+                canonical_max_bytes,
+                fp8_mode,
+                pieces_override,
+                a2a_chunks_override,
+                kernels,
+                ipc,
+            )
+
+        (
+            self.device,
+            self.world_size,
+            self.max_bytes,
+            self._fp8,
+            self._pieces_override,
+            self._a2a_chunks_override,
+            self._kernels,
+            self._ipc,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe DMA all-reduce preflight",
+            exchange_group=exchange_group,
+            setup=preflight,
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 2 — build and collectively agree the versioned IPC layout
+        # contract.  All values derive from the canonical preflight results
+        # so the agreement is over a single fixed-schema tuple.
+        # ------------------------------------------------------------------
+        self._fp8_stage = None
+        self._fp8_stage_stride = 0
+        if self._fp8:
+            max_shard_elems = self.max_bytes // 2 // self.world_size
+            self._fp8_stage_stride = _align_up(
+                max_shard_elems + max_shard_elems // FP8_QUANT_BLOCK * 4,
+                SCRATCH_ALIGN,
+            )
 
         self.shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
@@ -183,69 +366,131 @@ class PCIeDmaAllReduce:
         steps = 2 * (self.world_size - 1)
         flags_bytes = FLAG_SLOTS * FLAG_STRIDE
         slab_bytes = flags_bytes + steps * self.shard_capacity
+
+        # Collective contract agreement: every rank must prove it derived an
+        # identical IPC layout/protocol before any rank opens a peer CUDA IPC
+        # memory handle.  A divergent or malicious rank that applies a
+        # different offset/capacity/codec/schedule interpretation to a peer's
+        # exported allocation would issue out-of-bounds peer GPU accesses,
+        # corrupt the all-reduce result, or deadlock the ring.  The check
+        # precedes _allocate_shared_buffer (which performs
+        # cudaIpcOpenMemHandle) and the native prepare launch, so a mismatch
+        # rejects every rank before any IPC mapping exists.
+        _require_collective_contract(
+            owner="PCIe DMA all-reduce IPC layout",
+            exchange_group=exchange_group,
+            contract=_dma_ipc_layout_contract(
+                world_size=self.world_size,
+                max_bytes=self.max_bytes,
+                shard_capacity=self.shard_capacity,
+                flags_bytes=flags_bytes,
+                slab_bytes=slab_bytes,
+                fp8=self._fp8,
+                fp8_stage_stride=self._fp8_stage_stride,
+                pieces_override=self._pieces_override,
+                a2a_chunks_override=self._a2a_chunks_override,
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Phase 3 — allocate the shared IPC slab.  This is where
+        # cudaIpcOpenMemHandle happens.
+        # ------------------------------------------------------------------
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group, slab_bytes, zero_fill=True, ipc=self._ipc
         )
         self._flags_base = list(self._slab.peer_ptrs)
         self._scratch_base = [ptr + flags_bytes for ptr in self._slab.peer_ptrs]
-        # Device-resident monotonic counters: one per flag slot for the
-        # publisher role and one for the waiter role.
-        self._send_counters = torch.zeros(
-            FLAG_SLOTS, dtype=torch.int32, device=self.device
-        )
-        self._wait_counters = torch.zeros(
-            FLAG_SLOTS, dtype=torch.int32, device=self.device
-        )
-        self._copy_stream = torch.cuda.Stream(device=self.device)
-        self._flag_stream = torch.cuda.Stream(device=self.device)
-        # Separate CE/flag streams for the a2a broadcast phase so allgather
-        # traffic overlaps reduce-scatter traffic instead of queueing
-        # behind it.
-        self._ag_copy_stream = torch.cuda.Stream(device=self.device)
-        self._ag_flag_stream = torch.cuda.Stream(device=self.device)
-        # Persistent cross-stream events: captured graphs keep references to
-        # recorded events, so per-call temporaries must not be destroyed.
-        self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
-        self._copied_events = [
-            torch.cuda.Event() for _ in range(2 * (self.world_size - 1) * MAX_PIECES)
-        ]
-        self._input_ready = torch.cuda.Event()
-        self._ag_ready = torch.cuda.Event()
-        self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
-        self._a2a_ownq = [torch.cuda.Event() for _ in range(MAX_PIECES)]
-        # Explicit argument wins over the environment so integrations can
-        # plumb the mode through their own configuration.
-        self._fp8 = _normalize_fp8_mode(fp8) if fp8 is not None else _fp8_mode()
-        self._fp8_stage = None
-        self._fp8_stage_stride = 0
-        if self._fp8:
-            max_shard_elems = self.max_bytes // 2 // self.world_size
-            stride = _align_up(
-                max_shard_elems + max_shard_elems // FP8_QUANT_BLOCK * 4,
-                SCRATCH_ALIGN,
+        # Strict coordinated-close state.  The collective close ticket is
+        # armed only after the constructor's final verdict succeeds.
+        self._owned_buffers = [self._slab]
+        self._ipc_imports_closed = False
+        self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._collective_close_ticket = False
+        self._close_retry_ticket = None
+
+        # ------------------------------------------------------------------
+        # Phase 4 — every post-IPC operation is inside one collective
+        # finish/rollback boundary.  A local failure at any point
+        # (pointer derivation, resource allocation, kernel prepare, or
+        # final field initialization) is exchanged across all ranks,
+        # every rank closes its imports, the all-rank unmap verdict is
+        # exchanged, and only then are exports freed.  If any phase fails,
+        # ownership is retained in a _RetryableIPCExport for retry.
+        # ------------------------------------------------------------------
+        init_error: BaseException | None = None
+        try:
+            self._send_counters = torch.zeros(
+                FLAG_SLOTS, dtype=torch.int32, device=self.device
             )
-            self._fp8_stage = torch.empty(
-                self.world_size * stride, dtype=torch.uint8, device=self.device
+            self._wait_counters = torch.zeros(
+                FLAG_SLOTS, dtype=torch.int32, device=self.device
             )
-            self._fp8_stage_stride = stride
-        self.min_bytes = 0
-        wire_modes = {
-            "i8": "int8-ag",
-            "i8_ring": "int8-ring",
-            "i8_a2a": "int8-a2a",
-            "mx": "mxfp8-ag",
-            "mx_ring": "mxfp8-ring",
-            "mx_a2a": "mxfp8-a2a",
-        }
-        self.wire_mode = wire_modes.get(
-            self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
+            self._copy_stream = torch.cuda.Stream(device=self.device)
+            self._flag_stream = torch.cuda.Stream(device=self.device)
+            self._ag_copy_stream = torch.cuda.Stream(device=self.device)
+            self._ag_flag_stream = torch.cuda.Stream(device=self.device)
+            self._piece_events = [
+                torch.cuda.Event() for _ in range(MAX_PIECES)
+            ]
+            self._copied_events = [
+                torch.cuda.Event()
+                for _ in range(2 * (self.world_size - 1) * MAX_PIECES)
+            ]
+            self._input_ready = torch.cuda.Event()
+            self._ag_ready = torch.cuda.Event()
+            self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
+            self._a2a_ownq = [torch.cuda.Event() for _ in range(MAX_PIECES)]
+            if self._fp8:
+                self._fp8_stage = torch.empty(
+                    self.world_size * self._fp8_stage_stride,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+            prepare = getattr(self._kernels, "prepare", None)
+            if prepare is not None:
+                prepare(world_size=self.world_size, wire_mode=self._fp8)
+            self.min_bytes = 0
+            wire_modes = {
+                "i8": "int8-ag",
+                "i8_ring": "int8-ring",
+                "i8_a2a": "int8-a2a",
+                "mx": "mxfp8-ag",
+                "mx_ring": "mxfp8-ring",
+                "mx_a2a": "mxfp8-a2a",
+            }
+            self.wire_mode = wire_modes.get(
+                self._fp8, f"fp8-{self._fp8}" if self._fp8 else "bf16"
+            )
+            logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
+        except Exception as exc:
+            init_error = exc
+
+        def detach_shared_ownership() -> None:
+            self._owned_buffers.clear()
+            self._collective_close_ticket = False
+            self._lifecycle_state = "FAILED"
+
+        _finish_collective_runtime_setup(
+            owner="PCIe DMA all-reduce",
+            exchange_group=exchange_group,
+            ipc=self._ipc,
+            shared=self._slab,
+            local_error=init_error,
+            detach_shared_ownership=detach_shared_ownership,
         )
-        logger.debug("[PCIe DMA allreduce] wire mode: %s", self.wire_mode)
-        prepare = getattr(self._kernels, "prepare", None)
-        if prepare is not None:
-            prepare(world_size=self.world_size, wire_mode=self._fp8)
-        if logger.isEnabledFor(logging.DEBUG):
-            self._log_peer_copy_bandwidth()
+
+        # Arm the live-channel close ticket only after the final constructor
+        # verdict succeeds.  This is the last non-fallible step.
+        self._collective_close_ticket = True
+
+        # The peer-copy bandwidth probe used to be guarded by a rank-local
+        # logger.isEnabledFor(DEBUG) predicate but entered a dist.barrier and
+        # wrote peer scratch.  A rank with a different log level would
+        # deadlock the collective during construction.  The probe is no
+        # longer invoked from the constructor; it remains available as an
+        # explicitly-collective diagnostic if needed.
 
     def _log_peer_copy_bandwidth(self, iters: int = 20) -> None:
         """One-time raw cudaMemcpyAsync bandwidth check, bypassing the ring
@@ -312,9 +557,11 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
-    @staticmethod
-    def _pick_pieces(shard_elems: int, shard_bytes: int) -> int:
-        override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
+    def _pick_pieces(self, shard_elems: int, shard_bytes: int) -> int:
+        # The override was parsed once during coordinated preflight and
+        # frozen on the channel (``self._pieces_override``); it is never
+        # re-read from the environment so all ranks use the same schedule.
+        override = self._pieces_override
         # pieces=2 measured best at every size (deeper chunking pays an
         # extra wait+add launch chain per piece on the main stream).
         candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
@@ -324,7 +571,10 @@ class PCIeDmaAllReduce:
         return 1
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
-        if self._closed or inp.device != self.device:
+        with self._lifecycle_lock:
+            if self._lifecycle_state != "OPEN":
+                return False
+        if inp.device != self.device:
             return False
         if inp.dtype not in SUPPORTED_DTYPES:
             return False
@@ -336,20 +586,49 @@ class PCIeDmaAllReduce:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
+
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        with torch.cuda.device(self.device):
-            return self._all_reduce_on_device(inp, out=out)
+        # Hold the lifecycle lock through admission and complete host enqueue.
+        # Application-level collective ordering remains the distributed
+        # contract: per-launch ProcessGroup control collectives would serialize
+        # every serving launch and can deadlock with this full-grid IPC kernel.
+        with self._lifecycle_lock:
+            if self._lifecycle_state != "OPEN":
+                raise RuntimeError("PCIe DMA all-reduce channel is not open")
+            self._launch_count += 1
+            try:
+                if not self.should_allreduce(inp):
+                    raise ValueError(
+                        "input does not satisfy ring allreduce requirements "
+                        f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
+                    )
+                with torch.cuda.device(self.device):
+                    return self._all_reduce_on_device(inp, out=out)
+            finally:
+                self._launch_count -= 1
+                self._lifecycle_lock.notify_all()
+
+    def begin_capture(self) -> None:
+        """Acquire a capture lease so close cannot retire the slab while a
+        CUDAGraph is being captured or replayed."""
+        with self._lifecycle_lock:
+            if self._lifecycle_state != "OPEN":
+                raise RuntimeError(
+                    "cannot capture/replay on a non-open DMA channel"
+                )
+            self._capture_count += 1
+
+    def end_capture(self) -> None:
+        """Release a capture lease."""
+        with self._lifecycle_lock:
+            self._capture_count = max(0, self._capture_count - 1)
+            self._lifecycle_lock.notify_all()
 
     def _all_reduce_on_device(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if not self.should_allreduce(inp):
-            raise ValueError(
-                "input does not satisfy ring allreduce requirements "
-                f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
-            )
         if out is None:
             # Preserve normal out-of-place collective semantics. Callers can
             # retain this result while a later collective is in flight.
@@ -618,7 +897,10 @@ class PCIeDmaAllReduce:
         return out
 
     def _pick_a2a_chunks(self, shard_elems: int) -> int:
-        override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
+        # The override was parsed once during coordinated preflight and
+        # frozen on the channel (``self._a2a_chunks_override``); it is never
+        # re-read from the environment so all ranks use the same schedule.
+        override = self._a2a_chunks_override
         candidates = (override,) if 1 <= override <= MAX_PIECES else (4, 3, 2)
         for chunks in candidates:
             if (
@@ -802,22 +1084,203 @@ class PCIeDmaAllReduce:
         main.wait_stream(ag_flag)
         return out
 
-    def close(self) -> None:
-        if self._closed:
+    # ------------------------------------------------------------------
+    # Strict coordinated close protocol (mirrors PCIeOneshotAllReduce /
+    # PCIeTwoShotSP).  _coordinated_close_channels drives the phases:
+    #   1. every rank closes its IPC imports (cudaIpcCloseMemHandle)
+    #   2. all-rank unmap verdict is exchanged; if any rank fails, exports
+    #      are retained and the error is raised (retryable)
+    #   3. only after every peer reports successful unmap do ranks free
+    #      their exports (cudaFree)
+    #   4. all-rank free verdict is exchanged
+    # ``_closed`` is set during import close (step 1) but
+    # ``_coordinated_close_complete`` is only set after the full protocol
+    # succeeds, so a partial close can be retried.
+    # ------------------------------------------------------------------
+
+    def _closed_import_indices(self) -> set[tuple[int, int]]:
+        closed = getattr(self, "_closed_ipc_import_indices", None)
+        if closed is None:
+            closed = set()
+            self._closed_ipc_import_indices = closed
+        return closed
+
+    def _all_python_ipc_imports_closed(
+        self, closed: set[tuple[int, int]]
+    ) -> bool:
+        return all(
+            (buffer_index, remote_index) in closed
+            for buffer_index, shared in enumerate(self._owned_buffers)
+            for remote_index, _ in enumerate(shared.remote_ptrs)
+        )
+
+    def _close_ipc_imports_strict(self) -> None:
+        if self._ipc_imports_closed:
             return
         self._closed = True
-        # Drain the main and four auxiliary streams before any rank unmaps a
-        # peer allocation.  Every importer must unmap before its owner frees
-        # the exported slab.
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        for ptr in self._slab.remote_ptrs:
-            with suppress(Exception):
-                self._ipc.cudaIpcCloseMemHandle(ptr)
-        dist.barrier(group=self.group)
-        with suppress(Exception):
-            self._ipc.cudaFree(self._slab.local_ptr)
-        dist.barrier(group=self.group)
+        failures: list[tuple[str, Exception]] = []
+        closed = self._closed_import_indices()
+        for buffer_index, shared in enumerate(self._owned_buffers):
+            for remote_index, ptr in enumerate(shared.remote_ptrs):
+                key = (buffer_index, remote_index)
+                if key in closed:
+                    continue
+                try:
+                    self._ipc.cudaIpcCloseMemHandle(ptr)
+                except Exception as exc:
+                    failures.append((f"CUDA IPC import {ptr}", exc))
+                else:
+                    closed.add(key)
+
+        if not failures and self._all_python_ipc_imports_closed(closed):
+            self._ipc_imports_closed = True
+        if failures:
+            _raise_local_cleanup_errors(
+                "PCIe DMA all-reduce", "IPC import close", failures
+            )
+
+    def _free_ipc_exports_strict(self) -> None:
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports_strict()
+        failures: list[tuple[str, Exception]] = []
+        remaining = []
+        for shared in self._owned_buffers:
+            try:
+                self._ipc.cudaFree(shared.local_ptr)
+            except Exception as exc:
+                remaining.append(shared)
+                failures.append((f"CUDA IPC export {shared.local_ptr}", exc))
+        self._owned_buffers = remaining
+        if not remaining:
+            self._ipc_exports_freed = True
+        if failures:
+            _raise_local_cleanup_errors(
+                "PCIe DMA all-reduce", "IPC export free", failures
+            )
+
+    def close(self) -> None:
+        if getattr(self, "_coordinated_close_complete", False):
+            return
+        with self._lifecycle_lock:
+            if self._lifecycle_state == "CLOSED":
+                return
+            if self._lifecycle_state == "CLOSING":
+                while self._lifecycle_state == "CLOSING":
+                    self._lifecycle_lock.wait()
+                if self._lifecycle_state == "FAILED":
+                    if self._close_error is not None:
+                        raise self._close_error
+                else:
+                    return
+            while self._launch_count > 0 or self._capture_count > 0:
+                self._lifecycle_lock.wait()
+            self._lifecycle_state = "CLOSING"
+            self._closed = True
+            self._close_error = None
+            retry_ticket = self._close_retry_ticket
+
+        # All ranks must enter collective close only after the application has
+        # stopped issuing launches. Local launch/capture leases above guarantee
+        # that no host enqueue can race this rank's quiesce and unmap.
+        quiesced = False
+        try:
+            if retry_ticket is not None:
+                # A failed close transfers its exact remaining ownership into
+                # this ticket. Retry that state machine rather than walking the
+                # channel's stale slab metadata and double-closing resources.
+                retry_ticket.retry()
+                self._coordinated_close_complete = True
+            else:
+                quiesce_error: BaseException | None = None
+                try:
+                    torch.cuda.synchronize(self.device)
+                except Exception as exc:
+                    quiesce_error = exc
+                quiesce_statuses = _exchange_setup_failures(
+                    quiesce_error,
+                    exchange_group=self.group,
+                    phase="PCIe DMA all-reduce quiesce",
+                    exports_retained_on_exchange_failure=False,
+                )
+                if any(quiesce_statuses):
+                    raise RuntimeError(
+                        _setup_failure_message(
+                            "PCIe DMA all-reduce",
+                            "quiesce",
+                            quiesce_statuses,
+                            exports_retained=True,
+                        )
+                    ) from quiesce_error
+                quiesced = True
+
+                # Pass already_quiesced=True so the helper skips its own
+                # second uncoordinated synchronize+barrier.
+                _coordinated_close_channels(
+                    (self,),
+                    exchange_group=self.group,
+                    device=self.device,
+                    already_quiesced=True,
+                )
+        except Exception as exc:
+            retained = retry_ticket
+            if retained is None:
+                closed = self._closed_import_indices()
+                remaining_remote_ptrs = [
+                    ptr
+                    for buffer_index, shared in enumerate(self._owned_buffers)
+                    for remote_index, ptr in enumerate(shared.remote_ptrs)
+                    if (buffer_index, remote_index) not in closed
+                ]
+                local_ptr = (
+                    self._owned_buffers[0].local_ptr
+                    if self._owned_buffers
+                    else 0
+                )
+                if quiesced:
+                    retry_state = getattr(
+                        exc, "_ipc_close_retry_state", "unmap"
+                    )
+                    local_cleanup = None
+                else:
+                    retry_state = "native"
+                    device = self.device
+                    local_cleanup = lambda: torch.cuda.synchronize(device)
+                retained = _retain_failed_ipc_setup(
+                    ipc=self._ipc,
+                    local_ptr=local_ptr,
+                    exchange_group=self.group,
+                    owner="PCIe DMA all-reduce close",
+                    phase="close",
+                    remote_ptrs=remaining_remote_ptrs,
+                    local_cleanup=local_cleanup,
+                    state=retry_state,
+                )
+                # Ownership now belongs exclusively to the retry ticket.
+                self._owned_buffers.clear()
+                self._ipc_imports_closed = True
+                self._ipc_exports_freed = True
+                self._close_retry_ticket = retained
+
+            error = (
+                exc
+                if isinstance(exc, RuntimeError)
+                else RuntimeError("PCIe DMA all-reduce close failed")
+            )
+            _attach_retryable_setup(error, retained)
+            with self._lifecycle_lock:
+                self._lifecycle_state = "FAILED"
+                self._close_error = error
+                self._lifecycle_lock.notify_all()
+            if error is exc:
+                raise
+            raise error from exc
+
+        with self._lifecycle_lock:
+            self._lifecycle_state = "CLOSED"
+            self._collective_close_ticket = False
+            self._close_retry_ticket = None
+            self._lifecycle_lock.notify_all()
 
     def __enter__(self) -> "PCIeDmaAllReduce":
         return self
@@ -825,10 +1288,18 @@ class PCIeDmaAllReduce:
     def __exit__(self, *_args) -> None:
         self.close()
 
-    def __del__(self) -> None:
-        # Distributed barriers are unsafe during asymmetric interpreter
-        # teardown. Explicit/context-manager close owns coordinated release.
-        return None
+    def __del__(
+        self,
+        _quarantine: dict[int, object] = _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+    ) -> None:
+        # GC cannot prove that queued CUDA work has completed, and it must
+        # not synchronize or enter a distributed barrier.  Explicit /
+        # context-manager close owns the coordinated release; if the
+        # collective close ticket is still active (close never completed
+        # fully), quarantine the runtime so it remains available for a
+        # coordinated retry even if the local export was already freed.
+        if getattr(self, "_collective_close_ticket", False):
+            _quarantine[id(self)] = self
 
 
 def autotune_crossovers(
