@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from enum import Enum
+from threading import Condition, RLock
 from typing import Optional, Sequence
 
 import torch
@@ -15,17 +17,21 @@ from ._dcp_cute_common import signal_bytes
 from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _align_up,
-    _coordinated_close_channels,
     _current_stream_key,
     _device_guard,
+    _exchange_close_failures,
+    _finish_collective_runtime_setup,
+    _format_close_error,
     _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
-    _OwnedSharedBuffer,
+    _raise_coordinated_close_error,
     _raise_local_cleanup_errors,
     _require_collective_contract,
     _require_full_grid_residency,
+    _run_close_phase,
     _run_collective_preallocation_setup,
 )
 
@@ -83,6 +89,27 @@ def _candidate_staging_layout(
         slab_bytes=staging1_offset + slot_bytes,
         plane_bytes=plane_bytes,
     )
+
+
+_DCP_TOPK_CONTRACT_FIELDS = (
+    "version",
+    "topology_world",
+    "topology_supported_world_sizes",
+    "capacity_max_rows",
+    "capacity_max_owner_rows",
+    "capacity_topk",
+    "capacity_candidate_plane_elems",
+    "allocation_slab_bytes",
+    "allocation_slot_bytes",
+    "allocation_plane_bytes",
+    "offset_signal_bytes",
+    "offset_staging0",
+    "offset_staging1",
+    "wire_codec_index",
+    "wire_codec_score",
+    "schedule_max_blocks",
+    "schedule_signal_bytes",
+)
 
 
 def _dcp_topk_runtime_contract(
@@ -186,6 +213,24 @@ def owner_stage_reference(
     )
 
 
+class _ChannelLifecycle(Enum):
+    """Lifecycle state for the IPC channel.
+
+    OPEN — channel accepts launches/captures and is not closing.
+    CLOSING — one thread owns the collective teardown; launches are
+    rejected and concurrent close callers wait for the result.
+    CLOSED — teardown completed successfully; exports are freed.
+    FAILED — teardown failed; imports/exports are retained.  The channel
+    is permanently non-launchable but ``retry_close()`` may re-enter the
+    collective teardown from this state.
+    """
+
+    OPEN = 0
+    CLOSING = 1
+    CLOSED = 2
+    FAILED = 3
+
+
 class _IPCChannel:
     def _init_channel(
         self,
@@ -196,10 +241,18 @@ class _IPCChannel:
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
         stream_affine: bool,
     ) -> None:
+        owned_buffers_list = list(owned_buffers or ())
+        if exchange_group is None and any(
+            shared.remote_ptrs for shared in owned_buffers_list
+        ):
+            raise ValueError(
+                "exchange_group is required when the channel owns remote "
+                "CUDA IPC imports"
+            )
         self.device = _normalize_device(device)
         self.exchange_group = exchange_group
         self._ipc = ipc
-        self._owned_buffers = list(owned_buffers or ())
+        self._owned_buffers = owned_buffers_list
         self._stream_affine = bool(stream_affine)
         self._owner_stream_key: Optional[int] = None
         self._closed = False
@@ -207,13 +260,123 @@ class _IPCChannel:
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        self._lifecycle_lock = RLock()
+        self._lifecycle_cond = Condition(self._lifecycle_lock)
+        self._lifecycle_state = _ChannelLifecycle.OPEN
+        self._close_generation = 0
+        self._close_error: Optional[BaseException] = None
+        self._launch_depth = 0
+        self._capture_context_depth = 0
+        self._replay_depth = 0
+        # Graphs registered by this channel for gated replay.
+        self._registered_graphs: set[int] = set()
+        # Collective ticket: set on global init success, never before.
+        self._has_collective_ipc_ticket = False
+
+    # ------------------------------------------------------------------
+    # Launch gate — held from the closed-check through kernel enqueue so
+    # close cannot transition to CLOSING while a launch is in flight.
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _launch_gate(self):
+        with self._lifecycle_lock:
+            if self._lifecycle_state != _ChannelLifecycle.OPEN:
+                raise RuntimeError(
+                    f"{type(self).__name__} is "
+                    f"{self._lifecycle_state.name.lower()}; cannot stage candidates"
+                )
+            self._launch_depth += 1
+        try:
+            yield
+        finally:
+            with self._lifecycle_lock:
+                self._launch_depth -= 1
+                if self._launch_depth == 0:
+                    self._lifecycle_cond.notify_all()
+
+    # ------------------------------------------------------------------
+    # Replay gate — held while a captured graph replays so close waits.
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _replay_gate(self):
+        with self._lifecycle_lock:
+            if self._lifecycle_state != _ChannelLifecycle.OPEN:
+                raise RuntimeError(
+                    f"{type(self).__name__} is "
+                    f"{self._lifecycle_state.name.lower()}; cannot replay"
+                )
+            self._replay_depth += 1
+        try:
+            yield
+        finally:
+            with self._lifecycle_lock:
+                self._replay_depth -= 1
+                if self._replay_depth == 0:
+                    self._lifecycle_cond.notify_all()
+
+    # ------------------------------------------------------------------
+    # Close transition — atomically stop launches/replays/captures, wait
+    # for in-flight work, and let one thread enter the collective.
+    # ------------------------------------------------------------------
+
+    def _begin_close(self, *, allow_retry: bool = False) -> bool:
+        """Transition to CLOSING and return True if this caller owns the
+        collective teardown.
+
+        From OPEN: this caller owns the collective.
+        From FAILED with allow_retry=True: this caller owns a retry.
+        From CLOSING: wait for the active generation, observe its result.
+        From CLOSED: return False (idempotent).
+        From FAILED without allow_retry: re-raise the stored error.
+        """
+        with self._lifecycle_lock:
+            if self._lifecycle_state == _ChannelLifecycle.CLOSED:
+                return False
+            if self._lifecycle_state == _ChannelLifecycle.FAILED:
+                if not allow_retry:
+                    assert self._close_error is not None
+                    raise self._close_error
+                # Retry: fall through to claim the collective.
+            elif self._lifecycle_state == _ChannelLifecycle.CLOSING:
+                generation = self._close_generation
+                while (
+                    self._lifecycle_state == _ChannelLifecycle.CLOSING
+                    and self._close_generation == generation
+                ):
+                    self._lifecycle_cond.wait()
+                if self._lifecycle_state == _ChannelLifecycle.FAILED:
+                    assert self._close_error is not None
+                    raise self._close_error
+                return False
+            # Claim the collective.
+            self._lifecycle_state = _ChannelLifecycle.CLOSING
+            self._close_generation += 1
+            self._close_error = None
+            # Wait for in-flight launches, replays, and capture contexts.
+            while (
+                self._launch_depth > 0
+                or self._replay_depth > 0
+                or self._capture_context_depth > 0
+            ):
+                self._lifecycle_cond.wait()
+            return True
+
+    def _finish_close(self, *, error: Optional[BaseException] = None) -> None:
+        """Complete the CLOSING→CLOSED/FAILED transition."""
+        with self._lifecycle_lock:
+            if error is not None:
+                self._lifecycle_state = _ChannelLifecycle.FAILED
+                self._close_error = error
+            else:
+                self._lifecycle_state = _ChannelLifecycle.CLOSED
+                self._coordinated_close_complete = True
+            self._lifecycle_cond.notify_all()
 
     def _bind_stream(self) -> None:
         if not self._stream_affine or self.device.type != "cuda":
             return
-        # CUDA graph capture substitutes a torch-owned capture stream handle
-        # for the logical stream.  Keep affinity bound to the caller's eager
-        # stream so the same channel can be warmed, captured, and reused.
         if _is_current_stream_capturing(self.device):
             return
         stream_key = _current_stream_key(self.device)
@@ -243,6 +406,18 @@ class _IPCChannel:
             for remote_index, _ in enumerate(shared.remote_ptrs)
         )
 
+    def _quiesce_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _has_ipc_exports(self) -> bool:
+        return bool(getattr(self, "_owned_buffers", ()))
+
+    def _has_remote_imports(self) -> bool:
+        return any(
+            shared.remote_ptrs for shared in getattr(self, "_owned_buffers", ())
+        )
+
     def _close_ipc_imports(self) -> None:
         """Legacy best-effort close retained for non-strict callers."""
         if self._ipc_imports_closed:
@@ -256,12 +431,7 @@ class _IPCChannel:
         self._ipc_imports_closed = True
 
     def _close_ipc_imports_strict(self) -> None:
-        """Close every IPC import without suppressing errors.
-
-        Marks the channel closed so it cannot be reused even if unmap fails.
-        Failed imports remain open and observable; ``_ipc_imports_closed`` is
-        only set when every import handle was successfully closed.
-        """
+        """Close every IPC import without suppressing errors."""
         if self._ipc_imports_closed:
             return
         self._closed = True
@@ -306,12 +476,7 @@ class _IPCChannel:
         self._ipc_exports_freed = True
 
     def _free_ipc_exports_strict(self) -> None:
-        """Free exported IPC storage only after all imports are closed.
-
-        Must be called after the collective unmap acknowledgement so no peer
-        retains a usable imported pointer.  Failed frees retain the buffer
-        so the export stays observable and never becomes a silent leak.
-        """
+        """Free exported IPC storage only after all imports are closed."""
         if self._ipc_exports_freed:
             return
         self._close_ipc_imports_strict()
@@ -339,27 +504,146 @@ class _IPCChannel:
         if failures:
             _raise_local_cleanup_errors("PCIe DCP top-k", "IPC export free", failures)
 
-    def close(self) -> None:
-        if self._coordinated_close_complete:
+    def _fail_closed_multi_rank_without_group(self) -> None:
+        """Reject freeing multi-rank IPC exports without a teardown group.
+
+        Only applies when the channel has remote imports (peer pointers to
+        another rank's export).  A channel with only local exports and no
+        remote imports can close without a group.
+        """
+        world_size = getattr(self, "world_size", 1)
+        if (
+            world_size >= 2
+            and self._has_remote_imports()
+            and self.exchange_group is None
+        ):
+            self._closed = True
+            raise RuntimeError(
+                f"{type(self).__name__} has remote IPC imports for "
+                f"world_size={world_size} but no exchange group; cannot "
+                "collectively acknowledge peer unmap before freeing exports"
+            )
+
+    def _coordinated_close(self, *, allow_retry: bool = False) -> None:
+        """Collective teardown with explicit lifecycle state."""
+        if not self._begin_close(allow_retry=allow_retry):
             return
-        _coordinated_close_channels(
-            (self,),
-            exchange_group=self.exchange_group,
-            device=self.device,
-        )
+        error: Optional[BaseException] = None
+        try:
+            self._fail_closed_multi_rank_without_group()
+
+            quiesce_error: BaseException | None = None
+            try:
+                self._quiesce_device()
+            except Exception as exc:
+                quiesce_error = exc
+
+            if self.exchange_group is not None:
+                quiesce_status = _exchange_close_failures(
+                    (str(quiesce_error),) if quiesce_error else (),
+                    exchange_group=self.exchange_group,
+                    phase="DCP top-k quiescence",
+                )
+                if any(quiesce_status):
+                    _raise_coordinated_close_error(
+                        "DCP top-k quiescence",
+                        quiesce_status,
+                        local_errors=(
+                            [(0, quiesce_error)] if quiesce_error else []
+                        ),
+                        exports_retained=True,
+                    )
+                dist.barrier(group=self.exchange_group)
+            elif quiesce_error is not None:
+                raise quiesce_error
+
+            unmap_errors = _run_close_phase(
+                (self,),
+                strict_method="_close_ipc_imports_strict",
+                legacy_method="_close_ipc_imports",
+            )
+            unmap_status = _exchange_close_failures(
+                tuple(
+                    _format_close_error(index, error)
+                    for index, error in unmap_errors
+                ),
+                exchange_group=self.exchange_group,
+                phase="IPC unmap",
+            )
+            if any(unmap_status):
+                _raise_coordinated_close_error(
+                    "IPC unmap",
+                    unmap_status,
+                    local_errors=unmap_errors,
+                    exports_retained=True,
+                )
+
+            if self.exchange_group is not None:
+                dist.barrier(group=self.exchange_group)
+
+            free_errors = _run_close_phase(
+                (self,),
+                strict_method="_free_ipc_exports_strict",
+                legacy_method="_free_ipc_exports",
+            )
+            free_status = _exchange_close_failures(
+                tuple(
+                    _format_close_error(index, error)
+                    for index, error in free_errors
+                ),
+                exchange_group=self.exchange_group,
+                phase="IPC export free",
+            )
+            if any(free_status):
+                _raise_coordinated_close_error(
+                    "IPC export free",
+                    free_status,
+                    local_errors=free_errors,
+                    exports_retained=False,
+                )
+
+            if self.exchange_group is not None:
+                dist.barrier(group=self.exchange_group)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            self._finish_close(error=error)
+
+    def close(self) -> None:
+        self._coordinated_close()
 
     def close_coordinated(self) -> None:
         """Collectively close peer mappings before freeing exported storage."""
-        if self._coordinated_close_complete:
-            return
-        _coordinated_close_channels(
-            (self,),
-            exchange_group=self.exchange_group,
-            device=self.device,
-        )
+        self._coordinated_close()
 
-    def __del__(self) -> None:
-        return None
+    def retry_close(self) -> None:
+        """Re-enter the collective teardown from FAILED state.
+
+        Launches remain permanently disabled.  Every rank must call this
+        method simultaneously to retry the quiesce/unmap/free phases.
+        """
+        self._coordinated_close(allow_retry=True)
+
+    def __enter__(self) -> "_IPCChannel":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def __del__(
+        self,
+        _quarantine: dict[int, object] = _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+    ) -> None:
+        # GC cannot synchronize or enter a distributed barrier.  Retain
+        # any channel whose collective close did not complete so stale
+        # pointers survive until process teardown.
+        if getattr(self, "_coordinated_close_complete", False):
+            return
+        if self._has_ipc_exports() or getattr(
+            self, "_has_collective_ipc_ticket", False
+        ):
+            _quarantine[id(self)] = self
 
 
 class PCIeDCPTopKOwnerExchange(_IPCChannel):
@@ -425,7 +709,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         )
         self._next_slot = 0
         self._graph_slot: Optional[int] = None
-        self._capture_context_depth = 0
+
         candidate_shape = (self.max_owner_rows, self.world_size * self.topk)
         if self.device.type == "cuda":
             self._candidate_views = tuple(
@@ -517,16 +801,19 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 layout=layout,
             ),
         )
-        owned: list[_OwnedSharedBuffer] = []
+        slab = PCIeOneshotAllReduce._allocate_shared_buffer(
+            exchange_group,
+            layout.slab_bytes,
+            zero_fill=True,
+            ipc=ipc,
+        )
+        runtime: Optional[PCIeDCPTopKOwnerExchange] = None
+        init_error: BaseException | None = None
         try:
-            slab = PCIeOneshotAllReduce._allocate_shared_buffer(
-                exchange_group,
-                layout.slab_bytes,
-                zero_fill=True,
-                ipc=ipc,
-            )
-            owned.append(slab)
-            return cls(
+            # Construct WITHOUT slab ownership so a partial __init__ failure
+            # does not create a quarantined object with live exports.  The
+            # slab is attached only after the collective init verdict.
+            runtime = cls(
                 rank=rank,
                 world_size=world_size,
                 device=device_obj,
@@ -541,13 +828,36 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 topk=topk,
                 exchange_group=exchange_group,
                 ipc=ipc,
-                owned_buffers=owned,
+                owned_buffers=None,
                 ext_module=ext_module,
                 stream_affine=stream_affine,
             )
-        except Exception:
-            _release_failed_allocations(owned, ipc)
-            raise
+        except Exception as exc:
+            init_error = exc
+
+        def detach_shared_ownership() -> None:
+            # On rollback, clear any partial ownership the constructor may
+            # have set (e.g. candidate views) so __del__ does not quarantine
+            # a duplicate.
+            if runtime is not None:
+                runtime._owned_buffers.clear()
+                runtime._candidate_views = ()
+                runtime._has_collective_ipc_ticket = False
+
+        _finish_collective_runtime_setup(
+            owner="PCIe DCP top-k",
+            exchange_group=exchange_group,
+            ipc=ipc,
+            shared=slab,
+            local_error=init_error,
+            detach_shared_ownership=detach_shared_ownership,
+        )
+        assert runtime is not None
+        # Atomically attach the slab and set the collective ticket only on
+        # global init success.
+        runtime._owned_buffers = [slab]
+        runtime._has_collective_ipc_ticket = True
+        return runtime
 
     @classmethod
     def from_process_group(
@@ -588,7 +898,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         retired. The barrier stays inside the one transport kernel and
         therefore adds no CUDA graph node.
         """
-        with _device_guard(self.device):
+        with self._launch_gate(), _device_guard(self.device):
             return self._stage_candidates_on_device(
                 local_indices,
                 local_scores,
@@ -598,41 +908,91 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
 
     def prepare_graph(self, *, threads: int = 512) -> None:
         """Compile the exact graph launcher before capture begins."""
-        if self._closed:
-            raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
-        if _is_current_stream_capturing(self.device):
-            raise RuntimeError("prepare_graph() must be called before CUDA graph capture")
-        _validate_launch_config(
-            threads=int(threads),
-            block_limit=1,
-            world_size=self.world_size,
-        )
-        with _device_guard(self.device):
-            self._bind_stream()
-            from ._dcp_topk_cute import prepare_topk_stage
-
-            prepare_topk_stage(
-                self.world_size,
-                self.rank,
-                self.topk,
-                int(threads),
+        with self._launch_gate():
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "prepare_graph() must be called before CUDA graph capture"
+                )
+            _validate_launch_config(
+                threads=int(threads),
+                block_limit=1,
+                world_size=self.world_size,
             )
+            with _device_guard(self.device):
+                self._bind_stream()
+                from ._dcp_topk_cute import prepare_topk_stage
+
+                prepare_topk_stage(
+                    self.world_size,
+                    self.rank,
+                    self.topk,
+                    int(threads),
+                )
 
     @contextmanager
     def capture(self, *, threads: int = 512):
         """Own one serialized graph capture without adding graph nodes.
 
-        Enter this context before ``torch.cuda.graph``. Graphs captured from
-        this instance share one epoch and must never replay concurrently.
+        Enter this context before ``torch.cuda.graph`` and call
+        :meth:`register_graph` after capture. Graphs captured from this
+        instance share one epoch and must never replay concurrently through
+        any path other than :meth:`replay`. Close cannot run while a capture
+        context is active.
         """
-        if self._capture_context_depth:
-            raise RuntimeError("overlapping DCP top-k capture contexts are not allowed")
-        self.prepare_graph(threads=threads)
-        self._capture_context_depth = 1
+        # Atomically reserve the capture token under the lifecycle lock.
+        # This prevents close from transitioning to CLOSING between the
+        # OPEN check and the depth increment.
+        with self._lifecycle_lock:
+            if self._lifecycle_state != _ChannelLifecycle.OPEN:
+                raise RuntimeError(
+                    f"{type(self).__name__} is "
+                    f"{self._lifecycle_state.name.lower()}; cannot capture"
+                )
+            if self._capture_context_depth:
+                raise RuntimeError(
+                    "overlapping DCP top-k capture contexts are not allowed"
+                )
+            self._capture_context_depth = 1
+        try:
+            self.prepare_graph(threads=threads)
+        except Exception:
+            with self._lifecycle_lock:
+                self._capture_context_depth = 0
+                self._lifecycle_cond.notify_all()
+            raise
         try:
             yield self
         finally:
-            self._capture_context_depth = 0
+            with self._lifecycle_lock:
+                self._capture_context_depth = 0
+                self._lifecycle_cond.notify_all()
+
+    def register_graph(self, graph: torch.cuda.CUDAGraph) -> None:
+        """Register a captured CUDA graph for gated replay.
+
+        The channel tracks registered graphs so close can wait for active
+        replays and prevent use-after-free of captured staging pointers.
+        """
+        with self._lifecycle_lock:
+            if self._lifecycle_state != _ChannelLifecycle.OPEN:
+                raise RuntimeError(
+                    f"{type(self).__name__} is "
+                    f"{self._lifecycle_state.name.lower()}; cannot register graph"
+                )
+            self._registered_graphs.add(id(graph))
+
+    def replay(self, graph: torch.cuda.CUDAGraph) -> None:
+        """Replay a registered CUDA graph under the lifecycle gate.
+
+        Close cannot quiesce or free while a replay is in flight.
+        """
+        with self._replay_gate():
+            if id(graph) not in self._registered_graphs:
+                raise RuntimeError(
+                    "graph was not registered with this channel; call "
+                    "register_graph() after capture"
+                )
+            graph.replay()
 
     def _stage_candidates_on_device(
         self,
@@ -642,8 +1002,6 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         threads: int,
         block_limit: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._closed:
-            raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
         if local_indices.device != self.device or local_scores.device != self.device:
             raise ValueError("inputs must be on the runtime device")
         if local_indices.dtype != torch.int32:

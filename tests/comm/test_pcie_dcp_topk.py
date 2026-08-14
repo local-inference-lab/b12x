@@ -289,35 +289,15 @@ def _patch_factory_gates(monkeypatch, *, peer_contract: tuple) -> None:
 
 def _contract_field_index(field: str) -> int:
     """Return the position of a named field in the contract tuple."""
-    layout = _candidate_staging_layout(
-        signal_bytes=_SIGNAL_BYTES,
-        max_rows=8,
-        topk=4,
-        world_size=2,
+    fields = _topk_mod._DCP_TOPK_CONTRACT_FIELDS
+    canonical = _base_contract()
+    assert len(fields) == len(canonical), (
+        "runtime contract values and field schema must stay aligned"
     )
-    canonical = _topk_mod._dcp_topk_runtime_contract(
-        world_size=2,
-        max_rows=8,
-        topk=4,
-        layout=layout,
-    )
-
-    replacements: dict[str, tuple] = (
-        ("capacity_max_rows", (3,)),
-        ("capacity_topk", (5,)),
-        ("offset_staging0", (11,)),
-        ("offset_staging1", (12,)),
-        ("wire_codec_index", (13,)),
-        ("wire_codec_score", (14,)),
-        ("topology_world", (1,)),
-        ("schedule_max_blocks", (15,)),
-        ("schedule_signal_bytes", (16,)),
-    )
-    if field not in replacements:
-        raise KeyError(f"unknown field {field}")
-    (idx,) = replacements[field]
-    assert 0 <= idx < len(canonical), f"field {field} index out of range"
-    return idx
+    try:
+        return fields.index(field)
+    except ValueError:
+        raise KeyError(f"unknown field {field}") from None
 
 
 def _mismatched_contract(field: str) -> tuple:

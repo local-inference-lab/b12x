@@ -1,26 +1,25 @@
 """Focused lifecycle/close tests for the DCP top-k IPC channel.
 
-These tests prove the collective teardown ordering and error-propagation
-contract required by issue #181:
-
-* No export free (``cudaFree``) precedes every peer unmap acknowledgement
-  (``cudaIpcCloseMemHandle``).
-* Forced unmap, free, and collective-exchange failures propagate as
-  ``RuntimeError`` and leave the channel non-reusable without freeing
-  unsafe exports.
-* Double, out-of-order, and concurrent close cannot reuse stale pointers
-  or silently succeed.
+Issue #181: collective teardown ordering, error propagation, lifecycle state,
+retry from FAILED, launch/replay/capture exclusion, destructor quarantine.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+import gc
+import threading
 
 import pytest
 import torch
 
-from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
-from b12x.comm.pcie.pcie_oneshot import _OwnedSharedBuffer
+from b12x.comm.pcie.pcie_dcp_topk import (
+    PCIeDCPTopKOwnerExchange,
+    _ChannelLifecycle,
+)
+from b12x.comm.pcie.pcie_oneshot import (
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE,
+    _OwnedSharedBuffer,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,372 +28,747 @@ from b12x.comm.pcie.pcie_oneshot import _OwnedSharedBuffer
 
 
 class _FakeIPC:
-    """Records close/free calls and optionally injects failures.
-
-    ``events`` records every call in order as ``("close", ptr)`` or
-    ``("free", ptr)`` so tests can assert exact teardown ordering.
-    """
-
     def __init__(
-        self,
-        *,
-        close_fail_ptrs: Sequence[int] = (),
-        free_fail_ptrs: Sequence[int] = (),
+        self, *, close_fail: int = 0, free_fail: int = 0
     ) -> None:
         self.events: list[tuple[str, int]] = []
-        self._close_fail = set(close_fail_ptrs)
-        self._free_fail = set(free_fail_ptrs)
+        self._cf = close_fail
+        self._ff = free_fail
 
     @property
-    def closed(self) -> list[int]:
-        return [ptr for op, ptr in self.events if op == "close"]
+    def closed(self):
+        return [p for op, p in self.events if op == "close"]
 
     @property
-    def freed(self) -> list[int]:
-        return [ptr for op, ptr in self.events if op == "free"]
+    def freed(self):
+        return [p for op, p in self.events if op == "free"]
 
-    def cudaIpcCloseMemHandle(self, ptr: int) -> None:
+    def cudaIpcCloseMemHandle(self, ptr):
         self.events.append(("close", ptr))
-        if ptr in self._close_fail:
-            raise RuntimeError(f"injected unmap failure for ptr {ptr}")
+        if ptr == self._cf:
+            raise RuntimeError(f"injected unmap failure for {ptr}")
 
-    def cudaFree(self, ptr: int) -> None:
+    def cudaFree(self, ptr):
         self.events.append(("free", ptr))
-        if ptr in self._free_fail:
-            raise RuntimeError(f"injected free failure for ptr {ptr}")
+        if ptr == self._ff:
+            raise RuntimeError(f"injected free failure for {ptr}")
 
 
-def _make_channel(
-    ipc: _FakeIPC | None,
-    owned: Sequence[_OwnedSharedBuffer],
-    *,
-    exchange_group=None,
-) -> PCIeDCPTopKOwnerExchange:
-    """Construct a CPU DCP top-k channel with injected IPC and buffers."""
-    ch = PCIeDCPTopKOwnerExchange(
-        rank=0,
-        world_size=2,
-        device="cpu",
-        signal_ptrs=(10, 20),
-        staging0_ptrs=(30, 40),
-        staging1_ptrs=(62, 72),
-        max_rows=8,
-        topk=4,
-        ipc=ipc,
-        owned_buffers=owned,
-        exchange_group=exchange_group,
-        stream_affine=False,
+def _buf(local=1000, remote=0):
+    return _OwnedSharedBuffer(
+        local_ptr=local,
+        peer_ptrs=(local, remote) if remote else (local,),
+        remote_ptrs=(remote,) if remote else (),
     )
-    return ch
 
 
-def _buffers() -> list[_OwnedSharedBuffer]:
-    return [
-        _OwnedSharedBuffer(local_ptr=1000, peer_ptrs=(1000, 2000), remote_ptrs=(2000,)),
-        _OwnedSharedBuffer(local_ptr=3000, peer_ptrs=(3000, 4000), remote_ptrs=(4000,)),
-    ]
+def _ch(ipc, owned, *, group=None, ws=2, rank=0, ticket=False):
+    c = PCIeDCPTopKOwnerExchange(
+        rank=rank, world_size=ws, device="cpu",
+        signal_ptrs=tuple(10 + i * 10 for i in range(ws)),
+        staging0_ptrs=tuple(30 + i * 10 for i in range(ws)),
+        staging1_ptrs=tuple(62 + i * 10 for i in range(ws)),
+        max_rows=8, topk=4, ipc=ipc, owned_buffers=owned,
+        exchange_group=group, stream_affine=False,
+    )
+    if ticket:
+        c._has_collective_ipc_ticket = True
+    return c
+
+
+class _CP:
+    """Fake 2-rank control plane with per-round shared barriers.
+
+    When any rank raises during a barrier or exchange, all barriers are
+    aborted so the peer thread also receives a BrokenBarrierError instead
+    of hanging indefinitely.
+    """
+
+    def __init__(self, ws=2):
+        self.ws = ws
+        self._bi = 0
+        self._ei = 0
+        self._lk = threading.Lock()
+        self._b: list[threading.Barrier] = []
+        self._eb: list[threading.Barrier] = []
+        self._ed: list[list[object]] = []
+        self._local = threading.local()
+
+    def _get_barrier(self):
+        i = getattr(self._local, "barrier_index", 0)
+        self._local.barrier_index = i + 1
+        with self._lk:
+            while i >= len(self._b):
+                self._b.append(threading.Barrier(self.ws))
+            return self._b[i]
+
+    def dist_barrier(self, *, group=None):
+        b = self._get_barrier()
+        try:
+            b.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            raise RuntimeError(
+                "collective barrier broken by peer failure"
+            ) from None
+
+    def gather(self, obj, group=None):
+        i = getattr(self._local, "exchange_index", 0)
+        self._local.exchange_index = i + 1
+        with self._lk:
+            while i >= len(self._eb):
+                self._eb.append(threading.Barrier(self.ws))
+                self._ed.append([None] * self.ws)
+            b, d = self._eb[i], self._ed[i]
+        try:
+            s = b.wait(timeout=10)
+            d[s] = obj
+            b.wait(timeout=10)
+            b.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            raise RuntimeError(
+                "collective exchange broken by peer failure"
+            ) from None
+        return list(d)
+
+    def abort(self):
+        """Abort all barriers so peer threads don't hang."""
+        for b in self._b:
+            b.abort()
+        for b in self._eb:
+            b.abort()
+
+    def reset(self):
+        with self._lk:
+            self._local = threading.local()
+            self._b.clear()
+            self._eb.clear()
+            self._ed.clear()
+
+
+def _patch(monkeypatch, cp):
+    monkeypatch.setattr("b12x.comm.pcie.pcie_dcp_topk.dist.barrier", cp.dist_barrier)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", cp.gather
+    )
+
+
+def _rank(monkeypatch, cp, rank, *, cf=0, ff=0):
+    ipc = _FakeIPC(close_fail=cf, free_fail=ff)
+    local = 1000 + rank * 1000
+    remote = 1000 + (1 - rank) * 1000
+    c = _ch(ipc, [_buf(local, remote)], group=object(), rank=rank, ticket=True)
+    return c, ipc
 
 
 # ---------------------------------------------------------------------------
-# Ordering: unmap before free
+# Single-rank tests (world_size=1 fake control plane, group=object())
 # ---------------------------------------------------------------------------
 
 
-def test_close_unmaps_all_imports_before_freeing_any_export():
-    """Every cudaIpcCloseMemHandle must precede every cudaFree."""
+def test_unmap_before_free(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
     ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    ch.close()
-
-    # All remote pointers were closed.
-    assert sorted(ipc.closed) == [2000, 4000]
-    # All local pointers were freed.
-    assert sorted(ipc.freed) == [1000, 3000]
-    # The event log proves all closes precede all frees.
-    close_events = [i for i, (op, _) in enumerate(ipc.events) if op == "close"]
-    free_events = [i for i, (op, _) in enumerate(ipc.events) if op == "free"]
-    assert max(close_events) < min(free_events)
-    assert ch._coordinated_close_complete
-    assert ch._ipc_imports_closed
-    assert ch._ipc_exports_freed
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
+    c.close()
+    assert sorted(ipc.closed) == [2000]
+    assert sorted(ipc.freed) == [1000]
+    ci = [i for i, (op, _) in enumerate(ipc.events) if op == "close"]
+    fi = [i for i, (op, _) in enumerate(ipc.events) if op == "free"]
+    assert max(ci) < min(fi)
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
 
 
-def test_unmap_failure_blocks_all_export_frees():
-    """If any unmap fails, no cudaFree is called on any buffer."""
-    ipc = _FakeIPC(close_fail_ptrs=(2000,))
-    ch = _make_channel(ipc, _buffers())
-
+def test_unmap_failure_blocks_free(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(close_fail=2000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC import close"):
-        ch.close()
-
-    # The failing import was attempted but the other succeeded.
-    assert 2000 in ipc.closed
-    assert 4000 in ipc.closed
-    # Critical: NO export was freed.
+        c.close()
     assert ipc.freed == []
-    # Channel is closed (non-reusable) but exports are NOT freed.
-    assert ch._closed
-    assert not ch._ipc_exports_freed
-    assert not ch._coordinated_close_complete
-    # Owned buffers are retained.
-    assert [b.local_ptr for b in ch._owned_buffers] == [1000, 3000]
+    assert c._lifecycle_state == _ChannelLifecycle.FAILED
+    assert [b.local_ptr for b in c._owned_buffers] == [1000]
 
 
-def test_free_failure_retains_export_and_propagates():
-    """If a free fails, the buffer is retained and the error propagates."""
-    ipc = _FakeIPC(free_fail_ptrs=(1000,))
-    ch = _make_channel(ipc, _buffers())
-
+def test_free_failure_retains(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(free_fail=1000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC export free"):
-        ch.close()
-
-    # Unmap succeeded for all.
-    assert sorted(ipc.closed) == [2000, 4000]
-    # Free was attempted.
+        c.close()
     assert 1000 in ipc.freed
-    assert 3000 in ipc.freed
-    # The failing export is retained.
-    assert 1000 in [b.local_ptr for b in ch._owned_buffers]
-    assert 3000 not in [b.local_ptr for b in ch._owned_buffers]
-    assert not ch._ipc_exports_freed
-    assert not ch._coordinated_close_complete
+    assert 1000 in [b.local_ptr for b in c._owned_buffers]
+    assert c._lifecycle_state == _ChannelLifecycle.FAILED
 
 
-def test_unmap_failure_on_second_buffer_still_closes_first():
-    """Partial unmap success is tracked; failed imports remain open."""
-    ipc = _FakeIPC(close_fail_ptrs=(4000,))
-    ch = _make_channel(ipc, _buffers())
+def test_no_ipc_runtime_blocks(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    c = _ch(None, [_buf(1000, 2000)], group=object(), ticket=True)
+    with pytest.raises(RuntimeError, match="CUDA runtime is unavailable"):
+        c.close()
+    assert c._lifecycle_state == _ChannelLifecycle.FAILED
 
+
+def test_local_only_no_group_can_close():
+    """A channel with only local exports (no remote imports) closes fine."""
+    ipc = _FakeIPC()
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    c.close()
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert ipc.freed == [1000]
+
+
+def test_remote_imports_require_group_at_construction():
+    ipc = _FakeIPC()
+    with pytest.raises(ValueError, match="exchange_group is required"):
+        _ch(ipc, [_buf(1000, 2000)], group=None, ticket=True)
+    assert ipc.events == []
+
+
+# ---------------------------------------------------------------------------
+# Double / concurrent close
+# ---------------------------------------------------------------------------
+
+
+def test_double_close_idempotent():
+    ipc = _FakeIPC()
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    c.close()
+    first = list(ipc.freed)
+    c.close()
+    assert ipc.freed == first
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
+
+
+def test_close_after_failure_re_raises(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(close_fail=2000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC import close"):
-        ch.close()
-
-    assert 2000 in ipc.closed  # succeeded
-    assert 4000 in ipc.closed  # attempted
-    assert ipc.freed == []
-    # The successfully closed import is tracked; the failed one is not.
-    assert (0, 0) in ch._closed_ipc_import_indices  # buffer 0, remote 0
-    assert (1, 0) not in ch._closed_ipc_import_indices  # buffer 1, remote 0
+        c.close()
+    with pytest.raises(RuntimeError, match="IPC import close"):
+        c.close()
 
 
-# ---------------------------------------------------------------------------
-# Error propagation: no suppression
-# ---------------------------------------------------------------------------
-
-
-def test_no_ipc_runtime_blocks_unmap_and_free():
-    """Missing CUDA runtime prevents both unmap and free with errors."""
-    ch = _make_channel(None, _buffers())
-
-    with pytest.raises(RuntimeError, match="CUDA runtime is unavailable for IPC unmap"):
-        ch.close()
-
-    assert ch._closed
-    assert not ch._ipc_imports_closed
-    assert not ch._ipc_exports_freed
-    assert not ch._coordinated_close_complete
-    assert [b.local_ptr for b in ch._owned_buffers] == [1000, 3000]
-
-
-def test_free_failure_after_successful_unmap_retains_buffer():
-    """Free failure after full unmap success retains the export."""
-    ipc = _FakeIPC(free_fail_ptrs=(3000,))
-    ch = _make_channel(ipc, _buffers())
-
-    with pytest.raises(RuntimeError, match="IPC export free"):
-        ch.close()
-
-    assert sorted(ipc.closed) == [2000, 4000]
-    assert sorted(ipc.freed) == [1000, 3000]
-    # 1000 freed, 3000 retained.
-    assert [b.local_ptr for b in ch._owned_buffers] == [3000]
-    assert ch._ipc_imports_closed
-    assert not ch._ipc_exports_freed
-
-
-# ---------------------------------------------------------------------------
-# Double / out-of-order / concurrent close
-# ---------------------------------------------------------------------------
-
-
-def test_double_close_is_idempotent():
-    """A second close() does not issue additional IPC calls."""
+def test_closed_rejects_stage():
     ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    ch.close()
-    assert ch._coordinated_close_complete
-
-    first_closed = list(ipc.closed)
-    first_freed = list(ipc.freed)
-
-    ch.close()  # should be a no-op
-
-    assert ipc.closed == first_closed
-    assert ipc.freed == first_freed
-    assert ch._coordinated_close_complete
-
-
-def test_close_coordinated_is_also_idempotent():
-    """close_coordinated() respects the same completion guard."""
-    ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    ch.close_coordinated()
-    assert ch._coordinated_close_complete
-
-    first_closed = list(ipc.closed)
-    first_freed = list(ipc.freed)
-
-    ch.close_coordinated()
-
-    assert ipc.closed == first_closed
-    assert ipc.freed == first_freed
-
-
-def test_closed_channel_cannot_stage_candidates():
-    """After close, stage_candidates raises RuntimeError, not silent reuse."""
-    ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-    ch.close()
-    assert ch._closed
-
-    indices = torch.zeros(8, 4, dtype=torch.int32)
-    scores = torch.zeros(8, 4, dtype=torch.float32)
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    c.close()
     with pytest.raises(RuntimeError, match="closed"):
-        ch.stage_candidates(indices, scores)
+        c.stage_candidates(
+            torch.zeros(8, 4, dtype=torch.int32),
+            torch.zeros(8, 4, dtype=torch.float32),
+        )
 
 
-def test_failed_close_channel_cannot_stage_candidates():
-    """A channel whose unmap failed is closed and cannot be reused."""
-    ipc = _FakeIPC(close_fail_ptrs=(2000,))
-    ch = _make_channel(ipc, _buffers())
-
+def test_failed_rejects_stage(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(close_fail=2000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC import close"):
-        ch.close()
+        c.close()
+    with pytest.raises(RuntimeError, match="failed"):
+        c.stage_candidates(
+            torch.zeros(8, 4, dtype=torch.int32),
+            torch.zeros(8, 4, dtype=torch.float32),
+        )
 
-    assert ch._closed
-    indices = torch.zeros(8, 4, dtype=torch.int32)
-    scores = torch.zeros(8, 4, dtype=torch.float32)
+
+def test_concurrent_close_single_gen():
+    ipc = _FakeIPC()
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    res: list[Exception | None] = []
+
+    def do():
+        try:
+            c.close()
+            res.append(None)
+        except Exception as e:
+            res.append(e)
+
+    t1 = threading.Thread(target=do)
+    t2 = threading.Thread(target=do)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert all(r is None for r in res)
+    assert len(ipc.freed) == 1
+
+
+def test_concurrent_close_failure_propagates(monkeypatch):
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(free_fail=1000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
+    errs: list[Exception | None] = []
+
+    def do():
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            errs.append(e)
+
+    t1 = threading.Thread(target=do)
+    t2 = threading.Thread(target=do)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert c._lifecycle_state == _ChannelLifecycle.FAILED
+    assert all(e is not None for e in errs)
+
+
+# ---------------------------------------------------------------------------
+# Retry from FAILED
+# ---------------------------------------------------------------------------
+
+
+def test_retry_from_failed(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, ipc0 = _rank(monkeypatch, cp, 0, ff=1000)
+    c1, ipc1 = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
+
+    def do(c):
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            cp.abort()
+            errs.append(e)
+
+    t0 = threading.Thread(target=do, args=(c0,))
+    t1 = threading.Thread(target=do, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is not None for e in errs)
+    assert c0._lifecycle_state == _ChannelLifecycle.FAILED
+
+    cp.reset()
+    ipc0._ff = 0
+    rerrs: list[Exception | None] = []
+
+    def do_retry(c):
+        try:
+            c.retry_close()
+            rerrs.append(None)
+        except Exception as e:
+            cp.abort()
+            rerrs.append(e)
+
+    t0 = threading.Thread(target=do_retry, args=(c0,))
+    t1 = threading.Thread(target=do_retry, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is None for e in rerrs), f"retry: {rerrs}"
+    assert c0._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert c1._lifecycle_state == _ChannelLifecycle.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Launch vs close
+# ---------------------------------------------------------------------------
+
+
+class _Blocking(PCIeDCPTopKOwnerExchange):
+    def __init__(self, **kw):
+        super().__init__(
+            rank=0, world_size=2, device="cpu",
+            signal_ptrs=(10, 20), staging0_ptrs=(30, 40),
+            staging1_ptrs=(62, 72), max_rows=8, topk=4, **kw,
+        )
+        sh = (self.max_owner_rows, self.world_size * self.topk)
+        self._candidate_views = tuple(
+            (torch.empty(sh, dtype=torch.int32),
+             torch.empty(sh, dtype=torch.float32))
+            for _ in range(2)
+        )
+        self._ls = threading.Event()
+        self._lr = threading.Event()
+
+    def _launch_stage(self, *a, **kw):
+        self._ls.set()
+        self._lr.wait(timeout=5)
+
+
+def test_close_waits_for_launch():
+    c = _Blocking(stream_affine=False)
+    done = threading.Event()
+
+    def launch():
+        c.stage_candidates(
+            torch.zeros(8, 4, dtype=torch.int32),
+            torch.zeros(8, 4, dtype=torch.float32),
+            threads=128, block_limit=1,
+        )
+        done.set()
+
+    def close():
+        c._ls.wait(timeout=5)
+        c._lr.set()
+        c.close()
+
+    tl = threading.Thread(target=launch)
+    tc = threading.Thread(target=close)
+    tl.start()
+    c._ls.wait(timeout=5)
+    tc.start()
+    tl.join(timeout=10)
+    tc.join(timeout=10)
+    assert done.is_set()
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
+
+
+def test_closing_rejects_launch():
+    c = _Blocking(stream_affine=False)
+    with c._lifecycle_lock:
+        c._lifecycle_state = _ChannelLifecycle.CLOSING
+        c._close_generation += 1
+    with pytest.raises(RuntimeError, match="closing"):
+        c.stage_candidates(
+            torch.zeros(8, 4, dtype=torch.int32),
+            torch.zeros(8, 4, dtype=torch.float32),
+            threads=128, block_limit=1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Replay vs close
+# ---------------------------------------------------------------------------
+
+
+class _FakeGraph:
+    def __init__(self):
+        self.n = 0
+
+    def replay(self):
+        self.n += 1
+
+
+def test_unregistered_graph_replay_is_rejected():
+    c = _Blocking(stream_affine=False)
+    with pytest.raises(RuntimeError, match="was not registered"):
+        c.replay(_FakeGraph())
+
+
+def test_registered_graph_replays():
+    c = _Blocking(stream_affine=False)
+    graph = _FakeGraph()
+    c.register_graph(graph)
+    c.replay(graph)
+    assert graph.n == 1
+
+
+def test_replay_rejected_after_close():
+    c = _Blocking(stream_affine=False)
+    c._has_collective_ipc_ticket = True
+    c.close()
     with pytest.raises(RuntimeError, match="closed"):
-        ch.stage_candidates(indices, scores)
+        c.replay(_FakeGraph())
 
 
-def test_close_after_partial_unmap_failure_does_not_free_exports():
-    """Retrying close after a partial unmap failure does not free exports."""
-    ipc = _FakeIPC(close_fail_ptrs=(2000,))
-    ch = _make_channel(ipc, _buffers())
+def test_close_waits_for_replay():
+    c = _Blocking(stream_affine=False)
+    c._has_collective_ipc_ticket = True
+    rs = threading.Event()
+    rr = threading.Event()
+    cd = threading.Event()
 
-    with pytest.raises(RuntimeError, match="IPC import close"):
-        ch.close()
+    def replay():
+        with c._replay_gate():
+            rs.set()
+            rr.wait(timeout=5)
 
-    # Exports are still alive.
-    assert [b.local_ptr for b in ch._owned_buffers] == [1000, 3000]
-    assert ipc.freed == []
+    def close():
+        rs.wait(timeout=5)
+        rr.set()
+        c.close()
+        cd.set()
 
-    # Even if we fix the IPC and retry, the channel should not silently free
-    # without going through the coordinated protocol again.  Since
-    # _coordinated_close_complete is False, close() re-enters the protocol.
-    ipc._close_fail = set()  # fix the failure
-    ch.close()
-    # Now the retry should succeed and free everything.
-    assert ch._coordinated_close_complete
-    assert sorted(ipc.freed) == [1000, 3000]
+    tr = threading.Thread(target=replay)
+    tc = threading.Thread(target=close)
+    tr.start()
+    rs.wait(timeout=5)
+    tc.start()
+    tr.join(timeout=10)
+    tc.join(timeout=10)
+    assert cd.is_set()
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
 
 
-def test_concurrent_close_does_not_double_free():
-    """Two close() calls on a channel that completes simultaneously do not
-    issue duplicate IPC calls."""
+# ---------------------------------------------------------------------------
+# Destructor quarantine
+# ---------------------------------------------------------------------------
+
+
+def test_destructor_quarantines_incomplete():
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
     ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    # Simulate concurrent close: the completion guard makes the second a no-op.
-    ch.close()
-    # Manually simulate a racing second close that sees the flag after the
-    # first has set it.
-    assert ch._coordinated_close_complete
-    ch.close()
-
-    assert len(ipc.closed) == 2  # exactly 2 remote pointers, once each
-    assert len(ipc.freed) == 2  # exactly 2 local pointers, once each
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
+    cid = id(c)
+    del c
+    gc.collect()
+    r = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(cid, None)
+    assert r is not None
+    r._coordinated_close_complete = True
+    del r
 
 
-def test_out_of_order_close_retains_exports_until_unmap_acknowledged():
-    """A channel closed before its peer unmapped must not free exports."""
-    ipc = _FakeIPC(close_fail_ptrs=(2000,))
-    ch = _make_channel(ipc, _buffers())
+def test_destructor_no_quarantine_after_close():
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
+    ipc = _FakeIPC()
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    c.close()
+    cid = id(c)
+    del c
+    gc.collect()
+    assert cid not in _ABANDONED_PCIE_RUNTIME_QUARANTINE
 
+
+def test_destructor_quarantines_failed(monkeypatch):
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(close_fail=2000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC import close"):
-        ch.close()
-
-    # The export for the buffer whose import failed to close is still alive.
-    assert any(b.local_ptr == 1000 for b in ch._owned_buffers)
-    assert any(b.local_ptr == 3000 for b in ch._owned_buffers)
-    assert ipc.freed == []
-
-
-# ---------------------------------------------------------------------------
-# Strict method direct invocation
-# ---------------------------------------------------------------------------
+        c.close()
+    cid = id(c)
+    del c
+    gc.collect()
+    r = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(cid, None)
+    assert r is not None
+    r._coordinated_close_complete = True
+    del r
 
 
-def test_strict_unmap_direct_propagates_error():
-    ipc = _FakeIPC(close_fail_ptrs=(2000,))
-    ch = _make_channel(ipc, _buffers())
-
-    with pytest.raises(RuntimeError, match="IPC import close"):
-        ch._close_ipc_imports_strict()
-
-    assert ch._closed
-    assert not ch._ipc_imports_closed
-    assert ipc.freed == []
-
-
-def test_strict_free_direct_propagates_error():
-    ipc = _FakeIPC(free_fail_ptrs=(1000,))
-    ch = _make_channel(ipc, _buffers())
-
+def test_destructor_quarantines_locally_freed_failed(monkeypatch):
+    _ABANDONED_PCIE_RUNTIME_QUARANTINE.clear()
+    cp = _CP(ws=1)
+    _patch(monkeypatch, cp)
+    ipc = _FakeIPC(free_fail=1000)
+    c = _ch(ipc, [_buf(1000, 2000)], group=object(), ticket=True)
     with pytest.raises(RuntimeError, match="IPC export free"):
-        ch._free_ipc_exports_strict()
+        c.close()
+    cid = id(c)
+    del c
+    gc.collect()
+    r = _ABANDONED_PCIE_RUNTIME_QUARANTINE.pop(cid, None)
+    assert r is not None
+    r._coordinated_close_complete = True
+    del r
 
-    assert 1000 in [b.local_ptr for b in ch._owned_buffers]
-    assert not ch._ipc_exports_freed
+
+# ---------------------------------------------------------------------------
+# Context manager
+# ---------------------------------------------------------------------------
 
 
-def test_strict_unmap_idempotent_after_success():
+def test_context_manager():
     ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    ch._close_ipc_imports_strict()
-    assert ch._ipc_imports_closed
-    first_closed = list(ipc.closed)
-
-    ch._close_ipc_imports_strict()  # should be no-op
-    assert ipc.closed == first_closed
+    c = _ch(ipc, [_buf(1000)], group=None, ticket=True)
+    with c as ctx:
+        assert ctx is c
+        assert c._lifecycle_state == _ChannelLifecycle.OPEN
+    assert c._lifecycle_state == _ChannelLifecycle.CLOSED
 
 
-def test_strict_free_idempotent_after_success():
-    ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-
-    ch._close_ipc_imports_strict()
-    ch._free_ipc_exports_strict()
-    assert ch._ipc_exports_freed
-    first_freed = list(ipc.freed)
-
-    ch._free_ipc_exports_strict()  # should be no-op
-    assert ipc.freed == first_freed
+# ---------------------------------------------------------------------------
+# 2-rank tests
+# ---------------------------------------------------------------------------
 
 
-def test_candidate_views_cleared_on_free():
-    """Freeing exports clears candidate views so stale tensors are released."""
-    ipc = _FakeIPC()
-    ch = _make_channel(ipc, _buffers())
-    # CPU channels start with empty candidate views.
-    ch._candidate_views = (
-        (torch.empty(1, dtype=torch.int32), torch.empty(1, dtype=torch.float32)),
-    )
-    assert ch._candidate_views
+def test_two_rank_unmap_before_free(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, ipc0 = _rank(monkeypatch, cp, 0)
+    c1, ipc1 = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
 
-    ch.close()
-    assert ch._candidate_views == ()
+    def do(c):
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            errs.append(e)
+
+    t0 = threading.Thread(target=do, args=(c0,))
+    t1 = threading.Thread(target=do, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is None for e in errs), f"errors: {errs}"
+    for ipc in (ipc0, ipc1):
+        ci = [i for i, (op, _) in enumerate(ipc.events) if op == "close"]
+        fi = [i for i, (op, _) in enumerate(ipc.events) if op == "free"]
+        if ci and fi:
+            assert max(ci) < min(fi)
+    assert c0._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert c1._lifecycle_state == _ChannelLifecycle.CLOSED
+
+
+def test_two_rank_asymmetric_unmap(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, ipc0 = _rank(monkeypatch, cp, 0, cf=2000)
+    c1, ipc1 = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
+
+    def do(c):
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            cp.abort()
+            errs.append(e)
+
+    t0 = threading.Thread(target=do, args=(c0,))
+    t1 = threading.Thread(target=do, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is not None for e in errs), f"expected errors: {errs}"
+    assert ipc0.freed == []
+    assert ipc1.freed == []
+    assert c0._lifecycle_state == _ChannelLifecycle.FAILED
+    assert c1._lifecycle_state == _ChannelLifecycle.FAILED
+
+
+
+def test_two_rank_asymmetric_free(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, ipc0 = _rank(monkeypatch, cp, 0, ff=1000)
+    c1, ipc1 = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
+
+    def do(c):
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            errs.append(e)
+            cp.abort()
+
+    t0 = threading.Thread(target=do, args=(c0,))
+    t1 = threading.Thread(target=do, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is not None for e in errs)
+    assert 1000 in ipc0.freed
+    assert 1000 in [b.local_ptr for b in c0._owned_buffers]
+    assert c0._lifecycle_state == _ChannelLifecycle.FAILED
+    assert c1._lifecycle_state == _ChannelLifecycle.FAILED
+
+
+def test_two_rank_concurrent_close(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, _ = _rank(monkeypatch, cp, 0)
+    c1, _ = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
+
+    def close_twice():
+        def once():
+            try:
+                c0.close()
+                errs.append(None)
+            except Exception as e:
+                errs.append(e)
+
+        ta = threading.Thread(target=once)
+        tb = threading.Thread(target=once)
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+
+    c1_errs: list[Exception] = []
+
+    def close1():
+        try:
+            c1.close()
+        except Exception as exc:
+            c1_errs.append(exc)
+
+    t0 = threading.Thread(target=close_twice)
+    t1 = threading.Thread(target=close1)
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is None for e in errs), f"c0 errors: {errs}"
+    assert not c1_errs, f"c1 errors: {c1_errs}"
+    assert c0._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert c1._lifecycle_state == _ChannelLifecycle.CLOSED
+
+
+def test_two_rank_retry_after_failure(monkeypatch):
+    cp = _CP(ws=2)
+    _patch(monkeypatch, cp)
+    c0, ipc0 = _rank(monkeypatch, cp, 0, ff=1000)
+    c1, ipc1 = _rank(monkeypatch, cp, 1)
+    errs: list[Exception | None] = []
+
+    def do(c):
+        try:
+            c.close()
+            errs.append(None)
+        except Exception as e:
+            cp.abort()
+            errs.append(e)
+
+    t0 = threading.Thread(target=do, args=(c0,))
+    t1 = threading.Thread(target=do, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is not None for e in errs)
+    assert c0._lifecycle_state == _ChannelLifecycle.FAILED
+
+    cp.reset()
+    ipc0._ff = 0
+    rerrs: list[Exception | None] = []
+
+    def do_retry(c):
+        try:
+            c.retry_close()
+            rerrs.append(None)
+        except Exception as e:
+            rerrs.append(e)
+
+    t0 = threading.Thread(target=do_retry, args=(c0,))
+    t1 = threading.Thread(target=do_retry, args=(c1,))
+    t0.start()
+    t1.start()
+    t0.join(timeout=10)
+    t1.join(timeout=10)
+
+    assert all(e is None for e in rerrs), f"retry: {rerrs}"
+    assert c0._lifecycle_state == _ChannelLifecycle.CLOSED
+    assert c1._lifecycle_state == _ChannelLifecycle.CLOSED

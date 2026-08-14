@@ -15,10 +15,13 @@ from b12x.comm.pcie.pcie_dcp_topk import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_DCP_TOPK_TEST") != "1",
-    reason="set B12X_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.getenv("B12X_RUN_PCIE_DCP_TOPK_TEST") != "1",
+        reason="set B12X_RUN_PCIE_DCP_TOPK_TEST=1 to run GPU tests",
+    ),
+    pytest.mark.usefixtures("require_real_cutlass"),
+]
 
 MAX_ROWS = 64
 TOPK = 2048
@@ -197,6 +200,7 @@ def _worker(
         # contributes the only additional kernel; the two consumers are memcpy
         # nodes. The fixed-slot safety barrier is part of the transport kernel.
         assert _cuda_graph_kernel_count(graph) == 1 + int(dcp_rank == 0)
+        graph_owner.register_graph(graph)
         assert graph_owner._graph_slot is not None
         graph_views = graph_owner._candidate_views[graph_owner._graph_slot]
         assert (
@@ -227,7 +231,7 @@ def _worker(
             next_indices, next_scores = replay_inputs[replay_idx]
             graph_indices.copy_(next_indices)
             graph_scores.copy_(next_scores)
-            graph.replay()
+            graph_owner.replay(graph)
             replayed_indices[replay_idx].copy_(consumed_indices)
             replayed_scores[replay_idx].copy_(consumed_scores)
         torch.cuda.synchronize(device)
