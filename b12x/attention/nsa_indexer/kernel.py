@@ -980,7 +980,11 @@ class SparseNSAPagedLogitsKernel:
                     source_page_col < Int32(real_page_table.shape[1])
                 ):
                     page_id = Int32(real_page_table[q_idx, source_page_col])
-                    if page_id >= Int32(0):
+                    if (
+                        (page_id >= Int32(0))
+                        & (page_id < Int32(k_quant_bytes.shape[0]))
+                        & (page_id < Int32(k_scales.shape[0]))
+                    ):
                         if use_scalar_k_load_flag != Int32(0):
                             _load_index_k_page_scalar(
                                 k_quant_bytes,
@@ -1418,7 +1422,11 @@ class SparseNSAScheduledSingleRowLogitsKernel:
                 page_base = page_col * Int32(_PAGE_SIZE)
                 if page_base < seq_len:
                     page_id = Int32(real_page_table[Int32(0), page_col])
-                    if page_id >= Int32(0):
+                    if (
+                        (page_id >= Int32(0))
+                        & (page_id < Int32(k_quant_bytes.shape[0]))
+                        & (page_id < Int32(k_scales.shape[0]))
+                    ):
                         if use_scalar_k_load_flag != Int32(0):
                             _load_index_k_page_scalar(
                                 k_quant_bytes,
@@ -1806,7 +1814,11 @@ class SparseNSAScheduledMultiRowLogitsKernel:
                         page_base = page_col * Int32(_PAGE_SIZE)
                         if page_base < seq_len:
                             page_id = Int32(real_page_table[current_q_idx, page_col])
-                            if page_id >= Int32(0):
+                            if (
+                                (page_id >= Int32(0))
+                                & (page_id < Int32(k_quant_bytes.shape[0]))
+                                & (page_id < Int32(k_scales.shape[0]))
+                            ):
                                 if use_scalar_k_load_flag != Int32(0):
                                     _load_index_k_page_scalar(
                                         k_quant_bytes,
@@ -3453,7 +3465,11 @@ class SparseNSAPagedStreamLogitsKernel:
                     src_col0 < Int32(real_page_table.shape[1])
                 ):
                     page_id0 = Int32(real_page_table[q_idx, src_col0])
-                    if page_id0 >= Int32(0):
+                    if (
+                        (page_id0 >= Int32(0))
+                        & (page_id0 < Int32(k_quant_bytes.shape[0]))
+                        & (page_id0 < Int32(k_scales.shape[0]))
+                    ):
                         _stream_issue_k_page_cp_async(
                             k_quant_bytes,
                             k_scales,
@@ -3487,7 +3503,11 @@ class SparseNSAPagedStreamLogitsKernel:
                         src_col_n < Int32(real_page_table.shape[1])
                     ):
                         page_id_n = Int32(real_page_table[q_idx, src_col_n])
-                        if page_id_n >= Int32(0):
+                        if (
+                            (page_id_n >= Int32(0))
+                            & (page_id_n < Int32(k_quant_bytes.shape[0]))
+                            & (page_id_n < Int32(k_scales.shape[0]))
+                        ):
                             _stream_issue_k_page_cp_async(
                                 k_quant_bytes,
                                 k_scales,
@@ -3513,7 +3533,12 @@ class SparseNSAPagedStreamLogitsKernel:
                     if (page_base < seq_len) & (
                         src_col < Int32(real_page_table.shape[1])
                     ):
-                        if Int32(real_page_table[q_idx, src_col]) >= Int32(0):
+                        page_id = Int32(real_page_table[q_idx, src_col])
+                        if (
+                            (page_id >= Int32(0))
+                            & (page_id < Int32(k_quant_bytes.shape[0]))
+                            & (page_id < Int32(k_scales.shape[0]))
+                        ):
                             consume = Int32(1)
                 if consume != Int32(0):
                     valid_slots = seq_len - page_base

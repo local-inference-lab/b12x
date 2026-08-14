@@ -217,6 +217,7 @@ def _plan_two_level_fold(
         "page_table_width",
         "source_page_offset",
         "cache_row_stride_bytes",
+        "num_cache_pages",
     ]
 )
 def _gather_shared_paged_supertile_kernel(
@@ -235,6 +236,7 @@ def _gather_shared_paged_supertile_kernel(
     page_size: tl.constexpr,
     index_head_dim: tl.constexpr,
     cache_row_stride_bytes,
+    num_cache_pages,
     cache_data_bytes: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -248,7 +250,7 @@ def _gather_shared_paged_supertile_kernel(
         mask=token_mask & (page_cols < page_table_width),
         other=-1,
     )
-    valid_tokens = token_mask & (page_ids >= 0)
+    valid_tokens = token_mask & (page_ids >= 0) & (page_ids < num_cache_pages)
     # Packed multi-group allocations can span more than 4 GiB. Keep address
     # math 64-bit even though the logical page IDs themselves are int32.
     page_byte_offsets = page_ids.to(tl.int64) * cache_row_stride_bytes
@@ -631,6 +633,7 @@ def _prepare_shared_paged_supertile(
         PAGED_INDEX_PAGE_SIZE,
         INDEX_HEAD_DIM,
         int(index_k_cache.stride(0)),
+        int(index_k_cache.shape[0]),
         _PAGED_INDEX_CACHE_DATA_BYTES,
         num_warps=4,
     )
@@ -1083,7 +1086,7 @@ def index_topk_fp8(
                 page_size=page_size,
                 tile_block_q=_PAGED_INDEX_TILE_BLOCK_Q,
                 tile_block_k=_PAGED_INDEX_TILE_BLOCK_K,
-                preinitialize_tile_logits=False,
+                preinitialize_tile_logits=True,
             )
             topk_lengths = lengths_for_kernel
         if not logits.is_contiguous():
@@ -1162,6 +1165,7 @@ def index_topk_fp8(
                     else None
                 ),
                 output_page_size=page_size,
+                output_page_capacity=int(index_k_cache.shape[0]),
             )
 
     return final_raw_indices

@@ -188,6 +188,7 @@ def _emit_global_index_virtual(
     vidx: Int32,
     row_idx: Int32,
     page_size: Int32,
+    output_page_capacity: Int32,
     is_first: cutlass.Constexpr[bool],
     output_physical_slots: cutlass.Constexpr[bool],
 ) -> Int32:
@@ -207,18 +208,30 @@ def _emit_global_index_virtual(
         else:
             gidx = Int32(carry_indices[carry_base + (vidx - chunk_len)])
     if cutlass.const_expr(output_physical_slots):
-        physical_idx = Int32(-1)
-        if gidx >= Int32(0):
-            page_col = gidx // page_size
-            page_offset = gidx - page_col * page_size
-            page_table_index = (
-                Int64(row_idx) * Int64(output_page_table_row_stride)
-                + Int64(page_col)
-            )
-            page_id = Int32(output_page_table[page_table_index])
-            if page_id >= Int32(0):
-                physical_idx = page_id * page_size + page_offset
-        gidx = physical_idx
+        if output_page_capacity <= Int32(0):
+            # Row-fold gather tables contain final indices directly rather
+            # than page IDs; gidx is already bounded by the input extent.
+            if gidx >= Int32(0):
+                table_index = (
+                    Int64(row_idx) * Int64(output_page_table_row_stride)
+                    + Int64(gidx)
+                )
+                gidx = Int32(output_page_table[table_index])
+        else:
+            physical_idx = Int64(-1)
+            if gidx >= Int32(0):
+                page_col = gidx // page_size
+                page_offset = gidx - page_col * page_size
+                page_table_index = (
+                    Int64(row_idx) * Int64(output_page_table_row_stride)
+                    + Int64(page_col)
+                )
+                page_id = Int32(output_page_table[page_table_index])
+                if (page_id >= Int32(0)) & (page_id < output_page_capacity):
+                    candidate = Int64(page_id) * Int64(page_size) + Int64(page_offset)
+                    if candidate <= Int64(2147483647):
+                        physical_idx = candidate
+            gidx = Int32(physical_idx)
     return gidx
 
 
@@ -568,6 +581,7 @@ class SparseNSATiledTopkKernel:
         input_extent,
         output_index_offset,
         output_page_size,
+        output_page_capacity,
         out_row_stride,
         out_row_base,
         stream,
@@ -593,6 +607,7 @@ class SparseNSATiledTopkKernel:
             input_extent,
             output_index_offset,
             output_page_size,
+            output_page_capacity,
             out_row_stride,
             out_row_base,
         ).launch(
@@ -624,6 +639,7 @@ class SparseNSATiledTopkKernel:
         input_extent: Int32,
         output_index_offset: Int32,
         output_page_size: Int32,
+        output_page_capacity: Int32,
         out_row_stride: Int32,
         out_row_base: Int32,
     ):
@@ -783,6 +799,7 @@ class SparseNSATiledTopkKernel:
                         i,
                         bid,
                         output_page_size,
+                        output_page_capacity,
                         self.is_first,
                         self.output_physical_slots,
                     )
@@ -1205,6 +1222,7 @@ class SparseNSATiledTopkKernel:
                     selected0,
                     bid,
                     output_page_size,
+                    output_page_capacity,
                     self.is_first,
                     self.output_physical_slots,
                 )
@@ -1235,6 +1253,7 @@ class SparseNSATiledTopkKernel:
                     selected1,
                     bid,
                     output_page_size,
+                    output_page_capacity,
                     self.is_first,
                     self.output_physical_slots,
                 )
@@ -1310,6 +1329,7 @@ def run_tiled_topk(
     is_first: bool = True,
     output_page_table: torch.Tensor | None = None,
     output_page_size: int = 64,
+    output_page_capacity: int | None = None,
     extent_splits: int = 1,
     output_row_stride: int | None = None,
     output_row_base: int = 0,
@@ -1388,6 +1408,11 @@ def run_tiled_topk(
             raise ValueError(
                 f"output_page_size must be positive, got {output_page_size}"
             )
+        if output_page_capacity is None or int(output_page_capacity) <= 0:
+            raise ValueError(
+                "output_page_capacity must be positive when output_page_table is set"
+            )
+        output_page_capacity = int(output_page_capacity)
         output_page_table_row_stride = int(output_page_table.stride(0))
         if output_page_table_row_stride == 0:
             # A row-shared expanded table has no flattenable multi-row view.
@@ -1401,6 +1426,7 @@ def run_tiled_topk(
         output_page_table_for_kernel = lengths
         output_page_table_row_stride = 0
         output_page_size = 1
+        output_page_capacity = 0
     num_q_tiles = (num_q_rows + block_q - 1) // block_q
     tile_size = block_q * block_k
     total_elements = int(tile_logits.shape[0])
@@ -1535,6 +1561,7 @@ def run_tiled_topk(
         Int32(input_extent),
         Int32(output_index_offset),
         Int32(output_page_size),
+        Int32(output_page_capacity),
         Int32(output_row_stride),
         Int32(output_row_base),
         current_cuda_stream(),
@@ -1556,7 +1583,7 @@ def run_tiled_topk(
             "output_page_table", output_page_table_key_tensor, dynamic=True
         ),
         (
-            "tiled_topk_v27_runtime_page_stride",
+            "tiled_topk_v28_runtime_page_capacity",
             topk,
             block_q,
             block_k,
@@ -1568,7 +1595,7 @@ def run_tiled_topk(
     )
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.tiled_topk",
-        4,
+        5,
         cache_key,
         labels=(
             "input",
@@ -1718,6 +1745,7 @@ def run_row_topk(
         Int32(width),
         Int32(output_index_offset),
         Int32(1),
+        Int32(0),
         Int32(1),
         Int32(0),
         current_cuda_stream(),

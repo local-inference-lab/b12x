@@ -1521,7 +1521,11 @@ class SparseNSAFusedIndexerKernel:
                         pid = Int32(real_page_table[q_idx, pcol])
                 t0 = Float32(0.0)
                 t1 = Float32(0.0)
-                if pid >= Int32(0):
+                if (
+                    (pid >= Int32(0))
+                    & (pid < Int32(k_quant_bytes.shape[0]))
+                    & (pid < Int32(k_scales.shape[0]))
+                ):
                     k_off = Int64(pid) * Int64(self.k_quant_page_stride) + Int64(
                         (tip0 + lane // Int32(4)) * Int32(_INDEX_HEAD_DIM)
                         + lane4 * Int32(4)
@@ -1542,7 +1546,11 @@ class SparseNSAFusedIndexerKernel:
                         if tok_rel < span:
                             val = Float32(-3.4028235e38)
                             gidx = Int32(-1)
-                            if pid >= Int32(0):
+                            if (
+                                (pid >= Int32(0))
+                                & (pid < Int32(k_quant_bytes.shape[0]))
+                                & (pid < Int32(k_scales.shape[0]))
+                            ):
                                 if cutlass.const_expr(cc == 0):
                                     tsel = t0
                                 else:
@@ -1557,7 +1565,12 @@ class SparseNSAFusedIndexerKernel:
                                     tsel * ld_global_nc_f32(scale_addr)
                                 )
                                 if cutlass.const_expr(self.paged_output):
-                                    gidx = pid * Int32(_PAGE_SIZE) + tip0 + col
+                                    physical_idx = (
+                                        Int64(pid) * Int64(_PAGE_SIZE)
+                                        + Int64(tip0 + col)
+                                    )
+                                    if physical_idx <= Int64(2147483647):
+                                        gidx = Int32(physical_idx)
                                 else:
                                     gidx = span_first + tok_rel
                             s_c0_values[carry_count + tok_rel - round_base] = val
@@ -1611,7 +1624,7 @@ class SparseNSAFusedIndexerKernel:
             cur_scale_addr = scales_base_addr
             prev_do = Int32(0)
             prev_valid = Int32(0)
-            prev_out_base = Int32(0)
+            prev_out_base = Int64(0)
             prev_scale_addr = scales_base_addr
             prev_pl2 = Int32(0)
             cur_pl2 = Int32(0)
@@ -1620,7 +1633,11 @@ class SparseNSAFusedIndexerKernel:
                     pid0 = Int32(-1)
                     if page_start < Int32(real_page_table.shape[1]):
                         pid0 = Int32(real_page_table[q_idx, page_start])
-                    if pid0 >= Int32(0):
+                    if (
+                        (pid0 >= Int32(0))
+                        & (pid0 < Int32(k_quant_bytes.shape[0]))
+                        & (pid0 < Int32(k_scales.shape[0]))
+                    ):
                         _stream_issue_k_page_cp_async(
                             k_quant_bytes,
                             k_scales,
@@ -1647,7 +1664,12 @@ class SparseNSAFusedIndexerKernel:
                     page_id = Int32(-1)
                     if page_col < Int32(real_page_table.shape[1]):
                         page_id = Int32(real_page_table[q_idx, page_col])
-                    if (page_id >= Int32(0)) & (valid_slots > Int32(0)):
+                    if (
+                        (page_id >= Int32(0))
+                        & (page_id < Int32(k_quant_bytes.shape[0]))
+                        & (page_id < Int32(k_scales.shape[0]))
+                        & (valid_slots > Int32(0))
+                    ):
                         do_page = Int32(1)
                 else:
                     if valid_slots > Int32(0):
@@ -1670,7 +1692,12 @@ class SparseNSAFusedIndexerKernel:
                     if nxt < page_end:
                         if nxt < Int32(real_page_table.shape[1]):
                             pid_n = Int32(real_page_table[q_idx, nxt])
-                        if (pid_n >= Int32(0)) & (nxt * Int32(_PAGE_SIZE) < seq_len):
+                        if (
+                            (pid_n >= Int32(0))
+                            & (pid_n < Int32(k_quant_bytes.shape[0]))
+                            & (pid_n < Int32(k_scales.shape[0]))
+                            & (nxt * Int32(_PAGE_SIZE) < seq_len)
+                        ):
                             nxt_valid = Int32(1)
                     # stage((p+1) % 3): perm -> k_page -> k_page3 -> perm
                     nk = k_page_base_addr
@@ -1736,9 +1763,13 @@ class SparseNSAFusedIndexerKernel:
                                                 prev_scale_addr + slot_idx * Int32(4)
                                             )
                                         )
-                                        s_c0_gindex[carry_count + slot_idx] = (
-                                            prev_out_base + slot_idx
+                                        output_candidate = (
+                                            prev_out_base + Int64(slot_idx)
                                         )
+                                        output_idx = Int32(-1)
+                                        if output_candidate <= Int64(2147483647):
+                                            output_idx = Int32(output_candidate)
+                                        s_c0_gindex[carry_count + slot_idx] = output_idx
                             carry_count = carry_count + prev_valid
                             prev_do = Int32(0)
                 if do_page != Int32(0):
@@ -1813,9 +1844,9 @@ class SparseNSAFusedIndexerKernel:
                         prev_scale_addr = cur_scale_addr
                         prev_pl2 = cur_pl2
                         cur_pl2 = cur_pl2 ^ Int32(1)
-                        prev_out_base = abs_start + page_base
+                        prev_out_base = Int64(abs_start) + Int64(page_base)
                         if cutlass.const_expr(self.paged_output):
-                            prev_out_base = page_id * Int32(_PAGE_SIZE)
+                            prev_out_base = Int64(page_id) * Int64(_PAGE_SIZE)
                     else:
                         split_idx = Int32(0)
                         while split_idx < Int32(self.page_splits):
@@ -1874,9 +1905,13 @@ class SparseNSAFusedIndexerKernel:
                                             self.kv_layout == KV_LAYOUT_PAGED
                                             and self.paged_output
                                         ):
-                                            output_idx = (
-                                                page_id * Int32(_PAGE_SIZE) + slot_idx
+                                            output_candidate = (
+                                                Int64(page_id) * Int64(_PAGE_SIZE)
+                                                + Int64(slot_idx)
                                             )
+                                            output_idx = Int32(-1)
+                                            if output_candidate <= Int64(2147483647):
+                                                output_idx = Int32(output_candidate)
                                         s_c0_gindex[carry_count + slot_idx] = output_idx
                             # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
                             # barrier — the next page's load barrier (or the trim's leading
@@ -1981,9 +2016,13 @@ class SparseNSAFusedIndexerKernel:
                                         prev_scale_addr + slot_idx * Int32(4)
                                     )
                                 )
-                                s_c0_gindex[carry_count + slot_idx] = (
-                                    prev_out_base + slot_idx
+                                output_candidate = (
+                                    prev_out_base + Int64(slot_idx)
                                 )
+                                output_idx = Int32(-1)
+                                if output_candidate <= Int64(2147483647):
+                                    output_idx = Int32(output_candidate)
+                                s_c0_gindex[carry_count + slot_idx] = output_idx
                     carry_count = carry_count + prev_valid
                 if carry_count > topk_static:
                     cute.arch.sync_threads()

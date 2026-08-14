@@ -400,10 +400,13 @@ def test_index_topk_fp8_graph_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.parametrize("stream_scorer", [False, True])
 def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
     monkeypatch,
+    stream_scorer: bool,
 ) -> None:
     monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("B12X_INDEXER_STREAM_SCORER", "1" if stream_scorer else "0")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu").manual_seed(91_009)
@@ -485,6 +488,11 @@ def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
         torch.sort(expected, dim=1).values,
     )
 
+    shared_storage[0, :25].fill_(int(index_k_cache.shape[0]))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.all(actual == -1)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
@@ -507,7 +515,9 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
         device=device,
     )
 
-    def select(width: int, *, shared: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    def select(
+        width: int, *, shared: bool = False, capacity: int = 4096
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         selected_page_ids = page_ids
         if shared:
             selected_page_ids = torch.full_like(page_ids, 2000)
@@ -532,6 +542,7 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
             zero_row_start=True,
             output_page_table=page_table,
             output_page_size=64,
+            output_page_capacity=capacity,
         )
         torch.cuda.synchronize(device)
         return indices, selected_page_ids
@@ -540,6 +551,7 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
     misses_after_narrow = compile_cache_info()["compile_misses"]
     wide, wide_page_ids = select(8192)
     shared, shared_page_ids = select(8192, shared=True)
+    invalid, _ = select(1, capacity=1000)
     misses_after_reuse = compile_cache_info()["compile_misses"]
 
     def expected(selected_page_ids: torch.Tensor) -> torch.Tensor:
@@ -552,6 +564,7 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
     assert torch.equal(torch.sort(narrow, dim=1).values, expected(narrow_page_ids))
     assert torch.equal(torch.sort(wide, dim=1).values, expected(wide_page_ids))
     assert torch.equal(torch.sort(shared, dim=1).values, expected(shared_page_ids))
+    assert torch.all(invalid == -1)
     assert misses_after_reuse == misses_after_narrow
 
 
@@ -604,6 +617,7 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     )
     assert not index_k_cache.is_contiguous()
     actual = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    actual_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
     expected = torch.empty((rows, topk), dtype=torch.int32, device=device)
     shared_table_binding = graph_shared_page_table.expand(rows, -1)
     binding = _bind_paged_indexer(
@@ -675,6 +689,7 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
         expected_num_q_heads=num_heads,
         binding=binding,
         out_indices=actual,
+        out_scores=actual_scores,
         supertile_k=supertile_k,
     )
     torch.cuda.synchronize(device)
@@ -689,6 +704,7 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
             expected_num_q_heads=num_heads,
             binding=binding,
             out_indices=actual,
+            out_scores=actual_scores,
             supertile_k=supertile_k,
         )
     graph.replay()
@@ -716,6 +732,13 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
         torch.sort(actual, dim=1).values,
         torch.sort(expected, dim=1).values,
     )
+
+    prepare(int(index_k_cache.shape[0]), 64, shared_page_table=True)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    valid = actual >= 0
+    assert torch.all(valid.sum(dim=1) == 64)
+    assert torch.all(actual_scores[valid] == 0)
 
 
 def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:

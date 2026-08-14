@@ -510,6 +510,67 @@ def test_fused_indexer_preinitialized_state_graph_replay_switches_merge_mode():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+@pytest.mark.parametrize("ctas_per_group", [8, 32])
+def test_fused_indexer_graph_replay_masks_page_ids_at_capacity(ctas_per_group):
+    """Live invalid page IDs never form value or scale addresses."""
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 4, 64, 512, _PS
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=43, device=device
+    )
+    pack_capacity, _ = fused_indexer_scratch_capacity(
+        rows, topk, torch.cuda.get_device_properties(device).multi_processor_count
+    )
+    pack_capacity = max(pack_capacity, rows * ctas_per_group * topk)
+    kwargs = {
+        "q_bytes": q_fp8.view(torch.uint8),
+        "weights": weights,
+        "k_quant_bytes": k_fp8.view(torch.uint8).contiguous(),
+        "k_scales": k_scales,
+        "real_page_table": page_table,
+        "seqlens": seqlens,
+        "num_heads": heads,
+        "topk": topk,
+        "out_indices": torch.empty(
+            (rows, topk), dtype=torch.int32, device=device
+        ),
+        "out_values": torch.empty(
+            (rows, topk), dtype=torch.float32, device=device
+        ),
+        "ctas_per_group": ctas_per_group,
+        "pack_values": torch.empty(
+            pack_capacity, dtype=torch.float32, device=device
+        ),
+        "pack_indices": torch.empty(
+            pack_capacity, dtype=torch.int32, device=device
+        ),
+        "merge_state": torch.zeros(
+            rows * _COOP_STATE_WORDS, dtype=torch.int32, device=device
+        ),
+        "merge_state_preinitialized": True,
+    }
+    run_fused_paged_indexer(**kwargs)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_fused_paged_indexer(**kwargs)
+
+    page_table.fill_(int(k_fp8.shape[0]))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.all(kwargs["out_indices"] == -1)
+    assert torch.all(kwargs["out_values"] <= torch.finfo(torch.float32).min)
+
+    page_table.zero_()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    for row in range(rows):
+        valid = kwargs["out_indices"][row]
+        valid = valid[valid >= 0]
+        assert set(valid.tolist()) == set(range(seqlen))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
 @pytest.mark.parametrize("rows", [1, 2, 4])
 def test_fused_indexer_mla_matches_reference(rows):
     # FLAT/MLA: contiguous K, per-row [k_start, k_end) windows -> absolute indices.
@@ -537,6 +598,48 @@ def test_fused_indexer_mla_matches_reference(rows):
         logit = (torch.relu(torch.einsum("hd,td->ht", qf[r], kf[a:b])) * weights[r].unsqueeze(1)).sum(0) * k_scales[a:b]
         gset = set((torch.topk(logit, topk).indices + a).tolist())  # absolute index
         assert set(idx[r].tolist()) == gset
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_indexer_staged_physical_slot_overflow_returns_sentinel():
+    """Staged physical output never wraps a valid high PID into slot zero."""
+    device = torch.device("cuda")
+    rows, heads, topk = 1, 32, 512
+    high_page_id = 1 << 26
+    q_fp8 = torch.randn(
+        (rows, heads, 128), device=device
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn((rows, heads), dtype=torch.float32, device=device)
+    one_page = torch.randn(
+        (1, _PS, 128), device=device
+    ).to(torch.float8_e4m3fn)
+    one_scale_page = torch.ones((1, _PS), dtype=torch.float32, device=device)
+    pages_used = topk // _PS
+    k_quant = one_page.expand(high_page_id + pages_used, -1, -1)
+    k_scales = one_scale_page.expand(high_page_id + pages_used, -1)
+    page_table = torch.arange(
+        high_page_id,
+        high_page_id + pages_used,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(1, -1)
+    seqlens = torch.tensor([topk], dtype=torch.int32, device=device)
+
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_quant.view(torch.uint8),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+        ctas_per_group=8,
+        output_physical_slots=True,
+    )
+    torch.cuda.synchronize(device)
+    assert torch.all(idx == -1)
+    assert torch.isfinite(val).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
