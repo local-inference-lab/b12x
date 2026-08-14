@@ -22,6 +22,7 @@ from .pcie_oneshot import (
     _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
+    _raise_local_cleanup_errors,
 )
 
 
@@ -153,6 +154,8 @@ class _IPCChannel:
         self._closed = False
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
+        self._coordinated_close_complete = False
+        self._closed_ipc_import_indices: set[tuple[int, int]] = set()
 
     def _bind_stream(self) -> None:
         if not self._stream_affine or self.device.type != "cuda":
@@ -173,7 +176,24 @@ class _IPCChannel:
                 "per CUDA stream"
             )
 
+    def _closed_import_indices(self) -> set[tuple[int, int]]:
+        closed = getattr(self, "_closed_ipc_import_indices", None)
+        if closed is None:
+            closed = set()
+            self._closed_ipc_import_indices = closed
+        return closed
+
+    def _all_python_ipc_imports_closed(self, closed: set[tuple[int, int]]) -> bool:
+        if self._ipc is None:
+            return not any(shared.remote_ptrs for shared in self._owned_buffers)
+        return all(
+            (buffer_index, remote_index) in closed
+            for buffer_index, shared in enumerate(self._owned_buffers)
+            for remote_index, _ in enumerate(shared.remote_ptrs)
+        )
+
     def _close_ipc_imports(self) -> None:
+        """Legacy best-effort close retained for non-strict callers."""
         if self._ipc_imports_closed:
             return
         self._closed = True
@@ -184,7 +204,45 @@ class _IPCChannel:
                         self._ipc.cudaIpcCloseMemHandle(ptr)
         self._ipc_imports_closed = True
 
+    def _close_ipc_imports_strict(self) -> None:
+        """Close every IPC import without suppressing errors.
+
+        Marks the channel closed so it cannot be reused even if unmap fails.
+        Failed imports remain open and observable; ``_ipc_imports_closed`` is
+        only set when every import handle was successfully closed.
+        """
+        if self._ipc_imports_closed:
+            return
+        self._closed = True
+        failures: list[tuple[str, Exception]] = []
+        closed = self._closed_import_indices()
+        if self._ipc is not None:
+            for buffer_index, shared in enumerate(self._owned_buffers):
+                for remote_index, ptr in enumerate(shared.remote_ptrs):
+                    key = (buffer_index, remote_index)
+                    if key in closed:
+                        continue
+                    try:
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                    except Exception as exc:
+                        failures.append((f"CUDA IPC import {ptr}", exc))
+                    else:
+                        closed.add(key)
+        elif any(shared.remote_ptrs for shared in self._owned_buffers):
+            failures.append(
+                (
+                    "CUDA IPC imports",
+                    RuntimeError("CUDA runtime is unavailable for IPC unmap"),
+                )
+            )
+
+        if not failures and self._all_python_ipc_imports_closed(closed):
+            self._ipc_imports_closed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe DCP top-k", "IPC import close", failures)
+
     def _free_ipc_exports(self) -> None:
+        """Legacy best-effort free retained for non-strict callers."""
         if self._ipc_exports_freed:
             return
         self._close_ipc_imports()
@@ -196,7 +254,43 @@ class _IPCChannel:
         self._owned_buffers.clear()
         self._ipc_exports_freed = True
 
+    def _free_ipc_exports_strict(self) -> None:
+        """Free exported IPC storage only after all imports are closed.
+
+        Must be called after the collective unmap acknowledgement so no peer
+        retains a usable imported pointer.  Failed frees retain the buffer
+        so the export stays observable and never becomes a silent leak.
+        """
+        if self._ipc_exports_freed:
+            return
+        self._close_ipc_imports_strict()
+        failures: list[tuple[str, Exception]] = []
+        remaining: list[_OwnedSharedBuffer] = []
+        self._candidate_views = ()
+        if self._ipc is not None:
+            for shared in self._owned_buffers:
+                try:
+                    self._ipc.cudaFree(shared.local_ptr)
+                except Exception as exc:
+                    remaining.append(shared)
+                    failures.append((f"CUDA IPC export {shared.local_ptr}", exc))
+        elif self._owned_buffers:
+            remaining = list(self._owned_buffers)
+            failures.append(
+                (
+                    "CUDA IPC exports",
+                    RuntimeError("CUDA runtime is unavailable for export free"),
+                )
+            )
+        self._owned_buffers = remaining
+        if not remaining:
+            self._ipc_exports_freed = True
+        if failures:
+            _raise_local_cleanup_errors("PCIe DCP top-k", "IPC export free", failures)
+
     def close(self) -> None:
+        if self._coordinated_close_complete:
+            return
         _coordinated_close_channels(
             (self,),
             exchange_group=self.exchange_group,
@@ -205,6 +299,8 @@ class _IPCChannel:
 
     def close_coordinated(self) -> None:
         """Collectively close peer mappings before freeing exported storage."""
+        if self._coordinated_close_complete:
+            return
         _coordinated_close_channels(
             (self,),
             exchange_group=self.exchange_group,
