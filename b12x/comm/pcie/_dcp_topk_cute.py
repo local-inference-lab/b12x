@@ -15,10 +15,13 @@ from b12x._lib.intrinsics import ld_global_v4_u32, st_global_v4_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
-from ._dcp_cute_common import block_pair_barrier
+from ._dcp_cute_common import (
+    DCP_TOPK_COMPILE_VERSION,
+    DCP_TOPK_MAX_BLOCKS as _MAX_BLOCKS,
+    block_pair_barrier,
+)
 
 
-_MAX_BLOCKS = 128
 _MAX_PEERS = 8
 _PREPARED_TOPK_LAUNCHERS: set[tuple[int, int, int, int]] = set()
 
@@ -298,7 +301,7 @@ def _get_compiled_topk_stage(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_topk.owner_stage",
-            4,
+            DCP_TOPK_COMPILE_VERSION,
             key,
             labels=("world_size", "rank", "topk", "threads"),
         ),

@@ -182,7 +182,7 @@ def _worker(
         )
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         dist.barrier()
-        with graph_owner.capture(), torch.cuda.graph(graph):
+        with graph_owner.capture(rows=graph_rows), torch.cuda.graph(graph):
             graph_candidate_indices, graph_candidate_scores = (
                 graph_owner.stage_candidates(graph_indices, graph_scores)
             )

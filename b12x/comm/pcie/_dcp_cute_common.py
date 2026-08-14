@@ -19,6 +19,9 @@ from cutlass._mlir.dialects import llvm
 
 _FLAG_STRIDE = 32
 _MAX_RANKS = 16
+DCP_TOPK_MAX_BLOCKS = 128
+DCP_TOPK_ABI_VERSION = 1
+DCP_TOPK_COMPILE_VERSION = 4
 
 
 @dsl_user_op
@@ -145,5 +148,11 @@ def signal_bytes(max_blocks: int) -> int:
         + 2 * max_blocks * _MAX_RANKS * _FLAG_STRIDE
     ) * 4
 
-
-__all__ = ["block_pair_barrier", "signal_bytes"]
+__all__ = [
+    "DCP_TOPK_COMPILE_VERSION",
+    "DCP_TOPK_MAX_BLOCKS",
+    "_FLAG_STRIDE",
+    "_MAX_RANKS",
+    "block_pair_barrier",
+    "signal_bytes",
+]
