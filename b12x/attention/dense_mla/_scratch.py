@@ -473,10 +473,28 @@ def _validate_binding(
         raise ValueError(
             "page_table must have shape [batch, width<=max_page_table_width]"
         )
+    if int(page_table.shape[1]) < 1:
+        raise ValueError("page_table must have at least one column")
     if page_table.dtype != torch.int32:
         raise TypeError("page_table must be torch.int32")
     if page_table.device != scratch.device or not page_table.is_contiguous():
         raise ValueError("page_table must be contiguous on the plan device")
+
+    # --- Issue #157: shape-only capacity floor (no host sync) ---------------
+    # The actual kv_cache must contain at least one physical page because the
+    # device predicate in ``issue_dense_page_gather`` uses the validated
+    # request-local first page as the barrier-safe fallback for masked records.
+    # An invalid first page marks the request dead. This is a shape check (int
+    # on .shape), not a value read, so it honors the views-only / no-allocation
+    # / no-sync bind contract.
+    if int(cache.shape[0]) < 1:
+        raise ValueError("kv_cache must contain at least one physical page")
+
+    # Live *values* (cache_seqlens, page_table entries) are NOT validated here.
+    # They are mutable across CUDA-graph replay and reading them would require
+    # host synchronisation, violating the bind contract. Device-side predicates
+    # cap visible cache_length at the first invalid page and use only the
+    # validated page_table[request, 0] fallback for masked gather records.
 
     kv_scale = _validate_scalar(
         kv_scale,

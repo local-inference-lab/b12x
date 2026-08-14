@@ -196,6 +196,8 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         Int64(int(binding.kv_cache.stride(0)) * binding.kv_cache.element_size()),
         Int64(int(binding.kv_cache.stride(1)) * binding.kv_cache.element_size()),
         Int64(int(binding.page_table.stride(0))),
+        Int32(int(binding.page_table.shape[1])),
+        Int32(int(binding.kv_cache.shape[0])),
         Int32(int(binding.q.shape[0])),
         Int32(int(binding.cache_seqlens.shape[0])),
         Int32(binding.active_splits),

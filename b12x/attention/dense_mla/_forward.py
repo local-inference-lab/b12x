@@ -100,6 +100,8 @@ class DenseMlaForwardKernel:
         page_stride_bytes: Int64,
         cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
+        page_table_width: Int32,
+        num_cache_pages: Int32,
         total_q: Int32,
         batch: Int32,
         active_splits: Int32,
@@ -124,6 +126,8 @@ class DenseMlaForwardKernel:
             page_stride_bytes,
             cache_record_stride_bytes,
             page_table_stride,
+            page_table_width,
+            num_cache_pages,
             total_q,
             batch,
             active_splits,
@@ -416,6 +420,8 @@ class DenseMlaForwardKernel:
         page_stride_bytes: Int64,
         cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
+        page_table_width: Int32,
+        num_cache_pages: Int32,
         total_q: Int32,
         batch: Int32,
         active_splits: Int32,
@@ -445,6 +451,38 @@ class DenseMlaForwardKernel:
         query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
+
+        # Bound graph-live metadata by the actual table and cache capacities.
+        max_table_tokens = page_table_width * Int32(self.page_size)
+        if cache_length > max_table_tokens:
+            cache_length = max_table_tokens
+
+        first_page = Int32(page_table[request.to(Int64) * page_table_stride])
+        if first_page < Int32(0) or first_page >= num_cache_pages:
+            cache_length = Int32(0)
+
+        valid_pages = Int32(0)
+        required_pages = (cache_length + Int32(self.page_size) - Int32(1)) // Int32(
+            self.page_size
+        )
+        still_valid = Int32(1)
+        page_idx = Int32(0)
+        while page_idx < required_pages:
+            pid = Int32(
+                page_table[
+                    request.to(Int64) * page_table_stride + page_idx.to(Int64)
+                ]
+            )
+            page_is_valid = Int32(0)
+            if pid >= Int32(0) and pid < num_cache_pages:
+                page_is_valid = Int32(1)
+            valid_pages += still_valid * page_is_valid
+            if page_is_valid == Int32(0):
+                still_valid = Int32(0)
+            page_idx += Int32(1)
+        valid_cache_length = valid_pages * Int32(self.page_size)
+        if valid_cache_length < cache_length:
+            cache_length = valid_cache_length
 
         first_valid_chunk = Int32(0)
         visible_chunks_end = cache_length
@@ -499,6 +537,32 @@ class DenseMlaForwardKernel:
                             head_base + local_head,
                         ] = Float32(-Float32.inf)
                 entry += Int32(self.block_threads)
+
+            # Issue #157: Zero output for non-merge paths.  The merge
+            # kernel already produces zero when all split LSEs are -inf,
+            # but the direct (non-split or active_splits==1) path writes
+            # only LSE.  Without this, a dead request's output retains
+            # stale/NaN data from before replay.
+            if active_splits <= Int32(1):
+                total_qh = Int32(self.query_tile * HEADS_PER_TILE)
+                flat = tid
+                while flat < total_qh * Int32(self.value_dim):
+                    qh = flat // Int32(self.value_dim)
+                    v_idx = flat - qh * Int32(self.value_dim)
+                    q_slot = qh // Int32(HEADS_PER_TILE)
+                    l_head = qh - q_slot * Int32(HEADS_PER_TILE)
+                    q_row = query_start + q_slot
+                    if (
+                        q_row < total_q
+                        and head_base + l_head < Int32(self.num_heads)
+                    ):
+                        output[
+                            q_row,
+                            head_base + l_head,
+                            v_idx,
+                        ] = (Float32(0.0)).to(output.element_type)
+                    flat += Int32(self.block_threads)
+
             _exit_thread()
 
         smem = cutlass_utils.SmemAllocator()
@@ -548,6 +612,8 @@ class DenseMlaForwardKernel:
                     page_stride_bytes,
                     cache_record_stride_bytes,
                     page_table_stride,
+                    page_table_width,
+                    num_cache_pages,
                     page_size=self.page_size,
                     record_bytes=self.layout.record_bytes,
                     record_stride_bytes=self.layout.record_stride_bytes,
