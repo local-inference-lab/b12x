@@ -316,6 +316,11 @@ def msa_attention_reference(
         raise ValueError("q_heads must be divisible by kv_heads")
     if int(q2k_indices.shape[1]) < total_q:
         raise ValueError("q2k_indices total_q_capacity is smaller than q")
+    page_size = int(k_cache.shape[1])
+    entries_per_block = block_tokens // page_size
+    max_block_id = max(
+        (int(page_table.shape[1]) - 1) // entries_per_block, 0
+    )
     if softmax_scale is None:
         softmax_scale = head_dim_qk**-0.5
 
@@ -350,6 +355,8 @@ def msa_attention_reference(
                 for block_id_raw in block_ids:
                     block_id = int(block_id_raw)
                     if block_id < 0:
+                        continue
+                    if block_id > max_block_id:
                         continue
                     block_start = block_id * block_tokens
                     block_end = min(block_start + block_tokens, visible_limit)

@@ -429,6 +429,27 @@ def _make_plan_metadata_cache(
     )
 
 
+
+
+_MSA_BLOCK_TOKENS = 128
+_MSA_TOPK = 16
+
+
+def _msa_entries_per_block(page_size: int) -> int:
+    """Number of page-table entries spanned by one 128-token MSA block."""
+    return _MSA_BLOCK_TOKENS // max(int(page_size), 1)
+
+
+def _msa_max_valid_block_id(page_table_width: int, page_size: int) -> int:
+    """Physical upper bound on a batch-local q2k block index.
+
+    A block id maps to ``entries_per_block`` consecutive page-table entries.
+    The last valid entry index is ``page_table_width - 1``, so the last
+    valid block id is ``(page_table_width - 1) // entries_per_block``.
+    """
+    entries_per_block = _msa_entries_per_block(page_size)
+    return max((int(page_table_width) - 1) // entries_per_block, 0)
+
 @dataclass(kw_only=True)
 class B12XPagedAttentionScratch:
     """Paged-attention scratch views over caller-owned storage."""
@@ -865,6 +886,16 @@ class B12XPagedAttentionScratch:
                 f"page_table width={int(page_table.shape[1])} exceeds scratch "
                 f"capacity {self.max_page_table_width}"
             )
+        if (
+            self.msa_block_sparse
+            and self.copy_runtime_metadata
+            and int(page_table.shape[1]) != self.max_page_table_width
+        ):
+            raise ValueError(
+                "MSA block-sparse page_table width must exactly match the "
+                f"scratch capacity: got {int(page_table.shape[1])}, expected "
+                f"{self.max_page_table_width}"
+            )
         if int(cache_seqlens.shape[0]) > self.max_batch:
             raise ValueError(
                 f"cache_seqlens batch={int(cache_seqlens.shape[0])} exceeds "
@@ -912,6 +943,18 @@ class B12XPagedAttentionScratch:
                 raise ValueError(
                     "decode graph page_table width must fit the prepared "
                     f"capacity: got {runtime_width}, expected 1..{expected_width}"
+                )
+            if getattr(self, "msa_block_sparse", False) and runtime_width != expected_width:
+                # MSA q2k block-index guards bound page_idx against the page
+                # table width seen by the kernel.  When the source table is
+                # narrower than the scratch capacity, the copied padding
+                # columns are stale and could be selected by a valid q2k block
+                # id.  Enforce exact width for MSA so the kernel's width guard
+                # matches the caller's actual table.
+                raise ValueError(
+                    "MSA decode graph page_table width must exactly match the "
+                    f"prepared capacity: got {runtime_width}, expected "
+                    f"{expected_width}"
                 )
         elif runtime_width != expected_width:
             # A referenced table's row stride is embedded in the kernel launch.

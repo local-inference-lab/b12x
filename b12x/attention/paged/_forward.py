@@ -1084,6 +1084,8 @@ def paged_attention_forward(
             union_blocks=msa_union_blocks,
             union_masks=msa_union_masks,
             union_counts=msa_union_counts,
+            page_table_width=int(page_table.shape[1]),
+            page_size=int(plan.page_size),
         )
 
     q_arg = _to_kernel_tensor(q, _torch_to_cutlass_dtype(q.dtype))

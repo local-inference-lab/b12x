@@ -295,6 +295,7 @@ def build_msa_prefill_union_metadata_triton(
     union_counts_ptr,
     total_q_capacity,
     block_valid_capacity,
+    max_block_id,
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     TOPK: tl.constexpr,
@@ -343,8 +344,15 @@ def build_msa_prefill_union_metadata_triton(
             block_id = tl.load(
                 q2k_indices_ptr + q2k_offset, mask=token_valid, other=-1
             ).to(tl.int32)
+            # Int64 scaled product prevents Int32 overflow on large block ids.
+            # Physical bound (max_block_id from page_table_width) and logical
+            # bound (block_start < visible_len) are both checked.
+            block_id_i64 = block_id.to(tl.int64)
             valid_block = (
-                token_valid & (block_id >= 0) & (block_id * BLOCK_TOKENS < visible_len)
+                token_valid
+                & (block_id >= 0)
+                & (block_id <= max_block_id)
+                & (block_id_i64 * tl.constexpr(BLOCK_TOKENS) < visible_len.to(tl.int64))
             )
             found = tl.full((), False, tl.int1)
             found_slot = tl.full((), 0, tl.int32)
@@ -378,6 +386,11 @@ def build_msa_prefill_union_metadata_triton(
             tl.store(union_masks_ptr + union_base + union_count, bit, mask=do_store)
             union_count += tl.where(do_store, 1, 0)
 
+    # When filtering leaves zero blocks, initialize slot 0 to sentinel -1
+    # with a zero mask so the extend kernel cannot reuse stale state.
+    is_empty = work_valid & (union_count == 0)
+    tl.store(union_blocks_ptr + union_base, -1, mask=is_empty)
+    tl.store(union_masks_ptr + union_base, 0, mask=is_empty)
     tl.store(union_counts_ptr + union_count_offset, union_count, mask=work_valid)
 
 
@@ -437,11 +450,19 @@ def update_msa_decode_graph_metadata_fused_triton(
         tl.int32
     )
     active = batch_mask & (cache_len > 0)
-    visible_blocks = tl.maximum((cache_len + 127) // 128, 1)
+    visible_blocks = tl.maximum(
+        (cache_len.to(tl.int64) + 127) // 128, 1
+    ).to(tl.int32)
     selected_blocks = tl.minimum(visible_blocks, 16)
-    tail_tokens = tl.maximum(cache_len - (visible_blocks - 1) * 128, 1)
+    tail_tokens_i64 = cache_len.to(tl.int64) - (
+        visible_blocks.to(tl.int64) - 1
+    ) * 128
+    tail_tokens_i64 = tl.maximum(tail_tokens_i64, 1)
     tail_pages = tl.minimum(
-        tl.maximum((tail_tokens + PAGE_SIZE - 1) // PAGE_SIZE, 1), PAGES_PER_BLOCK
+        tl.maximum(
+            (tail_tokens_i64 + int(PAGE_SIZE) - 1) // int(PAGE_SIZE), 1
+        ),
+        PAGES_PER_BLOCK
     )
     effective_pages = tl.maximum(
         (selected_blocks - 1) * PAGES_PER_BLOCK + tail_pages, 1
@@ -881,6 +902,8 @@ def build_msa_prefill_union_metadata(
     union_blocks: torch.Tensor,
     union_masks: torch.Tensor,
     union_counts: torch.Tensor,
+    page_table_width: int,
+    page_size: int,
 ) -> None:
     if q2k_indices.ndim != 3 or int(q2k_indices.shape[2]) != _MSA_UNION_TOPK:
         raise ValueError("q2k_indices must have shape [kv_heads, total_q_capacity, 16]")
@@ -939,6 +962,11 @@ def build_msa_prefill_union_metadata(
         union_counts,
         int(q2k_indices.shape[1]),
         work_capacity,
+        max(
+            (int(page_table_width) - 1)
+            // (_PREFILL_BLOCK_ROWS // max(int(page_size), 1)),
+            0,
+        ),
         NUM_KV_HEADS=int(q2k_indices.shape[0]),
         BLOCK_TOKENS=128,
         TOPK=_MSA_UNION_TOPK,

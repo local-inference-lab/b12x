@@ -3358,8 +3358,8 @@ class PagedForwardKernel:
         visible_len,
     ):
         visible_len = cutlass.select_(visible_len > Int32(0), visible_len, Int32(1))
-        block_count = (visible_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(
-            self.MSA_BLOCK_TOKENS
+        block_count = Int32(
+            (Int64(visible_len) + Int64(self.MSA_BLOCK_TOKENS - 1)) // Int64(self.MSA_BLOCK_TOKENS)
         )
         block_count = cutlass.select_(
             block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK)
@@ -3371,8 +3371,10 @@ class PagedForwardKernel:
             return block_count * Int32(self.MSA_BLOCK_TOKENS)
         last_j = block_count - Int32(1)
         local_block_id = mQ2KIndices[kv_head_idx, q_row_idx, last_j]
-        tail_tokens = visible_len - local_block_id * Int32(self.MSA_BLOCK_TOKENS)
-        tail_pages = (tail_tokens + Int32(63)) // Int32(64)
+        tail_tokens_i64 = (
+            Int64(visible_len) - Int64(local_block_id) * Int64(self.MSA_BLOCK_TOKENS)
+        )
+        tail_pages = Int32((tail_tokens_i64 + Int64(63)) // Int64(64))
         tail_pages = cutlass.select_(tail_pages < Int32(1), Int32(1), tail_pages)
         tail_pages = cutlass.select_(tail_pages > Int32(2), Int32(2), tail_pages)
         return ((block_count - Int32(1)) * Int32(2) + tail_pages) * Int32(64)
@@ -3390,17 +3392,26 @@ class PagedForwardKernel:
         tile_token_count,
     ):
         block_count = mMSAUnionCounts[work_idx, kv_head_idx]
-        block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
+        # When the union filter leaves zero blocks, return 0 selected tokens
+        # so the kernel iterates over no K/V tiles.  The Triton builder
+        # initializes slot 0 to -1 when count=0, but we must not treat that
+        # sentinel as a live block.
         if const_expr(self.page_size == 128):
             # Whole-page walk at page_size=128 (no tail compaction).
-            return block_count * Int32(self.MSA_BLOCK_TOKENS)
+            return cutlass.select_(
+                block_count > Int32(0), block_count * Int32(self.MSA_BLOCK_TOKENS), Int32(0)
+            )
+        block_count = cutlass.select_(block_count > Int32(0), block_count, Int32(1))
         last_block_id = mMSAUnionBlocks[work_idx, kv_head_idx, block_count - Int32(1)]
         max_visible_len = cache_len - qo_len + tile_first_token + tile_token_count
         max_visible_len = cutlass.select_(
             max_visible_len > Int32(0), max_visible_len, Int32(1)
         )
-        tail_tokens = max_visible_len - last_block_id * Int32(self.MSA_BLOCK_TOKENS)
-        tail_pages = (tail_tokens + Int32(63)) // Int32(64)
+        tail_tokens_i64 = (
+            Int64(max_visible_len)
+            - Int64(last_block_id) * Int64(self.MSA_BLOCK_TOKENS)
+        )
+        tail_pages = Int32((tail_tokens_i64 + Int64(63)) // Int64(64))
         tail_pages = cutlass.select_(tail_pages < Int32(1), Int32(1), tail_pages)
         tail_pages = cutlass.select_(tail_pages > Int32(2), Int32(2), tail_pages)
         return ((block_count - Int32(1)) * Int32(2) + tail_pages) * Int32(64)
@@ -3415,32 +3426,40 @@ class PagedForwardKernel:
         q_row_idx,
         tile_token_base,
         page_size,
+        cache_len,
+        page_table_width,
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
-            if const_expr(self.entries_per_block == 1):
-                block_id = (
-                    mMSAUnionBlocks[work_idx, kv_head_idx, block_j]
-                    if const_expr(self.msa_union_tile)
-                    else mQ2KIndices[kv_head_idx, q_row_idx, block_j]
-                )
-                return cutlass.select_(
-                    block_id >= Int32(0),
-                    block_id,
-                    Int32(0),
-                )
-            block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
-            subpage = block_offset // page_size
             block_id = (
                 mMSAUnionBlocks[work_idx, kv_head_idx, block_j]
                 if const_expr(self.msa_union_tile)
                 else mQ2KIndices[kv_head_idx, q_row_idx, block_j]
             )
-            return cutlass.select_(
-                block_id >= Int32(0),
-                block_id * Int32(self.entries_per_block) + subpage,
-                Int32(0),
+            max_block_id = (Int32(page_table_width) - Int32(1)) // Int32(
+                self.entries_per_block
             )
+            block_start_i64 = Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS)
+            valid_block = (
+                (block_id >= Int32(0))
+                & (block_id <= max_block_id)
+                & (block_start_i64 < Int64(cache_len))
+            )
+            if const_expr(self.entries_per_block == 1):
+                return cutlass.select_(valid_block, block_id, Int32(0))
+            block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
+            subpage = block_offset // page_size
+            # Compute the actual page-table index in Int64 BEFORE bounding.
+            page_idx_i64 = Int64(block_id) * Int64(self.entries_per_block) + Int64(subpage)
+            # Per-request logical bound: page_idx must be within both the
+            # page table width and the request's live cache pages.
+            cache_pages = Int32(
+                (Int64(cache_len) + Int64(page_size) - Int64(1)) // Int64(page_size)
+            )
+            valid_page = valid_block & (page_idx_i64 < Int64(page_table_width)) & (
+                page_idx_i64 < Int64(cache_pages)
+            )
+            return cutlass.select_(valid_page, Int32(page_idx_i64), Int32(0))
         return tile_token_base // page_size
 
     @cute.jit
@@ -3452,6 +3471,8 @@ class PagedForwardKernel:
         kv_head_idx,
         q_row_idx,
         tile_token_base,
+        cache_len,
+        page_table_width,
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
@@ -3461,9 +3482,18 @@ class PagedForwardKernel:
                 if const_expr(self.msa_union_tile)
                 else mQ2KIndices[kv_head_idx, q_row_idx, block_j]
             )
+            max_block_id = (Int32(page_table_width) - Int32(1)) // Int32(
+                self.entries_per_block
+            )
+            block_start_i64 = Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS)
+            valid_block = (
+                (block_id >= Int32(0))
+                & (block_id <= max_block_id)
+                & (block_start_i64 < Int64(cache_len))
+            )
             return cutlass.select_(
-                block_id >= Int32(0),
-                block_id * Int32(self.MSA_BLOCK_TOKENS) + block_offset,
+                valid_block,
+                Int32(Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS) + Int64(block_offset)),
                 Int32(0x7FFFFFFF),
             )
         return tile_token_base
@@ -4107,6 +4137,7 @@ class PagedForwardKernel:
             else 1
         )
         page_size = mKCache.shape[1]
+        page_table_width = mPageTable.shape[1]
         stage_tile_rows = self.stage_tile_rows
         q_bytes = self.traits.q_smem_bytes
         kv_storage_bytes = self.dtype_kv_storage.width // 8
@@ -5049,6 +5080,8 @@ class PagedForwardKernel:
                     msa_q_row_idx,
                     prefetch_base,
                     page_size,
+                    cache_len,
+                    page_table_width,
                 )
                 if warp_linear_idx == Int32(0):
                     if const_expr(self.use_paged_k_tma):
@@ -5194,6 +5227,8 @@ class PagedForwardKernel:
                     msa_q_row_idx,
                     prefetch_base,
                     page_size,
+                    cache_len,
+                    page_table_width,
                 )
                 self._async_copy_paged_tile_permuted_128b(
                     mKBytes,
@@ -5285,6 +5320,8 @@ class PagedForwardKernel:
                 kv_head_idx,
                 msa_q_row_idx,
                 tile_base,
+                cache_len,
+                page_table_width,
             )
             tile_tokens = tile_limit - tile_base
             if const_expr(self.msa_block_sparse):
@@ -6063,6 +6100,8 @@ class PagedForwardKernel:
                                 msa_q_row_idx,
                                 next_tile_base,
                                 page_size,
+                                cache_len,
+                                page_table_width,
                             )
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,
@@ -6103,6 +6142,8 @@ class PagedForwardKernel:
                                 msa_q_row_idx,
                                 next_tile_base,
                                 page_size,
+                                cache_len,
+                                page_table_width,
                             )
                             self._async_copy_paged_tile_permuted_128b(
                                 mKBytes,

@@ -3613,8 +3613,8 @@ class PagedForwardKernel:
         q_row_idx,
         cache_len,
     ):
-        block_count = (cache_len + Int32(self.MSA_BLOCK_TOKENS - 1)) // Int32(
-            self.MSA_BLOCK_TOKENS
+        block_count = Int32(
+            (Int64(cache_len) + Int64(self.MSA_BLOCK_TOKENS - 1)) // Int64(self.MSA_BLOCK_TOKENS)
         )
         block_count = cutlass.select_(
             block_count < Int32(self.MSA_TOPK), block_count, Int32(self.MSA_TOPK)
@@ -3627,8 +3627,11 @@ class PagedForwardKernel:
             return block_count * Int32(self.MSA_BLOCK_TOKENS)
         last_j = block_count - Int32(1)
         local_block_id = mQ2KIndices[kv_head_idx, q_row_idx, last_j]
-        tail_tokens = cache_len - local_block_id * Int32(self.MSA_BLOCK_TOKENS)
-        tail_pages = (tail_tokens + Int32(63)) // Int32(64)
+        # Keep Int64 through the entire tail computation: subtract, add, div.
+        tail_tokens_i64 = (
+            Int64(cache_len) - Int64(local_block_id) * Int64(self.MSA_BLOCK_TOKENS)
+        )
+        tail_pages = Int32((tail_tokens_i64 + Int64(63)) // Int64(64))
         tail_pages = cutlass.select_(tail_pages < Int32(1), Int32(1), tail_pages)
         tail_pages = cutlass.select_(tail_pages > Int32(2), Int32(2), tail_pages)
         return ((block_count - Int32(1)) * Int32(2) + tail_pages) * Int32(64)
@@ -3641,24 +3644,43 @@ class PagedForwardKernel:
         q_row_idx,
         tile_token_base,
         page_size,
+        cache_len,
+        page_table_width,
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
+            block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
+            # Physical bound: (page_table_width - 1) // entries_per_block
+            max_block_id = (Int32(page_table_width) - Int32(1)) // Int32(
+                self.entries_per_block
+            )
+            # Logical bound: block_start < cache_len (visible tokens).
+            # Use Int64 for the scaled product.
+            block_start_i64 = Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS)
+            valid_block = (
+                (block_id >= Int32(0))
+                & (block_id <= max_block_id)
+                & (block_start_i64 < Int64(cache_len))
+            )
             if const_expr(self.entries_per_block == 1):
-                block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
-                return cutlass.select_(
-                    block_id >= Int32(0),
-                    block_id,
-                    Int32(0),
-                )
+                # Page 0 is a safe speculative address for invalid blocks;
+                # _tile_key_base returns 0x7FFFFFFF so tile_tokens=0 (no contribution).
+                return cutlass.select_(valid_block, block_id, Int32(0))
             block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
             subpage = block_offset // page_size
-            block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
-            return cutlass.select_(
-                block_id >= Int32(0),
-                block_id * Int32(self.entries_per_block) + subpage,
-                Int32(0),
+            # Compute the actual page-table index in Int64 BEFORE bounding.
+            page_idx_i64 = Int64(block_id) * Int64(self.entries_per_block) + Int64(subpage)
+            # Per-request logical bound: page_idx must be within both the
+            # page table width and the request's live cache pages.
+            # Use Int64 for ceil division to avoid Int32 overflow.
+            cache_pages = Int32(
+                (Int64(cache_len) + Int64(page_size) - Int64(1)) // Int64(page_size)
             )
+            valid_page = valid_block & (page_idx_i64 < Int64(page_table_width)) & (
+                page_idx_i64 < Int64(cache_pages)
+            )
+            # Narrow only after all bounds checks pass.
+            return cutlass.select_(valid_page, Int32(page_idx_i64), Int32(0))
         return tile_token_base // page_size
 
     @cute.jit
@@ -3678,14 +3700,27 @@ class PagedForwardKernel:
         kv_head_idx,
         q_row_idx,
         tile_token_base,
+        cache_len,
+        page_table_width,
     ):
         if const_expr(self.msa_block_sparse):
             block_j = tile_token_base // Int32(self.MSA_BLOCK_TOKENS)
             block_offset = tile_token_base - block_j * Int32(self.MSA_BLOCK_TOKENS)
             block_id = mQ2KIndices[kv_head_idx, q_row_idx, block_j]
+            max_block_id = (Int32(page_table_width) - Int32(1)) // Int32(
+                self.entries_per_block
+            )
+            block_start_i64 = Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS)
+            valid_block = (
+                (block_id >= Int32(0))
+                & (block_id <= max_block_id)
+                & (block_start_i64 < Int64(cache_len))
+            )
+            # For invalid blocks, return 0x7FFFFFFF so live_tokens = cache_len - 0x7FFFFFFF < 0
+            # -> tile_tokens = 0 -> no K/V contribution (sentinel preserved).
             return cutlass.select_(
-                block_id >= Int32(0),
-                block_id * Int32(self.MSA_BLOCK_TOKENS) + block_offset,
+                valid_block,
+                Int32(Int64(block_id) * Int64(self.MSA_BLOCK_TOKENS) + Int64(block_offset)),
                 Int32(0x7FFFFFFF),
             )
         return tile_token_base
@@ -4514,6 +4549,7 @@ class PagedForwardKernel:
         else:
             num_chunks_kv = 1
         page_size = mKCache.shape[1]
+        page_table_width = mPageTable.shape[1]
         stage_tile_rows = self.stage_tile_rows
         q_head_bytes = self.traits.q_smem_bytes
         q_bytes = q_head_bytes * self.heads_per_cta
@@ -5277,6 +5313,8 @@ class PagedForwardKernel:
                         q_start,
                         role_prefetch_base,
                         page_size,
+                        cache_len,
+                        page_table_width,
                     )
                     role_sub_tile = self._tile_subtile_idx(role_prefetch_base)
                     if const_expr(self.laguna_fp8_head_pair_wide_tma):
@@ -5629,6 +5667,8 @@ class PagedForwardKernel:
                         q_start,
                         prefetch_base,
                         page_size,
+                        cache_len,
+                        page_table_width,
                     )
                     prefetch_sub_tile = self._tile_subtile_idx(prefetch_base)
                     if const_expr(self.k_tma_plane_count > 3):
@@ -5766,6 +5806,8 @@ class PagedForwardKernel:
                 kv_head_idx,
                 q_start,
                 tile_base,
+                cache_len,
+                page_table_width,
             )
             tile_tokens = tile_limit - tile_base
             if const_expr(self.msa_block_sparse):
@@ -6395,6 +6437,8 @@ class PagedForwardKernel:
                                     q_start,
                                     next_tile_base,
                                     page_size,
+                                    cache_len,
+                                    page_table_width,
                                 )
                                 next_sub_tile = self._tile_subtile_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
@@ -6550,6 +6594,8 @@ class PagedForwardKernel:
                                     q_start,
                                     next_tile_base,
                                     page_size,
+                                    cache_len,
+                                    page_table_width,
                                 )
                                 next_sub_tile = self._tile_subtile_idx(next_tile_base)
                                 if const_expr(self.k_tma_plane_count > 3):
@@ -6953,6 +6999,8 @@ class PagedForwardKernel:
                                 q_start,
                                 next_tile_base,
                                 page_size,
+                                cache_len,
+                                page_table_width,
                             )
                             next_sub_tile = self._tile_subtile_idx(next_tile_base)
                             if const_expr(self.v_tma_plane_count > 3):
@@ -9006,7 +9054,7 @@ class PagedBf16ExtendRawForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=launch_grid,
+            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
             block=[32, 4, 1],
             # 99,328 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
