@@ -5,10 +5,12 @@ These are pure CPU/logic tests (no kernel launch): they pin the per-regime tile
 mapping and the M-independence-within-regime contract that lets one compiled
 kernel per (N,K,expected_m) be reused for all live M under frozen resolution.
 """
+
 from __future__ import annotations
 
 import cutlass
 import pytest
+import torch
 
 import b12x._lib.dense_gemm as dense_module
 from b12x._lib.dense_gemm import (
@@ -21,11 +23,68 @@ from b12x._lib.dense_gemm import (
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
+    dense_gemm,
+    dense_gemm_output_storage_plan,
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
 SPARK_SM = 20  # DGX Spark GB10
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
+
+
+@pytest.mark.parametrize(("rows", "groups"), ((2, 1), (1, 2)))
+def test_unswapped_tma_epilogue_rejects_unaligned_output_row_stride(
+    rows: int,
+    groups: int,
+):
+    lhs = (
+        torch.empty((rows, 128, groups), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+    rhs = (
+        torch.empty((132, 128, groups), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+
+    with pytest.raises(ValueError, match="16-byte-aligned C row stride"):
+        dense_gemm(
+            lhs,
+            rhs,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            sm_count=SM,
+            mma_tiler_mn=(64, 64),
+            load_path="tma",
+            swap_ab=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("rows", "columns", "expected_tile", "expected_swap"),
+    (
+        (1, 132, None, None),
+        (2, 132, (64, 64), True),
+        (8, 132, (64, 64), True),
+        (2, 128, None, None),
+        (1, 32, (64, 32), True),
+    ),
+)
+def test_output_storage_plan_respects_row_stride_alignment(
+    rows: int,
+    columns: int,
+    expected_tile: tuple[int, int] | None,
+    expected_swap: bool | None,
+) -> None:
+    plan = dense_gemm_output_storage_plan(
+        output_rows=rows,
+        output_columns=columns,
+        output_element_bits=16,
+    )
+
+    assert plan.mma_tiler_mn == expected_tile
+    assert plan.swap_ab is expected_swap
 
 
 def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=SM):
@@ -190,10 +249,7 @@ def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
                 k=1024,
                 sm_count=SPARK_SM,
             ) == (64, 128)
-            assert (
-                _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM)
-                == 128
-            )
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM) == 128
         policy = _dense_gemm_policy_for(
             m=64,
             n=16384,
@@ -237,8 +293,7 @@ def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
     assert _select_mxfp8_tile_k(1024, n, k, 1024, SM) == 128
     for em in (2048, 4096, 8192):
         tiles = {
-            _tile(live_m, expected_m=em, n=n, k=k)
-            for live_m in (1, 64, 2048, 8192)
+            _tile(live_m, expected_m=em, n=n, k=k) for live_m in (1, 64, 2048, 8192)
         }
         assert tiles == {(128, 128)}, (n, k, em, tiles)
         assert _select_mxfp8_tile_k(1, n, k, em, SM) == 64
@@ -365,12 +420,8 @@ def test_expected_m_prefill_hint_for_narrow_n():
     # decode winner, while declared prefill still moves to the prefill tile.
     narrow = 1024
     base = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True)
-    decode = _select_default_mma_tiler_mn(
-        64, narrow, SM, is_mxfp8=True, expected_m=1
-    )
-    small = _select_default_mma_tiler_mn(
-        64, narrow, SM, is_mxfp8=True, expected_m=64
-    )
+    decode = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=1)
+    small = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=64)
     prefill = _select_default_mma_tiler_mn(
         64, narrow, SM, is_mxfp8=True, expected_m=512
     )

@@ -90,6 +90,55 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     )
 
 
+@pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
+def test_mm_writes_all_rows_for_narrow_uneven_output_width(tokens: int) -> None:
+    """A small-batch GEMM must store every live row when N spans multiple tiles."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260814 + tokens)
+
+    source, _, packed = _make_inputs(tokens, 7168, 132)
+    actual = mxfp8_linear.mm(source, packed, expected_m=tokens)
+    expected = _reference_from_packed(source, packed)
+    torch.cuda.synchronize()
+
+    assert actual.shape == (tokens, 132)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
+def test_mm_unaligned_output_stride_captures_and_replays() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260822)
+
+    source, _, packed = _make_inputs(8, 7168, 132)
+    replacement = torch.randn_like(source).div_(4)
+    mxfp8_linear.mm(source, packed)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mxfp8_linear.mm(source, packed)
+    source.copy_(replacement)
+    expected = _reference_from_packed(source, packed)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
+
+
 def test_mm_pads_k32_to_dense_tile() -> None:
     require_b12x()
     require_mxf8_mma()

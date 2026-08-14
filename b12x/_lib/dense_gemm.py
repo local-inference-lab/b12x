@@ -164,11 +164,48 @@ _DENSE_FUSED_QUANT = os.environ.get(
     "B12X_DENSE_FUSED_QUANT", "0"
 ).lower() not in ("0", "false")
 
+
 @dataclass(frozen=True)
 class _DenseGemmPlan:
     mma_tiler_mn: Tuple[int, int]
     load_path: Literal["tma", "cpasync"]
     swap_ab: bool
+
+
+@dataclass(frozen=True)
+class DenseGemmOutputStoragePlan:
+    """Explicit kernel overrides required by an output tensor layout."""
+
+    mma_tiler_mn: Optional[Tuple[int, int]]
+    swap_ab: Optional[bool]
+
+
+_DENSE_GEMM_NARROW_OUTPUT_PLAN = DenseGemmOutputStoragePlan((64, 32), True)
+_DENSE_GEMM_UNALIGNED_OUTPUT_PLAN = DenseGemmOutputStoragePlan((64, 64), True)
+_DENSE_GEMM_DEFAULT_OUTPUT_PLAN = DenseGemmOutputStoragePlan(None, None)
+
+
+def dense_gemm_output_storage_plan(
+    *,
+    output_rows: int,
+    output_columns: int,
+    output_element_bits: int,
+) -> DenseGemmOutputStoragePlan:
+    """Plan dense-GEMM storage without padding the logical output width.
+
+    The unswapped TMA epilogue requires every outer output stride to be
+    16-byte aligned. A swapped plan stores narrow or unaligned multi-row
+    outputs directly while aligned shapes retain the default tile selector.
+    """
+
+    if output_rows < 1 or output_columns < 1 or output_element_bits < 1:
+        raise ValueError("output shape and element width must be positive")
+    if output_columns < 64:
+        return _DENSE_GEMM_NARROW_OUTPUT_PLAN
+    row_stride_bits = output_columns * output_element_bits
+    if output_rows > 1 and row_stride_bits % 128 != 0:
+        return _DENSE_GEMM_UNALIGNED_OUTPUT_PLAN
+    return _DENSE_GEMM_DEFAULT_OUTPUT_PLAN
 
 
 @triton.jit
@@ -7335,6 +7372,17 @@ def dense_gemm(
             swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
+    c_row_stride_bytes = n * c_cutlass_dtype.width // 8
+    if (
+        (m > 1 or l > 1)
+        and not swap_ab
+        and c_row_stride_bytes % 16 != 0
+    ):
+        raise ValueError(
+            "the unswapped dense_gemm TMA epilogue requires a 16-byte-aligned "
+            f"C row stride, but N={n} and c_dtype={c_dtype!r} produce "
+            f"{c_row_stride_bytes} bytes; use swap_ab=True or pad N"
+        )
     if is_mxfp6:
         # Only the unswapped single-slice TMA mainloop is wired for the FP6
         # byte-container path; fail loudly instead of silently miscomputing.

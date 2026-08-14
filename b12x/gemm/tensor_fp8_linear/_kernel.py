@@ -7,7 +7,10 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 import torch
 
-from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.dense_gemm import (
+    dense_gemm,
+    dense_gemm_output_storage_plan,
+)
 from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8_SCALE_VEC_SIZE,
@@ -96,12 +99,6 @@ def _activation_scale_mma(
     )
 
 
-def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
-    if int(out_features) < 64:
-        return {"mma_tiler_mn": (64, 32), "swap_ab": True}
-    return {}
-
-
 def is_tensor_fp8_linear_supported() -> tuple[bool, str | None]:
     if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
         return False, "CUTLASS DSL does not expose cute.nvgpu.warp.MmaMXF8Op"
@@ -178,6 +175,11 @@ def _tensor_fp8_linear_fused_op(
         tokens,
         int(padded_in_features),
     )
+    output_storage_plan = dense_gemm_output_storage_plan(
+        output_rows=tokens,
+        output_columns=out_features,
+        output_element_bits=16,
+    )
     return dense_gemm(
         (
             source_padded.reshape(tokens, padded_in_features, 1),
@@ -195,7 +197,8 @@ def _tensor_fp8_linear_fused_op(
         expected_m=expected_m,
         stream=stream_int,
         plain_fp8=True,
-        **_dense_gemm_kwargs_for_n(out_features),
+        mma_tiler_mn=output_storage_plan.mma_tiler_mn,
+        swap_ab=output_storage_plan.swap_ab,
     )[:, :, 0]
 
 

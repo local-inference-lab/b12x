@@ -9,7 +9,10 @@ from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.block_fp8 import (
     quantize_block_fp8_linear_input_mxfp8,
 )
-from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.dense_gemm import (
+    dense_gemm,
+    dense_gemm_output_storage_plan,
+)
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
@@ -84,12 +87,6 @@ def _pad_source_2d_k(source_2d: torch.Tensor, padded_k: int) -> torch.Tensor:
     padded = source_2d.new_zeros((tokens, padded_k))
     padded[:, :k] = source_2d
     return padded.contiguous()
-
-
-def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
-    if int(out_features) < 64:
-        return {"mma_tiler_mn": (64, 32), "swap_ab": True}
-    return {}
 
 
 def is_mxfp8_linear_supported() -> tuple[bool, str | None]:
@@ -185,6 +182,11 @@ def _mxfp8_linear_fused_op(
     tokens = int(source_2d.shape[0])
     source_for_quant = _pad_source_2d_k(source_2d, int(padded_in_features))
     x_q = quantize_block_fp8_linear_input_mxfp8(source_for_quant)
+    output_storage_plan = dense_gemm_output_storage_plan(
+        output_rows=tokens,
+        output_columns=out_features,
+        output_element_bits=16,
+    )
     return dense_gemm(
         (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
         (
@@ -197,7 +199,8 @@ def _mxfp8_linear_fused_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
-        **_dense_gemm_kwargs_for_n(out_features),
+        mma_tiler_mn=output_storage_plan.mma_tiler_mn,
+        swap_ab=output_storage_plan.swap_ab,
     )[:, :, 0]
 
 
