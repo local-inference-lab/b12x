@@ -33,7 +33,10 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+from b12x._lib.quant.mxfp8_rows import (
+    quantize_mxfp8_rows_cute,
+    validate_mxfp8_rows_source,
+)
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -471,6 +474,14 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
     tokens: int,
     in_features: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_mxfp8_rows_source(source_tk)
+    source_tokens, source_in_features = source_tk.shape
+    if tokens != source_tokens or in_features != source_in_features:
+        raise ValueError(
+            "quantize_block_fp8_linear_input_mxfp8_alloc dimensions must "
+            f"match source shape {tuple(source_tk.shape)}, got "
+            f"tokens={tokens}, in_features={in_features}"
+        )
     # Functional (allocate + return) quantizer: the raw CuTe kernel writes the
     # MXFP8 output views INSIDE this opaque op, so torch.compile never sees a
     # low-level mutation on 3 caller-visible views. Returns the
