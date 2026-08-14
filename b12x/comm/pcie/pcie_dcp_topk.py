@@ -22,13 +22,19 @@ from .pcie_oneshot import (
     _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
+    _OwnedSharedBuffer,
     _raise_local_cleanup_errors,
+    _require_collective_contract,
+    _require_full_grid_residency,
+    _run_collective_preallocation_setup,
 )
 
 
 SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8)
 _MAX_BLOCKS = 128
 _SIGNAL_BYTES = signal_bytes(_MAX_BLOCKS)
+
+_DCP_TOPK_CONTRACT_VERSION = 1
 
 
 def _validate_launch_config(*, threads: int, block_limit: int, world_size: int) -> None:
@@ -76,6 +82,51 @@ def _candidate_staging_layout(
         slot_bytes=slot_bytes,
         slab_bytes=staging1_offset + slot_bytes,
         plane_bytes=plane_bytes,
+    )
+
+
+def _dcp_topk_runtime_contract(
+    *,
+    world_size: int,
+    max_rows: int,
+    topk: int,
+    layout: _DoubleBufferLayout,
+) -> tuple:
+    """Build the versioned fixed-schema contract every rank must agree on.
+
+    The tuple covers every allocation size, offset, capacity, dtype/wire
+    codec, topology constraint, and schedule/launch knob that a peer needs
+    to interpret remote memory correctly.  All ranks must exchange and
+    compare this contract before any IPC allocation or kernel launch so a
+    divergent or compromised rank cannot turn peer DMA into out-of-bounds
+    access.
+    """
+    max_owner_rows = int(max_rows) // int(world_size)
+    candidate_plane_elems = max_owner_rows * int(world_size) * int(topk)
+    return (
+        _DCP_TOPK_CONTRACT_VERSION,
+        # topology
+        int(world_size),
+        SUPPORTED_WORLD_SIZES,
+        # capacity / row + expert knobs
+        int(max_rows),
+        max_owner_rows,
+        int(topk),
+        candidate_plane_elems,
+        # allocation sizes
+        int(layout.slab_bytes),
+        int(layout.slot_bytes),
+        int(layout.plane_bytes),
+        # offsets
+        int(layout.signal_bytes),
+        int(layout.staging0_offset),
+        int(layout.staging1_offset),
+        # wire codec
+        "int32_indices",
+        "float32_scores",
+        # schedule / launch knobs
+        _MAX_BLOCKS,
+        int(_SIGNAL_BYTES),
     )
 
 
@@ -412,16 +463,59 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
     ) -> "PCIeDCPTopKOwnerExchange":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
-        device_obj = _normalize_device(device)
-        if device_obj.type != "cuda":
-            raise ValueError("DCP top-k owner exchange requires a CUDA device")
-        ipc = CudaRTLibrary()
-        ipc.cudaSetDevice(device_obj.index or 0)
-        layout = _candidate_staging_layout(
-            signal_bytes=_SIGNAL_BYTES,
-            max_rows=max_rows,
-            topk=topk,
-            world_size=world_size,
+
+        def validate_factory_arguments():
+            device_obj = _normalize_device(device)
+            if device_obj.type != "cuda":
+                raise ValueError("DCP top-k owner exchange requires a CUDA device")
+            if world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(f"unsupported world size {world_size}")
+            if max_rows <= 0 or max_rows % world_size != 0:
+                raise ValueError(
+                    "max_rows must be positive and divisible by world_size"
+                )
+            if topk <= 0 or topk % 4 != 0:
+                raise ValueError("topk must be a positive multiple of 4")
+            return device_obj
+
+        device_obj = _run_collective_preallocation_setup(
+            owner="PCIe DCP top-k argument validation",
+            exchange_group=exchange_group,
+            setup=validate_factory_arguments,
+        )
+
+        _require_full_grid_residency(
+            owner="PCIe DCP top-k",
+            required_sms=_MAX_BLOCKS,
+            device=device_obj,
+            exchange_group=exchange_group,
+        )
+
+        def prepare():
+            prepared_ipc = CudaRTLibrary()
+            prepared_ipc.cudaSetDevice(device_obj.index or 0)
+            prepared_layout = _candidate_staging_layout(
+                signal_bytes=_SIGNAL_BYTES,
+                max_rows=max_rows,
+                topk=topk,
+                world_size=world_size,
+            )
+            return prepared_ipc, prepared_layout
+
+        ipc, layout = _run_collective_preallocation_setup(
+            owner="PCIe DCP top-k",
+            exchange_group=exchange_group,
+            setup=prepare,
+        )
+        _require_collective_contract(
+            owner="PCIe DCP top-k channel layout",
+            exchange_group=exchange_group,
+            contract=_dcp_topk_runtime_contract(
+                world_size=world_size,
+                max_rows=max_rows,
+                topk=topk,
+                layout=layout,
+            ),
         )
         owned: list[_OwnedSharedBuffer] = []
         try:

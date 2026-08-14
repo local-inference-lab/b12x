@@ -211,3 +211,213 @@ def test_configuration_rejects_invalid_capacity_and_topk():
             max_rows=6,
             topk=4,
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #178: collective DCP Top-K contract agreement before IPC allocation.
+# ---------------------------------------------------------------------------
+#
+# The tests below verify that every rank exchanges and compares a versioned
+# fixed-schema contract *before* any cudaIpcOpenMemHandle occurs.  A
+# single-field mismatch in capacity, offset, wire mode/codec, topology, or
+# schedule must fail every rank coherently.  An exact match must proceed to
+# allocation.
+
+from b12x.comm.pcie import pcie_dcp_topk as _topk_mod
+from b12x.comm.pcie import pcie_oneshot as _oneshot_mod
+
+
+def _base_contract() -> tuple:
+    """Return the canonical contract for world=2, max_rows=8, topk=4."""
+    layout = _candidate_staging_layout(
+        signal_bytes=_SIGNAL_BYTES,
+        max_rows=8,
+        topk=4,
+        world_size=2,
+    )
+    return _topk_mod._dcp_topk_runtime_contract(
+        world_size=2,
+        max_rows=8,
+        topk=4,
+        layout=layout,
+    )
+
+
+def _patch_factory_gates(monkeypatch, *, peer_contract: tuple) -> None:
+    """Monkeypatch collective gates so a 2-rank exchange can run on CPU.
+
+    * ``dist.get_rank`` / ``get_world_size`` report a 2-rank group.
+    * ``_run_collective_preallocation_setup`` runs ``setup()`` immediately.
+    * ``_require_full_grid_residency`` is a no-op (CPU test).
+    * ``_broadcast_gather_object`` returns ``[local, peer]`` so the local
+      rank sees a mismatched peer contract.
+    * ``_allocate_shared_buffer`` is patched to ``pytest.fail`` so the test
+      proves the contract check fires *before* IPC allocation.
+    """
+    monkeypatch.setattr(_topk_mod.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(_topk_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        _topk_mod,
+        "_run_collective_preallocation_setup",
+        lambda **kwargs: kwargs["setup"](),
+    )
+    monkeypatch.setattr(
+        _topk_mod,
+        "_require_full_grid_residency",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        _topk_mod,
+        "CudaRTLibrary",
+        lambda: type("FakeIPC", (), {
+            "cudaSetDevice": lambda self, device: None,
+        })(),
+    )
+    monkeypatch.setattr(
+        _oneshot_mod,
+        "_broadcast_gather_object",
+        lambda contract, group: [contract, peer_contract],
+    )
+    monkeypatch.setattr(
+        _oneshot_mod.PCIeOneshotAllReduce,
+        "_allocate_shared_buffer",
+        lambda *args, **kwargs: pytest.fail(
+            "IPC allocation must not start when the contract mismatches"
+        ),
+    )
+
+
+def _contract_field_index(field: str) -> int:
+    """Return the position of a named field in the contract tuple."""
+    layout = _candidate_staging_layout(
+        signal_bytes=_SIGNAL_BYTES,
+        max_rows=8,
+        topk=4,
+        world_size=2,
+    )
+    canonical = _topk_mod._dcp_topk_runtime_contract(
+        world_size=2,
+        max_rows=8,
+        topk=4,
+        layout=layout,
+    )
+
+    replacements: dict[str, tuple] = (
+        ("capacity_max_rows", (3,)),
+        ("capacity_topk", (5,)),
+        ("offset_staging0", (11,)),
+        ("offset_staging1", (12,)),
+        ("wire_codec_index", (13,)),
+        ("wire_codec_score", (14,)),
+        ("topology_world", (1,)),
+        ("schedule_max_blocks", (15,)),
+        ("schedule_signal_bytes", (16,)),
+    )
+    if field not in replacements:
+        raise KeyError(f"unknown field {field}")
+    (idx,) = replacements[field]
+    assert 0 <= idx < len(canonical), f"field {field} index out of range"
+    return idx
+
+
+def _mismatched_contract(field: str) -> tuple:
+    """Return a contract that differs from the canonical one in exactly one field."""
+    contract = list(_base_contract())
+    idx = _contract_field_index(field)
+    original = contract[idx]
+    if isinstance(original, int):
+        contract[idx] = original + 1
+    elif isinstance(original, str):
+        contract[idx] = original + "_mismatched"
+    elif isinstance(original, tuple):
+        contract[idx] = original + (999,)
+    else:
+        contract[idx] = "__MISMATCHED__"
+    return tuple(contract)
+
+
+@pytest.mark.parametrize(
+    "field, label",
+    [
+        ("capacity_max_rows", "capacity"),
+        ("capacity_topk", "capacity"),
+        ("offset_staging0", "offset"),
+        ("offset_staging1", "offset"),
+        ("wire_codec_index", "wire mode/codec"),
+        ("wire_codec_score", "wire mode/codec"),
+        ("topology_world", "topology"),
+        ("schedule_max_blocks", "schedule"),
+        ("schedule_signal_bytes", "schedule"),
+    ],
+)
+def test_contract_single_field_mismatch_fails_before_ipc_allocation(
+    monkeypatch, field, label,
+):
+    """A single-field mismatch in {label} must fail every rank before
+    cudaIpcOpenMemHandle."""
+    _patch_factory_gates(monkeypatch, peer_contract=_mismatched_contract(field))
+    with pytest.raises(RuntimeError, match="contract differs across ranks"):
+        PCIeDCPTopKOwnerExchange.from_exchange_group(
+            exchange_group=object(),
+            device=torch.device("cuda:0"),
+            max_rows=8,
+            topk=4,
+        )
+
+
+def test_contract_exact_match_proceeds_to_allocation(monkeypatch):
+    """When every field matches, the factory must proceed past the contract
+    check to IPC allocation."""
+    shared = _oneshot_mod._OwnedSharedBuffer(
+        local_ptr=1000,
+        peer_ptrs=(1000, 2000),
+        remote_ptrs=(2000,),
+    )
+
+    class FakeIPC:
+        def cudaSetDevice(self, device):
+            pass
+        def cudaFree(self, ptr):
+            pass
+        def cudaIpcCloseMemHandle(self, ptr):
+            pass
+
+    monkeypatch.setattr(_topk_mod.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(_topk_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        _topk_mod,
+        "_run_collective_preallocation_setup",
+        lambda **kwargs: kwargs["setup"](),
+    )
+    monkeypatch.setattr(
+        _topk_mod,
+        "_require_full_grid_residency",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        _oneshot_mod,
+        "_broadcast_gather_object",
+        lambda contract, group: [contract, contract],
+    )
+    monkeypatch.setattr(
+        _oneshot_mod.PCIeOneshotAllReduce,
+        "_allocate_shared_buffer",
+        lambda *args, **kwargs: shared,
+    )
+    monkeypatch.setattr(_topk_mod, "CudaRTLibrary", lambda: FakeIPC())
+    monkeypatch.setattr(
+        _topk_mod,
+        "_tensor_from_cuda_pointer",
+        lambda ptr, shape, **kwargs: torch.empty(shape, dtype=kwargs.get("dtype", torch.int32)),
+    )
+
+    owner = PCIeDCPTopKOwnerExchange.from_exchange_group(
+        exchange_group=object(),
+        device=torch.device("cuda:0"),
+        max_rows=8,
+        topk=4,
+    )
+    assert owner.world_size == 2
+    assert owner.max_rows == 8
+    assert owner.topk == 4
+    owner._coordinated_close_complete = True
