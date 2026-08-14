@@ -442,6 +442,7 @@ def _candidate_tile_fits(
     weight_layout: str = "packed",
     weight_bits: int = 4,
     allow_logical_tail: bool = False,
+    allow_qualified_fc2_tile: bool = False,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -462,7 +463,20 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    # The FC2 wave-balanced decode schedule uses one qualified 32x512 tile.
+    # Keep the generic tile floor while allowing that exact geometry to pass
+    # through the explicit-pin path used by the Torch custom-op boundary.
+    wide_n_fc2_tile = (
+        allow_qualified_fc2_tile
+        and int(tile_k) == 32
+        and int(tile_n) == 512
+        and int(cta_threads) == 256
+    )
+    if (
+        int(tile_n) < 64
+        or int(cta_threads) < 128
+        or (int(tile_k) < 64 and not wide_n_fc2_tile)
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -9933,28 +9947,27 @@ def compile_w4a16_fused_moe(
         and fc1_mn_after <= int(sms)
     ):
         ultra_fc2_tile_k = 32
-        ultra_smem = _shared_memory_footprint(
+        if _candidate_tile_fits(
+            problem_n=hidden_size,
+            problem_k=intermediate_size,
             cta_m_blocks=_covering_count(moe_block_size, 16),
             tile_n=512,
             tile_k=ultra_fc2_tile_k,
+            cta_threads=256,
+            max_shared_mem=int(max_shared_mem) - 512,
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=weight_bits,
-        )
-        if (
-            int(intermediate_size) % ultra_fc2_tile_k == 0
-            and ultra_smem <= int(max_shared_mem) - 512
+            allow_qualified_fc2_tile=True,
         ):
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
     if force_tile_config is not None:
-        # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
-        # Some weight layouts are packed for a specific CTA
-        # N-tile, so hybrid deployments pin ONE tile config across every m
-        # regime instead of the m-dependent auto selection (and TC-decode
-        # wide-N overrides) above. Overrides whatever was selected; the tiles
-        # land in the GEMM cache keys, so no cache collision is possible.
+        # Some weight layouts are packed for a specific CTA N-tile. An explicit
+        # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple therefore pins
+        # one geometry across every M regime. Tile values are part of the GEMM
+        # cache key, so distinct packed layouts cannot collide.
         fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = (
             int(v) for v in force_tile_config
         )
@@ -9981,6 +9994,7 @@ def compile_w4a16_fused_moe(
                 weight_layout=weight_layout,
                 weight_bits=weight_bits,
                 allow_logical_tail=allow_native_logical_tail,
+                allow_qualified_fc2_tile=name == "fc2",
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
