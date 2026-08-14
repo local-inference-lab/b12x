@@ -15,10 +15,11 @@ pools via ``<Class>Pool``.
   per-token FP8-e4m3 transport.
 - ``DcpAllToAll``: DCP attention exchange with fused LSE reduce-scatter.
 - ``DcpTopKOwnerExchange``: exact DCP candidate owner staging.
+- ``VocabParallelArgmax``: TP16 fused BF16 add and exact global greedy argmax.
 
-Every device kernel is authored in Python with CuTe DSL.  Host-side CUDA
-Runtime/Driver calls are also made from Python; this package contains no
-repo-authored C++ or CUDA source and never invokes a native extension build.
+Most device kernels are authored in Python with CuTe DSL. Vocabulary-parallel
+argmax JIT-builds the bundled ``pcie_vocab_argmax.cu`` extension on first use.
+Host-side CUDA Runtime and Driver calls are made from Python.
 """
 
 from __future__ import annotations
@@ -40,13 +41,14 @@ META = OpMeta(
         "DcpAllToAll",
         "DcpAllToAllPool",
         "DcpTopKOwnerExchange",
+        "VocabParallelArgmax",
         "autotune_dma_crossovers",
         "parse_oneshot_max_size",
         "lse_reduce_scatter_reference",
         "owner_stage_reference",
         "is_supported",
     ),
-    dtypes=("bf16", "fp32", "fp8_e4m3", "int32"),
+    dtypes=("bf16", "fp32", "fp8_e4m3", "int32", "int64"),
     requires=("multi_gpu",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -68,6 +70,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         OneshotAllReduce,
         OneshotAllReducePool,
         TwoShotReduceScatter,
+        VocabParallelArgmax,
         autotune_dma_crossovers,
         is_supported,
         lse_reduce_scatter_reference,
