@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import logging
 import os
+import weakref
+from contextlib import suppress
 from typing import Any, Optional
 
 import torch
@@ -45,9 +47,13 @@ from b12x.integration.vllm.fp6_serving import (
     QUANT_ALGO,
     QUANT_METHOD,
     B12XFP6MoEMethod,
+    CaptureOutputCache,
+    ServingScratchArena,
+    capture_sizes_from_config,
     get_fp6_moe_weight_plan,
     is_b12x_fp6_enabled,
     kernel_source_format_for_moe,
+    reset_serving_caches,
 )
 
 MODEL_DIR_ENV = "B12X_FP6_MODEL_DIR"
@@ -69,6 +75,7 @@ _MOE_WARM_MAX_M = 64
 # Dense decode/verify token counts warm-run at load time.
 _DENSE_WARM_DECODE_MS = (1, 2, 4, 5, 8, 16)
 _DENSE_WARMED_SHAPES: set[tuple] = set()
+_DENSE_WARM_MAX_SHAPES = 256  # bounded — prevents unbounded historical growth
 
 # Fused vLLM module suffix -> ordered HF constituent projection names.
 _FUSED_PARTS: dict[str, tuple[str, ...]] = {
@@ -80,6 +87,7 @@ _FUSED_PARTS: dict[str, tuple[str, ...]] = {
 
 _registered = False
 _CONFIG_CLS: Optional[type] = None
+_live_configs: "weakref.WeakSet[Any]" = weakref.WeakSet()
 logger = logging.getLogger("b12x.vllm_fp6")
 
 
@@ -104,6 +112,73 @@ def _moe_warm_decode_ms() -> tuple[int, ...]:
     except Exception:
         logger.debug("vLLM config unavailable for MoE warm sizes", exc_info=True)
     return tuple(sorted(s for s in sizes if 1 <= s <= _MOE_WARM_MAX_M))
+
+
+# Re-export the production function for plugin-internal use and test access.
+_capture_sizes_from_config = capture_sizes_from_config
+
+
+_CAPTURE_SIZES_ENV = "B12X_FP6_CAPTURE_SIZES"
+
+
+def _resolve_capture_catalog() -> tuple[int, ...]:
+    """Derive the authoritative capture-size catalog from the live vLLM config.
+
+    Reads ``cudagraph_capture_sizes`` from the finalized vLLM compilation
+    config.  All positive declared sizes are retained (no artificial upper
+    cap).  ``B12X_MOE_WARM_MS`` does NOT influence this catalog — it only
+    affects decode warmup token counts via :func:`_moe_warm_decode_ms`.
+
+    Fails closed: if vLLM config is unavailable or the capture sizes
+    attribute is ``None`` (auto-inference pre-finalization) or cannot be
+    parsed, raises ``RuntimeError`` so the problem surfaces at model load
+    rather than silently producing an empty catalog that would reject all
+    captures.
+
+    A compatibility fallback is available via ``B12X_FP6_CAPTURE_SIZES``
+    for deployments where vLLM config is not finalized at plugin load time.
+    """
+    # Try vLLM config first.
+    try:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+        compilation_config = cfg.compilation_config
+    except Exception:
+        pass  # fall through to env fallback
+    else:
+        cap: Any = None
+        if isinstance(compilation_config, dict):
+            cap = compilation_config.get("cudagraph_capture_sizes")
+        else:
+            cap = getattr(compilation_config, "cudagraph_capture_sizes", None)
+        if cap is not None:
+            return capture_sizes_from_config(compilation_config)
+        # cap is None — could be auto-inference or disabled. Fall through.
+
+    # Env fallback for compatibility.
+    env = os.environ.get(_CAPTURE_SIZES_ENV, "").strip()
+    if env:
+        try:
+            sizes = tuple(int(v) for v in env.replace(",", " ").split())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"B12X FP6: malformed {_CAPTURE_SIZES_ENV}={env!r} ({exc})"
+            ) from exc
+        catalog = tuple(sorted(s for s in sizes if s > 0))
+        if catalog:
+            logger.info(
+                "B12X FP6: using %s=%s for capture catalog (vLLM config "
+                "unavailable or None)", _CAPTURE_SIZES_ENV, catalog,
+            )
+            return catalog
+
+    raise RuntimeError(
+        f"B12X FP6: cannot resolve capture-size catalog. vLLM config is "
+        f"unavailable or cudagraph_capture_sizes is None. Set explicit "
+        f"capture sizes in vLLM compilation config, or set "
+        f"{_CAPTURE_SIZES_ENV} env var."
+    )
 
 
 def _rebuild_b12x_fp6_config(model_dir: Optional[str]) -> Any:
@@ -263,9 +338,32 @@ def register_b12x_fp6() -> None:
             )
             import b12x.quantization.mxfp6.fp6_dense_op  # noqa: F401
 
-            layer.b12x_fp6_gemm_weight = gemm_w
-            layer.b12x_fp6_scales = w.scale_storage
-            layer.b12x_fp6_gscale = w.global_scale
+            # Reload guard: if graph-visible dense tensors already exist,
+            # copy new values into existing storage (preserve data_ptr).
+            if hasattr(layer, "b12x_fp6_gemm_weight"):
+                old_gw = layer.b12x_fp6_gemm_weight
+                if (
+                    isinstance(old_gw, torch.Tensor)
+                    and old_gw.shape == gemm_w.shape
+                    and old_gw.dtype == gemm_w.dtype
+                    and old_gw.device == gemm_w.device
+                ):
+                    old_gw.copy_(gemm_w)
+                else:
+                    layer.b12x_fp6_gemm_weight = gemm_w
+                old_scales = getattr(layer, "b12x_fp6_scales", None)
+                if (
+                    isinstance(old_scales, torch.Tensor)
+                    and old_scales.shape == w.scale_storage.shape
+                    and old_scales.dtype == w.scale_storage.dtype
+                    and old_scales.device == w.scale_storage.device
+                ):
+                    old_scales.copy_(w.scale_storage)
+                else:
+                    layer.b12x_fp6_scales = w.scale_storage
+            else:
+                layer.b12x_fp6_gemm_weight = gemm_w
+                layer.b12x_fp6_scales = w.scale_storage
             layer.b12x_fp6_fmt = w.fmt
             layer.b12x_fp6_act_fmt = w.act_fmt
             layer.b12x_fp6_out_features = w.out_features
@@ -366,27 +464,38 @@ def register_b12x_fp6() -> None:
     from vllm.model_executor.utils import set_weight_attrs
 
     class _VllmMoEMethod(FusedMoEMethodBase):  # type: ignore[misc]
-        _OUT_BUF_MAX_M = 512
-
-        def __init__(self, moe_config: Any, source_format: str):
+        def __init__(
+            self, moe_config: Any, source_format: str, config: Any
+        ):
             super().__init__(moe_config)
             self.source_format = source_format
+            self._config = config
             self.core: Optional[B12XFP6MoEMethod] = None
-            self._out_bufs: dict[int, torch.Tensor] = {}
+            self._out_cache: Optional[CaptureOutputCache] = None
 
         def _output_for(self, x: torch.Tensor) -> Optional[torch.Tensor]:
             m = int(x.shape[0])
-            if m > self._OUT_BUF_MAX_M:
-                if not torch.cuda.is_current_stream_capturing():
-                    return None
-                return torch.zeros(m, x.shape[1], dtype=x.dtype, device=x.device)
-            buf = self._out_bufs.get(m)
-            if buf is None:
-                buf = torch.zeros(m, x.shape[1], dtype=x.dtype, device=x.device)
-                self._out_bufs[m] = buf
-            else:
-                buf.zero_()
-            return buf
+            if self._out_cache is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "B12X FP6 MoE: output cache not initialized before "
+                        "CUDA-graph capture"
+                    )
+                return None
+            return self._out_cache.get(m, x.dtype, x.device)
+
+        def unload(self) -> None:
+            """Drop this layer's retained output references.
+
+            Must be called only after vLLM has quiesced execution and
+            destroyed all CUDA graphs referencing this layer's tensors.
+            The model-owned shared scratch arena is cleared separately by
+            :meth:`B12XFp6Config.unload_serving`.
+            """
+            if self._out_cache is not None:
+                self._out_cache.clear()
+                self._out_cache = None
+            self.core = None
 
         def create_weights(
             self,
@@ -491,8 +600,9 @@ def register_b12x_fp6() -> None:
             ones_e = torch.ones(e, dtype=torch.float32, device=dev)
             ones_1 = torch.ones(1, dtype=torch.float32, device=dev)
             kernel_src = kernel_source_format_for_moe(self.source_format)
-            # Shared per-geometry plan object: makes the process-wide scratch
-            # cache in fp6_serving actually shared across all MoE layers.
+            # Shared per-geometry plan object (process-wide, tensor-free).
+            # Each model's ServingScratchArena holds a strong reference to the
+            # plan it was constructed with.
             weight_plan = get_fp6_moe_weight_plan(
                 source_format=kernel_src,
                 activation=activation,
@@ -523,19 +633,41 @@ def register_b12x_fp6() -> None:
                 p.data = torch.empty(0, dtype=p.dtype, device=dev)
             if dev.type == "cuda":
                 torch.cuda.empty_cache()
+            # Weight-only reload: vLLM's reload_weights() does NOT destroy
+            # CUDA graphs, so graph-captured output/scratch/weight pointers
+            # MUST stay stable.  Copy new prepared weight values into the
+            # existing storage (same data_ptr), never replace the objects.
+            if self.core is not None:
+                self.core.update_experts(prepared)
+                return
 
+            topk = int(getattr(self.moe, "experts_per_token", 0) or 8)
+            router_on_input = bool(
+                getattr(layer, "apply_router_weight_on_input", False)
+            )
+            # Get the model-shared scratch arena from the config (one per
+            # model, shared across all MoE layers — layers run sequentially).
+            catalog, arena = self._config._init_shared_serving(
+                weight_plan,
+                topk,
+                dev,
+                source_format=kernel_src,
+                activation=activation,
+                num_experts=e,
+                hidden_size=k,
+                intermediate_size=n,
+                apply_router_weight_on_input=router_on_input,
+            )
+            self._out_cache = CaptureOutputCache(
+                catalog, k, torch.bfloat16, dev
+            )
             self.core = B12XFP6MoEMethod(
                 prepared,
                 weight_plan,
-                apply_router_weight_on_input=bool(
-                    getattr(layer, "apply_router_weight_on_input", False)
-                ),
+                apply_router_weight_on_input=router_on_input,
+                arena=arena,
             )
             if dev.type == "cuda":
-                topk = int(getattr(self.moe, "experts_per_token", 0) or 8)
-                router_on_input = bool(
-                    getattr(layer, "apply_router_weight_on_input", False)
-                )
                 for m in _moe_warm_decode_ms():
                     x = torch.zeros(m, k, dtype=torch.bfloat16, device=dev)
                     ids = (
@@ -590,6 +722,10 @@ def register_b12x_fp6() -> None:
             self._match_miss: list[str] = []
             self._miss_count = 0
             self._warned_zero_overlap = False
+            self._moe_methods: list[_VllmMoEMethod] = []
+            self._shared_arena: Optional[ServingScratchArena] = None
+            self._serving_catalog: tuple[int, ...] = ()
+            self._serving_initialized = False
 
         def __reduce__(self):
             return (_rebuild_b12x_fp6_config, (self._model_dir,))
@@ -674,6 +810,8 @@ def register_b12x_fp6() -> None:
                 act_fmt_overrides=self._act_fmt_overrides,
             )
             self._loaded = True
+            # Track for process-wide teardown (weak — doesn't prevent GC).
+            _live_configs.add(self)
             logger.info(
                 "B12X FP6: %d FP6 modules discovered in %s "
                 "(source_format=%s act_fmt=%s overrides=%d)",
@@ -714,6 +852,71 @@ def register_b12x_fp6() -> None:
                 self._match_miss[0] if self._match_miss else "?",
             )
 
+        def _init_shared_serving(
+            self, weight_plan: Any, topk: int, device: torch.device,
+            *, source_format: str, activation: str, num_experts: int,
+            hidden_size: int, intermediate_size: int,
+            apply_router_weight_on_input: bool,
+        ) -> tuple[tuple[int, ...], ServingScratchArena]:
+            """Get the model-shared scratch arena, validating geometry match.
+
+            All MoE layers of a model share one arena because they run
+            sequentially on one stream and have identical geometry.  If a
+            later layer has different geometry, raises RuntimeError immediately
+            rather than silently misbinding scratch.
+            """
+            if self._serving_initialized:
+                if self._shared_arena is None:
+                    raise RuntimeError(
+                        "B12X FP6: serving initialized but arena is None"
+                    )
+                # Validate that this layer's geometry matches the arena's.
+                self._shared_arena.validate_geometry(
+                    weight_plan=weight_plan,
+                    topk=topk,
+                    device=device,
+                    source_format=source_format,
+                    activation=activation,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
+                return self._serving_catalog, self._shared_arena
+            self._serving_catalog = _resolve_capture_catalog()
+            self._shared_arena = ServingScratchArena(
+                self._serving_catalog,
+                weight_plan,
+                topk,
+                device,
+                source_format=source_format,
+                activation=activation,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            self._serving_initialized = True
+            return self._serving_catalog, self._shared_arena
+
+        def unload_serving(self) -> None:
+            """Release all model-owned serving caches after graphs are destroyed.
+
+            Call **after** vLLM has quiesced execution and destroyed all
+            CUDA graphs for this model.  Clears per-layer output caches and
+            the model-owned shared scratch arena, then drops references.
+            Does not affect other live models' arenas.  Does NOT clear
+            _moe_methods so that subsequent reload/unload cycles can still
+            find existing methods.
+            """
+            for method in self._moe_methods:
+                method.unload()
+            if self._shared_arena is not None:
+                self._shared_arena.clear()
+                self._shared_arena = None
+            self._serving_initialized = False
+            self._serving_catalog = ()
+
         def get_quant_method(self, layer: Any, prefix: str):
             from vllm.model_executor.layers.linear import (
                 LinearBase,
@@ -746,7 +949,9 @@ def register_b12x_fp6() -> None:
             if is_moe:
                 if self._has_fp6_experts(prefix):
                     logger.info("B12X FP6: bound FP6 MoE %s", prefix)
-                    return _VllmMoEMethod(layer.moe_config, self._source_format)
+                    method = _VllmMoEMethod(layer.moe_config, self._source_format, self)
+                    self._moe_methods.append(method)
+                    return method
                 logger.info("B12X FP6: vLLM-native MoE fallback for %s", prefix)
                 return None
 
@@ -781,6 +986,50 @@ def register_b12x_fp6() -> None:
 
     _CONFIG_CLS = B12XFp6Config
     _registered = True
+
+    # Register a shutdown hook by monkey-patching GPUModelRunner.shutdown.
+    # vLLM does not provide a plugin lifecycle hook for model unload, so we
+    # wrap the runner's shutdown to quiesce execution, clear CUDA graphs,
+    # and then call unload_serving() on every live b12x config.
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as _Runner
+
+        _orig_shutdown = _Runner.shutdown
+
+        def _b12x_shutdown(self_runner: Any) -> None:
+            # Quiesce: synchronize the device before touching graphs.
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            # Clear graph owners (full, piecewise, etc.) if present.
+            for attr in ("graph_runners", "cuda_graph_executor"):
+                runners = getattr(self_runner, attr, None)
+                if runners is None:
+                    continue
+                if isinstance(runners, dict):
+                    for entry in runners.values():
+                        graph = getattr(entry, "cuda_graph", None)
+                        if graph is not None:
+                            with suppress(Exception):
+                                graph.reset()
+                elif hasattr(runners, "reset"):
+                    with suppress(Exception):
+                        runners.reset()
+            # Now safe to unload serving caches (graphs are destroyed).
+            for cfg in list(_live_configs):
+                try:
+                    cfg.unload_serving()
+                except Exception:
+                    logger.debug("unload_serving during shutdown failed", exc_info=True)
+            reset_serving_caches()
+            # Call original shutdown.
+            _orig_shutdown(self_runner)
+
+        _Runner.shutdown = _b12x_shutdown
+    except Exception:
+        logger.debug("Could not patch GPUModelRunner.shutdown", exc_info=True)
 
 
 def _dense_weight_from_loaded(
@@ -820,3 +1069,14 @@ def _dense_weight_from_loaded(
         ),
         out_features_unsharded=out_features_unsharded,
     )
+
+
+def unload_b12x_fp6_serving() -> None:
+    """Process-wide teardown: clear the tensor-free weight-plan cache.
+
+    Safe only after **all** live models have been unloaded via their
+    ``B12XFp6Config.unload_serving()`` (which clears per-model scratch
+    arenas and output caches after destroying CUDA graphs).  This function
+    clears the process-wide weak plan cache for last-process cleanup.
+    """
+    reset_serving_caches()

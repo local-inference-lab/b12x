@@ -47,7 +47,9 @@ End-to-end flow
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import weakref
 from typing import Any, Optional
 
 import torch
@@ -56,19 +58,249 @@ ENABLE_ENV = "B12X_ENABLE_FP6"
 QUANT_METHOD = "modelopt"
 QUANT_ALGO = "W6A6"
 
-# Process-wide scratch/plan cache shared across ALL MoE layers of a model.
-# Layers run sequentially on one stream — eager and inside CUDA graphs alike —
-# so scratch reuse is safe, and every layer of a model has identical
-# (E, K, N, topk) geometry.  Per-layer caching multiplies the footprint by
-# the layer count (~40x): fatal under vLLM's CUDA-graph memory estimator.
-_SCRATCH_CACHE: dict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = {}
 
-# Deduped fused_moe weight plans, keyed by geometry.  Every MoE layer of a
-# model shares one plan object, which is what makes the scratch cache above
-# actually shared (its key includes ``id(weight_plan)``) and keeps
-# ``fused_moe.bind``'s ``experts.plan == caps.weight_plan`` check trivially
-# true for scratch planned against the shared object.
-_WEIGHT_PLAN_CACHE: dict[tuple, Any] = {}
+class CaptureOutputCache:
+    """Bounded output buffer cache keyed by the declared capture-size catalog.
+
+    Only catalogued M values (CUDA-graph capture sizes) get retained
+    ``(M, K)`` BF16 output buffers with stable addresses.  Uncatalogued
+    eager M returns ``None`` (caller allocates transiently).  Uncatalogued
+    M during CUDA-graph capture raises before any allocation.
+
+    Owner invariants (dtype, device, hidden_size) are fixed at construction
+    and validated on every ``get`` to prevent cross-model/cross-config aliasing.
+    """
+
+    def __init__(
+        self,
+        catalog: tuple[int, ...],
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self._catalog = frozenset(int(m) for m in catalog)
+        self._hidden_size = int(hidden_size)
+        self._dtype = dtype
+        self._device = device
+        self._bufs: dict[int, torch.Tensor] = {}
+
+    @property
+    def catalog(self) -> frozenset[int]:
+        return self._catalog
+
+    def get(
+        self, m: int, dtype: torch.dtype, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        if dtype != self._dtype or device != self._device:
+            raise RuntimeError(
+                f"B12X FP6 MoE: output cache dtype/device mismatch: "
+                f"got ({dtype}, {device}), expected ({self._dtype}, {self._device})"
+            )
+        if m not in self._catalog:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"B12X FP6 MoE: uncatalogued M={m} during CUDA-graph "
+                    "capture — output buffer not in capture-size catalog"
+                )
+            return None  # eager transient
+        buf = self._bufs.get(m)
+        if buf is None:
+            buf = torch.zeros(
+                m, self._hidden_size, dtype=self._dtype, device=self._device
+            )
+            self._bufs[m] = buf
+        else:
+            buf.zero_()
+        return buf
+
+    def clear(self) -> None:
+        self._bufs.clear()
+
+    def __len__(self) -> int:
+        return len(self._bufs)
+
+
+class ServingScratchArena:
+    """Model-owned scratch cache bounded by the declared capture catalog.
+
+    One arena instance is shared across ALL MoE layers of a model (layers
+    run sequentially on one stream, so scratch reuse is safe).  Only
+    catalogued M values get retained scratch with stable addresses (needed
+    for CUDA-graph capture).  Uncatalogued eager M computes transient
+    scratch that is never stored.  Uncatalogued capture M is rejected
+    before allocation.
+
+    The scratch key includes the full semantic geometry (source_format,
+    activation, E, K, N, topk, device, router_on_input) so different model
+    geometries never alias, and plan re-creation does not split generations.
+    """
+
+    def __init__(
+        self,
+        catalog: tuple[int, ...],
+        weight_plan: Any,
+        topk: int,
+        device: torch.device,
+        *,
+        source_format: str = "",
+        activation: str = "",
+        num_experts: int = 0,
+        hidden_size: int = 0,
+        intermediate_size: int = 0,
+        apply_router_weight_on_input: bool = False,
+    ):
+        self._catalog = frozenset(int(m) for m in catalog)
+        self._weight_plan = weight_plan
+        self._topk = int(topk)
+        self._device = device
+        self._router_on_input = bool(apply_router_weight_on_input)
+        # Full semantic geometry key — stable across plan re-creation.
+        self._geometry = (
+            source_format,
+            activation,
+            int(num_experts),
+            int(hidden_size),
+            int(intermediate_size),
+            self._topk,
+            str(device),
+            self._router_on_input,
+        )
+        self._scratch: dict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = {}
+
+    def validate_geometry(
+        self, *, weight_plan: Any, topk: int, device: torch.device,
+        source_format: str, activation: str, num_experts: int,
+        hidden_size: int, intermediate_size: int,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """Raise RuntimeError if caller geometry differs from arena geometry."""
+        other = (
+            source_format, activation, int(num_experts),
+            int(hidden_size), int(intermediate_size),
+            int(topk), str(device), bool(apply_router_weight_on_input),
+        )
+        if other != self._geometry:
+            raise RuntimeError(
+                f"B12X FP6 MoE: geometry mismatch — arena has "
+                f"{self._geometry} but layer has {other}. All MoE layers "
+                "of a model must share identical geometry."
+            )
+
+    @property
+    def catalog(self) -> frozenset[int]:
+        return self._catalog
+
+    @property
+    def weight_plan(self) -> Any:
+        return self._weight_plan
+
+    def _key(self, m: int) -> tuple:
+        return (int(m), self._geometry)
+
+    def get_or_build(
+        self, m: int
+    ) -> tuple[Any, tuple[torch.Tensor, ...]]:
+        """Return retained scratch for catalogued M, transient for uncatalogued eager.
+
+        Raises RuntimeError for uncatalogued M during CUDA-graph capture.
+        """
+        if m not in self._catalog:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"B12X FP6 MoE: uncatalogued M={m} during CUDA-graph "
+                    "capture — scratch not in capture-size catalog"
+                )
+            # Uncatalogued eager: build transient, do not retain.
+            return self._build(m)
+        key = self._key(m)
+        cached = self._scratch.get(key)
+        if cached is not None:
+            return cached
+        plan, scratch = self._build(m)
+        self._scratch[key] = (plan, scratch)
+        return plan, scratch
+
+    def _build(self, m: int) -> tuple[Any, tuple[torch.Tensor, ...]]:
+        from b12x.moe import fused_moe
+
+        plan = fused_moe.plan(
+            fused_moe.Caps(
+                max_tokens=m,
+                num_topk=self._topk,
+                device=self._device,
+                weight_plan=self._weight_plan,
+                core_token_counts=(m,),
+                route_num_experts=0,
+                quant_mode="w6a8_mx",
+                apply_router_weight_on_input=self._router_on_input,
+            )
+        )
+        scratch = tuple(
+            torch.empty(
+                shape,
+                dtype=dtype,
+                device=plan.scratch_specs()[i].device,
+            )
+            for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+        )
+        return plan, scratch
+
+    def clear(self) -> None:
+        """Drop all retained scratch references.
+
+        Safe only after all CUDA graphs referencing this arena's tensors
+        have been destroyed.
+        """
+        self._scratch.clear()
+
+    def __len__(self) -> int:
+        return len(self._scratch)
+
+
+# Deduped fused_moe weight plans, keyed by geometry.  Uses WeakValueDictionary
+# so plans are garbage-collected when no live arena references them — no
+# historical accumulation.  Plans are tensor-free metadata; the weak ref
+# prevents stale geometries from accumulating across model churn.
+_WEIGHT_PLAN_CACHE: "weakref.WeakValueDictionary[tuple, Any]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def reset_serving_caches() -> None:
+    """Drop all process-wide weight-plan references.
+
+    Safe only after **all** live models' CUDA graphs have been destroyed.
+    Per-model scratch is owned by :class:`ServingScratchArena` instances and
+    cleared via their ``clear()`` method; this function only clears the
+    tensor-free plan cache.
+    """
+    _WEIGHT_PLAN_CACHE.clear()
+
+
+def capture_sizes_from_config(compilation_config: Any) -> tuple[int, ...]:
+    """Extract cudagraph_capture_sizes from a vLLM compilation config.
+
+    Handles both object and dict config forms.  Returns all positive declared
+    sizes (no upper cap — vLLM can declare capture sizes above 512).
+    Returns ``()`` if graph capture is disabled (``None`` or empty).
+    Raises ``RuntimeError`` if the attribute exists but has an unsupported type,
+    so discovery problems surface at model load, not during capture.
+    """
+    cap: Any = None
+    if isinstance(compilation_config, dict):
+        cap = compilation_config.get("cudagraph_capture_sizes")
+    else:
+        cap = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    if cap is None:
+        return ()  # graph capture disabled
+    try:
+        sizes = tuple(int(s) for s in cap)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"B12X FP6: cudagraph_capture_sizes has unsupported type/value: "
+            f"{cap!r} ({exc})"
+        ) from exc
+    return tuple(sorted(s for s in sizes if s > 0))
 
 
 def get_fp6_moe_weight_plan(
@@ -79,7 +311,11 @@ def get_fp6_moe_weight_plan(
     hidden_size: int,
     intermediate_size: int,
 ) -> Any:
-    """One shared ``fused_moe.plan_weights`` result per (geometry, activation)."""
+    """One shared ``fused_moe.plan_weights`` result per (geometry, activation).
+
+    The plan is cached weakly so it is GC'd when no live arena holds a
+    strong reference, preventing historical geometry accumulation.
+    """
     from b12x.moe import fused_moe
 
     key = (
@@ -90,17 +326,19 @@ def get_fp6_moe_weight_plan(
         int(intermediate_size),
     )
     plan = _WEIGHT_PLAN_CACHE.get(key)
-    if plan is None:
-        plan = fused_moe.plan_weights(
-            quant_modes="w6a8_mx",
-            source_format=source_format,
-            activation=activation,
-            params_dtype=torch.bfloat16,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
-        )
+    if plan is not None:
+        return plan
+    plan = fused_moe.plan_weights(
+        quant_modes="w6a8_mx",
+        source_format=source_format,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
+    )
+    with contextlib.suppress(TypeError):
         _WEIGHT_PLAN_CACHE[key] = plan
     return plan
 
@@ -161,8 +399,14 @@ def kernel_source_format_for_moe(_checkpoint_source_format: str) -> str:
 class B12XFP6MoEMethod:
     """Reference routed-MoE method backed by :mod:`b12x.moe.fused_moe`.
 
-    Holds one layer's prepared experts and weight plan; scratch/plan tensors come
-    from the process-wide shared cache (see ``_SCRATCH_CACHE``).
+    Holds one layer's prepared experts and weight plan.  Scratch/plan tensors
+    come from the owner's :class:`ServingScratchArena` (if provided) or are
+    transient (if no arena — standalone eager path).
+
+    Scratch retention is bounded by the arena's capture-size catalog.  Only
+    catalogued M values get retained scratch with stable addresses.  Uncatalogued
+    eager M computes transient scratch that is never stored.  Uncatalogued M
+    during CUDA-graph capture is rejected before any cache lookup or allocation.
     """
 
     def __init__(
@@ -172,49 +416,93 @@ class B12XFP6MoEMethod:
         *,
         input_scales_static: bool = True,
         apply_router_weight_on_input: bool = False,
+        arena: Optional[ServingScratchArena] = None,
     ):
         self.experts_prepared = experts_prepared
         self.weight_plan = weight_plan
         self.input_scales_static = input_scales_static
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.arena = arena
+
+    def update_experts(self, new_prepared: Any) -> None:
+        """Copy new prepared weight values into existing storage (reload-safe).
+
+        vLLM's ``reload_weights()`` does NOT destroy CUDA graphs, so
+        graph-captured weight pointers must stay stable.  This copies the
+        tensor data from ``new_prepared`` into the existing
+        ``self.experts_prepared`` storage, preserving every ``data_ptr``
+        that a captured graph may reference.
+
+        Raises RuntimeError if shapes/dtypes/devices don't match (topology
+        change requires graph destruction and recapture, not in-place copy).
+        """
+        old = self.experts_prepared
+        # The prepared object is opaque (from fused_moe.prepare_weights).
+        # Copy every tensor attribute from new into old, preserving data_ptr.
+        for attr_name in dir(new_prepared):
+            if attr_name.startswith("_"):
+                continue
+            new_val = getattr(new_prepared, attr_name, None)
+            old_val = getattr(old, attr_name, None)
+            if not isinstance(new_val, torch.Tensor):
+                continue
+            if not isinstance(old_val, torch.Tensor):
+                raise RuntimeError(
+                    f"B12X FP6 MoE: reload attribute '{attr_name}' is a "
+                    f"tensor in new prepared but not in old — topology "
+                    f"changed, cannot copy in-place. Destroy CUDA graphs "
+                    f"and call unload_serving() before reloading."
+                )
+            if (
+                new_val.shape != old_val.shape
+                or new_val.dtype != old_val.dtype
+                or new_val.device != old_val.device
+            ):
+                raise RuntimeError(
+                    f"B12X FP6 MoE: reload attribute '{attr_name}' has "
+                    f"shape/dtype/device mismatch: "
+                    f"new={tuple(new_val.shape)},{new_val.dtype},"
+                    f"{new_val.device} vs "
+                    f"old={tuple(old_val.shape)},{old_val.dtype},"
+                    f"{old_val.device}. Topology changed — destroy CUDA "
+                    f"graphs and call unload_serving() before reloading."
+                )
+            old_val.copy_(new_val)
 
     def _plan_and_scratch(
         self, m: int, topk: int, device: torch.device
     ) -> tuple[Any, tuple[torch.Tensor, ...]]:
+        if self.arena is not None:
+            return self.arena.get_or_build(m)
+        # No arena (standalone eager path): always transient, never retained.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"B12X FP6 MoE: uncatalogued M={m} during CUDA-graph "
+                "capture — no scratch arena configured"
+            )
         from b12x.moe import fused_moe
 
-        key = (
-            int(m),
-            int(topk),
-            device,
-            id(self.weight_plan),
-            bool(self.apply_router_weight_on_input),
+        plan = fused_moe.plan(
+            fused_moe.Caps(
+                max_tokens=m,
+                num_topk=topk,
+                device=device,
+                weight_plan=self.weight_plan,
+                core_token_counts=(m,),
+                route_num_experts=0,
+                quant_mode="w6a8_mx",
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+            )
         )
-        cached = _SCRATCH_CACHE.get(key)
-        if cached is None:
-            plan = fused_moe.plan(
-                fused_moe.Caps(
-                    max_tokens=m,
-                    num_topk=topk,
-                    device=device,
-                    weight_plan=self.weight_plan,
-                    core_token_counts=(m,),
-                    route_num_experts=0,
-                    quant_mode="w6a8_mx",
-                    apply_router_weight_on_input=self.apply_router_weight_on_input,
-                )
+        scratch = tuple(
+            torch.empty(
+                shape,
+                dtype=dtype,
+                device=plan.scratch_specs()[i].device,
             )
-            scratch = tuple(
-                torch.empty(
-                    shape,
-                    dtype=dtype,
-                    device=plan.scratch_specs()[i].device,
-                )
-                for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
-            )
-            cached = (plan, scratch)
-            _SCRATCH_CACHE[key] = cached
-        return cached
+            for i, (shape, dtype) in enumerate(plan.shapes_and_dtypes())
+        )
+        return plan, scratch
 
     def apply(
         self,
@@ -243,6 +531,9 @@ class B12XFP6MoEMethod:
                 f"with {self.apply_router_weight_on_input}, apply() got "
                 f"{router_on_input}"
             )
+        # Check catalog membership and capture state BEFORE cache lookup or
+        # allocation.  A direct caller supplying a caller-owned output during
+        # capture must not reach _build_scratch for an uncatalogued M.
         if output is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -255,6 +546,8 @@ class B12XFP6MoEMethod:
                 dtype=hidden_states.dtype,
                 device=device,
             )
+        # _plan_and_scratch checks capture/catalog and raises for uncatalogued
+        # capture before any allocation.
         plan, scratch = self._plan_and_scratch(m, topk, device)
         binding = fused_moe.bind(
             plan,
