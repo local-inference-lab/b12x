@@ -89,7 +89,7 @@ def test_factory_retains_twoshot_ipc_ownership_when_verdict_fails(
         classmethod(lambda cls, *args, **kwargs: shared),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
         exchange,
     )
 

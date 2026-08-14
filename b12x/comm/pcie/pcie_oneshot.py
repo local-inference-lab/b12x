@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -211,29 +212,12 @@ def _collective_capture_needs_preparation(
     """
 
     catalog = tuple(sorted(prepared_channel_ids))
-    local_state = (logical_id, catalog)
-    gathered = _broadcast_gather_object(local_state, exchange_group)
+    gathered = _exchange_capture_contract(logical_id, catalog, exchange_group)
     if not gathered:
         raise RuntimeError(f"{owner} capture contract returned no rank states")
 
     requested_ids: list[str] = []
-    for group_rank, state in enumerate(gathered):
-        if not isinstance(state, (tuple, list)) or len(state) != 2:
-            raise RuntimeError(
-                f"invalid {owner} capture contract from group rank {group_rank}"
-            )
-        requested_id, peer_catalog = state
-        if not isinstance(requested_id, str) or not isinstance(
-            peer_catalog, (tuple, list)
-        ):
-            raise RuntimeError(
-                f"invalid {owner} capture contract from group rank {group_rank}"
-            )
-        peer_catalog = tuple(peer_catalog)
-        if any(not isinstance(value, str) for value in peer_catalog):
-            raise RuntimeError(
-                f"invalid {owner} capture contract from group rank {group_rank}"
-            )
+    for _group_rank, (requested_id, peer_catalog) in enumerate(gathered):
         if peer_catalog != catalog:
             raise RuntimeError(
                 f"{owner} prepared channel catalog differs across ranks: {gathered}"
@@ -271,7 +255,148 @@ def _group_ranks(group: ProcessGroup) -> list[int]:
     return list(range(world_size))
 
 
-def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
+# ---------------------------------------------------------------------------
+# Typed tensor wire format for IPC metadata/handle exchange
+#
+# Every ProcessGroup exchange on the PCIe setup path uses a fixed-schema
+# int64 tensor envelope and dist.all_gather instead of pickle-based object
+# collectives (broadcast_object_list / all_gather_object).
+#
+# All exchanges share a COMMON fixed-size envelope so that ranks entering
+# different phases on the same group cannot cause an NCCL element-count
+# mismatch.  The envelope carries: magic, version, message kind, sender
+# group rank, world size, payload count, and payload byte length.  Every
+# received frame validates the full header before subtype decoding.
+#
+# Fallible local validation is coordinated through an infallible fixed-size
+# verdict preflight (_exchange_preflight) that runs before any payload
+# exchange, preventing asymmetric hangs when one rank's local data is
+# malformed.
+# ---------------------------------------------------------------------------
+
+_IPC_WIRE_MAGIC = 0xB12C0169
+_IPC_WIRE_VERSION = 2
+_CUDA_IPC_HANDLE_BYTES = 128
+_IPC_HANDLE_INT64S = _CUDA_IPC_HANDLE_BYTES // 8  # 16
+
+# Message kinds for the common envelope.
+_MSG_KIND_PREFLIGHT = 1
+_MSG_KIND_IPC_HANDLE = 2
+_MSG_KIND_INT_CONTRACT = 3
+_MSG_KIND_STATUS_STRINGS = 4
+_MSG_KIND_GRAPH_META = 5
+_MSG_KIND_CHANNEL_STATE = 6
+_MSG_KIND_CAPTURE_CONTRACT = 7
+
+# Common envelope: [magic, version, kind, rank, world, count, byte_len, <payload...>]
+_ENVELOPE_HEADER_INT64S = 7
+
+# Bounded capacities for variable-length fields.
+_MAX_STATUS_STR_COUNT = 8
+_MAX_STATUS_STR_LEN = 256
+_MAX_CHANNEL_ID_COUNT = 64
+_MAX_CHANNEL_ID_LEN = 64
+_MAX_GRAPH_BUFFERS = 64
+_MAX_CONTRACT_INTS = 16
+
+# Computed fixed sizes for each message kind (header + payload).
+_STR_STATUS_PAYLOAD = 1 + _MAX_STATUS_STR_COUNT + (_MAX_STATUS_STR_COUNT * _MAX_STATUS_STR_LEN + 7) // 8
+_STR_CHANNEL_BLOCK = 1 + _MAX_CHANNEL_ID_COUNT + (_MAX_CHANNEL_ID_COUNT * _MAX_CHANNEL_ID_LEN + 7) // 8
+_STR_SINGLE_BLOCK = 1 + 1 + (_MAX_CHANNEL_ID_LEN + 7) // 8
+
+_FRAME_SIZE_PREFLIGHT = _ENVELOPE_HEADER_INT64S + 3  # header + planned_kind + planned_frame_size + ok_flag
+_FRAME_SIZE_IPC_HANDLE = _ENVELOPE_HEADER_INT64S + _IPC_HANDLE_INT64S
+_FRAME_SIZE_INT_CONTRACT = _ENVELOPE_HEADER_INT64S + _MAX_CONTRACT_INTS
+_FRAME_SIZE_STATUS = _ENVELOPE_HEADER_INT64S + _STR_STATUS_PAYLOAD
+_FRAME_SIZE_GRAPH = _ENVELOPE_HEADER_INT64S + _MAX_GRAPH_BUFFERS * 2  # handles + offsets
+_FRAME_SIZE_CHANNEL_STATE = _ENVELOPE_HEADER_INT64S + _STR_CHANNEL_BLOCK * 2
+_FRAME_SIZE_CAPTURE = _ENVELOPE_HEADER_INT64S + _STR_SINGLE_BLOCK + _STR_CHANNEL_BLOCK
+
+_SIGNED_I64_MIN = -(1 << 63)
+_SIGNED_I64_MAX = (1 << 63) - 1
+
+
+def _check_i64(value: int) -> int:
+    """Clamp/validate that a Python int fits in signed int64 range."""
+    if value < _SIGNED_I64_MIN or value > _SIGNED_I64_MAX:
+        raise ValueError(f"integer {value} out of signed int64 range")
+    return int(value)
+
+
+def _pack_bytes_to_int64s(data: bytes) -> list[int]:
+    """Pack bytes into little-endian int64 values (8 bytes each)."""
+    padded_len = (len(data) + 7) // 8 * 8
+    padded = data + b"\x00" * (padded_len - len(data))
+    return list(struct.unpack(f"<{padded_len // 8}q", padded))
+
+
+def _unpack_int64s_to_bytes(values: Sequence[int], length: int) -> bytes:
+    """Unpack int64 values back to bytes, trimming to *length*."""
+    if not values:
+        return b"\x00" * length
+    packed = struct.pack(f"<{len(values)}q", *values)
+    return packed[:length]
+
+
+def _encode_strings_to_int64(
+    strings: Sequence[str], max_count: int, max_len: int
+) -> list[int]:
+    """Encode a sequence of strings into a flat int64 list.
+
+    Layout: ``[count, len0, len1, ..., len(max_count-1), packed_bytes]``
+    where each string is zero-padded to *max_len* bytes and the whole
+    byte block is packed into int64 values.
+    """
+    count = len(strings)
+    if count > max_count:
+        raise ValueError(f"string count {count} exceeds max {max_count}")
+    lengths: list[int] = [0] * max_count
+    raw = bytearray()
+    for i in range(count):
+        encoded = strings[i].encode("utf-8")
+        if len(encoded) > max_len:
+            raise ValueError(
+                f"string at index {i} is {len(encoded)} bytes, exceeds max {max_len}"
+            )
+        lengths[i] = len(encoded)
+        raw += encoded
+        raw += b"\x00" * (max_len - len(encoded))
+    raw += b"\x00" * ((max_count - count) * max_len)
+    byte_ints = _pack_bytes_to_int64s(bytes(raw))
+    return [count] + lengths + byte_ints
+
+
+def _decode_strings_from_int64(
+    values: Sequence[int], max_count: int, max_len: int
+) -> tuple[str, ...]:
+    """Decode a flat int64 list produced by :func:`_encode_strings_to_int64`."""
+    if len(values) < 1 + max_count:
+        raise ValueError(
+            f"string block too short: {len(values)} < {1 + max_count}"
+        )
+    count = int(values[0])
+    if count < 0 or count > max_count:
+        raise ValueError(f"invalid string count {count} (max {max_count})")
+    lengths = [int(v) for v in values[1 : 1 + max_count]]
+    byte_offset = 1 + max_count
+    byte_ints = list(values[byte_offset:])
+    all_bytes = _unpack_int64s_to_bytes(byte_ints, max_count * max_len)
+    result: list[str] = []
+    for i in range(count):
+        length = lengths[i]
+        if length < 0 or length > max_len:
+            raise ValueError(f"invalid string length {length} at index {i}")
+        start = i * max_len
+        result.append(all_bytes[start : start + length].decode("utf-8"))
+    return tuple(result)
+
+
+def _string_block_int64s(max_count: int, max_len: int) -> int:
+    return 1 + max_count + (max_count * max_len + 7) // 8
+
+
+def _validate_nccl_backend(group: ProcessGroup) -> None:
+    """Validate that the ProcessGroup backend is NCCL."""
     try:
         try:
             backend = dist.get_backend(group=group)
@@ -288,22 +413,446 @@ def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
         )
     if not torch.cuda.is_available():
         raise RuntimeError("PCIe oneshot IPC exchange requires CUDA")
-    return torch.device("cuda", torch.cuda.current_device())
 
 
-def _broadcast_gather_object(local_object: object, group: ProcessGroup) -> list[object]:
-    # `broadcast_object_list` is more robust than `all_gather_object` for
-    # the host-side exchange that happens around IPC setup and graph capture.
+def _all_gather_int64(
+    local_values: Sequence[int],
+    group: ProcessGroup,
+    device: torch.device,
+) -> list[list[int]]:
+    """All-gather a flat int64 vector from every rank via tensor collective.
+
+    *device* is the explicit owner device, not the ambient current device.
+    """
+    world_size = dist.get_world_size(group=group)
+    local_tensor = torch.tensor(local_values, dtype=torch.int64, device=device)
+    gathered = [torch.empty_like(local_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, local_tensor, group=group)
+    return [t.cpu().tolist() for t in gathered]
+
+
+def _validate_envelope(
+    values: Sequence[int],
+    group_rank: int,
+    world_size: int,
+    expected_kind: int,
+    expected_frame_size: int,
+) -> None:
+    """Validate the common envelope header and exact frame size."""
+    if len(values) != expected_frame_size:
+        raise RuntimeError(
+            f"IPC wire frame size mismatch from group rank {group_rank}: "
+            f"expected {expected_frame_size} int64s, got {len(values)}"
+        )
+    magic = int(values[0])
+    if magic != _IPC_WIRE_MAGIC:
+        raise RuntimeError(
+            f"IPC wire magic mismatch from group rank {group_rank}: "
+            f"expected 0x{_IPC_WIRE_MAGIC:X}, got 0x{magic:X}"
+        )
+    version = int(values[1])
+    if version != _IPC_WIRE_VERSION:
+        raise RuntimeError(
+            f"IPC wire version mismatch from group rank {group_rank}: "
+            f"expected {_IPC_WIRE_VERSION}, got {version}"
+        )
+    kind = int(values[2])
+    if kind != expected_kind:
+        raise RuntimeError(
+            f"IPC wire message kind mismatch from group rank {group_rank}: "
+            f"expected {expected_kind}, got {kind}"
+        )
+    peer_rank = int(values[3])
+    if peer_rank != group_rank:
+        raise RuntimeError(
+            f"IPC wire rank mismatch from group rank {group_rank}: "
+            f"reported rank {peer_rank}"
+        )
+    peer_world = int(values[4])
+    if peer_world != world_size:
+        raise RuntimeError(
+            f"IPC wire world size mismatch from group rank {group_rank}: "
+            f"expected {world_size}, got {peer_world}"
+        )
+    # values[5] = count, values[6] = byte_len -- validated by subtype decoder
+
+
+def _exchange_preflight(
+    local_ok: bool,
+    group: ProcessGroup,
+    device: torch.device,
+    planned_kind: int,
+    planned_frame_size: int,
+) -> list[bool]:
+    """Agree the payload shape and local-validation verdict before exchange."""
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
-    all_objects: list[list[object | None]] = [[None] for _ in range(world_size)]
-    all_objects[rank][0] = local_object
-    device = _object_broadcast_device(group)
-    for index, src_rank in enumerate(_group_ranks(group)):
-        dist.broadcast_object_list(
-            all_objects[index], src=src_rank, group=group, device=device
+    wire = [
+        _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_PREFLIGHT,
+        rank, world_size, 3, 24,
+        int(planned_kind), int(planned_frame_size), int(local_ok),
+    ]
+    gathered = _all_gather_int64(wire, group, device)
+    result: list[bool] = []
+    for i, values in enumerate(gathered):
+        _validate_envelope(
+            values, i, world_size, _MSG_KIND_PREFLIGHT, _FRAME_SIZE_PREFLIGHT
         )
-    return [entry[0] for entry in all_objects]
+        peer_kind = int(values[_ENVELOPE_HEADER_INT64S])
+        peer_frame_size = int(values[_ENVELOPE_HEADER_INT64S + 1])
+        if peer_kind != planned_kind or peer_frame_size != planned_frame_size:
+            raise RuntimeError(
+                f"IPC wire preflight plan mismatch from group rank {i}: "
+                f"expected kind/frame {planned_kind}/{planned_frame_size}, "
+                f"got {peer_kind}/{peer_frame_size}"
+            )
+        result.append(bool(int(values[_ENVELOPE_HEADER_INT64S + 2])))
+    return result
+
+
+def _coordinated_exchange(
+    local_ok: bool,
+    build_wire: Callable[[int, int], list[int]],
+    group: ProcessGroup,
+    device: torch.device,
+    msg_kind: int,
+    frame_size: int,
+) -> list[list[int]]:
+    """Run preflight then payload exchange, coordinating local validation failures.
+
+    *build_wire* receives (rank, world_size) and returns the full wire frame
+    (including envelope header).  If any rank's preflight reports failure,
+    all ranks raise before entering the payload gather.
+    """
+    world_size = dist.get_world_size(group=group)
+    rank = dist.get_rank(group=group)
+    ok_results = _exchange_preflight(
+        local_ok, group, device, msg_kind, frame_size
+    )
+    if not all(ok_results):
+        failed = [str(i) for i, ok in enumerate(ok_results) if not ok]
+        raise RuntimeError(
+            f"IPC wire preflight failed for group ranks {','.join(failed)}"
+        )
+    wire = build_wire(rank, world_size)
+    gathered = _all_gather_int64(wire, group, device)
+    for i, values in enumerate(gathered):
+        _validate_envelope(values, i, world_size, msg_kind, frame_size)
+    return gathered
+
+
+def _exchange_ipc_handles(
+    local_handle: bytes, group: ProcessGroup, device: Optional[torch.device] = None
+) -> list[bytes]:
+    """Exchange CUDA IPC handle bytes via typed int64 tensor collective.
+
+    Each rank contributes exactly 128 bytes of handle data, packed into 16
+    int64 values.  A coordinated preflight validates local handle length
+    on all ranks before any enters the payload gather.  Received handles
+    are validated for magic, version, kind, rank, world_size, and exact
+    frame size **before** any caller opens them with ``cudaIpcOpenMemHandle``.
+    """
+    local_ok = len(local_handle) == _CUDA_IPC_HANDLE_BYTES
+    if not local_ok:
+        local_handle = b"\x00" * _CUDA_IPC_HANDLE_BYTES  # safe placeholder
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        packed = _pack_bytes_to_int64s(local_handle)
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_IPC_HANDLE,
+            rk, ws, _CUDA_IPC_HANDLE_BYTES, _CUDA_IPC_HANDLE_BYTES, *packed,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_IPC_HANDLE, _FRAME_SIZE_IPC_HANDLE,
+    )
+    handles: list[bytes] = []
+    for i, values in enumerate(gathered):
+        handle_bytes = _unpack_int64s_to_bytes(
+            values[_ENVELOPE_HEADER_INT64S:], _CUDA_IPC_HANDLE_BYTES
+        )
+        if len(handle_bytes) != _CUDA_IPC_HANDLE_BYTES:
+            raise RuntimeError(
+                f"CUDA IPC handle byte length mismatch from group rank {i}: "
+                f"expected {_CUDA_IPC_HANDLE_BYTES}, got {len(handle_bytes)}"
+            )
+        handles.append(handle_bytes)
+    return handles
+
+
+def _exchange_int_contract(
+    local_values: Sequence[int], group: ProcessGroup, device: Optional[torch.device] = None
+) -> list[list[int]]:
+    """Exchange integer contract values via int64 tensor collective.
+
+    All ranks must contribute the same number of fields.  A coordinated
+    preflight validates local field count and int64 range on all ranks
+    before any enters the payload gather.
+    """
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+    field_count = len(local_values)
+    local_ok = field_count <= _MAX_CONTRACT_INTS
+    if local_ok:
+        try:
+            validated = [_check_i64(int(v)) for v in local_values]
+        except (ValueError, TypeError):
+            local_ok = False
+            validated = [0] * field_count
+    else:
+        validated = []
+    field_count_safe = min(field_count, _MAX_CONTRACT_INTS)
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        padded = (validated + [0] * _MAX_CONTRACT_INTS)[:_MAX_CONTRACT_INTS]
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_INT_CONTRACT,
+            rk, ws, field_count_safe, field_count_safe * 8, *padded,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_INT_CONTRACT, _FRAME_SIZE_INT_CONTRACT,
+    )
+    result: list[list[int]] = []
+    for i, values in enumerate(gathered):
+        peer_count = int(values[5])
+        if peer_count != field_count_safe:
+            raise RuntimeError(
+                f"contract field count mismatch from group rank {i}: "
+                f"expected {field_count_safe}, got {peer_count}"
+            )
+        result.append([int(v) for v in values[_ENVELOPE_HEADER_INT64S : _ENVELOPE_HEADER_INT64S + peer_count]])
+    return result
+
+
+def _exchange_status_strings(
+    local_strings: tuple[str, ...], group: ProcessGroup, device: Optional[torch.device] = None
+) -> tuple[tuple[str, ...], ...]:
+    """Exchange bounded status/error strings via int64 tensor collective."""
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+
+    # Validate locally; preflight coordinates any failure.
+    local_ok = True
+    try:
+        if len(local_strings) > _MAX_STATUS_STR_COUNT:
+            local_ok = False
+        for s in local_strings:
+            if len(s.encode("utf-8")) > _MAX_STATUS_STR_LEN:
+                local_ok = False
+    except Exception:
+        local_ok = False
+    safe_strings = local_strings if local_ok else ()
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        encoded = _encode_strings_to_int64(
+            safe_strings, _MAX_STATUS_STR_COUNT, _MAX_STATUS_STR_LEN
+        )
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_STATUS_STRINGS,
+            rk, ws, len(safe_strings), _MAX_STATUS_STR_LEN, *encoded,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_STATUS_STRINGS, _FRAME_SIZE_STATUS,
+    )
+    result: list[tuple[str, ...]] = []
+    for _i, values in enumerate(gathered):
+        strings = _decode_strings_from_int64(
+            values[_ENVELOPE_HEADER_INT64S:], _MAX_STATUS_STR_COUNT, _MAX_STATUS_STR_LEN
+        )
+        result.append(strings)
+    return tuple(result)
+
+
+def _exchange_graph_meta(
+    local_handles: list[int],
+    local_offsets: list[int],
+    group: ProcessGroup,
+    device: Optional[torch.device] = None,
+) -> list[tuple[list[int], list[int]]]:
+    """Exchange graph-buffer IPC handles and offsets via int64 tensor collective.
+
+    Handles and offsets have **independent** cardinalities.  Each handle
+    value is a small integer (native handle id), not a 128-byte CUDA IPC
+    handle.  All values are validated as non-negative int64 before exchange.
+    """
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+    handle_count = len(local_handles)
+    offset_count = len(local_offsets)
+    local_ok = (
+        handle_count <= _MAX_GRAPH_BUFFERS
+        and offset_count <= _MAX_GRAPH_BUFFERS
+    )
+    if local_ok:
+        try:
+            for v in local_handles:
+                _check_i64(int(v))
+            for v in local_offsets:
+                _check_i64(int(v))
+        except (ValueError, TypeError):
+            local_ok = False
+    safe_h = local_handles if local_ok else []
+    safe_o = local_offsets if local_ok else []
+    h_count = min(handle_count, _MAX_GRAPH_BUFFERS)
+    o_count = min(offset_count, _MAX_GRAPH_BUFFERS)
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        padded_h = ([_check_i64(int(v)) for v in safe_h] + [0] * _MAX_GRAPH_BUFFERS)[:_MAX_GRAPH_BUFFERS]
+        padded_o = ([_check_i64(int(v)) for v in safe_o] + [0] * _MAX_GRAPH_BUFFERS)[:_MAX_GRAPH_BUFFERS]
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_GRAPH_META,
+            rk, ws, h_count, o_count, *padded_h, *padded_o,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_GRAPH_META, _FRAME_SIZE_GRAPH,
+    )
+    result: list[tuple[list[int], list[int]]] = []
+    for i, values in enumerate(gathered):
+        peer_h_count = int(values[5])
+        peer_o_count = int(values[6])
+        if peer_h_count < 0 or peer_h_count > _MAX_GRAPH_BUFFERS:
+            raise RuntimeError(
+                f"graph handle count {peer_h_count} from group rank {i} "
+                f"exceeds max {_MAX_GRAPH_BUFFERS}"
+            )
+        if peer_o_count < 0 or peer_o_count > _MAX_GRAPH_BUFFERS:
+            raise RuntimeError(
+                f"graph offset count {peer_o_count} from group rank {i} "
+                f"exceeds max {_MAX_GRAPH_BUFFERS}"
+            )
+        base = _ENVELOPE_HEADER_INT64S
+        handles = [int(v) for v in values[base : base + peer_h_count]]
+        offsets = [
+            int(v)
+            for v in values[base + _MAX_GRAPH_BUFFERS : base + _MAX_GRAPH_BUFFERS + peer_o_count]
+        ]
+        result.append((handles, offsets))
+    return result
+
+
+def _exchange_channel_state(
+    normalized: tuple[str, ...],
+    existing: tuple[str, ...],
+    group: ProcessGroup,
+    device: Optional[torch.device] = None,
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    """Exchange logical channel preparation state via int64 tensor collective."""
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+
+    local_ok = True
+    try:
+        if len(normalized) > _MAX_CHANNEL_ID_COUNT or len(existing) > _MAX_CHANNEL_ID_COUNT:
+            local_ok = False
+        for s in list(normalized) + list(existing):
+            if len(s.encode("utf-8")) > _MAX_CHANNEL_ID_LEN:
+                local_ok = False
+    except Exception:
+        local_ok = False
+    safe_norm = normalized if local_ok else ()
+    safe_exist = existing if local_ok else ()
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        norm_enc = _encode_strings_to_int64(
+            safe_norm, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN
+        )
+        exist_enc = _encode_strings_to_int64(
+            safe_exist, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN
+        )
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_CHANNEL_STATE,
+            rk, ws, len(safe_norm), len(safe_exist), *norm_enc, *exist_enc,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_CHANNEL_STATE, _FRAME_SIZE_CHANNEL_STATE,
+    )
+    block = _string_block_int64s(_MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN)
+    result: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for _i, values in enumerate(gathered):
+        norm_vals = values[_ENVELOPE_HEADER_INT64S : _ENVELOPE_HEADER_INT64S + block]
+        exist_vals = values[_ENVELOPE_HEADER_INT64S + block : _ENVELOPE_HEADER_INT64S + 2 * block]
+        norm = _decode_strings_from_int64(norm_vals, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN)
+        exist = _decode_strings_from_int64(exist_vals, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN)
+        result.append((norm, exist))
+    return result
+
+
+def _exchange_capture_contract(
+    logical_id: str,
+    catalog: tuple[str, ...],
+    group: ProcessGroup,
+    device: Optional[torch.device] = None,
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Exchange capture contract (logical_id, catalog) via int64 tensor collective."""
+    resolved_device = device or _resolve_exchange_device(group)
+    dist.get_world_size(group=group)
+    dist.get_rank(group=group)
+
+    local_ok = True
+    try:
+        if len(logical_id.encode("utf-8")) > _MAX_CHANNEL_ID_LEN:
+            local_ok = False
+        if len(catalog) > _MAX_CHANNEL_ID_COUNT:
+            local_ok = False
+        for s in catalog:
+            if len(s.encode("utf-8")) > _MAX_CHANNEL_ID_LEN:
+                local_ok = False
+    except Exception:
+        local_ok = False
+    safe_id = logical_id if local_ok else ""
+    safe_cat = catalog if local_ok else ()
+
+    def build_wire(rk: int, ws: int) -> list[int]:
+        id_enc = _encode_strings_to_int64((safe_id,), 1, _MAX_CHANNEL_ID_LEN)
+        cat_enc = _encode_strings_to_int64(
+            safe_cat, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN
+        )
+        return [
+            _IPC_WIRE_MAGIC, _IPC_WIRE_VERSION, _MSG_KIND_CAPTURE_CONTRACT,
+            rk, ws, 1, len(safe_cat), *id_enc, *cat_enc,
+        ]
+
+    gathered = _coordinated_exchange(
+        local_ok, build_wire, group, resolved_device,
+        _MSG_KIND_CAPTURE_CONTRACT, _FRAME_SIZE_CAPTURE,
+    )
+    id_block = _string_block_int64s(1, _MAX_CHANNEL_ID_LEN)
+    cat_block = _string_block_int64s(_MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN)
+    result: list[tuple[str, tuple[str, ...]]] = []
+    for _i, values in enumerate(gathered):
+        id_vals = values[_ENVELOPE_HEADER_INT64S : _ENVELOPE_HEADER_INT64S + id_block]
+        cat_vals = values[_ENVELOPE_HEADER_INT64S + id_block : _ENVELOPE_HEADER_INT64S + id_block + cat_block]
+        decoded_id = _decode_strings_from_int64(id_vals, 1, _MAX_CHANNEL_ID_LEN)[0]
+        cat = _decode_strings_from_int64(cat_vals, _MAX_CHANNEL_ID_COUNT, _MAX_CHANNEL_ID_LEN)
+        result.append((decoded_id, cat))
+    return result
+
+
+def _resolve_exchange_device(group: ProcessGroup) -> torch.device:
+    """Resolve the CUDA device for tensor collectives.
+
+    Preserves the existing NCCL/CUDA integration contract: the ProcessGroup
+    backend must be NCCL and CUDA must be available.  Returns the current
+    CUDA device.
+    """
+    _validate_nccl_backend(group)
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 @dataclass(frozen=True)
@@ -563,7 +1112,7 @@ def _exchange_setup_failures(
     """Collect a setup verdict without allowing one rank to return early."""
 
     try:
-        gathered = _broadcast_gather_object(
+        gathered = _exchange_status_strings(
             _format_setup_error(local_error), exchange_group
         )
     except Exception as exc:
@@ -576,19 +1125,7 @@ def _exchange_setup_failures(
             f"failed to exchange peer {phase} status{retention}"
         ) from exc
 
-    statuses: list[tuple[str, ...]] = []
-    for group_rank, status in enumerate(gathered):
-        if not isinstance(status, (tuple, list)):
-            retention = (
-                "; CUDA IPC exports were retained"
-                if exports_retained_on_exchange_failure
-                else ""
-            )
-            raise RuntimeError(
-                f"invalid peer {phase} status from group rank {group_rank}{retention}"
-            )
-        statuses.append(tuple(str(item) for item in status))
-    return tuple(statuses)
+    return gathered
 
 
 def _require_full_grid_residency(
@@ -683,12 +1220,13 @@ def _run_collective_preallocation_setup(
 
 
 def _require_collective_contract(
-    *, owner: str, exchange_group: ProcessGroup, contract: object
+    *, owner: str, exchange_group: ProcessGroup, contract_fields: Sequence[int]
 ) -> None:
     """Reject divergent rank-local layout/channel inputs before allocation."""
 
-    gathered = _broadcast_gather_object(contract, exchange_group)
-    if any(peer != contract for peer in gathered):
+    gathered = _exchange_int_contract(contract_fields, exchange_group)
+    local_list = list(contract_fields)
+    if any(peer != local_list for peer in gathered):
         raise RuntimeError(f"{owner} contract differs across ranks: {gathered}")
 
 
@@ -1140,22 +1678,14 @@ def _exchange_close_failures(
     if exchange_group is None:
         return (local_failures,)
     try:
-        gathered = _broadcast_gather_object(local_failures, exchange_group)
+        gathered = _exchange_status_strings(local_failures, exchange_group)
     except Exception as exc:
         raise RuntimeError(
             f"failed to exchange peer {phase} status; exported IPC allocations "
             "were not freed"
         ) from exc
 
-    statuses: list[tuple[str, ...]] = []
-    for rank_index, status in enumerate(gathered):
-        if not isinstance(status, (tuple, list)):
-            raise RuntimeError(
-                f"invalid peer {phase} status from group rank {rank_index}; "
-                "exported IPC allocations were not freed"
-            )
-        statuses.append(tuple(str(item) for item in status))
-    return tuple(statuses)
+    return gathered
 
 
 def _raise_coordinated_close_error(
@@ -2002,14 +2532,15 @@ class PCIeOneshotAllReduce:
             _require_collective_contract(
                 owner="PCIe oneshot direct constructor",
                 exchange_group=self.exchange_group,
-                contract=(
+                contract_fields=[
                     self.world_size,
                     self.max_size,
                     self.rank_data_bytes,
-                    self.eager_buffer_bytes,
-                    self._pending_eager_ptrs is not None,
-                    self._transport_policy,
-                ),
+                    int(self.eager_buffer_bytes is not None),
+                    self.eager_buffer_bytes or 0,
+                    int(self._pending_eager_ptrs is not None),
+                    *self._transport_policy,
+                ],
             )
 
         init_error = self._initialize_native_runtime()
@@ -2239,13 +2770,14 @@ class PCIeOneshotAllReduce:
         _require_collective_contract(
             owner="PCIe oneshot channel layout",
             exchange_group=exchange_group,
-            contract=(
+            contract_fields=[
                 signal_bytes,
-                eager_buffer_bytes,
+                int(eager_buffer_bytes is not None),
+                eager_buffer_bytes or 0,
                 max_size,
                 rank_data_bytes,
-                transport_policy,
-            ),
+                *transport_policy,
+            ],
         )
 
         channel_buffers = cls._allocate_eager_channel_buffers(
@@ -2437,7 +2969,7 @@ class PCIeOneshotAllReduce:
         try:
             world_size = dist.get_world_size(group=exchange_group)
             rank = dist.get_rank(group=exchange_group)
-            handles = _broadcast_gather_object(local_handle, exchange_group)
+            handles = _exchange_ipc_handles(local_handle, exchange_group)
         except Exception as exchange_error:
             # No rank has opened an import before handle exchange completes.
             # Retain both ownership and a collective retry ticket if progress
@@ -2868,8 +3400,10 @@ class PCIeOneshotAllReduce:
     def register_graph_buffers(self) -> None:
         if self.exchange_group is None:
             raise ValueError("exchange_group is required to register graph buffers")
-        local_meta = self.get_graph_buffer_ipc_meta()
-        all_meta = _broadcast_gather_object(local_meta, self.exchange_group)
+        local_handles, local_offsets = self.get_graph_buffer_ipc_meta()
+        all_meta = _exchange_graph_meta(
+            local_handles, local_offsets, self.exchange_group
+        )
         num_buffers = [len(entry[1]) for entry in all_meta]
         if any(count != num_buffers[0] for count in num_buffers):
             raise RuntimeError(
@@ -3276,15 +3810,16 @@ class PCIeOneshotAllReducePool:
             _require_collective_contract(
                 owner="PCIe oneshot pool channel layout",
                 exchange_group=self.exchange_group,
-                contract=(
+                contract_fields=[
                     self._signal_bytes,
-                    self.eager_buffer_bytes,
+                    int(self.eager_buffer_bytes is not None),
+                    self.eager_buffer_bytes or 0,
                     self.max_size,
                     self.rank_data_bytes,
-                    self.single_channel,
+                    int(self.single_channel),
                     self.max_concurrent_channels,
-                    self._transport_policy,
-                ),
+                    *self._transport_policy,
+                ],
             )
             # A genuine single-channel pool has no independent eager/graph
             # owners to name. Multi-channel distributed callers must prepare
@@ -3435,9 +3970,11 @@ class PCIeOneshotAllReducePool:
                 exchange_group=self.exchange_group,
                 setup=normalize_and_validate,
             )
-            local_state = (normalized, tuple(sorted(self._logical_channels)))
-            gathered = _broadcast_gather_object(local_state, self.exchange_group)
-            if any(state != local_state for state in gathered):
+            existing = tuple(sorted(self._logical_channels))
+            gathered = _exchange_channel_state(
+                normalized, existing, self.exchange_group
+            )
+            if any(state != (normalized, existing) for state in gathered):
                 raise RuntimeError(
                     "PCIe oneshot logical channel preparation differs across "
                     f"ranks: {gathered}"

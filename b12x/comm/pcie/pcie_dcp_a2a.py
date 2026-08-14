@@ -19,7 +19,7 @@ from .pcie_oneshot import (
     _finish_collective_runtime_setup,
     _raise_local_cleanup_errors,
     _align_up,
-    _broadcast_gather_object,
+    _exchange_channel_state,
     _collective_capture_needs_preparation,
     _coordinated_close_channels,
     _current_stream_key,
@@ -352,7 +352,7 @@ class PCIeDCPA2A:
             _require_collective_contract(
                 owner="PCIe DCP A2A direct constructor",
                 exchange_group=self.exchange_group,
-                contract=(
+                contract_fields=[
                     self.world_size,
                     self.max_batch_size,
                     self.total_heads,
@@ -361,7 +361,7 @@ class PCIeDCPA2A:
                     self.output_capacity_elems,
                     self.lse_offset,
                     self.lse_capacity,
-                ),
+                ],
             )
 
         init_error = self._initialize_backend_runtime()
@@ -567,13 +567,20 @@ class PCIeDCPA2A:
         _require_collective_contract(
             owner="PCIe DCP A2A channel layout",
             exchange_group=exchange_group,
-            contract=(
+            contract_fields=[
                 int(max_batch_size),
                 int(total_heads),
                 int(head_dim),
                 int(query_head_dim),
-                layout,
-            ),
+                layout.signal_bytes,
+                layout.staging0_offset,
+                layout.staging1_offset,
+                layout.output_capacity_elems,
+                layout.lse_offset,
+                layout.lse_capacity,
+                layout.slot_bytes,
+                layout.slab_bytes,
+            ],
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group,
@@ -1602,7 +1609,7 @@ class PCIeDCPA2APool:
             _require_collective_contract(
                 owner="PCIe DCP A2A pool overlap contract",
                 exchange_group=self.exchange_group,
-                contract=self.max_concurrent_channels,
+                contract_fields=[self.max_concurrent_channels],
             )
             _require_full_grid_residency(
                 owner="PCIe DCP A2A pool",
@@ -1706,9 +1713,11 @@ class PCIeDCPA2APool:
                 exchange_group=self.exchange_group,
                 setup=normalize_and_validate,
             )
-            local_state = (normalized, tuple(sorted(self._logical_channels)))
-            gathered = _broadcast_gather_object(local_state, self.exchange_group)
-            if any(state != local_state for state in gathered):
+            existing = tuple(sorted(self._logical_channels))
+            gathered = _exchange_channel_state(
+                normalized, existing, self.exchange_group
+            )
+            if any(state != (normalized, existing) for state in gathered):
                 raise RuntimeError(
                     "PCIe DCP A2A logical channel preparation differs across "
                     f"ranks: {gathered}"

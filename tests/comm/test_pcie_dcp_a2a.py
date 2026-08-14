@@ -802,12 +802,12 @@ def test_pool_collectively_prepares_logical_channels_in_canonical_order(
         lambda stream_key: created.append(stream_key) or object(),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_dcp_a2a._exchange_channel_state",
+        lambda norm, exist, group: [(norm, exist), (norm, exist)],
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, local_status],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, local_strings),
     )
 
     pool.prepare_channels(("target", "draft"))
@@ -835,17 +835,17 @@ def test_pool_rejects_logical_channel_set_mismatch_before_allocation(monkeypatch
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if not local_state or isinstance(local_state[0], str):
-            return [local_state, ()]
-        _requested, existing = local_state
-        return [(("other",), existing), local_state]
+    def gather_status(local_strings, group):
+        return (local_strings, ())
+
+    def gather_channels(normalized, existing, group):
+        return [(("other",), existing), (normalized, existing)]
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_dcp_a2a._exchange_channel_state", gather_channels
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", gather_status
     )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
@@ -870,8 +870,8 @@ def test_pool_invalid_logical_id_is_rejected_collectively(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with pytest.raises(RuntimeError, match="must not be empty"):
@@ -945,8 +945,8 @@ def test_pool_capture_requires_stable_semantic_id(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with (
@@ -981,15 +981,18 @@ def test_pool_capture_allows_opposite_order_from_agreed_catalog(monkeypatch):
         lambda device, stream=None: int(stream),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        requested, catalog = local_state
-        assert requested == "graph:target"
-        return [local_state, ("graph:draft", catalog)]
+    def gather_status(local_strings, group):
+        return (local_strings, local_strings)
+
+    def gather_capture(logical_id, catalog, group):
+        assert logical_id == "graph:target"
+        return [(logical_id, catalog), ("graph:draft", catalog)]
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", gather_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract", gather_capture
     )
 
     with pool.capture(7, channel_id="graph:target") as channel:
@@ -1018,13 +1021,17 @@ def test_pool_capture_rejects_divergent_catalog_before_allocation(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        return [local_state, ("graph:target", ())]
+    def gather_status(local_strings, group):
+        return (local_strings, local_strings)
+
+    def gather_capture(logical_id, catalog, group):
+        return [(logical_id, catalog), ("graph:target", ())]
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", gather_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract", gather_capture
     )
 
     with (
@@ -1054,14 +1061,17 @@ def test_pool_capture_rejects_differing_unprepared_ids(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        _, catalog = local_state
-        return [local_state, ("graph:unknown", catalog)]
+    def gather_status(local_strings, group):
+        return (local_strings, local_strings)
+
+    def gather_capture(logical_id, catalog, group):
+        return [(logical_id, catalog), ("graph:unknown", catalog)]
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", gather_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract", gather_capture
     )
 
     with (
@@ -1095,12 +1105,16 @@ def test_pool_capture_preserves_same_id_convenience_allocation(monkeypatch):
         lambda device, stream=None: int(stream),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, local_strings),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_dcp_a2a._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [(logical_id, catalog), (logical_id, catalog)],
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._exchange_channel_state",
+        lambda norm, exist, group: [(norm, exist), (norm, exist)],
     )
 
     with pool.capture(7, channel_id="graph:target") as captured:
@@ -1135,8 +1149,12 @@ def test_pool_capture_routes_eager_warmup_to_graph_channel(monkeypatch):
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, local_strings),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [(logical_id, catalog), (logical_id, catalog)],
     )
 
     with pool.capture(7, channel_id="graph:target") as captured:

@@ -50,8 +50,8 @@ def test_pool_explicit_close_coordinates_imports_before_exports(monkeypatch) -> 
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     pool.close()
@@ -256,8 +256,8 @@ def test_twoshot_explicit_close_coordinates_unmap_then_free(monkeypatch) -> None
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     runtime.close()
@@ -488,9 +488,9 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
     runtime.exchange_group = object()
     peer_statuses = iter(
         [
-            lambda local: [local, ("peer close failed",)],
-            lambda local: [local, ()],
-            lambda local: [local, ()],
+            lambda local: (local, ("peer close failed",)),
+            lambda local: (local, ()),
+            lambda local: (local, ()),
         ]
     )
 
@@ -503,8 +503,8 @@ def test_peer_unmap_failure_is_exchanged_before_any_local_export_free(
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: next(peer_statuses)(local_status),
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: next(peer_statuses)(local_strings),
     )
 
     with pytest.raises(RuntimeError, match="group rank 1: peer close failed"):
@@ -548,7 +548,7 @@ def test_status_exchange_failure_retains_local_exports(monkeypatch) -> None:
         lambda *, group: events.append("barrier"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
         fail_status_exchange,
     )
 
@@ -577,10 +577,10 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
     runtime.exchange_group = object()
     peer_statuses = iter(
         [
-            lambda local: [local, ()],
-            lambda local: [local, ("peer export free failed",)],
-            lambda local: [local, ()],
-            lambda local: [local, ()],
+            lambda local: (local, ()),
+            lambda local: (local, ("peer export free failed",)),
+            lambda local: (local, ()),
+            lambda local: (local, ()),
         ]
     )
 
@@ -593,8 +593,8 @@ def test_rank_that_freed_locally_retries_until_peer_free_succeeds(
         lambda device: events.append("synchronize"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: next(peer_statuses)(local_status),
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: next(peer_statuses)(local_strings),
     )
 
     with pytest.raises(RuntimeError, match="group rank 1: peer export free failed"):

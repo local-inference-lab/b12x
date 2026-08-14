@@ -29,6 +29,7 @@ import json
 import math
 import os
 import statistics
+import struct
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -444,22 +445,78 @@ def _global_max(values: Sequence[float]) -> tuple[float, ...]:
     return tuple(float(value) for value in tensor.tolist())
 
 
-def _topology_snapshot(device: torch.device) -> dict[str, Any]:
+def _topology_snapshot(device: torch.device, tp_group: object) -> dict[str, Any]:
     properties = torch.cuda.get_device_properties(device)
-    local_device = {
-        "rank": dist.get_rank(),
-        "visible_ordinal": device.index,
-        "pci_address": (
-            f"{properties.pci_domain_id:08x}:{properties.pci_bus_id:02x}:"
-            f"{properties.pci_device_id:02x}.0"
-        ),
-        "uuid": str(properties.uuid),
-        "name": properties.name,
-    }
-    rank_devices: list[dict[str, Any] | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(rank_devices, local_device)
-    if dist.get_rank() != 0:
+    rank = dist.get_rank(group=tp_group)
+    world_size = dist.get_world_size(group=tp_group)
+    visible_ordinal = device.index if device.index is not None else 0
+
+    # Encode device topology as a fixed-schema int64 tensor on the NCCL
+    # TP group (not the default Gloo group) so the wire stays on the
+    # mandated CUDA/NCCL control backend.
+    _UUID_BYTES = 64
+    _NAME_BYTES = 128
+    uuid_bytes = str(properties.uuid).encode("utf-8")[:_UUID_BYTES]
+    name_bytes = properties.name.encode("utf-8")[:_NAME_BYTES]
+    uuid_packed = struct.unpack(
+        f"<{(_UUID_BYTES + 7) // 8}q", uuid_bytes + b"\x00" * ((_UUID_BYTES + 7) // 8 * 8 - len(uuid_bytes))
+    )
+    name_packed = struct.unpack(
+        f"<{(_NAME_BYTES + 7) // 8}q", name_bytes + b"\x00" * ((_NAME_BYTES + 7) // 8 * 8 - len(name_bytes))
+    )
+    local_wire = torch.tensor(
+        [
+            rank,
+            visible_ordinal,
+            int(properties.pci_domain_id),
+            int(properties.pci_bus_id),
+            int(properties.pci_device_id),
+            *uuid_packed,
+            *name_packed,
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    gathered = [
+        torch.empty_like(local_wire) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered, local_wire, group=tp_group)
+
+    if rank != 0:
         return {}
+
+    rank_devices: list[dict[str, Any]] = []
+    seen_ranks: set[int] = set()
+    for t in gathered:
+        vals = t.cpu().tolist()
+        peer_rank = int(vals[0])
+        if peer_rank in seen_ranks:
+            raise RuntimeError(
+                f"duplicate rank {peer_rank} in topology snapshot"
+            )
+        seen_ranks.add(peer_rank)
+        uuid_raw = struct.pack(f"<{len(uuid_packed)}q", *vals[5 : 5 + len(uuid_packed)])
+        name_raw = struct.pack(f"<{len(name_packed)}q", *vals[5 + len(uuid_packed) :])
+        rank_devices.append(
+            {
+                "rank": peer_rank,
+                "visible_ordinal": int(vals[1]),
+                "pci_address": (
+                    f"{int(vals[2]):08x}:{int(vals[3]):02x}:"
+                    f"{int(vals[4]):02x}.0"
+                ),
+                "uuid": uuid_raw.rstrip(b"\x00").decode("utf-8"),
+                "name": name_raw.rstrip(b"\x00").decode("utf-8"),
+            }
+        )
+
+    # Validate complete rank set
+    if sorted(seen_ranks) != list(range(world_size)):
+        raise RuntimeError(
+            f"topology snapshot rank set {sorted(seen_ranks)} != "
+            f"expected {list(range(world_size))}"
+        )
+
 
     def run(command: list[str]) -> str:
         try:
@@ -1180,7 +1237,7 @@ def _rotate(values: tuple[str, ...], offset: int) -> tuple[str, ...]:
 
 def run_probe(config: ProbeConfig) -> dict[str, Any] | None:
     probe = CollectiveOverlapProbe(config)
-    topology = _topology_snapshot(probe.device)
+    topology = _topology_snapshot(probe.device, probe.tp_group)
     rank = probe.rank
     modes = ("tp", "ckv", "side_first", "tp_first")
     result: dict[str, Any] = {

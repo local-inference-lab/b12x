@@ -203,7 +203,9 @@ def test_pool_overlap_residency_scales_with_declared_concurrency(monkeypatch) ->
     monkeypatch.setattr(
         oneshot,
         "_require_collective_contract",
-        lambda **kwargs: events.append(("oneshot_contract", kwargs["contract"])),
+        lambda **kwargs: events.append(
+            ("oneshot_contract", kwargs["contract_fields"])
+        ),
     )
 
     oneshot_pool = oneshot.PCIeOneshotAllReducePool(
@@ -227,7 +229,7 @@ def test_pool_overlap_residency_scales_with_declared_concurrency(monkeypatch) ->
     monkeypatch.setattr(
         dcp,
         "_require_collective_contract",
-        lambda **kwargs: events.append(("dcp_contract", kwargs["contract"])),
+        lambda **kwargs: events.append(("dcp_contract", kwargs["contract_fields"])),
     )
     monkeypatch.setattr(
         dcp,
@@ -251,8 +253,8 @@ def test_pool_overlap_residency_scales_with_declared_concurrency(monkeypatch) ->
     oneshot_contract = next(
         contract for name, contract in events if name == "oneshot_contract"
     )
-    assert oneshot_contract[-2] == 3
-    assert ("dcp_contract", 2) in events
+    assert oneshot_contract[6] == 3
+    assert ("dcp_contract", [2]) in events
     assert ("dcp_sms", dcp.DCP_A2A_REQUIRED_SMS * 2) in events
 
 
@@ -305,8 +307,11 @@ def test_oneshot_overlap_contract_mismatch_fails_before_channel_allocation(
     monkeypatch.setattr(oneshot, "_require_full_grid_residency", lambda **kwargs: None)
     monkeypatch.setattr(
         oneshot,
-        "_broadcast_gather_object",
-        lambda contract, group: [contract, (*contract[:-2], 2, contract[-1])],
+        "_exchange_int_contract",
+        lambda local_values, group: [
+            local_values,
+            local_values[:-2] + [2, local_values[-1]],
+        ],
     )
     monkeypatch.setattr(
         oneshot.PCIeOneshotAllReduce,
@@ -338,8 +343,8 @@ def test_dcp_overlap_contract_mismatch_fails_before_channel_allocation(
     )
     monkeypatch.setattr(
         oneshot,
-        "_broadcast_gather_object",
-        lambda contract, group: [contract, 1],
+        "_exchange_int_contract",
+        lambda local_values, group: [local_values, [1]],
     )
     monkeypatch.setattr(
         dcp,

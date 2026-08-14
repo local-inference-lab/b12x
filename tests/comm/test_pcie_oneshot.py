@@ -11,7 +11,6 @@ from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
     _abort_collective_ipc_setup,
-    _broadcast_gather_object,
     _compute_crossover_size,
     _finish_collective_runtime_setup,
     _group_ranks,
@@ -743,12 +742,12 @@ def test_allocate_shared_buffer_cleans_up_on_failed_peer_open(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: (
-            [local_object, (), ()]
-            if isinstance(local_object, tuple)
-            else [local_object, b"remote0", b"remote1"]
-        ),
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, (), ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote0", b"remote1"],
     )
 
     with pytest.raises(RuntimeError, match="peer group rank 2"):
@@ -783,8 +782,8 @@ def test_failed_setup_export_free_is_retained_and_retryable(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: [local_object, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with pytest.raises(RuntimeError, match="exports were retained") as exc:
@@ -829,29 +828,31 @@ def test_failed_peer_setup_export_free_is_retained_and_retryable(monkeypatch):
     ipc = FakeIPC()
     status_round = 0
 
-    def exchange(local_object, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
-        if not isinstance(local_object, tuple):
-            return [local_object, b"remote"]
         status_round += 1
         if status_round == 1:  # retained-setup gate
-            return [local_object, ()]
+            return (local_strings, ())
         if status_round == 2:  # export preparation
-            return [local_object, ()]
+            return (local_strings, ())
         if status_round == 3:  # import-open verdict
-            return [local_object, ("peer open failed",)]
+            return (local_strings, ("peer open failed",))
         if status_round == 4:  # rollback-unmap verdict
-            return [local_object, ()]
+            return (local_strings, ())
         if status_round == 5:  # rollback-export-free verdict
-            return [local_object, ()]
+            return (local_strings, ())
         if status_round == 6:  # retry export-free verdict
-            return [local_object, ()]
+            return (local_strings, ())
         raise AssertionError(f"unexpected status round {status_round}")
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote"],
     )
 
     with pytest.raises(RuntimeError, match="exports were retained") as exc:
@@ -896,27 +897,29 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
     ipc = FakeIPC()
     status_round = 0
 
-    def exchange(local_object, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
-        if not isinstance(local_object, tuple):
-            return [local_object, b"remote0", b"remote1"]
         status_round += 1
         if status_round == 1:  # retained-setup gate
-            return [local_object, (), ()]
+            return (local_strings, (), ())
         if status_round == 2:  # export preparation
-            return [local_object, (), ()]
+            return (local_strings, (), ())
         if status_round == 3:  # import-open verdict
-            return [local_object, ("peer open failed",), ()]
+            return (local_strings, ("peer open failed",), ())
         if status_round == 4:  # rollback-unmap verdict
-            return [local_object, ("peer unmap failed",), ()]
+            return (local_strings, ("peer unmap failed",), ())
         if status_round in (5, 6):  # retry unmap / retry export free
-            return [local_object, (), ()]
+            return (local_strings, (), ())
         raise AssertionError(f"unexpected status round {status_round}")
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote0", b"remote1"],
     )
 
     with pytest.raises(RuntimeError, match=r"retained.*peer unmap failed") as exc:
@@ -953,20 +956,25 @@ def test_handle_exchange_failure_retains_export_until_collective_retry(monkeypat
     status_round = 0
     fail_handle_exchange = True
 
-    def exchange(local_object, group):
-        nonlocal status_round, fail_handle_exchange
-        if not isinstance(local_object, tuple):
-            if fail_handle_exchange:
-                fail_handle_exchange = False
-                raise RuntimeError("injected handle exchange failure")
-            return [local_object, b"remote"]
+    def exchange_status(local_strings, group):
+        nonlocal status_round
         status_round += 1
-        return [local_object, ()]
+        return (local_strings, ())
+
+    def exchange_ipc(local_handle, group):
+        nonlocal fail_handle_exchange
+        if fail_handle_exchange:
+            fail_handle_exchange = False
+            raise RuntimeError("injected handle exchange failure")
+        return [local_handle, b"remote"]
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles", exchange_ipc
     )
 
     with pytest.raises(RuntimeError, match="handle exchange failed") as exc:
@@ -1010,19 +1018,21 @@ def test_import_status_exchange_failure_retains_imports_for_retry(monkeypatch):
     ipc = FakeIPC()
     status_round = 0
 
-    def exchange(local_object, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
-        if not isinstance(local_object, tuple):
-            return [local_object, b"remote"]
         status_round += 1
         if status_round == 3:
             raise RuntimeError("injected import verdict exchange failure")
-        return [local_object, ()]
+        return (local_strings, ())
 
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote"],
     )
 
     with pytest.raises(RuntimeError, match="import-open status") as exc:
@@ -1061,8 +1071,8 @@ def test_failed_native_cleanup_is_owned_and_retried_before_export_free(monkeypat
             raise RuntimeError("transient native dispose failure")
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with pytest.raises(RuntimeError, match="rollback native cleanup") as exc:
@@ -1110,15 +1120,15 @@ def test_peer_native_cleanup_failure_blocks_every_rank_from_unmapping(monkeypatc
         nonlocal cleanup_calls
         cleanup_calls += 1
 
-    def exchange(local_status, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
         status_round += 1
         if status_round == 1:
-            return [local_status, ("peer native dispose failed",)]
-        return [local_status, ()]
+            return (local_strings, ("peer native dispose failed",))
+        return (local_strings, ())
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
     )
 
     with pytest.raises(RuntimeError, match="rollback native cleanup") as exc:
@@ -1161,15 +1171,15 @@ def test_native_cleanup_verdict_exchange_failure_retains_imports(monkeypatch):
     ipc = FakeIPC()
     status_round = 0
 
-    def exchange(local_status, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
         status_round += 1
         if status_round == 1:
             raise RuntimeError("injected native cleanup verdict exchange failure")
-        return [local_status, ()]
+        return (local_strings, ())
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
     )
 
     with pytest.raises(RuntimeError, match="cleanup status exchange") as exc:
@@ -1211,16 +1221,16 @@ def test_initial_native_verdict_exchange_retains_complete_setup_until_retry(
     group = object()
     status_round = 0
 
-    def exchange(local_status, exchange_group):
+    def exchange_status(local_strings, exchange_group):
         nonlocal status_round
         assert exchange_group is group
         status_round += 1
         if status_round == 1:
             raise RuntimeError("injected first native verdict exchange failure")
-        return [local_status, ()]
+        return (local_strings, ())
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
     )
 
     with pytest.raises(RuntimeError, match="must be coordinated by every rank") as exc:
@@ -1269,15 +1279,15 @@ def test_free_status_exchange_failure_keeps_coordination_ticket_without_double_f
     ipc = FakeIPC()
     status_round = 0
 
-    def exchange(local_status, group):
+    def exchange_status(local_strings, group):
         nonlocal status_round
         status_round += 1
         if status_round == 2:
             raise RuntimeError("injected free verdict exchange failure")
-        return [local_status, ()]
+        return (local_strings, ())
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
     )
 
     with pytest.raises(RuntimeError, match="free status exchange") as exc:
@@ -1313,15 +1323,15 @@ def test_retained_generation_blocks_second_setup_before_cuda_allocation(monkeypa
     group = object()
     status_round = 0
 
-    def exchange(local_status, exchange_group):
+    def exchange_status(local_strings, exchange_group):
         nonlocal status_round
         status_round += 1
         if status_round == 2:
             raise RuntimeError("injected preparation verdict exchange failure")
-        return [local_status, ()]
+        return (local_strings, ())
 
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings", exchange_status
     )
 
     with pytest.raises(RuntimeError, match="preparation status") as exc:
@@ -1382,12 +1392,12 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: (
-            [local_object, (), ()]
-            if isinstance(local_object, tuple)
-            else [local_object, b"remote0", b"remote1"]
-        ),
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, (), ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote0", b"remote1"],
     )
 
     buffers = PCIeOneshotAllReduce._allocate_eager_channel_buffers(
@@ -1445,12 +1455,12 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_object, group: (
-            [local_object, (), ()]
-            if isinstance(local_object, tuple)
-            else [local_object, b"remote0", b"remote1"]
-        ),
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, (), ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_ipc_handles",
+        lambda local_handle, group: [local_handle, b"remote0", b"remote1"],
     )
 
     with pytest.raises(RuntimeError, match="memset failed"):
@@ -1467,25 +1477,18 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
 
 
 def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
-    remote_meta = {
-        0: ([1, 2, 3], [0, 64]),
-        1: ([9, 8, 7], [16, 80]),
-    }
-
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
     monkeypatch.setattr(
         "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
-        lambda group: "cpu",
+        "b12x.comm.pcie.pcie_oneshot._exchange_graph_meta",
+        lambda local_handles, local_offsets, group: [
+            ([1, 2, 3], [0, 64]),
+            ([9, 8, 7], [16, 80]),
+        ],
     )
-
-    def fake_broadcast(object_list, src, group=None, device=None):
-        object_list[0] = remote_meta[src]
-
-    monkeypatch.setattr("torch.distributed.broadcast_object_list", fake_broadcast)
 
     runtime = _make_runtime()
     runtime.exchange_group = object()
@@ -1496,12 +1499,10 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
         (12345, [[1, 2, 3], [9, 8, 7]], [[0, 64], [16, 80]])
     ]
 
-
 def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(
     monkeypatch,
 ):
     group = object()
-    sources: list[int] = []
     nonmonotonic_ranks = [7, 2, 9]
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 3)
     monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 1)
@@ -1509,24 +1510,8 @@ def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(
         "torch.distributed.get_process_group_ranks",
         lambda group=None: list(nonmonotonic_ranks),
     )
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
-        lambda group: "cpu",
-    )
-
-    def fake_broadcast(object_list, src, group=None, device=None):
-        sources.append(src)
-        object_list[0] = f"from-{src}"
-
-    monkeypatch.setattr("torch.distributed.broadcast_object_list", fake_broadcast)
 
     assert _group_ranks(group) == nonmonotonic_ranks
-    assert _broadcast_gather_object("local", group) == [
-        "from-7",
-        "from-2",
-        "from-9",
-    ]
-    assert sources == nonmonotonic_ranks
 
 
 def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatch):
@@ -1536,14 +1521,8 @@ def test_register_graph_buffers_noops_when_no_rank_registered_buffers(monkeypatc
         "torch.distributed.get_process_group_ranks", lambda group=None: [0, 1]
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._object_broadcast_device",
-        lambda group: "cpu",
-    )
-    monkeypatch.setattr(
-        "torch.distributed.broadcast_object_list",
-        lambda object_list, src, group=None, device=None: object_list.__setitem__(
-            0, ([], [])
-        ),
+        "b12x.comm.pcie.pcie_oneshot._exchange_graph_meta",
+        lambda local_handles, local_offsets, group: [([], []), ([], [])],
     )
 
     runtime = _make_runtime()
@@ -1632,8 +1611,12 @@ def test_collective_logical_channel_preparation_is_canonical(monkeypatch):
         lambda stream_key: created.append(stream_key) or object(),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_channel_state",
+        lambda normalized, existing, group: [(normalized, existing), (normalized, existing)],
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, local_strings),
     )
 
     pool.prepare_channels(("draft", "target"))
@@ -1658,13 +1641,14 @@ def test_collective_logical_channel_mismatch_rejects_before_allocation(monkeypat
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if not local_state or isinstance(local_state[0], str):
-            return [local_state, ()]
-        _requested, existing = local_state
-        return [local_state, (("other",), existing)]
-
-    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_channel_state",
+        lambda normalized, existing, group: [(normalized, existing), (("other",), existing)],
+    )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(("target",))
@@ -1687,8 +1671,8 @@ def test_invalid_logical_channel_id_is_rejected_collectively_before_allocation(
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with pytest.raises(RuntimeError, match="must not be empty"):
@@ -1705,13 +1689,14 @@ def test_empty_logical_channel_set_still_enters_collective_contract(monkeypatch)
     pool._channel_factory = None
     pool.exchange_group = object()
 
-    def gather(local_state, group):
-        if not local_state or isinstance(local_state[0], str):
-            return [local_state, ()]
-        _, existing = local_state
-        return [local_state, (("peer-channel",), existing)]
-
-    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_channel_state",
+        lambda normalized, existing, group: [(normalized, existing), (("peer-channel",), existing)],
+    )
 
     with pytest.raises(RuntimeError, match="differs across ranks"):
         pool.prepare_channels(())
@@ -1733,8 +1718,8 @@ def test_collective_capture_requires_stable_semantic_id(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_status, group: [local_status, ()],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
     )
 
     with (
@@ -1766,14 +1751,17 @@ def test_collective_capture_allows_opposite_order_from_agreed_catalog(monkeypatc
         lambda device, stream=None: int(stream),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        requested, catalog = local_state
-        assert requested == "graph:target"
-        return [local_state, ("graph:draft", catalog)]
-
-    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [
+            (logical_id, catalog),
+            ("graph:draft", catalog),
+        ],
+    )
 
     with pool.capture(7, channel_id="graph:target") as channel:
         assert channel is target
@@ -1798,12 +1786,17 @@ def test_collective_capture_rejects_divergent_catalog_before_allocation(monkeypa
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        return [local_state, ("graph:target", ())]
-
-    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [
+            (logical_id, catalog),
+            ("graph:target", ()),
+        ],
+    )
 
     with (
         pytest.raises(RuntimeError, match="prepared channel catalog differs"),
@@ -1829,13 +1822,17 @@ def test_collective_capture_rejects_differing_unprepared_ids(monkeypatch):
         lambda stream_key: pytest.fail("channel allocation must not start"),
     )
 
-    def gather(local_state, group):
-        if local_state == ():
-            return [(), ()]
-        _, catalog = local_state
-        return [local_state, ("graph:unknown", catalog)]
-
-    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", gather)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [
+            (logical_id, catalog),
+            ("graph:unknown", catalog),
+        ],
+    )
 
     with (
         pytest.raises(RuntimeError, match="unprepared logical channels"),
@@ -1865,8 +1862,19 @@ def test_collective_capture_preserves_same_id_convenience_allocation(monkeypatch
         lambda device, stream=None: int(stream),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [
+            (logical_id, catalog),
+            (logical_id, catalog),
+        ],
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_channel_state",
+        lambda normalized, existing, group: [(normalized, existing), (normalized, existing)],
     )
 
     with pool.capture(7, channel_id="graph:target") as captured:
@@ -1898,8 +1906,15 @@ def test_collective_capture_routes_eager_warmup_to_graph_channel(monkeypatch):
         lambda device, stream=None: 7 if stream is None else int(stream),
     )
     monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
-        lambda local_state, group: [local_state, local_state],
+        "b12x.comm.pcie.pcie_oneshot._exchange_status_strings",
+        lambda local_strings, group: (local_strings, ()),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._exchange_capture_contract",
+        lambda logical_id, catalog, group: [
+            (logical_id, catalog),
+            (logical_id, catalog),
+        ],
     )
 
     with pool.capture(7, channel_id="graph:target") as captured:

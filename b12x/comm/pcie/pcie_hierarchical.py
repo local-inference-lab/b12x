@@ -21,7 +21,12 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from ._hierarchical_cute import get_hierarchical_launcher
-from .pcie_oneshot import _broadcast_gather_object, _normalize_device
+from .pcie_oneshot import (
+    _exchange_ipc_handles,
+    _exchange_setup_failures,
+    _normalize_device,
+    _require_collective_contract,
+)
 
 
 ISLAND_SIZE = 4
@@ -218,49 +223,117 @@ class PCIeHierarchicalAllReduce:
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
-
         slab_bytes = self._layout.bytes
         peer_ptrs = [0] * self.world_size
+
+        # Validate layout contract across ranks before any allocation.
+        _require_collective_contract(
+            owner="PCIe hierarchical",
+            exchange_group=exchange_group,
+            contract_fields=[
+                self.world_size,
+                self.max_elements,
+                slab_bytes,
+                self._layout.stage[0],
+                self._layout.stage[1],
+                self._layout.partial[0],
+                self._layout.partial[1],
+            ],
+        )
+
+        # Coordinated export preparation: allocate and export before
+        # exchanging handles.  A rank-local allocation failure is
+        # reported to all peers before any enters handle exchange.
+        local_ptr: int | None = None
+        local_handle: bytes | None = None
+        prepare_error: BaseException | None = None
         try:
-            self._local_ptr = self._ipc.cudaMalloc(slab_bytes)
-            self._ipc.cudaMemset(self._local_ptr, 0, slab_bytes)
-            local_handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
-            handles = _broadcast_gather_object(local_handle, exchange_group)
-            peer_ptrs[self.rank] = self._local_ptr
-            for peer in _selected_peers(self.rank, self.world_size):
+            local_ptr = self._ipc.cudaMalloc(slab_bytes)
+            self._ipc.cudaMemset(local_ptr, 0, slab_bytes)
+            local_handle = self._ipc.cudaIpcGetMemHandleBytes(local_ptr)
+        except Exception as exc:
+            prepare_error = exc
+
+        prepare_statuses = _exchange_setup_failures(
+            prepare_error,
+            exchange_group=exchange_group,
+            phase="PCIe hierarchical export preparation",
+            exports_retained_on_exchange_failure=False,
+        )
+        if any(prepare_statuses):
+            if local_ptr is not None:
+                with suppress(Exception):
+                    self._ipc.cudaFree(local_ptr)
+            raise RuntimeError(
+                f"PCIe hierarchical export preparation failed: {prepare_statuses}"
+            ) from prepare_error
+
+        assert local_ptr is not None
+        assert local_handle is not None
+        self._local_ptr = local_ptr
+
+        # Exchange IPC handles with typed tensor wire format.
+        try:
+            handles = _exchange_ipc_handles(
+                local_handle, exchange_group, self.device
+            )
+        except Exception as exchange_error:
+            with suppress(Exception):
+                self._ipc.cudaFree(local_ptr)
+            self._local_ptr = 0
+            raise RuntimeError(
+                "PCIe hierarchical CUDA IPC handle exchange failed"
+            ) from exchange_error
+
+        peer_ptrs[self.rank] = local_ptr
+        open_error: BaseException | None = None
+        for peer in _selected_peers(self.rank, self.world_size):
+            try:
                 remote_ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
+            except Exception as exc:
+                if open_error is None:
+                    open_error = RuntimeError(
+                        f"failed to open CUDA IPC handle for peer {peer}"
+                    )
+                    open_error.__cause__ = exc
+                peer_ptrs[peer] = 0
+            else:
                 peer_ptrs[peer] = remote_ptr
                 self._remote_ptrs.append(remote_ptr)
-            # Keep the fixed slab addresses in the captured kernel node's
-            # parameter bank.  The CuTe rank specialization references only
-            # this rank's mapped peers, so unmapped entries remain zero and
-            # are dead at compile time.
-            self._slab_ptrs = tuple(peer_ptrs)
-            # Resolve and load the only reachable specialization before the
-            # channel is exposed.  A first call made under CUDA graph capture
-            # must never compile or load a module.
-            with torch.cuda.device(self.device):
-                for vectorized in ({False, True} if self.vectorized_bf16x2 else {False}):
-                    self._launchers[vectorized] = get_hierarchical_launcher(
-                        self.world_size,
-                        self.rank,
-                        self.device.index or 0,
-                        threads=(112 if vectorized else self.threads),
-                        wait_nanosleep_cycles=self.wait_nanosleep_cycles,
-                        double_buffered=self.double_buffered,
-                        deferred_consumption=self.deferred_consumption,
-                        vectorized_bf16x2=vectorized,
-                    )
-        except Exception:
+
+        # Coordinated import-open verdict: no rank frees its export
+        # until all peers confirm imports are open or the collective
+        # aborts.
+        open_statuses = _exchange_setup_failures(
+            open_error,
+            exchange_group=exchange_group,
+            phase="PCIe hierarchical import open",
+        )
+        if any(open_statuses):
             for ptr in self._remote_ptrs:
                 with suppress(Exception):
                     self._ipc.cudaIpcCloseMemHandle(ptr)
             self._remote_ptrs.clear()
-            if self._local_ptr:
-                with suppress(Exception):
-                    self._ipc.cudaFree(self._local_ptr)
-                self._local_ptr = 0
-            raise
+            with suppress(Exception):
+                self._ipc.cudaFree(local_ptr)
+            self._local_ptr = 0
+            raise RuntimeError(
+                f"PCIe hierarchical import open failed: {open_statuses}"
+            ) from open_error
+
+        self._slab_ptrs = tuple(peer_ptrs)
+        with torch.cuda.device(self.device):
+            for vectorized in ({False, True} if self.vectorized_bf16x2 else {False}):
+                self._launchers[vectorized] = get_hierarchical_launcher(
+                    self.world_size,
+                    self.rank,
+                    self.device.index or 0,
+                    threads=(112 if vectorized else self.threads),
+                    wait_nanosleep_cycles=self.wait_nanosleep_cycles,
+                    double_buffered=self.double_buffered,
+                    deferred_consumption=self.deferred_consumption,
+                    vectorized_bf16x2=vectorized,
+                )
 
     @property
     def mapped_peer_count(self) -> int:

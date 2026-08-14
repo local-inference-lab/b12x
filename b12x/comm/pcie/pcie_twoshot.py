@@ -230,11 +230,16 @@ class PCIeTwoShotSP:
         _require_collective_contract(
             owner="PCIe twoshot channel layout",
             exchange_group=exchange_group,
-            contract=(
+            contract_fields=[
                 int(max_rows),
                 int(row_elems),
-                layout,
-            ),
+                layout.signal_bytes,
+                layout.pack_stride,
+                layout.scale_offset,
+                layout.scale_stride,
+                layout.slot_bytes,
+                layout.slab_bytes,
+            ],
         )
 
         shared = PCIeOneshotAllReduce._allocate_shared_buffer(

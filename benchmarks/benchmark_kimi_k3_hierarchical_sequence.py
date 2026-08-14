@@ -31,7 +31,7 @@ from torch.utils.cpp_extension import load
 from b12x.comm.pcie import AllReduce
 from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
-from b12x.comm.pcie.pcie_oneshot import _broadcast_gather_object
+from b12x.comm.pcie.pcie_oneshot import _exchange_ipc_handles
 
 
 DEFAULT_SHAPES = (7168, 3584, 7168)
@@ -98,7 +98,7 @@ class LaneDistributedAllReducePOC:
             self._local_ptr = self._ipc.cudaMalloc(slab_bytes)
             self._ipc.cudaMemset(self._local_ptr, 0, slab_bytes)
             local_handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
-            handles = _broadcast_gather_object(local_handle, exchange_group)
+            handles = _exchange_ipc_handles(local_handle, exchange_group, self.device)
             peer_ptrs[self.rank] = self._local_ptr
             for peer in _lane_peers(self.rank, self.world_size):
                 ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
