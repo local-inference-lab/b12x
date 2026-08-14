@@ -2978,9 +2978,16 @@ class MoEDynamicKernelBackend:
             if flat_tid < total_pairs:
                 m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
                 token_map[m1_physical_row] = Int32(0)
-                token_weights[m1_physical_row] = topk_weights[flat_tid].to(
-                    cutlass.Float32
-                )
+                m1_weight = topk_weights[flat_tid].to(cutlass.Float32)
+                # Enforce canonical expert-ID validity (0 <= eid < num_experts):
+                # zero the routing weight for out-of-range IDs so they cannot
+                # contribute to the output.
+                m1_eid = topk_ids[flat_tid].to(Int32)
+                if m1_eid < Int32(0):
+                    m1_weight = cutlass.Float32(0.0)
+                if m1_eid >= num_experts:
+                    m1_weight = cutlass.Float32(0.0)
+                token_weights[m1_physical_row] = m1_weight
 
         cute.arch.sync_threads()
         self._resident_grid_barrier(
@@ -2997,7 +3004,16 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(not self.direct_routing):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
-                expert_id = topk_ids[hist_idx].to(Int32)
+                expert_id_raw = topk_ids[hist_idx]
+                # Enforce canonical expert-ID validity (0 <= eid < num_experts):
+                # validate in the source width before narrowing to Int32,
+                # then clamp out-of-range IDs to expert 0 so the atomic
+                # write always targets a valid histogram slot.
+                if expert_id_raw < Int32(0):
+                    expert_id_raw = Int32(0)
+                if expert_id_raw >= num_experts:
+                    expert_id_raw = Int32(0)
+                expert_id = expert_id_raw.to(Int32)
                 atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
                 hist_idx += flat_stride
 
@@ -3100,8 +3116,20 @@ class MoEDynamicKernelBackend:
                                 topk_step = Int32(self.input_warps_per_token)
                             while topk_slot < num_topk:
                                 pair_idx = token_idx * num_topk + topk_slot
-                                expert_id = topk_ids[pair_idx].to(Int32)
+                                expert_id_raw = topk_ids[pair_idx]
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
+                                # Enforce canonical expert-ID validity:
+                                # validate in the source width before narrowing,
+                                # clamp to expert 0 and zero the routing weight
+                                # so invalid IDs cannot form addresses or
+                                # contribute to the output.
+                                if expert_id_raw < Int32(0):
+                                    expert_id_raw = Int32(0)
+                                    weight = cutlass.Float32(0.0)
+                                if expert_id_raw >= num_experts:
+                                    expert_id_raw = Int32(0)
+                                    weight = cutlass.Float32(0.0)
+                                expert_id = expert_id_raw.to(Int32)
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
@@ -3502,9 +3530,19 @@ class MoEDynamicKernelBackend:
                         row = Int32(0)
                         phys_tile = Int32(0)
                         if pair_idx < total_pairs:
-                            expert_id = topk_ids[pair_idx].to(Int32)
+                            expert_id_raw = topk_ids[pair_idx]
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
+                            # Enforce canonical expert-ID validity:
+                            # validate in the source width before narrowing,
+                            # clamp to expert 0 and zero the routing weight.
+                            if expert_id_raw < Int32(0):
+                                expert_id_raw = Int32(0)
+                                weight = cutlass.Float32(0.0)
+                            if expert_id_raw >= num_experts:
+                                expert_id_raw = Int32(0)
+                                weight = cutlass.Float32(0.0)
+                            expert_id = expert_id_raw.to(Int32)
 
                             if lane_id == Int32(0):
                                 if cutlass.const_expr(self.direct_routing):
@@ -3768,7 +3806,15 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.direct_routing):
                     pair_flush = Int32(bidz)
                     while pair_flush < total_pairs:
-                        expert_flush = topk_ids[pair_flush].to(Int32)
+                        expert_flush_raw = topk_ids[pair_flush]
+                        # Enforce canonical expert-ID validity: validate in
+                        # the source width before narrowing, clamp to
+                        # expert 0 so deferred tasks reference a valid expert.
+                        if expert_flush_raw < Int32(0):
+                            expert_flush_raw = Int32(0)
+                        if expert_flush_raw >= num_experts:
+                            expert_flush_raw = Int32(0)
+                        expert_flush = expert_flush_raw.to(Int32)
                         self._publish_deferred_tasks(
                             task_expert,
                             task_valid_rows,
@@ -4417,7 +4463,16 @@ class MoEDynamicKernelBackend:
                 if materialized_slot < materialized_tail:
                     route_idx = materialized_slot // route_gate_tile_cnt
                     route_slice = materialized_slot - route_idx * route_gate_tile_cnt
-                    work_item[_WORK_EXPERT] = topk_ids[route_idx].to(Int32)
+                    m1_eid_raw = topk_ids[route_idx]
+                    # Enforce canonical expert-ID validity: validate in the
+                    # source width before narrowing, clamp to expert 0
+                    # so all downstream weight/scale indexing is in-bounds.
+                    if m1_eid_raw < Int32(0):
+                        m1_eid_raw = Int32(0)
+                    if m1_eid_raw >= num_experts:
+                        m1_eid_raw = Int32(0)
+                    m1_eid = m1_eid_raw.to(Int32)
+                    work_item[_WORK_EXPERT] = m1_eid
                     work_item[_WORK_M_TILE] = route_idx
                     work_item[_WORK_SLICE_BEGIN] = route_slice
                     work_item[_WORK_SLICE_COUNT] = Int32(1)
@@ -8762,7 +8817,15 @@ class MoEDynamicKernelBackend:
                     phase2_output_tile = (
                         phase2_slot - phase2_m_tile * phase2_task_output_tiles
                     )
-                    phase2_expert = topk_ids[phase2_m_tile].to(Int32)
+                    phase2_expert_raw = topk_ids[phase2_m_tile]
+                    # Enforce canonical expert-ID validity: validate in the
+                    # source width before narrowing, clamp to expert 0
+                    # so FC2 weight/scale indexing is in-bounds.
+                    if phase2_expert_raw < Int32(0):
+                        phase2_expert_raw = Int32(0)
+                    if phase2_expert_raw >= num_experts:
+                        phase2_expert_raw = Int32(0)
+                    phase2_expert = phase2_expert_raw.to(Int32)
                     self._run_w4a8_materialized_fc2(
                         intermediate_u32,
                         down_rp,

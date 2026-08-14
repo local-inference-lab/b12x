@@ -231,7 +231,14 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc1_per_rt
             nt = rem // Int32(c["fc1_ktg"])
             ktg = rem % Int32(c["fc1_ktg"])
-            eid = Int64(Int32(topk_ids[rt_idx]))
+            eid_raw = Int32(topk_ids[rt_idx])
+            # Enforce canonical expert-ID validity: clamp to expert 0 so
+            # weight/scale base addresses are in-bounds.
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+            if eid_raw >= Int32(c["weight_E"]):
+                eid_raw = Int32(0)
+            eid = Int64(eid_raw)
             tok = rt_idx // Int32(c["num_topk"])
             we_base = w13_base + eid * Int64(c["w13_words"] * 4)
             se_base = sfb13_base + eid * Int64(c["sfb13_bytes"])
@@ -326,9 +333,19 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc2_per_rt
             nt = rem // Int32(c["fc2_ktg"])
             ktg = rem % Int32(c["fc2_ktg"])
-            eid = Int64(Int32(topk_ids[rt_idx]))
-            tok = rt_idx // Int32(c["num_topk"])
+            eid_raw = Int32(topk_ids[rt_idx])
+            # Enforce canonical expert-ID validity: clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses
+            # or contribute to the output.
             rw = Float32(topk_weights[rt_idx])
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                rw = Float32(0.0)
+            if eid_raw >= Int32(c["weight_E"]):
+                eid_raw = Int32(0)
+                rw = Float32(0.0)
+            eid = Int64(eid_raw)
+            tok = rt_idx // Int32(c["num_topk"])
             we_base = w2_base + eid * Int64(c["w2_words"] * 4)
             se_base = sfb2_base + eid * Int64(c["sfb2_bytes"])
             srow_base = se_base + Int64(r8 * Int32(4) + n8c * Int32(128))

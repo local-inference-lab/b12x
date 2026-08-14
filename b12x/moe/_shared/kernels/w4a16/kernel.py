@@ -93,6 +93,7 @@ from b12x._lib.quant.sqg_fp16_d3l import (
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
+    zero_invalid_rows,
 )
 from b12x.moe._shared.kernels.w4a16.host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
@@ -1654,7 +1655,10 @@ class W4A16GemmKernel:
                         expert_idx = packed_route_indices[route_block_idx].to(Int32)
                     else:
                         expert_idx = block_expert_ids[route_block_idx].to(Int32)
-                    if expert_idx >= Int32(0):
+                    if (
+                        expert_idx >= Int32(0)
+                        and expert_idx < Int32(self.num_experts)
+                    ):
                         self._run_tile(
                             a_bf16_flat,
                             a_alt_bf16_flat,
@@ -4335,12 +4339,10 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
-                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
-                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
-                        b_region, tile_base, lane, low_bits
-                    )
-                elif logical_k16 < Int32(8):
+                if cutlass.const_expr(
+                    int(low_bits) == int(high_bits)
+                    or logical_k16 < Int32(8)
+                ):
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits
@@ -11888,6 +11890,7 @@ def pack_topk_routes_by_expert(
     block_size: int,
     num_experts: int,
     *,
+    local_num_experts: int | None = None,
     expert_map: torch.Tensor | None = None,
     packed_route_indices: torch.Tensor | None = None,
     block_expert_ids: torch.Tensor | None = None,
@@ -11908,6 +11911,7 @@ def pack_topk_routes_by_expert(
         topk_ids,
         int(block_size),
         int(num_experts),
+        local_num_experts=local_num_experts,
         expert_map=expert_map,
         packed_route_indices=packed_route_indices,
         block_expert_ids=block_expert_ids,
@@ -12893,9 +12897,6 @@ def run_w4a16_moe(
         and topk_ids.is_cuda
         and int(m) <= _TC_DECODE_MAX_M
     )
-    if use_tc_decode and topk_ids.dtype != torch.int32:
-        # The inline direct-topk route path needs int32 route indices.
-        topk_ids = topk_ids.to(torch.int32)
 
     mapped_direct = expert_map is not None
     direct_m_cap = (
@@ -12979,6 +12980,7 @@ def run_w4a16_moe(
                 topk_ids,
                 block_size_m,
                 route_num_experts,
+                local_num_experts=int(prepared.num_experts),
                 expert_map=expert_map,
                 packed_route_indices=packed_route_indices,
                 block_expert_ids=block_expert_ids,
@@ -13073,8 +13075,7 @@ def run_w4a16_moe(
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
             zero_fc2_output=(
-                expert_map is not None
-                and not full_rotation
+                not full_rotation
                 and not use_direct_topk_routes
             ),
             moe_block_size=block_size_m,
@@ -13121,8 +13122,7 @@ def run_w4a16_moe(
             activation,
             bool(apply_router_weight_on_input),
             (
-                expert_map is not None
-                and not full_rotation
+                not full_rotation
                 and not use_direct_topk_routes
             ),
             element_dtype,
@@ -13488,6 +13488,14 @@ def run_w4a16_moe(
     if use_tc_decode:
         # FC2 already wrote the top-k-summed result into `output`.
         return output
+    if use_direct_topk_routes and not full_rotation and expert_map is None:
+        routed_rows = int(m) * int(topk)
+        zero_invalid_rows(
+            fc2_out[: routed_rows * hidden_size].view(routed_rows, hidden_size),
+            topk_ids.view(-1),
+            num_experts=int(prepared.num_experts),
+        )
+
 
     sum_expert_map = output_expert_map if output_expert_map is not None else expert_map
     sum_uses_map = sum_expert_map is not None and (

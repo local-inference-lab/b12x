@@ -26,24 +26,32 @@ def _w4a16_route_count_kernel(
     counts,
     live_numel,
     NUM_EXPERTS: tl.constexpr,
+    LOCAL_NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     """Parallel atomic histogram of routes per (mapped) expert.
 
     Same expert-id resolution as the sort kernel (expert_map aware).
-    Writes ``counts[NUM_EXPERTS]``."""
+    Validates raw IDs against NUM_EXPERTS (global route space), then
+    validates mapped local IDs against LOCAL_NUM_EXPERTS (actual weight
+    allocation).  Writes ``counts[LOCAL_NUM_EXPERTS]``."""
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-        tl.int32
-    )
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
+    # Validate in the source width (int32 or int64) BEFORE narrowing
+    # to int32, so wraparound values like 2**32+1 are rejected.
     valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    raw_ids = raw_ids.to(tl.int32)
     ids = raw_ids
     if HAS_EXPERT_MAP:
         safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
         ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
-        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+        # Validate mapped local ID against the actual local weight allocation.
+        valid = valid & (ids >= 0) & (ids < LOCAL_NUM_EXPERTS)
+    else:
+        # Without a map, the global ID is the local ID.
+        valid = valid & (ids < LOCAL_NUM_EXPERTS)
     tl.atomic_add(counts + ids, 1, sem="relaxed", mask=valid)
 
 
@@ -165,6 +173,7 @@ def _pack_topk_routes_small_prefix_kernel(
     NUMEL_CAPACITY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
+    LOCAL_NUM_EXPERTS: tl.constexpr,
     MAX_PACKED_ROUTES: tl.constexpr,
     MAX_ROUTE_BLOCKS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
@@ -182,22 +191,24 @@ def _pack_topk_routes_small_prefix_kernel(
     enters through the O(BLOCK_E) vector ops and the O(log BLOCK_E) search
     depth, so large-expert MoE decode does not regress the packing launch."""
     experts = tl.arange(0, BLOCK_E)
-    expert_mask = experts < NUM_EXPERTS
+    expert_mask = experts < LOCAL_NUM_EXPERTS
     tl.store(expert_counts + experts, 0, mask=expert_mask)
     tl.debug_barrier()
 
     route_offsets = tl.arange(0, BLOCK_T)
     for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
         offsets = start + route_offsets
-        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-            tl.int32
-        )
+        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
+        # Validate in the source width BEFORE narrowing to int32.
         valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
-        ids = raw_ids
+        raw_ids = raw_ids.to(tl.int32)
         if HAS_EXPERT_MAP:
             safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
             ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
-            valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+            valid = valid & (ids >= 0) & (ids < LOCAL_NUM_EXPERTS)
+        else:
+            ids = raw_ids
+            valid = valid & (ids < LOCAL_NUM_EXPERTS)
         tl.atomic_add(expert_counts + ids, 1, sem="relaxed", mask=valid)
     tl.debug_barrier()
 
@@ -209,7 +220,7 @@ def _pack_topk_routes_small_prefix_kernel(
     total = tl.sum(padded, axis=0)
 
     tl.store(expert_offsets + experts, prefix, mask=expert_mask)
-    tl.store(expert_offsets + NUM_EXPERTS, total)
+    tl.store(expert_offsets + LOCAL_NUM_EXPERTS, total)
     tl.store(packed_route_count, total)
 
     route_init_offsets = tl.arange(0, BLOCK_ROUTE_INIT)
@@ -227,7 +238,7 @@ def _pack_topk_routes_small_prefix_kernel(
     block_rows = block_offsets * BLOCK_SIZE
     valid_blocks = (block_offsets < MAX_ROUTE_BLOCKS) & (block_rows < total)
     low = tl.zeros((BLOCK_M,), dtype=tl.int32)
-    high = tl.full((BLOCK_M,), NUM_EXPERTS, dtype=tl.int32)
+    high = tl.full((BLOCK_M,), LOCAL_NUM_EXPERTS, dtype=tl.int32)
     for _ in tl.static_range(0, SEARCH_STEPS):
         mid = (low + high) // 2
         mid_offset = tl.load(expert_offsets + mid, mask=valid_blocks, other=0)
@@ -250,20 +261,24 @@ def _pack_topk_routes_sort_kernel(
     expert_offsets,
     live_numel,
     NUM_EXPERTS: tl.constexpr,
+    LOCAL_NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-        tl.int32
-    )
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
+    # Validate in the source width BEFORE narrowing to int32.
     valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    raw_ids = raw_ids.to(tl.int32)
     ids = raw_ids
     if HAS_EXPERT_MAP:
         safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
         ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
-        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+        # Validate mapped local ID against the actual local weight allocation.
+        valid = valid & (ids >= 0) & (ids < LOCAL_NUM_EXPERTS)
+    else:
+        valid = valid & (ids < LOCAL_NUM_EXPERTS)
 
     ranks = tl.atomic_add(expert_offsets + ids, 1, sem="relaxed", mask=valid)
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
@@ -274,6 +289,7 @@ def pack_topk_routes_by_expert(
     block_size: int,
     num_experts: int,
     *,
+    local_num_experts: int | None = None,
     expert_map: torch.Tensor | None = None,
     packed_route_indices: torch.Tensor | None = None,
     block_expert_ids: torch.Tensor | None = None,
@@ -281,6 +297,11 @@ def pack_topk_routes_by_expert(
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    local_num_experts = (
+        int(num_experts) if local_num_experts is None else int(local_num_experts)
+    )
+    if local_num_experts <= 0:
+        raise ValueError("local_num_experts must be positive")
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
     numel_capacity, capacity_packed_routes, capacity_route_blocks = route_pack_capacity(
@@ -354,7 +375,7 @@ def pack_topk_routes_by_expert(
     expert_offsets = _workspace_slice(
         expert_offsets,
         name="expert_offsets",
-        elements=int(num_experts) + 1,
+        elements=local_num_experts + 1,
         dtype=torch.int32,
         device=topk_ids.device,
     )
@@ -365,7 +386,7 @@ def pack_topk_routes_by_expert(
         packed_route_count.zero_()
         return packed_route_indices, block_expert_ids, packed_route_count
 
-    block_e = _next_power_of_2(num_experts)
+    block_e = _next_power_of_2(local_num_experts)
     sort_grid = (triton.cdiv(numel, _SORT_BLOCK_T),)
     expert_map_tensor = expert_map if expert_map is not None else topk_ids
 
@@ -382,7 +403,7 @@ def pack_topk_routes_by_expert(
         expert_counts = _workspace_slice(
             expert_counts,
             name="expert_counts",
-            elements=int(num_experts),
+            elements=local_num_experts,
             dtype=torch.int32,
             device=topk_ids.device,
         )
@@ -398,6 +419,7 @@ def pack_topk_routes_by_expert(
             NUMEL_CAPACITY=numel_capacity,
             BLOCK_SIZE=int(block_size),
             NUM_EXPERTS=int(num_experts),
+            LOCAL_NUM_EXPERTS=local_num_experts,
             MAX_PACKED_ROUTES=max_packed_routes,
             MAX_ROUTE_BLOCKS=max_route_blocks,
             HAS_EXPERT_MAP=expert_map is not None,
@@ -418,7 +440,7 @@ def pack_topk_routes_by_expert(
         expert_counts = _workspace_slice(
             expert_counts,
             name="expert_counts",
-            elements=int(num_experts),
+            elements=local_num_experts,
             dtype=torch.int32,
             device=topk_ids.device,
         )
@@ -429,6 +451,7 @@ def pack_topk_routes_by_expert(
             expert_counts,
             numel,
             NUM_EXPERTS=int(num_experts),
+            LOCAL_NUM_EXPERTS=local_num_experts,
             HAS_EXPERT_MAP=expert_map is not None,
             BLOCK_T=_FAST_COUNT_BLOCK_T,
             num_warps=4,
@@ -438,7 +461,7 @@ def pack_topk_routes_by_expert(
             packed_route_count,
             expert_offsets,
             BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
+            NUM_EXPERTS=local_num_experts,
             BLOCK_E=block_e,
             num_warps=4,
         )
@@ -454,7 +477,7 @@ def pack_topk_routes_by_expert(
             expert_offsets,
             numel,
             BLOCK_SIZE=int(block_size),
-            NUM_EXPERTS=int(num_experts),
+            NUM_EXPERTS=local_num_experts,
             MAX_PACKED_ROUTES=max_packed_routes,
             MAX_ROUTE_BLOCKS=max_route_blocks,
             BLOCK_T=_POST_PREFIX_BLOCK_T,
@@ -468,6 +491,7 @@ def pack_topk_routes_by_expert(
         expert_offsets,
         numel,
         NUM_EXPERTS=int(num_experts),
+        LOCAL_NUM_EXPERTS=local_num_experts,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_T=_SORT_BLOCK_T,
         num_warps=4,
@@ -475,4 +499,122 @@ def pack_topk_routes_by_expert(
     return packed_route_indices, block_expert_ids, packed_route_count
 
 
-__all__ = ["pack_topk_routes_by_expert"]
+
+
+@triton.jit
+def _sanitize_routing_ids_kernel(
+    raw_ids,
+    raw_weights,
+    out_ids,
+    out_weights,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    INVALID_ID: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Graph-safe device kernel: validate and sanitize caller routing IDs.
+
+    Reads raw IDs in their source width (int32 or int64), clamps
+    out-of-range IDs to 0, zeroes the corresponding routing weight,
+    and writes sanitized int32 IDs + float32 weights to the output
+    buffers.  This is graph-safe (pure device kernel, no host sync).
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    valid = offsets < live_numel
+    # Load the raw ID in its source width (int32 or int64) and validate
+    # BEFORE narrowing to int32, so wraparound values like 2**32+1 are
+    # rejected rather than aliasing a valid expert.
+    raw_id = tl.load(raw_ids + offsets, mask=valid, other=0)
+    w = tl.load(raw_weights + offsets, mask=valid, other=0.0)
+    id_valid = (raw_id >= 0) & (raw_id < NUM_EXPERTS)
+    safe_id = tl.where(id_valid, raw_id, INVALID_ID).to(tl.int32)
+    safe_w = tl.where(id_valid, w, 0.0)
+    tl.store(out_ids + offsets, safe_id, mask=valid)
+    tl.store(out_weights + offsets, safe_w, mask=valid)
+
+
+def sanitize_routing_ids(
+    raw_ids: torch.Tensor,
+    raw_weights: torch.Tensor,
+    num_experts: int,
+    *,
+    out_ids: torch.Tensor | None = None,
+    out_weights: torch.Tensor | None = None,
+    invalid_id: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sanitize caller routing IDs on-device (graph-safe).
+
+    Validates every ID against ``num_experts`` in the source width before
+    narrowing to int32. Invalid IDs become ``invalid_id`` and receive zero
+    routing weight. Returns sanitized int32 IDs and float32 weights.
+    """
+    numel = int(raw_ids.numel())
+    if out_ids is None:
+        out_ids = torch.empty(numel, dtype=torch.int32, device=raw_ids.device)
+    if out_weights is None:
+        out_weights = torch.empty(numel, dtype=torch.float32, device=raw_ids.device)
+    if numel == 0:
+        return out_ids, out_weights
+    grid = (triton.cdiv(numel, _FAST_COUNT_BLOCK_T),)
+    _sanitize_routing_ids_kernel[grid](
+        raw_ids,
+        raw_weights,
+        out_ids,
+        out_weights,
+        numel,
+        NUM_EXPERTS=int(num_experts),
+        INVALID_ID=int(invalid_id),
+        BLOCK_T=_FAST_COUNT_BLOCK_T,
+        num_warps=4,
+    )
+    return out_ids, out_weights
+
+@triton.jit
+def _zero_invalid_rows_kernel(
+    output,
+    route_ids,
+    rows,
+    cols,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    total = rows * cols
+    valid = offsets < total
+    row = offsets // cols
+    route_id = tl.load(route_ids + row, mask=valid, other=-1)
+    invalid_route = (route_id < 0) | (
+        (NUM_EXPERTS >= 0) & (route_id >= NUM_EXPERTS)
+    )
+    tl.store(output + offsets, 0.0, mask=valid & invalid_route)
+
+
+def zero_invalid_rows(
+    output: torch.Tensor,
+    route_ids: torch.Tensor,
+    *,
+    num_experts: int | None = None,
+) -> None:
+    """Overwrite invalid route rows after kernels that may skip or emit NaN."""
+    rows, cols = map(int, output.shape)
+    if rows != int(route_ids.numel()):
+        raise ValueError("route_ids must contain one ID per output row")
+    total = rows * cols
+    if total:
+        _zero_invalid_rows_kernel[(triton.cdiv(total, 256),)](
+            output,
+            route_ids,
+            rows,
+            cols,
+            NUM_EXPERTS=-1 if num_experts is None else int(num_experts),
+            BLOCK=256,
+            num_warps=4,
+        )
+
+
+__all__ = [
+    "pack_topk_routes_by_expert",
+    "sanitize_routing_ids",
+    "zero_invalid_rows",
+]

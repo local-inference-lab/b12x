@@ -219,6 +219,7 @@ class TPMicroWorkspace(TPMoEWorkspace):
     weight_expert_ids: torch.Tensor
     global_to_local_expert: torch.Tensor
     compact_topk_ids: torch.Tensor
+    compact_topk_weights: torch.Tensor
     micro_intermediate: torch.Tensor
 
 
@@ -245,6 +246,8 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     task_slice_count: torch.Tensor
     task_valid_rows: torch.Tensor
     tile_write_count: torch.Tensor
+    compact_topk_ids: torch.Tensor
+    compact_topk_weights: torch.Tensor
     input_gs_src_ptr: int = 0
     down_input_scale_src_ptr: int = 0
 
@@ -272,6 +275,8 @@ class TPW4A16Workspace:
     block_expert_ids: torch.Tensor
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
+    compact_topk_ids: torch.Tensor
+    compact_topk_weights: torch.Tensor
     expert_counts: torch.Tensor | None = None
     full_rotation_output: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
@@ -1018,6 +1023,7 @@ class TPMoEFP4Binding:
     weight_expert_ids: torch.Tensor | None = None
     global_to_local_expert: torch.Tensor | None = None
     compact_topk_ids: torch.Tensor | None = None
+    compact_topk_weights: torch.Tensor | None = None
     micro_intermediate: torch.Tensor | None = None
     physical_tiles_capacity: int | None = None
     task_capacity: int | None = None
@@ -2407,6 +2413,8 @@ def _build_tp_moe_fp4_binding_from_views(
             packed_route_count=tensors["packed_route_count"],
             expert_offsets=tensors["expert_offsets"],
             expert_counts=tensors.get("expert_counts"),
+            compact_topk_ids=tensors["compact_topk_ids"],
+            compact_topk_weights=tensors["compact_topk_weights"],
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=(
                 tensors.get("rotation_a_gate")
@@ -2445,6 +2453,7 @@ def _build_tp_moe_fp4_binding_from_views(
             weight_expert_ids=tensors["weight_expert_ids"],
             global_to_local_expert=tensors["global_to_local_expert"],
             compact_topk_ids=tensors["compact_topk_ids"],
+            compact_topk_weights=tensors["compact_topk_weights"],
             micro_intermediate=tensors["micro_intermediate"],
         )
 
@@ -2492,6 +2501,8 @@ def _build_tp_moe_fp4_binding_from_views(
             task_slice_count=tensors["task_slice_count"],
             task_valid_rows=tensors["task_valid_rows"],
             tile_write_count=tensors["tile_write_count"],
+            compact_topk_ids=tensors["compact_topk_ids"],
+            compact_topk_weights=tensors["compact_topk_weights"],
         )
 
     raise ValueError(
@@ -2783,6 +2794,10 @@ def _plan_core_workspace(
             _TensorAllocSpec("block_expert_ids", (route_blocks_capacity,), torch.int32),
             _TensorAllocSpec("packed_route_count", (1,), torch.int32),
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
+            _TensorAllocSpec("compact_topk_ids", (routed_capacity,), torch.int32),
+            _TensorAllocSpec(
+                "compact_topk_weights", (routed_capacity,), torch.float32
+            ),
         ]
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
@@ -2935,6 +2950,7 @@ def _plan_core_workspace(
                 ),
                 _TensorAllocSpec("global_to_local_expert", (weight_E,), torch.int32),
                 _TensorAllocSpec("compact_topk_ids", (routed_rows,), torch.int32),
+                _TensorAllocSpec("compact_topk_weights", (routed_rows,), torch.float32),
                 _TensorAllocSpec(
                     "micro_intermediate",
                     (micro_intermediate_elements,),
@@ -3066,6 +3082,10 @@ def _plan_core_workspace(
             ),
             _TensorAllocSpec("input_gs", (weight_E,), torch.float32),
             _TensorAllocSpec("down_input_scale", (weight_E,), torch.float32),
+            _TensorAllocSpec("compact_topk_ids", (routed_rows,), torch.int32),
+            _TensorAllocSpec(
+                "compact_topk_weights", (routed_rows,), torch.float32
+            ),
             _TensorAllocSpec("pair_head", (1,), torch.int32, init="zeros"),
             _TensorAllocSpec("producers_done_count", (1,), torch.int32, init="zeros"),
             _TensorAllocSpec("all_work_published", (1,), torch.int32, init="zeros"),
@@ -3305,6 +3325,7 @@ def _materialize_workspace_from_core_arena(
             weight_expert_ids=tensors["weight_expert_ids"],
             global_to_local_expert=tensors["global_to_local_expert"],
             compact_topk_ids=tensors["compact_topk_ids"],
+            compact_topk_weights=tensors["compact_topk_weights"],
             micro_intermediate=tensors["micro_intermediate"],
         )
         _finalize_workspace_views(workspace)
@@ -5570,9 +5591,10 @@ def prepare_b12x_fp4_moe_weights(
 def prepare_w4a16_fc2_e8m0(
     w2_fp4: torch.Tensor,
     w2_e8m0_scale: torch.Tensor,
+    *,
+    route_capacity: int = 4096,
 ):
-    """Prepare a source-native MXFP4 down projection for FC2-only execution."""
-
+    """Prepare source-native MXFP4 FC2 weights and fixed routing scratch."""
     from b12x.moe._shared.kernels.w4a16.prepare import (
         prepare_w4a16_fc2_e8m0_weights,
     )
@@ -5581,6 +5603,7 @@ def prepare_w4a16_fc2_e8m0(
         w2_fp4,
         w2_e8m0_scale,
         params_dtype=torch.bfloat16,
+        route_capacity=route_capacity,
     )
 
 
@@ -5592,11 +5615,34 @@ def prewarm_w4a16_fc2_e8m0(experts, *, route_ids_dtype: torch.dtype) -> None:
 
     if not isinstance(experts, W4A16FC2Weights):
         raise TypeError("experts must come from prepare_w4a16_fc2_e8m0")
+    if route_ids_dtype not in (torch.int32, torch.int64):
+        raise TypeError("route_ids_dtype must be torch.int32 or torch.int64")
+    from b12x.moe._shared.kernels.w4a16.route_pack import (
+        sanitize_routing_ids,
+        zero_invalid_rows,
+    )
+
+    raw_ids = torch.zeros(1, dtype=route_ids_dtype, device=experts.w2.device)
+    raw_weights = torch.zeros(1, dtype=torch.float32, device=experts.w2.device)
+    sanitize_routing_ids(
+        raw_ids,
+        raw_weights,
+        experts.num_experts,
+        out_ids=experts.route_ids_scratch[:1],
+        out_weights=experts.route_weights_scratch[:1],
+        invalid_id=-1,
+    )
+    zero_invalid_rows(
+        torch.empty((1, 1), dtype=torch.bfloat16, device=experts.w2.device),
+        experts.route_ids_scratch[:1],
+    )
+    # The sanitizer always outputs int32 IDs regardless of the input dtype,
+    # so the downstream kernel must always be compiled for int32.
     w4a16_kernel._compile_w4a16_fc2_direct(
         hidden_size=experts.hidden_size,
         intermediate_size=experts.intermediate_size,
         num_experts=experts.num_experts,
-        topk_ids_dtype=route_ids_dtype,
+        topk_ids_dtype=torch.int32,
         device=experts.w2.device,
     )
 
@@ -5665,6 +5711,28 @@ def run_w4a16_fc2_e8m0(
             "output must be contiguous BF16 [routes, hidden_size] on the input device"
         )
 
+    # Validate in source width into retained, capture-safe scratch.
+    from b12x.moe._shared.kernels.w4a16.route_pack import sanitize_routing_ids
+
+    if m > experts.route_capacity:
+        raise ValueError(
+            f"FC2 route count {m} exceeds prepared capacity "
+            f"{experts.route_capacity}"
+        )
+    san_ids = experts.route_ids_scratch[:m]
+    san_weights = experts.route_weights_scratch[:m]
+    sanitize_routing_ids(
+        route_expert_ids,
+        route_weights,
+        int(experts.num_experts),
+        out_ids=san_ids,
+        out_weights=san_weights,
+        invalid_id=-1,
+    )
+    route_expert_ids = san_ids
+    route_weights = san_weights
+
+    output.zero_()
     torch.ops.b12x.w4a16_fc2_direct_launch(
         intermediate,
         experts.w2,
@@ -5681,6 +5749,9 @@ def run_w4a16_fc2_e8m0(
         experts.num_experts,
         int(current_cuda_stream()),
     )
+    from b12x.moe._shared.kernels.w4a16.route_pack import zero_invalid_rows
+
+    zero_invalid_rows(output, route_expert_ids)
     return output
 
 
@@ -6863,6 +6934,7 @@ def _plan_full_rotation_w4a16_launches(
                 capacity_tokens * core_plan.num_topk,
                 int(block_size_m),
                 int(core_plan.route_E),
+                int(core_plan.weight_E),
                 mapped,
             )
             if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
@@ -6909,6 +6981,7 @@ def _plan_full_rotation_w4a16_launches(
                 dummy_topk_ids,
                 block_size_m,
                 core_plan.route_E,
+                local_num_experts=int(core_plan.weight_E),
                 expert_map=expert_map,
                 packed_route_indices=packed_route_indices,
                 block_expert_ids=block_expert_ids,
@@ -7121,6 +7194,26 @@ def _prewarm_w4a16_planned_launches(
     with torch.cuda.device(workspace.device):
         is_capturing = torch.cuda.is_current_stream_capturing()
         _rot_scales_dummy(workspace.device)
+        if not is_capturing:
+            from b12x.moe._shared.kernels.w4a16.route_pack import (
+                sanitize_routing_ids,
+            )
+
+            for ids_dtype in (torch.int32, torch.int64):
+                raw_ids = torch.zeros(
+                    1, dtype=ids_dtype, device=workspace.device
+                )
+                raw_weights = torch.zeros(
+                    1, dtype=torch.float32, device=workspace.device
+                )
+                sanitize_routing_ids(
+                    raw_ids,
+                    raw_weights,
+                    workspace.route_E,
+                    out_ids=workspace.compact_topk_ids[:1],
+                    out_weights=workspace.compact_topk_weights[:1],
+                    invalid_id=-1,
+                )
         props = torch.cuda.get_device_properties(workspace.device)
         sms = int(props.multi_processor_count)
         max_shared_mem = int(
@@ -7174,7 +7267,7 @@ def _prewarm_w4a16_planned_launches(
                     top_k=workspace.num_topk,
                     activation=workspace.activation,
                     apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                    zero_fc2_output=False,
+                    zero_fc2_output=not full_rotation,
                     moe_block_size=block_size_m,
                     max_m_blocks=max_m_blocks,
                     element_dtype=element_dtype,
@@ -7270,6 +7363,7 @@ def _prewarm_w4a16_planned_launches(
                 int(token_count) * int(workspace.num_topk),
                 int(block_size_m),
                 int(workspace.route_E),
+                int(workspace.weight_E),
                 bool(False),
             )
             if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
@@ -7300,6 +7394,7 @@ def _prewarm_w4a16_planned_launches(
                 dummy_topk_ids,
                 block_size_m,
                 workspace.route_E,
+                local_num_experts=int(workspace.weight_E),
                 packed_route_indices=workspace.packed_route_indices,
                 block_expert_ids=workspace.block_expert_ids,
                 packed_route_count=workspace.packed_route_count,
@@ -7924,7 +8019,7 @@ def build_tp_moe_fp4_binding(
             weight_layout=weight_layout,
             scale_format=scale_format,
             collect_activation_amax=collect_activation_amax,
-            route_ids_dtype=topk_ids.dtype,
+            route_ids_dtype=torch.int32,
             use_route_expert_map=route_expert_map is not None,
             use_output_expert_map=output_expert_map is not None,
         )
@@ -7985,6 +8080,7 @@ def build_tp_moe_fp4_binding(
             weight_expert_ids=workspace.weight_expert_ids,
             global_to_local_expert=workspace.global_to_local_expert,
             compact_topk_ids=workspace.compact_topk_ids,
+            compact_topk_weights=workspace.compact_topk_weights,
             micro_intermediate=workspace.micro_intermediate,
         )
     if isinstance(workspace, TPDynamicWorkspace):
@@ -10562,11 +10658,22 @@ def _launch_micro(
         # The w4a8_mx tiny band reaches the compact family only via the
         # tiny_decode resolve gate; its weights are N256/K128-repacked,
         # which direct-micro cannot read.
-        if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
-            launch_ids = flat_ids
-        else:
-            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            launch_ids.copy_(flat_ids.to(torch.int32))
+        # Graph-safe device sanitization: validate every ID against the
+        # actual expert count in the source width before narrowing to
+        # int32, and zero routing weights for invalid IDs.
+        from b12x.moe._shared.kernels.w4a16.route_pack import (
+            sanitize_routing_ids,
+        )
+
+        launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        launch_weights = workspace.compact_topk_weights[: flat_weights.numel()]
+        sanitize_routing_ids(
+            flat_ids,
+            flat_weights,
+            weight_E,
+            out_ids=launch_ids,
+            out_weights=launch_weights,
+        )
         torch.ops.b12x.tp_moe_tiny_decode_launch(
             workspace.barrier_count,
             workspace.barrier_epoch,
@@ -10577,7 +10684,7 @@ def _launch_micro(
             weights.w2_scale_storage,
             a,
             launch_ids,
-            flat_weights,
+            launch_weights,
             scatter_output,
             weight_E,
             m,
@@ -10615,11 +10722,22 @@ def _launch_micro(
             f"(m={m}, k={k}, n={n}, num_topk={num_topk}); such shapes must route "
             "to the dynamic backend (see _resolve_workspace_layout)."
         )
-    if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
-        launch_ids = flat_ids
-    else:
-        launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-        launch_ids.copy_(flat_ids.to(torch.int32))
+    # Graph-safe device sanitization: validate every ID against the
+    # actual expert count in the source width before narrowing to
+    # int32, and zero routing weights for invalid IDs.
+    from b12x.moe._shared.kernels.w4a16.route_pack import (
+        sanitize_routing_ids,
+    )
+
+    launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+    launch_weights = workspace.compact_topk_weights[: flat_weights.numel()]
+    sanitize_routing_ids(
+        flat_ids,
+        flat_weights,
+        weight_E,
+        out_ids=launch_ids,
+        out_weights=launch_weights,
+    )
     torch.ops.b12x.tp_moe_compact_micro_launch(
         workspace.barrier_count,
         workspace.barrier_epoch,
@@ -10632,7 +10750,7 @@ def _launch_micro(
         weights.w2_alpha,
         a,
         launch_ids,
-        flat_weights,
+        launch_weights,
         input_gs,
         down_input_scale,
         scatter_output,
@@ -10734,6 +10852,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 binding, "global_to_local_expert"
             ),
             compact_topk_ids=_require_binding_field(binding, "compact_topk_ids"),
+            compact_topk_weights=_require_binding_field(binding, "compact_topk_weights"),
             micro_intermediate=_require_binding_field(binding, "micro_intermediate"),
         )
     elif binding.implementation == "dynamic":
@@ -10793,6 +10912,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             task_slice_count=_require_binding_field(binding, "task_slice_count"),
             task_valid_rows=_require_binding_field(binding, "task_valid_rows"),
             tile_write_count=_require_binding_field(binding, "tile_write_count"),
+            compact_topk_ids=_require_binding_field(binding, "compact_topk_ids"),
+            compact_topk_weights=_require_binding_field(
+                binding, "compact_topk_weights"
+            ),
         )
     elif binding.implementation != "w4a16":
         raise TypeError(
@@ -10931,6 +11054,29 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
+        from b12x.moe._shared.kernels.w4a16.route_pack import (
+            sanitize_routing_ids,
+        )
+
+        san_ids = _require_binding_field(binding, "compact_topk_ids")[:routed_rows]
+        san_weights = _require_binding_field(
+            binding, "compact_topk_weights"
+        )[:routed_rows]
+        route_domain = (
+            int(binding.route_expert_map.numel())
+            if binding.route_expert_map is not None
+            else int(weight_E)
+        )
+        sanitize_routing_ids(
+            topk_ids.view(-1),
+            topk_weights.view(-1),
+            route_domain,
+            out_ids=san_ids,
+            out_weights=san_weights,
+            invalid_id=-1,
+        )
+        topk_ids = san_ids.view_as(topk_ids)
+        topk_weights = san_weights.view_as(topk_weights)
         return run_w4a16_moe(
             a,
             prepared,
@@ -11117,6 +11263,21 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     if not scatter_output.is_contiguous():
         raise ValueError("output must be contiguous")
+
+    # Normalize every route in its source width into caller-owned scratch.
+    from b12x.moe._shared.kernels.w4a16.route_pack import sanitize_routing_ids
+    san_ids = s.compact_topk_ids[: flat_ids.numel()]
+    san_weights = s.compact_topk_weights[: flat_weights.numel()]
+    sanitize_routing_ids(
+        flat_ids,
+        flat_weights,
+        int(weight_E),
+        out_ids=san_ids,
+        out_weights=san_weights,
+        invalid_id=-1,
+    )
+    flat_ids = san_ids
+    flat_weights = san_weights
 
     if impl == "dynamic":
         deterministic_output = plan.deterministic_output

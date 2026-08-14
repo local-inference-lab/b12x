@@ -125,6 +125,9 @@ class W4A16FC2Weights:
     w2_scale: torch.Tensor
     w2_global_scale: torch.Tensor
     workspace: torch.Tensor
+    route_ids_scratch: torch.Tensor
+    route_weights_scratch: torch.Tensor
+    route_capacity: int
     hidden_size: int
     intermediate_size: int
     num_experts: int
@@ -1150,6 +1153,7 @@ def prepare_w4a16_fc2_e8m0_weights(
     w2_e8m0_scale: torch.Tensor,
     *,
     params_dtype: torch.dtype = torch.bfloat16,
+    route_capacity: int = 4096,
 ) -> W4A16FC2Weights:
     """Prepare a native MXFP4 down projection without an FC1 placeholder.
 
@@ -1163,6 +1167,8 @@ def prepare_w4a16_fc2_e8m0_weights(
     Returns:
         Prepared source-native weights and caller-owned launch workspace.
     """
+    if route_capacity <= 0:
+        raise ValueError("route_capacity must be positive")
 
     if params_dtype != torch.bfloat16:
         raise TypeError("W4A16 FC2-only weights require torch.bfloat16")
@@ -1199,6 +1205,13 @@ def prepare_w4a16_fc2_e8m0_weights(
         w2_scale=packed_scale,
         w2_global_scale=global_scale,
         workspace=_make_workspace(w2_fp4.device, max_blocks_per_sm=1),
+        route_ids_scratch=torch.empty(
+            route_capacity, dtype=torch.int32, device=w2_fp4.device
+        ),
+        route_weights_scratch=torch.empty(
+            route_capacity, dtype=torch.float32, device=w2_fp4.device
+        ),
+        route_capacity=int(route_capacity),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -3510,7 +3523,7 @@ def prepare_qsrt_atom_v2_moe_weights(
     for matrix_index in range(2):
         group_offset = matrix_index * matrix_words
         for group_words, (_ids, source, p43, _bundle) in zip(
-            group_matrix_words, groups
+            group_matrix_words, groups, strict=True
         ):
             _restore_group_matrix_into(
                 source,
@@ -3522,7 +3535,7 @@ def prepare_qsrt_atom_v2_moe_weights(
             group_offset += group_words
     group_offset = 0
     for group_words, (_ids, source, p43, _bundle) in zip(
-        group_matrix_words, groups
+        group_matrix_words, groups, strict=True
     ):
         _restore_group_matrix_into(
             source,

@@ -965,8 +965,18 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses.
             router_w = topk_weights[eid_addr]
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1190,8 +1200,18 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses.
             router_w = topk_weights[eid_addr]
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1445,8 +1465,18 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses.
             router_w = topk_weights[eid_addr]
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1673,8 +1703,18 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses.
             router_w = topk_weights[eid_addr]
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1919,8 +1959,18 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 and
+            # zero the routing weight so invalid IDs cannot form addresses.
             router_w = topk_weights[eid_addr]
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+                router_w = cutlass.Float32(0.0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1985,7 +2035,15 @@ class MoEMicroKernelBackend:
                         )
                 elif cutlass.const_expr(kk + 1 < cfg.num_topk):
                     next_eid_addr = t * Int32(cfg.num_topk) + Int32(kk + 1)
-                    next_eid = Int32(topk_ids[next_eid_addr])
+                    next_eid_raw = topk_ids[next_eid_addr]
+                    # Enforce canonical expert-ID validity: validate in
+                    # the source width before narrowing, clamp to expert 0
+                    # so prefetch addresses are in-bounds.
+                    if next_eid_raw < Int32(0):
+                        next_eid_raw = Int32(0)
+                    if next_eid_raw >= Int32(cfg.weight_E):
+                        next_eid_raw = Int32(0)
+                    next_eid = Int32(next_eid_raw)
                     next_ebase_w = Int64(next_eid) * Int64(cfg.k_dim * cfg.n_half)
                     next_ebase_sf = Int64(next_eid) * Int64(
                         cfg.w2_sf_rows * cfg.w2_sf_cols
@@ -2486,7 +2544,16 @@ class MoEMicroKernelBackend:
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
+                gs_fc1_eid_0_raw = topk_ids[eid_addr_0]
+                # Enforce canonical expert-ID validity: validate in the
+                # source width before narrowing, clamp to expert 0
+                # so input_gs indexing is in-bounds.
+                if gs_fc1_eid_0_raw < Int32(0):
+                    gs_fc1_eid_0_raw = Int32(0)
+                if gs_fc1_eid_0_raw >= Int32(cfg.weight_E):
+                    gs_fc1_eid_0_raw = Int32(0)
+                gs_fc1_eid_0 = Int32(gs_fc1_eid_0_raw)
+                gs_fc1_0 = input_gs[gs_fc1_eid_0]
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2568,7 +2635,15 @@ class MoEMicroKernelBackend:
             i_chunk_off = chunk_idx * Int32(cfg.i_chunk)
 
             eid_addr = t * Int32(cfg.num_topk) + k_idx
-            eid = Int32(topk_ids[eid_addr])
+            eid_raw = topk_ids[eid_addr]
+            # Enforce canonical expert-ID validity: validate in the source
+            # width before narrowing to Int32, clamp to expert 0 so
+            # alpha/scale/weight indexing is in-bounds.
+            if eid_raw < Int32(0):
+                eid_raw = Int32(0)
+            if eid_raw >= Int32(cfg.weight_E):
+                eid_raw = Int32(0)
+            eid = Int32(eid_raw)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -5266,7 +5341,16 @@ class MoEMicroKernelBackend:
                         next_eid_addr = t_next * Int32(cfg.num_topk) + (
                             next_route - t_next * Int32(cfg.num_topk)
                         )
-                        gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
+                        gs_fc1_next_eid_raw = topk_ids[next_eid_addr]
+                        # Enforce canonical expert-ID validity: validate in
+                        # the source width before narrowing, clamp to
+                        # expert 0 so input_gs indexing is in-bounds.
+                        if gs_fc1_next_eid_raw < Int32(0):
+                            gs_fc1_next_eid_raw = Int32(0)
+                        if gs_fc1_next_eid_raw >= Int32(cfg.weight_E):
+                            gs_fc1_next_eid_raw = Int32(0)
+                        gs_fc1_next_eid = Int32(gs_fc1_next_eid_raw)
+                        gs_fc1_next = input_gs[gs_fc1_next_eid]
                         next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                         in_blk = tidx
                         while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
@@ -5555,10 +5639,20 @@ class MoEMicroKernelBackend:
             kk = Int32(0)
             while kk < Int32(cfg.num_topk):
                 eid_addr = t * Int32(cfg.num_topk) + kk
-                eid = Int32(topk_ids[eid_addr])
-                scale_lane = Float32(w2_alphas[eid]) * Float32(
-                    topk_weights[eid_addr]
-                )
+                eid_raw = topk_ids[eid_addr]
+                # Enforce canonical expert-ID validity: validate in the
+                # source width before narrowing, clamp to expert 0
+                # and zero the routing weight so invalid IDs cannot form
+                # addresses or contribute to the output.
+                router_w = Float32(topk_weights[eid_addr])
+                if eid_raw < Int32(0):
+                    eid_raw = Int32(0)
+                    router_w = Float32(0.0)
+                if eid_raw >= Int32(cfg.weight_E):
+                    eid_raw = Int32(0)
+                    router_w = Float32(0.0)
+                eid = Int32(eid_raw)
+                scale_lane = Float32(w2_alphas[eid]) * router_w
                 base_e = Int64(eid) * Int64(tr_eu2) + Int64(tile) * Int64(tr_tu)
                 x_base = t * Int32(cfg.inter_u32) + kk * Int32(cfg.n // 2)
                 p_lo = Float32(0.0)

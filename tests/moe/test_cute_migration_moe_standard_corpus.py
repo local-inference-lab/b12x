@@ -534,3 +534,257 @@ def test_standard_moe_tiny_decode_live_graph_oracle(
         min_cos=0.998,
         max_normalized_rmse=0.05,
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for issue #154: out-of-range expert IDs must be clamped
+# in-kernel so they cannot cause OOB GPU writes.  Each test forces a
+# specific kernel route (micro.py via nvfp4, tiny_decode via w4a8_mx,
+# W4A16 FC2-only capacity), uses actual CUDA graph capture/replay, and
+# asserts finite output + all-invalid zero.
+# ---------------------------------------------------------------------------
+
+
+def _make_invalid_inputs(
+    device: torch.device,
+    *,
+    m: int,
+    seed: int,
+    invalid_ids: list[int],
+    dtype: torch.dtype = torch.int32,
+) -> _Inputs:
+    """Like _make_inputs but injects invalid expert IDs (no validity guard)."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    a = (
+        torch.randn(m, _K, dtype=torch.float32, device=device, generator=generator)
+        * 0.35
+    ).to(torch.bfloat16)
+    topk_ids = torch.tensor(
+        [invalid_ids[:_TOPK] for _ in range(m)],
+        dtype=dtype,
+        device=device,
+    ).contiguous()
+    topk_weights = torch.rand(
+        m, _TOPK, dtype=torch.float32, device=device, generator=generator
+    ).add_(0.25)
+    topk_weights.div_(topk_weights.sum(dim=1, keepdim=True))
+    return _Inputs(a=a, topk_ids=topk_ids, topk_weights=topk_weights)
+
+
+def _run_invalid_id_safety_check(
+    case: _BoundCase,
+    initial: _Inputs,
+    changed: _Inputs,
+    *,
+    context: str,
+) -> None:
+    """Run eager + CUDA-graph capture + mutate + replay; assert finite output."""
+    from b12x.moe.fused_moe._impl import b12x_moe_fp4
+
+    binding = case.binding
+    output = binding.output
+    assert output is not None
+
+    # Eager warmup.
+    b12x_moe_fp4(binding=binding)
+    torch.cuda.synchronize()
+    assert bool(output.float().isfinite().all().item()), (context, "eager non-finite")
+
+    # Graph capture + replay.
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+        b12x_moe_fp4(binding=binding)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+    assert bool(output.float().isfinite().all().item()), (
+        context,
+        "capture non-finite",
+    )
+
+    # Replay with mutated invalid inputs.
+    initial.a.copy_(changed.a)
+    initial.topk_ids.copy_(changed.topk_ids)
+    initial.topk_weights.copy_(changed.topk_weights)
+    output.fill_(37.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(output.float().isfinite().all().item()), (
+        context,
+        "replay non-finite",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_micro_nvfp4_negative_expert_id_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real micro.py route (nvfp4): clamp -1 expert ID without OOB writes."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=401)
+    initial = _make_invalid_inputs(device, m=2, seed=402, invalid_ids=[-1, 0])
+    changed = _make_invalid_inputs(device, m=2, seed=403, invalid_ids=[0, -1])
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    assert case.binding.implementation == "micro"
+    _run_invalid_id_safety_check(case, initial, changed, context="micro-nvfp4-neg-id")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_micro_nvfp4_equal_num_experts_id_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real micro.py route (nvfp4): clamp ID == num_experts without OOB."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=411)
+    initial = _make_invalid_inputs(device, m=2, seed=412, invalid_ids=[_E, 0])
+    changed = _make_invalid_inputs(device, m=2, seed=413, invalid_ids=[0, _E])
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    assert case.binding.implementation == "micro"
+    _run_invalid_id_safety_check(case, initial, changed, context="micro-nvfp4-eq-E-id")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_micro_nvfp4_large_expert_id_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real micro.py route (nvfp4): clamp very large ID without OOB."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=421)
+    initial = _make_invalid_inputs(device, m=2, seed=422, invalid_ids=[99999, 0])
+    changed = _make_invalid_inputs(device, m=2, seed=423, invalid_ids=[0, 99999])
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    assert case.binding.implementation == "micro"
+    _run_invalid_id_safety_check(case, initial, changed, context="micro-nvfp4-large-id")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_micro_nvfp4_int64_wraparound_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real micro.py route: Int64 wraparound IDs must be rejected."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=431)
+    wrap_val = 2**32 + 1
+    initial = _make_invalid_inputs(
+        device, m=2, seed=432, invalid_ids=[wrap_val, 0], dtype=torch.int64
+    )
+    changed = _make_invalid_inputs(
+        device, m=2, seed=433, invalid_ids=[0, wrap_val], dtype=torch.int64
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    assert case.binding.implementation == "micro"
+    _run_invalid_id_safety_check(case, initial, changed, context="micro-nvfp4-int64-wrap")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tiny_decode_negative_expert_id_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tiny-decode kernel must clamp -1 expert ID without OOB writes."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_mxfp4_weights(device, seed=441)
+    initial = _make_invalid_inputs(device, m=2, seed=442, invalid_ids=[-1, 0])
+    changed = _make_invalid_inputs(device, m=2, seed=443, invalid_ids=[0, -1])
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+    )
+    assert 1 <= int(initial.a.shape[0]) <= 4
+    _run_invalid_id_safety_check(case, initial, changed, context="tiny-decode-neg-id")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tiny_decode_large_expert_id_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tiny-decode kernel must clamp very large ID without OOB writes."""
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_mxfp4_weights(device, seed=451)
+    initial = _make_invalid_inputs(device, m=2, seed=452, invalid_ids=[99999, 0])
+    changed = _make_invalid_inputs(device, m=2, seed=453, invalid_ids=[0, 99999])
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+    )
+    assert 1 <= int(initial.a.shape[0]) <= 4
+    _run_invalid_id_safety_check(case, initial, changed, context="tiny-decode-large-id")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_w4a16_fc2_capacity_mismatch_invalid_id_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W4A16 FC2-only: ID in [num_experts, capacity) must be rejected.
+
+    The compiled capacity bucket may exceed the actual expert count.
+    An ID == num_experts must be clamped, not indexed past the allocation.
+    """
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    from b12x.moe.fused_moe._impl import (
+        prepare_w4a16_fc2_e8m0,
+        run_w4a16_fc2_e8m0,
+        prewarm_w4a16_fc2_e8m0,
+    )
+
+    E_actual = 2
+    K = _K
+    n = _N
+    # API: prepare_w4a16_fc2_e8m0(w2_fp4, w2_e8m0_scale)
+    # w2_fp4: [E, H, I/2] uint8, w2_e8m0_scale: [E, H, I/32] uint8
+    w2_fp4 = torch.randint(
+        0, 256, (E_actual, K, n // 2), dtype=torch.uint8, device=device
+    )
+    # E8M0 scale bytes: byte 122 = 2^-5
+    w2_e8m0_scale = torch.full(
+        (E_actual, K, n // 32), 122, dtype=torch.uint8, device=device
+    )
+
+    experts = prepare_w4a16_fc2_e8m0(w2_fp4, w2_e8m0_scale)
+    prewarm_w4a16_fc2_e8m0(experts, route_ids_dtype=torch.int32)
+
+    m = 4
+    intermediate = torch.randn(m, n, dtype=torch.bfloat16, device=device)
+    output = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
+    # One route has ID == E_actual (in the capacity bucket but past the allocation).
+    route_ids = torch.tensor([0, 1, E_actual, -1], dtype=torch.int32, device=device)
+    route_weights = torch.tensor(
+        [0.5, 0.3, 0.2, 0.1], dtype=torch.float32, device=device
+    )
+    run_w4a16_fc2_e8m0(
+        intermediate, experts, route_ids, route_weights, output=output
+    )
+    assert torch.isfinite(output).all(), (
+        "FC2 capacity mismatch produced non-finite output"
+    )
+
+    # All-invalid IDs must produce zero output.
+    route_ids_all_bad = torch.full((m,), -1, dtype=torch.int32, device=device)
+    route_weights_all = torch.ones(m, dtype=torch.float32, device=device)
+    output_all_bad = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
+    run_w4a16_fc2_e8m0(
+        intermediate, experts, route_ids_all_bad, route_weights_all, output=output_all_bad
+    )
+    assert output_all_bad.abs().sum().item() == 0.0, (
+        "all-invalid FC2 IDs must produce zero"
+    )
