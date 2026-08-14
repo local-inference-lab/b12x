@@ -96,9 +96,19 @@ def _activation_scale_mma(
     )
 
 
-def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
-    if int(out_features) < 64:
+def _dense_gemm_kwargs_for_shape(
+    tokens: int,
+    out_features: int,
+) -> dict[str, object]:
+    out_features = int(out_features)
+    if out_features < 64:
         return {"mma_tiler_mn": (64, 32), "swap_ab": True}
+    # The unswapped TMA epilogue requires every outer C stride to be aligned
+    # to 16 bytes.  BF16/FP16 rows with N % 8 != 0 violate that requirement
+    # once the output contains more than one row.  The swapped kernel stores C
+    # directly and therefore supports the logical row stride without padding.
+    if int(tokens) > 1 and out_features % 8 != 0:
+        return {"mma_tiler_mn": (64, 64), "swap_ab": True}
     return {}
 
 
@@ -195,7 +205,7 @@ def _tensor_fp8_linear_fused_op(
         expected_m=expected_m,
         stream=stream_int,
         plain_fp8=True,
-        **_dense_gemm_kwargs_for_n(out_features),
+        **_dense_gemm_kwargs_for_shape(tokens, out_features),
     )[:, :, 0]
 
 

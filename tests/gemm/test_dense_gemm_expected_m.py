@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import cutlass
 import pytest
+import torch
 
 import b12x._lib.dense_gemm as dense_module
 from b12x._lib.dense_gemm import (
@@ -21,11 +22,37 @@ from b12x._lib.dense_gemm import (
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
+    dense_gemm,
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
 SPARK_SM = 20  # DGX Spark GB10
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
+
+
+def test_unswapped_tma_epilogue_rejects_unaligned_output_row_stride():
+    lhs = (
+        torch.empty((2, 128, 1), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+    rhs = (
+        torch.empty((132, 128, 1), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+
+    with pytest.raises(ValueError, match="16-byte-aligned C row stride"):
+        dense_gemm(
+            lhs,
+            rhs,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            sm_count=SM,
+            mma_tiler_mn=(64, 64),
+            load_path="tma",
+            swap_ab=False,
+        )
 
 
 def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=SM):

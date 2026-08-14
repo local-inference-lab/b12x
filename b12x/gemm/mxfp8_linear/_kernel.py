@@ -86,9 +86,19 @@ def _pad_source_2d_k(source_2d: torch.Tensor, padded_k: int) -> torch.Tensor:
     return padded.contiguous()
 
 
-def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
-    if int(out_features) < 64:
+def _dense_gemm_kwargs_for_shape(
+    tokens: int,
+    out_features: int,
+) -> dict[str, object]:
+    out_features = int(out_features)
+    if out_features < 64:
         return {"mma_tiler_mn": (64, 32), "swap_ab": True}
+    # The unswapped TMA epilogue requires every outer C stride to be aligned
+    # to 16 bytes.  BF16/FP16 rows with N % 8 != 0 violate that requirement
+    # once the output contains more than one row.  The swapped kernel stores C
+    # directly and therefore supports the logical row stride without padding.
+    if int(tokens) > 1 and out_features % 8 != 0:
+        return {"mma_tiler_mn": (64, 64), "swap_ab": True}
     return {}
 
 
@@ -197,7 +207,7 @@ def _mxfp8_linear_fused_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
-        **_dense_gemm_kwargs_for_n(out_features),
+        **_dense_gemm_kwargs_for_shape(tokens, out_features),
     )[:, :, 0]
 
 
