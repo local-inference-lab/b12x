@@ -7,9 +7,9 @@ import json
 import math
 import os
 import re
-import shutil
+import secrets
+import stat
 import sys
-import tempfile
 import time
 import traceback
 from collections import OrderedDict
@@ -673,6 +673,402 @@ def _cute_compile_cache_dir() -> Path:
     if xdg_cache_home:
         return Path(xdg_cache_home) / "b12x" / "compile"
     return Path.home() / ".cache" / "b12x" / "compile"
+
+
+def _open_secure_dir_fd(path: Path) -> int:
+    """Walk from ``/`` to *path*, opening each component with
+    ``O_DIRECTORY | O_NOFOLLOW`` and fstat-validating it.
+
+    Ancestors must be euid/root-owned and not group/world-writable.
+    The final directory must be euid-owned with no group/other permission
+    bits (mode ``0700``).  Missing components are created with ``0700``.
+
+    Returns a dirfd for the final directory.  Raises ``RuntimeError`` or
+    ``OSError`` on any violation.
+    """
+    abs_path = Path(os.path.abspath(str(path)))
+    parts = [p for p in abs_path.parts if p not in ("", "/")]
+    if not parts:
+        raise RuntimeError("b12x cache root must not be /")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i, part in enumerate(parts):
+            is_final = i == len(parts) - 1
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                created = False
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                if created:
+                    os.fsync(fd)
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            os.close(fd)
+            fd = next_fd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise RuntimeError(
+                    f"b12x cache path component {part!r} is not a directory"
+                )
+            if is_final:
+                _fstat_assert_private_dir(fd, str(abs_path))
+            else:
+                _fstat_assert_ancestor_dir(st, str(abs_path), part)
+        return fd
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+
+
+def _open_secure_shard_fd(root_fd: int, shard_name: str) -> int:
+    """Open or create the shard directory relative to *root_fd*.
+
+    The shard must be euid-owned with no group/other permission bits.
+    """
+    try:
+        fd = os.open(
+            shard_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
+        created = False
+        try:
+            os.mkdir(shard_name, 0o700, dir_fd=root_fd)
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            os.fsync(root_fd)
+        fd = os.open(
+            shard_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+    try:
+        _fstat_assert_private_dir(fd, shard_name)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fstat_assert_private_dir(fd: int, label: str) -> None:
+    """Assert fd is an euid-owned directory with no group/other bits."""
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"b12x cache dir {label} is not a directory")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"b12x cache dir {label} owned by uid {st.st_uid}, "
+            f"not euid {os.geteuid()}"
+        )
+    if st.st_mode & 0o077:
+        raise RuntimeError(
+            f"b12x cache dir {label} has group/other permission bits; "
+            f"refusing non-private cache"
+        )
+
+
+def _fstat_assert_ancestor_dir(st: os.stat_result, label: str, part: str) -> None:
+    """Assert an ancestor directory is not writable by untrusted users."""
+    if st.st_uid != os.geteuid() and st.st_uid != 0:
+        raise RuntimeError(
+            f"b12x cache ancestor {part!r} owned by uid {st.st_uid}, "
+            f"not euid {os.geteuid()} or root"
+        )
+    root_sticky = st.st_uid == 0 and bool(st.st_mode & stat.S_ISVTX)
+    if st.st_mode & stat.S_IWOTH and not root_sticky:
+        raise RuntimeError(
+            f"b12x cache ancestor {part!r} is world-writable; refusing untrusted cache"
+        )
+    if st.st_mode & stat.S_IWGRP and not root_sticky:
+        raise RuntimeError(
+            f"b12x cache ancestor {part!r} is group-writable; refusing untrusted cache"
+        )
+
+
+def _fstat_assert_regular_0600(fd: int, label: str) -> None:
+    """Assert fd is an euid-owned regular file with mode 0600 and nlink==1."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"b12x cache file {label} is not a regular file")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"b12x cache file {label} owned by uid {st.st_uid}, "
+            f"not euid {os.geteuid()}"
+        )
+    if st.st_mode & 0o077:
+        raise RuntimeError(
+            f"b12x cache file {label} has group/other permission bits; "
+            f"refusing non-private artifact"
+        )
+    if st.st_nlink != 1:
+        raise RuntimeError(
+            f"b12x cache file {label} has {st.st_nlink} hard links; "
+            f"refusing non-exclusive artifact"
+        )
+
+
+def _read_fd_complete(fd: int) -> bytes:
+    """Read *fd* to EOF in a loop, returning the complete contents."""
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _openat_secure_regular(
+    dir_fd: int, name: str, flags: int = os.O_RDONLY
+) -> int:
+    """Open a leaf file relative to *dir_fd* with ``O_NOFOLLOW | O_NONBLOCK``
+    and fstat-validate as an euid-owned regular file with mode 0600.
+
+    ``O_NONBLOCK`` prevents blocking on FIFOs or special files; regular
+    files are unaffected.
+    """
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    try:
+        _fstat_assert_regular_0600(fd, name)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _create_secure_temp(dir_fd: int, prefix: str) -> tuple[int, str]:
+    """Create an unpredictable temp file relative to *dir_fd*.
+
+    Uses ``O_CREAT | O_EXCL | O_NOFOLLOW`` with mode ``0600`` and a
+    ``secrets``-generated name to prevent symlink preemption and name
+    guessing.
+    """
+    for _ in range(16):
+        name = f".{prefix}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            return fd, name
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not create unique temp file for {prefix}")
+
+
+def _write_fd_complete(fd: int, data: bytes) -> None:
+    """Write all of *data* to *fd* in a loop, then fsync."""
+    written = 0
+    while written < len(data):
+        n = os.write(fd, data[written:])
+        if n == 0:
+            raise OSError("write returned 0 bytes")
+        written += n
+    os.fsync(fd)
+
+
+def _verify_manifest_identity(
+    manifest: object,
+    cache_key: str,
+    cache_payload: tuple[object, ...],
+    func: Any,
+    object_len: int,
+) -> str:
+    """Validate *manifest* against the expected compilation identity.
+
+    Requires exact schema v3, the exact expected field set (no extra
+    or missing keys), recomputes the cache key, and verifies every
+    payload-derived semantic field including cache_payload,
+    launch_metadata, and artifact_evidence_sha256.
+
+    Returns the ``object_sha256`` digest string on success, raises
+    ``ValueError`` on any mismatch.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest is not a JSON object")
+
+    schema = manifest["schema"]
+    if schema != "b12x._lib.compile_manifest.v3":
+        raise ValueError(f"manifest schema {schema!r} != v3")
+
+    # Recompute cache_key from the payload representation.
+    recomputed_key = hashlib.sha256(
+        repr(cache_payload).encode("utf-8")
+    ).hexdigest()
+    if recomputed_key != cache_key:
+        raise ValueError(
+            f"recomputed cache_key {recomputed_key!r} != requested {cache_key!r}"
+        )
+
+    mk = manifest["cache_key"]
+    if mk != cache_key:
+        raise ValueError(
+            f"manifest cache_key {mk!r} != requested {cache_key!r}"
+        )
+
+    sha = manifest["object_sha256"]
+    if not isinstance(sha, str) or len(sha) != 64:
+        raise ValueError("manifest object_sha256 is not a 64-char hex string")
+
+    ob = manifest["object_bytes"]
+    if not isinstance(ob, int) or ob != object_len:
+        raise ValueError(
+            f"manifest object_bytes {ob!r} != actual {object_len}"
+        )
+    # Build the expected manifest from the payload.  Use the actual
+    # object_bytes so object_sha256 matches.  launch_metadata and
+    # artifact_evidence_sha256 depend on the compiled object (which
+    # we don't have at load time), so we verify those separately.
+    expected = _build_compile_manifest(
+        cache_key, cache_payload, func, b"\x00" * object_len, compiled=None
+    )
+
+    # Verify exact field set: no extra or missing keys.
+    expected_keys = set(expected.keys())
+    actual_keys = set(manifest.keys())
+    if actual_keys != expected_keys:
+        missing = expected_keys - actual_keys
+        extra = actual_keys - expected_keys
+        parts = []
+        if missing:
+            parts.append(f"missing: {sorted(missing)}")
+        if extra:
+            parts.append(f"extra: {sorted(extra)}")
+        raise ValueError(f"manifest key set mismatch ({'; '.join(parts)})")
+
+    # Verify all payload-derived fields.  Skip launch_metadata and
+    # artifact_evidence_sha256 which are runtime-dependent (compiled-
+    # specific).  object_sha256 is already verified above.
+    skip_fields = {"launch_metadata", "artifact_evidence_sha256", "object_sha256"}
+    for field in sorted(expected_keys - skip_fields):
+        _assert_manifest_field(manifest, expected, field)
+
+    # Structurally validate launch_metadata (v3 canonical form).
+    _validate_launch_metadata(manifest["launch_metadata"])
+
+    # Recompute and verify artifact_evidence_sha256 from the manifest's
+    # own object_sha256 and the now-validated launch_metadata.
+    artifact_evidence = {
+        "cache_key": cache_key,
+        "object_sha256": sha,
+        "launch_metadata": manifest["launch_metadata"],
+    }
+    artifact_evidence_json = json.dumps(
+        artifact_evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    expected_evidence_sha = hashlib.sha256(
+        artifact_evidence_json.encode("utf-8")
+    ).hexdigest()
+    if manifest["artifact_evidence_sha256"] != expected_evidence_sha:
+        raise ValueError(
+            f"manifest artifact_evidence_sha256 mismatch: "
+            f"{manifest['artifact_evidence_sha256']!r} != {expected_evidence_sha!r}"
+        )
+
+    return sha
+
+
+def _assert_manifest_field(
+    manifest: dict, expected: dict, field: str
+) -> None:
+    """Assert that manifest[field] matches expected[field] (required key)."""
+    actual = manifest[field]
+    wanted = expected[field]
+    if actual != wanted:
+        raise ValueError(
+            f"manifest {field} mismatch: {actual!r} != {wanted!r}"
+        )
+
+
+def _validate_launch_metadata(lm: object) -> None:
+    """Validate launch_metadata matches the v3 canonical structure.
+
+    Required keys: status, source, launch_dynamic_smem_bytes.
+    Optional key: reason (str).
+
+    status must be "exact" or "unknown".
+    source must be a non-empty string.
+    When status == "exact", launch_dynamic_smem_bytes must be a
+    non-empty dict of non-empty kernel-name strings to non-empty lists of
+    nonnegative integer SMEM byte counts.
+    When status == "unknown", launch_dynamic_smem_bytes must be empty
+    and reason must be present.
+    """
+    if not isinstance(lm, dict):
+        raise ValueError("launch_metadata is not a dict")
+    required = {"status", "source", "launch_dynamic_smem_bytes"}
+    actual_keys = set(lm.keys())
+    if not required.issubset(actual_keys):
+        raise ValueError(
+            f"launch_metadata missing keys: {sorted(required - actual_keys)}"
+        )
+    extra = actual_keys - required - {"reason"}
+    if extra:
+        raise ValueError(
+            f"launch_metadata has extra keys: {sorted(extra)}"
+        )
+    status = lm["status"]
+    if status not in ("exact", "unknown"):
+        raise ValueError(f"launch_metadata status {status!r} not valid")
+    source = lm["source"]
+    if not isinstance(source, str) or not source:
+        raise ValueError("launch_metadata source must be a non-empty string")
+    smem = lm["launch_dynamic_smem_bytes"]
+    if not isinstance(smem, dict):
+        raise ValueError("launch_dynamic_smem_bytes must be a dict")
+    if status == "exact":
+        if "reason" in lm:
+            raise ValueError(
+                "launch_metadata reason is only valid for unknown status"
+            )
+        if not smem:
+            raise ValueError(
+                "launch_dynamic_smem_bytes must be non-empty for exact status"
+            )
+        for kernel, values in smem.items():
+            if not isinstance(kernel, str) or not kernel:
+                raise ValueError(
+                    "launch_dynamic_smem_bytes keys must be non-empty strings"
+                )
+            if not isinstance(values, list) or not values:
+                raise ValueError(
+                    "launch_dynamic_smem_bytes values must be non-empty lists"
+                )
+            if any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in values
+            ):
+                raise ValueError(
+                    "launch_dynamic_smem_bytes values must contain nonnegative ints"
+                )
+    else:
+        if smem:
+            raise ValueError("launch_dynamic_smem_bytes must be empty for unknown status")
+        if "reason" not in lm or not isinstance(lm["reason"], str) or not lm["reason"]:
+            raise ValueError("launch_metadata reason required for unknown status")
 
 
 def _cute_compile_log_enabled() -> bool:
@@ -2430,50 +2826,61 @@ def _write_compile_manifest(
     func: Any,
     object_bytes: bytes,
     compiled: Any = None,
+    *,
+    shard_fd: int | None = None,
 ) -> None:
-    manifest_path = _cache_manifest_path(cache_key)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = _build_compile_manifest(
         cache_key, cache_payload, func, object_bytes, compiled=compiled
     )
-    tmp_name: str | None = None
+    manifest_json = (
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    own_fds = shard_fd is None
+    root_fd: int | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=manifest_path.parent,
-            prefix=f".{manifest_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp_file:
-            tmp_name = tmp_file.name
-            json.dump(
-                manifest,
-                tmp_file,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
+        if own_fds:
+            root_fd = _open_secure_dir_fd(_cute_compile_cache_dir())
+            shard_fd = _open_secure_shard_fd(root_fd, cache_key[:2])
+        manifest_name = f"{cache_key}.json"
+        fd, tmp_name = _create_secure_temp(shard_fd, manifest_name)
+        try:
+            _write_fd_complete(fd, manifest_json)
+            pre_st = os.fstat(fd)
+            os.replace(
+                tmp_name, manifest_name,
+                src_dir_fd=shard_fd, dst_dir_fd=shard_fd,
             )
-            tmp_file.write("\n")
-        os.replace(tmp_name, manifest_path)
-        tmp_name = None
-    finally:
-        if tmp_name is not None:
+            os.fsync(shard_fd)
+            post_st = os.fstat(fd)
+            if (pre_st.st_ino, pre_st.st_dev) != (
+                post_st.st_ino, post_st.st_dev,
+            ):
+                raise RuntimeError("manifest inode changed during replace")
+            if post_st.st_nlink != 1:
+                raise RuntimeError(
+                    f"manifest has {post_st.st_nlink} links after publish"
+                )
+            os.close(fd)
+        except BaseException:
             with suppress(OSError):
-                os.unlink(tmp_name)
-
-
-def _ensure_cute_compile_manifest(
-    cache_key: str,
-    cache_payload: tuple[object, ...],
-    func: Any,
-) -> None:
-    manifest_path = _cache_manifest_path(cache_key)
-    if manifest_path.exists():
-        return
-    object_bytes = _cache_object_path(cache_key).read_bytes()
-    _write_compile_manifest(cache_key, cache_payload, func, object_bytes)
+                os.close(fd)
+            with suppress(OSError):
+                os.unlink(tmp_name, dir_fd=shard_fd)
+            raise
+    finally:
+        if own_fds:
+            with suppress(OSError):
+                os.close(shard_fd)
+            with suppress(OSError):
+                if root_fd is not None:
+                    os.close(root_fd)
 
 
 @contextmanager
@@ -2481,39 +2888,182 @@ def _disk_cache_key_lock(cache_key: str):
     try:
         import fcntl
     except ImportError:
-        yield
+        yield None
         return
 
-    lock_path = _cache_lock_path(cache_key)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _load_cute_compile_from_disk(cache_key: str):
-    from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
-
-    object_path = _cache_object_path(cache_key)
-    if not object_path.exists():
-        return None
+    lock_name = f"{cache_key}.lock"
+    root_fd: int | None = None
+    shard_fd: int | None = None
     try:
-        # CUTLASS may finalize or patch the ELF while loading it.  The cache
-        # object is content-addressed and its digest is recorded in the compile
-        # manifest, so never expose that canonical object to the loader.
-        with tempfile.TemporaryDirectory(
-            prefix="b12x-cute-cache-load-"
-        ) as raw_stage:
-            staged_object = Path(raw_stage) / object_path.name
-            shutil.copy2(object_path, staged_object)
-            module = ExternalBinaryModule(str(staged_object))
-            return getattr(module, _cache_prefix(cache_key))
+        root_fd = _open_secure_dir_fd(_cute_compile_cache_dir())
+        shard_fd = _open_secure_shard_fd(root_fd, cache_key[:2])
+        # Try exclusive creation first; if the lock already exists, open
+        # with O_NOFOLLOW and fstat-validate as a secure regular file.
+        try:
+            fd = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=shard_fd,
+            )
+        except FileExistsError:
+            fd = _openat_secure_regular(
+                shard_fd, lock_name, os.O_RDWR
+            )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield shard_fd
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    finally:
+        with suppress(OSError):
+            if shard_fd is not None:
+                os.close(shard_fd)
+        with suppress(OSError):
+            if root_fd is not None:
+                os.close(root_fd)
+
+
+def _load_cute_compile_from_disk(
+    cache_key: str,
+    cache_payload: tuple[object, ...] | None = None,
+    func: Any = None,
+    *,
+    shard_fd: int | None = None,
+):
+    """Load a compiled kernel from the disk cache with full integrity checks.
+
+    All path resolution is descriptor-relative.  The object is read once;
+    its SHA-256 is verified; the manifest's full semantic identity is
+    verified against *cache_payload*.  The verified buffer is staged
+    through a single O_RDWR fd that is unlinked descriptor-relative
+    (so the inode has no replaceable name), re-verified by digest on
+    that same fd, and loaded via ``/dev/fd/N`` while the fd stays open.
+
+    ``cache_payload`` and ``func`` are **required** — there is no
+    minimal-manifest fallback.
+
+    Trust contract: this verifies integrity (digest, semantic identity,
+    ownership, permissions, link count) but not provenance.  A same-euid
+    writer can produce a self-consistent malicious pair; defend against
+    that with a trusted producer/signature or process isolation.
+    """
+    if cache_payload is None or func is None:
+        return None
+    object_name = f"{cache_key}.o"
+    manifest_name = f"{cache_key}.json"
+    own_fds = shard_fd is None
+    root_fd: int | None = None
+    staging_fd: int | None = None
+    staging_dir_name: str | None = None
+    stage_fd: int | None = None
+    try:
+        if own_fds:
+            root_fd = _open_secure_dir_fd(_cute_compile_cache_dir())
+            shard_fd = _open_secure_shard_fd(root_fd, cache_key[:2])
+
+        # Open manifest descriptor-relative; fstat-validates regular 0600 nlink==1.
+        manifest_fd = _openat_secure_regular(shard_fd, manifest_name)
+        try:
+            manifest_bytes = _read_fd_complete(manifest_fd)
+        finally:
+            os.close(manifest_fd)
+
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+
+        # Open object descriptor-relative; fstat-validates regular 0600 nlink==1.
+        object_fd = _openat_secure_regular(shard_fd, object_name)
+        try:
+            object_bytes = _read_fd_complete(object_fd)
+        finally:
+            os.close(object_fd)
+
+        # Full semantic identity verification — no fallback.
+        expected_sha = _verify_manifest_identity(
+            manifest, cache_key, cache_payload, func, len(object_bytes)
+        )
+
+        # Verify the exact digest of the one buffer we will stage.
+        actual_sha = hashlib.sha256(object_bytes).hexdigest()
+        if actual_sha != expected_sha:
+            return None
+
+        # Stage the verified buffer under the validated cache shard.
+        staging_dir_name = f"._stage_{secrets.token_hex(16)}"
+        os.mkdir(staging_dir_name, 0o700, dir_fd=shard_fd)
+        staging_fd = os.open(
+            staging_dir_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=shard_fd,
+        )
+        # Use a single O_RDWR fd for staging: write, fsync, unlink
+        # descriptor-relative, then verify digest on the same fd.
+        # The unlinked inode has no name that can be swapped.
+        stage_fd = os.open(
+            object_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=staging_fd,
+        )
+        _write_fd_complete(stage_fd, object_bytes)
+        # Unlink descriptor-relative so the inode has no replaceable name.
+        os.unlink(object_name, dir_fd=staging_fd)
+        # Re-verify digest on the same fd we wrote through.
+        os.lseek(stage_fd, 0, os.SEEK_SET)
+        staged_bytes = _read_fd_complete(stage_fd)
+        if hashlib.sha256(staged_bytes).hexdigest() != expected_sha:
+            return None
+        # Verify the staged inode is still regular/euid/0600/nlink==0 (unlinked).
+        st = os.fstat(stage_fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_uid != os.geteuid():
+            return None
+        if st.st_mode & 0o077:
+            return None
+        if st.st_nlink != 0:
+            return None
+        # ExternalBinaryModule opens /dev/fd/N at the descriptor's current
+        # position on some platforms. Rewind after the digest read so the
+        # loader always sees the complete verified object.
+        os.lseek(stage_fd, 0, os.SEEK_SET)
+
+        from cutlass.base_dsl.export.external_binary_module import (
+            ExternalBinaryModule,
+        )
+
+        # Load from the exact fd we wrote and verified — no name involved.
+        inode_path = f"/dev/fd/{stage_fd}"
+        module = ExternalBinaryModule(inode_path)
+        # The CUTLASS loader may patch its private staging copy. The
+        # manifest-bound cache object remains untouched and is revalidated
+        # on every load; never publish this staging inode back to the cache.
+        result = getattr(module, _cache_prefix(cache_key))
+        return result
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError):
+        return None
     except Exception:
         return None
-
+    finally:
+        with suppress(OSError):
+            if stage_fd is not None:
+                os.close(stage_fd)
+        if staging_fd is not None:
+            with suppress(OSError):
+                os.close(staging_fd)
+        if staging_dir_name is not None and shard_fd is not None:
+            with suppress(OSError):
+                os.rmdir(staging_dir_name, dir_fd=shard_fd)
+        if own_fds:
+            with suppress(OSError):
+                if shard_fd is not None:
+                    os.close(shard_fd)
+            with suppress(OSError):
+                if root_fd is not None:
+                    os.close(root_fd)
 
 def _store_cute_compile_to_disk(
     cache_key: str,
@@ -2521,21 +3071,58 @@ def _store_cute_compile_to_disk(
     *,
     cache_payload: tuple[object, ...] | None = None,
     func: Any = None,
+    shard_fd: int | None = None,
 ) -> None:
     if not hasattr(compiled, "dump_to_object"):
         return
 
-    object_path = _cache_object_path(cache_key)
-    object_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = object_path.with_suffix(".tmp")
+    object_name = f"{cache_key}.o"
     object_bytes = compiled.dump_to_object(_cache_prefix(cache_key))
-    with open(tmp_path, "wb") as f:
-        f.write(object_bytes)
-    os.replace(tmp_path, object_path)
-    if cache_payload is not None and func is not None:
-        _write_compile_manifest(
-            cache_key, cache_payload, func, object_bytes, compiled=compiled
-        )
+    own_fds = shard_fd is None
+    root_fd: int | None = None
+    try:
+        if own_fds:
+            root_fd = _open_secure_dir_fd(_cute_compile_cache_dir())
+            shard_fd = _open_secure_shard_fd(root_fd, cache_key[:2])
+        # Publish object atomically via unpredictable O_EXCL temp.
+        # Retain fd through replace and verify post-rename inode.
+        fd, tmp_name = _create_secure_temp(shard_fd, object_name)
+        try:
+            _write_fd_complete(fd, object_bytes)
+            pre_st = os.fstat(fd)
+            os.replace(
+                tmp_name, object_name,
+                src_dir_fd=shard_fd, dst_dir_fd=shard_fd,
+            )
+            os.fsync(shard_fd)
+            post_st = os.fstat(fd)
+            if (pre_st.st_ino, pre_st.st_dev) != (
+                post_st.st_ino, post_st.st_dev,
+            ):
+                raise RuntimeError("object inode changed during replace")
+            if post_st.st_nlink != 1:
+                raise RuntimeError(
+                    f"object has {post_st.st_nlink} links after publish"
+                )
+            os.close(fd)
+        except BaseException:
+            with suppress(OSError):
+                os.close(fd)
+            with suppress(OSError):
+                os.unlink(tmp_name, dir_fd=shard_fd)
+            raise
+        if cache_payload is not None and func is not None:
+            _write_compile_manifest(
+                cache_key, cache_payload, func, object_bytes,
+                compiled=compiled, shard_fd=shard_fd,
+            )
+    finally:
+        if own_fds:
+            with suppress(OSError):
+                os.close(shard_fd)
+            with suppress(OSError):
+                if root_fd is not None:
+                    os.close(root_fd)
 
 
 def _memory_cache_get(cache_key: object) -> Any | None:
@@ -2664,10 +3251,8 @@ def compile(
     disk_cache_enabled = _cute_compile_disk_cache_enabled_for_payload(payload)
 
     if disk_cache_enabled:
-        compiled = _load_cute_compile_from_disk(cache_key)
+        compiled = _load_cute_compile_from_disk(cache_key, payload, func)
         if compiled is not None:
-            with suppress(Exception):
-                _ensure_cute_compile_manifest(cache_key, payload, func)
             with _MEMORY_CACHE_LOCK:
                 _DISK_CACHE_HITS += 1
             if post_engine_start_log:
@@ -2685,15 +3270,15 @@ def compile(
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
 
-        with _disk_cache_key_lock(cache_key):
+        with _disk_cache_key_lock(cache_key) as shard_fd:
             compiled = _memory_cache_get(memory_cache_key)
             if compiled is not None:
                 return compiled
 
-            compiled = _load_cute_compile_from_disk(cache_key)
+            compiled = _load_cute_compile_from_disk(
+                cache_key, payload, func, shard_fd=shard_fd,
+            )
             if compiled is not None:
-                with suppress(Exception):
-                    _ensure_cute_compile_manifest(cache_key, payload, func)
                 with _MEMORY_CACHE_LOCK:
                     _DISK_CACHE_HITS += 1
                 if post_engine_start_log:
@@ -2744,6 +3329,7 @@ def compile(
                     compiled,
                     cache_payload=payload,
                     func=func,
+                    shard_fd=shard_fd,
                 )
             _memory_cache_put(memory_cache_key, compiled)
             return compiled
