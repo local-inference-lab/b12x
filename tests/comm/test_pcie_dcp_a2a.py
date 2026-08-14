@@ -415,7 +415,9 @@ def test_lse_launch_preserves_native_launch_bounds_contract() -> None:
     assert "min_blocks_per_mp=1," in source
 
 
-def test_all_gather_uses_constexpr_direct_source_pointers() -> None:
+def test_all_gather_resolves_one_peer_address_before_each_copy() -> None:
+    """The peer selector must not clone the memory transaction per rank."""
+
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
     kernel_source = inspect.getsource(kernels._AllGatherHeadsLaunch.kernel)
@@ -425,7 +427,8 @@ def test_all_gather_uses_constexpr_direct_source_pointers() -> None:
     assert "if cutlass.const_expr(source == self._rank):" in read_phase
     assert "source_words = local_input" in read_phase
     assert "source_words = self._staging_words(staging[source])" in read_phase
-    assert "source_address" not in read_phase
+    assert "source_address = Int64(" in read_phase
+    assert "_copy_16b_addr(" in read_phase
     assert "source_words = cute.make_ptr(" not in read_phase
 
 
