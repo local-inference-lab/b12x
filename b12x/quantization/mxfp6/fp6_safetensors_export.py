@@ -21,9 +21,9 @@ its original dtype and recorded in ``quantization_config.exclude_modules``.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
-import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -180,15 +180,515 @@ class _ErrorStats:
                 f"{s['rel_rmse']:>9.5f}  {s['worst']:>9.5f}  {s['worst_key']}"
             )
 
+# ---------------------------------------------------------------------------
+# Secure fd-anchored export helpers (issue #173)
+#
+# Every public FP6 export entrypoint builds the complete checkpoint in a
+# private, mode-0700 sibling *staging* directory and publishes it with a
+# single atomic directory rename.  All file operations are anchored to
+# held directory descriptors (``parent_fd``, ``staging_fd``) so that an
+# attacker cannot redirect writes by renaming or symlinking path components
+# after creation.
+#
+# Security properties:
+#   * Every ancestor of the output path is walked with openat(O_NOFOLLOW |
+#     O_DIRECTORY), rejecting symlinked components.
+#   * The staging directory is created exclusively via os.mkdir(dir_fd=) and
+#     its inode is pinned; all cleanup verifies the inode before acting.
+#   * safetensors.save() serializes to bytes in memory; the bytes are written
+#     to a fresh fd opened with O_CREAT|O_EXCL relative to staging_fd, then
+#     renamed to the final name — never unlinked and re-opened.
+#   * The final destination leaf must not exist (checked via stat with
+#     dir_fd=parent_fd); publication is a single os.replace directory rename.
+#   * On failure, only the owned staging directory (identified by inode) is
+#     cleaned up — never a path-resolved replacement.
+# ---------------------------------------------------------------------------
+import contextlib
+import ctypes
+import ctypes.util
+import stat
+import sys
+
+
+# Platform-specific atomic no-replace directory rename.
+def _init_rename_no_replace():
+    libc_path = ctypes.util.find_library("c")
+    if libc_path is None:
+        return None
+    libc = ctypes.CDLL(libc_path, use_errno=True)
+    if sys.platform == "darwin":
+        try:
+            fn = libc.renameatx_np
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        except AttributeError:
+            return None
+        def _mac_rename(from_fd, from_name, to_fd, to_name):
+            result = fn(from_fd, from_name.encode(), to_fd, to_name.encode(), 0x0004)
+            if result != 0:
+                err = ctypes.get_errno()
+                if err == 17:
+                    raise FileExistsError(f"output destination already exists: {to_name}")
+                raise OSError(err, os.strerror(err))
+        return _mac_rename
+    if sys.platform.startswith("linux"):
+        try:
+            fn = libc.renameat2
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        except AttributeError:
+            return None
+        def _linux_rename(from_fd, from_name, to_fd, to_name):
+            result = fn(from_fd, from_name.encode(), to_fd, to_name.encode(), 0x1)
+            if result != 0:
+                err = ctypes.get_errno()
+                if err == 17:
+                    raise FileExistsError(f"output destination already exists: {to_name}")
+                raise OSError(err, os.strerror(err))
+        return _linux_rename
+    return None
+
+
+_RENAME_NO_REPLACE = _init_rename_no_replace()
+
+
+def _resolve_canonical(path: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.realpath(str(path), strict=False))
+
+
+def _resolve_absolute(path: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.abspath(str(path)))
+
+
+def _openat_nofollow_dir(fd: int, name: str) -> int:
+    return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+
+
+def _inode(fd: int) -> tuple[int, int]:
+    st = os.fstat(fd)
+    return (st.st_dev, st.st_ino)
+
+
+def _is_safe_parent(fd: int) -> bool:
+    """True if the directory is safe against attacker entry substitution.
+
+    Safe if owned by current user and not group/world-writable, OR if
+    sticky bit set AND owned by root or current user (so the directory
+    owner cannot rename other users' entries).
+    """
+    st = os.fstat(fd)
+    mode = st.st_mode
+    uid = os.getuid()
+    if mode & stat.S_ISVTX:
+        # Sticky bit: only entry owner can rename/unlink. But the directory
+        # owner can still rename entries they own. Require trusted owner.
+        return st.st_uid in (0, uid)
+    return bool(st.st_uid == uid and not (mode & (stat.S_IWGRP | stat.S_IWOTH)))
+
+
+def _fsync_fd(fd: int) -> None:
+    """fsync a file descriptor, ignoring errors on unsupported platforms."""
+    with contextlib.suppress(OSError):
+        os.fsync(fd)
+
+
+def _fsync_dir(fd: int) -> None:
+    """fsync a directory fd for durability of its entries."""
+    _fsync_fd(fd)
+
+
+@contextlib.contextmanager
+def _fd_cmgr(fd: int):
+    try:
+        yield fd
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _walk_and_pin_source(src_abs: pathlib.Path) -> tuple[int, set[tuple[int, int]]]:
+    """Walk source path with openat, returning (src_dir_fd, src_inodes)."""
+    comps = [p for p in src_abs.parts[1:] if p]
+    if not comps:
+        raise ValueError("source path has no components")
+    root_fd = os.open("/", os.O_RDONLY | os.O_NOFOLLOW)
+    fd = root_fd
+    try:
+        for comp in comps:
+            next_fd = _openat_nofollow_dir(fd, comp)
+            if fd != root_fd:
+                os.close(fd)
+            fd = next_fd
+        result_fd = fd
+        fd = None  # transfer ownership
+        return result_fd, {_inode(result_fd)}
+    finally:
+        if fd is not None and fd != root_fd:
+            os.close(fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _walk_to_parent(
+    out_abs: pathlib.Path,
+    src_inodes: set[tuple[int, int]],
+) -> tuple[int, str, list[str]]:
+    """Walk ancestors of *out_abs*, creating missing dirs.
+
+    Returns (parent_fd, leaf_name, created_ancestors) where created_ancestors
+    tracks dirs we created so they can be cleaned up on failure.
+    """
+    comps = [p for p in out_abs.parts[1:] if p]
+    if not comps:
+        raise ValueError("output path has no leaf component")
+    leaf = comps[-1]
+    root_fd = os.open("/", os.O_RDONLY | os.O_NOFOLLOW)
+    fd = root_fd
+    created: list[str] = []
+    try:
+        for comp in comps[:-1]:
+            if _inode(fd) in src_inodes:
+                raise ValueError(
+                    f"output path overlaps source directory at component '{comp}'"
+                )
+            try:
+                next_fd = _openat_nofollow_dir(fd, comp)
+            except FileNotFoundError:
+                os.mkdir(comp, dir_fd=fd)
+                created.append(comp)
+                next_fd = _openat_nofollow_dir(fd, comp)
+            if fd != root_fd:
+                os.close(fd)
+            fd = next_fd
+        if _inode(fd) in src_inodes:
+            raise ValueError("output parent overlaps source directory")
+        result_fd = fd
+        fd = None  # transfer ownership
+        return result_fd, leaf, created
+    finally:
+        if fd is not None and fd != root_fd:
+            os.close(fd)
+        os.close(root_fd)
+
+
+def _staging_name(leaf: str) -> str:
+    import random
+    import string
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    return f".b12x-ws-{leaf}-{suffix}"
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    mv = memoryview(data)
+    total = 0
+    while total < len(mv):
+        written = os.write(fd, mv[total:])
+        if written <= 0:
+            raise OSError("short write returned non-positive count")
+        total += written
+
+
+_DEFAULT_MAX_SHARD_BYTES = 512 * 1024 * 1024
+
+
+class _SecureExportContext:
+    """fd-anchored workspace for atomic checkpoint publication.
+
+    Creates a private mode-0700 workspace directory in the output parent.
+    The checkpoint payload is built as a child of the workspace.  Publication
+    renames the payload child from the (inaccessible) workspace fd to the
+    final leaf name in the parent — the attacker cannot swap the payload
+    because it lives inside the mode-0700 workspace.
+    """
+
+    def __init__(self, src_path: pathlib.Path, out_dir: pathlib.Path, *, src_dir_fd: int | None = None):
+        self.src_abs = _resolve_canonical(pathlib.Path(src_path))
+        self.out_abs = _resolve_absolute(pathlib.Path(out_dir))
+        self.parent_fd: int | None = None
+        self.workspace_fd: int | None = None
+        self._payload_fd: int | None = None
+        self.workspace_name: str | None = None
+        self.payload_name: str | None = None
+        self.leaf_name: str | None = None
+        self.workspace_identity: tuple[int, int] | None = None
+        self._payload_identity: tuple[int, int] | None = None
+        self.src_inodes: set[tuple[int, int]] = set()
+        self._published = False
+        self._src_dir_fd: int | None = src_dir_fd
+        self._owns_src_fd = src_dir_fd is None  # we close it only if we opened it
+        self._exit_stack: contextlib.ExitStack | None = None
+        self._created_ancestors: list[str] = []
+
+    @property
+    def staging_fd(self) -> int | None:
+        """The payload directory fd (for ShardWriter compatibility)."""
+        return self._payload_fd
+
+    def __enter__(self) -> "_SecureExportContext":
+        self._exit_stack = contextlib.ExitStack()
+        stack = self._exit_stack
+        try:
+            # Pin source if not already provided externally.
+            if self._src_dir_fd is not None:
+                self.src_inodes = {_inode(self._src_dir_fd)}
+            else:
+                self._src_dir_fd, self.src_inodes = _walk_and_pin_source(self.src_abs)
+                self._owns_src_fd = True
+            if self._owns_src_fd:
+                stack.callback(os.close, self._src_dir_fd)
+
+            # Walk to output parent, creating missing ancestors.
+            self.parent_fd, self.leaf_name, self._created_ancestors = _walk_to_parent(
+                self.out_abs, self.src_inodes
+            )
+            stack.callback(os.close, self.parent_fd)
+
+            # Validate parent safety.
+            if not _is_safe_parent(self.parent_fd):
+                raise PermissionError(
+                    f"output parent directory is not safe: it must be owned by "
+                    f"the current user with no group/world write, or have the "
+                    f"sticky bit set with a trusted owner; refusing to export "
+                    f"to {self.out_abs}"
+                )
+
+            # Check leaf existence and overlap.
+            try:
+                leaf_stat = os.lstat(self.leaf_name, dir_fd=self.parent_fd)
+                if (leaf_stat.st_dev, leaf_stat.st_ino) in self.src_inodes:
+                    raise ValueError(
+                        f"output {self.out_abs} overlaps source model directory"
+                    )
+                raise FileExistsError(
+                    f"output destination {self.out_abs} already exists; "
+                    f"refusing to overwrite"
+                )
+            except FileNotFoundError:
+                pass
+
+            # Create private mode-0700 workspace sibling.
+            self.workspace_name = _staging_name(self.leaf_name)
+            os.mkdir(self.workspace_name, mode=0o700, dir_fd=self.parent_fd)
+            try:
+                self.workspace_fd = _openat_nofollow_dir(
+                    self.parent_fd, self.workspace_name
+                )
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.rmdir(self.workspace_name, dir_fd=self.parent_fd)
+                raise
+            stack.callback(os.close, self.workspace_fd)
+            self.workspace_identity = _inode(self.workspace_fd)
+
+            # Create payload (the actual checkpoint dir) inside workspace.
+            self.payload_name = "payload"
+            os.mkdir(self.payload_name, mode=0o700, dir_fd=self.workspace_fd)
+            self._payload_fd = _openat_nofollow_dir(
+                self.workspace_fd, self.payload_name
+            )
+            self._payload_identity = _inode(self._payload_fd)
+            stack.callback(os.close, self._payload_fd)
+            return self
+        except BaseException:
+            self._cleanup_on_error()
+            raise
+
+    def _cleanup_on_error(self) -> None:
+        """Clean up on __enter__ failure."""
+        # Remove payload if created (inside workspace, fd-anchored).
+        if self._payload_fd is not None and self.payload_name is not None:
+            with contextlib.suppress(OSError):
+                if _inode(self._payload_fd) == getattr(self, "_payload_identity", None):
+                    for entry in os.listdir(self._payload_fd):
+                        with contextlib.suppress(OSError):
+                            os.unlink(entry, dir_fd=self._payload_fd)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(self.payload_name, dir_fd=self.workspace_fd)
+        # Remove workspace if created.
+        if self.workspace_fd is not None and self.workspace_name is not None:
+            with contextlib.suppress(OSError):
+                if _inode(self.workspace_fd) == self.workspace_identity:
+                    for entry in os.listdir(self.workspace_fd):
+                        if entry != self.payload_name:
+                            with contextlib.suppress(OSError):
+                                os.unlink(entry, dir_fd=self.workspace_fd)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(self.workspace_name, dir_fd=self.parent_fd)
+        if self._exit_stack is not None:
+            self._exit_stack.close()
+            self._exit_stack = None
+        self.parent_fd = None
+        self.workspace_fd = None
+        self._payload_fd = None
+        self._src_dir_fd = None
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        original_exc = exc_val
+        try:
+            if exc_type is None and not self._published:
+                try:
+                    self._publish()
+                except BaseException:
+                    self._cleanup()
+                    raise
+            elif not self._published:
+                self._cleanup()
+        except BaseException:
+            if original_exc is not None:
+                pass
+            elif exc_type is None:
+                raise
+        finally:
+            if self._exit_stack is not None:
+                self._exit_stack.close()
+                self._exit_stack = None
+            self.parent_fd = None
+            self.workspace_fd = None
+            self._payload_fd = None
+            self._src_dir_fd = None
+        return None
+
+    def _publish(self) -> None:
+        """Atomically rename payload child to the final leaf name."""
+        if _RENAME_NO_REPLACE is None:
+            raise RuntimeError(
+                "platform does not support atomic no-replace rename; "
+                "cannot safely publish checkpoint"
+            )
+        # Verify workspace identity.
+        if _inode(self.workspace_fd) != self.workspace_identity:
+            raise RuntimeError("workspace directory identity changed; aborting")
+        # fsync payload dir and workspace dir before rename.
+        _fsync_dir(self._payload_fd)
+        _fsync_dir(self.workspace_fd)
+        # Atomic no-replace rename: payload_name (in workspace) -> leaf_name (in parent).
+        _RENAME_NO_REPLACE(
+            self.workspace_fd, self.payload_name,
+            self.parent_fd, self.leaf_name,
+        )
+        # fsync parent dir to commit the rename.
+        _fsync_dir(self.parent_fd)
+        self._published = True
+        # Remove now-empty workspace.
+        with contextlib.suppress(OSError):
+            os.rmdir(self.workspace_name, dir_fd=self.parent_fd)
+
+    def _cleanup(self) -> None:
+        """Remove payload and workspace, verifying identity."""
+        # Remove payload contents (fd-anchored).
+        if self._payload_fd is not None and self.payload_name is not None:
+            try:
+                if _inode(self._payload_fd) == getattr(self, "_payload_identity", _inode(self._payload_fd)):
+                    for entry in os.listdir(self._payload_fd):
+                        with contextlib.suppress(OSError):
+                            os.unlink(entry, dir_fd=self._payload_fd)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(self.payload_name, dir_fd=self.workspace_fd)
+            except OSError:
+                pass
+        # Remove workspace.
+        if self.workspace_fd is not None and self.workspace_name is not None:
+            try:
+                if _inode(self.workspace_fd) == self.workspace_identity:
+                    for entry in os.listdir(self.workspace_fd):
+                        with contextlib.suppress(OSError):
+                            os.unlink(entry, dir_fd=self.workspace_fd)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(self.workspace_name, dir_fd=self.parent_fd)
+            except OSError:
+                pass
+
+    # -- fd-anchored write helpers ------------------------------------------
+
+    def write_bytes(self, filename: str, data: bytes) -> int:
+        fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o644, dir_fd=self._payload_fd)
+        try:
+            _write_all(fd, data)
+            _fsync_fd(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(filename, dir_fd=self._payload_fd)
+            raise
+        return fd
+
+    def write_text(self, filename: str, text: str) -> None:
+        fd = self.write_bytes(filename, text.encode("utf-8"))
+        os.close(fd)
+
+    def save_safetensors(self, save_fn, tensors: dict, filename: str) -> None:
+        data = save_fn(tensors, metadata={"format": "pt"})
+        fd = self.write_bytes(filename, data)
+        os.close(fd)
+
+    def rename_in_staging(self, old_name: str, final_name: str) -> None:
+        os.replace(old_name, final_name, src_dir_fd=self._payload_fd, dst_dir_fd=self._payload_fd)
+
+    def copy_aux_files(self, src_dir_fd: int) -> None:
+        """Copy aux files from source dirfd into payload, rejecting symlinks/FIFOs."""
+        if src_dir_fd is None:
+            raise OSError("source directory fd is not available")
+        skip_names = {"model.safetensors.index.json", "config.json"}
+        for entry in os.listdir(src_dir_fd):
+            if entry in skip_names or entry.endswith(".safetensors") or entry.endswith(".safetensors.index.json"):
+                continue
+            # Open with O_NOFOLLOW | O_NONBLOCK (rejects symlinks, prevents FIFO block).
+            try:
+                src_entry_fd = os.open(
+                    entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_dir_fd
+                )
+            except OSError:
+                continue  # symlink or special file — skip
+            try:
+                st = os.fstat(src_entry_fd)
+                if (st.st_mode & 0o170000) != 0o100000:
+                    continue  # not a regular file
+                # Read all content from the source fd.
+                data = b""
+                while True:
+                    chunk = os.read(src_entry_fd, 65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                # Write to payload via fd.
+                dst_fd = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o644, dir_fd=self._payload_fd)
+                try:
+                    _write_all(dst_fd, data)
+                    os.fchmod(dst_fd, st.st_mode)
+                    os.utime(dst_fd, (st.st_atime, st.st_mtime))
+                    _fsync_fd(dst_fd)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.close(dst_fd)
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry, dir_fd=self._payload_fd)
+                    raise
+                os.close(dst_fd)
+            finally:
+                os.close(src_entry_fd)
+
+    def fsync_staging(self) -> None:
+        """fsync the payload directory after all files are written."""
+        if self._payload_fd is not None:
+            _fsync_dir(self._payload_fd)
+
+    @property
+    def out_path(self) -> pathlib.Path:
+        return self.out_abs
+    @property
+    def staging_name(self) -> str | None:
+        """Workspace name for test compatibility."""
+        return self.workspace_name
 
 class _ShardWriter:
     """Stream tensors to size-capped safetensors shards, then finalize the index."""
 
-    def __init__(self, out_dir: pathlib.Path, *, max_shard_bytes: int):
-        from safetensors.torch import save_file
+    def __init__(self, ctx: _SecureExportContext, *, max_shard_bytes: int):
+        from safetensors.torch import save as _save_bytes
 
-        self._save_file = save_file
-        self.out_dir = out_dir
+        self._save = _save_bytes  # returns bytes, not writes to file
+        self._ctx = ctx
         self.max_shard_bytes = max_shard_bytes
         self._buf: dict[str, torch.Tensor] = {}
         self._buf_bytes = 0
@@ -197,8 +697,15 @@ class _ShardWriter:
         self.total_bytes = 0
 
     def add(self, key: str, tensor: torch.Tensor) -> None:
+        # Check size BEFORE detach/cpu transfer to avoid GPU OOM.
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes > self.max_shard_bytes:
+            raise ValueError(
+                f"tensor {key} is {nbytes} bytes which exceeds the shard cap "
+                f"of {self.max_shard_bytes} bytes; reduce max_shard_bytes or "
+                f"split the model"
+            )
         t = tensor.detach().cpu().contiguous()
-        nbytes = t.numel() * t.element_size()
         if self._buf_bytes and self._buf_bytes + nbytes > self.max_shard_bytes:
             self._flush()
         self._buf[key] = t
@@ -214,7 +721,7 @@ class _ShardWriter:
             return
         idx = len(self._shard_keys)
         name = f"model-{idx:05d}.safetensors"
-        self._save_file(self._buf, str(self.out_dir / name), metadata={"format": "pt"})
+        self._ctx.save_safetensors(self._save, self._buf, name)
         self._shard_keys.append(list(self._buf.keys()))
         self._buf = {}
         self._buf_bytes = 0
@@ -224,46 +731,35 @@ class _ShardWriter:
         self._flush()
         n = len(self._shard_keys)
         for idx, keys in enumerate(self._shard_keys):
-            old = self.out_dir / f"model-{idx:05d}.safetensors"
+            old_name = f"model-{idx:05d}.safetensors"
             final = (
                 "model.safetensors"
                 if n == 1
                 else f"model-{idx + 1:05d}-of-{n:05d}.safetensors"
             )
-            (self.out_dir / final).unlink(missing_ok=True)
-            old.rename(self.out_dir / final)
+            self._ctx.rename_in_staging(old_name, final)
             for key in keys:
                 self.weight_map[key] = final
         index = {
             "metadata": {"total_size": self.total_bytes},
             "weight_map": self.weight_map,
         }
-        (self.out_dir / "model.safetensors.index.json").write_text(
-            json.dumps(index, indent=2)
+        self._ctx.write_text(
+            "model.safetensors.index.json",
+            json.dumps(index, indent=2),
         )
+        self._ctx.fsync_staging()
         return n
 
 
-def _copy_aux_files(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """Copy tokenizer / generation / misc files so the output dir is fully loadable."""
-    skip_suffixes = (".safetensors",)
-    skip_names = {"model.safetensors.index.json", "config.json"}
-    for item in src.iterdir():
-        if not item.is_file():
-            continue
-        if item.name in skip_names or item.suffix in skip_suffixes:
-            continue
-        if item.name.endswith(".safetensors.index.json"):
-            continue
-        shutil.copy2(item, dst / item.name)
-
-
 def _write_config(
-    src_config: dict, out_dir: pathlib.Path, quant_config: dict
+    src_config: dict, ctx: _SecureExportContext, quant_config: dict
 ) -> None:
     cfg = dict(src_config)
     cfg["quantization_config"] = quant_config
-    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    ctx.write_text("config.json", json.dumps(cfg, indent=2))
+
+
 
 
 def _emit_quantized_linear(
@@ -346,7 +842,7 @@ def export_moe_model_to_fp6_safetensors(
     device: str = "cuda",
     use_gpu: bool = True,
     block_scale_rule: str = "mse",
-    max_shard_bytes: int = 4 * 1024**3,
+    max_shard_bytes: int = _DEFAULT_MAX_SHARD_BYTES,
     dry_run: bool = False,
     verbose: bool = True,
 ) -> ExportReport:
@@ -368,7 +864,14 @@ def export_moe_model_to_fp6_safetensors(
     ``report_error`` dequantizes every emitted tensor and prints a per-group
     relative-RMSE table (also returned on ``report.error_groups``).
     """
-    model = SafetensorsModel(model_path)
+    # Pin source directory by inode before any reads.
+    src_abs = _resolve_canonical(pathlib.Path(model_path))
+    src_dir_fd, _src_inodes = _walk_and_pin_source(src_abs)
+    try:
+        model = SafetensorsModel(model_path, src_dir_fd=src_dir_fd)
+    except BaseException:
+        os.close(src_dir_fd)
+        raise
     scheme = discover_moe_experts(model)
     if scheme is None:
         raise ValueError(f"no MoE experts discovered under {model_path}")
@@ -443,74 +946,78 @@ def export_moe_model_to_fp6_safetensors(
 
     if dry_run:
         report.quantized_tensors = expert_quant + len(quant_keys)
+        os.close(src_dir_fd)
         return report
 
-    out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    writer = _ShardWriter(out, max_shard_bytes=max_shard_bytes)
-    exclude_patterns: set[str] = set()
-    error_stats = _ErrorStats() if report_error else None
+    with _SecureExportContext(
+        pathlib.Path(model_path), pathlib.Path(out_dir), src_dir_fd=src_dir_fd
+    ) as ctx:
+        writer = _ShardWriter(ctx, max_shard_bytes=max_shard_bytes)
+        exclude_patterns: set[str] = set()
+        error_stats = _ErrorStats() if report_error else None
 
-    # 1) Walk non-expert tensors: quantize golden-rule Linears, copy the rest BF16.
-    for key in model.keys():
-        if key in drop_keys:
-            continue
-        if key in quant_keys:
-            name = key[: -len(".weight")]
-            w = model.get_tensor(key).to(device, torch.bfloat16)
-            quantized = _emit_quantized_linear(
-                writer, report, name, w, source_format=source_format,
-                use_gpu=use_gpu, block_scale_rule=block_scale_rule,
-                error_stats=error_stats,
-            )
-            if not quantized:
+        # 1) Walk non-expert tensors: quantize golden-rule Linears, copy the rest BF16.
+        for key in model.keys():
+            if key in drop_keys:
+                continue
+            if key in quant_keys:
+                name = key[: -len(".weight")]
+                w = model.get_tensor(key).to(device, torch.bfloat16)
+                quantized = _emit_quantized_linear(
+                    writer, report, name, w, source_format=source_format,
+                    use_gpu=use_gpu, block_scale_rule=block_scale_rule,
+                    error_stats=error_stats,
+                )
+                if not quantized:
+                    exclude_patterns.add(_module_pattern(key))
+                del w
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                writer.add(key, model.get_tensor(key))
+                report.copied_tensors += 1
                 exclude_patterns.add(_module_pattern(key))
-            del w
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        else:
-            writer.add(key, model.get_tensor(key))
-            report.copied_tensors += 1
-            exclude_patterns.add(_module_pattern(key))
 
-    # 2) Emit per-expert FP6 keys for the quantized layers.
-    for layer in layers if not skip_experts else []:
-        gate_e, up_e, down_e = _layer_expert_matrices(
-            model, scheme, layer, device, is_gated, gate_up_order
-        )
-        prefix = scheme.prefix_template.format(L=layer)
-        for e in range(scheme.num_experts):
-            _emit_quantized_linear(
-                writer, report, f"{prefix}.experts.{e}.{_DOWN_PROJ}",
-                down_e[e], source_format=source_format, use_gpu=use_gpu,
-                block_scale_rule=block_scale_rule, error_stats=error_stats,
+        # 2) Emit per-expert FP6 keys for the quantized layers.
+        for layer in layers if not skip_experts else []:
+            gate_e, up_e, down_e = _layer_expert_matrices(
+                model, scheme, layer, device, is_gated, gate_up_order
             )
-            _emit_quantized_linear(
-                writer, report, f"{prefix}.experts.{e}.{_GATE_PROJ}",
-                gate_e[e], source_format=source_format, use_gpu=use_gpu,
-                block_scale_rule=block_scale_rule, error_stats=error_stats,
-            )
-            if is_gated:
+            prefix = scheme.prefix_template.format(L=layer)
+            for e in range(scheme.num_experts):
                 _emit_quantized_linear(
-                    writer, report, f"{prefix}.experts.{e}.{_UP_PROJ}",
-                    up_e[e], source_format=source_format, use_gpu=use_gpu,
+                    writer, report, f"{prefix}.experts.{e}.{_DOWN_PROJ}",
+                    down_e[e], source_format=source_format, use_gpu=use_gpu,
                     block_scale_rule=block_scale_rule, error_stats=error_stats,
                 )
-        if verbose:
-            print(f"  layer {layer}: {scheme.num_experts} experts -> FP6")
-        del gate_e, up_e, down_e
-        if device == "cuda":
-            torch.cuda.empty_cache()
+                _emit_quantized_linear(
+                    writer, report, f"{prefix}.experts.{e}.{_GATE_PROJ}",
+                    gate_e[e], source_format=source_format, use_gpu=use_gpu,
+                    block_scale_rule=block_scale_rule, error_stats=error_stats,
+                )
+                if is_gated:
+                    _emit_quantized_linear(
+                        writer, report, f"{prefix}.experts.{e}.{_UP_PROJ}",
+                        up_e[e], source_format=source_format, use_gpu=use_gpu,
+                        block_scale_rule=block_scale_rule, error_stats=error_stats,
+                    )
+            if verbose:
+                print(f"  layer {layer}: {scheme.num_experts} experts -> FP6")
+            del gate_e, up_e, down_e
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
-    report.shards = writer.finalize()
-    report.total_bytes = writer.total_bytes
-    quant_config = build_quantization_config(
-        source_format=source_format,
-        exclude_modules=sorted(exclude_patterns),
-        block_scale_rule=block_scale_rule,
-    )
-    _write_config(model.config, out, quant_config)
-    _copy_aux_files(pathlib.Path(model_path), out)
+        report.shards = writer.finalize()
+        report.total_bytes = writer.total_bytes
+        quant_config = build_quantization_config(
+            source_format=source_format,
+            exclude_modules=sorted(exclude_patterns),
+            block_scale_rule=block_scale_rule,
+        )
+        _write_config(model.config, ctx, quant_config)
+        ctx.copy_aux_files(ctx._src_dir_fd)
+        out = ctx.out_path
+
     if error_stats is not None:
         report.error_groups = error_stats.summary()
         if verbose:
@@ -594,7 +1101,7 @@ def export_dense_model_to_fp6_safetensors(
     device: str = "cuda",
     use_gpu: bool = True,
     block_scale_rule: str = "mse",
-    max_shard_bytes: int = 4 * 1024**3,
+    max_shard_bytes: int = _DEFAULT_MAX_SHARD_BYTES,
     dry_run: bool = False,
     verbose: bool = True,
 ) -> ExportReport:
@@ -607,7 +1114,14 @@ def export_dense_model_to_fp6_safetensors(
     quality trade-off (FP6 is lower precision than the FP8 those layers usually
     ship in) — validate downstream before relying on them.
     """
-    model = SafetensorsModel(model_path)
+    # Pin source directory by inode before any reads.
+    src_abs = _resolve_canonical(pathlib.Path(model_path))
+    src_dir_fd, _src_inodes = _walk_and_pin_source(src_abs)
+    try:
+        model = SafetensorsModel(model_path, src_dir_fd=src_dir_fd)
+    except BaseException:
+        os.close(src_dir_fd)
+        raise
 
     # Golden-rule selection (mirrors LLM-Compressor targets="Linear", ignore=[...]):
     # quantize every 2-D ``.weight`` whose dims the quantizer can handle and that is
@@ -659,41 +1173,42 @@ def export_dense_model_to_fp6_safetensors(
         report.quantized_tensors = len(quant_keys)
         return report
 
-    out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    writer = _ShardWriter(out, max_shard_bytes=max_shard_bytes)
-    exclude_patterns: set[str] = set()
-    error_stats = _ErrorStats() if report_error else None
+    with _SecureExportContext(pathlib.Path(model_path), pathlib.Path(out_dir)) as ctx:
+        writer = _ShardWriter(ctx, max_shard_bytes=max_shard_bytes)
+        exclude_patterns: set[str] = set()
+        error_stats = _ErrorStats() if report_error else None
 
-    for key in model.keys():
-        if key in quant_keys:
-            name = key[: -len(".weight")]
-            w = model.get_tensor(key).to(device, torch.bfloat16)
-            quantized = _emit_quantized_linear(
-                writer, report, name, w, source_format=source_format,
-                use_gpu=use_gpu, block_scale_rule=block_scale_rule,
-                error_stats=error_stats,
-            )
-            if not quantized:
-                # Copied through as BF16 -> must be excluded from the quant config.
+        for key in model.keys():
+            if key in quant_keys:
+                name = key[: -len(".weight")]
+                w = model.get_tensor(key).to(device, torch.bfloat16)
+                quantized = _emit_quantized_linear(
+                    writer, report, name, w, source_format=source_format,
+                    use_gpu=use_gpu, block_scale_rule=block_scale_rule,
+                    error_stats=error_stats,
+                )
+                if not quantized:
+                    # Copied through as BF16 -> must be excluded from the quant config.
+                    exclude_patterns.add(_module_pattern(key))
+                del w
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                writer.add(key, model.get_tensor(key))
+                report.copied_tensors += 1
                 exclude_patterns.add(_module_pattern(key))
-            del w
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        else:
-            writer.add(key, model.get_tensor(key))
-            report.copied_tensors += 1
-            exclude_patterns.add(_module_pattern(key))
 
-    report.shards = writer.finalize()
-    report.total_bytes = writer.total_bytes
-    quant_config = build_quantization_config(
-        source_format=source_format,
-        exclude_modules=sorted(exclude_patterns),
-        block_scale_rule=block_scale_rule,
-    )
-    _write_config(model.config, out, quant_config)
-    _copy_aux_files(pathlib.Path(model_path), out)
+        report.shards = writer.finalize()
+        report.total_bytes = writer.total_bytes
+        quant_config = build_quantization_config(
+            source_format=source_format,
+            exclude_modules=sorted(exclude_patterns),
+            block_scale_rule=block_scale_rule,
+        )
+        _write_config(model.config, ctx, quant_config)
+        ctx.copy_aux_files(ctx._src_dir_fd)
+        out = ctx.out_path
+
     if error_stats is not None:
         report.error_groups = error_stats.summary()
         if verbose:
@@ -711,7 +1226,7 @@ def dequantize_fp6_checkpoint_to_bf16(
     out_dir: str | pathlib.Path,
     *,
     device: str = "cuda",
-    max_shard_bytes: int = 4 * 1024**3,
+    max_shard_bytes: int = _DEFAULT_MAX_SHARD_BYTES,
     verbose: bool = True,
 ) -> ExportReport:
     """Decode an FP6 checkpoint back to a plain BF16 HF checkpoint.
@@ -744,43 +1259,44 @@ def dequantize_fp6_checkpoint_to_bf16(
             f"-> BF16 {out_dir}"
         )
 
-    out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    writer = _ShardWriter(out, max_shard_bytes=max_shard_bytes)
-    drop_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
+    with _SecureExportContext(pathlib.Path(model_path), pathlib.Path(out_dir)) as ctx:
+        writer = _ShardWriter(ctx, max_shard_bytes=max_shard_bytes)
+        drop_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
 
-    for key in model.keys():
-        base = key
-        for suffix in drop_suffixes:
-            if key.endswith(suffix):
-                base = key[: -len(suffix)]
-                break
-        if base != key and base in quantized:
-            continue  # consumed by the dequantized .weight emission
-        if key.endswith(".weight") and key[: -len(".weight")] in quantized:
-            name = key[: -len(".weight")]
-            packed = model.get_tensor(key).to(device)
-            scale = model.get_tensor(name + ".weight_scale").to(device)
-            ws2_key = name + ".weight_scale_2"
-            ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
-            w = dequantize_linear_from_fp6(
-                packed, scale, fmt=fmt, weight_scale_2=ws2
-            )
-            writer.add(key, w.to(torch.bfloat16))
-            report.quantized_tensors += 1
-            del packed, scale, w
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        else:
-            writer.add(key, model.get_tensor(key))
-            report.copied_tensors += 1
+        for key in model.keys():
+            base = key
+            for suffix in drop_suffixes:
+                if key.endswith(suffix):
+                    base = key[: -len(suffix)]
+                    break
+            if base != key and base in quantized:
+                continue  # consumed by the dequantized .weight emission
+            if key.endswith(".weight") and key[: -len(".weight")] in quantized:
+                name = key[: -len(".weight")]
+                packed = model.get_tensor(key).to(device)
+                scale = model.get_tensor(name + ".weight_scale").to(device)
+                ws2_key = name + ".weight_scale_2"
+                ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
+                w = dequantize_linear_from_fp6(
+                    packed, scale, fmt=fmt, weight_scale_2=ws2
+                )
+                writer.add(key, w.to(torch.bfloat16))
+                report.quantized_tensors += 1
+                del packed, scale, w
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                writer.add(key, model.get_tensor(key))
+                report.copied_tensors += 1
 
-    report.shards = writer.finalize()
-    report.total_bytes = writer.total_bytes
-    cfg = dict(model.config)
-    cfg.pop("quantization_config", None)
-    (out / "config.json").write_text(json.dumps(cfg, indent=2))
-    _copy_aux_files(pathlib.Path(model_path), out)
+        report.shards = writer.finalize()
+        report.total_bytes = writer.total_bytes
+        cfg = dict(model.config)
+        cfg.pop("quantization_config", None)
+        ctx.write_text("config.json", json.dumps(cfg, indent=2))
+        ctx.copy_aux_files(ctx._src_dir_fd)
+        out = ctx.out_path
+
     if verbose:
         print(
             f"[fp6-dequant] done: dequantized={report.quantized_tensors} "

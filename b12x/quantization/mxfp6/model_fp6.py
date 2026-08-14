@@ -23,8 +23,10 @@ nothing (the output directory is not even created).
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -59,45 +61,133 @@ _SEP_DOWN = ("down_proj", "w2")
 _FUSED_GATE_UP = ("gate_up_proj", "w13")
 _ATTN_ORDER = ("q_proj", "k_proj", "v_proj", "o_proj")
 
-
 class SafetensorsModel:
-    """Lazy reader for a HF safetensors checkpoint directory."""
+    """Lazy reader for a HF safetensors checkpoint directory.
 
-    def __init__(self, model_path: str | pathlib.Path):
+    When *src_dir_fd* is provided, all reads (config, index, shards) are
+    anchored to that file descriptor with O_NOFOLLOW and basename-only
+    shard validation, preventing path substitution races.
+    """
+
+    def __init__(
+        self,
+        model_path: str | pathlib.Path,
+        src_dir_fd: int | None = None,
+    ):
         self.path = pathlib.Path(model_path)
-        cfg = self.path / "config.json"
-        self.config: dict = json.loads(cfg.read_text()) if cfg.exists() else {}
+        self._src_fd = src_dir_fd
+        self.config: dict = self._read_config()
         self.text_config: dict = self.config.get("text_config", self.config)
         self.weight_map = self._build_weight_map()
         self._handles: dict[str, object] = {}
 
+    def _read_file_via_fd(self, name: str) -> str:
+        """Read a file from the source directory via the pinned dirfd."""
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._src_fd)
+        try:
+            st = os.fstat(fd)
+            if (st.st_mode & 0o170000) != 0o100000:
+                raise OSError(f"{name} is not a regular file")
+            data = b""
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("utf-8")
+        finally:
+            os.close(fd)
+
+    def _read_config(self) -> dict:
+        if self._src_fd is not None:
+            try:
+                return json.loads(self._read_file_via_fd("config.json"))
+            except FileNotFoundError:
+                return {}
+        cfg = self.path / "config.json"
+        return json.loads(cfg.read_text()) if cfg.exists() else {}
+
     def _build_weight_map(self) -> dict[str, str]:
+        if self._src_fd is not None:
+            return self._build_weight_map_fd()
         index = self.path / "model.safetensors.index.json"
         if index.exists():
             return json.loads(index.read_text())["weight_map"]
         single = self.path / "model.safetensors"
         if single.exists():
             from safetensors import safe_open
-
             with safe_open(str(single), framework="pt") as f:  # type: ignore[no-untyped-call]
                 return {k: "model.safetensors" for k in f.keys()}
         raise FileNotFoundError(f"no model.safetensors(.index.json) under {self.path}")
+
+    def _build_weight_map_fd(self) -> dict[str, str]:
+        """Build weight map using fd-backed reads (no path resolution)."""
+        try:
+            index_text = self._read_file_via_fd("model.safetensors.index.json")
+            weight_map = json.loads(index_text)["weight_map"]
+            # Validate: shard names must be basenames (no / or ..).
+            for shard in weight_map.values():
+                if "/" in shard or ".." in shard or os.path.isabs(shard):
+                    raise ValueError(f"invalid shard name in index: {shard!r}")
+            return weight_map
+        except FileNotFoundError:
+            pass
+        # Single-file model.
+        shard_fd = os.open(
+            "model.safetensors", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._src_fd
+        )
+        try:
+            st = os.fstat(shard_fd)
+            if (st.st_mode & 0o170000) != 0o100000:
+                raise OSError("model.safetensors is not a regular file")
+            fd_path = self._fd_path(shard_fd)
+            from safetensors import safe_open
+            with safe_open(fd_path, framework="pt") as f:  # type: ignore[no-untyped-call]
+                return {k: "model.safetensors" for k in f.keys()}
+        finally:
+            # safe_open may retain its own fd; close ours.
+            os.close(shard_fd)
+
+    @staticmethod
+    def _fd_path(fd: int) -> str:
+        """Platform-specific path for accessing a file via its fd."""
+        if sys.platform == "darwin":
+            return f"/dev/fd/{fd}"
+        return f"/proc/self/fd/{fd}"
+
+    def _handle(self, key: str):
+        from safetensors import safe_open
+
+        shard = self.weight_map[key]
+        # Validate basename.
+        if "/" in shard or ".." in shard or os.path.isabs(shard):
+            raise ValueError(f"invalid shard name: {shard!r}")
+        handle = self._handles.get(shard)
+        if handle is None:
+            if self._src_fd is not None:
+                shard_fd = os.open(
+                    shard, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._src_fd
+                )
+                st = os.fstat(shard_fd)
+                if (st.st_mode & 0o170000) != 0o100000:
+                    os.close(shard_fd)
+                    raise OSError(f"{shard} is not a regular file")
+                fd_path = self._fd_path(shard_fd)
+                handle = safe_open(fd_path, framework="pt")  # type: ignore[no-untyped-call]
+                # Note: safe_open duplicates the fd internally, so we can
+                # close ours. But we need to keep the shard_fd alive as
+                # long as the handle lives — safe_open should dup it.
+                os.close(shard_fd)
+            else:
+                handle = safe_open(str(self.path / shard), framework="pt")  # type: ignore[no-untyped-call]
+            self._handles[shard] = handle
+        return handle
 
     def keys(self) -> Iterable[str]:
         return self.weight_map.keys()
 
     def has(self, key: str) -> bool:
         return key in self.weight_map
-
-    def _handle(self, key: str):
-        from safetensors import safe_open
-
-        shard = self.weight_map[key]
-        handle = self._handles.get(shard)
-        if handle is None:
-            handle = safe_open(str(self.path / shard), framework="pt")  # type: ignore[no-untyped-call]
-            self._handles[shard] = handle
-        return handle
 
     def get_tensor(self, key: str) -> torch.Tensor:
         return self._handle(key).get_tensor(key)
