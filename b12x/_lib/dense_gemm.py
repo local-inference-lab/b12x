@@ -7335,6 +7335,17 @@ def dense_gemm(
             swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
+    c_row_stride_bytes = n * c_cutlass_dtype.width // 8
+    if (
+        (m > 1 or l > 1)
+        and not swap_ab
+        and c_row_stride_bytes % 16 != 0
+    ):
+        raise ValueError(
+            "the unswapped dense_gemm TMA epilogue requires a 16-byte-aligned "
+            f"C row stride, but N={n} and c_dtype={c_dtype!r} produce "
+            f"{c_row_stride_bytes} bytes; use swap_ab=True or pad N"
+        )
     if is_mxfp6:
         # Only the unswapped single-slice TMA mainloop is wired for the FP6
         # byte-container path; fail loudly instead of silently miscomputing.
