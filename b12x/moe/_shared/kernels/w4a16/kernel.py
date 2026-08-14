@@ -11267,6 +11267,7 @@ def run_w4a16_moe(
     fused_launch: W4A16FusedMoeCompileResult | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     route_block_size_m: int | None = None,
+    route_token_capacity: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
     a_input_up: torch.Tensor | None = None,
     full_rotation: bool = False,
@@ -11394,6 +11395,22 @@ def run_w4a16_moe(
 
     m, hidden_size = a_input.shape
     topk = int(topk_ids.shape[1])
+    if route_token_capacity is not None:
+        route_token_capacity = int(route_token_capacity)
+        if not full_rotation:
+            raise ValueError("route_token_capacity is only valid with full_rotation")
+        if route_token_capacity < max(int(m), 1):
+            raise ValueError(
+                "route_token_capacity is below the live token count: "
+                f"{route_token_capacity} < {int(m)}"
+            )
+    route_pack_max_tokens = route_token_capacity
+    if (
+        route_pack_max_tokens is None
+        and fused_launch is not None
+        and fused_launch.full_rotation
+    ):
+        route_pack_max_tokens = int(fused_launch.size_m)
     if tuple(topk_weights.shape) != (m, topk):
         raise ValueError(f"topk_weights must have shape {(m, topk)}")
     if int(prepared.hidden_size) != hidden_size:
@@ -11707,11 +11724,7 @@ def run_w4a16_moe(
                 packed_route_count=packed_route_count,
                 expert_offsets=expert_offsets,
                 expert_counts=expert_counts,
-                max_tokens=(
-                    int(fused_launch.size_m)
-                    if fused_launch is not None and fused_launch.full_rotation
-                    else None
-                ),
+                max_tokens=route_pack_max_tokens,
                 stream=stream,
             )
         )

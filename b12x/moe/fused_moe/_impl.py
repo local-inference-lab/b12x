@@ -91,8 +91,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -133,9 +132,7 @@ def _w4a16_route_pack_prewarm_specs(
         if full_rotation
         else (capacity_tokens,)
     )
-    route_ids_dtypes = (
-        (torch.int32, torch.int64) if full_rotation else (torch.int32,)
-    )
+    route_ids_dtypes = (torch.int32, torch.int64) if full_rotation else (torch.int32,)
     mapped_options = (False, True) if full_rotation else (False,)
     return tuple(
         (
@@ -152,6 +149,7 @@ def _w4a16_route_pack_prewarm_specs(
         for mapped in mapped_options
         for live_tokens in live_token_counts
     )
+
 
 # W4A8's unified dynamic specialization consumes an N256/K128 lane-major
 # weight representation.  Preparation is independent from scheduling: the
@@ -1081,6 +1079,9 @@ class TPMoEFP4Binding:
     # Re-running the live-batch heuristic here can select a smaller block than
     # the arena was sized for (for example, planned 64 versus live 48).
     route_block_size_m: int | None = None
+    # Full-rotation scratch plans own a fixed route-capacity specialization.
+    # Carry it independently from the live-M fused launch selection.
+    route_token_capacity: int | None = None
     route_expert_map: torch.Tensor | None = None
     output_expert_map: torch.Tensor | None = None
     fused_launch: object | None = None
@@ -2435,6 +2436,9 @@ def _build_tp_moe_fp4_binding_from_views(
             rotation_a_up=tensors.get("rotation_a_up"),
             kernel_workspace=tensors.get("kernel_workspace"),
             route_block_size_m=plan.route_block_size_m,
+            route_token_capacity=(
+                plan.routed_rows // plan.num_topk if plan.full_rotation else None
+            ),
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
             fused_launch=fused_launch,
@@ -10278,6 +10282,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "W4A16 TP MoE binding capacity is too small: "
                 f"capacity={binding.routed_rows_capacity}, requested={routed_rows}"
             )
+        route_token_capacity = binding.route_token_capacity if full_rotation else None
         intermediate_cache13 = _require_binding_field(binding, "intermediate_cache13")
         intermediate_cache2 = _require_binding_field(binding, "intermediate_cache2")
         fc1_c_tmp = _require_binding_field(binding, "fc1_c_tmp")
@@ -10339,6 +10344,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_block_size_m=binding.route_block_size_m,
+            route_token_capacity=route_token_capacity,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None
             ),
@@ -10578,8 +10584,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -10937,9 +10942,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current
