@@ -650,6 +650,13 @@ class UnifiedDecodeKernel:
         section_len: Int32,
         stride_kv_block: Int64,
     ):
+        # Physical slot capacity = floor(cache_bytes / block_stride) * page_size.
+        # floor (not ceil): a partial final block is not addressable.  Computed
+        # from the live cache tensor so it tracks replay-time geometry without a
+        # host sync.  Int64 arithmetic avoids overflow.  The cache tensor is a
+        # flat uint8 byte view so shape[0] is already bytes.
+        _cap_bytes = Int64(kv_cache_u8.shape[0])
+        slot_capacity = Int32(_cap_bytes // stride_kv_block) * Int32(self.page_block_size)
         t = self.traits
         L = self.layout
         tid = Int32(cute.arch.thread_idx()[0])
@@ -804,6 +811,7 @@ class UnifiedDecodeKernel:
                     g_end,
                     Int32(self.page_block_size),
                     stride_kv_block,
+                    slot_capacity,
                     io_lane,
                     bi=t.bi,
                     kv_smem_stride=staged_kv_stride,
@@ -977,6 +985,7 @@ class UnifiedDecodeKernel:
                         split_cand_end,
                         section_len,
                         sm_scale_log2,
+                        slot_capacity,
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
@@ -1088,6 +1097,7 @@ class UnifiedDecodeKernel:
                         split_cand_end,
                         section_len,
                         sm_scale_log2,
+                        slot_capacity,
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
@@ -1424,6 +1434,18 @@ class UnifiedDecodeKernel:
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
     ):
+        # Physical slot capacity = floor(cache_bytes / block_stride) * page_size.
+        # floor (not ceil): a partial final block is not addressable.  Computed
+        # from the live cache tensor so it tracks replay-time geometry without a
+        # host sync.  Int64 arithmetic avoids overflow.  The cache tensor is a
+        # flat uint8 byte view so shape[0] is already bytes.
+        _cap_bytes = Int64(kv_cache_u8.shape[0])
+        slot_capacity = Int32(_cap_bytes // stride_kv_block) * Int32(self.page_block_size)
+        if cutlass.const_expr(has_extra):
+            _ecap_bytes = Int64(extra_kv_cache_u8.shape[0])
+            extra_slot_capacity = Int32(_ecap_bytes // stride_extra_kv_block) * Int32(self.pbs_extra)
+        else:
+            extra_slot_capacity = slot_capacity
         t = self.traits
         L = self.layout
         tid = Int32(cute.arch.thread_idx()[0])
@@ -1686,6 +1708,7 @@ class UnifiedDecodeKernel:
                             g_end,
                             Int32(self.pbs_extra),
                             stride_extra_kv_block,
+                            extra_slot_capacity,
                             io_lane,
                             **io_kw,
                         )
@@ -1706,6 +1729,7 @@ class UnifiedDecodeKernel:
                             g_end,
                             Int32(self.page_block_size),
                             stride_kv_block,
+                            slot_capacity,
                             io_lane,
                             **io_kw,
                         )
@@ -1726,6 +1750,7 @@ class UnifiedDecodeKernel:
                         g_end,
                         Int32(self.page_block_size),
                         stride_kv_block,
+                        slot_capacity,
                         io_lane,
                         **io_kw,
                     )
@@ -1929,10 +1954,12 @@ class UnifiedDecodeKernel:
                     )
                     sc_start = split_cand_start
                     sec_len = section_len
+                    s3_cap = slot_capacity
                     if cutlass.const_expr(has_extra):
                         if ci >= num_main_chunks:
                             sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
                             sec_len = extra_section_len
+                            s3_cap = extra_slot_capacity
                     sc_end = sc_start + Int32(_CAND_WINDOW)
                     if sc_end > sec_len:
                         sc_end = sec_len
@@ -1944,6 +1971,7 @@ class UnifiedDecodeKernel:
                         sc_end,
                         sec_len,
                         sm_scale_log2,
+                        s3_cap,
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
@@ -2057,9 +2085,11 @@ class UnifiedDecodeKernel:
                     if cutlass.const_expr(has_extra):
                         sc_start = split_cand_start
                         sec_len = section_len
+                        s3_cap = slot_capacity
                         if ci >= num_main_chunks:
                             sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
                             sec_len = extra_section_len
+                            s3_cap = extra_slot_capacity
                         sc_end = sc_start + Int32(_CAND_WINDOW)
                         if sc_end > sec_len:
                             sc_end = sec_len
@@ -2071,6 +2101,7 @@ class UnifiedDecodeKernel:
                             sc_end,
                             sec_len,
                             sm_scale_log2,
+                            s3_cap,
                             lane,
                         )
                     else:
@@ -2085,6 +2116,7 @@ class UnifiedDecodeKernel:
                             split_cand_end,
                             section_len,
                             sm_scale_log2,
+                            slot_capacity,
                             lane,
                         )
 

@@ -119,6 +119,101 @@ def _validate_tensor_storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
         )
 
 
+def _sparse_mla_slot_capacity(
+    kv_cache: torch.Tensor, page_size: int
+) -> int:
+    """Physical token-slot capacity of a sparse/compressed MLA KV cache.
+
+    Rank-3 [num_pages, page_size, record_bytes] and rank-2 [num_pages,
+    page_bytes] layouts are both supported.  The capacity is the total number
+    of addressable token slots (num_pages * page_size); the in-kernel gather
+    clamps any live index >= capacity to a safe sentinel.
+    """
+    page_size = int(page_size)
+    if kv_cache.ndim == 3:
+        num_pages = int(kv_cache.shape[0])
+        # The middle dim SHOULD equal page_size, but packed vLLM views may
+        # stride differently; the product of the leading dim is the capacity.
+        return num_pages * page_size
+    if kv_cache.ndim == 2:
+        # Compressed MLA byte view: [num_pages, page_bytes].
+        num_pages = int(kv_cache.shape[0])
+        return num_pages * page_size
+    # Flat 1-D view (already reshaped by _cache_base_tensor).
+    return int(kv_cache.numel()) // page_size if page_size > 0 else int(kv_cache.numel())
+
+
+def _validate_sparse_mla_index_bounds(
+    selected_indices: torch.Tensor,
+    active_token_counts: torch.Tensor,
+    slot_capacity: int,
+    *,
+    is_graph_capture: bool,
+) -> None:
+    """Fail-closed validation that every LIVE positive selected index is < capacity.
+
+    Negative sentinels (-1) are the contractual invalid marker and are retained
+    (the kernel masks them).  High positive indices >= capacity are rejected
+    because they would cause out-of-bounds GPU reads.
+
+    A zero-capacity cache with any non-sentinel index is rejected pre-capture.
+
+    This validation is SKIPPED during CUDA graph capture/replay to avoid a
+    host-device sync; the in-kernel ``slot_capacity`` bound dominates in that
+    path (it is computed from the live cache tensor shape at replay time).
+    """
+    if is_graph_capture:
+        return
+    if selected_indices.numel() == 0:
+        return
+    # Zero-capacity cache: reject if any non-sentinel index exists.
+    if slot_capacity <= 0:
+        positive = selected_indices[selected_indices >= 0]
+        if positive.numel() > 0:
+            raise ValueError(
+                "sparse MLA cache has zero slot capacity but contains "
+                f"{positive.numel()} non-sentinel indices; would cause "
+                "out-of-bounds GPU reads"
+            )
+        return
+    # Mask by active_token_counts: only check indices within the live per-token
+    # length. Entries past the length are padding and may contain stale indices.
+    rows, width = selected_indices.shape
+    has_live_mask = (
+        active_token_counts is not None
+        and active_token_counts.numel() == rows
+    )
+    if has_live_mask:
+        lengths_cpu = active_token_counts.clamp(min=0, max=width)
+        # Check each row's live prefix for OOB positive indices.
+        for row in range(rows):
+            live_len = int(lengths_cpu[row].item())
+            if live_len <= 0:
+                continue
+            row_indices = selected_indices[row, :live_len]
+            positive = row_indices[row_indices >= 0]
+            if positive.numel() == 0:
+                continue
+            max_idx = int(positive.max().item())
+            if max_idx >= slot_capacity:
+                raise ValueError(
+                    f"sparse MLA selected index {max_idx} in row {row} "
+                    f"exceeds cache slot capacity {slot_capacity} "
+                    f"(num_pages * page_size); high positive indices "
+                    f"would cause out-of-bounds GPU reads"
+                )
+    else:
+        positive = selected_indices[selected_indices >= 0]
+        if positive.numel() == 0:
+            return
+        max_idx = int(positive.max().item())
+        if max_idx >= slot_capacity:
+            raise ValueError(
+                f"sparse MLA selected index {max_idx} exceeds cache slot capacity "
+                f"{slot_capacity} (num_pages * page_size); high positive indices "
+                f"would cause out-of-bounds GPU reads"
+            )
+
 def _is_supported_packed_kv_cache_view(
     tensor: torch.Tensor,
     *,
@@ -682,6 +777,17 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
+    # Fail-closed: reject high positive indices that exceed the physical cache
+    # slot capacity.  Negative sentinels (-1) are the contractual invalid
+    # marker and are retained.  The in-kernel slot_capacity bound dominates
+    # during CUDA graph replay (computed from the live cache tensor shape).
+    _slot_cap = _sparse_mla_slot_capacity(kv_cache, int(workspace.page_size))
+    _validate_sparse_mla_index_bounds(
+        selected_indices,
+        active_token_counts,
+        _slot_cap,
+        is_graph_capture=_is_cuda_graph_capture_active(q_all.device),
+    )
     if _sm120_route:
         q_head_dim = int(q_all.shape[-1])
         if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:

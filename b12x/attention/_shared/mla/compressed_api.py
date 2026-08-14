@@ -226,6 +226,31 @@ def compressed_mla_decode_forward(
         + (indexed_indices_2d.shape[1] if has_indexed else 0),
     )
 
+    # Fail-closed: reject high positive indices that exceed the physical cache
+    # slot capacity.  Negative sentinels (-1) are retained.  The in-kernel
+    # slot_capacity bound dominates during CUDA graph replay.
+    from .api import (
+        _is_cuda_graph_capture_active,
+        _sparse_mla_slot_capacity,
+        _validate_sparse_mla_index_bounds,
+    )
+
+    _is_capture = _is_cuda_graph_capture_active(q3.device)
+    _swa_cap = _sparse_mla_slot_capacity(swa_k_cache, int(swa_page_size))
+    _validate_sparse_mla_index_bounds(
+        swa_indices_2d, swa_topk_lengths, _swa_cap, is_graph_capture=_is_capture
+    )
+    if has_indexed:
+        _idx_cap = _sparse_mla_slot_capacity(
+            indexed_k_cache, int(indexed_page_size)
+        )
+        _validate_sparse_mla_index_bounds(
+            indexed_indices_2d,
+            indexed_topk_lengths,
+            _idx_cap,
+            is_graph_capture=_is_capture,
+        )
+
     if out is not None:
         _validate_compressed_mla_out(out, q3=q3)
 

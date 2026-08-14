@@ -40,6 +40,8 @@ _NVFP4_IO_STRIDE = 432
 _NVFP4_NOPE_SCALE_BYTES = 288
 _NVFP4_FP8_ROPE_IO_STRIDE = 368
 
+# Default smem addr for the optional kv_sc dst (unused when no footer/latent scale).
+_DEFAULT_KV_SC_ADDR = Int32(0)
 
 @cute.jit
 def io_issue_gather_dsv4_nope(
@@ -52,6 +54,7 @@ def io_issue_gather_dsv4_nope(
     g_end: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     io_lane: Int32,
     cache_policy: Uint64,
     *,
@@ -79,8 +82,7 @@ def io_issue_gather_dsv4_nope(
                 idx_raw = Int32(topk_indices[cand_pos])
 
             f0 = Uint32(0)
-            f1 = Uint32(0)
-            if idx_raw >= Int32(0):
+            if (idx_raw >= Int32(0)) & (idx_raw < slot_capacity):
                 block_idx = idx_raw // page_block_size
                 local_idx = idx_raw - block_idx * page_block_size
                 scale_base_off = (
@@ -113,7 +115,7 @@ def io_issue_gather_dsv4_nope(
             if cand_pos < g_end:
                 idx_raw = Int32(topk_indices[cand_pos])
             idx = idx_raw
-            if idx < Int32(0):
+            if (idx < Int32(0)) | (idx >= slot_capacity):
                 idx = Int32(0)
             block_idx = idx // page_block_size
             local_idx = idx - block_idx * page_block_size
@@ -138,6 +140,7 @@ def io_issue_gather_glm_mg(
     g_end: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     io_lane: Int32,
     cache_policy: Uint64,
     *,
@@ -147,7 +150,7 @@ def io_issue_gather_glm_mg(
     scale_format: cutlass.Constexpr = 1,
     fp8_rope: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
-    kv_sc_dst_addr: Int32 = Int32(0),
+    kv_sc_dst_addr: Int32 = _DEFAULT_KV_SC_ADDR,
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -188,7 +191,7 @@ def io_issue_gather_glm_mg(
                 if cand_pos < g_end:
                     idx_raw = Int32(topk_indices[cand_pos])
                 f1 = Uint32(0)
-                if idx_raw >= Int32(0):
+                if (idx_raw >= Int32(0)) & (idx_raw < slot_capacity):
                     block_idx = idx_raw // page_block_size
                     local_idx = idx_raw - block_idx * page_block_size
                     scale_base_off = (
@@ -216,7 +219,7 @@ def io_issue_gather_glm_mg(
             if cand_pos < g_end:
                 idx_raw = Int32(topk_indices[cand_pos])
             idx = idx_raw
-            if idx < Int32(0):
+            if (idx < Int32(0)) | (idx >= slot_capacity):
                 idx = Int32(0)
             block_idx = idx // page_block_size
             local_idx = idx - block_idx * page_block_size

@@ -100,6 +100,7 @@ def io_issue_gather(
     g_end: Int32,  # min(g_start + CAND_WINDOW, section_len)
     page_block_size: Int32,  # pbs: tokens per paged block (THIS section)
     stride_kv_block: Int64,  # per-block byte stride in gmem (THIS section)
+    slot_capacity: Int32,  # physical token-slot upper bound for THIS section
     io_lane: Int32,  # lane within the IO warp [0, 32)
     *,
     bi: cutlass.Constexpr,  # 64
@@ -186,7 +187,7 @@ def io_issue_gather(
     def _issue_payload_entry(entry: Int32, idx_raw: Int32):
         full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
         idx = idx_raw
-        if idx < Int32(0):
+        if (idx < Int32(0)) | (idx >= slot_capacity):
             idx = Int32(0)
         block_idx = idx // _section_pbs
         local_idx = idx - block_idx * _section_pbs
@@ -231,7 +232,7 @@ def io_issue_gather(
                 if cand_pos < g_end:
                     idx_raw = Int32(_section_idx[cand_pos])
                 idx = idx_raw
-                if idx < Int32(0):
+                if (idx < Int32(0)) | (idx >= slot_capacity):
                     idx = Int32(0)
                 block_idx = idx // _section_pbs
                 local_idx = idx - block_idx * _section_pbs
@@ -288,7 +289,7 @@ def io_issue_gather(
 
         overlap_f0 = Uint32(0)
         overlap_f1 = Uint32(0)
-        if overlap_idx_raw >= Int32(0):
+        if (overlap_idx_raw >= Int32(0)) & (overlap_idx_raw < slot_capacity):
             overlap_block_idx = overlap_idx_raw // _section_pbs
             overlap_local_idx = overlap_idx_raw - overlap_block_idx * _section_pbs
             overlap_scale_base_off = (
@@ -325,7 +326,7 @@ def io_issue_gather(
                 # footer (inline scales travel in the kv_fp8 nope bulk).
                 f0 = Uint32(0)
                 f1 = Uint32(0)
-                if idx_raw >= Int32(0):
+                if (idx_raw >= Int32(0)) & (idx_raw < slot_capacity):
                     block_idx = idx_raw // _section_pbs
                     local_idx = idx_raw - block_idx * _section_pbs
                     scale_base_off = (
@@ -347,7 +348,7 @@ def io_issue_gather(
                 # pair at [288, 296) (rope scale, latent scale) and keep the
                 # second word -- same nc.v2 pattern as the DSV4 footer.
                 f1 = Uint32(0)
-                if idx_raw >= Int32(0):
+                if (idx_raw >= Int32(0)) & (idx_raw < slot_capacity):
                     block_idx = idx_raw // _section_pbs
                     local_idx = idx_raw - block_idx * _section_pbs
                     scale_base_off = (

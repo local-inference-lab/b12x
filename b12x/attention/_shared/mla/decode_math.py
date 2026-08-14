@@ -1139,6 +1139,7 @@ def s3_mask_and_scale(
     split_cand_end: Int32,  # min(start + CAND_WINDOW, section_len)
     section_len: Int32,
     sm_scale_log2: Float32,  # sm_scale * LOG2E
+    slot_capacity: Int32,  # physical token-slot upper bound
     lane: Int32,
 ):
     """S3: mask + base-2 prescale. Validity = staged token index (gap #9).
@@ -1165,10 +1166,10 @@ def s3_mask_and_scale(
     if abs_c1 < section_len:
         idx1 = Int32(sTokenIdx[c1])
 
-    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+    if abs_c0 >= split_cand_end or (idx0 < Int32(0)) | (idx0 >= slot_capacity):
         qk[0] = Float32(_QK_MASK)
         qk[2] = Float32(_QK_MASK)
-    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+    if abs_c1 >= split_cand_end or (idx1 < Int32(0)) | (idx1 >= slot_capacity):
         qk[1] = Float32(_QK_MASK)
         qk[3] = Float32(_QK_MASK)
 
@@ -1188,6 +1189,7 @@ def s3_mask_and_scale_glm_h8_swap_ab(
     split_cand_end: Int32,
     section_len: Int32,
     sm_scale_log2: Float32,
+    slot_capacity: Int32,
     lane: Int32,
 ):
     """Mask the two candidate rows owned by a swapped GLM TP8 fragment."""
@@ -1204,10 +1206,10 @@ def s3_mask_and_scale_glm_h8_swap_ab(
     if abs_c1 < section_len:
         idx1 = Int32(sTokenIdx[c1])
 
-    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+    if abs_c0 >= split_cand_end or (idx0 < Int32(0)) | (idx0 >= slot_capacity):
         qk[0] = Float32(_QK_MASK)
         qk[1] = Float32(_QK_MASK)
-    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+    if abs_c1 >= split_cand_end or (idx1 < Int32(0)) | (idx1 >= slot_capacity):
         qk[2] = Float32(_QK_MASK)
         qk[3] = Float32(_QK_MASK)
 

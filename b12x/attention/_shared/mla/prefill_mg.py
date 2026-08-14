@@ -116,9 +116,9 @@ def s3_mask_and_scale_global(
     split_cand_end: Int32,
     section_len: Int32,
     sm_scale_log2: Float32,
+    slot_capacity: Int32,
     lane: Int32,
 ):
-    """FI-shaped S3: validate candidates from the global selected-index row."""
     tid = lane & Int32(3)
     c0 = warp_first_cand + tid * Int32(2)
     c1 = c0 + Int32(1)
@@ -132,10 +132,10 @@ def s3_mask_and_scale_global(
     if abs_c1 < section_len:
         idx1 = _ld_global_index_i32(index_base_ptr, c1)
 
-    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+    if abs_c0 >= split_cand_end or (idx0 < Int32(0)) | (idx0 >= slot_capacity):
         qk[0] = Float32(-1.0e30)
         qk[2] = Float32(-1.0e30)
-    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+    if abs_c1 >= split_cand_end or (idx1 < Int32(0)) | (idx1 >= slot_capacity):
         qk[1] = Float32(-1.0e30)
         qk[3] = Float32(-1.0e30)
 
@@ -242,15 +242,15 @@ def _dsv4_record_off(
 
 @cute.jit
 def _dsv4_rope_base_off(
-    idx: Int32, page_block_size: Int32, stride_kv_block: Int64
+    idx: Int32, page_block_size: Int32, stride_kv_block: Int64,
+    slot_capacity: Int32,
 ) -> Int64:
     """Full DSV4 RoPE-record offset used by the QK prefetch paths."""
-    if idx < Int32(0):
+    if (idx < Int32(0)) | (idx >= slot_capacity):
         idx = Int32(0)
     return _dsv4_record_off(idx, page_block_size, stride_kv_block) + Int64(
         _DSV4_ROPE_GMEM_OFFSET
     )
-
 
 @cute.jit
 def _ld_global_dsv4_rope_b16(
@@ -258,9 +258,10 @@ def _ld_global_dsv4_rope_b16(
     idx: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
 ) -> Uint32:
     out = Uint32(0)
-    if idx >= Int32(0):
+    if (idx >= Int32(0)) & (idx < slot_capacity):
         byte_off = _dsv4_record_off(idx, page_block_size, stride_kv_block)
         out = ld_global_b16(rope_dim_ptr + byte_off)
     return out
@@ -276,6 +277,7 @@ def s2_qk_rope_global_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     d_rope: cutlass.Constexpr,
 ):
@@ -285,7 +287,7 @@ def s2_qk_rope_global_dsv4(
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
     idx = _ld_global_index_i32(index_base_ptr, entry)
-    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
+    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block, slot_capacity)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -320,6 +322,7 @@ def s2_qk_rope_global_mg_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     d_rope: cutlass.Constexpr,
     q_rope_stride: cutlass.Constexpr,
@@ -343,7 +346,7 @@ def s2_qk_rope_global_mg_dsv4(
     a_col = (lane >> Int32(4)) * Int32(8)
     entry = warp_first_cand + gid
     idx = _ld_global_index_i32(index_base_ptr, entry)
-    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
+    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block, slot_capacity)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -384,9 +387,10 @@ def s2_qk_rope_global_mg_dsv4(
 # =============================================================================
 @cute.jit
 def _glm_rope_base_off(
-    idx: Int32, page_block_size: Int32, stride_kv_block: Int64
+    idx: Int32, page_block_size: Int32, stride_kv_block: Int64,
+    slot_capacity: Int32,
 ) -> Int64:
-    if idx < Int32(0):
+    if (idx < Int32(0)) | (idx >= slot_capacity):
         idx = Int32(0)
     block_idx = idx // page_block_size
     local_idx = idx - block_idx * page_block_size
@@ -396,16 +400,16 @@ def _glm_rope_base_off(
         + Int64(_GLM_ROPE_GMEM_OFFSET)
     )
 
-
 @cute.jit
 def _nvfp4_rope_base_off(
     idx: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     fp8_rope: cutlass.Constexpr = False,
 ) -> Int64:
-    if idx < Int32(0):
+    if (idx < Int32(0)) | (idx >= slot_capacity):
         idx = Int32(0)
     block_idx = idx // page_block_size
     local_idx = idx - block_idx * page_block_size
@@ -459,6 +463,7 @@ def s2_qk_rope_regs_mg_glm(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
@@ -486,10 +491,11 @@ def s2_qk_rope_regs_mg_glm(
             idx,
             page_block_size,
             stride_kv_block,
+            slot_capacity,
             fp8_rope=fp8_rope,
         )
     else:
-        rope_base = _glm_rope_base_off(idx, page_block_size, stride_kv_block)
+        rope_base = _glm_rope_base_off(idx, page_block_size, stride_kv_block, slot_capacity)
     hi0 = cutlass.const_expr(valid_hpb > 8)
 
     if cutlass.const_expr(scale_format == 2 and fp8_rope):
@@ -1213,6 +1219,7 @@ def s2_qk_rope_regs_mg_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     d_rope: cutlass.Constexpr,
     n_hg: cutlass.Constexpr = 2,
@@ -1222,7 +1229,7 @@ def s2_qk_rope_regs_mg_dsv4(
     tid = lane & Int32(3)
     entry = warp_first_cand + gid
     idx = _ld_global_index_i32(index_base_ptr, entry)
-    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block)
+    rope_base = _dsv4_rope_base_off(idx, page_block_size, stride_kv_block, slot_capacity)
 
     for ks in cutlass.range_constexpr(d_rope // 16):
         ko = Int32(ks) * Int32(16)
@@ -1277,6 +1284,7 @@ def s6b_xv_rope_global_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     bi: cutlass.Constexpr,
     d_rope: cutlass.Constexpr,
@@ -1305,16 +1313,16 @@ def s6b_xv_rope_global_dsv4(
         idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
         idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
         v0 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx0, page_block_size, stride_kv_block
+            rope_dim_ptr, idx0, page_block_size, stride_kv_block, slot_capacity
         )
         v1 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx1, page_block_size, stride_kv_block
+            rope_dim_ptr, idx1, page_block_size, stride_kv_block, slot_capacity
         )
         v8 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx8, page_block_size, stride_kv_block
+            rope_dim_ptr, idx8, page_block_size, stride_kv_block, slot_capacity
         )
         v9 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx9, page_block_size, stride_kv_block
+            rope_dim_ptr, idx9, page_block_size, stride_kv_block, slot_capacity
         )
         b0 = v0 | (v1 << Uint32(16))
         b1 = v8 | (v9 << Uint32(16))
@@ -1337,6 +1345,7 @@ def s6b_xv_rope_global_mg_dsv4(
     lane: Int32,
     page_block_size: Int32,
     stride_kv_block: Int64,
+    slot_capacity: Int32,
     *,
     bi: cutlass.Constexpr,
     sm_p_stride: cutlass.Constexpr,
@@ -1411,16 +1420,16 @@ def s6b_xv_rope_global_mg_dsv4(
         idx8 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(8))
         idx9 = _ld_global_index_i32(index_base_ptr, ent0 + Int32(9))
         v0 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx0, page_block_size, stride_kv_block
+            rope_dim_ptr, idx0, page_block_size, stride_kv_block, slot_capacity
         )
         v1 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx1, page_block_size, stride_kv_block
+            rope_dim_ptr, idx1, page_block_size, stride_kv_block, slot_capacity
         )
         v8 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx8, page_block_size, stride_kv_block
+            rope_dim_ptr, idx8, page_block_size, stride_kv_block, slot_capacity
         )
         v9 = _ld_global_dsv4_rope_b16(
-            rope_dim_ptr, idx9, page_block_size, stride_kv_block
+            rope_dim_ptr, idx9, page_block_size, stride_kv_block, slot_capacity
         )
         b0 = v0 | (v1 << Uint32(16))
         b1 = v8 | (v9 << Uint32(16))
@@ -2481,6 +2490,19 @@ class UnifiedPrefillMGKernel:
             extra_section_len = section_len
             loop_tiles = actual_tiles
 
+        # Physical slot capacity = floor(cache_bytes / block_stride) * page_size.
+        # floor (not ceil): a partial final block is not addressable.  Computed
+        # from the live cache tensor so it tracks replay-time geometry without a
+        # host sync.  Int64 arithmetic avoids overflow.  The cache tensor is a
+        # flat uint8 byte view so shape[0] is already bytes.
+        _cap_bytes = Int64(kv_cache_u8.shape[0])
+        slot_capacity = Int32(_cap_bytes // stride_kv_block) * Int32(self.page_block_size)
+        if cutlass.const_expr(has_extra):
+            _ecap_bytes = Int64(extra_kv_cache_u8.shape[0])
+            extra_slot_capacity = Int32(_ecap_bytes // stride_extra_kv_block) * Int32(self.pbs_extra)
+        else:
+            extra_slot_capacity = slot_capacity
+
         topk_row = cute.make_tensor(
             indices.iterator + token_idx.to(Int64) * Int64(self.indices_stride_row),
             cute.make_layout(self.topk),
@@ -2530,6 +2552,7 @@ class UnifiedPrefillMGKernel:
                         g_end0,
                         Int32(self.page_block_size),
                         stride_kv_block,
+                        slot_capacity,
                         io_lane,
                         kv_l2_policy,
                         bi=t.bi,
@@ -2551,6 +2574,7 @@ class UnifiedPrefillMGKernel:
                         g_end0,
                         Int32(self.page_block_size),
                         stride_kv_block,
+                        slot_capacity,
                         io_lane,
                         kv_l2_policy,
                         bi=t.bi,
@@ -2588,6 +2612,7 @@ class UnifiedPrefillMGKernel:
                                 g_end,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
+                                extra_slot_capacity,
                                 io_lane,
                                 kv_l2_policy,
                                 bi=t.bi,
@@ -2609,6 +2634,7 @@ class UnifiedPrefillMGKernel:
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
+                                slot_capacity,
                                 io_lane,
                                 kv_l2_policy,
                                 bi=t.bi,
@@ -2630,6 +2656,7 @@ class UnifiedPrefillMGKernel:
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
+                                slot_capacity,
                                 io_lane,
                                 kv_l2_policy,
                                 bi=t.bi,
@@ -2651,6 +2678,7 @@ class UnifiedPrefillMGKernel:
                                 g_end,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
+                                slot_capacity,
                                 io_lane,
                                 kv_l2_policy,
                                 bi=t.bi,
@@ -2867,11 +2895,13 @@ class UnifiedPrefillMGKernel:
                 # / sec_len_now are the literal main expressions, exactly as today).
                 split_cand_start = ci * Int32(_CAND_WINDOW)
                 sec_len_now = section_len
+                sec_cap = slot_capacity
                 if cutlass.const_expr(has_extra):
                     if ci >= num_main_tiles:
                         cis = ci - num_main_tiles
                         split_cand_start = cis * Int32(_CAND_WINDOW)
                         sec_len_now = extra_section_len
+                        sec_cap = extra_slot_capacity
                 split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
                 if split_cand_end > sec_len_now:
                     split_cand_end = sec_len_now
@@ -2949,6 +2979,7 @@ class UnifiedPrefillMGKernel:
                         lane,
                         rope_pbs,
                         rope_stride,
+                        sec_cap,
                         d_rope=t.d_rope,
                         n_hg=n_hg,
                         valid_hpb=self.valid_hpb,
@@ -2983,7 +3014,8 @@ class UnifiedPrefillMGKernel:
                     rope_entry = warp_first_cand + (lane >> Int32(2))
                     rope_idx = _ld_global_index_i32(index_base_ptr, rope_entry)
                     rope_base = _dsv4_rope_base_off(
-                        rope_idx, Int32(self.page_block_size), stride_kv_block
+                        rope_idx, Int32(self.page_block_size), stride_kv_block,
+                        sec_cap,
                     )
                     rope_base_ptr = get_ptr_as_int64(kv_cache_u8, rope_base)
                     if cutlass.const_expr(has_extra):
@@ -2992,6 +3024,7 @@ class UnifiedPrefillMGKernel:
                                 rope_idx,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
+                                sec_cap,
                             )
                             rope_base_ptr = get_ptr_as_int64(
                                 extra_kv_cache_u8, rope_base
@@ -3119,6 +3152,7 @@ class UnifiedPrefillMGKernel:
                             lane,
                             rope_pbs,
                             rope_stride,
+                            sec_cap,
                             d_rope=t.d_rope,
                             n_hg=n_hg,
                             valid_hpb=self.valid_hpb,
@@ -3139,7 +3173,7 @@ class UnifiedPrefillMGKernel:
                             warp_first_cand,
                             lane,
                             rope_pbs,
-                            rope_stride,
+                            sec_cap,
                             d_rope=t.d_rope,
                             q_rope_stride=L.q_rope_stride,
                             n_hg=n_hg,
@@ -3153,6 +3187,7 @@ class UnifiedPrefillMGKernel:
                     split_cand_end,
                     sec_len_now,
                     sm_scale_log2,
+                    sec_cap,
                     lane,
                 )
                 if cutlass.const_expr(n_hg == 2):
@@ -3164,6 +3199,7 @@ class UnifiedPrefillMGKernel:
                         split_cand_end,
                         sec_len_now,
                         sm_scale_log2,
+                        sec_cap,
                         lane,
                     )
                 p0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
@@ -3409,6 +3445,7 @@ class UnifiedPrefillMGKernel:
                                 lane,
                                 Int32(self.pbs_extra),
                                 stride_extra_kv_block,
+                                extra_slot_capacity,
                                 bi=t.bi,
                                 sm_p_stride=L.sm_p_full_stride,
                                 hpb=t.hpb,
@@ -3431,6 +3468,7 @@ class UnifiedPrefillMGKernel:
                                 lane,
                                 Int32(self.page_block_size),
                                 stride_kv_block,
+                                slot_capacity,
                                 bi=t.bi,
                                 sm_p_stride=L.sm_p_full_stride,
                                 hpb=t.hpb,
@@ -3451,6 +3489,9 @@ class UnifiedPrefillMGKernel:
                             index_base_ptr,
                             warp_id,
                             lane,
+                            rope_pbs,
+                            rope_stride,
+                            sec_cap,
                             rope_pbs,
                             rope_stride,
                             bi=t.bi,
