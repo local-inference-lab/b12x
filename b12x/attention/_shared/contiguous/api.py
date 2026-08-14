@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping, Sequence
+import threading
 from dataclasses import dataclass, field
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int32
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover - triton is optional at import time
+    triton = None
+    tl = None
+
 
 from b12x.attention._shared.contiguous.forward import (
     ContiguousAttentionForwardKernel,
@@ -27,6 +36,247 @@ from b12x._lib.scratch import (
 
 
 _ARENA_ALIGN_BYTES = 1024
+_VARLEN_CAPTURE_PREWARMED: set[tuple[object, ...]] = set()
+_VARLEN_CAPTURE_PREWARM_LOCK = threading.Lock()
+
+if triton is not None and tl is not None:
+
+    @triton.jit(do_not_specialize=["q_rows", "k_rows", "max_seqlen_q", "max_seqlen_k"])
+    def _varlen_cu_seqlens_guard_kernel(
+        cu_q_ptr,
+        cu_k_ptr,
+        status_ptr,
+        q_rows,
+        k_rows,
+        max_seqlen_q,
+        max_seqlen_k,
+        NUM: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Validate caller-owned cumulative offsets on device; neutralize on failure.
+
+        Reads the guard copies of ``cu_seqlens_q``/``cu_seqlens_k`` (already
+        copied from the caller's live tensors), enforces ``cu[0] == 0``,
+        nondecreasing adjacent entries, ``cu[-1]`` equal to the exact packed
+        row extent, and per-segment lengths within the compiled maxima.  On any
+        violation it writes a nonzero status and zero-fills both guard buffers
+        so every segment becomes empty and the attention kernel performs no
+        out-of-bounds address use.  All arithmetic uses 64-bit row ids.
+        """
+        offs = tl.arange(0, BLOCK)
+        mask = offs < NUM
+        cu_q = tl.load(cu_q_ptr + offs, mask=mask, other=0).to(tl.int64)
+        cu_k = tl.load(cu_k_ptr + offs, mask=mask, other=0).to(tl.int64)
+
+        # Start with 0 (valid) for masked lanes so they don't inflate the sum.
+        invalid = tl.zeros((BLOCK,), dtype=tl.int32)
+        first = offs == 0
+        last = offs == (NUM - 1)
+        nxt = offs + 1
+        interior = mask & (nxt < NUM)
+
+        # Non-negative offsets everywhere (only for real lanes).
+        invalid = tl.where(
+            mask, tl.where((cu_q < 0) | (cu_k < 0), invalid + 1, invalid), invalid
+        )
+        # Zero starts.
+        invalid = tl.where(
+            first, tl.where((cu_q != 0) | (cu_k != 0), invalid + 1, invalid), invalid
+        )
+
+        cu_q_nxt = tl.load(cu_q_ptr + nxt, mask=interior, other=0).to(tl.int64)
+        cu_k_nxt = tl.load(cu_k_ptr + nxt, mask=interior, other=0).to(tl.int64)
+        # Nondecreasing adjacent entries.
+        invalid = tl.where(
+            interior,
+            tl.where((cu_q_nxt < cu_q) | (cu_k_nxt < cu_k), invalid + 1, invalid),
+            invalid,
+        )
+        # Per-segment lengths within [0, max_seqlen].
+        seg_q = tl.where(interior, cu_q_nxt - cu_q, 0)
+        seg_k = tl.where(interior, cu_k_nxt - cu_k, 0)
+        invalid = tl.where(
+            interior,
+            tl.where((seg_q > max_seqlen_q) | (seg_k > max_seqlen_k), invalid + 1, invalid),
+            invalid,
+        )
+        # Exact final packed extents.
+        invalid = tl.where(
+            last, tl.where((cu_q != q_rows) | (cu_k != k_rows), invalid + 1, invalid), invalid
+        )
+
+        all_valid = tl.sum(invalid, axis=0) == 0
+        tl.store(status_ptr, tl.where(all_valid, 0, 1))
+        keep = tl.where(all_valid, 1, 0)
+        out_q = tl.where(keep == 1, cu_q.to(tl.int32), tl.zeros((BLOCK,), dtype=tl.int32))
+        out_k = tl.where(keep == 1, cu_k.to(tl.int32), tl.zeros((BLOCK,), dtype=tl.int32))
+        tl.store(cu_q_ptr + offs, out_q, mask=mask)
+        tl.store(cu_k_ptr + offs, out_k, mask=mask)
+
+
+def _run_varlen_cu_seqlens_guard(
+    *,
+    cu_seqlens_q_guard: torch.Tensor,
+    cu_seqlens_k_guard: torch.Tensor,
+    metadata_status: torch.Tensor,
+    q_rows: int,
+    k_rows: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_batch: int,
+) -> None:
+    """Launch the on-device cumulative-offset guard on the current CUDA stream.
+
+    Allocation-free at replay: every buffer is caller-owned planned scratch.
+    No host synchronization is performed.
+    """
+    if triton is None:
+        raise RuntimeError(
+            "varlen cumulative-offset device guard requires triton, which is "
+            "unavailable"
+        )
+    num = int(num_batch) + 1
+    block = triton.next_power_of_2(max(num, 1))
+    _varlen_cu_seqlens_guard_kernel[(1,)](
+        cu_seqlens_q_guard,
+        cu_seqlens_k_guard,
+        metadata_status,
+        int(q_rows),
+        int(k_rows),
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        NUM=num,
+        BLOCK=block,
+    )
+
+if triton is not None and tl is not None:
+
+    @triton.jit
+    def _varlen_output_sanitizer_kernel(
+        output_ptr,
+        lse_ptr,
+        status_ptr,
+        total_q_rows: tl.constexpr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        OUTPUT_BLOCK: tl.constexpr,
+    ):
+        """Conditionally neutralize output and LSE when metadata is invalid.
+
+        Reads ``status_ptr``; if nonzero, writes zeros to ``output_ptr`` and
+        ``-inf`` to ``lse_ptr`` so the caller never receives stale/uninitialized
+        data.  Runs on the same stream after the attention kernel.
+        """
+        status = tl.load(status_ptr).to(tl.int32)
+        if status != 0:
+            pid = tl.program_id(0)
+            row = pid.to(tl.int64)
+            if row < total_q_rows:
+                head_offs = tl.arange(0, OUTPUT_BLOCK)
+                head_offs_i64 = head_offs.to(tl.int64)
+                head_mask = head_offs < num_heads
+                for dim_start in tl.range(0, head_dim, OUTPUT_BLOCK):
+                    dim_mask = head_offs + dim_start < head_dim
+                    combined_mask = head_mask[:, None] & dim_mask[None, :]
+                    out_offsets = (
+                        row * num_heads * head_dim
+                        + head_offs_i64[:, None] * head_dim
+                        + (dim_start + head_offs[None, :]).to(tl.int64)
+                    )
+                    tl.store(output_ptr + out_offsets, tl.zeros((OUTPUT_BLOCK, OUTPUT_BLOCK), dtype=tl.float32), mask=combined_mask)
+                lse_offsets = head_offs_i64 * total_q_rows + row
+                neg_inf = tl.full((OUTPUT_BLOCK,), float("-inf"), dtype=tl.float32)
+                tl.store(lse_ptr + lse_offsets, neg_inf, mask=head_mask)
+
+
+def _run_varlen_output_sanitizer(
+    *,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    metadata_status: torch.Tensor,
+) -> None:
+    """Launch the output sanitizer on the current CUDA stream.
+
+    Zero-fills output and sets LSE to -inf when the metadata guard detected
+    a violation.  Allocation-free; no host sync.
+    """
+    if triton is None:
+        raise RuntimeError(
+            "varlen output sanitizer requires triton, which is unavailable"
+        )
+    total_q_rows = int(output.shape[0])
+    num_heads = int(output.shape[1])
+    head_dim = int(output.shape[2])
+    block = triton.next_power_of_2(max(num_heads, 1))
+    head_dim_block = min(triton.next_power_of_2(max(head_dim, 1)), 1024)
+    _varlen_output_sanitizer_kernel[(total_q_rows,)](
+        output,
+        lse,
+        metadata_status,
+        total_q_rows=total_q_rows,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        OUTPUT_BLOCK=max(block, head_dim_block),
+    )
+
+def _prepare_varlen_capture(
+    *,
+    device: torch.device,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    num_cu: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> None:
+    """Warm guard/sanitizer specializations once per capture contract."""
+    if triton is None:
+        raise RuntimeError(
+            "varlen capture readiness requires triton, which is unavailable"
+        )
+    key = (
+        _cuda_device_index(device),
+        tuple(q_shape),
+        tuple(k_shape),
+        tuple(v_shape),
+        dtype,
+        int(num_cu),
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+    )
+    with _VARLEN_CAPTURE_PREWARM_LOCK:
+        if key in _VARLEN_CAPTURE_PREWARMED:
+            return
+        with torch.cuda.device(device):
+            dummy_q_guard = torch.zeros((num_cu,), dtype=torch.int32, device=device)
+            dummy_k_guard = torch.zeros((num_cu,), dtype=torch.int32, device=device)
+            dummy_status = torch.zeros((1,), dtype=torch.int32, device=device)
+            _run_varlen_cu_seqlens_guard(
+                cu_seqlens_q_guard=dummy_q_guard,
+                cu_seqlens_k_guard=dummy_k_guard,
+                metadata_status=dummy_status,
+                q_rows=int(q_shape[0]),
+                k_rows=int(k_shape[0]),
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(max_seqlen_k),
+                num_batch=int(num_cu) - 1,
+            )
+            dummy_output = torch.zeros(
+                _output_shape(q_shape, v_shape), dtype=dtype, device=device
+            )
+            dummy_lse = torch.zeros(
+                _lse_shape(q_shape), dtype=torch.float32, device=device
+            )
+            _run_varlen_output_sanitizer(
+                output=dummy_output,
+                lse=dummy_lse,
+                metadata_status=dummy_status,
+            )
+            _attention_sink_placeholder(_cuda_device_index(device))
+            torch.cuda.synchronize(device)
+        _VARLEN_CAPTURE_PREWARMED.add(key)
+
 
 
 def _torch_to_cutlass_dtype(dtype: torch.dtype) -> type[cutlass.Numeric]:
@@ -335,6 +585,164 @@ def _validate_varlen_inputs(
         dtype,
     )
 
+def _occupied_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return (start, end) byte addresses for the tensor's occupied span.
+
+    For contiguous tensors this is [data_ptr, data_ptr + numel*itemsize).
+    For noncanonical (gapped/stride0) tensors, derives the conservative
+    min/max byte span from shape, strides, and item size.
+    Returns [start, start) for empty tensors (no invented bytes).
+    """
+    if tensor.numel() == 0:
+        return int(tensor.data_ptr()), int(tensor.data_ptr())
+    if tensor.is_contiguous():
+        start = int(tensor.data_ptr())
+        nbytes = int(tensor.numel()) * int(tensor.element_size())
+        return start, start + nbytes
+    # Conservative span for noncanonical layouts.
+    start = int(tensor.data_ptr())
+    strides = tensor.stride()
+    shape = tensor.shape
+    itemsize = int(tensor.element_size())
+    min_off = 0
+    max_off = 0
+    for size, stride in zip(shape, strides, strict=True):
+        if size <= 1:
+            continue
+        if stride >= 0:
+            min_off = min(min_off, 0)
+            max_off = max(max_off, (size - 1) * stride)
+        else:
+            min_off = min(min_off, (size - 1) * stride)
+            max_off = max(max_off, 0)
+    return start + min_off * itemsize, start + (max_off + 1) * itemsize
+
+
+def _byte_ranges_overlap(
+    start_a: int,
+    end_a: int,
+    start_b: int,
+    end_b: int,
+) -> bool:
+    """Return whether two half-open byte ranges have nonempty intersection."""
+    return max(start_a, start_b) < min(end_a, end_b)
+
+
+def _reject_write_overlap(
+    write_targets: list[tuple[str, torch.Tensor]],
+    all_tensors: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Reject byte-range overlap of write targets against all tensors.
+
+    Write targets (output, LSE, guard buffers) must not overlap each other
+    or any other tensor.  Read-read aliases (e.g. cu_seqlens_k is cu_seqlens_q)
+    are allowed since no CTA writes them.
+    """
+    write_ranges = [
+        (name, *_occupied_byte_range(tensor))
+        for name, tensor in write_targets
+    ]
+    all_ranges = [
+        (name, *_occupied_byte_range(tensor))
+        for name, tensor in all_tensors
+    ]
+    # Write-write overlap (skip zero-width ranges).
+    for i in range(len(write_ranges)):
+        for j in range(i + 1, len(write_ranges)):
+            name_i, start_i, end_i = write_ranges[i]
+            name_j, start_j, end_j = write_ranges[j]
+            if _byte_ranges_overlap(start_i, end_i, start_j, end_j):
+                raise ValueError(
+                    f"storage overlap between write targets {name_i} "
+                    f"[{start_i:#x}, {end_i:#x}) and {name_j} "
+                    f"[{start_j:#x}, {end_j:#x})"
+                )
+    # Write-vs-all overlap (skip zero-width ranges).
+    for w_name, w_start, w_end in write_ranges:
+        for a_name, a_start, a_end in all_ranges:
+            if w_name == a_name:
+                continue
+            if _byte_ranges_overlap(w_start, w_end, a_start, a_end):
+                raise ValueError(
+                    f"write target {w_name} [{w_start:#x}, {w_end:#x}) "
+                    f"overlaps {a_name} [{a_start:#x}, {a_end:#x})"
+                )
+
+
+def _validate_varlen_cu_seqlens_values(
+    *,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...] | None = None,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> None:
+    """Eagerly validate cumulative-offset value invariants before any address use.
+
+    Checks ``cu[0] == 0``, nondecreasing adjacent entries, exact final packed
+    extents, per-segment lengths within the compiled maxima, K/V packed-row
+    equality, and a sane maximum segment count.  Issues a host sync; must only
+    be called outside CUDA graph capture.
+    """
+    _MAX_SEGMENTS = 65536
+    num = int(cu_seqlens_q.numel())
+    if num < 2:
+        raise ValueError(
+            f"cu_seqlens_q must have at least two entries, got {num}"
+        )
+    if num > _MAX_SEGMENTS:
+        raise ValueError(
+            f"cu_seqlens_q has {num} entries; maximum supported is {_MAX_SEGMENTS}"
+        )
+    # Int64 widening so large packed row counts cannot overflow in comparisons.
+    cu_q = cu_seqlens_q.to(torch.long)
+    cu_k = cu_seqlens_k.to(torch.long)
+    q_rows = int(q_shape[0])
+    k_rows = int(k_shape[0])
+    if v_shape is not None:
+        v_rows = int(v_shape[0])
+        if k_rows != v_rows:
+            raise ValueError(
+                f"packed k rows ({k_rows}) must equal packed v rows ({v_rows}); "
+                "the forward kernel uses K offsets for both K and V"
+            )
+    first_q = int(cu_q[0].item())
+    first_k = int(cu_k[0].item())
+    if first_q != 0 or first_k != 0:
+        raise ValueError(
+            f"cu_seqlens_q[0] and cu_seqlens_k[0] must be 0, got ({first_q}, {first_k})"
+        )
+    diffs_q = cu_q[1:] - cu_q[:-1]
+    diffs_k = cu_k[1:] - cu_k[:-1]
+    min_diff_q = int(diffs_q.min().item())
+    min_diff_k = int(diffs_k.min().item())
+    if min_diff_q < 0 or min_diff_k < 0:
+        raise ValueError(
+            f"cu_seqlens must be nondecreasing, got min diff ({min_diff_q}, {min_diff_k})"
+        )
+    max_diff_q = int(diffs_q.max().item())
+    max_diff_k = int(diffs_k.max().item())
+    if max_diff_q > int(max_seqlen_q):
+        raise ValueError(
+            f"segment length exceeds max_seqlen_q={int(max_seqlen_q)}, got {max_diff_q}"
+        )
+    if max_diff_k > int(max_seqlen_k):
+        raise ValueError(
+            f"segment length exceeds max_seqlen_k={int(max_seqlen_k)}, got {max_diff_k}"
+        )
+    last_q = int(cu_q[-1].item())
+    last_k = int(cu_k[-1].item())
+    if last_q != q_rows:
+        raise ValueError(
+            f"cu_seqlens_q[-1] must equal packed q rows {q_rows}, got {last_q}"
+        )
+    if last_k != k_rows:
+        raise ValueError(
+            f"cu_seqlens_k[-1] must equal packed k rows {k_rows}, got {last_k}"
+        )
+
 
 def _validate_varlen_inputs_against_plan(
     *,
@@ -514,6 +922,9 @@ class VarlenAttentionWorkspace:
     max_seqlen_k: int
     output: torch.Tensor
     lse: torch.Tensor
+    metadata_status: torch.Tensor | None = None
+    cu_seqlens_q_guard: torch.Tensor | None = None
+    cu_seqlens_k_guard: torch.Tensor | None = None
     plan_key: VarlenAttentionPlanKey | None = None
 
     def bind(
@@ -605,6 +1016,9 @@ class VarlenAttentionBinding:
     cu_seqlens_k: torch.Tensor
     output: torch.Tensor
     lse: torch.Tensor
+    metadata_status: torch.Tensor
+    cu_seqlens_q_guard: torch.Tensor
+    cu_seqlens_k_guard: torch.Tensor
     plan: VarlenAttentionPlan
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
@@ -622,13 +1036,17 @@ class _AttentionScratchLayout:
     nbytes: int
     output_offset_bytes: int
     lse_offset_bytes: int
-
+    metadata_status_offset_bytes: int = 0
+    cu_seqlens_guard_offset_bytes: int = 0
+    cu_seqlens_guard_nbytes: int = 0
 
 @dataclass(frozen=True)
 class _AttentionScratchViews:
     output: torch.Tensor
     lse: torch.Tensor
-
+    metadata_status: torch.Tensor | None = None
+    cu_seqlens_q_guard: torch.Tensor | None = None
+    cu_seqlens_k_guard: torch.Tensor | None = None
 
 @dataclass(frozen=True)
 class AttentionScratchPlan:
@@ -703,6 +1121,9 @@ class VarlenAttentionScratchPlan:
         return _build_varlen_attention_binding_from_views(
             output=views.output,
             lse=views.lse,
+            metadata_status=views.metadata_status,
+            cu_seqlens_q_guard=views.cu_seqlens_q_guard,
+            cu_seqlens_k_guard=views.cu_seqlens_k_guard,
             q=q,
             k=k,
             v=v,
@@ -1293,6 +1714,8 @@ def clear_attention_caches() -> None:
     _compile_varlen_attention.cache_clear()
     _get_attention_plan.cache_clear()
     _get_varlen_attention_plan.cache_clear()
+    with _VARLEN_CAPTURE_PREWARM_LOCK:
+        _VARLEN_CAPTURE_PREWARMED.clear()
 
 
 def _validate_workspace(
@@ -1388,6 +1811,44 @@ def _validate_varlen_workspace(
             "varlen workspace plan mismatch: "
             f"expected {workspace.plan_key}, got {plan.key}"
         )
+    num_cu = int(plan.cu_seqlens_q_shape[0]) if plan.cu_seqlens_q_shape else 0
+    if workspace.metadata_status is None:
+        raise ValueError("varlen workspace is missing metadata_status guard buffer")
+    if workspace.cu_seqlens_q_guard is None:
+        raise ValueError("varlen workspace is missing cu_seqlens_q_guard buffer")
+    if workspace.cu_seqlens_k_guard is None:
+        raise ValueError("varlen workspace is missing cu_seqlens_k_guard buffer")
+    if workspace.metadata_status.shape != (1,):
+        raise ValueError(
+            f"metadata_status must have shape (1,), got {tuple(workspace.metadata_status.shape)}"
+        )
+    if workspace.metadata_status.dtype != torch.int32:
+        raise TypeError(
+            f"metadata_status must be torch.int32, got {workspace.metadata_status.dtype}"
+        )
+    if workspace.cu_seqlens_q_guard.shape != (num_cu,):
+        raise ValueError(
+            f"cu_seqlens_q_guard must have shape ({num_cu},), "
+            f"got {tuple(workspace.cu_seqlens_q_guard.shape)}"
+        )
+    if workspace.cu_seqlens_k_guard.shape != (num_cu,):
+        raise ValueError(
+            f"cu_seqlens_k_guard must have shape ({num_cu},), "
+            f"got {tuple(workspace.cu_seqlens_k_guard.shape)}"
+        )
+    if (
+        workspace.cu_seqlens_q_guard.dtype != torch.int32
+        or workspace.cu_seqlens_k_guard.dtype != torch.int32
+    ):
+        raise TypeError("cu_seqlens guard buffers must be torch.int32")
+    if (
+        workspace.metadata_status.device != plan.device
+        or workspace.cu_seqlens_q_guard.device != plan.device
+        or workspace.cu_seqlens_k_guard.device != plan.device
+    ):
+        raise ValueError(
+            "metadata_status and cu_seqlens guard buffers must be on the plan device"
+        )
 
 
 def _validate_attention_output_lse(
@@ -1410,6 +1871,8 @@ def _validate_attention_output_lse(
         raise ValueError(
             f"attention output dtype {output.dtype} does not match plan dtype {plan.dtype}"
         )
+    if not output.is_contiguous():
+        raise ValueError("attention output must be contiguous")
     expected_lse_shape = _lse_shape(plan.q_shape)
     if lse.shape != expected_lse_shape:
         raise ValueError(
@@ -1423,13 +1886,15 @@ def _validate_attention_output_lse(
         raise ValueError(
             f"attention lse must have dtype torch.float32, got {lse.dtype}"
         )
-
+    if not lse.is_contiguous():
+        raise ValueError("attention lse must be contiguous")
 
 def _attention_scratch_layout(
     *,
     q_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
     dtype: torch.dtype,
+    cu_seqlens_q_shape: tuple[int, ...] | None = None,
 ) -> _AttentionScratchLayout:
     cursor = 0
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
@@ -1438,10 +1903,27 @@ def _attention_scratch_layout(
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
     lse_offset_bytes = cursor
     cursor += _shape_numel(_lse_shape(q_shape)) * _dtype_nbytes(torch.float32)
+    metadata_status_offset_bytes = 0
+    cu_seqlens_guard_offset_bytes = 0
+    cu_seqlens_guard_nbytes = 0
+    if cu_seqlens_q_shape is not None:
+        num_cu = int(cu_seqlens_q_shape[0]) if cu_seqlens_q_shape else 0
+        guard_nbytes = num_cu * _dtype_nbytes(torch.int32)
+        guard_nbytes = max(guard_nbytes, _ARENA_ALIGN_BYTES)
+        cu_seqlens_guard_nbytes = guard_nbytes
+        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        cu_seqlens_guard_offset_bytes = cursor
+        cursor += guard_nbytes * 2
+        cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
+        metadata_status_offset_bytes = cursor
+        cursor += _dtype_nbytes(torch.int32)
     return _AttentionScratchLayout(
         nbytes=max(int(cursor), 1),
         output_offset_bytes=output_offset_bytes,
         lse_offset_bytes=lse_offset_bytes,
+        metadata_status_offset_bytes=metadata_status_offset_bytes,
+        cu_seqlens_guard_offset_bytes=cu_seqlens_guard_offset_bytes,
+        cu_seqlens_guard_nbytes=cu_seqlens_guard_nbytes,
     )
 
 
@@ -1534,6 +2016,9 @@ def _varlen_attention_workspace_from_arena(
         max_seqlen_k=plan.max_seqlen_k,
         output=views.output,
         lse=views.lse,
+        metadata_status=views.metadata_status,
+        cu_seqlens_q_guard=views.cu_seqlens_q_guard,
+        cu_seqlens_k_guard=views.cu_seqlens_k_guard,
         plan_key=getattr(plan, "key", None),
     )
 
@@ -1556,7 +2041,31 @@ def _varlen_attention_scratch_views_from_arena(
         shape=_lse_shape(plan.q_shape),
         dtype=torch.float32,
     )
-    return _AttentionScratchViews(output=output, lse=lse)
+    metadata_status = None
+    cu_seqlens_q_guard = None
+    cu_seqlens_k_guard = None
+    if layout.cu_seqlens_guard_nbytes > 0:
+        num_cu = int(plan.cu_seqlens_q_shape[0]) if plan.cu_seqlens_q_shape else 0
+        guard_bytes = layout.cu_seqlens_guard_nbytes
+        guard_base = layout.cu_seqlens_guard_offset_bytes
+        cu_seqlens_q_guard = arena.narrow(
+            0, guard_base, num_cu * _dtype_nbytes(torch.int32)
+        ).view(torch.int32)
+        cu_seqlens_k_guard = arena.narrow(
+            0,
+            guard_base + guard_bytes,
+            num_cu * _dtype_nbytes(torch.int32),
+        ).view(torch.int32)
+        metadata_status = arena.narrow(
+            0, layout.metadata_status_offset_bytes, _dtype_nbytes(torch.int32)
+        ).view(torch.int32)
+    return _AttentionScratchViews(
+        output=output,
+        lse=lse,
+        metadata_status=metadata_status,
+        cu_seqlens_q_guard=cu_seqlens_q_guard,
+        cu_seqlens_k_guard=cu_seqlens_k_guard,
+    )
 
 
 def _attention_workspace_from_scratch_plan(
@@ -1854,9 +2363,21 @@ def build_varlen_attention_binding(
     _validate_attention_output_lse(
         output=workspace.output, lse=workspace.lse, plan=plan
     )
+    _validate_varlen_cu_seqlens_values(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=plan.max_seqlen_q,
+        max_seqlen_k=plan.max_seqlen_k,
+    )
     return _build_varlen_attention_binding_from_views(
         output=workspace.output,
         lse=workspace.lse,
+        metadata_status=workspace.metadata_status,
+        cu_seqlens_q_guard=workspace.cu_seqlens_q_guard,
+        cu_seqlens_k_guard=workspace.cu_seqlens_k_guard,
         q=q,
         k=k,
         v=v,
@@ -1876,6 +2397,9 @@ def _build_varlen_attention_binding_from_views(
     *,
     output: torch.Tensor,
     lse: torch.Tensor,
+    metadata_status: torch.Tensor | None = None,
+    cu_seqlens_q_guard: torch.Tensor | None = None,
+    cu_seqlens_k_guard: torch.Tensor | None = None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1943,6 +2467,28 @@ def _build_varlen_attention_binding_from_views(
         plan=plan,
     )
     _validate_attention_output_lse(output=output, lse=lse, plan=plan)
+    _validate_varlen_cu_seqlens_values(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=plan.max_seqlen_q,
+        max_seqlen_k=plan.max_seqlen_k,
+    )
+    # Warm up guard/sanitizer Triton kernels and sink placeholder so the
+    # first captured forward only enqueues already-loaded kernels.
+    num_cu = int(cu_seqlens_q.numel())
+    _prepare_varlen_capture(
+        device=device,
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        dtype=dtype,
+        num_cu=num_cu,
+        max_seqlen_q=plan.max_seqlen_q,
+        max_seqlen_k=plan.max_seqlen_k,
+    )
     return VarlenAttentionBinding(
         q=q,
         k=k,
@@ -1951,6 +2497,9 @@ def _build_varlen_attention_binding_from_views(
         cu_seqlens_k=cu_seqlens_k,
         output=output,
         lse=lse,
+        metadata_status=metadata_status,
+        cu_seqlens_q_guard=cu_seqlens_q_guard,
+        cu_seqlens_k_guard=cu_seqlens_k_guard,
         plan=plan,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
@@ -1982,7 +2531,10 @@ def plan_varlen_attention_scratch(
     plan: VarlenAttentionPlan,
 ) -> VarlenAttentionScratchPlan:
     layout = _attention_scratch_layout(
-        q_shape=plan.q_shape, v_shape=plan.v_shape, dtype=plan.dtype
+        q_shape=plan.q_shape,
+        v_shape=plan.v_shape,
+        dtype=plan.dtype,
+        cu_seqlens_q_shape=plan.cu_seqlens_q_shape,
     )
     return VarlenAttentionScratchPlan(
         plan=plan,
@@ -2022,7 +2574,6 @@ def allocate_attention_workspace_for_plan(plan: AttentionPlan) -> AttentionWorks
         plan_key=plan.key,
     )
 
-
 def allocate_varlen_attention_workspace_for_plan(
     plan: VarlenAttentionPlan,
 ) -> VarlenAttentionWorkspace:
@@ -2033,6 +2584,12 @@ def allocate_varlen_attention_workspace_for_plan(
         device=plan.device,
     )
     lse = torch.empty(_lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
+    num_cu = (
+        int(plan.cu_seqlens_q_shape[0]) if plan.cu_seqlens_q_shape else 0
+    )
+    metadata_status = torch.zeros((1,), dtype=torch.int32, device=plan.device)
+    cu_seqlens_q_guard = torch.zeros((num_cu,), dtype=torch.int32, device=plan.device)
+    cu_seqlens_k_guard = torch.zeros((num_cu,), dtype=torch.int32, device=plan.device)
     return VarlenAttentionWorkspace(
         q_shape=plan.q_shape,
         k_shape=plan.k_shape,
@@ -2051,6 +2608,9 @@ def allocate_varlen_attention_workspace_for_plan(
         max_seqlen_k=plan.max_seqlen_k,
         output=output,
         lse=lse,
+        metadata_status=metadata_status,
+        cu_seqlens_q_guard=cu_seqlens_q_guard,
+        cu_seqlens_k_guard=cu_seqlens_k_guard,
         plan_key=plan.key,
     )
 
@@ -2157,6 +2717,15 @@ def create_varlen_attention_plan(
         cu_seqlens_k,
         max_seqlen_k,
         name="max_seqlen_k",
+    )
+    _validate_varlen_cu_seqlens_values(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
     _, _, head_dim = q_shape
     tile_m, tile_n = tile_shape or _select_tile_shape(head_dim, causal=causal)
@@ -2497,6 +3066,96 @@ def b12x_varlen_attention_forward(
     if attention_sink_bias is None:
         attention_sink_bias = _attention_sink_placeholder(resolved_plan.device_index)
 
+    # Guard buffers are required fields on VarlenAttentionBinding.
+    metadata_status = binding.metadata_status
+    cu_seqlens_q_guard = binding.cu_seqlens_q_guard
+    cu_seqlens_k_guard = binding.cu_seqlens_k_guard
+    if metadata_status is None or cu_seqlens_q_guard is None or cu_seqlens_k_guard is None:
+        raise ValueError(
+            "varlen attention binding is missing required guard buffers "
+            "(metadata_status, cu_seqlens_q_guard, cu_seqlens_k_guard)"
+        )
+
+    # Structural validation of guard buffers (allocation-free, no host sync).
+    num_cu = int(cu_seqlens_q.numel())
+    if metadata_status.shape != (1,):
+        raise ValueError(
+            f"metadata_status must have shape (1,), got {tuple(metadata_status.shape)}"
+        )
+    if metadata_status.dtype != torch.int32:
+        raise TypeError(
+            f"metadata_status must be torch.int32, got {metadata_status.dtype}"
+        )
+    if cu_seqlens_q_guard.shape != (num_cu,):
+        raise ValueError(
+            f"cu_seqlens_q_guard must have shape ({num_cu},), "
+            f"got {tuple(cu_seqlens_q_guard.shape)}"
+        )
+    if cu_seqlens_k_guard.shape != (num_cu,):
+        raise ValueError(
+            f"cu_seqlens_k_guard must have shape ({num_cu},), "
+            f"got {tuple(cu_seqlens_k_guard.shape)}"
+        )
+    if (
+        cu_seqlens_q_guard.dtype != torch.int32
+        or cu_seqlens_k_guard.dtype != torch.int32
+    ):
+        raise TypeError("cu_seqlens guard buffers must be torch.int32")
+    if (
+        metadata_status.device != device
+        or cu_seqlens_q_guard.device != device
+        or cu_seqlens_k_guard.device != device
+    ):
+        raise ValueError(
+            "guard buffers must be on the same device as q/k/v"
+        )
+    if (
+        not cu_seqlens_q_guard.is_contiguous()
+        or not cu_seqlens_k_guard.is_contiguous()
+        or not metadata_status.is_contiguous()
+    ):
+        raise ValueError("guard buffers must be contiguous")
+
+    # Reject unsafe storage aliasing: write targets (output, LSE, guard
+    # buffers) must not overlap each other or any input/read tensor.
+    # Read-read aliases (e.g. cu_seqlens_k is cu_seqlens_q) are allowed.
+    all_tensors = [
+        ("output", output), ("lse", lse),
+        ("metadata_status", metadata_status),
+        ("cu_seqlens_q_guard", cu_seqlens_q_guard),
+        ("cu_seqlens_k_guard", cu_seqlens_k_guard),
+        ("q", q), ("k", k), ("v", v),
+        ("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k),
+    ]
+    if attention_sink_bias is not None:
+        all_tensors.append(("attention_sink_bias", attention_sink_bias))
+    write_targets = [
+        ("output", output), ("lse", lse),
+        ("metadata_status", metadata_status),
+        ("cu_seqlens_q_guard", cu_seqlens_q_guard),
+        ("cu_seqlens_k_guard", cu_seqlens_k_guard),
+    ]
+    _reject_write_overlap(write_targets, all_tensors)
+
+    # Device-side cumulative-offset guard: copy caller-owned cu_seqlens into
+    # planned scratch, validate on-device, and neutralize on failure so the
+    # attention kernel sees all-zero offsets (empty segments) instead of
+    # out-of-bounds addresses.  The guard buffers are caller-owned planned
+    # scratch, so no allocation or host sync occurs during CUDA graph replay.
+    cu_seqlens_q_guard.copy_(cu_seqlens_q)
+    cu_seqlens_k_guard.copy_(cu_seqlens_k)
+    num_batch = int(cu_seqlens_q.numel()) - 1
+    _run_varlen_cu_seqlens_guard(
+        cu_seqlens_q_guard=cu_seqlens_q_guard,
+        cu_seqlens_k_guard=cu_seqlens_k_guard,
+        metadata_status=metadata_status,
+        q_rows=int(q_shape[0]),
+        k_rows=int(k_shape[0]),
+        max_seqlen_q=int(resolved_plan.max_seqlen_q),
+        max_seqlen_k=int(resolved_plan.max_seqlen_k),
+        num_batch=num_batch,
+    )
+
     resolved_plan.compiled(
         make_ptr(
             resolved_plan.cutlass_dtype,
@@ -2530,13 +3189,13 @@ def b12x_varlen_attention_forward(
         ),
         make_ptr(
             cutlass.Int32,
-            cu_seqlens_q.data_ptr(),
+            cu_seqlens_q_guard.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
         make_ptr(
             cutlass.Int32,
-            cu_seqlens_k.data_ptr(),
+            cu_seqlens_k_guard.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,
         ),
@@ -2549,6 +3208,18 @@ def b12x_varlen_attention_forward(
         float(softmax_scale),
         current_cuda_stream(),
     )
+
+    # Post-attention sanitizer: if the guard detected invalid metadata, zero
+    # the output and set LSE to -inf so the caller never receives stale or
+    # uninitialized data.  Runs on the same stream after attention; no host
+    # sync.
+    _run_varlen_output_sanitizer(
+        output=output,
+        lse=lse,
+        metadata_status=metadata_status,
+    )
+    # The status tensor is available for the caller to check asynchronously;
+    # we do NOT host-sync here to preserve CUDA graph replay safety.
     return output, lse
 
 

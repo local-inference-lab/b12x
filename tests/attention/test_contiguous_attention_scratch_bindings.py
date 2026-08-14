@@ -86,12 +86,15 @@ def _patch_varlen_validation(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(contig, "_validate_varlen_inputs", fake_validate)
-
+    monkeypatch.setattr(contig, "_validate_varlen_cu_seqlens_values", lambda **kwargs: None)
+    monkeypatch.setattr(contig, "_prepare_varlen_capture", lambda **kwargs: None)
+    monkeypatch.setattr(contig, "_reject_write_overlap", lambda *args, **kwargs: None)
 
 def _patch_launch(monkeypatch) -> None:
     monkeypatch.setattr(contig, "make_ptr", lambda dtype, ptr, *args, **kwargs: ptr)
     monkeypatch.setattr(contig, "current_cuda_stream", lambda: 0)
-
+    monkeypatch.setattr(contig, "_run_varlen_cu_seqlens_guard", lambda **kwargs: None)
+    monkeypatch.setattr(contig, "_run_varlen_output_sanitizer", lambda **kwargs: None)
 
 def test_attention_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_attention_scratch(_attention_plan())
@@ -287,6 +290,6 @@ def test_varlen_attention_binding_supplies_runtime_tensors(monkeypatch) -> None:
     assert call[2] == v.data_ptr()
     assert call[3] == binding.output.data_ptr()
     assert call[4] == binding.lse.data_ptr()
-    assert call[5] == cu_q.data_ptr()
-    assert call[6] == cu_k.data_ptr()
+    assert call[5] == binding.cu_seqlens_q_guard.data_ptr()
+    assert call[6] == binding.cu_seqlens_k_guard.data_ptr()
     assert call[7] == sink.data_ptr()
