@@ -8,11 +8,7 @@ import cutlass.cute as cute
 import torch
 
 from b12x._lib.dense_gemm import dense_gemm
-from b12x._lib.utils import (
-    record_tensors_on_current_stream,
-    validate_stream_is_current,
-    validate_stream_int_is_current,
-)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8_SCALE_VEC_SIZE,
     _check_gpu_tensor,
@@ -175,11 +171,6 @@ def _tensor_fp8_linear_fused_op(
     out_dtype: torch.dtype,
     stream_int: int | None,
 ) -> torch.Tensor:
-    validate_stream_int_is_current(stream_int, source_2d.device)
-    record_tensors_on_current_stream(
-        [source_2d, weight_values, weight_scale_mma, output_scale],
-        source_2d.device,
-    )
     tokens = int(source_2d.shape[0])
     source_padded = _pad_k(source_2d, int(padded_in_features))
     source_scale_mma = _activation_scale_mma(
@@ -238,26 +229,11 @@ def tensor_fp8_linear(
     expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Run static per-tensor E4M3 operands through the SM12x dense GEMM.
-
-    `stream` must be `None` or the current Torch stream for `source.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
-    """
+    """Run static per-tensor E4M3 operands through the SM12x dense GEMM."""
 
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, TensorFP8LinearWeight):
         raise TypeError("packed_weight must be a TensorFP8LinearWeight")
-    validate_stream_is_current(stream, source.device)
-    record_tensors_on_current_stream(
-        [
-            source,
-            packed_weight.values,
-            packed_weight.scale_mma,
-            packed_weight.output_scale,
-            bias,
-        ],
-        source.device,
-    )
     source_2d = _source_2d(source)
     tokens, in_features = map(int, source_2d.shape)
     if source_2d.dtype != torch.float8_e4m3fn:
@@ -299,7 +275,7 @@ def tensor_fp8_linear(
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
             out_dtype,
-            None,  # stream: validated as current; use current stream
+            cuda_stream_to_int(stream),
         )
     if bias is not None:
         output = output + bias
@@ -313,20 +289,8 @@ def prewarm_tensor_fp8_linear(
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
 ) -> int:
-    """Compile and cache serving shapes before CUDA graph capture.
+    """Compile and cache serving shapes before CUDA graph capture."""
 
-    `stream` must be `None` or the current Torch stream for the weight device.
-    """
-
-    validate_stream_is_current(stream, packed_weight.values.device)
-    record_tensors_on_current_stream(
-        [
-            packed_weight.values,
-            packed_weight.scale_mma,
-            packed_weight.output_scale,
-        ],
-        packed_weight.values.device,
-    )
     warmed = 0
     with torch.inference_mode():
         for tokens in sorted({int(value) for value in token_counts if int(value) > 0}):

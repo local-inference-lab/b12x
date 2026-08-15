@@ -10,11 +10,7 @@ from typing import Iterable, Sequence
 
 import torch
 
-from b12x._lib.utils import (
-    record_tensors_on_current_stream,
-    validate_stream_is_current,
-    validate_stream_int_is_current,
-)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x._lib.dense_gemm import (
     dense_gemm,
     dense_gemm_fused_quant_a,
@@ -561,11 +557,6 @@ def _block_fp8_linear_mxfp8_fused_op(
     expected_m: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    validate_stream_int_is_current(stream_int, source_2d.device)
-    record_tensors_on_current_stream(
-        [source_2d, weight_values, weight_scale_rows, weight_scale_mma],
-        source_2d.device,
-    )
     # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
     # one op, so the token-shaped activation MXFP8 views (x_q.values/scale_mma)
     # are never graph values -- they can't become symbolic-shaped view inputs to
@@ -631,9 +622,6 @@ def block_fp8_linear_mxfp8(
     expected_m forwards a DeepGEMM-style regime hint to dense_gemm (decode vs
     prefill tile); None keeps the M-independent default. When a binding is given
     its stored expected_m is used.
-
-    `stream` must be `None` or the current Torch stream for `source.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
     """
 
     if binding is not None:
@@ -667,26 +655,6 @@ def block_fp8_linear_mxfp8(
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
-    validate_stream_is_current(stream, source.device)
-    lifetime_tensors = [
-        source,
-        packed_weight.weight.values,
-        packed_weight.weight.scale_rows,
-        packed_weight.weight.scale_mma,
-        packed_weight.weight.values_tiled,
-        bias,
-        output_storage,
-    ]
-    if x_q_storage is not None:
-        lifetime_tensors.extend(
-            [
-                x_q_storage.values,
-                x_q_storage.scale_rows,
-                x_q_storage.scale_mma,
-                x_q_storage.values_tiled,
-            ]
-        )
-    record_tensors_on_current_stream(lifetime_tensors, source.device)
     source_2d = _source_2d(source)
     tokens, in_features = source_2d.shape
     if in_features != packed_weight.in_features:
@@ -695,7 +663,7 @@ def block_fp8_linear_mxfp8(
         )
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
-    stream_int = None  # validated as current stream; use current everywhere
+    stream_int = cuda_stream_to_int(stream)
 
     if binding is None:
         # No caller-owned buffers (e.g. the torch.compile path): one fully opaque
@@ -802,8 +770,6 @@ def prewarm_block_fp8_linear_mxfp8(
 
     Pass the same expected_m the serving path will use so the warmed tile matches
     the regime kernel that live calls reuse under frozen resolution.
-
-    `stream` must be `None` or the current Torch stream for the weight device.
     """
 
     if not isinstance(packed_weight, BlockFP8LinearWeight):
@@ -811,16 +777,6 @@ def prewarm_block_fp8_linear_mxfp8(
     if output_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"output_dtype must be bf16/fp16, got {output_dtype}")
     device = packed_weight.weight.values.device
-    validate_stream_is_current(stream, device)
-    record_tensors_on_current_stream(
-        [
-            packed_weight.weight.values,
-            packed_weight.weight.scale_rows,
-            packed_weight.weight.scale_mma,
-            packed_weight.weight.values_tiled,
-        ],
-        device,
-    )
     counts = sorted({int(tokens) for tokens in token_counts if int(tokens) > 0})
     if not counts:
         return

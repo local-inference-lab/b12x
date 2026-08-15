@@ -57,6 +57,9 @@ from b12x._lib.compiler import (
     compile as b12x_compile,
 )
 from b12x._lib.utils import (
+    cuda_stream_scope,
+    cuda_stream_from_int_or_current,
+    cuda_stream_to_int,
     current_cuda_stream,
     cutlass_to_torch_dtype,
     get_cutlass_dtype,
@@ -66,11 +69,8 @@ from b12x._lib.utils import (
     make_ptr,
     mxfp6_logical_k_from_packed_bytes,
     mxfp6_tile_k,
-    record_tensors_on_current_stream,
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
-    validate_stream_is_current,
-    validate_stream_int_is_current,
 )
 from b12x._lib.intrinsics import (
     FLOAT8_E4M3_MAX,
@@ -5192,7 +5192,6 @@ def _get_compiled_dense_gemm_mxfp6(
         w_gscale_tensor_gpu: Optional[torch.Tensor] = None,
         row_scale_tensor_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        validate_stream_int_is_current(stream_int, a_tensor_gpu.device)
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
             c_tensor_gpu = _empty_dense_gemm_output(
@@ -5206,20 +5205,6 @@ def _get_compiled_dense_gemm_mxfp6(
             alpha_tensor_gpu = _cached_alpha_one(a_tensor_gpu.device)
 
         nonlocal compiled_kernel
-        launch_stream = record_tensors_on_current_stream(
-            [
-                a_tensor_gpu,
-                b_tensor_gpu,
-                sfa_tensor_gpu,
-                sfb_tensor_gpu,
-                c_tensor_gpu,
-                alpha_tensor_gpu,
-                x_bf16_tensor_gpu,
-                w_gscale_tensor_gpu,
-                row_scale_tensor_gpu,
-            ],
-            a_tensor_gpu.device,
-        )
         compiled_kernel(
             *_make_runtime_pointers(
                 [
@@ -5235,7 +5220,7 @@ def _get_compiled_dense_gemm_mxfp6(
                 ]
             ),
             m,
-            launch_stream,
+            cuda_stream_from_int_or_current(stream_int),
         )
         return c_tensor_gpu
 
@@ -5454,11 +5439,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
         alpha: torch.Tensor,
         stream_int: Optional[int],
     ) -> torch.Tensor:
-        validate_stream_int_is_current(stream_int, source.device)
         source_ptr = source.data_ptr()
-        launch_stream = record_tensors_on_current_stream(
-            [source, b, sfb, out, alpha], source.device
-        )
         compiled(
             make_ptr(
                 cutlass.Float8E4M3FN,
@@ -5495,7 +5476,7 @@ def _get_compiled_dense_gemm_fused_quant_a(
                 assumed_align=16,
             ),
             int(source.shape[0]),
-            launch_stream,
+            cuda_stream_from_int_or_current(stream_int),
         )
         return out
 
@@ -5774,11 +5755,7 @@ def _get_compiled_dense_gemm_fused_quant_a_grouped(
         alpha: torch.Tensor,
         stream_int: Optional[int],
     ) -> torch.Tensor:
-        validate_stream_int_is_current(stream_int, source.device)
         source_ptr = source.data_ptr()
-        launch_stream = record_tensors_on_current_stream(
-            [source, positions, cos_sin, b, sfb, out, alpha], source.device
-        )
         compiled(
             make_ptr(
                 cutlass.Float8E4M3FN,
@@ -5833,7 +5810,7 @@ def _get_compiled_dense_gemm_fused_quant_a_grouped(
             ),
             int(source.shape[0]),
             int(cos_sin.numel()),
-            launch_stream,
+            cuda_stream_from_int_or_current(stream_int),
         )
         return out
 
@@ -5864,19 +5841,36 @@ def dense_gemm_fused_quant_a_grouped(
     `positions`/`cos_sin_cache` are given, the trailing `rope_dim` of every
     `head_dim` block is inverse-RoPE-rotated before quantization.
 
-    `stream` must be `None` or the current Torch stream for `source.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
+    An explicit stream runs the complete operation on that stream. Dependencies
+    from and back to the caller's current stream are inserted automatically.
     """
+
+    if stream is not None:
+        with cuda_stream_scope(
+            stream,
+            source.device,
+            [source, b, sfb, out, positions, cos_sin_cache],
+        ):
+            return dense_gemm_fused_quant_a_grouped(
+                source,
+                b,
+                sfb,
+                groups=groups,
+                out=out,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                head_dim=head_dim,
+                nope_dim=nope_dim,
+                rope_dim=rope_dim,
+                expected_m=expected_m,
+                sfb_k_replicated=sfb_k_replicated,
+                mma_tiler_mn=mma_tiler_mn,
+            )
 
     if source.dtype != torch.bfloat16 or source.ndim != 3:
         raise ValueError(
             "fused grouped MXFP8 quantization requires BF16 [M, groups, K]"
         )
-    validate_stream_is_current(stream, source.device)
-    record_tensors_on_current_stream(
-        [source, b, sfb, out, positions, cos_sin_cache],
-        source.device,
-    )
     m = int(source.shape[0])
     k = int(source.shape[2])
     if int(source.shape[1]) != groups:
@@ -5988,7 +5982,7 @@ def dense_gemm_fused_quant_a_grouped(
         sfb,
         out,
         _cached_alpha_one(source.device),
-        None,  # stream: validated as current; use current stream
+        cuda_stream_to_int(stream),
     )
 
 
@@ -6226,7 +6220,6 @@ def _get_compiled_dense_gemm(
         quant_c_scale_rows_gpu: Optional[torch.Tensor] = None,
         quant_c_scale_mma_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        validate_stream_int_is_current(stream_int, a_tensor_gpu.device)
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
             c_tensor_gpu = torch.empty(
@@ -6251,20 +6244,6 @@ def _get_compiled_dense_gemm(
             ]
 
         nonlocal compiled_kernel
-        launch_stream = record_tensors_on_current_stream(
-            [
-                a_tensor_gpu,
-                b_tensor_gpu,
-                sfa_tensor_gpu,
-                sfb_tensor_gpu,
-                c_tensor_gpu,
-                alpha_tensor_gpu,
-                quant_c_values_gpu,
-                quant_c_scale_rows_gpu,
-                quant_c_scale_mma_gpu,
-            ],
-            a_tensor_gpu.device,
-        )
         compiled_kernel(
             *_make_runtime_pointers(
                 [
@@ -6278,7 +6257,7 @@ def _get_compiled_dense_gemm(
                 quant_c_tensors,
             ),
             m,
-            launch_stream,
+            cuda_stream_from_int_or_current(stream_int),
         )
         return c_tensor_gpu
 
@@ -6320,7 +6299,6 @@ def _dense_gemm_launch_flat(
     alpha_is_one: bool,
     stream_int: Optional[int],
 ) -> None:
-    validate_stream_int_is_current(stream_int, a_tensor_gpu.device)
     b_tile_major = b_tensor_gpu.ndim == 5
     policy = _DenseGemmPolicy(
         single_work_tile_per_cta=single_work_tile_per_cta,
@@ -6435,7 +6413,6 @@ def _dense_gemm_launch_op(
     alpha_is_one: bool,
     stream_int: Optional[int],
 ) -> None:
-    validate_stream_int_is_current(stream_int, a_tensor_gpu.device)
     _dense_gemm_launch_flat(
         a_tensor_gpu,
         b_tensor_gpu,
@@ -6595,7 +6572,6 @@ def _dense_gemm_launch_functional_op(
     alpha_is_one: bool,
     stream_int: Optional[int],
 ) -> torch.Tensor:
-    validate_stream_int_is_current(stream_int, a_tensor_gpu.device)
     m = int(a_tensor_gpu.shape[0])
     out = _empty_dense_gemm_output(
         m,
@@ -6982,16 +6958,30 @@ def dense_gemm_fused_quant_a(
     dense_gemm split-K policy (FP32 partials + fused reduce) instead of forcing
     a single un-split kernel, which loses ~2x at M=1 for N,K >= 4096.
 
-    `stream` must be `None` or the current Torch stream for `source.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
+    An explicit stream runs the complete operation on that stream. Dependencies
+    from and back to the caller's current stream are inserted automatically.
     """
 
+    if stream is not None:
+        with cuda_stream_scope(
+            stream,
+            source.device,
+            [source, b, sfb, out, rhs_values_tiled],
+        ):
+            return dense_gemm_fused_quant_a(
+                source,
+                b,
+                sfb,
+                out=out,
+                expected_m=expected_m,
+                sfb_k_replicated=sfb_k_replicated,
+                rhs_values_tiled=rhs_values_tiled,
+                a_inner_span=a_inner_span,
+                mma_tiler_mn=mma_tiler_mn,
+                _atomic_output_precleared=_atomic_output_precleared,
+            )
+
     a_inner_span = int(a_inner_span)
-    validate_stream_is_current(stream, source.device)
-    record_tensors_on_current_stream(
-        [source, b, sfb, out, rhs_values_tiled],
-        source.device,
-    )
     if source.dtype != torch.bfloat16:
         raise ValueError("fused MXFP8 activation quantization requires BF16 A")
     if a_inner_span == 0:
@@ -7118,7 +7108,7 @@ def dense_gemm_fused_quant_a(
         sfb,
         c_tensor_gpu,
         _cached_alpha_one(source.device),
-        None,  # stream: validated as current; use current stream
+        cuda_stream_to_int(stream),
     )
     if split_storage is not None:
         _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
@@ -7216,28 +7206,60 @@ def dense_gemm(
     apply compact FP32 activation ``[M,K/128]`` and weight
     ``[N/128,K/128]`` scales before adding it to the final accumulator.
 
-    ``stream`` must be ``None`` or the current Torch stream for the operand
-    device. Make a side stream current with ``torch.cuda.stream`` before calling.
+    An explicit stream runs allocations, kernels, reductions, and epilogues on
+    that stream. Dependencies from and back to the caller's current stream are
+    inserted automatically.
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
-    validate_stream_is_current(stream, a_torch.device)
-    record_tensors_on_current_stream(
-        [
-            a_torch,
-            sfa_torch,
-            b_torch,
-            sfb_torch,
-            out,
-            alpha,
-            rhs_values_tiled,
-            x_bf16,
-            w_gscale,
-            row_scale,
-            *(() if _quantized_c is None else _quantized_c),
-        ],
-        a_torch.device,
-    )
+    if stream is not None:
+        with cuda_stream_scope(
+            stream,
+            a_torch.device,
+            [
+                a_torch,
+                sfa_torch,
+                b_torch,
+                sfb_torch,
+                out,
+                alpha,
+                rhs_values_tiled,
+                x_bf16,
+                w_gscale,
+                row_scale,
+                *(() if _quantized_c is None else _quantized_c),
+            ],
+        ):
+            return dense_gemm(
+                lhs,
+                rhs,
+                out,
+                ab_dtype=ab_dtype,
+                sf_dtype=sf_dtype,
+                c_dtype=c_dtype,
+                sf_vec_size=sf_vec_size,
+                sm_count=sm_count,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                alpha=alpha,
+                alpha_dtype=alpha_dtype,
+                expected_m=expected_m,
+                load_path=load_path,
+                swap_ab=swap_ab,
+                sfb_k_replicated=sfb_k_replicated,
+                rhs_values_tiled=rhs_values_tiled,
+                _quantized_c=_quantized_c,
+                a_preexpanded=a_preexpanded,
+                b_preexpanded=b_preexpanded,
+                b_packed=b_packed,
+                a_fmt=a_fmt,
+                b_fmt=b_fmt,
+                x_bf16=x_bf16,
+                w_gscale=w_gscale,
+                plain_fp8=plain_fp8,
+                row_scale=row_scale,
+                block_fp8=block_fp8,
+            )
     if load_path is not None and load_path not in _DENSE_LOAD_PATHS:
         raise ValueError(
             f"dense_gemm load_path must be one of {_DENSE_LOAD_PATHS}, got {load_path!r}"
@@ -7511,7 +7533,7 @@ def dense_gemm(
     alpha_is_one = alpha is None
     if alpha is None:
         alpha = _cached_alpha_one(a_torch.device)
-    stream_int = None  # validated as current stream; use current everywhere
+    stream_int = cuda_stream_to_int(stream)
     kernel_c_dtype_name = (
         "float32" if split_k_output and not split_k_atomic_bf16 else c_dtype
     )

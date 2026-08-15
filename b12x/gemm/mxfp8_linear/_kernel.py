@@ -5,11 +5,7 @@ from dataclasses import dataclass
 import cutlass.cute as cute
 import torch
 
-from b12x._lib.utils import (
-    record_tensors_on_current_stream,
-    validate_stream_is_current,
-    validate_stream_int_is_current,
-)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.block_fp8 import (
     quantize_block_fp8_linear_input_mxfp8,
 )
@@ -185,11 +181,6 @@ def _mxfp8_linear_fused_op(
     expected_m: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    validate_stream_int_is_current(stream_int, source_2d.device)
-    record_tensors_on_current_stream(
-        [source_2d, weight_values, weight_scale_rows, weight_scale_mma],
-        source_2d.device,
-    )
     del weight_scale_rows
     tokens = int(source_2d.shape[0])
     source_for_quant = _pad_source_2d_k(source_2d, int(padded_in_features))
@@ -240,27 +231,11 @@ def mxfp8_linear(
     expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Run a ModelOpt MXFP8 linear through the native b12x dense GEMM path.
-
-    `stream` must be `None` or the current Torch stream for `source.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
-    """
+    """Run a ModelOpt MXFP8 linear through the native b12x dense GEMM path."""
 
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, MXFP8LinearWeight):
         raise TypeError("packed_weight must be an MXFP8LinearWeight")
-    validate_stream_is_current(stream, source.device)
-    record_tensors_on_current_stream(
-        [
-            source,
-            packed_weight.weight.values,
-            packed_weight.weight.scale_rows,
-            packed_weight.weight.scale_mma,
-            packed_weight.weight.values_tiled,
-            bias,
-        ],
-        source.device,
-    )
     source_2d = _source_2d(source)
     tokens, in_features = map(int, source_2d.shape)
     if in_features != int(packed_weight.in_features):
@@ -284,7 +259,7 @@ def mxfp8_linear(
             packed_weight.padded_in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
-            None,  # stream: validated as current; use current stream
+            cuda_stream_to_int(stream),
         )
     if bias is not None:
         output = output + bias

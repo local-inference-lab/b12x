@@ -15,11 +15,7 @@ from ..._lib.scratch_layout import (
     materialize_scratch_view as _materialize_arena_view,
     wo_mxfp8_scale_physical_shape as _wo_mxfp8_scale_physical_shape,
 )
-from b12x._lib.utils import (
-    record_tensors_on_current_stream,
-    validate_stream_is_current,
-    validate_stream_int_is_current,
-)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x._lib.dense_gemm import (
     _WO_SPARK_MAX_SMS,
     dense_gemm,
@@ -2579,9 +2575,6 @@ def wo_projection_mxfp8(
 
     `source_tgd` is `[tokens, groups, group_width]`. The default return value
     is the SGLang-friendly `[tokens, hidden]` view over the binding output.
-
-    `stream` must be `None` or the current Torch stream for `source_tgd.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
     """
 
     if binding is not None:
@@ -2620,7 +2613,6 @@ def wo_projection_mxfp8(
             "wo_projection_mxfp8 requires source_tgd and weights or binding"
         )
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
-    validate_stream_is_current(stream, source_tgd.device)
     # WO auto-defaults the regime hint to the (capture-fixed) token count so the
     # wo_b up-projection (N=hidden>1536) picks the decode tile (32x128) at small
     # M and the prefill tile (64x128) at large M, with no caller change.
@@ -2630,30 +2622,6 @@ def wo_projection_mxfp8(
         expected_m = int(tokens)
     if x_q is None or tmp is None or tmp_q is None or output is None:
         raise TypeError("wo_projection_mxfp8 requires binding for caller-owned scratch")
-    record_tensors_on_current_stream(
-        [
-            source_tgd,
-            weights.wo_a.values,
-            weights.wo_a.values_tiled,
-            weights.wo_a.scale_rows,
-            weights.wo_a.scale_mma,
-            weights.wo_b.values,
-            weights.wo_b.values_tiled,
-            weights.wo_b.scale_rows,
-            weights.wo_b.scale_mma,
-            x_q.values,
-            x_q.values_tiled,
-            x_q.scale_rows,
-            x_q.scale_mma,
-            tmp,
-            tmp_q.values,
-            tmp_q.values_tiled,
-            tmp_q.scale_rows,
-            tmp_q.scale_mma,
-            output,
-        ],
-        source_tgd.device,
-    )
 
     alpha_one = _cached_alpha_one(source_tgd.device)
     # WO-A stays on the standalone quantizer + GEMM; fusing quant into the
@@ -2723,23 +2691,6 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
-    validate_stream_int_is_current(stream_int, o.device)
-    record_tensors_on_current_stream(
-        [
-            o,
-            positions,
-            cos_sin_cache,
-            wo_a_values,
-            wo_a_values_tiled,
-            wo_a_scale_rows,
-            wo_a_scale_mma,
-            wo_b_values,
-            wo_b_values_tiled,
-            wo_b_scale_rows,
-            wo_b_scale_mma,
-        ],
-        o.device,
-    )
     # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
     # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
     # MXFP8 view (x_q, tmp_q) stays internal and never becomes a symbolic-shaped
@@ -2943,11 +2894,7 @@ def wo_projection_inv_rope_mxfp8(
     expected_m: int | None = None,
     stream: object = None,
 ) -> torch.Tensor:
-    """Run WO projection from attention output without BF16 inverse-RoPE storage.
-
-    `stream` must be `None` or the current Torch stream for `o.device`.
-    Make a side stream current with `torch.cuda.stream` before calling.
-    """
+    """Run WO projection from attention output without BF16 inverse-RoPE storage."""
 
     if binding is not None:
         extras = [
@@ -3007,23 +2954,6 @@ def wo_projection_inv_rope_mxfp8(
     )
     _check_gpu_tensor("positions", positions)
     _check_gpu_tensor("cos_sin_cache", cos_sin_cache)
-    validate_stream_is_current(stream, o.device)
-    record_tensors_on_current_stream(
-        [
-            o,
-            positions,
-            cos_sin_cache,
-            weights.wo_a.values,
-            weights.wo_a.values_tiled,
-            weights.wo_a.scale_rows,
-            weights.wo_a.scale_mma,
-            weights.wo_b.values,
-            weights.wo_b.values_tiled,
-            weights.wo_b.scale_rows,
-            weights.wo_b.scale_mma,
-        ],
-        o.device,
-    )
     # Auto-default the regime hint to the (capture-fixed) token count (see
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
@@ -3053,7 +2983,7 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim,
         expected_m,
         weights.sfb_k_replicated,
-        None,  # stream: validated as current; use current stream
+        cuda_stream_to_int(stream),
     )
     if return_3d:
         return output

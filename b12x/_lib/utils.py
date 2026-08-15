@@ -15,11 +15,14 @@ limitations under the License.
 """
 
 import ctypes
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 import functools
 import importlib.util
 from typing import Union, Tuple
 
 import cuda.bindings.driver as cuda
+import cuda.bindings.runtime as cudart
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
@@ -204,93 +207,97 @@ def cuda_stream_from_int_or_current(stream_int: int | None) -> cuda.CUstream:
     return cuda.CUstream(int(stream_int))
 
 
-def record_tensors_on_current_stream(
-    tensors: list[torch.Tensor | None], device: torch.device
-) -> cuda.CUstream:
-    """Resolve the device-qualified current stream, record all tensors, return handle.
+def _resolve_torch_cuda_stream(
+    stream: object | None,
+    device: torch.device,
+) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
+    """Return the caller-current and requested streams on one CUDA device."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"CUDA stream execution requires a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
 
-    This is the allocator-lifetime safety primitive for composite CUDA work and
-    raw CuTe launches. Even when the public API restricts ``stream`` to the
-    current stream, input/output tensors may have been *allocated* on a
-    different stream. Calling ``record_stream`` tells PyTorch's caching
-    allocator that each tensor's storage is in use on this stream, preventing
-    premature reuse while any queued stage is pending.
-
-    Returns a ``cuda.CUstream`` handle suitable for passing to compiled kernels.
-    """
-    stream = torch.cuda.current_stream(device)
-    for tensor in tensors:
-        if tensor is not None:
-            tensor.record_stream(stream)
-    return cuda.CUstream(int(stream.cuda_stream))
-
-
-def validate_stream_is_current(
-    stream: object | None, device: torch.device
-) -> None:
-    """Validate that ``stream`` is ``None`` or the current stream for ``device``.
-
-    The dense-GEMM path launches raw CuTe kernels alongside PyTorch allocations,
-    zero-fills, Triton reductions, quantizers, and bias epilogues.  Restricting
-    the explicit stream to the current stream ensures all of these stages are
-    ordered by same-stream program order.  Allocator lifetime safety is
-    provided separately by ``record_tensors_on_current_stream`` at every public
-    composite and raw launch boundary, because input/output tensors may have
-    been allocated on a different stream. An explicit stream must be the current
-    stream for the operand device -- anything else is rejected before work.
-
-    Raises ``ValueError`` for wrong-device, non-current, or invalid handles.
-    """
+    caller_stream = torch.cuda.current_stream(device)
     if stream is None:
-        return
-    device_index = int(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    current = torch.cuda.current_stream(device)
-    current_handle = int(current.cuda_stream)
+        return caller_stream, caller_stream
     if isinstance(stream, torch.cuda.Stream):
-        if stream.device.index != device_index:
-            raise ValueError(
-                f"stream is on {stream.device}, but operands are on "
-                f"cuda:{device_index}"
+        launch_stream = stream
+    else:
+        handle = cuda_stream_to_int(stream)
+        assert handle is not None
+        if handle == int(caller_stream.cuda_stream):
+            launch_stream = caller_stream
+        elif handle == 0:
+            launch_stream = torch.cuda.default_stream(device)
+        else:
+            error, stream_device = cudart.cudaStreamGetDevice(
+                cudart.cudaStream_t(handle)
             )
-        if int(stream.cuda_stream) != current_handle:
-            raise ValueError(
-                f"dense GEMM stream must be the current stream for {device} "
-                f"(handle {current_handle}); got handle "
-                f"{int(stream.cuda_stream)} on {stream.device}"
-            )
-        return
-    stream_int = cuda_stream_to_int(stream)
-    validate_stream_int_is_current(stream_int, device)
+            if error != cudart.cudaError_t.cudaSuccess:
+                raise ValueError(f"invalid CUDA stream handle: {error.name}")
+            if int(stream_device) != device.index:
+                raise ValueError(
+                    f"CUDA stream is on cuda:{stream_device}, but operands are on {device}"
+                )
+            launch_stream = torch.cuda.ExternalStream(handle, device=device)
+    if launch_stream.device != device:
+        raise ValueError(
+            f"CUDA stream is on {launch_stream.device}, but operands are on {device}"
+        )
+    return caller_stream, launch_stream
 
 
-def validate_stream_int_is_current(
-    stream_int: int | None, device: torch.device
-) -> None:
-    """Validate that a raw stream handle is ``None`` or the current stream.
+@contextmanager
+def cuda_stream_scope(
+    stream: object | None,
+    device: torch.device,
+    tensors: Iterable[torch.Tensor | None],
+) -> Iterator[torch.cuda.Stream]:
+    """Run composite CUDA work on one stream with allocator-safe lifetimes.
 
-    Used inside custom ops that receive ``stream_int`` as a scalar.  When
-    ``stream_int`` is ``None`` the launch falls back to the current stream.
-    A non-``None`` handle must be the current stream for ``device`` (handle 0
-    is accepted only when it is the default stream and that is current).
+    A non-current explicit stream waits for work already queued on the caller's
+    current stream. Before returning, the caller's stream waits for the explicit
+    stream, so follow-on PyTorch work can consume the result without an extra
+    event. On a non-current launch stream, each external storage is recorded
+    once; tensors allocated inside the scope inherit that stream from PyTorch.
     """
-    if stream_int is None:
-        return
-    current = torch.cuda.current_stream(device)
-    current_handle = int(current.cuda_stream)
-    if int(stream_int) == current_handle:
-        return
-    # Handle 0 is the default stream; accept it only if it is the current
-    # stream (some devices use a non-zero default-stream handle).
-    if int(stream_int) == 0:
-        default_handle = int(torch.cuda.default_stream(device).cuda_stream)
-        if default_handle == current_handle:
-            return
-    raise ValueError(
-        f"dense GEMM stream must be the current stream for {device} "
-        f"(handle {current_handle}); got handle {int(stream_int)}"
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"CUDA stream execution requires a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    caller_stream, launch_stream = _resolve_torch_cuda_stream(stream, device)
+    distinct_stream = int(launch_stream.cuda_stream) != int(
+        caller_stream.cuda_stream
     )
+    if distinct_stream:
+        launch_stream.wait_stream(caller_stream)
+
+    if not distinct_stream:
+        with torch.cuda.device(device):
+            yield launch_stream
+        return
+
+    seen_storages: set[int] = set()
+    with torch.cuda.device(device), torch.cuda.stream(launch_stream):
+        for tensor in tensors:
+            if tensor is None or tensor.numel() == 0:
+                continue
+            if tensor.device != device:
+                raise ValueError(
+                    f"tensor is on {tensor.device}, but launch stream is on {device}"
+                )
+            storage_ptr = int(tensor.untyped_storage().data_ptr())
+            if storage_ptr in seen_storages:
+                continue
+            tensor.record_stream(launch_stream)
+            seen_storages.add(storage_ptr)
+        try:
+            yield launch_stream
+        finally:
+            caller_stream.wait_stream(launch_stream)
+
 
 # Cache for HardwareInfo - it's expensive to create on every call
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
