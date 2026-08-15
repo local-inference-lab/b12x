@@ -60,12 +60,12 @@ QUANT_ALGO = "W6A6"
 
 
 class CaptureOutputCache:
-    """Bounded output buffer cache keyed by the declared capture-size catalog.
+    """Bounded output storage for graph and eager execution.
 
-    Only catalogued M values (CUDA-graph capture sizes) get retained
-    ``(M, K)`` BF16 output buffers with stable addresses.  Uncatalogued
-    eager M returns ``None`` (caller allocates transiently).  Uncatalogued
-    M during CUDA-graph capture raises before any allocation.
+    Catalogued M values get exact-shape buffers whose addresses remain stable
+    for CUDA graphs. Uncatalogued eager values share one geometrically grown
+    capacity buffer, bounded by ``eager_max_tokens``. Capture rejects both
+    uncatalogued sizes and unprepared catalogued sizes before allocation.
 
     Owner invariants (dtype, device, hidden_size) are fixed at construction
     and validated on every ``get`` to prevent cross-model/cross-config aliasing.
@@ -77,16 +77,39 @@ class CaptureOutputCache:
         hidden_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        *,
+        eager_max_tokens: Optional[int] = None,
     ):
         self._catalog = frozenset(int(m) for m in catalog)
         self._hidden_size = int(hidden_size)
         self._dtype = dtype
         self._device = device
+        catalog_max = max(self._catalog, default=0)
+        if eager_max_tokens is None:
+            eager_max_tokens = catalog_max
+        self._eager_max_tokens = max(int(eager_max_tokens), catalog_max)
         self._bufs: dict[int, torch.Tensor] = {}
+        self._eager_buf: Optional[torch.Tensor] = None
 
     @property
     def catalog(self) -> frozenset[int]:
         return self._catalog
+
+    @property
+    def eager_capacity(self) -> int:
+        return 0 if self._eager_buf is None else int(self._eager_buf.shape[0])
+
+    @property
+    def eager_max_tokens(self) -> int:
+        return self._eager_max_tokens
+
+    def _next_eager_capacity(self, m: int) -> int:
+        if m > self._eager_max_tokens:
+            raise RuntimeError(
+                f"B12X FP6 MoE: eager M={m} exceeds configured capacity "
+                f"{self._eager_max_tokens}"
+            )
+        return min(self._eager_max_tokens, 1 << (max(m, 1) - 1).bit_length())
 
     def get(
         self, m: int, dtype: torch.dtype, device: torch.device
@@ -102,9 +125,24 @@ class CaptureOutputCache:
                     f"B12X FP6 MoE: uncatalogued M={m} during CUDA-graph "
                     "capture — output buffer not in capture-size catalog"
                 )
-            return None  # eager transient
+            if self._eager_buf is None or self.eager_capacity < m:
+                capacity = self._next_eager_capacity(m)
+                self._eager_buf = torch.zeros(
+                    capacity,
+                    self._hidden_size,
+                    dtype=self._dtype,
+                    device=self._device,
+                )
+            output = self._eager_buf[:m]
+            output.zero_()
+            return output
         buf = self._bufs.get(m)
         if buf is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"B12X FP6 MoE: catalogued M={m} was not prepared before "
+                    "CUDA-graph capture"
+                )
             buf = torch.zeros(
                 m, self._hidden_size, dtype=self._dtype, device=self._device
             )
@@ -115,6 +153,7 @@ class CaptureOutputCache:
 
     def clear(self) -> None:
         self._bufs.clear()
+        self._eager_buf = None
 
     def __len__(self) -> int:
         return len(self._bufs)
@@ -126,9 +165,9 @@ class ServingScratchArena:
     One arena instance is shared across ALL MoE layers of a model (layers
     run sequentially on one stream, so scratch reuse is safe).  Only
     catalogued M values get retained scratch with stable addresses (needed
-    for CUDA-graph capture).  Uncatalogued eager M computes transient
-    scratch that is never stored.  Uncatalogued capture M is rejected
-    before allocation.
+    for CUDA-graph capture). Uncatalogued eager M values share one
+    geometrically grown plan and scratch allocation, bounded by
+    ``eager_max_tokens``. Capture never builds plans or allocates scratch.
 
     The scratch key includes the full semantic geometry (source_format,
     activation, E, K, N, topk, device, router_on_input) so different model
@@ -148,6 +187,7 @@ class ServingScratchArena:
         hidden_size: int = 0,
         intermediate_size: int = 0,
         apply_router_weight_on_input: bool = False,
+        eager_max_tokens: Optional[int] = None,
     ):
         self._catalog = frozenset(int(m) for m in catalog)
         self._weight_plan = weight_plan
@@ -166,6 +206,13 @@ class ServingScratchArena:
             self._router_on_input,
         )
         self._scratch: dict[tuple, tuple[Any, tuple[torch.Tensor, ...]]] = {}
+        catalog_max = max(self._catalog, default=0)
+        if eager_max_tokens is None:
+            eager_max_tokens = catalog_max
+        self._eager_max_tokens = max(int(eager_max_tokens), catalog_max)
+        self._eager: Optional[
+            tuple[int, Any, tuple[torch.Tensor, ...]]
+        ] = None
 
     def validate_geometry(
         self, *, weight_plan: Any, topk: int, device: torch.device,
@@ -194,15 +241,31 @@ class ServingScratchArena:
     def weight_plan(self) -> Any:
         return self._weight_plan
 
+    @property
+    def eager_capacity(self) -> int:
+        return 0 if self._eager is None else self._eager[0]
+
+    @property
+    def eager_max_tokens(self) -> int:
+        return self._eager_max_tokens
+
+    def _next_eager_capacity(self, m: int) -> int:
+        if m > self._eager_max_tokens:
+            raise RuntimeError(
+                f"B12X FP6 MoE: eager M={m} exceeds configured capacity "
+                f"{self._eager_max_tokens}"
+            )
+        return min(self._eager_max_tokens, 1 << (max(m, 1) - 1).bit_length())
+
     def _key(self, m: int) -> tuple:
         return (int(m), self._geometry)
 
     def get_or_build(
         self, m: int
     ) -> tuple[Any, tuple[torch.Tensor, ...]]:
-        """Return retained scratch for catalogued M, transient for uncatalogued eager.
+        """Return exact graph scratch or the bounded reusable eager slot.
 
-        Raises RuntimeError for uncatalogued M during CUDA-graph capture.
+        Raises RuntimeError rather than planning or allocating during capture.
         """
         if m not in self._catalog:
             if torch.cuda.is_current_stream_capturing():
@@ -210,12 +273,20 @@ class ServingScratchArena:
                     f"B12X FP6 MoE: uncatalogued M={m} during CUDA-graph "
                     "capture — scratch not in capture-size catalog"
                 )
-            # Uncatalogued eager: build transient, do not retain.
-            return self._build(m)
+            if self._eager is None or self._eager[0] < m:
+                capacity = self._next_eager_capacity(m)
+                plan, scratch = self._build(capacity)
+                self._eager = (capacity, plan, scratch)
+            return self._eager[1], self._eager[2]
         key = self._key(m)
         cached = self._scratch.get(key)
         if cached is not None:
             return cached
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"B12X FP6 MoE: catalogued M={m} was not prepared before "
+                "CUDA-graph capture"
+            )
         plan, scratch = self._build(m)
         self._scratch[key] = (plan, scratch)
         return plan, scratch
@@ -252,6 +323,7 @@ class ServingScratchArena:
         have been destroyed.
         """
         self._scratch.clear()
+        self._eager = None
 
     def __len__(self) -> int:
         return len(self._scratch)
@@ -403,10 +475,10 @@ class B12XFP6MoEMethod:
     come from the owner's :class:`ServingScratchArena` (if provided) or are
     transient (if no arena — standalone eager path).
 
-    Scratch retention is bounded by the arena's capture-size catalog.  Only
-    catalogued M values get retained scratch with stable addresses.  Uncatalogued
-    eager M computes transient scratch that is never stored.  Uncatalogued M
-    during CUDA-graph capture is rejected before any cache lookup or allocation.
+    Scratch retention is bounded by the arena's capture-size catalog plus one
+    reusable eager-capacity slot. Catalogued M values retain exact stable
+    addresses. Capture rejects unprepared or uncatalogued sizes before any
+    planning or allocation.
     """
 
     def __init__(

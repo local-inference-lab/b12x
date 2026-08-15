@@ -9,9 +9,9 @@ Also tests the plugin-side catalog derivation function
 :func:`capture_sizes_from_config`.
 
 Covers: catalog-bounded retention across M=1..512, stable addresses for
-catalogued sizes, transient uncatalogued eager, uncatalogued capture rejection
-before allocation, multi-owner isolation/churn, shared arena across layers,
-dtype/device validation, pointer stability/zeroing, and teardown ordering.
+catalogued sizes, one bounded reusable uncatalogued eager slot, capture
+rejection before allocation, multi-owner isolation/churn, shared arena across
+layers, dtype/device validation, pointer stability/zeroing, and teardown.
 """
 from __future__ import annotations
 
@@ -175,6 +175,7 @@ def _make_arena(catalog, **kw):
         hidden_size=kw.get("hidden_size", 512),
         intermediate_size=kw.get("intermediate_size", 256),
         apply_router_weight_on_input=kw.get("apply_router_weight_on_input", False),
+        eager_max_tokens=kw.get("eager_max_tokens", 512),
     )
 
 
@@ -202,13 +203,21 @@ class TestCaptureOutputCache:
         assert buf2 is buf1
         assert buf2.sum() == 0.0, "reused buffer must be zeroed"
 
-    def test_uncatalogued_eager_returns_none(self):
+    def test_uncatalogued_eager_reuses_capacity_view(self):
         from b12x.integration.vllm.fp6_serving import CaptureOutputCache
 
         cache = CaptureOutputCache(
             catalog=(1, 2, 4, 8), hidden_size=128, dtype=_DTYPE, device=_DEV,
+            eager_max_tokens=64,
         )
-        assert cache.get(7, _DTYPE, _DEV) is None
+        first = cache.get(7, _DTYPE, _DEV)
+        assert first is not None and first.shape == (7, 128)
+        assert cache.eager_capacity == 8
+        ptr = first.data_ptr()
+        first.fill_(1.0)
+        second = cache.get(6, _DTYPE, _DEV)
+        assert second is not None and second.data_ptr() == ptr
+        assert second.shape == (6, 128) and second.sum() == 0.0
 
     def test_retained_count_equals_catalog_size_across_m1_to_512(self):
         from b12x.integration.vllm.fp6_serving import CaptureOutputCache
@@ -216,6 +225,7 @@ class TestCaptureOutputCache:
         catalog = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
         cache = CaptureOutputCache(
             catalog=catalog, hidden_size=128, dtype=_DTYPE, device=_DEV,
+            eager_max_tokens=512,
         )
         for m in range(1, 513):
             cache.get(m, _DTYPE, _DEV)
@@ -239,6 +249,7 @@ class TestCaptureOutputCache:
         catalog = (1, 8, 32)
         cache = CaptureOutputCache(
             catalog=catalog, hidden_size=64, dtype=_DTYPE, device=_DEV,
+            eager_max_tokens=512,
         )
         first = {m: cache.get(m, _DTYPE, _DEV) for m in catalog}
         for _ in range(10):
@@ -253,11 +264,47 @@ class TestCaptureOutputCache:
         cache = CaptureOutputCache(
             catalog=(1, 2, 4, 8), hidden_size=128, dtype=_DTYPE, device=_DEV,
         )
+        prepared = cache.get(8, _DTYPE, _DEV)
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
         with pytest.raises(RuntimeError, match="uncatalogued M=7"):
             cache.get(7, _DTYPE, _DEV)
         buf = cache.get(8, _DTYPE, _DEV)
-        assert buf is not None and buf.shape == (8, 128)
+        assert buf is prepared and buf.shape == (8, 128)
+
+    def test_catalogued_capture_miss_rejected_before_allocation(self, monkeypatch):
+        from b12x.integration.vllm.fp6_serving import CaptureOutputCache
+
+        cache = CaptureOutputCache(
+            catalog=(1, 2, 4, 8), hidden_size=128, dtype=_DTYPE, device=_DEV,
+        )
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="was not prepared"):
+            cache.get(8, _DTYPE, _DEV)
+        assert len(cache) == 0
+
+    def test_catalogued_hit_does_not_query_capture_state(self, monkeypatch):
+        from b12x.integration.vllm.fp6_serving import CaptureOutputCache
+
+        cache = CaptureOutputCache(
+            catalog=(1, 2, 4, 8), hidden_size=128, dtype=_DTYPE, device=_DEV,
+        )
+        prepared = cache.get(8, _DTYPE, _DEV)
+        monkeypatch.setattr(
+            torch.cuda,
+            "is_current_stream_capturing",
+            lambda: pytest.fail("prepared output queried capture state"),
+        )
+        assert cache.get(8, _DTYPE, _DEV) is prepared
+
+    def test_uncatalogued_eager_capacity_bound(self):
+        from b12x.integration.vllm.fp6_serving import CaptureOutputCache
+
+        cache = CaptureOutputCache(
+            catalog=(1, 2, 4, 8), hidden_size=128, dtype=_DTYPE, device=_DEV,
+            eager_max_tokens=32,
+        )
+        with pytest.raises(RuntimeError, match="exceeds configured capacity 32"):
+            cache.get(33, _DTYPE, _DEV)
 
     def test_dtype_mismatch_rejected(self):
         from b12x.integration.vllm.fp6_serving import CaptureOutputCache
@@ -293,9 +340,12 @@ class TestServingScratchArena:
         p2, s2 = arena.get_or_build(4)
         assert p1 is p2 and s1 is s2
 
-    def test_uncatalogued_eager_no_retention(self, mock_fused_moe):
+    def test_uncatalogued_eager_reuses_one_capacity_slot(self, mock_fused_moe):
         arena = _make_arena((1, 2, 4, 8))
-        arena.get_or_build(7)
+        p1, s1 = arena.get_or_build(7)
+        assert arena.eager_capacity == 8
+        p2, s2 = arena.get_or_build(6)
+        assert p1 is p2 and s1 is s2
         assert len(arena) == 0
 
     def test_retained_count_bounded_across_m1_to_512(self, mock_fused_moe):
@@ -330,6 +380,32 @@ class TestServingScratchArena:
         with pytest.raises(RuntimeError, match="uncatalogued M=7"):
             arena.get_or_build(7)
         assert len(arena) == 0
+
+    def test_catalogued_capture_miss_rejected_before_allocation(
+        self, mock_fused_moe, monkeypatch
+    ):
+        arena = _make_arena((1, 2, 4, 8))
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="was not prepared"):
+            arena.get_or_build(8)
+        assert len(arena) == 0 and arena.eager_capacity == 0
+
+    def test_catalogued_hit_does_not_query_capture_state(
+        self, mock_fused_moe, monkeypatch
+    ):
+        arena = _make_arena((1, 2, 4, 8))
+        prepared = arena.get_or_build(8)
+        monkeypatch.setattr(
+            torch.cuda,
+            "is_current_stream_capturing",
+            lambda: pytest.fail("prepared scratch queried capture state"),
+        )
+        assert arena.get_or_build(8) == prepared
+
+    def test_uncatalogued_eager_capacity_bound(self, mock_fused_moe):
+        arena = _make_arena((1, 2, 4, 8), eager_max_tokens=32)
+        with pytest.raises(RuntimeError, match="exceeds configured capacity 32"):
+            arena.get_or_build(33)
 
     def test_clear_empties_all(self, mock_fused_moe):
         arena = _make_arena((1, 2, 4, 8))
@@ -486,7 +562,7 @@ class TestB12XFP6MoEMethodCaptureRejection:
         with pytest.raises(RuntimeError, match="uncatalogued M=7"):
             method.apply(x, w, ids, output=output)
 
-    def test_apply_uncatalogued_eager_works_without_retention(self, mock_fused_moe):
+    def test_apply_uncatalogued_eager_reuses_bounded_slot(self, mock_fused_moe):
         from b12x.integration.vllm.fp6_serving import B12XFP6MoEMethod
 
         arena = _make_arena((1, 2, 4, 8))
@@ -498,7 +574,11 @@ class TestB12XFP6MoEMethodCaptureRejection:
         w = torch.full((7, 2), 0.5, dtype=torch.float32)
         result = method.apply(x, w, ids)
         assert result is not None and result.shape == (7, 64)
-        assert len(arena) == 0
+        assert len(arena) == 0 and arena.eager_capacity == 8
+        _, first_scratch = arena.get_or_build(7)
+        method.apply(x, w, ids)
+        _, second_scratch = arena.get_or_build(7)
+        assert first_scratch is second_scratch
 
     def test_apply_no_arena_capture_raises(self, mock_fused_moe, monkeypatch):
         from b12x.integration.vllm.fp6_serving import B12XFP6MoEMethod
@@ -574,7 +654,7 @@ class TestTeardownOrdering:
             arena.get_or_build(m)
         assert len(arena) == 4
         arena.clear()
-        assert len(arena) == 0
+        assert len(arena) == 0 and arena.eager_capacity == 0
         arena.get_or_build(3)
         assert len(arena) == 0
 
@@ -588,9 +668,73 @@ class TestTeardownOrdering:
             cache.get(m, _DTYPE, _DEV)
         assert len(cache) == 4
         cache.clear()
-        assert len(cache) == 0
+        assert len(cache) == 0 and cache.eager_capacity == 0
         buf = cache.get(8, _DTYPE, _DEV)
         assert buf is not None and len(cache) == 1
+
+
+@requires_torch
+class TestDenseGraphVisibleReload:
+    """Dense reload keeps every graph-visible tensor address stable."""
+
+    @staticmethod
+    def _weight(value: float, *, gscale_shape: tuple[int, ...] = (1,)):
+        return types.SimpleNamespace(
+            scale_storage=torch.full((8,), value, dtype=torch.uint8),
+            global_scale=torch.full(gscale_shape, value, dtype=torch.float32),
+            fmt="e2m3",
+            act_fmt="e4m3",
+            out_features=128,
+            in_features=256,
+        )
+
+    def test_initial_load_installs_gscale(self):
+        from b12x.integration.vllm.plugin import _store_graph_visible_dense_state
+
+        layer = types.SimpleNamespace()
+        weight = self._weight(1)
+        gemm = torch.full((4, 8), 1, dtype=torch.uint8)
+        _store_graph_visible_dense_state(layer, weight, gemm)
+        assert layer.b12x_fp6_gscale is weight.global_scale
+        assert layer.b12x_fp6_gemm_weight is gemm
+
+    def test_reload_copies_gscale_without_changing_pointer(self):
+        from b12x.integration.vllm.plugin import _store_graph_visible_dense_state
+
+        layer = types.SimpleNamespace()
+        first = self._weight(1)
+        _store_graph_visible_dense_state(
+            layer, first, torch.full((4, 8), 1, dtype=torch.uint8)
+        )
+        pointers = {
+            name: getattr(layer, name).data_ptr()
+            for name in (
+                "b12x_fp6_gemm_weight",
+                "b12x_fp6_scales",
+                "b12x_fp6_gscale",
+            )
+        }
+        second = self._weight(2)
+        _store_graph_visible_dense_state(
+            layer, second, torch.full((4, 8), 2, dtype=torch.uint8)
+        )
+        for name, pointer in pointers.items():
+            assert getattr(layer, name).data_ptr() == pointer
+        assert torch.equal(layer.b12x_fp6_gscale, second.global_scale)
+
+    def test_reload_rejects_gscale_shape_change_before_copying(self):
+        from b12x.integration.vllm.plugin import _store_graph_visible_dense_state
+
+        layer = types.SimpleNamespace()
+        first = self._weight(1)
+        first_gemm = torch.full((4, 8), 1, dtype=torch.uint8)
+        _store_graph_visible_dense_state(layer, first, first_gemm)
+        second = self._weight(2, gscale_shape=(2,))
+        with pytest.raises(RuntimeError, match="cannot preserve b12x_fp6_gscale"):
+            _store_graph_visible_dense_state(
+                layer, second, torch.full((4, 8), 2, dtype=torch.uint8)
+            )
+        assert torch.equal(layer.b12x_fp6_gemm_weight, first_gemm)
 
     def test_reset_serving_caches_clears_plan_cache(
         self, mock_fused_moe, clean_plan_cache

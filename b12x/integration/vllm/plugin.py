@@ -181,6 +181,30 @@ def _resolve_capture_catalog() -> tuple[int, ...]:
     )
 
 
+def _resolve_eager_max_tokens(catalog: tuple[int, ...]) -> int:
+    """Resolve the model's bounded eager MoE token capacity."""
+    catalog_max = max(catalog, default=0)
+    try:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+        scheduler_config = cfg.scheduler_config
+        if isinstance(scheduler_config, dict):
+            configured = scheduler_config.get("max_num_batched_tokens")
+        else:
+            configured = getattr(scheduler_config, "max_num_batched_tokens", None)
+        if configured is not None and int(configured) > 0:
+            return max(catalog_max, int(configured))
+    except Exception:
+        logger.debug("vLLM scheduler config unavailable for FP6 eager capacity")
+    if catalog_max > 0:
+        return catalog_max
+    raise RuntimeError(
+        "B12X FP6: cannot resolve eager MoE capacity because both "
+        "max_num_batched_tokens and the capture-size catalog are unavailable"
+    )
+
+
 def _rebuild_b12x_fp6_config(model_dir: Optional[str]) -> Any:
     register_b12x_fp6()
     assert _CONFIG_CLS is not None
@@ -195,6 +219,61 @@ def _norm_key(name: str) -> str:
     name = name.removeprefix("model.")
     name = name.replace("language_model.model.", "language_model.")
     return name
+
+
+def _store_graph_visible_dense_state(
+    layer: Any, weight: Any, gemm_weight: torch.Tensor
+) -> None:
+    """Install or update dense tensors without invalidating captured pointers."""
+    tensor_values = {
+        "b12x_fp6_gemm_weight": gemm_weight,
+        "b12x_fp6_scales": weight.scale_storage,
+        "b12x_fp6_gscale": weight.global_scale,
+    }
+    metadata = {
+        "b12x_fp6_fmt": weight.fmt,
+        "b12x_fp6_act_fmt": weight.act_fmt,
+        "b12x_fp6_out_features": weight.out_features,
+        "b12x_fp6_in_features": weight.in_features,
+    }
+    if not hasattr(layer, "b12x_fp6_gemm_weight"):
+        for name, value in tensor_values.items():
+            setattr(layer, name, value)
+        for name, value in metadata.items():
+            setattr(layer, name, value)
+        return
+
+    for name, new_value in metadata.items():
+        old_value = getattr(layer, name, None)
+        if old_value != new_value:
+            raise RuntimeError(
+                f"B12X FP6 dense reload changed {name}: "
+                f"old={old_value!r}, new={new_value!r}. Destroy CUDA graphs "
+                "before changing dense topology or formats."
+            )
+    for name, new_value in tensor_values.items():
+        old_value = getattr(layer, name, None)
+        if not isinstance(old_value, torch.Tensor):
+            raise RuntimeError(
+                f"B12X FP6 dense reload cannot preserve {name}: existing "
+                "graph-visible storage is missing or is not a tensor. Destroy "
+                "CUDA graphs before reloading."
+            )
+        if (
+            old_value.shape != new_value.shape
+            or old_value.dtype != new_value.dtype
+            or old_value.device != new_value.device
+        ):
+            raise RuntimeError(
+                f"B12X FP6 dense reload cannot preserve {name}: "
+                f"new={tuple(new_value.shape)},{new_value.dtype},"
+                f"{new_value.device} vs old={tuple(old_value.shape)},"
+                f"{old_value.dtype},{old_value.device}. Destroy CUDA graphs "
+                "before changing dense topology."
+            )
+    with torch.no_grad():
+        for name, new_value in tensor_values.items():
+            getattr(layer, name).copy_(new_value)
 
 
 def register_b12x_fp6() -> None:
@@ -331,43 +410,14 @@ def register_b12x_fp6() -> None:
                 )
             if not w.use_packed_gemm:
                 w.packed = torch.empty(0, dtype=torch.uint8, device=dev)
+            import b12x.quantization.mxfp6.fp6_dense_op  # noqa: F401
+
+            _store_graph_visible_dense_state(layer, w, gemm_w)
             layer.b12x_fp6_weight = w
             layer.weight.data = torch.empty(0, dtype=dt, device=dev)
             layer.weight_scale.data = torch.empty(
                 0, dtype=layer.weight_scale.dtype, device=dev
             )
-            import b12x.quantization.mxfp6.fp6_dense_op  # noqa: F401
-
-            # Reload guard: if graph-visible dense tensors already exist,
-            # copy new values into existing storage (preserve data_ptr).
-            if hasattr(layer, "b12x_fp6_gemm_weight"):
-                old_gw = layer.b12x_fp6_gemm_weight
-                if (
-                    isinstance(old_gw, torch.Tensor)
-                    and old_gw.shape == gemm_w.shape
-                    and old_gw.dtype == gemm_w.dtype
-                    and old_gw.device == gemm_w.device
-                ):
-                    old_gw.copy_(gemm_w)
-                else:
-                    layer.b12x_fp6_gemm_weight = gemm_w
-                old_scales = getattr(layer, "b12x_fp6_scales", None)
-                if (
-                    isinstance(old_scales, torch.Tensor)
-                    and old_scales.shape == w.scale_storage.shape
-                    and old_scales.dtype == w.scale_storage.dtype
-                    and old_scales.device == w.scale_storage.device
-                ):
-                    old_scales.copy_(w.scale_storage)
-                else:
-                    layer.b12x_fp6_scales = w.scale_storage
-            else:
-                layer.b12x_fp6_gemm_weight = gemm_w
-                layer.b12x_fp6_scales = w.scale_storage
-            layer.b12x_fp6_fmt = w.fmt
-            layer.b12x_fp6_act_fmt = w.act_fmt
-            layer.b12x_fp6_out_features = w.out_features
-            layer.b12x_fp6_in_features = w.in_features
             if self.act_fmt_overrides and act_fmt != self.default_act_fmt:
                 logger.info(
                     "B12X FP6: act_fmt override %s -> %s (default %s)",
@@ -659,7 +709,11 @@ def register_b12x_fp6() -> None:
                 apply_router_weight_on_input=router_on_input,
             )
             self._out_cache = CaptureOutputCache(
-                catalog, k, torch.bfloat16, dev
+                catalog,
+                k,
+                torch.bfloat16,
+                dev,
+                eager_max_tokens=arena.eager_max_tokens,
             )
             self.core = B12XFP6MoEMethod(
                 prepared,
@@ -884,6 +938,7 @@ def register_b12x_fp6() -> None:
                 )
                 return self._serving_catalog, self._shared_arena
             self._serving_catalog = _resolve_capture_catalog()
+            eager_max_tokens = _resolve_eager_max_tokens(self._serving_catalog)
             self._shared_arena = ServingScratchArena(
                 self._serving_catalog,
                 weight_plan,
@@ -895,6 +950,7 @@ def register_b12x_fp6() -> None:
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                eager_max_tokens=eager_max_tokens,
             )
             self._serving_initialized = True
             return self._serving_catalog, self._shared_arena
