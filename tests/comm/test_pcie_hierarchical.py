@@ -69,6 +69,98 @@ def test_allreduce_factory_builds_tp16_hierarchy(
     )
 
 
+def test_allreduce_factory_forwards_oneshot_channel_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = SimpleNamespace(
+        rank=0,
+        world_size=8,
+        device=torch.device("cuda:0"),
+    )
+    oneshot_factory = MagicMock(return_value=runtime)
+    exchange_group = object()
+    monkeypatch.setattr(pcie_allreduce.dist, "get_world_size", lambda group: 8)
+    monkeypatch.setattr(
+        pcie_allreduce.PCIeOneshotAllReducePool,
+        "from_exchange_group",
+        oneshot_factory,
+    )
+
+    allreduce = PCIeAllReduce.from_exchange_group(
+        exchange_group=exchange_group,  # type: ignore[arg-type]
+        device="cuda:0",
+        max_concurrent_channels=3,
+    )
+
+    assert allreduce.algorithm == "oneshot"
+    oneshot_factory.assert_called_once_with(
+        exchange_group=exchange_group,
+        device="cuda:0",
+        eager_buffer_bytes=8388608,
+        max_size=8388608,
+        rank_data_bytes=8388608,
+        ext_module=None,
+        single_channel=False,
+        max_concurrent_channels=3,
+    )
+
+
+def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
+    runtime = MagicMock()
+    runtime.rank = 0
+    runtime.world_size = 8
+    runtime.device = torch.device("cuda:0")
+    allreduce = PCIeAllReduce(runtime, "oneshot")
+    stream = object()
+    inp = torch.randn(2, 4)
+    out = torch.empty_like(inp)
+
+    allreduce.prepare_channels(("target", "draft"))
+    allreduce.for_stream(stream, channel_id="target")
+    allreduce.all_reduce(inp, out=out, stream=stream, channel_id="target")
+    with allreduce.capture(stream, channel_id="target"):
+        pass
+
+    runtime.prepare_channels.assert_called_once_with(("target", "draft"))
+    runtime.for_stream.assert_called_once_with(stream, channel_id="target")
+    runtime.all_reduce.assert_called_once_with(
+        inp,
+        out=out,
+        peer_input_ptrs=None,
+        stream=stream,
+        channel_id="target",
+    )
+    runtime.capture.assert_called_once_with(stream=stream, channel_id="target")
+
+
+def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
+    runtime = MagicMock(
+        spec=["rank", "world_size", "device", "for_stream", "all_reduce", "capture"]
+    )
+    runtime.rank = 0
+    runtime.world_size = 16
+    runtime.device = torch.device("cuda:0")
+    allreduce = PCIeAllReduce(runtime, "hierarchical")
+    stream = object()
+    inp = torch.randn(2, 4)
+    out = torch.empty_like(inp)
+
+    allreduce.prepare_channels(("target", "draft"))
+    allreduce.for_stream(stream, channel_id="target")
+    allreduce.all_reduce(inp, out=out, stream=stream, channel_id="target")
+    with allreduce.capture(stream, channel_id="target"):
+        pass
+
+    runtime.for_stream.assert_called_once_with(stream)
+    runtime.all_reduce.assert_called_once_with(
+        inp,
+        out=out,
+        blocks=None,
+        stream=stream,
+    )
+    runtime.capture.assert_called_once_with(stream=stream)
+
+
 @pytest.mark.parametrize("world_size", [1, 3, 10, 14, 20])
 def test_allreduce_rejects_unsupported_or_peer_unsafe_worlds(
     world_size: int,
@@ -319,19 +411,20 @@ def test_hierarchical_slab_layout_matches_native_alignment(
     layout = _make_layout(max_elements)
     assert layout.stage[0] == 69_888
     for slot in range(2):
-        assert layout.partial[slot] == (
-            (layout.stage[slot] + max_elements * 2 + 255) // 256
-        ) * 256
-        assert layout.final[slot] == (
-            (layout.partial[slot] + max_elements * 4 + 255) // 256
-        ) * 256
+        assert (
+            layout.partial[slot]
+            == ((layout.stage[slot] + max_elements * 2 + 255) // 256) * 256
+        )
+        assert (
+            layout.final[slot]
+            == ((layout.partial[slot] + max_elements * 4 + 255) // 256) * 256
+        )
         if slot == 0:
-            assert layout.stage[1] == (
-                (layout.final[0] + max_elements * 2 + 255) // 256
-            ) * 256
-    assert layout.bytes == (
-        (layout.final[1] + max_elements * 2 + 255) // 256
-    ) * 256
+            assert (
+                layout.stage[1]
+                == ((layout.final[0] + max_elements * 2 + 255) // 256) * 256
+            )
+    assert layout.bytes == ((layout.final[1] + max_elements * 2 + 255) // 256) * 256
     assert all(
         value % 256 == 0
         for offsets in (layout.stage, layout.partial, layout.final)
