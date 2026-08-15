@@ -98,6 +98,14 @@ def _run_trellis_dynamic(
         torch.randn(m, top_k, device=device), dim=-1
     ).float()
 
+    active_routes = (topk_ids >= 0) & (topk_ids < E)
+    reference_ids = torch.where(
+        active_routes, topk_ids, torch.zeros_like(topk_ids)
+    )
+    reference_weights = torch.where(
+        active_routes, topk_weights, torch.zeros_like(topk_weights)
+    )
+
     # ---- torch oracle in the kernel bases ----
     rot_cols = (6 if coupled else 3) * n
     rotations = (
@@ -118,8 +126,8 @@ def _run_trellis_dynamic(
         w13_ref,
         down_w,
         rotations,
-        topk_ids,
-        topk_weights,
+        reference_ids,
+        reference_weights,
         coupled=coupled,
     )
     torch.cuda.synchronize()
@@ -376,7 +384,7 @@ def test_dynamic_trellis_matches_scaffold(activation: str, m: int) -> None:
 def test_dynamic_w4a8_m1_direct_ignores_inactive_routes() -> None:
     """M=1 direct scheduling must skip every inactive expert route."""
 
-    got, _ = _run_trellis_dynamic(
+    got, want = _run_trellis_dynamic(
         activation="silu",
         E=4,
         m=1,
@@ -388,7 +396,8 @@ def test_dynamic_w4a8_m1_direct_ignores_inactive_routes() -> None:
         direct=True,
         topk_ids_override=torch.full((1, 2), -1, dtype=torch.int32),
     )
-    torch.testing.assert_close(got, torch.zeros_like(got), rtol=0, atol=0)
+    torch.testing.assert_close(want, torch.zeros_like(want), rtol=0, atol=0)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
