@@ -4885,7 +4885,7 @@ class W4A16GemmKernel:
                     scale_bf2 = ld_shared_u32(
                         smem_base
                         + Int32(self.sh_topk_off * 16)
-                        + metadata_row * Int32(4)
+                        + row * Int32(4)
                     )
                     q0 = self._elem2_mul(q0, scale_bf2)
                     q1 = self._elem2_mul(q1, scale_bf2)
@@ -4952,7 +4952,7 @@ class W4A16GemmKernel:
                     scale_bf2 = ld_shared_u32(
                         smem_base
                         + Int32(self.sh_topk_off * 16)
-                        + metadata_row * Int32(4)
+                        + row * Int32(4)
                     )
                     q0 = self._elem2_mul(q0, scale_bf2)
                     q1 = self._elem2_mul(q1, scale_bf2)
