@@ -92,8 +92,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -115,6 +114,44 @@ _DYNAMIC_WORK_SOURCES = {
     "ready_queue",
 }
 _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
+
+
+def _w4a16_route_pack_prewarm_specs(
+    capacity_tokens: int,
+    num_topk: int,
+    *,
+    full_rotation: bool,
+) -> tuple[tuple[torch.dtype, bool, int, int], ...]:
+    """Return route dtype, mapping, live-M, and canonical capacity variants."""
+    from b12x.moe._shared.kernels.w4a16.host import (
+        route_pack_token_capacity,
+        route_pack_warmup_token_counts,
+    )
+
+    live_token_counts = (
+        route_pack_warmup_token_counts(capacity_tokens)
+        if full_rotation
+        else (capacity_tokens,)
+    )
+    route_ids_dtypes = (torch.int32, torch.int64) if full_rotation else (torch.int32,)
+    mapped_options = (False, True) if full_rotation else (False,)
+    return tuple(
+        (
+            route_ids_dtype,
+            mapped,
+            live_tokens,
+            route_pack_token_capacity(
+                live_tokens,
+                num_topk,
+                max_tokens=(capacity_tokens if full_rotation else None),
+            ),
+        )
+        for route_ids_dtype in route_ids_dtypes
+        for mapped in mapped_options
+        for live_tokens in live_token_counts
+    )
+
+
 # W4A8's unified dynamic specialization consumes an N256/K128 lane-major
 # weight representation.  Preparation is independent from scheduling: the
 # same representation serves both materialized queue and persistent-grid work.
@@ -1055,6 +1092,9 @@ class TPMoEFP4Binding:
     # Re-running the live-batch heuristic here can select a smaller block than
     # the arena was sized for (for example, planned 64 versus live 48).
     route_block_size_m: int | None = None
+    # Full-rotation scratch plans own a fixed route-capacity specialization.
+    # Carry it independently from the live-M fused launch selection.
+    route_token_capacity: int | None = None
     route_expert_map: torch.Tensor | None = None
     output_expert_map: torch.Tensor | None = None
     fused_launch: object | None = None
@@ -2415,6 +2455,9 @@ def _build_tp_moe_fp4_binding_from_views(
             ),
             kernel_workspace=tensors.get("kernel_workspace"),
             route_block_size_m=plan.route_block_size_m,
+            route_token_capacity=(
+                plan.routed_rows // plan.num_topk if plan.full_rotation else None
+            ),
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
             fused_launch=fused_launch,
@@ -6856,68 +6899,93 @@ def _plan_full_rotation_w4a16_launches(
             for ids_dtype in (torch.int32, torch.int64)
             for mapped in (False, True)
         )
-        for mapped in (False, True):
+        packed_route_indices = torch.empty(
+            capacity_route_slots,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        block_expert_ids = torch.empty(
+            capacity_m_blocks,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        packed_route_count = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_offsets = torch.empty(
+            core_plan.route_E + 1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_counts = torch.empty(
+            core_plan.route_E,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        pending_route_pack_keys: list[tuple[object, ...]] = []
+        dummy_topk_ids = {
+            route_ids_dtype: torch.zeros(
+                capacity_tokens,
+                core_plan.num_topk,
+                dtype=route_ids_dtype,
+                device=core_plan.device,
+            )
+            for route_ids_dtype in (torch.int32, torch.int64)
+        }
+        expert_maps = {
+            False: None,
+            True: torch.arange(
+                core_plan.route_E,
+                dtype=torch.int32,
+                device=core_plan.device,
+            ),
+        }
+        for (
+            route_ids_dtype,
+            mapped,
+            token_count,
+            token_capacity,
+        ) in _w4a16_route_pack_prewarm_specs(
+            capacity_tokens,
+            core_plan.num_topk,
+            full_rotation=True,
+        ):
             route_pack_key = (
                 core_plan.device.type,
                 int(torch.cuda.current_device()),
-                capacity_tokens * core_plan.num_topk,
+                str(route_ids_dtype),
+                token_count * core_plan.num_topk,
+                token_capacity * core_plan.num_topk,
                 int(block_size_m),
                 int(core_plan.route_E),
                 mapped,
             )
             if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
                 continue
-            dummy_topk_ids = torch.zeros(
-                capacity_tokens,
-                core_plan.num_topk,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            packed_route_indices = torch.empty(
-                capacity_route_slots,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            block_expert_ids = torch.empty(
-                capacity_m_blocks,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            packed_route_count = torch.empty(
-                1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_offsets = torch.empty(
-                core_plan.route_E + 1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_counts = torch.empty(
-                core_plan.route_E,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_map = None
-            if mapped:
-                expert_map = torch.arange(
-                    core_plan.route_E,
-                    dtype=torch.int32,
-                    device=core_plan.device,
-                )
             pack_topk_routes_by_expert(
-                dummy_topk_ids,
+                dummy_topk_ids[route_ids_dtype][:token_count],
                 block_size_m,
                 core_plan.route_E,
-                expert_map=expert_map,
+                expert_map=expert_maps[mapped],
                 packed_route_indices=packed_route_indices,
                 block_expert_ids=block_expert_ids,
                 packed_route_count=packed_route_count,
                 expert_offsets=expert_offsets,
                 expert_counts=expert_counts,
+                max_tokens=capacity_tokens,
             )
-            torch.cuda.current_stream(core_plan.device).synchronize()
-            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
+            pending_route_pack_keys.append(route_pack_key)
+        torch.cuda.current_stream(core_plan.device).synchronize()
+        _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
+        if pending_route_pack_keys:
+            logger.info(
+                "Prewarmed %d full-rotation W4A16 route-pack variant(s) "
+                "for token capacity %d.",
+                len(pending_route_pack_keys),
+                capacity_tokens,
+            )
     return fused_launches, topk_sum_launches
 
 
@@ -7264,48 +7332,63 @@ def _prewarm_w4a16_planned_launches(
                         )
                 continue
 
-            route_pack_key = (
-                workspace.device.type,
-                int(torch.cuda.current_device()),
-                int(token_count) * int(workspace.num_topk),
-                int(block_size_m),
-                int(workspace.route_E),
-                bool(False),
-            )
-            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
-                if _B12X_TIMING:
-                    total_ms = (t_sum - t_token) * 1000.0
-                    if total_ms >= _B12X_TIMING_THRESHOLD_MS:
-                        logger.warning(
-                            "b12x_w4a16_prewarm timing tokens=%d capturing=%s "
-                            "shape=%.3fms compile_fused=%.3fms "
-                            "compile_sum=%.3fms route_pack=cached total=%.3fms",
-                            int(token_count),
-                            is_capturing,
-                            (t_shape - t_token) * 1000.0,
-                            (t_fused - t_shape) * 1000.0,
-                            (t_sum - t_fused) * 1000.0,
-                            total_ms,
-                        )
-                continue
-
-            dummy_topk_ids = torch.empty(
+            pending_route_pack_keys: list[tuple[object, ...]] = []
+            route_specs = _w4a16_route_pack_prewarm_specs(
                 token_count,
                 workspace.num_topk,
-                dtype=torch.int32,
-                device=workspace.device,
+                full_rotation=full_rotation,
             )
-            dummy_topk_ids.zero_()
-            pack_topk_routes_by_expert(
-                dummy_topk_ids,
-                block_size_m,
-                workspace.route_E,
-                packed_route_indices=workspace.packed_route_indices,
-                block_expert_ids=workspace.block_expert_ids,
-                packed_route_count=workspace.packed_route_count,
-                expert_offsets=workspace.expert_offsets,
-            )
-            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
+            dummy_topk_ids = {
+                route_ids_dtype: torch.zeros(
+                    token_count,
+                    workspace.num_topk,
+                    dtype=route_ids_dtype,
+                    device=workspace.device,
+                )
+                for route_ids_dtype in dict.fromkeys(spec[0] for spec in route_specs)
+            }
+            expert_maps = {
+                False: None,
+                True: torch.arange(
+                    workspace.route_E,
+                    dtype=torch.int32,
+                    device=workspace.device,
+                ),
+            }
+            for (
+                route_ids_dtype,
+                mapped,
+                live_tokens,
+                route_pack_token_cap,
+            ) in route_specs:
+                route_pack_key = (
+                    workspace.device.type,
+                    int(torch.cuda.current_device()),
+                    str(route_ids_dtype),
+                    int(live_tokens) * int(workspace.num_topk),
+                    route_pack_token_cap * int(workspace.num_topk),
+                    int(block_size_m),
+                    int(workspace.route_E),
+                    mapped,
+                )
+                if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                    continue
+                pack_topk_routes_by_expert(
+                    dummy_topk_ids[route_ids_dtype][:live_tokens],
+                    block_size_m,
+                    workspace.route_E,
+                    expert_map=expert_maps[mapped],
+                    packed_route_indices=workspace.packed_route_indices,
+                    block_expert_ids=workspace.block_expert_ids,
+                    packed_route_count=workspace.packed_route_count,
+                    expert_offsets=workspace.expert_offsets,
+                    expert_counts=workspace.expert_counts,
+                    max_tokens=(token_count if full_rotation else None),
+                )
+                pending_route_pack_keys.append(route_pack_key)
+            if pending_route_pack_keys:
+                torch.cuda.current_stream(workspace.device).synchronize()
+                _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
             if _B12X_TIMING:
                 t_route = time.perf_counter()
                 total_ms = (t_route - t_token) * 1000.0
@@ -10902,6 +10985,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "W4A16 TP MoE binding capacity is too small: "
                 f"capacity={binding.routed_rows_capacity}, requested={routed_rows}"
             )
+        route_token_capacity = binding.route_token_capacity if full_rotation else None
         intermediate_cache13 = _require_binding_field(binding, "intermediate_cache13")
         intermediate_cache2 = _require_binding_field(binding, "intermediate_cache2")
         fc1_c_tmp = _require_binding_field(binding, "fc1_c_tmp")
@@ -10963,6 +11047,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_block_size_m=binding.route_block_size_m,
+            route_token_capacity=route_token_capacity,
             intermediate_rotation_scales=(
                 prepared.intermediate_rotations if full_rotation else None
             ),
@@ -11214,8 +11299,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -11574,9 +11658,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

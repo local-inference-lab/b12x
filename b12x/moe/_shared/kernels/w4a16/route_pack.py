@@ -280,6 +280,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
     topk = int(topk_ids.shape[-1]) if topk_ids.ndim >= 2 else 1
@@ -288,6 +289,7 @@ def pack_topk_routes_by_expert(
         int(block_size),
         int(num_experts),
         topk=topk,
+        max_tokens=max_tokens,
     )
     if packed_route_indices is not None and block_expert_ids is not None:
         if (

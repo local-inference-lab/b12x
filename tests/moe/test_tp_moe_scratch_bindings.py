@@ -868,6 +868,7 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
 def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
     weight_plan = _weight_plan(
         "w4a16",
         w4a16_layout=PreparedWeightLayout.MMA_PACKED,
@@ -908,6 +909,47 @@ def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     assert result is output
     assert calls["activation_amax"] is activation_amax
     assert calls["layer_idx"] == 2
+    assert calls["route_token_capacity"] is None
+
+
+def test_full_rotation_binding_carries_fixed_route_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    weight_plan = plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        trellis_bits=3,
+        trellis_tile_config=(64, 128, 64, 128),
+    )
+    plan = plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=4,
+            num_topk=2,
+            route_num_experts=8,
+            device="cpu",
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            w4a16_block_size_m=8,
+        )
+    )
+    tensors = _runtime_tensors(m=3, n=128)
+    payload = SimpleNamespace(
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+    )
+    binding = plan.bind(
+        scratch=_scratch_for_plan(plan),
+        **_binding_args(tensors, _experts(tensors, weight_plan, payload)),
+    )
+
+    assert plan.full_rotation
+    assert binding.route_token_capacity == 4
 
 
 def test_activation_amax_is_w4a16_only() -> None:

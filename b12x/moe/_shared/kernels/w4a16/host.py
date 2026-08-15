@@ -179,15 +179,61 @@ def max_packed_route_slots(numel: int, block_size: int, num_experts: int) -> int
     return max_packed_routes
 
 
-def route_pack_numel_capacity(numel: int, topk: int = 1) -> int:
+def route_pack_numel_capacity(
+    numel: int,
+    topk: int = 1,
+    *,
+    max_tokens: int | None = None,
+) -> int:
     topk = max(int(topk), 1)
     tokens = (max(int(numel), 1) + topk - 1) // topk
-    return route_pack_token_capacity(tokens, topk) * topk
+    return route_pack_token_capacity(tokens, topk, max_tokens=max_tokens) * topk
 
 
-def route_pack_token_capacity(tokens: int, topk: int) -> int:
+def route_pack_token_capacity(
+    tokens: int,
+    topk: int,
+    *,
+    max_tokens: int | None = None,
+) -> int:
     del topk
-    return 1 << (max(int(tokens), 1) - 1).bit_length()
+    tokens = max(int(tokens), 1)
+    capacity = 1 << (tokens - 1).bit_length()
+    if max_tokens is None:
+        return capacity
+    max_tokens = int(max_tokens)
+    if max_tokens < tokens:
+        raise ValueError(
+            "route-pack max token capacity is below the live token count: "
+            f"{max_tokens} < {tokens}"
+        )
+    return min(capacity, max_tokens)
+
+
+def route_pack_warmup_token_counts(capacity: int) -> tuple[int, ...]:
+    """Return live row counts covering capacity and scalar specializations.
+
+    Triton specializes the runtime ``live_numel`` scalar on alignment as well
+    as the constexpr route-capacity bucket. For a power-of-two bucket, the
+    bucket maximum and its first live member cover both alignment classes
+    reached by the GLM top-k route counts (for example 8 and 5 rows in the
+    8-row bucket). Warming only bucket maxima leaves the less-aligned variant
+    to compile on the first odd-sized request.
+    """
+    capacity = int(capacity)
+    if capacity < 1:
+        raise ValueError(f"route-pack warmup capacity must be positive, got {capacity}")
+    counts: list[int] = []
+    bucket = 1
+    while True:
+        first_in_bucket = 1 if bucket == 1 else bucket // 2 + 1
+        if first_in_bucket > capacity:
+            break
+        for count in (first_in_bucket, min(bucket, capacity)):
+            if not counts or counts[-1] != count:
+                counts.append(count)
+        bucket *= 2
+    return tuple(counts)
 
 
 def route_pack_capacity(
@@ -197,10 +243,11 @@ def route_pack_capacity(
     *,
     topk: int = 1,
     bucket_tokens: bool = True,
+    max_tokens: int | None = None,
 ) -> tuple[int, int, int]:
     """Return the canonical routed-row, packed-slot, and block capacities."""
     numel_capacity = (
-        route_pack_numel_capacity(numel, topk=topk)
+        route_pack_numel_capacity(numel, topk=topk, max_tokens=max_tokens)
         if bucket_tokens
         else max(int(numel), 1)
     )
@@ -409,6 +456,7 @@ __all__ = [
     "route_pack_numel_capacity",
     "route_pack_capacity",
     "route_pack_token_capacity",
+    "route_pack_warmup_token_counts",
     "select_route_block_size_m",
     "unswizzle_block_scale",
     "unswizzle_expert_scales",
