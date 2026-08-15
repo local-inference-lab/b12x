@@ -73,6 +73,19 @@ def _fake_f32(shape):
     return cute.runtime.make_fake_compact_tensor(cutlass.Float32, shape, assumed_align=16)
 
 
+def _active_route_reference_inputs(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent inactive routes with safe indices and zero oracle weights."""
+
+    active = (topk_ids >= 0) & (topk_ids < num_experts)
+    safe_ids = torch.where(active, topk_ids, torch.zeros_like(topk_ids))
+    active_weights = torch.where(active, topk_weights, torch.zeros_like(topk_weights))
+    return safe_ids, active_weights
+
+
 def _run_w4a8_dynamic(
     *,
     recipe: str,
@@ -115,8 +128,6 @@ def _run_w4a8_dynamic(
                 f"{(m, top_k)}, got {tuple(topk_ids_override.shape)}"
             )
         topk_ids = topk_ids_override.to(device=device, dtype=torch.int32).contiguous()
-        if int(topk_ids.min().item()) < 0 or int(topk_ids.max().item()) >= E:
-            raise ValueError("topk_ids_override contains an out-of-range expert")
     topk_weights = torch.softmax(torch.randn(m, top_k, device=device), dim=-1).float()
     if route_weight_slot is not None:
         if not 0 <= route_weight_slot < top_k:
@@ -154,11 +165,14 @@ def _run_w4a8_dynamic(
     w2_packed = torch.stack([q[0] for q in w2_q]).contiguous()
     ones = torch.ones(E, device=device)
 
+    reference_ids, reference_weights = _active_route_reference_inputs(
+        topk_ids, topk_weights, E
+    )
     reference = moe_reference_w4a8_mx(
         x.float(),
         w13_packed, w13_mx, ref_res_w13, ones,
         w2_packed, w2_mx, ref_res_w2, ones,
-        topk_ids, topk_weights, E, K, n,
+        reference_ids, reference_weights, E, K, n,
         activation=activation,
     )
 
@@ -597,8 +611,8 @@ def _run_w4a8_dynamic(
                     w2_mx,
                     fc2_residual,
                     ones,
-                    topk_ids,
-                    topk_weights,
+                    reference_ids,
+                    reference_weights,
                     E,
                     K,
                     n,
@@ -651,6 +665,9 @@ def _run_w4a8_dynamic(
 
         if return_state:
             def _current_reference():
+                live_ids, live_weights = _active_route_reference_inputs(
+                    flat_ids.view(m, top_k), flat_weights.view(m, top_k), E
+                )
                 return moe_reference_w4a8_mx(
                     x.float(),
                     w13_packed,
@@ -661,8 +678,8 @@ def _run_w4a8_dynamic(
                     w2_mx,
                     ref_res_w2,
                     ones,
-                    flat_ids.view(m, top_k),
-                    flat_weights.view(m, top_k),
+                    live_ids,
+                    live_weights,
                     E,
                     K,
                     n,
@@ -732,6 +749,46 @@ def test_w4a8_dynamic_matches_oracle(recipe: str, activation: str) -> None:
     assert metrics.cos > 0.999, metrics
     ref_rms = ref.float().square().mean().sqrt().item()
     assert metrics.rmse <= max(0.03 * ref_rms, 5e-3), (metrics, ref_rms)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("inactive_expert", [-1, 4])
+def test_w4a8_dynamic_ignores_inactive_routes(inactive_expert: int) -> None:
+    """Inactive routes must not enter expert storage or contribute output."""
+
+    require_b12x()
+    topk_ids = torch.tensor(
+        [
+            [inactive_expert, inactive_expert],
+            [0, inactive_expert],
+            [1, 2],
+            [inactive_expert, 3],
+            [2, inactive_expert],
+            [3, 0],
+            [inactive_expert, 1],
+            [0, 2],
+        ],
+        dtype=torch.int32,
+    )
+    out, ref, debug = _run_w4a8_dynamic(
+        recipe="w4a8_mx",
+        activation="silu",
+        E=4,
+        m=8,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=211,
+        topk_ids_override=topk_ids,
+        return_debug=True,
+    )
+
+    active_routes = int(((topk_ids >= 0) & (topk_ids < 4)).sum().item())
+    assert int(debug["row_counts"].sum().item()) == active_routes
+    assert int(debug["expert_write_rows"].sum().item()) == active_routes
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
+    metrics = compare_to_reference(out.float(), ref)
+    assert metrics.cos > 0.999, metrics
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -976,10 +1033,13 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         )
 
     def _oracle():
+        live_ids, live_weights = _active_route_reference_inputs(
+            flat_ids.view(m, top_k), flat_weights.view(m, top_k), E
+        )
         return moe_reference_w4a8_mx(
             x.float(), w13_packed, w13_mx, None, ones,
             w2_packed, w2_mx, None, ones,
-            flat_ids.view(m, top_k), flat_weights.view(m, top_k), E, K, n,
+            live_ids, live_weights, E, K, n,
             activation="silu",
         )
 
@@ -1000,6 +1060,10 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         new_ids = torch.stack(
             [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
         ).to(torch.int32)
+        if round_idx == 1:
+            new_ids[-3:, 1] = -1
+        elif round_idx == 2:
+            new_ids.fill_(-1)
         new_w = torch.softmax(torch.randn(m, top_k, device=device), dim=-1).float()
         flat_ids.copy_(new_ids.reshape(-1))
         flat_weights.copy_(new_w.reshape(-1))
@@ -1007,6 +1071,11 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         graph.replay()
         torch.cuda.synchronize()
         ref = _oracle()
-        metrics = compare_to_reference(scatter_output.float(), ref)
-        assert scatter_output.abs().sum().item() > 0, round_idx
-        assert metrics.cos > 0.999, (round_idx, metrics)
+        if round_idx == 2:
+            torch.testing.assert_close(
+                scatter_output, torch.zeros_like(scatter_output), rtol=0, atol=0
+            )
+        else:
+            metrics = compare_to_reference(scatter_output.float(), ref)
+            assert scatter_output.abs().sum().item() > 0, round_idx
+            assert metrics.cos > 0.999, (round_idx, metrics)
