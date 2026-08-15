@@ -245,6 +245,9 @@ class W4A16MixedTrellisKernel:
         factor = gemm.schedule_route_block_factor
         first_route_block = route_block_idx * Int32(factor)
         first_lock_slot = lock_slot * Int32(factor)
+        # Mixed K3/K4 execution is pinned to the MCG codebook, whose tile
+        # decoder does not consume the generic Trellis LUT ABI slot.
+        trellis_lut_addr = cutlass.Int64(0)
         if cutlass.const_expr(gemm.paired_m8_routes):
             gemm._run_tile_m8_pair(
                 a_flat,
@@ -257,6 +260,7 @@ class W4A16MixedTrellisKernel:
                 topk_weights,
                 c_tmp,
                 locks,
+                trellis_lut_addr,
                 smem_base,
                 tid,
                 first_route_block,
@@ -282,6 +286,7 @@ class W4A16MixedTrellisKernel:
                     topk_weights,
                     c_tmp,
                     locks,
+                    trellis_lut_addr,
                     smem_base,
                     tid,
                     first_route_block + Int32(subtile),
@@ -761,6 +766,10 @@ class W4A16MixedTrellisKernel:
             gate_suh,
             up_suh,
             descriptor_map,
+            # Mixed tier emit hooks own Trellis decoding, so the shared
+            # driver's LUT ABI slots are intentionally unused.
+            cutlass.Int64(0),
+            cutlass.Int64(0),
             total_experts,
             total_experts,
             smem_base,
@@ -834,6 +843,7 @@ def compile_mixed_trellis(
             scale_format="e4m3_k32",
             w13_layout="trellis3_t256_proj",
             trellis_bits=bits,
+            trellis_codebook="mcg",
             intermediate_rotation=True,
             full_rotation=True,
             rotation_input_dtype=rotation_input_dtype,
