@@ -32,6 +32,18 @@ def _packed_weight(*, in_features: int = 128, out_features: int = 256) -> BlockF
     )
 
 
+def _stub_destination_validation(monkeypatch):
+    prepared = object()
+    calls = []
+
+    def validate(source, values, scale_rows, scale_mma):
+        calls.append((source, values, scale_rows, scale_mma))
+        return prepared
+
+    monkeypatch.setattr(block_impl, "validate_mxfp8_rows_destinations", validate)
+    return prepared, calls
+
+
 def test_block_fp8_linear_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
@@ -51,7 +63,7 @@ def test_block_fp8_linear_scratch_plan_exposes_one_opaque_scratch_spec() -> None
 
 
 def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch) -> None:
-    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    _, validation_calls = _stub_destination_validation(monkeypatch)
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",
@@ -79,10 +91,12 @@ def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch) -> None:
     assert not hasattr(binding, "workspace")
     assert binding.x_q.values.shape == (3, 128)
     assert binding.output is output
+    assert binding._quantization is None
+    assert validation_calls == []
 
 
 def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
-    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    _, validation_calls = _stub_destination_validation(monkeypatch)
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",
@@ -110,23 +124,25 @@ def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
     assert binding.output is output
     assert binding.source is source
     assert binding.packed_weight is packed
+    assert binding._quantization is None
+    assert validation_calls == []
 
 
 def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     monkeypatch.setattr(block_impl, "_check_gpu_tensor", lambda *args, **kwargs: None)
-    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    prepared, validation_calls = _stub_destination_validation(monkeypatch)
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",
-            max_tokens=4,
+            max_tokens=9,
             in_features=128,
             out_features=256,
         )
     )
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    source = torch.empty((3, 128), dtype=torch.bfloat16)
-    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
+    source = torch.empty((9, 128), dtype=torch.bfloat16)
+    output = torch.empty((9, 256, 1), dtype=torch.bfloat16)
     packed = _packed_weight()
     binding = plan.bind(
         scratch=scratch,
@@ -136,10 +152,8 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     )
     calls = {}
 
-    def fake_quantize(source_tk, *, out=None):
-        calls["source_tk"] = source_tk
-        calls["x_q_out"] = out
-        return out
+    def fake_quantize(prepared_quantization):
+        calls["quantization"] = prepared_quantization
 
     def fake_dense_gemm(a, b, **kwargs):
         calls["a"] = a
@@ -148,19 +162,19 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
         kwargs["out"].zero_()
         return kwargs["out"]
 
-    monkeypatch.setattr(block_impl, "quantize_block_fp8_linear_input_mxfp8", fake_quantize)
+    monkeypatch.setattr(block_impl, "quantize_prepared_mxfp8_rows_cute", fake_quantize)
     monkeypatch.setattr(block_impl, "dense_gemm", fake_dense_gemm)
 
     out = block_impl.block_fp8_linear_mxfp8(binding=binding)
 
-    assert calls["source_tk"].data_ptr() == source.data_ptr()
-    assert calls["x_q_out"] is binding.x_q
+    assert calls["quantization"] is prepared
     assert calls["dense_out"] is output
-    assert out.shape == (3, 256)
+    assert out.shape == (9, 256)
+    assert len(validation_calls) == 1
 
 
 def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:
-    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    _stub_destination_validation(monkeypatch)
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",

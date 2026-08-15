@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 import torch
@@ -34,7 +34,11 @@ from b12x._lib.scratch import (
     scratch_tensor,
 )
 from b12x._lib.quant.mxfp8_rows import (
+    _PreparedMXFP8RowsQuantization,
+    _quantize_mxfp8_rows_cute_unchecked,
+    quantize_prepared_mxfp8_rows_cute,
     quantize_mxfp8_rows_cute,
+    validate_mxfp8_rows_destinations,
     validate_mxfp8_rows_source,
 )
 
@@ -67,6 +71,7 @@ class BlockFP8LinearBinding:
     packed_weight: BlockFP8LinearWeight
     x_q: MXFP8Rows
     output: torch.Tensor
+    _quantization: _PreparedMXFP8RowsQuantization | None = field(repr=False)
     bias: torch.Tensor | None = None
     # DeepGEMM-style regime hint forwarded to dense_gemm (decode vs prefill tile).
     # None keeps the M-independent default; set it at bind time so the warmed
@@ -330,20 +335,13 @@ def _source_2d(source: torch.Tensor) -> torch.Tensor:
     return source.view(-1, source.shape[-1])
 
 
-def _check_block_fp8_linear_tensors(
-    x_q: MXFP8Rows,
+def _check_block_fp8_linear_output(
     output: torch.Tensor,
     *,
     tokens: int,
     packed_weight: BlockFP8LinearWeight,
     output_dtype: torch.dtype,
 ) -> None:
-    _check_mxfp8_rows_storage(
-        x_q,
-        m=tokens,
-        k=packed_weight.in_features,
-        num_groups=1,
-    )
     if output.shape != (tokens, packed_weight.out_features, 1):
         raise ValueError(
             "output must have shape "
@@ -374,18 +372,26 @@ def build_block_fp8_linear_binding(
         )
     if source_2d.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"source dtype must be bf16/fp16, got {source_2d.dtype}")
-    _check_block_fp8_linear_tensors(
-        x_q,
+    _check_block_fp8_linear_output(
         output,
         tokens=tokens,
         packed_weight=packed_weight,
         output_dtype=source_2d.dtype,
     )
+    quantization = None
+    if tokens > 8 or source_2d.dtype != torch.bfloat16:
+        quantization = validate_mxfp8_rows_destinations(
+            source_2d,
+            x_q.values,
+            x_q.scale_rows,
+            x_q.scale_mma,
+        )
     return BlockFP8LinearBinding(
         source=source,
         packed_weight=packed_weight,
         x_q=x_q,
         output=output,
+        _quantization=quantization,
         bias=bias,
         expected_m=expected_m,
     )
@@ -457,7 +463,7 @@ def _run_block_fp8_quant_kernel(
     in_features: int,
 ) -> None:
     del tokens, in_features
-    quantize_mxfp8_rows_cute(
+    _quantize_mxfp8_rows_cute_unchecked(
         source_tk,
         out_values,
         out_scale_rows,
@@ -547,9 +553,11 @@ def quantize_block_fp8_linear_input_mxfp8(
             num_groups=1,
         )
 
-    _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
-    _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
+    quantize_mxfp8_rows_cute(
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
     )
     return out
 
@@ -654,11 +662,13 @@ def block_fp8_linear_mxfp8(
         packed_weight = binding.packed_weight
         x_q_storage = binding.x_q
         output_storage = binding.output
+        quantization = binding._quantization
         bias = binding.bias
         expected_m = binding.expected_m
     else:
         x_q_storage = None
         output_storage = None
+        quantization = None
     if source is None or packed_weight is None:
         raise TypeError(
             "block_fp8_linear_mxfp8 requires source and packed_weight or binding"
@@ -699,14 +709,6 @@ def block_fp8_linear_mxfp8(
         raise TypeError(
             "block_fp8_linear_mxfp8 requires binding for caller-owned scratch"
         )
-    _check_block_fp8_linear_tensors(
-        x_q_storage,
-        output_storage,
-        tokens=tokens,
-        packed_weight=packed_weight,
-        output_dtype=source_2d.dtype,
-    )
-
     assert x_q_storage is not None
     assert output_storage is not None
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
@@ -727,7 +729,9 @@ def block_fp8_linear_mxfp8(
         if bias is not None:
             output += bias
         return output.view(*source.shape[:-1], packed_weight.out_features)
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
+    assert quantization is not None
+    quantize_prepared_mxfp8_rows_cute(quantization)
+    x_q = x_q_storage
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
         (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),

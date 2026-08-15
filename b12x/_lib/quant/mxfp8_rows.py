@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -42,6 +43,16 @@ _KERNEL_ALIGN_BYTES = 16
 # 2^31 - 1 is the max positive Int32; keep a safety margin for intermediate
 # products before the final addition.
 _INT32_MAX = 2 ** 31 - 1
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMXFP8RowsQuantization:
+    """Validated tensors for one fixed raw-pointer quantizer launch contract."""
+
+    source: torch.Tensor
+    values: torch.Tensor
+    scale_rows: torch.Tensor
+    scale_mma: torch.Tensor
 
 
 class _MXFP8RowsQuantLaunch:
@@ -641,7 +652,7 @@ def validate_mxfp8_rows_destinations(
     values: torch.Tensor,
     scale_rows: torch.Tensor,
     scale_mma: torch.Tensor,
-) -> None:
+) -> _PreparedMXFP8RowsQuantization:
     """Validate every caller-owned MXFP8 row-quantizer destination before launch.
 
     This is the single reusable exact destination contract for the row
@@ -720,8 +731,31 @@ def validate_mxfp8_rows_destinations(
     _check_no_alias("scale_rows", scale_rows_ptr, geom["scale_rows_bytes"],
                      "scale_mma", scale_mma_ptr, geom["scale_mma_bytes"])
 
+    return _PreparedMXFP8RowsQuantization(
+        source=source,
+        values=values,
+        scale_rows=scale_rows,
+        scale_mma=scale_mma,
+    )
 
-def quantize_mxfp8_rows_cute(
+
+def quantize_prepared_mxfp8_rows_cute(
+    prepared: _PreparedMXFP8RowsQuantization,
+    *,
+    value_order: str = "linear",
+) -> None:
+    """Launch a destination contract validated during preparation."""
+
+    _quantize_mxfp8_rows_cute_unchecked(
+        prepared.source,
+        prepared.values,
+        prepared.scale_rows,
+        prepared.scale_mma,
+        value_order=value_order,
+    )
+
+
+def _quantize_mxfp8_rows_cute_unchecked(
     source: torch.Tensor,
     values: torch.Tensor,
     scale_rows: torch.Tensor,
@@ -729,14 +763,8 @@ def quantize_mxfp8_rows_cute(
     *,
     value_order: str = "linear",
 ) -> None:
-    """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
+    """Launch tensors whose raw-pointer contract is already established."""
 
-    ``trellis_native_mma`` applies the fixed within-K32 byte permutation used
-    by direct native-trellis E4M3 B fragments.  It changes neither values nor
-    scale groups and avoids a separate activation transpose kernel.
-    """
-
-    validate_mxfp8_rows_destinations(source, values, scale_rows, scale_mma)
     if value_order == "trellis_native_mma":
         subgroup_width = 8
     else:
@@ -755,3 +783,27 @@ def quantize_mxfp8_rows_cute(
             scale_rows,
             scale_mma,
         )
+
+
+def quantize_mxfp8_rows_cute(
+    source: torch.Tensor,
+    values: torch.Tensor,
+    scale_rows: torch.Tensor,
+    scale_mma: torch.Tensor,
+    *,
+    value_order: str = "linear",
+) -> None:
+    """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
+
+    ``trellis_native_mma`` applies the fixed within-K32 byte permutation used
+    by direct native-trellis E4M3 B fragments.  It changes neither values nor
+    scale groups and avoids a separate activation transpose kernel.
+    """
+
+    prepared = validate_mxfp8_rows_destinations(
+        source,
+        values,
+        scale_rows,
+        scale_mma,
+    )
+    quantize_prepared_mxfp8_rows_cute(prepared, value_order=value_order)
