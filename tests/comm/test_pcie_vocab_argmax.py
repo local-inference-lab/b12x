@@ -12,6 +12,7 @@ from b12x.comm.pcie.pcie_hierarchical import (
 from b12x.comm.pcie.pcie_vocab_argmax import (
     PCIeVocabParallelArgmax,
     _exchange_ipc_handles,
+    _require_uniform_geometry,
     _selected_peers,
     _wait_nanosleep_cycles_from_env,
 )
@@ -85,6 +86,18 @@ def test_vocab_argmax_rejects_missing_gloo_handle(monkeypatch) -> None:
         _exchange_ipc_handles(b"rank-0", group)
 
 
+def test_vocab_argmax_rejects_mismatched_rank_geometry(monkeypatch) -> None:
+    group = MagicMock()
+    monkeypatch.setattr(
+        vocab_argmax_module,
+        "_broadcast_gather_object",
+        lambda geometry, group: [geometry] * 15 + [(2048, 4)],
+    )
+
+    with pytest.raises(RuntimeError, match="geometry differs across ranks"):
+        _require_uniform_geometry(1024, 4, group)
+
+
 @pytest.mark.parametrize("rank", [-1, 16])
 def test_vocab_argmax_rejects_invalid_rank(rank: int) -> None:
     with pytest.raises(ValueError, match="requires TP16"):
@@ -148,6 +161,11 @@ def test_vocab_argmax_resolves_implicit_cuda_device(
     monkeypatch.setattr(vocab_argmax_module, "CudaRTLibrary", lambda: ipc)
     monkeypatch.setattr(
         vocab_argmax_module,
+        "_require_uniform_geometry",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        vocab_argmax_module,
         "_exchange_ipc_handles",
         lambda local_handle, group: [local_handle] * 16,
     )
@@ -180,6 +198,27 @@ def test_vocab_argmax_destructor_never_enters_collective_teardown(
     runtime._ipc.cudaIpcCloseMemHandle.assert_called_once_with(456)
     runtime._ipc.cudaFree.assert_called_once_with(789)
     assert runtime._closed
+    assert runtime._runtime == 0
+    assert runtime._remote_ptrs == []
+    assert runtime._local_ptr == 0
+
+
+def test_vocab_argmax_close_reaches_all_barriers_after_destroy_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _fake_runtime()
+    runtime.group = MagicMock()
+    runtime._ext.destroy_runtime.side_effect = RuntimeError("destroy failed")
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.cuda, "synchronize", MagicMock())
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+
+    with pytest.raises(RuntimeError, match="destroy failed"):
+        runtime.close()
+
+    assert barrier.call_count == 3
+    runtime._ipc.cudaIpcCloseMemHandle.assert_called_once_with(456)
+    runtime._ipc.cudaFree.assert_called_once_with(789)
     assert runtime._runtime == 0
     assert runtime._remote_ptrs == []
     assert runtime._local_ptr == 0

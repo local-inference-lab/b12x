@@ -6,7 +6,7 @@ import os
 from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 from warnings import warn
 
 import torch
@@ -44,6 +44,20 @@ def _exchange_ipc_handles(
     if any(handle is None for handle in handles):
         raise RuntimeError("vocabulary argmax IPC exchange returned an empty handle")
     return list(handles)
+
+
+def _require_uniform_geometry(
+    local_vocab_size: int,
+    max_batch_size: int,
+    group: ProcessGroup,
+) -> None:
+    """Reject rank-local geometry before allocating collective resources."""
+    geometry = (int(local_vocab_size), int(max_batch_size))
+    peer_geometry = _broadcast_gather_object(geometry, group)
+    if any(candidate != geometry for candidate in peer_geometry):
+        raise RuntimeError(
+            f"vocabulary argmax geometry differs across ranks: {peer_geometry}"
+        )
 
 
 def _wait_nanosleep_cycles_from_env() -> int:
@@ -91,7 +105,14 @@ def _selected_peers(rank: int, world_size: int = WORLD_SIZE) -> tuple[int, ...]:
 
 
 class PCIeVocabParallelArgmax:
-    """Fuse BF16 add and exact global greedy sampling across TP16 shards."""
+    """Fuse BF16 add and exact global greedy sampling across TP16 shards.
+
+    Every TP rank must invoke ``fused_add_argmax`` once per logical step with
+    the same batch size. Tensor-parallel schedulers satisfy this collective
+    ordering invariant; callers that cannot guarantee it must not use this
+    runtime. Construction verifies that local vocabulary and capacity geometry
+    match on all ranks.
+    """
 
     def __init__(
         self,
@@ -127,9 +148,13 @@ class PCIeVocabParallelArgmax:
 
         self.local_vocab_size = int(local_vocab_size)
         self.max_batch_size = int(max_batch_size)
+        _require_uniform_geometry(
+            self.local_vocab_size,
+            self.max_batch_size,
+            exchange_group,
+        )
         self._ext = ext_module or _load_extension()
         self._ipc = CudaRTLibrary()
-        self._ipc.cudaSetDevice(device_index)
         self._runtime = 0
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
@@ -138,35 +163,37 @@ class PCIeVocabParallelArgmax:
         slab_bytes = int(self._ext.slab_bytes())
         peer_ptrs = [0] * self.world_size
         try:
-            self._local_ptr = self._ipc.cudaMalloc(slab_bytes)
-            self._ipc.cudaMemset(self._local_ptr, 0, slab_bytes)
-            local_handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
-            handles = _exchange_ipc_handles(local_handle, exchange_group)
-            peer_ptrs[self.rank] = self._local_ptr
-            for peer in _selected_peers(self.rank, self.world_size):
-                remote_ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
-                peer_ptrs[peer] = remote_ptr
-                self._remote_ptrs.append(remote_ptr)
-            self._runtime = int(
-                self._ext.init_runtime(
-                    peer_ptrs,
-                    self.rank,
-                    self.local_vocab_size,
-                    self.max_batch_size,
+            with self._cuda_runtime_device():
+                self._local_ptr = self._ipc.cudaMalloc(slab_bytes)
+                self._ipc.cudaMemset(self._local_ptr, 0, slab_bytes)
+                local_handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
+                handles = _exchange_ipc_handles(local_handle, exchange_group)
+                peer_ptrs[self.rank] = self._local_ptr
+                for peer in _selected_peers(self.rank, self.world_size):
+                    remote_ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
+                    peer_ptrs[peer] = remote_ptr
+                    self._remote_ptrs.append(remote_ptr)
+                self._runtime = int(
+                    self._ext.init_runtime(
+                        peer_ptrs,
+                        self.rank,
+                        self.local_vocab_size,
+                        self.max_batch_size,
+                    )
                 )
-            )
         except Exception:
             # Construction cleanup is rank-local. Mark the object closed so
             # garbage collection cannot enter the collective close protocol.
             self._closed = True
-            for ptr in self._remote_ptrs:
-                with suppress(Exception):
-                    self._ipc.cudaIpcCloseMemHandle(ptr)
-            self._remote_ptrs.clear()
-            if self._local_ptr:
-                with suppress(Exception):
-                    self._ipc.cudaFree(self._local_ptr)
-                self._local_ptr = 0
+            with suppress(Exception), self._cuda_runtime_device():
+                for ptr in self._remote_ptrs:
+                    with suppress(Exception):
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                self._remote_ptrs.clear()
+                if self._local_ptr:
+                    with suppress(Exception):
+                        self._ipc.cudaFree(self._local_ptr)
+                    self._local_ptr = 0
             raise
 
     @classmethod
@@ -208,6 +235,24 @@ class PCIeVocabParallelArgmax:
     @property
     def mapped_peer_count(self) -> int:
         return len(self._remote_ptrs)
+
+    @contextmanager
+    def _cuda_runtime_device(self) -> Iterator[None]:
+        """Select this runtime's CUDA device and restore the caller's device."""
+        if self.device.type != "cuda" or self.device.index is None:
+            yield
+            return
+        previous_device: int | None
+        try:
+            previous_device = torch.cuda.current_device()
+        except Exception:
+            previous_device = None
+        self._ipc.cudaSetDevice(self.device.index)
+        try:
+            yield
+        finally:
+            if previous_device is not None and previous_device != self.device.index:
+                self._ipc.cudaSetDevice(previous_device)
 
     def fused_add_argmax(
         self,
@@ -266,19 +311,26 @@ class PCIeVocabParallelArgmax:
         if self._closed:
             return
         self._closed = True
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        if self._runtime:
-            self._ext.destroy_runtime(self._runtime)
-            self._runtime = 0
-        for ptr in self._remote_ptrs:
-            self._ipc.cudaIpcCloseMemHandle(ptr)
-        self._remote_ptrs.clear()
-        dist.barrier(group=self.group)
-        if self._local_ptr:
-            self._ipc.cudaFree(self._local_ptr)
-            self._local_ptr = 0
-        dist.barrier(group=self.group)
+        with self._cuda_runtime_device():
+            torch.cuda.synchronize(self.device)
+            dist.barrier(group=self.group)
+            try:
+                if self._runtime:
+                    self._ext.destroy_runtime(self._runtime)
+            finally:
+                self._runtime = 0
+                try:
+                    for ptr in self._remote_ptrs:
+                        self._ipc.cudaIpcCloseMemHandle(ptr)
+                finally:
+                    self._remote_ptrs.clear()
+                    dist.barrier(group=self.group)
+                    try:
+                        if self._local_ptr:
+                            self._ipc.cudaFree(self._local_ptr)
+                    finally:
+                        self._local_ptr = 0
+                        dist.barrier(group=self.group)
 
     def __enter__(self) -> "PCIeVocabParallelArgmax":
         return self
@@ -303,23 +355,24 @@ class PCIeVocabParallelArgmax:
                 stacklevel=2,
             )
 
-        runtime = getattr(self, "_runtime", 0)
-        self._runtime = 0
-        if runtime:
-            with suppress(Exception):
-                self._ext.destroy_runtime(runtime)
+        with suppress(Exception), self._cuda_runtime_device():
+            runtime = getattr(self, "_runtime", 0)
+            self._runtime = 0
+            if runtime:
+                with suppress(Exception):
+                    self._ext.destroy_runtime(runtime)
 
-        remote_ptrs = list(getattr(self, "_remote_ptrs", ()))
-        self._remote_ptrs = []
-        for ptr in remote_ptrs:
-            with suppress(Exception):
-                self._ipc.cudaIpcCloseMemHandle(ptr)
+            remote_ptrs = list(getattr(self, "_remote_ptrs", ()))
+            self._remote_ptrs = []
+            for ptr in remote_ptrs:
+                with suppress(Exception):
+                    self._ipc.cudaIpcCloseMemHandle(ptr)
 
-        local_ptr = getattr(self, "_local_ptr", 0)
-        self._local_ptr = 0
-        if local_ptr:
-            with suppress(Exception):
-                self._ipc.cudaFree(local_ptr)
+            local_ptr = getattr(self, "_local_ptr", 0)
+            self._local_ptr = 0
+            if local_ptr:
+                with suppress(Exception):
+                    self._ipc.cudaFree(local_ptr)
 
 
 __all__ = ["PCIeVocabParallelArgmax"]

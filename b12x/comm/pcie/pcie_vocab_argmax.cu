@@ -63,7 +63,8 @@ __device__ __forceinline__ uint32_t load_acquire(const uint32_t* ptr) {
   uint32_t value;
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
                : "=r"(value)
-               : "l"(ptr));
+               : "l"(ptr)
+               : "memory");
   return value;
 }
 

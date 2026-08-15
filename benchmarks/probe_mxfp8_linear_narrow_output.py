@@ -174,6 +174,17 @@ def main() -> None:
                 int((actual[row] != reference[row]).sum().item())
                 for row in range(args.tokens)
             ]
+            correctness = {
+                "plan": plan.name,
+                "finite": finite,
+                "mismatches": mismatches,
+                "max_abs_error": max_abs_error,
+                "row_mismatches": row_mismatches,
+                "timing_eligible": finite and mismatches == 0,
+            }
+            if not correctness["timing_eligible"]:
+                results.append(correctness)
+                continue
 
             for _ in range(args.warmup):
                 _launch(
@@ -201,11 +212,7 @@ def main() -> None:
             milliseconds = float(start.elapsed_time(stop) / args.repeats)
             results.append(
                 {
-                    "plan": plan.name,
-                    "finite": finite,
-                    "mismatches": mismatches,
-                    "max_abs_error": max_abs_error,
-                    "row_mismatches": row_mismatches,
+                    **correctness,
                     "milliseconds": milliseconds,
                 }
             )
