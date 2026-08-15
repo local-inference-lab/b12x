@@ -50,6 +50,7 @@ SCHEMA_VERSION = "b12x_fp6_safetensors_v1"  # historical schema id; do not renam
 QUANT_METHOD = "modelopt"
 QUANT_ALGO = "W6A6"
 GROUP_SIZE = SF_VEC_SIZE_FP6  # 32-element MX block
+_DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES = 32 * 1024**3
 
 WEIGHT_SUFFIX = ".weight"
 WEIGHT_SCALE_SUFFIX = ".weight_scale"
@@ -479,31 +480,157 @@ def fp6_decode_lut(fmt: str, device: torch.device | str = "cpu") -> torch.Tensor
     )
 
 
+def _estimate_fp6_dequant_working_bytes(rows: int, k: int) -> int:
+    """Conservatively bound the live bytes materialized by the vectorized path."""
+    expanded = int(rows) * int(k)
+    scales = expanded // GROUP_SIZE
+    packed_input = expanded * 3 // 4
+    # Per expanded value: unpacked code, int64 LUT index, decoded value,
+    # repeated block scale, decoded result, and optional globally-scaled result.
+    value_working = expanded * (1 + 8 + 4 + 4 + 4 + 4)
+    # Count the input byte plus five conservative int32/float32 scale temporaries.
+    scale_working = scales * (1 + 5 * 4)
+    return packed_input + value_working + scale_working + 64 * 4
+
+
+def _validate_fp6_dequant_geometry(
+    packed: torch.Tensor,
+    block_scale: torch.Tensor,
+    weight_scale_2: Optional[torch.Tensor],
+    *,
+    max_working_bytes: Optional[int],
+) -> tuple[int, int]:
+    """Validate FP6 geometry and budget before high-amplification decoding.
+
+    Derives logical ``in_features`` from the packed weight and proves the scale
+    tensors match before any byte expansion or float32 LUT gather. The optional
+    working-set budget uses a conservative sum of every vectorized temporary;
+    ``None`` explicitly disables it for an operator-controlled offline run.
+    Returns ``(rows, k)`` for a validated tensor set.
+    """
+    # --- packed weight: (out, 3*in//4) uint8 codes -------------------------
+    if packed.ndim != 2:
+        raise ValueError(
+            f"packed weight must be rank-2 (out, 3*in//4), got {packed.ndim}D "
+            f"shape {tuple(packed.shape)}"
+        )
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"packed weight must be uint8 FP6 codes, got {packed.dtype}")
+    if not packed.is_contiguous():
+        raise ValueError("packed weight must be contiguous for byte expansion")
+    rows, packed_cols = packed.shape
+    if rows <= 0 or packed_cols <= 0:
+        raise ValueError(
+            f"packed weight must have positive dimensions, got "
+            f"({rows}, {packed_cols})"
+        )
+    # Legal FP6 packed-column ratio: 3 bytes hold exactly 4 six-bit codes.
+    if packed_cols % 3 != 0:
+        raise ValueError(
+            f"packed weight columns must be a multiple of 3 (3 bytes per 4 FP6 "
+            f"codes), got {packed_cols}"
+        )
+    k = (packed_cols * 4) // 3  # logical in_features; > 0 since packed_cols > 0
+    # 32-element MX block grouping must divide K exactly (one scale per block).
+    if k % GROUP_SIZE != 0:
+        raise ValueError(
+            f"derived in_features k={k} must be divisible by the MX block size "
+            f"{GROUP_SIZE} (packed_cols={packed_cols})"
+        )
+
+    # --- block scale: (out, in//32) uint8 UE8M0 bytes ----------------------
+    if block_scale.ndim != 2:
+        raise ValueError(
+            f"block_scale must be rank-2 (out, in//{GROUP_SIZE}), got "
+            f"{block_scale.ndim}D shape {tuple(block_scale.shape)}"
+        )
+    if block_scale.dtype != torch.uint8:
+        raise ValueError(
+            f"block_scale must be uint8 UE8M0 bytes, got {block_scale.dtype}"
+        )
+    if not block_scale.is_contiguous():
+        raise ValueError("block_scale must be contiguous")
+    if block_scale.device != packed.device:
+        raise ValueError(
+            f"block_scale device {block_scale.device} != packed device "
+            f"{packed.device}"
+        )
+    expected_scale_shape = (rows, k // GROUP_SIZE)
+    if tuple(block_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"block_scale shape {tuple(block_scale.shape)} does not match packed "
+            f"weight; expected {expected_scale_shape} for k={k}"
+        )
+    # Deterministic capacity check derived from validated geometry: the scale
+    # tensor must exactly cover the expanded output (one byte per GROUP_SIZE
+    # elements), with no surplus or deficit.
+    if block_scale.numel() * GROUP_SIZE != rows * k:
+        raise ValueError(
+            f"block_scale has {block_scale.numel()} entries covering "
+            f"{block_scale.numel() * GROUP_SIZE} elements, but the packed "
+            f"weight expands to {rows * k} elements"
+        )
+
+    # --- global weight scale: scalar or per-row float ----------------------
+    if weight_scale_2 is not None:
+        if not torch.is_floating_point(weight_scale_2):
+            raise ValueError(
+                f"weight_scale_2 must be a floating-point tensor, got "
+                f"{weight_scale_2.dtype}"
+            )
+        gs_numel = weight_scale_2.numel()
+        if gs_numel != 1 and gs_numel != rows:
+            raise ValueError(
+                f"weight_scale_2 has {gs_numel} elements; expected a scalar "
+                f"or one per output row ({rows})"
+            )
+
+    estimated_bytes = _estimate_fp6_dequant_working_bytes(rows, k)
+    if max_working_bytes is not None:
+        if isinstance(max_working_bytes, bool) or not isinstance(
+            max_working_bytes, int
+        ):
+            raise TypeError("max_working_bytes must be a positive integer or None")
+        if max_working_bytes <= 0:
+            raise ValueError("max_working_bytes must be positive or None")
+        if estimated_bytes > max_working_bytes:
+            raise ValueError(
+                "FP6 dequantization working set exceeds the operator budget: "
+                f"estimated {estimated_bytes} bytes, budget {max_working_bytes} bytes"
+            )
+    return rows, k
+
+
 def dequantize_linear_from_fp6(
     packed: torch.Tensor,
     block_scale: torch.Tensor,
     *,
     fmt: str,
     weight_scale_2: Optional[torch.Tensor] = None,
+    max_working_bytes: Optional[int] = _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES,
 ) -> torch.Tensor:
     """Reconstruct a ``(out, in)`` float32 weight from on-disk FP6 tensors.
 
     Vectorized inverse of :func:`quantize_linear_to_fp6`:
     ``x_hat = decode(code) * 2^(ue8m0 - 127) / gs``. ``packed`` is
     ``(out, 3*in//4)`` uint8 codes; ``block_scale`` is the **unswizzled**
-    ``(out, in//32)`` UE8M0 bytes as stored on disk (ue==0 means an all-zero
-    block).
+    ``(out, in//32)`` UE8M0 grid stored on disk.
 
-    ``weight_scale_2`` is the on-disk global weight scale: quantization stores
-    ``code ~= x * gs / block_scale`` (and derives the block scale from
-    ``block_max * gs``), so a non-unit ``gs`` divides back out here. ``None``
-    or an all-ones tensor keeps the pure-MX fast path unchanged. Accepts a
-    scalar or a per-row ``(out,)`` tensor (future per-row global scales).
+    ``weight_scale_2`` accepts a scalar or one value per output row.
+    ``max_working_bytes`` defaults to a conservative 32 GiB vectorized
+    working-set cap; pass a positive operator-selected limit, or ``None`` to
+    disable the cap for a trusted offline conversion.
     """
     from b12x._lib.fp6 import expand_mxfp6_packed_to_bytes
 
-    rows, packed_cols = packed.shape
-    k = packed_cols * 4 // 3
+    if fmt not in {"e2m3", "e3m2"}:
+        raise ValueError(f"fmt must be 'e2m3' or 'e3m2', got {fmt!r}")
+    rows, k = _validate_fp6_dequant_geometry(
+        packed,
+        block_scale,
+        weight_scale_2,
+        max_working_bytes=max_working_bytes,
+    )
     codes = expand_mxfp6_packed_to_bytes(packed, k)  # (out, in) uint8
     lut = fp6_decode_lut(fmt, device=packed.device)
     values = lut[codes.long()]  # (out, in) f32
@@ -513,11 +640,6 @@ def dequantize_linear_from_fp6(
         torch.zeros((), dtype=torch.float32, device=packed.device),
         torch.exp2((ue - 127).to(torch.float32)),
     )  # (out, in//32)
-    if scale.shape != (rows, k // GROUP_SIZE):
-        raise ValueError(
-            f"block_scale shape {tuple(scale.shape)} does not match packed "
-            f"weight ({rows}, {k // GROUP_SIZE})"
-        )
     w_hat = values * scale.repeat_interleave(GROUP_SIZE, dim=1)
     if weight_scale_2 is not None:
         gs = weight_scale_2.to(device=w_hat.device, dtype=torch.float32).reshape(-1)
@@ -526,9 +648,4 @@ def dequantize_linear_from_fp6(
                 w_hat = w_hat / gs
             elif gs.numel() == rows:
                 w_hat = w_hat / gs.view(rows, 1)
-            else:
-                raise ValueError(
-                    f"weight_scale_2 has {gs.numel()} elements; expected a "
-                    f"scalar or one per output row ({rows})"
-                )
     return w_hat

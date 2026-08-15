@@ -34,6 +34,7 @@ import torch
 
 from .fp6_checkpoint import (
     QUANT_ALGO,
+    _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES,
     build_quantization_config,
     dequantize_linear_from_fp6,
     quantize_linear_to_fp6,
@@ -882,6 +883,9 @@ def dequantize_fp6_checkpoint_to_bf16(
     *,
     device: str = "cuda",
     max_shard_bytes: int = 4 * 1024**3,
+    max_dequant_working_bytes: Optional[int] = (
+        _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES
+    ),
     verbose: bool = True,
 ) -> ExportReport:
     """Decode an FP6 checkpoint back to a plain BF16 HF checkpoint.
@@ -892,6 +896,9 @@ def dequantize_fp6_checkpoint_to_bf16(
     The output runs on stock vLLM with no b12x involvement, so a KLD
     against the original BF16 model isolates *weight* quantization error from
     the runtime W6A6 *activation* quantization error.
+
+    ``max_dequant_working_bytes`` bounds each vectorized tensor decode; ``None``
+    explicitly disables the cap for a trusted offline conversion.
     """
     model = SafetensorsModel(model_path)
     qcfg = model.config.get("quantization_config") or {}
@@ -934,7 +941,11 @@ def dequantize_fp6_checkpoint_to_bf16(
             ws2_key = name + ".weight_scale_2"
             ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
             w = dequantize_linear_from_fp6(
-                packed, scale, fmt=fmt, weight_scale_2=ws2
+                packed,
+                scale,
+                fmt=fmt,
+                weight_scale_2=ws2,
+                max_working_bytes=max_dequant_working_bytes,
             )
             writer.add(key, w.to(torch.bfloat16))
             report.quantized_tensors += 1
