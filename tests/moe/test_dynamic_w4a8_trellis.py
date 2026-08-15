@@ -66,6 +66,8 @@ def _run_trellis_dynamic(
     split_materialized: bool = False,
     coupled: bool = False,
     direct_lut: bool = False,
+    direct: bool = False,
+    topk_ids_override: torch.Tensor | None = None,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -79,9 +81,19 @@ def _run_trellis_dynamic(
     w13_i16 = torch.stack((gate_payload, up_payload), dim=0).contiguous()
     w2_i16 = down_payload.contiguous()
     w13_ref = torch.stack((gate_w, up_w), dim=0)
-    topk_ids = torch.stack(
-        [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
-    ).to(torch.int32)
+    if topk_ids_override is None:
+        topk_ids = torch.stack(
+            [torch.randperm(E, device=device)[:top_k] for _ in range(m)]
+        ).to(torch.int32)
+    else:
+        if tuple(topk_ids_override.shape) != (m, top_k):
+            raise ValueError(
+                "topk_ids_override must have shape "
+                f"{(m, top_k)}, got {tuple(topk_ids_override.shape)}"
+            )
+        topk_ids = topk_ids_override.to(
+            device=device, dtype=torch.int32
+        ).contiguous()
     topk_weights = torch.softmax(
         torch.randn(m, top_k, device=device), dim=-1
     ).float()
@@ -170,7 +182,7 @@ def _run_trellis_dynamic(
     flat_weights = topk_weights.reshape(-1).contiguous()
 
     import os as _os
-    _direct = _os.environ.get("BENCH_DIRECT", "0") == "1"
+    _direct = direct or _os.environ.get("BENCH_DIRECT", "0") == "1"
     _share = (
         split_materialized
         or _direct
@@ -358,6 +370,25 @@ def test_dynamic_trellis_matches_scaffold(activation: str, m: int) -> None:
             got[row : row + 1], want[row : row + 1]
         ).item()
         assert row_cos > 0.995, (row, row_cos)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dynamic_w4a8_m1_direct_ignores_inactive_routes() -> None:
+    """M=1 direct scheduling must skip every inactive expert route."""
+
+    got, _ = _run_trellis_dynamic(
+        activation="silu",
+        E=4,
+        m=1,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=20260815,
+        recipe="w4a8_mx",
+        direct=True,
+        topk_ids_override=torch.full((1, 2), -1, dtype=torch.int32),
+    )
+    torch.testing.assert_close(got, torch.zeros_like(got), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

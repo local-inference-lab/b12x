@@ -2998,7 +2998,13 @@ class MoEDynamicKernelBackend:
             hist_idx = flat_tid
             while hist_idx < total_pairs:
                 expert_id = topk_ids[hist_idx].to(Int32)
-                atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
+                # A route outside the local expert domain is inactive. vLLM
+                # uses -1 for scheduler padding, and expert-parallel callers
+                # may use the same contract for non-local routes.
+                if expert_id >= Int32(0) and expert_id < num_experts:
+                    atomic_add_global_i32(
+                        get_ptr_as_int64(row_counts, expert_id), Int32(1)
+                    )
                 hist_idx += flat_stride
 
             self._resident_grid_barrier(
@@ -3102,29 +3108,33 @@ class MoEDynamicKernelBackend:
                                 pair_idx = token_idx * num_topk + topk_slot
                                 expert_id = topk_ids[pair_idx].to(Int32)
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
-                                if cutlass.const_expr(self.direct_routing):
-                                    row = Int32(0)
-                                    phys_tile = pair_idx
-                                else:
-                                    row = atomic_add_global_i32(
-                                        get_ptr_as_int64(expert_write_rows, expert_id),
-                                        Int32(1),
+                                phys_row = Int32(-1)
+                                if expert_id >= Int32(0) and expert_id < num_experts:
+                                    if cutlass.const_expr(self.direct_routing):
+                                        row = Int32(0)
+                                        phys_tile = pair_idx
+                                    else:
+                                        row = atomic_add_global_i32(
+                                            get_ptr_as_int64(
+                                                expert_write_rows, expert_id
+                                            ),
+                                            Int32(1),
+                                        )
+                                        phys_tile = expert_tile_base[
+                                            expert_id
+                                        ] + row // Int32(self.tile_shape_mnk[0])
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
+                                    map_value = token_idx
+                                    if cutlass.const_expr(self.deterministic_output):
+                                        map_value = pair_idx
+                                    st_global_i32(
+                                        get_ptr_as_int64(token_map, phys_row), map_value
                                     )
-                                    phys_tile = expert_tile_base[
-                                        expert_id
-                                    ] + row // Int32(self.tile_shape_mnk[0])
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                map_value = token_idx
-                                if cutlass.const_expr(self.deterministic_output):
-                                    map_value = pair_idx
-                                st_global_i32(
-                                    get_ptr_as_int64(token_map, phys_row), map_value
-                                )
-                                st_global_f32(
-                                    get_ptr_as_int64(token_weights, phys_row), weight
-                                )
+                                    st_global_f32(
+                                        get_ptr_as_int64(token_weights, phys_row), weight
+                                    )
                                 slot = route_slot_base + topk_slot
                                 _st_shared_i32(
                                     route_phys_rows_addr + slot * Int32(4), phys_row
@@ -3202,18 +3212,19 @@ class MoEDynamicKernelBackend:
                                                 phys_row = shared_route_phys_rows[
                                                     cache_slot
                                                 ]
-                                                output_offset = (
-                                                    phys_row * output_bytes_per_row
-                                                    + block_start
-                                                    + Int32(payload_pair * 8)
-                                                )
-                                                st_global_u64(
-                                                    get_ptr_as_int64(
-                                                        packed_a_storage,
-                                                        output_offset,
-                                                    ),
-                                                    packed64,
-                                                )
+                                                if phys_row >= Int32(0):
+                                                    output_offset = (
+                                                        phys_row * output_bytes_per_row
+                                                        + block_start
+                                                        + Int32(payload_pair * 8)
+                                                    )
+                                                    st_global_u64(
+                                                        get_ptr_as_int64(
+                                                            packed_a_storage,
+                                                            output_offset,
+                                                        ),
+                                                        packed64,
+                                                    )
                                     if cutlass.const_expr(
                                         self.materialize_intermediate
                                     ):
@@ -3225,9 +3236,12 @@ class MoEDynamicKernelBackend:
                                             phys_row = shared_route_phys_rows[
                                                 cache_slot
                                             ]
-                                            scale_storage[
-                                                phys_row * mx_blocks_per_row + blk_idx
-                                            ] = Uint8(mx_scale_byte & Uint32(0xFF))
+                                            if phys_row >= Int32(0):
+                                                scale_storage[
+                                                    phys_row * mx_blocks_per_row + blk_idx
+                                                ] = Uint8(
+                                                    mx_scale_byte & Uint32(0xFF)
+                                                )
                                     blk_idx += Int32(self.input_warps_per_token * 32)
                             else:
                                 blk_idx = lane_id + token_partition * Int32(32)
@@ -3287,18 +3301,19 @@ class MoEDynamicKernelBackend:
                                                     route_phys_rows_addr
                                                     + slot * Int32(4)
                                                 )
-                                                output_offset = (
-                                                    phys_row * output_bytes_per_row
-                                                    + block_start
-                                                    + Int32(payload_pair * 8)
-                                                )
-                                                st_global_u64(
-                                                    get_ptr_as_int64(
-                                                        packed_a_storage,
-                                                        output_offset,
-                                                    ),
-                                                    packed64,
-                                                )
+                                                if phys_row >= Int32(0):
+                                                    output_offset = (
+                                                        phys_row * output_bytes_per_row
+                                                        + block_start
+                                                        + Int32(payload_pair * 8)
+                                                    )
+                                                    st_global_u64(
+                                                        get_ptr_as_int64(
+                                                            packed_a_storage,
+                                                            output_offset,
+                                                        ),
+                                                        packed64,
+                                                    )
                                                 topk_slot += Int32(1)
                                     if cutlass.const_expr(
                                         self.materialize_intermediate
@@ -3313,9 +3328,12 @@ class MoEDynamicKernelBackend:
                                             phys_row = _ld_shared_i32(
                                                 route_phys_rows_addr + slot * Int32(4)
                                             )
-                                            scale_storage[
-                                                phys_row * mx_blocks_per_row + blk_idx
-                                            ] = Uint8(mx_scale_byte & Uint32(0xFF))
+                                            if phys_row >= Int32(0):
+                                                scale_storage[
+                                                    phys_row * mx_blocks_per_row + blk_idx
+                                                ] = Uint8(
+                                                    mx_scale_byte & Uint32(0xFF)
+                                                )
                                             topk_slot += Int32(1)
                                     blk_idx += Int32(self.input_warps_per_token * 32)
                         else:
@@ -3326,18 +3344,23 @@ class MoEDynamicKernelBackend:
                                     phys_row = _ld_shared_i32(
                                         route_phys_rows_addr + slot * Int32(4)
                                     )
-                                    route_output_base[cache_slot] = (
-                                        phys_row * output_bytes_per_row
-                                    )
-                                    # Scale storage is tiled in 128-row SF
-                                    # atoms, independently of the MMA tile.
-                                    sf_atom = phys_row >> Int32(7)
-                                    sf_row = phys_row & Int32(127)
-                                    route_scale_base[cache_slot] = (
-                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                        + (sf_row % Int32(32)) * Int32(4 * 4)
-                                        + (sf_row // Int32(32)) * Int32(4)
-                                    )
+                                    route_output_base[cache_slot] = Int32(-1)
+                                    route_scale_base[cache_slot] = Int32(-1)
+                                    if phys_row >= Int32(0):
+                                        route_output_base[cache_slot] = (
+                                            phys_row * output_bytes_per_row
+                                        )
+                                        # Scale storage is tiled in 128-row SF
+                                        # atoms, independently of the MMA tile.
+                                        sf_atom = phys_row >> Int32(7)
+                                        sf_row = phys_row & Int32(127)
+                                        route_scale_base[cache_slot] = (
+                                            sf_atom
+                                            * num_k_tiles
+                                            * Int32(32 * 4 * 4)
+                                            + (sf_row % Int32(32)) * Int32(4 * 4)
+                                            + (sf_row // Int32(32)) * Int32(4)
+                                        )
 
                                 sf_idx = lane_id
                                 while sf_idx < sf_blocks_per_row:
@@ -3371,18 +3394,21 @@ class MoEDynamicKernelBackend:
                                         k_tile_idx * Int32(32 * 4 * 4) + inner_k_idx
                                     )
                                     for cache_slot in cutlass.range_constexpr(8):
-                                        output_offset = route_output_base[
-                                            cache_slot
-                                        ] + sf_idx * Int32(8)
-                                        st_global_u64(
-                                            get_ptr_as_int64(
-                                                packed_a_storage, output_offset
-                                            ),
-                                            packed64,
-                                        )
-                                        scale_storage[
-                                            route_scale_base[cache_slot] + scale_k_base
-                                        ] = scale_byte
+                                        output_base = route_output_base[cache_slot]
+                                        if output_base >= Int32(0):
+                                            output_offset = output_base + sf_idx * Int32(
+                                                8
+                                            )
+                                            st_global_u64(
+                                                get_ptr_as_int64(
+                                                    packed_a_storage, output_offset
+                                                ),
+                                                packed64,
+                                            )
+                                            scale_storage[
+                                                route_scale_base[cache_slot]
+                                                + scale_k_base
+                                            ] = scale_byte
                                     sf_idx += Int32(32)
                             else:
                                 sf_idx = lane_id
@@ -3417,35 +3443,36 @@ class MoEDynamicKernelBackend:
                                         phys_row = _ld_shared_i32(
                                             route_phys_rows_addr + slot * Int32(4)
                                         )
-                                        output_offset = (
-                                            phys_row * output_bytes_per_row
-                                            + sf_idx * Int32(8)
-                                        )
-                                        st_global_u64(
-                                            get_ptr_as_int64(
-                                                packed_a_storage, output_offset
-                                            ),
-                                            packed64,
-                                        )
+                                        if phys_row >= Int32(0):
+                                            output_offset = (
+                                                phys_row * output_bytes_per_row
+                                                + sf_idx * Int32(8)
+                                            )
+                                            st_global_u64(
+                                                get_ptr_as_int64(
+                                                    packed_a_storage, output_offset
+                                                ),
+                                                packed64,
+                                            )
 
-                                        # scale_storage uses 128-row SF atoms
-                                        # (tile_atom_to_shape_SF); index by the 128-atom
-                                        # (phys_row>>7) + row-within-atom, NOT the MMA
-                                        # tile (which may be 64). Identity at tile_m==128.
-                                        k_tile_idx = sf_idx // Int32(4)
-                                        sf_atom = phys_row >> Int32(7)
-                                        sf_row = phys_row & Int32(127)
-                                        outer_m_idx = sf_row % Int32(32)
-                                        inner_m_idx = sf_row // Int32(32)
-                                        inner_k_idx = sf_idx % Int32(4)
-                                        scale_offset = (
-                                            sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                            + k_tile_idx * Int32(32 * 4 * 4)
-                                            + outer_m_idx * Int32(4 * 4)
-                                            + inner_m_idx * Int32(4)
-                                            + inner_k_idx
-                                        )
-                                        scale_storage[scale_offset] = scale_byte
+                                            # Scale storage uses 128-row SF atoms,
+                                            # independently of the MMA tile.
+                                            k_tile_idx = sf_idx // Int32(4)
+                                            sf_atom = phys_row >> Int32(7)
+                                            sf_row = phys_row & Int32(127)
+                                            outer_m_idx = sf_row % Int32(32)
+                                            inner_m_idx = sf_row // Int32(32)
+                                            inner_k_idx = sf_idx % Int32(4)
+                                            scale_offset = (
+                                                sf_atom
+                                                * num_k_tiles
+                                                * Int32(32 * 4 * 4)
+                                                + k_tile_idx * Int32(32 * 4 * 4)
+                                                + outer_m_idx * Int32(4 * 4)
+                                                + inner_m_idx * Int32(4)
+                                                + inner_k_idx
+                                            )
+                                            scale_storage[scale_offset] = scale_byte
                                         topk_slot += Int32(1)
                                     sf_idx += Int32(32)
 
@@ -3469,28 +3496,33 @@ class MoEDynamicKernelBackend:
                                     expert_id = _ld_shared_i32(
                                         route_expert_ids_addr + slot * Int32(4)
                                     )
-                                    phys_tile = phys_row // Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self._publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
+                                    if phys_row >= Int32(0):
+                                        phys_tile = phys_row // Int32(
+                                            self.tile_shape_mnk[0]
                                         )
+                                        completed = atomic_add_global_i32(
+                                            get_ptr_as_int64(
+                                                tile_write_count, phys_tile
+                                            ),
+                                            Int32(1),
+                                        ) + Int32(1)
+                                        if completed == Int32(
+                                            self.tile_shape_mnk[0]
+                                        ):
+                                            self._publish_ready_tasks(
+                                                task_tail,
+                                                task_ready,
+                                                task_expert,
+                                                task_m_tile,
+                                                task_slice_begin,
+                                                task_slice_count,
+                                                task_valid_rows,
+                                                route_gate_tile_cnt,
+                                                task_slice_chunk,
+                                                expert_id,
+                                                phys_tile,
+                                                Int32(self.tile_shape_mnk[0]),
+                                            )
                                     topk_slot += Int32(1)
                 else:
                     warp_item = Int32(0)
@@ -3501,12 +3533,15 @@ class MoEDynamicKernelBackend:
                         weight = cutlass.Float32(0.0)
                         row = Int32(0)
                         phys_tile = Int32(0)
+                        route_is_valid = Int32(0)
                         if pair_idx < total_pairs:
                             expert_id = topk_ids[pair_idx].to(Int32)
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
+                            if expert_id >= Int32(0) and expert_id < num_experts:
+                                route_is_valid = Int32(1)
 
-                            if lane_id == Int32(0):
+                            if lane_id == Int32(0) and route_is_valid > Int32(0):
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
@@ -3535,8 +3570,16 @@ class MoEDynamicKernelBackend:
                             phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
                             expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
                             token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
+                            route_is_valid = cute.arch.shuffle_sync(
+                                route_is_valid, Int32(0)
+                            )
 
-                            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                            safe_expert_id = expert_id
+                            if route_is_valid == Int32(0):
+                                safe_expert_id = Int32(0)
+                            gs_value = input_global_scale[safe_expert_id].to(
+                                cutlass.Float32
+                            )
                             if cutlass.const_expr(self.is_w4a8):
                                 # w4a8: per-32 dynamic UE8M0 + E4M3 payload, no
                                 # global scale. Payload stored plain row-major;
@@ -3574,24 +3617,25 @@ class MoEDynamicKernelBackend:
                                                 values, block_max
                                             )
                                         )
-                                    output_offset = (
-                                        phys_row * output_bytes_per_row + block_start
-                                    )
-                                    for pair_idx in cutlass.range_constexpr(4):
-                                        packed64 = (
-                                            Uint64(payload[pair_idx * 2 + 1])
-                                            << Uint64(32)
-                                        ) | Uint64(payload[pair_idx * 2])
-                                        st_global_u64(
-                                            get_ptr_as_int64(
-                                                packed_a_storage,
-                                                output_offset + Int32(pair_idx * 8),
-                                            ),
-                                            packed64,
+                                    if route_is_valid > Int32(0):
+                                        output_offset = (
+                                            phys_row * output_bytes_per_row + block_start
                                         )
-                                    scale_storage[
-                                        phys_row * mx_blocks_per_row + blk_idx
-                                    ] = Uint8(mx_scale_byte & Uint32(0xFF))
+                                        for pair_idx in cutlass.range_constexpr(4):
+                                            packed64 = (
+                                                Uint64(payload[pair_idx * 2 + 1])
+                                                << Uint64(32)
+                                            ) | Uint64(payload[pair_idx * 2])
+                                            st_global_u64(
+                                                get_ptr_as_int64(
+                                                    packed_a_storage,
+                                                    output_offset + Int32(pair_idx * 8),
+                                                ),
+                                                packed64,
+                                            )
+                                        scale_storage[
+                                            phys_row * mx_blocks_per_row + blk_idx
+                                        ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                     blk_idx += Int32(32)
                             elif cutlass.const_expr(self.is_w6a8):
                                 # w6a8_mx: MXFP8-E4M3 K/32 byte-container
@@ -3624,36 +3668,38 @@ class MoEDynamicKernelBackend:
                                             self.mxfp6_fmt_a,
                                         )
                                     )
-                                    output_offset = (
-                                        phys_tile * Int32(self.tile_shape_mnk[0])
-                                        + row % Int32(self.tile_shape_mnk[0])
-                                    ) * output_bytes_per_row + (
-                                        sf_idx * packed_bytes_per_sf_block
-                                    )
-                                    moe_mxfp6_store_expanded_global(
-                                        packed_a_storage,
-                                        output_offset,
-                                        containers,
-                                    )
+                                    if route_is_valid > Int32(0):
+                                        output_offset = (
+                                            phys_tile * Int32(self.tile_shape_mnk[0])
+                                            + row % Int32(self.tile_shape_mnk[0])
+                                        ) * output_bytes_per_row + (
+                                            sf_idx * packed_bytes_per_sf_block
+                                        )
+                                        moe_mxfp6_store_expanded_global(
+                                            packed_a_storage,
+                                            output_offset,
+                                            containers,
+                                        )
 
-                                    k_tile_idx = sf_idx // Int32(4)
-                                    inner_k_idx = sf_idx % Int32(4)
-                                    # scale_storage uses 128-row SF atoms: index by
-                                    # the 128-atom + row-within-atom, not the MMA
-                                    # tile. Identity at tile_m==128.
-                                    phys_row = phys_tile * Int32(
-                                        self.tile_shape_mnk[0]
-                                    ) + row % Int32(self.tile_shape_mnk[0])
-                                    sf_atom = phys_row >> Int32(7)
-                                    sf_row = phys_row & Int32(127)
-                                    scale_offset = (
-                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                        + k_tile_idx * Int32(32 * 4 * 4)
-                                        + (sf_row % Int32(32)) * Int32(4 * 4)
-                                        + (sf_row // Int32(32)) * Int32(4)
-                                        + inner_k_idx
-                                    )
-                                    scale_storage[scale_offset] = scale_byte
+                                        k_tile_idx = sf_idx // Int32(4)
+                                        inner_k_idx = sf_idx % Int32(4)
+                                        # Scale storage uses 128-row SF atoms,
+                                        # independently of the MMA tile.
+                                        phys_row = phys_tile * Int32(
+                                            self.tile_shape_mnk[0]
+                                        ) + row % Int32(self.tile_shape_mnk[0])
+                                        sf_atom = phys_row >> Int32(7)
+                                        sf_row = phys_row & Int32(127)
+                                        scale_offset = (
+                                            sf_atom
+                                            * num_k_tiles
+                                            * Int32(32 * 4 * 4)
+                                            + k_tile_idx * Int32(32 * 4 * 4)
+                                            + (sf_row % Int32(32)) * Int32(4 * 4)
+                                            + (sf_row // Int32(32)) * Int32(4)
+                                            + inner_k_idx
+                                        )
+                                        scale_storage[scale_offset] = scale_byte
                                     sf_idx += Int32(32)
                             else:
                                 sf_idx = lane_id
@@ -3682,35 +3728,37 @@ class MoEDynamicKernelBackend:
                                             values, block_max, gs_value
                                         )
 
-                                    output_offset = (
-                                        phys_tile * Int32(self.tile_shape_mnk[0])
-                                        + row % Int32(self.tile_shape_mnk[0])
-                                    ) * output_bytes_per_row + sf_idx * Int32(8)
-                                    st_global_u64(
-                                        get_ptr_as_int64(
-                                            packed_a_storage, output_offset
-                                        ),
-                                        packed64,
-                                    )
+                                    if route_is_valid > Int32(0):
+                                        output_offset = (
+                                            phys_tile * Int32(self.tile_shape_mnk[0])
+                                            + row % Int32(self.tile_shape_mnk[0])
+                                        ) * output_bytes_per_row + sf_idx * Int32(8)
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage, output_offset
+                                            ),
+                                            packed64,
+                                        )
 
-                                    k_tile_idx = sf_idx // Int32(4)
-                                    inner_k_idx = sf_idx % Int32(4)
-                                    # scale_storage uses 128-row SF atoms: index by the
-                                    # 128-atom + row-within-atom, not the MMA tile.
-                                    # Identity at tile_m==128.
-                                    phys_row = phys_tile * Int32(
-                                        self.tile_shape_mnk[0]
-                                    ) + row % Int32(self.tile_shape_mnk[0])
-                                    sf_atom = phys_row >> Int32(7)
-                                    sf_row = phys_row & Int32(127)
-                                    scale_offset = (
-                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                        + k_tile_idx * Int32(32 * 4 * 4)
-                                        + (sf_row % Int32(32)) * Int32(4 * 4)
-                                        + (sf_row // Int32(32)) * Int32(4)
-                                        + inner_k_idx
-                                    )
-                                    scale_storage[scale_offset] = scale_byte
+                                        k_tile_idx = sf_idx // Int32(4)
+                                        inner_k_idx = sf_idx % Int32(4)
+                                        # Scale storage uses 128-row SF atoms,
+                                        # independently of the MMA tile.
+                                        phys_row = phys_tile * Int32(
+                                            self.tile_shape_mnk[0]
+                                        ) + row % Int32(self.tile_shape_mnk[0])
+                                        sf_atom = phys_row >> Int32(7)
+                                        sf_row = phys_row & Int32(127)
+                                        scale_offset = (
+                                            sf_atom
+                                            * num_k_tiles
+                                            * Int32(32 * 4 * 4)
+                                            + k_tile_idx * Int32(32 * 4 * 4)
+                                            + (sf_row % Int32(32)) * Int32(4 * 4)
+                                            + (sf_row // Int32(32)) * Int32(4)
+                                            + inner_k_idx
+                                        )
+                                        scale_storage[scale_offset] = scale_byte
                                     sf_idx += Int32(32)
 
                             if cutlass.const_expr(self.work_is_streaming):
@@ -3721,7 +3769,10 @@ class MoEDynamicKernelBackend:
                                 _threadfence()
                                 cute.arch.sync_warp()
 
-                                if lane_id == Int32(0):
+                                if (
+                                    lane_id == Int32(0)
+                                    and route_is_valid > Int32(0)
+                                ):
                                     completed = atomic_add_global_i32(
                                         get_ptr_as_int64(tile_write_count, phys_tile),
                                         Int32(1),
@@ -3769,6 +3820,17 @@ class MoEDynamicKernelBackend:
                     pair_flush = Int32(bidz)
                     while pair_flush < total_pairs:
                         expert_flush = topk_ids[pair_flush].to(Int32)
+                        valid_rows = Int32(0)
+                        if (
+                            expert_flush >= Int32(0)
+                            and expert_flush < num_experts
+                        ):
+                            valid_rows = Int32(1)
+                        else:
+                            # Deferred direct tasks use an arithmetic slot per
+                            # route. Keep the slot addressable, but give an
+                            # inactive route a safe expert index and no work.
+                            expert_flush = Int32(0)
                         self._publish_deferred_tasks(
                             task_expert,
                             task_valid_rows,
@@ -3776,7 +3838,7 @@ class MoEDynamicKernelBackend:
                             task_slice_chunk,
                             expert_flush,
                             pair_flush,
-                            Int32(1),
+                            valid_rows,
                         )
                         pair_flush += Int32(gdim_z)
                 else:
@@ -4417,12 +4479,14 @@ class MoEDynamicKernelBackend:
                 if materialized_slot < materialized_tail:
                     route_idx = materialized_slot // route_gate_tile_cnt
                     route_slice = materialized_slot - route_idx * route_gate_tile_cnt
-                    work_item[_WORK_EXPERT] = topk_ids[route_idx].to(Int32)
-                    work_item[_WORK_M_TILE] = route_idx
-                    work_item[_WORK_SLICE_BEGIN] = route_slice
-                    work_item[_WORK_SLICE_COUNT] = Int32(1)
-                    work_item[_WORK_VALID_ROWS] = Int32(1)
-                    has_task = Int32(1)
+                    route_expert = topk_ids[route_idx].to(Int32)
+                    if route_expert >= Int32(0) and route_expert < num_experts:
+                        work_item[_WORK_EXPERT] = route_expert
+                        work_item[_WORK_M_TILE] = route_idx
+                        work_item[_WORK_SLICE_BEGIN] = route_slice
+                        work_item[_WORK_SLICE_COUNT] = Int32(1)
+                        work_item[_WORK_VALID_ROWS] = Int32(1)
+                        has_task = Int32(1)
                 else:
                     is_done = Int32(1)
                 materialized_slot += Int32(gdim_z)
@@ -4541,6 +4605,12 @@ class MoEDynamicKernelBackend:
                     not self.work_is_persistent_grid and not self.w4a8_m1_materialized
                 ):
                     self._load_shared_work_item(work_item, ctrl_base_addr)
+                # Direct routing retains arithmetic task slots for graph-stable
+                # scheduling. An inactive route carries zero valid rows and
+                # must not reach any expert weight or scale load.
+                if work_item[_WORK_VALID_ROWS] <= Int32(0):
+                    has_task = Int32(0)
+            if has_task > Int32(0):
                 task_m_tile_idx_cache = work_item[_WORK_M_TILE]
                 task_valid_rows_cache = work_item[_WORK_VALID_ROWS]
                 tile_m_base_cache = task_m_tile_idx_cache * Int32(
@@ -8763,29 +8833,30 @@ class MoEDynamicKernelBackend:
                         phase2_slot - phase2_m_tile * phase2_task_output_tiles
                     )
                     phase2_expert = topk_ids[phase2_m_tile].to(Int32)
-                    self._run_w4a8_materialized_fc2(
-                        intermediate_u32,
-                        down_rp,
-                        down_sfb_rp,
-                        scatter_output,
-                        token_map,
-                        token_weights,
-                        down_alpha,
-                        global_scale,
-                        sa_flat_addr,
-                        w4a8_sb0,
-                        w4a8_sb1,
-                        w4a8_sfbb,
-                        Int32(tidx),
-                        warp_idx,
-                        phase2_m_tile,
-                        phase2_expert,
-                        phase2_output_tile,
-                        Int32(1),
-                        rows_capacity,
-                        gate_tile_cnt,
-                        phase2_packed_output_tiles,
-                    )
+                    if phase2_expert >= Int32(0) and phase2_expert < num_experts:
+                        self._run_w4a8_materialized_fc2(
+                            intermediate_u32,
+                            down_rp,
+                            down_sfb_rp,
+                            scatter_output,
+                            token_map,
+                            token_weights,
+                            down_alpha,
+                            global_scale,
+                            sa_flat_addr,
+                            w4a8_sb0,
+                            w4a8_sb1,
+                            w4a8_sfbb,
+                            Int32(tidx),
+                            warp_idx,
+                            phase2_m_tile,
+                            phase2_expert,
+                            phase2_output_tile,
+                            Int32(1),
+                            rows_capacity,
+                            gate_tile_cnt,
+                            phase2_packed_output_tiles,
+                        )
                     cute.arch.sync_threads()
                     phase2_slot += Int32(gdim_z)
             else:
