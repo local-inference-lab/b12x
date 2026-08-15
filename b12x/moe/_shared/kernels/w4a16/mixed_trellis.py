@@ -57,7 +57,6 @@ class MixedTrellisCompileResult:
     moe_block_size: int
     fc2_moe_block_size: int
     fc2_schedule_route_block_factor: int
-    fc2_paired_m8_routes: bool
     max_m_blocks: int
     blocks_per_sm: int
     sms: int
@@ -160,7 +159,6 @@ class W4A16MixedTrellisKernel:
                     g.cta_threads,
                     g.moe_block_size,
                     g.schedule_route_block_factor,
-                    g.paired_m8_routes,
                 )
                 for g in gemms
             )
@@ -174,13 +172,6 @@ class W4A16MixedTrellisKernel:
             raise ValueError(
                 "mixed Trellis FC2 schedule factor must divide one packed "
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
-            )
-        expected_pair = fc2_factor == 2 and driver.fc2.moe_block_size == 8
-        if bool(driver.fc2.paired_m8_routes) != expected_pair:
-            raise ValueError(
-                "mixed Trellis FC2 pair contract mismatch: "
-                f"factor={fc2_factor}, m={driver.fc2.moe_block_size}, "
-                f"paired={driver.fc2.paired_m8_routes}"
             )
         if tier0.num_experts > 256 or tier1.num_experts > 256:
             raise ValueError("tier-local expert ids must fit in eight bits")
@@ -245,8 +236,8 @@ class W4A16MixedTrellisKernel:
         factor = gemm.schedule_route_block_factor
         first_route_block = route_block_idx * Int32(factor)
         first_lock_slot = lock_slot * Int32(factor)
-        if cutlass.const_expr(gemm.paired_m8_routes):
-            gemm._run_tile_m8_pair(
+        for subtile in cutlass.range_constexpr(factor):
+            gemm._run_tile(
                 a_flat,
                 a_alt_flat,
                 b_flat,
@@ -259,41 +250,16 @@ class W4A16MixedTrellisKernel:
                 locks,
                 smem_base,
                 tid,
-                first_route_block,
+                first_route_block + Int32(subtile),
                 local_expert,
                 output_n_tile,
                 reduce_k_tile,
                 reduce_tile_count,
                 reduce_slice_count,
                 reduce_slice_idx,
-                first_lock_slot,
+                first_lock_slot + Int32(subtile),
                 active_size_m,
             )
-        else:
-            for subtile in cutlass.range_constexpr(factor):
-                gemm._run_tile(
-                    a_flat,
-                    a_alt_flat,
-                    b_flat,
-                    c_flat,
-                    scales_flat,
-                    global_scale,
-                    packed_route_indices,
-                    topk_weights,
-                    c_tmp,
-                    locks,
-                    smem_base,
-                    tid,
-                    first_route_block + Int32(subtile),
-                    local_expert,
-                    output_n_tile,
-                    reduce_k_tile,
-                    reduce_tile_count,
-                    reduce_slice_count,
-                    reduce_slice_idx,
-                    first_lock_slot + Int32(subtile),
-                    active_size_m,
-                )
 
     @cute.jit
     def _emit_tier_tile(
@@ -809,7 +775,7 @@ def compile_mixed_trellis(
             "large-M cross-tier partial reductions"
         )
     total_experts = int(tier0_num_experts) + int(tier1_num_experts)
-    paired_m8_fc2 = int(moe_block_size) in (32, 64)
+    grouped_m8_fc2 = int(moe_block_size) in (32, 64)
 
     def make_kernel(num_experts: int, bits: int) -> W4A16FusedMoeKernel:
         return W4A16FusedMoeKernel(
@@ -827,8 +793,8 @@ def compile_mixed_trellis(
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
-            fc2_moe_block_size=(8 if paired_m8_fc2 else moe_block_size),
-            fc2_schedule_route_block_factor=(2 if paired_m8_fc2 else 1),
+            fc2_moe_block_size=(8 if grouped_m8_fc2 else moe_block_size),
+            fc2_schedule_route_block_factor=(2 if grouped_m8_fc2 else 1),
             element_dtype="fp16",
             weight_layout="trellis3_t256",
             scale_format="e4m3_k32",
@@ -985,7 +951,6 @@ def compile_mixed_trellis(
         fc2_schedule_route_block_factor=int(
             kernel.driver.fc2.schedule_route_block_factor
         ),
-        fc2_paired_m8_routes=bool(kernel.driver.fc2.paired_m8_routes),
         max_m_blocks=int(max_m_blocks),
         blocks_per_sm=int(kernel.blocks_per_sm),
         sms=int(sms),

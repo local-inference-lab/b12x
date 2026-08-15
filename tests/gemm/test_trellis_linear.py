@@ -9,8 +9,6 @@ import torch
 
 from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
-from b12x.gemm.trellis_linear import _small_m
-from b12x.gemm.trellis_linear._small_m import _default_num_sms
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_cheb_normal_e4m3_direct_lut_cpu,
@@ -21,10 +19,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.w4a16.kernel import (
-    _run_trellis_dense_hadamard128,
-    _trellis256_dense_launch_geometry,
-)
+from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_qsrt_pair_moe_weights,
 )
@@ -41,20 +36,6 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability()
     return major == 12 and minor in (0, 1)
-
-
-def _hadamard128_reference(source: torch.Tensor) -> torch.Tensor:
-    """Natural-order, normalized H128 with the kernel's fp32 butterflies."""
-
-    original_shape = source.shape
-    values = source.float().reshape(-1, 128).clone()
-    for stride in (1, 2, 4, 8, 16, 32, 64):
-        groups = values.reshape(-1, 128 // (2 * stride), 2, stride)
-        low = groups[:, :, 0, :].clone()
-        high = groups[:, :, 1, :].clone()
-        groups[:, :, 0, :] = low + high
-        groups[:, :, 1, :] = low - high
-    return (values * (1.0 / np.sqrt(128.0))).reshape(original_shape)
 
 
 def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
@@ -225,9 +206,6 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
         .reshape(m, k)
     )
 
-
-
-
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
     tensors = tuple(torch.empty(0) for _ in range(3))
     expected = SimpleNamespace()
@@ -366,44 +344,6 @@ def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("size_k", "size_n", "available_sms", "expected"),
-    [
-        (2048, 4096, 188, 128),
-        (2048, 4096, 120, 120),
-        (6144, 1024, 188, 64),
-        (6144, 1024, 48, 48),
-        (512, 6144, 188, 96),
-        (512, 6144, 80, 80),
-        # The unsharded dimensions are deliberately not inferred from TP4.
-        (6144, 4096, 188, 188),
-        (2048, 6144, 188, 188),
-        (3072, 6144, 188, 188),
-        (4096, 6144, 188, 188),
-        (6144, 6144, 188, 188),
-    ],
-)
-def test_k6_small_m_default_sms_preserves_glm_decode_overlap(
-    size_k: int,
-    size_n: int,
-    available_sms: int,
-    expected: int,
-) -> None:
-    assert _default_num_sms(size_k, size_n, available_sms) == expected
-
-
-def test_k6_small_m_rejects_unsupported_arch_before_jit(monkeypatch) -> None:
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr(
-        _small_m,
-        "_extension",
-        lambda: pytest.fail("extension must not compile for an unsupported GPU"),
-    )
-
-    with pytest.raises(NotImplementedError, match="built for sm_120 only"):
-        _small_m.run_k6_mcg(*(torch.empty(0) for _ in range(7)))
-
-
-@pytest.mark.parametrize(
     ("size_m", "size_k", "size_n", "expected"),
     [
         # Narrow profile: avoid a short spill by increasing both M and N work.
@@ -435,86 +375,8 @@ def test_dense_launch_geometry_avoids_short_spill_waves(
         == expected
     )
 
-
-@pytest.mark.parametrize(
-    ("m", "size_k", "size_n"),
-    [
-        (7, 128, 128),
-        (1, 2048, 4096),
-        (7, 6144, 1024),
-        (32, 512, 6144),
-    ],
-)
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_k6_small_m_matches_separate_cute_pipeline(
-    m: int,
-    size_k: int,
-    size_n: int,
-) -> None:
-    device = torch.device("cuda", torch.cuda.current_device())
-    torch.manual_seed(0)
-    trellis = torch.randint(
-        -32768,
-        32767,
-        (size_k // 16, size_n // 16, 96),
-        dtype=torch.int16,
-        device=device,
-    )
-    suh = torch.randn((size_k,), dtype=torch.float16, device=device)
-    svh = torch.randn((size_n,), dtype=torch.float16, device=device)
-    weight = trellis_linear.prepare_weight(
-        trellis,
-        suh,
-        svh,
-        mcg=torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device),
-        params_dtype=torch.float16,
-    )
-    x = torch.randn((m, size_k), dtype=torch.float16, device=device)
-
-    def separate_hadamard(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        left_scale,
-        right_scale,
-        _scale: float,
-    ) -> None:
-        _run_trellis_dense_hadamard128(
-            source,
-            destination,
-            left_scale if left_scale is not None else right_scale,
-            scale_before=left_scale is not None,
-        )
-
-    expected = trellis_linear.run(
-        x,
-        weight,
-        hadamard_128=separate_hadamard,
-    ).clone()
-    weight.workspace.zero_()
-    actual = trellis_linear.run(x, weight).clone()
-    torch.cuda.synchronize(device)
-
-    # The cooperative kernel and CuTe fallback use different legal FP16 MMA
-    # accumulation orders. Compare their direction and normalized error rather
-    # than imposing a large absolute tolerance on values near zero.
-    actual_f32 = actual.float()
-    expected_f32 = expected.float()
-    delta = actual_f32 - expected_f32
-    relative_l2 = delta.norm() / expected_f32.norm().clamp_min(1e-12)
-    cosine = torch.nn.functional.cosine_similarity(
-        actual_f32.flatten(), expected_f32.flatten(), dim=0
-    )
-    max_relative_to_range = delta.abs().max() / expected_f32.abs().max().clamp_min(
-        1e-12
-    )
-
-    assert float(relative_l2) < 1.5e-3
-    assert float(cosine) > 0.999998
-    assert float(max_relative_to_range) < 2e-3
-
-
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
+def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     m = 3
     features = 128

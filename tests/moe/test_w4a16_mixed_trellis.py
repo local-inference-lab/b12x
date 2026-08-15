@@ -184,6 +184,21 @@ def test_mixed_runtime_tracks_topk_sum_contract() -> None:
     ]
 
 
+def test_mixed_dispatch_calls_shared_tile_primitive() -> None:
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel._dispatch_tier_gemm))
+    )
+    tile_calls = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("_run_tile")
+    ]
+
+    assert tile_calls == ["_run_tile"]
+
+
 def _prepared(
     *,
     experts: int,
@@ -832,7 +847,7 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
 def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     candidate_block_size: int,
 ) -> None:
-    """Large route blocks with paired-M8 FC2 preserve one-grid arithmetic."""
+    """Large route blocks with M8 FC2 subtiles preserve one-grid arithmetic."""
 
     torch.manual_seed(20260801)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -933,7 +948,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert candidate_launch.moe_block_size == candidate_block_size
     assert candidate_launch.fc2_moe_block_size == 8
     assert candidate_launch.fc2_schedule_route_block_factor == 2
-    assert candidate_launch.fc2_paired_m8_routes is True
     assert phase_equal == (True, True, True), geometry
     assert torch.equal(candidate, reference), geometry
     assert candidate_launch.local_memory_bytes == 0
