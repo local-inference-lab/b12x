@@ -1,10 +1,10 @@
-"""Validate and benchmark the TP16 Kimi paired projection/top-k collective.
+"""Benchmark Kimi paired projection gathering with fused expert selection.
 
-The reference arm gathers both projection rows and applies vLLM ``grouped_topk``.
-The fused arm gathers the projection rows while selecting the same 16 experts.
-Expert IDs and projection data must match exactly. Router weights may differ by
-at most one FP32 rounding step because the implementations use different
-parallel reduction orders.
+The benchmark covers the PCIe DCP world sizes supported by B12X: TP2, TP4,
+TP8, and TP16. It compares a separate paired gather plus vLLM ``grouped_topk``
+against the fused B12X operation. Expert IDs and projection data must match
+exactly. Router weights may differ by at most one FP32 rounding step because
+the implementations use different parallel reduction orders.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ def _case(
     name: str,
     *,
     rank: int,
+    world_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if name == "random":
@@ -92,7 +93,10 @@ def _case(
         bias[33] = float("inf")
     else:
         raise ValueError(name)
-    local = logits[:, rank * 56 : (rank + 1) * 56].contiguous()
+    local_width = 896 // world_size
+    local = logits[
+        :, rank * local_width : (rank + 1) * local_width
+    ].contiguous()
     return local, bias.contiguous()
 
 
@@ -128,32 +132,34 @@ def _worker(
     reference_pool: PCIeDCPA2APool | None = None
     fused_pool: PCIeDCPA2APool | None = None
     try:
+        query_head_dim = 10752 // world_size
         reference_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
             max_batch_size=1,
             total_heads=world_size,
-            head_dim=672,
-            query_head_dim=672,
+            head_dim=query_head_dim,
+            query_head_dim=query_head_dim,
         )
         fused_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
             max_batch_size=1,
             total_heads=world_size,
-            head_dim=672,
-            query_head_dim=672,
+            head_dim=query_head_dim,
+            query_head_dim=query_head_dim,
         )
         reference_channel = "k3-pair-topk:reference"
         fused_channel = "k3-pair-topk:fused"
         reference_pool.prepare_channels((reference_channel,))
         fused_pool.prepare_channels((fused_channel,))
 
+        local_down_width = 3584 // world_size
         down_local = (
-            torch.arange(224, device=device, dtype=torch.float32)
-            .add_(rank * 224)
+            torch.arange(local_down_width, device=device, dtype=torch.float32)
+            .add_(rank * local_down_width)
             .to(torch.bfloat16)
-            .view(1, 224)
+            .view(1, local_down_width)
         )
         reference_down = torch.empty((1, 3584), device=device, dtype=torch.bfloat16)
         reference_router = torch.empty((1, 896), device=device, dtype=torch.float32)
@@ -178,7 +184,12 @@ def _worker(
         benchmark_router: torch.Tensor | None = None
         benchmark_bias: torch.Tensor | None = None
         for name in ("random", "ties", "near_ties", "wide"):
-            local_router, bias = _case(name, rank=rank, device=device)
+            local_router, bias = _case(
+                name,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+            )
             reference_pool.all_gather_pair(
                 down_local,
                 local_router,
@@ -314,8 +325,10 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--samples", type=int, default=5)
     args = parser.parse_args()
-    if args.world_size != 16:
-        raise SystemExit("Kimi paired gather+top-k benchmark requires TP16")
+    if args.world_size not in (2, 4, 8, 16):
+        raise SystemExit(
+            "Kimi paired gather+top-k benchmark requires TP2, TP4, TP8, or TP16"
+        )
     mp.spawn(
         _worker,
         args=(

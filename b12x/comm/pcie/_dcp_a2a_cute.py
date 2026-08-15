@@ -2192,6 +2192,7 @@ def all_gather_pair(
 
 def all_gather_pair_kimi_topk(
     *,
+    world_size: int,
     rank: int,
     local_down_ptr: int,
     local_router_ptr: int,
@@ -2206,14 +2207,16 @@ def all_gather_pair_kimi_topk(
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_all_gather_pair(
-        16,
+        world_size,
         rank,
         512,
         device_slot_selection,
         True,
     )
     if not device_slot_selection:
-        _get_compiled_all_gather_pair(16, rank, 512, True, True)
+        _get_compiled_all_gather_pair(
+            world_size, rank, 512, True, True
+        )
     launcher(
         local_down_ptr,
         local_router_ptr,
@@ -2224,8 +2227,8 @@ def all_gather_pair_kimi_topk(
         staging_ptrs,
         signal_ptrs,
         1,
-        28,
-        14,
+        448 // world_size,
+        224 // world_size,
         slot_delta_256b,
     )
 

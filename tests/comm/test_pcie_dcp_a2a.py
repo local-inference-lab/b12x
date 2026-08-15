@@ -131,7 +131,7 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         device_slot_selection,
     ):
         del local_router, correction_bias, slot, device_slot_selection
-        out_down.copy_(torch.cat((local_down,) * 16, dim=1))
+        out_down.copy_(torch.cat((local_down,) * self.world_size, dim=1))
         topk_weights.fill_(1.0 / 16.0)
         topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
 
@@ -139,8 +139,10 @@ def _make_runtime() -> PCIeDCPA2A:
     return _FakeRuntime()
 
 
-def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
-    world_size = 16
+def _make_kimi_runtime(
+    world_size: int, ext: _FakeExt | None = None
+) -> PCIeDCPA2A:
+    query_head_dim = 7168 // world_size + 3584 // world_size
     return _FakeKimiRuntime(
         rank=0,
         world_size=world_size,
@@ -150,11 +152,11 @@ def _make_kimi_tp16_runtime(ext: _FakeExt | None = None) -> PCIeDCPA2A:
         staging1_ptrs=tuple(range(300, 300 + world_size)),
         max_batch_size=1,
         total_heads=world_size,
-        head_dim=672,
-        output_capacity_elems=world_size * 672,
-        lse_offset=world_size * 672 * 2,
+        head_dim=query_head_dim,
+        output_capacity_elems=world_size * query_head_dim,
+        lse_offset=world_size * query_head_dim * 2,
         lse_capacity=world_size,
-        query_head_dim=672,
+        query_head_dim=query_head_dim,
         ext_module=ext or _FakeExt(),
     )
 
@@ -632,11 +634,18 @@ def test_runtime_accepts_head_major_input_and_output():
     torch.testing.assert_close(actual, partial_output[:, :16])
 
 
-def test_kimi_tp16_pair_topk_dispatches_compact_outputs() -> None:
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     ext = _FakeExt()
-    runtime = _make_kimi_tp16_runtime(ext)
-    local_down = torch.arange(224, dtype=torch.bfloat16).view(1, 224)
-    local_router = torch.arange(56, dtype=torch.float32).view(1, 56)
+    runtime = _make_kimi_runtime(world_size, ext)
+    local_down_width = 3584 // world_size
+    local_router_width = 896 // world_size
+    local_down = torch.arange(
+        local_down_width, dtype=torch.bfloat16
+    ).view(1, local_down_width)
+    local_router = torch.arange(
+        local_router_width, dtype=torch.float32
+    ).view(1, local_router_width)
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
     down, weights, ids = runtime.all_gather_pair_kimi_topk(
