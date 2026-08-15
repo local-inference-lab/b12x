@@ -1464,7 +1464,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
 
             # Pull the 3,584-byte router row in 16-byte packs. This uses 224
             # peer transactions instead of 896 scalar transactions; PCIe
-            # transaction count dominates this phase.
+            # transaction count dominates router-row transfer time.
             router_pack = Int32(tidx)
             router_packs_total = Int32(self._world_size) * second_packs
             while router_pack < router_packs_total:
