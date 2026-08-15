@@ -33,6 +33,27 @@ with ModelOpt-mirror tensor keys (`.weight` / `.weight_scale` /
 `.weight_scale_2` / `.input_scale`), and copies of the tokenizer/chat
 template files. Routed MoE experts are written per-expert.
 
+> **Security: auxiliary files and symlinks.** The exporter copies tokenizer /
+> chat-template / generation-config files from the source directory into the
+> output, but only if they are **real regular files**. Every *eligible*
+> auxiliary candidate — any top-level entry that is not `*.safetensors`,
+> `config.json`, or a shard index — that is a symlink (absolute, relative,
+> broken, or a standard Hugging Face cache snapshot link
+> `snapshots/<rev>/<file> → ../../blobs/<hash>`) or a non-regular special
+> file **fails closed**: it is never copied. When the unsafe kind can be
+> identified the exporter raises `UnsafeAuxiliaryFileError`; when the OS
+> itself rejects the open (e.g. a device node) the underlying `OSError`
+> propagates. In either case no bytes from the entry enter the output
+> bundle. This prevents an attacker-authored symlink from embedding arbitrary
+> victim-readable bytes into the output bundle.
+>
+> If you are converting a model downloaded via `huggingface_hub` and the
+> cache snapshot uses symlink-to-blob links, re-download or materialize the
+> checkpoint as real files through the HF client's vetted download path
+> (e.g. `huggingface_hub` `local_dir` mode, which writes real files, not
+> symlinks) before running the exporter. **Never** dereference symlinks from
+> an untrusted or attacker-authored checkout — copy only real files.
+
 **What gets quantized (the "golden rule" walk):** MLP projections,
 attention q/k/v/o, MoE routed experts (gate/up/down) and the shared expert.
 **Kept BF16:** norms, embeddings, router gates, `lm_head`, the MTP head,

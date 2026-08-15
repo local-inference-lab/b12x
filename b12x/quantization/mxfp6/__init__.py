@@ -254,6 +254,7 @@ from b12x.quantization.mxfp6.model_fp6 import (  # noqa: E402
     ConvertReport,
 )
 from b12x.quantization.mxfp6.fp6_safetensors_export import (  # noqa: E402
+    UnsafeAuxiliaryFileError,
     ExportReport,
     export_model_to_fp6_safetensors,
     export_moe_model_to_fp6_safetensors,
@@ -308,6 +309,7 @@ __all__ = [
     "dequantize_fp6_checkpoint_to_bf16",
     "load_fp6_moe_weights_from_safetensors",
     "load_fp6_moe_checkpoint",
+    "UnsafeAuxiliaryFileError",
     "load_fp6_dense_weight_from_safetensors",
     "load_fp6_dense_checkpoint",
 ]
