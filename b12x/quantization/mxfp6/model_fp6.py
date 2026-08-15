@@ -60,28 +60,166 @@ _FUSED_GATE_UP = ("gate_up_proj", "w13")
 _ATTN_ORDER = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
+def _validate_shard_name(shard: object) -> str:
+    """Validate and return a single-component ``.safetensors`` shard filename.
+
+    Rejects non-strings, empty strings, POSIX/Windows path separators (``/``
+    and ``\\``), Windows drive/UNC forms, ``.``/``..``, and any name not
+    ending in ``.safetensors``.  The check is purely lexical and portable so
+    Windows spellings are rejected even when tests run on POSIX.
+    """
+    if not isinstance(shard, str):
+        raise ValueError(
+            f"invalid shard name: expected string, got {type(shard).__name__}"
+        )
+    if not shard:
+        raise ValueError("invalid shard name: empty string")
+    if "/" in shard or "\\" in shard:
+        raise ValueError(f"invalid shard name {shard!r}: contains a path separator")
+    if shard in (".", ".."):
+        raise ValueError(f"invalid shard name {shard!r}")
+    # Reject Windows drive-letter forms (e.g. ``C:foo``, ``1:foo``) even on
+    # POSIX.  ntpath treats any single-character-colon prefix as a drive, so
+    # we reject any ``X:`` where X is one character regardless of type.
+    if len(shard) >= 2 and shard[1] == ":":
+        raise ValueError(f"invalid shard name {shard!r}: Windows drive form")
+    if not shard.endswith(".safetensors"):
+        raise ValueError(f"invalid shard name {shard!r}: must end with .safetensors")
+    return shard
+
+
+def _hf_repo_root(root: pathlib.Path) -> pathlib.Path | None:
+    """Return the ``models--<repo>`` cache root if *root* is an HF snapshot dir.
+
+    A standard Hugging Face hub cache stores snapshots under
+    ``models--<org>--<model>/snapshots/<revision>/``.  Returns the
+    ``models--<repo>`` directory when *root* matches that layout, else ``None``.
+    """
+    parts = root.parts
+    if len(parts) >= 3 and parts[-2] == "snapshots" and parts[-3].startswith("models--"):
+        return root.parent.parent
+    return None
+
+
+def _resolve_shard(root: pathlib.Path, shard_name: str) -> pathlib.Path:
+    """Resolve a validated shard name to a canonical regular file under *root*.
+
+    Follows symlinks but confines the resolved target to either the model root
+    or, for recognized Hugging Face cache snapshots, the same repository's
+    ``blobs`` directory (preserving the standard
+    ``snapshots/<rev>/<basename> -> ../../blobs/<digest>`` layout).
+
+    Rejects missing paths, directories, devices, sockets, broken links, and
+    any target that escapes the model root or the narrow HF blob exception.
+
+    Concurrency/hardlink note: this check validates the path at resolution
+    time.  Concurrent mutation of model/cache ancestor directories, or a
+    hardlink whose other names lie outside the boundary, is outside this
+    containment contract.
+    """
+    candidate = root / shard_name
+    if not candidate.exists():
+        raise ValueError(f"shard {shard_name!r} not found under {root}")
+    resolved = candidate.resolve()
+    if not resolved.is_file():
+        raise ValueError(f"shard {shard_name!r} under {root} is not a regular file")
+    # Accept any resolved target that stays inside the model root.
+    if resolved.is_relative_to(root):
+        return resolved
+    # Narrow HF cache exception: a snapshot basename may be a symlink to
+    # ../../blobs/<digest> within the same repository cache.  Require the
+    # blobs directory to be a real (non-symlink) directory and compare the
+    # canonical target against the *unresolved* same-repo blobs path so a
+    # relocated or symlinked blobs directory cannot smuggle external files.
+    repo_root = _hf_repo_root(root)
+    if repo_root is not None and candidate.is_symlink():
+        blobs_dir = repo_root / "blobs"
+        if blobs_dir.is_dir() and not blobs_dir.is_symlink():
+            if resolved.is_relative_to(blobs_dir):
+                return resolved
+    raise ValueError(
+        f"shard {shard_name!r} under {root} resolves outside the model root"
+    )
+
+
 class SafetensorsModel:
-    """Lazy reader for a HF safetensors checkpoint directory."""
+    """Lazy reader for a HF safetensors checkpoint directory.
+
+    Shard names from ``model.safetensors.index.json`` (and the single-file
+    ``model.safetensors`` fallback) are lexically validated eagerly at
+    construction time — every key/value type and shard spelling is checked,
+    including entries not selected by architecture discovery.  Filesystem
+    resolution (existence, containment, symlink confinement) is lazy and
+    memoized per shard name, performed in :meth:`_handle` immediately before
+    :func:`safetensors.safe_open`.  This preserves index-only dry runs for
+    :func:`convert_moe_model_to_fp6` and :func:`convert_dense_model_to_fp6`.
+    The full-checkpoint safetensors exporters still open selected shards to
+    inspect tensor shapes before their own dry-run return.
+
+    ``self.path`` is canonical (``.resolve()``) so a symlinked model root is
+    accepted transparently.  Handles are cached by validated canonical path so
+    multiple keys sharing one physical file deduplicate to a single handle.
+
+    Concurrency/hardlink note: containment is validated at resolution time
+    only.  Concurrent mutation of model/cache ancestor directories, or a
+    hardlink whose other names lie outside the boundary, is outside this
+    containment contract.
+    """
 
     def __init__(self, model_path: str | pathlib.Path):
-        self.path = pathlib.Path(model_path)
+        self.path = pathlib.Path(model_path).resolve()
         cfg = self.path / "config.json"
         self.config: dict = json.loads(cfg.read_text()) if cfg.exists() else {}
         self.text_config: dict = self.config.get("text_config", self.config)
+        self.weight_map: dict[str, str] = {}
+        self._resolved: dict[str, str] = {}   # shard name -> canonical path
+        self._handles: dict[str, object] = {}  # canonical path -> handle
         self.weight_map = self._build_weight_map()
-        self._handles: dict[str, object] = {}
 
     def _build_weight_map(self) -> dict[str, str]:
+        """Return ``{tensor_key: shard_name}`` with eager lexical validation.
+
+        For the single-file fallback the file must be opened to enumerate
+        keys, so its resolution happens here.  For the index case no shard
+        file is touched — resolution is deferred to :meth:`_handle`.
+        """
         index = self.path / "model.safetensors.index.json"
         if index.exists():
-            return json.loads(index.read_text())["weight_map"]
+            raw = json.loads(index.read_text())
+            weight_map = raw.get("weight_map")
+            if not isinstance(weight_map, dict):
+                raise ValueError(
+                    "model.safetensors.index.json: 'weight_map' is not a JSON object"
+                )
+            return self._validate_weight_map(weight_map)
         single = self.path / "model.safetensors"
         if single.exists():
+            # The single-file case must open the file to enumerate keys, so
+            # resolve it here (containment check included).
+            canonical = _resolve_shard(self.path, "model.safetensors")
+            canonical_str = str(canonical)
+            self._resolved["model.safetensors"] = canonical_str
             from safetensors import safe_open
 
-            with safe_open(str(single), framework="pt") as f:  # type: ignore[no-untyped-call]
+            with safe_open(canonical_str, framework="pt") as f:  # type: ignore[no-untyped-call]
                 return {k: "model.safetensors" for k in f.keys()}
         raise FileNotFoundError(f"no model.safetensors(.index.json) under {self.path}")
+
+    def _validate_weight_map(self, raw: dict) -> dict[str, str]:
+        """Lexically validate every key/value and return ``{key: shard_name}``.
+
+        Fails the model as a unit rather than silently skipping an invalid
+        mapping, even for entries not selected by architecture discovery.
+        Filesystem resolution is deferred to :meth:`_handle`.
+        """
+        result: dict[str, str] = {}
+        for key, shard in raw.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"invalid weight_map key: expected string, got {type(key).__name__}"
+                )
+            result[key] = _validate_shard_name(shard)
+        return result
 
     def keys(self) -> Iterable[str]:
         return self.weight_map.keys()
@@ -92,11 +230,15 @@ class SafetensorsModel:
     def _handle(self, key: str):
         from safetensors import safe_open
 
-        shard = self.weight_map[key]
-        handle = self._handles.get(shard)
+        shard_name = self.weight_map[key]
+        canonical = self._resolved.get(shard_name)
+        if canonical is None:
+            canonical = str(_resolve_shard(self.path, shard_name))
+            self._resolved[shard_name] = canonical
+        handle = self._handles.get(canonical)
         if handle is None:
-            handle = safe_open(str(self.path / shard), framework="pt")  # type: ignore[no-untyped-call]
-            self._handles[shard] = handle
+            handle = safe_open(canonical, framework="pt")  # type: ignore[no-untyped-call]
+            self._handles[canonical] = handle
         return handle
 
     def get_tensor(self, key: str) -> torch.Tensor:

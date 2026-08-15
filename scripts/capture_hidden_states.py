@@ -26,8 +26,61 @@ import pathlib
 
 import torch
 
+# Minimum transformers version that patches CVE-2026-4372 (config-injection
+# RCE via _attn_implementation_internal that bypasses trust_remote_code).
+# All releases before 5.3.0 are affected; keep in sync with pyproject.toml.
+TRANSFORMERS_FLOOR = "5.3.0"
 
-def main() -> None:
+
+def assert_safe_transformers() -> None:
+    """Fail closed if the installed transformers is below the patched floor.
+
+    Packaging metadata (pyproject.toml) already excludes affected releases,
+    but a source checkout in an older environment can bypass that check, so
+    this runtime guard runs before any model-loading API is touched.
+
+    Raises SystemExit when transformers is missing or below 5.3.0, or when
+    the *packaging* library itself cannot be imported (we cannot safely
+    compare versions without it, so we fail closed).
+    """
+    import importlib.metadata
+
+    # Look up the installed version *before* importing packaging so that a
+    # missing-transformers error is surfaced first, without depending on
+    # packaging being importable for the lookup itself.
+    try:
+        raw_version = importlib.metadata.version("transformers")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise SystemExit(
+            f"[capture] transformers is not installed; this tool requires "
+            f"transformers>={TRANSFORMERS_FLOOR} (CVE-2026-4372)."
+        ) from exc
+
+    try:
+        from packaging.version import Version
+    except ImportError as exc:
+        raise SystemExit(
+            "[capture] the 'packaging' library is required to verify the "
+            "transformers version (CVE-2026-4372 guard); install it via "
+            "'pip install packaging>=24'."
+        ) from exc
+
+    installed = Version(raw_version)
+    if (
+        installed < Version(TRANSFORMERS_FLOOR)
+        or installed.is_prerelease
+        or installed.is_devrelease
+    ):
+        raise SystemExit(
+            f"[capture] transformers {installed} is installed but a final "
+            f"release >={TRANSFORMERS_FLOOR} is required; older, prerelease, "
+            f"and development versions are rejected by the CVE-2026-4372 "
+            f"guard (config-injection RCE that bypasses --trust-remote-code)."
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (extracted for testability)."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -51,11 +104,23 @@ def main() -> None:
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
-        help="allow the checkpoint's custom modeling code to run (required "
-        "for e.g. Qwen3.6; off by default so untrusted repos never execute "
-        "code without an explicit opt-in)",
+        help="allow the checkpoint's custom modeling code to be imported "
+        "(required for e.g. Qwen3.6; off by default, which blocks "
+        "checkpoint-supplied modeling code). This flag alone does NOT make "
+        "loading untrusted models safe; only transformers>=5.3.0 (enforced "
+        "by this tool and the project dependency floor) blocks CVE-2026-4372 "
+        "config-injection RCE that bypasses this flag entirely.",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
+
+    # Runtime guard before any model-loading API: a source checkout in an
+    # older environment can bypass the pyproject.toml dependency floor.
+    assert_safe_transformers()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

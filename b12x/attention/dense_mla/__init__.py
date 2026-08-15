@@ -1,22 +1,25 @@
-"""Dense Multi-head Latent Attention for Kimi K3 on SM12x.
+"""Paged dense Multi-head Latent Attention on SM12x.
 
-The operator consumes the absorbed K3 query and the combined compressed-cache
-record directly:
+The operator consumes absorbed queries and combined compressed-cache records
+directly. Logical Q/K width, logical value width, and physical-record width
+are planned independently. Supported logical widths are ``(576, 512)`` and
+``(1088, 1024)``.
 
-* query: ``[total_q, local_heads, 576]``;
-* cache: ``[pages, page_size, 576]`` (or a singleton-head rank-4 view);
-* key: all 576 record elements;
-* value: the first 512 record elements.
+* query: ``[total_q, local_heads, logical_qk_width]``;
+* cache: ``[pages, page_size, physical_record_width]`` (or a singleton-head
+  rank-4 view), where the logical key prefix is read directly;
+* value: the logical value prefix of each record.
 
-The attention scale is based on K3's *raw* 192-wide QK head
-(``1 / sqrt(192)``), not the 576-wide absorbed record.  BF16 and standard
-E4M3 combined records are supported; E4M3 uses one caller-provided FP32 scalar
-scale for the whole record.
+``window_size=None`` attends to the full causal context. A positive
+``window_size`` restricts query position ``p`` to the inclusive interval
+``[max(0, p - window_size + 1), p]``. The attention scale is caller-provided.
+BF16 and E4M3 records are supported. For E4M3 cache with BF16 query input,
+``q_dtype=torch.bfloat16`` plans fixed query-quantization storage in the same
+caller-owned scratch buffer.
 
 Planned lifecycle: ``plan(Caps(...))`` -> caller allocates ``scratch_specs`` ->
-``bind`` (views and validation only) -> ``compile``/``run``.  Decode and
-single-request prefill share the same graph-safe dense core.  No selected-index
-array is materialized.
+``bind`` (views and validation only) -> ``compile``/``run``. Decode and extend
+share the same graph-safe dense core. No selected-index array is materialized.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ META = OpMeta(
         "clear_caches",
     ),
     dtypes=("bf16", "fp8_e4m3"),
-    recipes=("kimi_k3_dense_mla",),
+    recipes=("strided_paged_dense_mla",),
     requires=(),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -59,9 +62,8 @@ META = OpMeta(
     test_path="tests/attention/test_dense_mla.py",
     since="0.8.0",
     notes=(
-        "K3 TP12 uses eight local heads, a 576-element absorbed Q/K record, "
-        "a 512-element latent value, and 1/sqrt(192) scaling. Pool-scaled "
-        "addressing is 64-bit and the runtime owns no allocations."
+        "Physical page and record addressing is 64-bit. Optional BF16-to-E4M3 "
+        "query conversion uses planned caller-owned storage."
     ),
 )
 

@@ -75,6 +75,12 @@ def _lse_shape(q_shape: tuple[int, ...]) -> tuple[int, ...]:
     return (batch, q_heads, seqlen_q)
 
 
+def _output_shape(
+    q_shape: tuple[int, ...], v_shape: tuple[int, ...]
+) -> tuple[int, ...]:
+    return (*q_shape[:-1], int(v_shape[-1]))
+
+
 def _seq_dims(shape: tuple[int, ...]) -> tuple[tuple[int, ...], int, int, int]:
     if len(shape) == 3:
         seqlen, num_heads, head_dim = shape
@@ -224,10 +230,10 @@ def _validate_forward_inputs(
     batch_v, _, v_heads, v_head_dim = _seq_dims(v_shape)
     if batch_q != batch_k or batch_q != batch_v:
         raise ValueError("q, k, and v must have matching batch dimensions")
-    if q_head_dim != k_head_dim or q_head_dim != v_head_dim:
-        raise ValueError(
-            "q, k, and v must have matching head dimensions in the initial path"
-        )
+    if q_head_dim != k_head_dim:
+        raise ValueError("q and k must have matching head dimensions")
+    if v_head_dim <= 0:
+        raise ValueError("v head dimension must be positive")
     if kv_heads != v_heads:
         raise ValueError("k and v must have the same number of KV heads")
     if q_heads % kv_heads != 0:
@@ -730,13 +736,13 @@ class _AttentionForwardLaunch:
         self._q_shape = q_shape
         self._k_shape = k_shape
         self._v_shape = v_shape
-        self._o_shape = q_shape
+        self._o_shape = _output_shape(q_shape, v_shape)
         self._lse_shape = _lse_shape(q_shape)
         self._attention_sink_bias_shape = (q_shape[-2],)
         self._q_stride = _contiguous_stride(q_shape)
         self._k_stride = _contiguous_stride(k_shape)
         self._v_stride = _contiguous_stride(v_shape)
-        self._o_stride = _contiguous_stride(q_shape)
+        self._o_stride = _contiguous_stride(self._o_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._attention_sink_bias_stride = _contiguous_stride(
             self._attention_sink_bias_shape
@@ -870,7 +876,7 @@ class _VarlenAttentionForwardLaunch:
         self._v_shape = v_shape
         self._cu_seqlens_q_shape = cu_seqlens_q_shape
         self._cu_seqlens_k_shape = cu_seqlens_k_shape
-        self._o_shape = q_shape
+        self._o_shape = _output_shape(q_shape, v_shape)
         self._lse_shape = _lse_shape(q_shape)
         self._attention_sink_bias_shape = (q_shape[-2],)
         self._q_stride = _contiguous_stride(q_shape)
@@ -878,7 +884,7 @@ class _VarlenAttentionForwardLaunch:
         self._v_stride = _contiguous_stride(v_shape)
         self._cu_seqlens_q_stride = _contiguous_stride(cu_seqlens_q_shape)
         self._cu_seqlens_k_stride = _contiguous_stride(cu_seqlens_k_shape)
-        self._o_stride = _contiguous_stride(q_shape)
+        self._o_stride = _contiguous_stride(self._o_shape)
         self._lse_stride = _contiguous_stride(self._lse_shape)
         self._attention_sink_bias_stride = _contiguous_stride(
             self._attention_sink_bias_shape
@@ -936,9 +942,7 @@ class _VarlenAttentionForwardLaunch:
             # existing unpacked-head kernel as the static fallback for those
             # shapes; this choice depends only on plan geometry and is graph
             # capture safe.
-            pack_gqa=(
-                qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0
-            ),
+            pack_gqa=(qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
             tile_m=tile_m,
             tile_n=tile_n,
         )
@@ -1392,9 +1396,11 @@ def _validate_attention_output_lse(
     lse: torch.Tensor,
     plan: AttentionPlan | VarlenAttentionPlan,
 ) -> None:
-    if output.shape != plan.q_shape:
+    expected_output_shape = _output_shape(plan.q_shape, plan.v_shape)
+    if output.shape != expected_output_shape:
         raise ValueError(
-            f"attention output must have shape {plan.q_shape}, got {tuple(output.shape)}"
+            "attention output must have shape "
+            f"{expected_output_shape}, got {tuple(output.shape)}"
         )
     if output.device != plan.device:
         raise ValueError(
@@ -1422,12 +1428,13 @@ def _validate_attention_output_lse(
 def _attention_scratch_layout(
     *,
     q_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> _AttentionScratchLayout:
     cursor = 0
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
     output_offset_bytes = cursor
-    cursor += _shape_numel(q_shape) * _dtype_nbytes(dtype)
+    cursor += _shape_numel(_output_shape(q_shape, v_shape)) * _dtype_nbytes(dtype)
     cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
     lse_offset_bytes = cursor
     cursor += _shape_numel(_lse_shape(q_shape)) * _dtype_nbytes(torch.float32)
@@ -1486,7 +1493,7 @@ def _attention_scratch_views_from_arena(
     output = _arena_view(
         arena,
         offset_bytes=layout.output_offset_bytes,
-        shape=plan.q_shape,
+        shape=_output_shape(plan.q_shape, plan.v_shape),
         dtype=plan.dtype,
     )
     lse = _arena_view(
@@ -1540,7 +1547,7 @@ def _varlen_attention_scratch_views_from_arena(
     output = _arena_view(
         arena,
         offset_bytes=layout.output_offset_bytes,
-        shape=plan.q_shape,
+        shape=_output_shape(plan.q_shape, plan.v_shape),
         dtype=plan.dtype,
     )
     lse = _arena_view(
@@ -1955,7 +1962,9 @@ def _build_varlen_attention_binding_from_views(
 
 
 def plan_attention_scratch(plan: AttentionPlan) -> AttentionScratchPlan:
-    layout = _attention_scratch_layout(q_shape=plan.q_shape, dtype=plan.dtype)
+    layout = _attention_scratch_layout(
+        q_shape=plan.q_shape, v_shape=plan.v_shape, dtype=plan.dtype
+    )
     return AttentionScratchPlan(
         plan=plan,
         _layout=layout,
@@ -1972,7 +1981,9 @@ def plan_attention_scratch(plan: AttentionPlan) -> AttentionScratchPlan:
 def plan_varlen_attention_scratch(
     plan: VarlenAttentionPlan,
 ) -> VarlenAttentionScratchPlan:
-    layout = _attention_scratch_layout(q_shape=plan.q_shape, dtype=plan.dtype)
+    layout = _attention_scratch_layout(
+        q_shape=plan.q_shape, v_shape=plan.v_shape, dtype=plan.dtype
+    )
     return VarlenAttentionScratchPlan(
         plan=plan,
         _layout=layout,
@@ -1988,7 +1999,11 @@ def plan_varlen_attention_scratch(
 
 def allocate_attention_workspace_for_plan(plan: AttentionPlan) -> AttentionWorkspace:
     """Allocate reusable scratch for one exact contiguous attention plan."""
-    output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
+    output = torch.empty(
+        _output_shape(plan.q_shape, plan.v_shape),
+        dtype=plan.dtype,
+        device=plan.device,
+    )
     lse = torch.empty(_lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
     return AttentionWorkspace(
         q_shape=plan.q_shape,
@@ -2012,7 +2027,11 @@ def allocate_varlen_attention_workspace_for_plan(
     plan: VarlenAttentionPlan,
 ) -> VarlenAttentionWorkspace:
     """Allocate reusable scratch for one exact packed varlen attention plan."""
-    output = torch.empty(plan.q_shape, dtype=plan.dtype, device=plan.device)
+    output = torch.empty(
+        _output_shape(plan.q_shape, plan.v_shape),
+        dtype=plan.dtype,
+        device=plan.device,
+    )
     lse = torch.empty(_lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device)
     return VarlenAttentionWorkspace(
         q_shape=plan.q_shape,

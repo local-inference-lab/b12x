@@ -79,9 +79,6 @@ if [[ "${_curl_major}" -lt 8 ]] || { [[ "${_curl_major}" -eq 8 ]] && [[ "${_curl
   echo "Error: curl >= 8.4.0 is required for reliable max-filesize enforcement, found ${_curl_version}" >&2
   exit 1
 fi
-_sglang_profile_resp="$(mktemp)"
-trap 'rm -f "${_sglang_profile_resp}"' EXIT
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url)
@@ -140,17 +137,28 @@ case "${mode}" in
     ;;
 esac
 
+_RESPONSE_FILE=""
+
+_cleanup_response_file() {
+  [[ -n "${_RESPONSE_FILE}" ]] && rm -f "${_RESPONSE_FILE}"
+  return 0
+}
+
 curl_post() {
   local url="$1"
   local body="$2"
   local http_code curl_exit actual_size
+
+  trap _cleanup_response_file EXIT
+  _RESPONSE_FILE="$(mktemp "${TMPDIR:-/tmp}/sglang_prof_resp.XXXXXXXX")"
+  chmod 600 "${_RESPONSE_FILE}"
 
   http_code=$(curl -q -sS \
       --no-location \
       --proto '=http,https' \
       --max-time "${B12X_PROFILE_MAX_TIME}" \
       --max-filesize "${B12X_PROFILE_MAX_FILESIZE}" \
-      -o "${_sglang_profile_resp}" \
+      -o "${_RESPONSE_FILE}" \
       -w '%{http_code}' \
       -X POST \
       -H 'Content-Type: application/json' \
@@ -166,14 +174,15 @@ curl_post() {
     return 1
   fi
 
-  actual_size=$(wc -c < "${_sglang_profile_resp}" | tr -d ' ')
+  actual_size=$(wc -c < "${_RESPONSE_FILE}" | tr -d ' ')
   if [[ "${actual_size}" -gt "${B12X_PROFILE_MAX_FILESIZE}" ]]; then
     echo "Error: response body (${actual_size} bytes) exceeded max filesize (${B12X_PROFILE_MAX_FILESIZE} bytes)" >&2
     return 1
   fi
 
-  cat "${_sglang_profile_resp}"
-  rm -f "${_sglang_profile_resp}"
+  cat "${_RESPONSE_FILE}"
+  rm -f "${_RESPONSE_FILE}"
+  _RESPONSE_FILE=""
 
   if [[ "${http_code}" != 2* ]]; then
     echo >&2

@@ -2581,6 +2581,10 @@ def run_fused_paged_indexer(
             topk=int(topk),
         )
 
+    if out_indices is not None and out_indices.device != dev:
+        raise ValueError("out_indices device must match the query device")
+    if out_values is not None and out_values.device != dev:
+        raise ValueError("out_values device must match the query device")
     out_i = (
         torch.empty((rows, topk), dtype=torch.int32, device=dev)
         if out_indices is None

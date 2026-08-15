@@ -26,6 +26,7 @@ def issue_dense_page_gather(
     token_end: Int32,
     io_lane: Int32,
     page_stride_bytes: Int64,
+    record_stride_bytes_global: Int64,
     page_table_stride: Int64,
     *,
     page_size: cutlass.Constexpr,
@@ -60,9 +61,10 @@ def issue_dense_page_gather(
 
         # Load-bearing Int64 conversions. Neither multiplication is allowed to
         # occur in Int32, even when benchmark page ids happen to be small.
-        source_offset = physical_page.to(Int64) * page_stride_bytes + in_page.to(
-            Int64
-        ) * Int64(record_bytes)
+        source_offset = (
+            physical_page.to(Int64) * page_stride_bytes
+            + in_page.to(Int64) * record_stride_bytes_global
+        )
         cp_async_bulk_g2s_mbar(
             kv_dst_addr + entry * Int32(record_stride_bytes),
             get_ptr_as_int64(cache_bytes, source_offset),

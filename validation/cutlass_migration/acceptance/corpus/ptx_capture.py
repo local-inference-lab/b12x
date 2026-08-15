@@ -81,6 +81,7 @@ _BOUND_MANIFEST_FIELDS = (
     "toolchain",
     "compile_options",
     "compile_environment",
+    "comparison_compile_environment",
 )
 _SIDECAR_FIELDS = {
     "schema",
@@ -118,6 +119,7 @@ _MANIFEST_FIELDS = {
     "toolchain",
     "compile_options",
     "compile_environment",
+    "comparison_compile_environment",
     "launch_metadata",
     "artifact_evidence_sha256",
     "compile_spec_hash",

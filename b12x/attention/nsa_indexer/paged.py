@@ -814,6 +814,8 @@ def index_topk_fp8(
             )
         if out_indices.dtype != torch.int32 or not out_indices.is_contiguous():
             raise ValueError("out_indices must be contiguous torch.int32")
+        if out_indices.device != q_fp8.device:
+            raise ValueError("out_indices device must match q_fp8")
     if out_scores is not None:
         if out_scores.shape != (q_rows, topk):
             raise ValueError(

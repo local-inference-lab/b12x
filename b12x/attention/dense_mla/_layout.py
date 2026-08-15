@@ -33,7 +33,9 @@ class SmemLayout:
     total_bytes: int
 
 
-def make_smem_layout(*, query_tile: int, fp8: bool) -> SmemLayout:
+def make_smem_layout(
+    *, query_tile: int, fp8: bool, qk_dim: int = K3_QK_DIM
+) -> SmemLayout:
     query_tile = int(query_tile)
     if query_tile not in (1, 2, 4):
         raise ValueError("dense MLA query_tile must be 1, 2, or 4")
@@ -45,8 +47,11 @@ def make_smem_layout(*, query_tile: int, fp8: bool) -> SmemLayout:
     # opt-in SMEM limit exposed by RTX PRO 6000 Blackwell.  BF16 retains the
     # same producer/consumer transaction protocol with one stage; the primary
     # E4M3 serving path keeps the latency-hiding double buffer.
-    kv_stages = KV_STAGES if fp8 else 1
-    record_bytes = K3_QK_DIM * element_bytes
+    qk_dim = int(qk_dim)
+    if qk_dim <= 0 or qk_dim % 32:
+        raise ValueError("dense MLA qk_dim must be a positive multiple of 32")
+    kv_stages = KV_STAGES if fp8 and qk_dim <= K3_QK_DIM else 1
+    record_bytes = qk_dim * element_bytes
     # The extra 16 bytes rotate successive rows across banks while making
     # every row a legal cp.async.bulk destination.
     record_stride_bytes = record_bytes + 16

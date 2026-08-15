@@ -1,4 +1,4 @@
-"""Public planned API for dense Kimi-K3 MLA."""
+"""Public planned API for paged dense MLA."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def run(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def reference(*args, **kwargs):
-    """Run the FP32 paged K3 dense-MLA oracle."""
+    """Run the FP32 paged dense-MLA oracle."""
     return dense_mla_reference(*args, **kwargs)
 
 
@@ -55,9 +55,10 @@ def is_supported(device=None) -> bool:
     """True only for the fail-closed SM120/SM121 production envelope."""
     if not default_is_supported(device, requires=META.requires):
         return False
-    device = torch.device(
-        device if device is not None else ("cuda", torch.cuda.current_device())
-    )
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device(device)
     return tuple(torch.cuda.get_device_capability(device)) in ((12, 0), (12, 1))
 
 

@@ -1,7 +1,8 @@
 """Contiguous (non-paged) attention for SM12x: batched and varlen forward.
 
-BF16/FP16 Q/K/V, causal + sliding-window + attention-sink; tile shapes
-auto-selected by head_dim/causality. ``run`` is the varlen (cu_seqlens)
+BF16/FP16 Q/K/V, including different Q/K and V head dimensions, causal +
+sliding-window + attention-sink; tile shapes auto-selected by Q/K head
+dimension and causality. ``run`` is the varlen (cu_seqlens)
 entry, ``run_batched`` the fixed-shape batched entry; each has its own
 plan/scratch/binding family (``create_plan*`` for the per-shape kernel plan,
 ``plan*`` for scratch sizing).

@@ -19,11 +19,14 @@ its original dtype and recorded in ``quantization_config.exclude_modules``.
 * Dense: MLP (+ optional attention) linears are quantized in place.
 """
 from __future__ import annotations
-
+import errno
 import json
+import os
 import pathlib
 import re
 import shutil
+import stat
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -31,6 +34,7 @@ import torch
 
 from .fp6_checkpoint import (
     QUANT_ALGO,
+    _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES,
     build_quantization_config,
     dequantize_linear_from_fp6,
     quantize_linear_to_fp6,
@@ -244,18 +248,185 @@ class _ShardWriter:
         return n
 
 
+class UnsafeAuxiliaryFileError(RuntimeError):
+    """Raised when an eligible auxiliary source entry is identified as unsafe.
+
+    The FP6 exporters must never follow attacker-authored symlinks or copy
+    special file types: doing so would embed arbitrary victim-readable bytes
+    into the output bundle.  Every *eligible* auxiliary candidate (any
+    top-level entry that is not ``*.safetensors``, ``config.json``, or a
+    shard index) that is a symlink or non-regular file fails closed — it is
+    never copied.  This exception is raised when the unsafe kind can be
+    identified through the no-follow open + ``fstat`` path (symlinks detected
+    via ``O_NOFOLLOW``/``ELOOP``, or special files identified by ``fstat``
+    after a successful open).  When the underlying ``os.open`` itself rejects
+    the entry (e.g. ``ENXIO`` for a device node), the original ``OSError`` is
+    allowed to propagate.  Entries that are intentionally skipped — model
+    weights, the generated ``config.json``, and shard index files — are never
+    inspected and therefore never trigger this error.  Standard Hugging Face
+    cache snapshot links are deliberately rejected; see
+    :func:`_copy_aux_files` for guidance.
+    """
+
+
 def _copy_aux_files(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """Copy tokenizer / generation / misc files so the output dir is fully loadable."""
+    """Copy tokenizer / generation / misc files so the output dir is fully loadable.
+
+    Security contract: only ordinary regular files from ``src`` are copied.
+    Every *eligible* auxiliary candidate (i.e. any top-level entry that is
+    not ``*.safetensors``, ``config.json``, or a shard index) that is a
+    symlink or non-regular file fails closed — it is never copied.  When the
+    unsafe kind can be identified through the no-follow open + ``fstat``
+    path, :class:`UnsafeAuxiliaryFileError` is raised with a descriptive
+    message; when the underlying ``os.open`` itself rejects the entry (e.g.
+    ``ENXIO`` for a device node), the original ``OSError`` propagates.  In
+    either case no bytes from the entry enter the output bundle.  Skipped
+    names (model weights, generated config, shard indices) are never
+    inspected and cannot trigger this error.
+
+    Race resistance: the source root is opened with ``O_DIRECTORY | O_NOFOLLOW``
+    (rejecting a symlinked root), and each candidate is opened with
+    ``O_NOFOLLOW | O_NONBLOCK`` relative to the source-directory descriptor,
+    then ``fstat``-ed and required to be a regular file before copying.  There
+    is no separate ``lstat`` before the open, so a swap to a symlink between
+    validation and open is rejected atomically by the kernel rather than
+    followed.
+
+    Capabilities: this function requires ``O_NOFOLLOW``, ``O_DIRECTORY``,
+    ``O_NONBLOCK``, fd-relative ``os.open`` (``dir_fd`` — verified via
+    ``os.supports_dir_fd``), and fd-based ``os.listdir`` (verified via
+    ``os.supports_fd``).  If any are unavailable the function fails closed
+    rather than silently degrading to symlink-following behavior.
+
+    Hugging Face cache snapshot inputs present files as client-generated
+    symlinks to content-addressed blobs outside the snapshot directory.  These
+    are rejected here by design.  Operators who trust the HF client's own
+    cache links should materialize the snapshot as real files through the
+    HF client's vetted download path (e.g. ``huggingface_hub`` ``local_dir``
+    mode, which writes real files, not symlinks) before export.  **Never**
+    dereference symlinks from an untrusted or attacker-authored checkout —
+    copy only real files.
+    """
+    _require_aux_capabilities()
     skip_suffixes = (".safetensors",)
     skip_names = {"model.safetensors.index.json", "config.json"}
-    for item in src.iterdir():
-        if not item.is_file():
-            continue
-        if item.name in skip_names or item.suffix in skip_suffixes:
-            continue
-        if item.name.endswith(".safetensors.index.json"):
-            continue
-        shutil.copy2(item, dst / item.name)
+    src = pathlib.Path(src)
+    dst = pathlib.Path(dst)
+    # O_NOFOLLOW on the root rejects a symlinked source directory.
+    src_fd = os.open(str(src), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for entry in os.listdir(src_fd):
+            if entry in skip_names:
+                continue
+            if entry.endswith(".safetensors.index.json"):
+                continue
+            _copy_one_aux(src_fd, str(src), entry, skip_suffixes, dst)
+    finally:
+        os.close(src_fd)
+
+
+# Module-local seam for the candidate open.  Tests monkeypatch this to
+# simulate races (swap-to-symlink, file-vanishes) without disturbing the
+# real os.open used by the capability check and the source-root open.
+_candidate_open = os.open
+
+
+_AUX_CAPABILITIES: tuple[str, ...] = (
+    "O_NOFOLLOW",
+    "O_DIRECTORY",
+    "O_NONBLOCK",
+)
+
+
+def _require_aux_capabilities() -> None:
+    """Fail closed if the OS lacks the flags *and* fd APIs needed for safe copying.
+
+    The fd-relative ``os.open(dir_fd=...)`` and fd-based ``os.listdir(fd)``
+    APIs are essential: without them the helper cannot open candidates
+    relative to a pinned source-directory descriptor, which would reopen
+    the lstat+open TOCTOU window.  We fail closed rather than silently
+    degrading to symlink-following behavior.
+    """
+    missing_flags = [name for name in _AUX_CAPABILITIES if not hasattr(os, name)]
+    if missing_flags:
+        raise UnsafeAuxiliaryFileError(
+            f"cannot safely copy auxiliary files: missing OS flags {missing_flags}"
+        )
+    if os.open not in os.supports_dir_fd:
+        raise UnsafeAuxiliaryFileError(
+            "cannot safely copy auxiliary files: "
+            "os.open does not support dir_fd on this platform"
+        )
+    if os.listdir not in os.supports_fd:
+        raise UnsafeAuxiliaryFileError(
+            "cannot safely copy auxiliary files: "
+            "os.listdir does not support fd on this platform"
+        )
+
+def _copy_one_aux(
+    src_fd: int,
+    src_dir: str,
+    name: str,
+    skip_suffixes: tuple[str, ...],
+    dst: pathlib.Path,
+) -> None:
+    """Open ``name`` no-follow relative to ``src_fd`` and copy it if regular."""
+    if "." in name and ("." + name.rsplit(".", 1)[-1]) in skip_suffixes:
+        return
+    # O_NOFOLLOW rejects symlinks atomically at the kernel level.
+    # O_NONBLOCK prevents a FIFO/special file from blocking the open.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = _candidate_open(name, flags, dir_fd=src_fd)
+    except OSError as exc:
+        # O_NOFOLLOW on a symlink raises ELOOP (Linux) / EFTYPE (macOS).
+        # These are refused rather than followed.
+        if exc.errno in (
+            errno.ELOOP,
+            getattr(errno, "EFTYPE", errno.ELOOP),
+        ):
+            raise UnsafeAuxiliaryFileError(
+                f"refusing to follow auxiliary symlink {src_dir!r}/{name!r}; "
+                "only real regular files are copied"
+            ) from exc
+        # ENOENT (broken link / vanished entry) is a changing-source condition,
+        # not a symlink — propagate the original error.
+        raise
+    try:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            # Preserve old behavior: silently skip real subdirectories.
+            return
+        if not stat.S_ISREG(mode):
+            kind = _unsafe_kind(mode)
+            raise UnsafeAuxiliaryFileError(
+                f"refusing to copy {kind} {src_dir!r}/{name!r}; "
+                "only real regular files are copied"
+            )
+        # fdopen takes ownership of fd on success.
+        srcf = os.fdopen(fd, "rb")
+        fd = -1
+        with srcf, open(dst / name, "wb") as dstf:
+            shutil.copyfileobj(srcf, dstf)
+    finally:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _unsafe_kind(mode: int) -> str:
+    """Return a human-readable name for a non-regular, non-directory mode."""
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular file"
 
 
 def _write_config(
@@ -712,6 +883,9 @@ def dequantize_fp6_checkpoint_to_bf16(
     *,
     device: str = "cuda",
     max_shard_bytes: int = 4 * 1024**3,
+    max_dequant_working_bytes: Optional[int] = (
+        _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES
+    ),
     verbose: bool = True,
 ) -> ExportReport:
     """Decode an FP6 checkpoint back to a plain BF16 HF checkpoint.
@@ -722,6 +896,9 @@ def dequantize_fp6_checkpoint_to_bf16(
     The output runs on stock vLLM with no b12x involvement, so a KLD
     against the original BF16 model isolates *weight* quantization error from
     the runtime W6A6 *activation* quantization error.
+
+    ``max_dequant_working_bytes`` bounds each vectorized tensor decode; ``None``
+    explicitly disables the cap for a trusted offline conversion.
     """
     model = SafetensorsModel(model_path)
     qcfg = model.config.get("quantization_config") or {}
@@ -764,7 +941,11 @@ def dequantize_fp6_checkpoint_to_bf16(
             ws2_key = name + ".weight_scale_2"
             ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
             w = dequantize_linear_from_fp6(
-                packed, scale, fmt=fmt, weight_scale_2=ws2
+                packed,
+                scale,
+                fmt=fmt,
+                weight_scale_2=ws2,
+                max_working_bytes=max_dequant_working_bytes,
             )
             writer.add(key, w.to(torch.bfloat16))
             report.quantized_tensors += 1

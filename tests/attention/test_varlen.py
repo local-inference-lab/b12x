@@ -449,3 +449,75 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
 
     assert (out - ref).abs().max().item() <= 0.035
     assert _cosine_similarity(out, ref) >= 0.9998
+
+
+@torch.inference_mode()
+def test_unequal_value_prefill_qk256_v128_causal_window_ragged() -> None:
+    from b12x.attention import varlen
+
+    device = _require_contiguous_backend()
+    torch.manual_seed(20260813)
+    lengths = [65, 514]
+    total = sum(lengths)
+    heads = 8
+    q = (torch.randn(total, heads, 256, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    k = (torch.randn(total, heads, 256, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    v = (torch.randn(total, heads, 128, dtype=torch.float32, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    cu = torch.tensor([0, 65, total], dtype=torch.int32, device=device)
+    kernel_plan = varlen.create_plan(
+        q,
+        k,
+        v,
+        cu,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        window_size=(512, 0),
+    )
+    scratch_plan = varlen.plan(kernel_plan)
+    (spec,) = scratch_plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        softmax_scale=1.0 / 16.0,
+        causal=True,
+        window_size=(512, 0),
+    )
+    actual, actual_lse = varlen.run(binding=binding)
+
+    expected = torch.empty_like(actual)
+    begin = 0
+    for length in lengths:
+        q_seq = q[begin : begin + length].float().transpose(0, 1)
+        k_seq = k[begin : begin + length].float().transpose(0, 1)
+        v_seq = v[begin : begin + length].float().transpose(0, 1)
+        scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) / 16.0
+        positions = torch.arange(length, device=device)
+        mask = (positions[None, :] <= positions[:, None]) & (
+            positions[None, :] >= positions[:, None] - 512
+        )
+        scores.masked_fill_(~mask, float("-inf"))
+        expected[begin : begin + length] = (
+            torch.matmul(torch.softmax(scores, dim=-1), v_seq)
+            .transpose(0, 1)
+            .to(torch.bfloat16)
+        )
+        begin += length
+
+    torch.cuda.synchronize()
+    assert actual.shape == (total, heads, 128)
+    assert bool(torch.isfinite(actual).all().item())
+    assert bool(torch.isfinite(actual_lse).all().item())
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)

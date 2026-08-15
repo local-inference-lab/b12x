@@ -39,8 +39,6 @@ from b12x._lib.intrinsics import (
 from ._layout import (
     CANDIDATES_PER_CHUNK,
     HEADS_PER_TILE,
-    K3_QK_DIM,
-    K3_VALUE_DIM,
     MATH_WARPS_PER_QUERY,
 )
 
@@ -157,6 +155,7 @@ def qk_fp8(
     lane: Int32,
     *,
     record_stride_bytes: cutlass.Constexpr,
+    qk_dim: cutlass.Constexpr,
 ):
     """Raw E4M3 K-by-Q MMA for one 16-candidate warp tile."""
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
@@ -165,7 +164,7 @@ def qk_fp8(
     b_col = ((lane >> Int32(3)) & Int32(1)) * Int32(16)
     first_candidate = local_warp * Int32(16)
 
-    for ks in cutlass.range_constexpr(K3_QK_DIM // 32):
+    for ks in cutlass.range_constexpr(qk_dim // 32):
         ko = Int32(ks * 32)
         a_addr = (
             kv_smem_addr
@@ -200,6 +199,7 @@ def qk_bf16(
     lane: Int32,
     *,
     record_stride_bytes: cutlass.Constexpr,
+    qk_dim: cutlass.Constexpr,
 ):
     """Raw BF16 K-by-Q MMA for one 16-candidate warp tile."""
     gid = lane >> Int32(2)
@@ -208,7 +208,7 @@ def qk_bf16(
     a_col = (lane >> Int32(4)) * Int32(8)
     first_candidate = local_warp * Int32(16)
 
-    for ks in cutlass.range_constexpr(K3_QK_DIM // 16):
+    for ks in cutlass.range_constexpr(qk_dim // 16):
         ko = Int32(ks * 16)
         a_addr = (
             kv_smem_addr
@@ -238,6 +238,7 @@ def qk_bf16(
 def mask_and_scale(
     qk,
     chunk_begin: Int32,
+    visible_begin: Int32,
     visible_end: Int32,
     scale_log2: Float32,
     local_warp: Int32,
@@ -247,10 +248,10 @@ def mask_and_scale(
     gid = lane >> Int32(2)
     candidate0 = chunk_begin + local_warp * Int32(16) + gid
     candidate1 = candidate0 + Int32(8)
-    if candidate0 >= visible_end:
+    if candidate0 < visible_begin or candidate0 >= visible_end:
         qk[0] = Float32(_MASK)
         qk[1] = Float32(_MASK)
-    if candidate1 >= visible_end:
+    if candidate1 < visible_begin or candidate1 >= visible_end:
         qk[2] = Float32(_MASK)
         qk[3] = Float32(_MASK)
     for idx in cutlass.range_constexpr(4):
@@ -272,6 +273,7 @@ def online_softmax(
     local_tid: Int32,
     *,
     barrier_id: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
 ):
     """Update a base-2 online softmax and rescale persistent PV registers."""
     gid = lane >> Int32(2)
@@ -366,7 +368,7 @@ def online_softmax(
     row_alpha = row_alpha0
     if (gid & Int32(1)) != Int32(0):
         row_alpha = row_alpha1
-    for tile in cutlass.range_constexpr(16):
+    for tile in cutlass.range_constexpr(value_dim // 32):
         acc[tile][0] = acc[tile][0] * row_alpha
         acc[tile][1] = acc[tile][1] * row_alpha
 
@@ -472,6 +474,7 @@ def pv_fp8(
     *,
     record_stride_bytes: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
 ):
     """HIGH/LOW E4M3 probability MMA against the raw K3 value prefix."""
     gid = lane >> Int32(2)
@@ -563,7 +566,7 @@ def pv_fp8(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(16)
     row_scale = ld_shared_f32(weight_scale_addr + gid * Int32(4))
-    for value_chunk in cutlass.range_constexpr(K3_VALUE_DIM // 64):
+    for value_chunk in cutlass.range_constexpr(value_dim // 64):
         for n_tile in cutlass.range_constexpr(2):
             dimension = Int32(value_chunk * 64) + (
                 Int32(n_tile * MATH_WARPS_PER_QUERY) + local_warp
@@ -612,6 +615,7 @@ def pv_bf16(
     *,
     record_stride_bytes: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
 ):
     """BF16 probability/value MMA for the K3 value prefix."""
     gid = lane >> Int32(2)
@@ -644,7 +648,7 @@ def pv_bf16(
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
-    for value_chunk in cutlass.range_constexpr(K3_VALUE_DIM // 64):
+    for value_chunk in cutlass.range_constexpr(value_dim // 64):
         for n_tile in cutlass.range_constexpr(2):
             column = (
                 Int32(value_chunk * 64)
@@ -721,6 +725,7 @@ def write_partial_or_final(
     has_splits: cutlass.Constexpr,
     fp8: cutlass.Constexpr,
     ln2: cutlass.Constexpr,
+    value_dim: cutlass.Constexpr,
 ):
     """Write a normalized split partial, or the final one-split result."""
     gid = lane >> Int32(2)
@@ -744,7 +749,7 @@ def write_partial_or_final(
         scale = scale * value_scale
 
     if query_valid != Int32(0) and head_base + gid < Int32(num_heads):
-        for value_chunk in cutlass.range_constexpr(K3_VALUE_DIM // 64):
+        for value_chunk in cutlass.range_constexpr(value_dim // 64):
             for n_tile in cutlass.range_constexpr(2):
                 tile = value_chunk * 2 + n_tile
                 dimension = (

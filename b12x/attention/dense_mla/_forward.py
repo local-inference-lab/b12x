@@ -60,6 +60,9 @@ class DenseMlaForwardKernel:
         chunks_per_split: int,
         query_tile: int,
         fp8: bool,
+        qk_dim: int,
+        value_dim: int,
+        window_size: int | None,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -69,6 +72,9 @@ class DenseMlaForwardKernel:
         self.chunks_per_split = int(chunks_per_split)
         self.query_tile = int(query_tile)
         self.fp8 = bool(fp8)
+        self.qk_dim = int(qk_dim)
+        self.value_dim = int(value_dim)
+        self.window_size = None if window_size is None else int(window_size)
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -92,6 +98,7 @@ class DenseMlaForwardKernel:
         q_stride_row_bytes: Int64,
         q_stride_head_bytes: Int64,
         page_stride_bytes: Int64,
+        cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
@@ -115,6 +122,7 @@ class DenseMlaForwardKernel:
             q_stride_row_bytes,
             q_stride_head_bytes,
             page_stride_bytes,
+            cache_record_stride_bytes,
             page_table_stride,
             total_q,
             batch,
@@ -138,6 +146,7 @@ class DenseMlaForwardKernel:
         mbar_base,
         active_chunks: Int32,
         split_first_chunk: Int32,
+        visible_begin: Int32,
         visible_end: Int32,
         query_row: Int32,
         head_base: Int32,
@@ -156,10 +165,10 @@ class DenseMlaForwardKernel:
         *,
         barrier_id: cutlass.Constexpr,
     ):
-        accumulator_fragment = cute.make_rmem_tensor(32, Float32)
+        accumulator_fragment = cute.make_rmem_tensor(self.value_dim // 16, Float32)
         global_max_fragment = cute.make_rmem_tensor(2, Float32)
         global_sum_fragment = cute.make_rmem_tensor(2, Float32)
-        for idx in cutlass.range_constexpr(32):
+        for idx in cutlass.range_constexpr(self.value_dim // 16):
             accumulator_fragment[idx] = Float32(0.0)
         global_max_fragment[0] = Float32(-1.0e30)
         global_max_fragment[1] = Float32(-1.0e30)
@@ -192,7 +201,7 @@ class DenseMlaForwardKernel:
                         accumulator_fragment[tile * 2],
                         accumulator_fragment[tile * 2 + 1],
                     ]
-                    for tile in range(16)
+                    for tile in range(self.value_dim // 32)
                 ]
                 global_max = [
                     global_max_fragment[0],
@@ -216,6 +225,7 @@ class DenseMlaForwardKernel:
                         local_warp,
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
+                        qk_dim=self.qk_dim,
                     )
                 else:
                     qk = qk_bf16(
@@ -225,10 +235,12 @@ class DenseMlaForwardKernel:
                         local_warp,
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
+                        qk_dim=self.qk_dim,
                     )
                 qk = mask_and_scale(
                     qk,
                     chunk_begin,
+                    visible_begin,
                     visible_end,
                     score_scale_log2,
                     local_warp,
@@ -252,6 +264,7 @@ class DenseMlaForwardKernel:
                     lane,
                     local_tid,
                     barrier_id=barrier_id,
+                    value_dim=self.value_dim,
                 )
                 weights = [
                     probability[0] * warp_scale0,
@@ -271,6 +284,7 @@ class DenseMlaForwardKernel:
                         local_tid,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
+                        value_dim=self.value_dim,
                     )
                 else:
                     accumulator = pv_bf16(
@@ -282,8 +296,9 @@ class DenseMlaForwardKernel:
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
+                        value_dim=self.value_dim,
                     )
-                for tile in cutlass.range_constexpr(16):
+                for tile in cutlass.range_constexpr(self.value_dim // 32):
                     accumulator_fragment[tile * 2] = accumulator[tile][0]
                     accumulator_fragment[tile * 2 + 1] = accumulator[tile][1]
                 global_max_fragment[0] = global_max[0]
@@ -309,7 +324,7 @@ class DenseMlaForwardKernel:
                 accumulator_fragment[tile * 2],
                 accumulator_fragment[tile * 2 + 1],
             ]
-            for tile in range(16)
+            for tile in range(self.value_dim // 32)
         ]
         global_max = [
             global_max_fragment[0],
@@ -338,6 +353,7 @@ class DenseMlaForwardKernel:
                     has_splits=True,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
+                    value_dim=self.value_dim,
                 )
             else:
                 write_partial_or_final(
@@ -357,6 +373,7 @@ class DenseMlaForwardKernel:
                     has_splits=False,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
+                    value_dim=self.value_dim,
                 )
         else:
             write_partial_or_final(
@@ -376,6 +393,7 @@ class DenseMlaForwardKernel:
                 has_splits=False,
                 fp8=self.fp8,
                 ln2=0.6931471805599453,
+                value_dim=self.value_dim,
             )
 
     @cute.kernel
@@ -396,6 +414,7 @@ class DenseMlaForwardKernel:
         q_stride_row_bytes: Int64,
         q_stride_head_bytes: Int64,
         page_stride_bytes: Int64,
+        cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
@@ -427,10 +446,25 @@ class DenseMlaForwardKernel:
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
 
-        valid_chunks = (cache_length + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
+        first_valid_chunk = Int32(0)
+        visible_chunks_end = cache_length
+        if cutlass.const_expr(self.window_size is not None):
+            tile_local_query = query_start - query_begin
+            visible_chunks_end = (
+                cache_length - query_length + tile_local_query + Int32(1)
+            )
+            if visible_chunks_end < Int32(0):
+                visible_chunks_end = Int32(0)
+            if visible_chunks_end > cache_length:
+                visible_chunks_end = cache_length
+            visible_chunks_begin = visible_chunks_end - Int32(self.window_size)
+            if visible_chunks_begin < Int32(0):
+                visible_chunks_begin = Int32(0)
+            first_valid_chunk = visible_chunks_begin // Int32(CANDIDATES_PER_CHUNK)
+        valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
-        split_first_chunk = split * Int32(self.chunks_per_split)
+        split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
         split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
         if split_last_chunk > valid_chunks:
             split_last_chunk = valid_chunks
@@ -444,9 +478,8 @@ class DenseMlaForwardKernel:
                 query_slot = entry // Int32(HEADS_PER_TILE)
                 local_head = entry - query_slot * Int32(HEADS_PER_TILE)
                 query_row = query_start + query_slot
-                if (
-                    query_row < total_q
-                    and head_base + local_head < Int32(self.num_heads)
+                if query_row < total_q and head_base + local_head < Int32(
+                    self.num_heads
                 ):
                     if cutlass.const_expr(self.num_splits > 1):
                         if active_splits > Int32(1):
@@ -513,6 +546,7 @@ class DenseMlaForwardKernel:
                     cache_length,
                     io_lane,
                     page_stride_bytes,
+                    cache_record_stride_bytes,
                     page_table_stride,
                     page_size=self.page_size,
                     record_bytes=self.layout.record_bytes,
@@ -555,6 +589,11 @@ class DenseMlaForwardKernel:
                 visible_end = Int32(0)
             if visible_end > cache_length:
                 visible_end = cache_length
+            visible_begin = Int32(0)
+            if cutlass.const_expr(self.window_size is not None):
+                visible_begin = visible_end - Int32(self.window_size)
+                if visible_begin < Int32(0):
+                    visible_begin = Int32(0)
 
             score_scale = sm_scale_log2
             value_scale = Float32(1.0)
@@ -589,6 +628,7 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
+                    visible_begin,
                     visible_end,
                     query_row,
                     head_base,
@@ -617,6 +657,7 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
+                    visible_begin,
                     visible_end,
                     query_row,
                     head_base,
@@ -645,6 +686,7 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
+                    visible_begin,
                     visible_end,
                     query_row,
                     head_base,
@@ -673,6 +715,7 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
+                    visible_begin,
                     visible_end,
                     query_row,
                     head_base,

@@ -47,6 +47,50 @@ _MODULES = [vllm, sglang]
 _MODULE_IDS = ["vllm", "sglang"]
 
 
+def _adapt_stream_path_fixture(mod):
+    """Map the original path-based test fixture onto the pinned-fd API."""
+    stream_type = mod.StreamRequest
+
+    class _PathFixtureStream(stream_type):
+        def __init__(self, *, log_path=None, error_path=None, **kwargs):
+            self._fixture_dir_fd = None
+            if log_path is None and error_path is None:
+                super().__init__(**kwargs)
+                return
+            if log_path is None or error_path is None:
+                raise ValueError("log_path and error_path must be provided together")
+            log_path = Path(log_path)
+            error_path = Path(error_path)
+            if log_path.parent != error_path.parent:
+                raise ValueError("stream fixture outputs must share a directory")
+            fd = mod._open_dir_fd(log_path.parent)
+            try:
+                super().__init__(
+                    log_basename=log_path.name,
+                    error_basename=error_path.name,
+                    dir_fd=fd,
+                    **kwargs,
+                )
+            except Exception:
+                os.close(fd)
+                raise
+            self._fixture_dir_fd = fd
+
+        def start(self):
+            try:
+                super().start()
+            finally:
+                if self._fixture_dir_fd is not None:
+                    os.close(self._fixture_dir_fd)
+                    self._fixture_dir_fd = None
+
+    mod.StreamRequest = _PathFixtureStream
+
+
+for _module in _MODULES:
+    _adapt_stream_path_fixture(_module)
+
+
 # ---------------------------------------------------------------------------
 # Fake server helpers
 # ---------------------------------------------------------------------------
@@ -643,8 +687,8 @@ def test_stream_one_byte_over_line_rejected(fake_server, mod, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mod", _MODULES, ids=_MODULE_IDS)
-def test_stream_stale_file_cleanup(fake_server, mod, tmp_path):
-    """A pre-existing stale stream.log must be removed on overflow, not extended."""
+def test_stream_preexisting_file_rejected(fake_server, mod, tmp_path):
+    """A pre-existing stream log is rejected without modifying its contents."""
     srv = fake_server(mode="endless_stream")
     headers = {"Content-Type": "application/json"}
     payload = {"model": "test", "prompt": "hi", "max_tokens": 1, "stream": True}
@@ -661,8 +705,8 @@ def test_stream_stale_file_cleanup(fake_server, mod, tmp_path):
     stream.start()
     assert stream.finished_event.wait(timeout=30)
     assert stream.error is not None
-    assert "max_stream_bytes" in stream.error
-    assert not log_path.exists(), "stale log should be deleted on overflow"
+    assert "refusing to overwrite" in stream.error
+    assert log_path.read_bytes() == stale_content
 
 
 # ---------------------------------------------------------------------------
