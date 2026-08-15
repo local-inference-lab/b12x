@@ -37,6 +37,7 @@ from b12x._lib.fp6 import (
     mx_gs_numerator,
 )
 from b12x._lib.utils import mxfp6_packed_k_bytes
+from b12x._lib.intrinsics import align_up
 from b12x._lib.dense_gemm import dense_gemm, _DENSE_FUSED_QUANT
 
 _TILE = 128  # MX-FP6 GPU quantizer tile (M and K must be multiples of this)
@@ -316,6 +317,141 @@ def _quantize_matrix_fp6_bytes_small_m(
         return codes, out.scale_storage, alpha, inv_gs[:m].view(m, 1)
     return codes, out.scale_storage, alpha
 
+# Standalone FP6 dense-weight safetensors schema id (see save_fp6_dense_weight).
+# Existing artifacts carry this tag; the loader rejects anything else.
+_FP6_DENSE_FORMAT_TAG = "b12x_fp6_dense_weight_v1"
+_FP6_WEIGHT_FMTS = ("e3m2", "e2m3")
+_FP6_ACT_FMTS = ("e3m2", "e2m3", "e4m3")
+_FP6_DENSE_TENSOR_KEYS = frozenset({"packed", "scale_storage", "global_scale"})
+_FP6_DENSE_META_KEYS = frozenset(
+    {"out_features", "in_features", "fmt", "act_fmt", "out_features_unsharded"}
+)
+_FP6_DENSE_REQUIRED_META_KEYS = frozenset({"out_features", "in_features", "fmt"})
+
+
+def _validate_fp6_dense_artifact(weight: "FP6DenseWeight") -> None:
+    """Validate the standalone FP6 dense-weight artifact schema and geometry.
+
+    Enforces the exact ``b12x_fp6_dense_weight_v1`` contract that the saver
+    emits and the producer (``quantize_dense_weight_to_fp6``) guarantees:
+
+    * ``out_features`` is a positive integer (the MX-FP6 GEMM imposes no N
+      alignment constraint; the scale producer pads N to 128 internally);
+    * ``in_features`` is a positive integer and a multiple of
+      ``SF_VEC_SIZE_FP6`` (32) — the minimum the FP6 packing and scale layout
+      require (``%32`` implies the ``%4`` that ``mxfp6_packed_k_bytes`` needs);
+    * ``packed`` is a contiguous rank-2 ``uint8`` tensor of shape exactly
+      ``(out_features, 3*in_features//4)`` — i.e. its leading dimension *is*
+      ``out_features`` (this is the security-critical check that defeats both
+      PoCs in issue #152);
+    * ``scale_storage`` is a contiguous ``uint8`` buffer of the exact padded
+      swizzled-block size ``align_up(out_features, 128) *
+      align_up(in_features//32, 4)`` (128-row scale padding is what lets a
+      too-small ``out_features`` hide inside an oversized scale buffer);
+    * ``global_scale`` is a ``float32`` tensor with shape exactly ``(1,)``;
+    * ``fmt`` / ``act_fmt`` are on the FP6 sub-format allowlist;
+    * ``out_features_unsharded`` is a non-negative int (a routing hint only;
+      it never scales into an offset, so it cannot by itself corrupt memory);
+    * ``packed``, ``scale_storage``, and ``global_scale`` share one device.
+
+    Raises ``ValueError`` on any violation. Called from
+    :meth:`FP6DenseWeight.__post_init__`, so it gates every construction path:
+    the standalone loader builds the dataclass on CPU *before* any CUDA
+    transfer, and ``.to(device)`` reconstructs a fresh instance *after*
+    transfer; trusted in-memory producers always emit schema-valid objects.
+
+    Note: the dataclass is mutable; the vLLM plugin releases ``packed`` to
+    ``torch.empty(0)`` after materializing ``gemm_weight()`` (plugin.py:258).
+    That post-construction mutation is outside the validator's scope; callers
+    must not invoke ``to()`` or ``save`` on a released instance.
+    """
+    of = weight.out_features
+    inf = weight.in_features
+    if not isinstance(of, int) or isinstance(of, bool):
+        raise ValueError(f"FP6DenseWeight: out_features must be int, got {type(of).__name__}")
+    if not isinstance(inf, int) or isinstance(inf, bool):
+        raise ValueError(f"FP6DenseWeight: in_features must be int, got {type(inf).__name__}")
+    if of <= 0:
+        raise ValueError(f"FP6DenseWeight: out_features must be positive, got {of}")
+    if inf <= 0 or inf % SF_VEC_SIZE_FP6 != 0:
+        raise ValueError(
+            f"FP6DenseWeight: in_features must be a positive multiple of "
+            f"{SF_VEC_SIZE_FP6}, got {inf}"
+        )
+    ofu = weight.out_features_unsharded
+    if not isinstance(ofu, int) or isinstance(ofu, bool):
+        raise ValueError(
+            f"FP6DenseWeight: out_features_unsharded must be int, got {type(ofu).__name__}"
+        )
+    if ofu < 0:
+        raise ValueError(f"FP6DenseWeight: out_features_unsharded must be >= 0, got {ofu}")
+
+    if weight.fmt not in _FP6_WEIGHT_FMTS:
+        raise ValueError(
+            f"FP6DenseWeight: fmt must be one of {_FP6_WEIGHT_FMTS}, got {weight.fmt!r}"
+        )
+    if weight.act_fmt not in _FP6_ACT_FMTS:
+        raise ValueError(
+            f"FP6DenseWeight: act_fmt must be one of {_FP6_ACT_FMTS}, got {weight.act_fmt!r}"
+        )
+
+    packed = weight.packed
+    if not isinstance(packed, torch.Tensor):
+        raise ValueError(
+            f"FP6DenseWeight: packed must be a torch.Tensor, got {type(packed).__name__}"
+        )
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"FP6DenseWeight: packed must be uint8, got {packed.dtype}")
+    if packed.ndim != 2:
+        raise ValueError(
+            f"FP6DenseWeight: packed must be rank-2 (out_features, 3*in_features//4), "
+            f"got {tuple(packed.shape)}"
+        )
+    if not packed.is_contiguous():
+        raise ValueError("FP6DenseWeight: packed must be contiguous")
+    exp_packed_k = mxfp6_packed_k_bytes(inf)
+    if tuple(packed.shape) != (of, exp_packed_k):
+        raise ValueError(
+            f"FP6DenseWeight: packed shape must be ({of}, {exp_packed_k}), "
+            f"got {tuple(packed.shape)}"
+        )
+
+    scale = weight.scale_storage
+    if not isinstance(scale, torch.Tensor):
+        raise ValueError(
+            f"FP6DenseWeight: scale_storage must be a torch.Tensor, got {type(scale).__name__}"
+        )
+    if scale.dtype != torch.uint8:
+        raise ValueError(f"FP6DenseWeight: scale_storage must be uint8, got {scale.dtype}")
+    if not scale.is_contiguous():
+        raise ValueError("FP6DenseWeight: scale_storage must be contiguous")
+    exp_scale_numel = align_up(of, _TILE) * align_up(inf // SF_VEC_SIZE_FP6, 4)
+    if scale.numel() != exp_scale_numel:
+        raise ValueError(
+            f"FP6DenseWeight: scale_storage must hold {exp_scale_numel} padded uint8 elements "
+            f"(align_up(out_features,128) * align_up(in_features//32,4)), "
+            f"got {scale.numel()}"
+        )
+
+    gs = weight.global_scale
+    if not isinstance(gs, torch.Tensor):
+        raise ValueError(
+            f"FP6DenseWeight: global_scale must be a torch.Tensor, got {type(gs).__name__}"
+        )
+    if gs.dtype != torch.float32:
+        raise ValueError(f"FP6DenseWeight: global_scale must be float32, got {gs.dtype}")
+    if tuple(gs.shape) != (1,):
+        raise ValueError(
+            f"FP6DenseWeight: global_scale must have shape (1,), got {tuple(gs.shape)}"
+        )
+
+    if packed.device != scale.device or packed.device != gs.device:
+        raise ValueError(
+            f"FP6DenseWeight: packed/scale_storage/global_scale must share one device, "
+            f"got packed={packed.device}, scale_storage={scale.device}, "
+            f"global_scale={gs.device}"
+        )
+
 
 @dataclass
 class FP6DenseWeight:
@@ -346,8 +482,12 @@ class FP6DenseWeight:
         # Not a dataclass field so it is excluded from ``fields()``/save and is
         # rebuilt lazily after ``to()`` (which constructs a fresh instance).
         self._packed_expanded: Optional[torch.Tensor] = None
-        if not self.act_fmt:
+        if isinstance(self.act_fmt, str) and not self.act_fmt:
             self.act_fmt = self.fmt
+        # Enforce the standalone artifact schema/geometry on every construction
+        # path: the loader builds on CPU before any CUDA transfer, ``.to()``
+        # reconstructs after transfer, and trusted producers emit valid objects.
+        _validate_fp6_dense_artifact(self)
 
     @property
     def ab_dtype(self) -> str:
@@ -481,6 +621,18 @@ def dense_fp6_linear_expanded(
     if k != in_features:
         raise ValueError(
             f"in_features mismatch: x K={k}, weight in_features={in_features}"
+        )
+    # Defense in depth: the raw weight's leading dimension (the GEMM's RHS-derived
+    # N) must equal the metadata out_features the caller used to size the output.
+    # The dataclass loader already enforces this for FP6DenseWeight, but this
+    # tensor-level wrapper (and the opaque custom op on top of it) accept loose
+    # tensors, so reject a mismatch before any quantization, allocation, or
+    # kernel resolution. ``shape[0]`` is the row count for both the 2-D packed
+    # ``(N, 3K/4)`` and 3-D expanded ``(N, K, 1)`` layouts.
+    if weight.shape[0] != out_features:
+        raise ValueError(
+            f"out_features mismatch: weight has {weight.shape[0]} rows but "
+            f"out_features={out_features}"
         )
     w_k = weight.shape[1]
     if w_k == in_features:
@@ -705,7 +857,7 @@ def save_fp6_dense_weight(weight: FP6DenseWeight, path: str) -> None:
 
     tensors: dict[str, torch.Tensor] = {}
     # historical schema id; do not rename (existing artifacts carry it)
-    metadata = {"__format__": "b12x_fp6_dense_weight_v1"}
+    metadata = {"__format__": _FP6_DENSE_FORMAT_TAG}
     # fields()+getattr instead of asdict(): asdict deep-copies every field,
     # cloning the (potentially on-GPU) packed tensors before the .cpu() move.
     for f in fields(weight):
@@ -720,18 +872,48 @@ def save_fp6_dense_weight(weight: FP6DenseWeight, path: str) -> None:
 def load_fp6_dense_weight(
     path: str, *, device: torch.device | str = "cuda"
 ) -> FP6DenseWeight:
-    """Load a weight saved by :func:`save_fp6_dense_weight` onto ``device``."""
+    """Load a weight saved by :func:`save_fp6_dense_weight` onto ``device``.
+
+    Untrusted artifacts are validated against the standalone
+    ``b12x_fp6_dense_weight_v1`` schema before any CUDA transfer: metadata and
+    tensor key sets are checked before tensor materialization, and
+    :meth:`FP6DenseWeight.__post_init__` enforces the full geometry (dimensions,
+    packed/scale shapes, scalar global scale, formats) on the CPU-built
+    dataclass, ahead of the ``.to(device)`` move.
+    """
     import json
 
     from safetensors.torch import safe_open
 
-    fields: dict[str, object] = {}
+    kwargs: dict[str, object] = {}
     with safe_open(path, framework="pt", device="cpu") as f:
         metadata = f.metadata() or {}
-        for key in f.keys():
-            fields[key] = f.get_tensor(key)
-    for key, value in metadata.items():
-        if key == "__format__":
-            continue
-        fields[key] = json.loads(value)
-    return FP6DenseWeight(**fields).to(device)
+        fmt_tag = metadata.get("__format__")
+        if fmt_tag != _FP6_DENSE_FORMAT_TAG:
+            raise ValueError(
+                f"unsupported FP6 dense artifact format: expected "
+                f"{_FP6_DENSE_FORMAT_TAG!r}, got {fmt_tag!r}"
+            )
+        meta_keys = set(metadata) - {"__format__"}
+        unexpected = meta_keys - _FP6_DENSE_META_KEYS
+        if unexpected:
+            raise ValueError(
+                f"FP6 dense artifact has unexpected metadata keys: {sorted(unexpected)}"
+            )
+        missing = _FP6_DENSE_REQUIRED_META_KEYS - meta_keys
+        if missing:
+            raise ValueError(
+                f"FP6 dense artifact missing required metadata keys: {sorted(missing)}"
+            )
+        for key in _FP6_DENSE_META_KEYS & meta_keys:
+            kwargs[key] = json.loads(metadata[key])
+
+        tensor_keys = set(f.keys())
+        if tensor_keys != _FP6_DENSE_TENSOR_KEYS:
+            raise ValueError(
+                f"FP6 dense artifact tensor keys must be exactly "
+                f"{sorted(_FP6_DENSE_TENSOR_KEYS)}, got {sorted(tensor_keys)}"
+            )
+        for key in tensor_keys:
+            kwargs[key] = f.get_tensor(key)
+    return FP6DenseWeight(**kwargs).to(device)
