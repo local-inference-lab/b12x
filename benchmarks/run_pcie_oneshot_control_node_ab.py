@@ -21,8 +21,8 @@ from contextlib import suppress
 from pathlib import Path
 
 
-RUN_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.run", "version": 3}
-SUITE_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.ab_suite", "version": 3}
+RUN_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.run", "version": 4}
+SUITE_SCHEMA = {"name": "b12x.pcie_oneshot_control_node.ab_suite", "version": 4}
 RUN_TOP_LEVEL_KEYS = {
     "schema",
     "contract",
@@ -68,13 +68,9 @@ IDENTITY_KEYS = {
     "started_at_utc",
 }
 PROVENANCE_KEYS = {
-    "module_path",
-    "module_sha256",
-    "cuda_source_path",
-    "cuda_source_sha256",
-    "extension_path",
-    "extension_sha256",
-    "extension_build_root",
+    "module_path_sha256",
+    "cuda_source_path_sha256",
+    "extension_path_sha256",
     "extension_build_manifest",
     "extension_build_manifest_sha256",
     "fresh_extension_cache",
@@ -361,29 +357,8 @@ def _validate_run(
     provenance = record["provenance"]
     if set(provenance) != PROVENANCE_KEYS:
         raise ValueError("run provenance schema mismatch")
-    expected_module = (
-        implementation_root / "b12x/comm/pcie/pcie_oneshot.py"
-    ).resolve()
-    expected_source = expected_module.with_suffix(".cu")
-    if Path(provenance["module_path"]).resolve() != expected_module:
-        raise ValueError("run imported module does not belong to implementation root")
-    if Path(provenance["cuda_source_path"]).resolve() != expected_source:
-        raise ValueError("run CUDA source does not belong to implementation root")
-    if (
-        not Path(provenance["extension_path"])
-        .resolve()
-        .is_relative_to(extension_dir.resolve())
-    ):
-        raise ValueError("run extension binary is outside its fresh cache")
     if not provenance["fresh_extension_cache"] or not provenance["post_run_verified"]:
         raise ValueError("run extension provenance was not freshly post-verified")
-    for path_key, digest_key in (
-        ("module_path", "module_sha256"),
-        ("cuda_source_path", "cuda_source_sha256"),
-        ("extension_path", "extension_sha256"),
-    ):
-        if _sha256(Path(provenance[path_key])) != provenance[digest_key]:
-            raise ValueError(f"run {path_key} digest mismatch")
     manifest = provenance["extension_build_manifest"]
     if not isinstance(manifest, list) or not manifest:
         raise ValueError("run extension build manifest is empty")

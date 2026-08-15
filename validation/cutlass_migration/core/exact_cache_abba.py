@@ -38,6 +38,7 @@ from validation.cutlass_migration.core.gpu_scope import (
     require_target_gpu as require_target_gpu,
 )
 import b12x.cute.compiler as cute_compiler
+from b12x._lib.provenance import sanitize_environment_map, sanitize_value
 
 
 SINGLE_ARM_E2E_RUN_SCHEMA = "b12x.cute.migration.end_to_end_process_result.v4"
@@ -1352,21 +1353,15 @@ def time_conditions(
 def _single_arm_runtime_environment() -> tuple[str, str]:
     """Return raw and comparison hashes for the complete benchmark controls."""
 
-    set_variables = {
-        name: value
-        for name, value in sorted(os.environ.items())
-        if name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES)
-    }
-    explicit_controls = {
-        name: (
-            {"status": "set", "value": os.environ[name]}
-            if name in os.environ
-            else {"status": "missing"}
-        )
-        for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
-    }
+    set_variables = sanitize_environment_map(prefixes=_RUNTIME_ENVIRONMENT_PREFIXES)
+    explicit_controls: dict[str, object] = {}
+    for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS:
+        if name not in os.environ:
+            explicit_controls[name] = {"status": "unset"}
+        else:
+            explicit_controls[name] = sanitize_value(name, os.environ[name])
     raw_payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "b12x-runtime-environment-v2",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -1387,18 +1382,13 @@ def _single_arm_runtime_environment() -> tuple[str, str]:
         raise AssertionError("runtime environment set-variable map changed type")
     path_states: dict[str, dict[str, object]] = {}
     for name in _RUNTIME_ENVIRONMENT_OPERATIONAL_PATH_EXCEPTIONS:
-        raw_value = comparison_variables.pop(name, None)
-        if raw_value is None:
-            path_states[name] = {"status": "missing"}
+        popped = comparison_variables.pop(name, None)
+        if popped is None:
+            path_states[name] = {"status": "unset"}
         elif name == "CUTE_DSL_LIBS":
-            path_states[name] = {
-                "status": "set",
-                "library_basenames": [
-                    Path(component).name
-                    for component in str(raw_value).split(":")
-                    if component
-                ],
-            }
+            # Retain the CUTE_DSL_LIBS digest in the comparison payload.
+            comparison_variables[name] = popped
+            path_states[name] = {"status": "retained"}
         else:
             path_states[name] = {"status": "set"}
     comparison_payload["operational_path_exceptions"] = {

@@ -110,15 +110,21 @@ def normalize_comparison_compile_environment(value: object) -> list[list[str]]:
         if name != "CUTE_DSL_LIBS":
             normalized.append([name, raw_value])
             continue
-        retained = [
-            component
-            for component in raw_value.split(os.pathsep)
-            if not _is_package_owned_cute_dsl_runtime(component)
-        ]
-        if retained:
-            normalized.append([name, os.pathsep.join(retained)])
+        # CUTE_DSL_LIBS is now comparison-normalized by the compiler
+        # (package-owned runtime removed before digesting).  If the value
+        # is already a digest string (starts with "v1:"), pass it through.
+        # If it's a raw path (legacy manifests), apply the old normalization.
+        if isinstance(raw_value, str) and raw_value.startswith("v1:"):
+            normalized.append([name, raw_value])
+        else:
+            retained = [
+                component
+                for component in raw_value.split(os.pathsep)
+                if not _is_package_owned_cute_dsl_runtime(component)
+            ]
+            if retained:
+                normalized.append([name, os.pathsep.join(retained)])
     return sorted(normalized, key=lambda entry: entry[0])
-
 
 def normalize_comparison_compile_kwargs(value: object) -> object:
     """Normalize only the DSL option provenance nested in compile kwargs."""
@@ -201,7 +207,10 @@ def comparison_semantic_key_from_manifest(manifest: Mapping[str, object]) -> str
         compile_spec_json=str(manifest.get("compile_spec_json", "")),
         compile_kwargs_json=str(manifest.get("compile_kwargs_json", "")),
         compile_options=manifest.get("compile_options"),
-        compile_environment=manifest.get("compile_environment"),
+        compile_environment=manifest.get(
+            "comparison_compile_environment",
+            manifest.get("compile_environment"),
+        ),
     )
 
 

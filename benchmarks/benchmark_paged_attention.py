@@ -31,6 +31,7 @@ from b12x.attention._shared.contiguous.api import clear_attention_caches
 from b12x.attention.paged._scratch import build_paged_attention_binding
 from b12x.attention.paged.traits import select_paged_forward_traits_from_plan
 from b12x._lib import b12x_package_fingerprint
+from b12x._lib.provenance import sanitize_environment_map, sanitize_value
 
 
 _REFERENCE_MINIMUM_COSINE = 0.999
@@ -475,22 +476,22 @@ def _decode_graph_timing_metadata(
 
 
 def _runtime_environment_provenance() -> dict[str, object]:
-    """Return the complete benchmark-control environment without broad NVIDIA_ scans."""
-    set_variables = {
-        name: value
-        for name, value in sorted(os.environ.items())
-        if name.startswith(_RUNTIME_ENVIRONMENT_PREFIXES)
-    }
-    explicit_controls = {
-        name: (
-            {"status": "set", "value": os.environ[name]}
-            if name in os.environ
-            else {"status": "missing"}
-        )
-        for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS
-    }
+    """Return the complete benchmark-control environment without broad NVIDIA_ scans.
+
+    ``set_variables`` and ``explicit_controls`` values are sanitized via the
+    shared provenance helper: secret-like names are redacted, unknown prefixed
+    variables are digested, and only known-safe architecture/tuning values
+    that pass per-name validators are recorded verbatim.
+    """
+    set_variables = sanitize_environment_map(prefixes=_RUNTIME_ENVIRONMENT_PREFIXES)
+    explicit_controls: dict[str, object] = {}
+    for name in _RUNTIME_ENVIRONMENT_EXPLICIT_CONTROLS:
+        if name not in os.environ:
+            explicit_controls[name] = {"status": "unset"}
+        else:
+            explicit_controls[name] = sanitize_value(name, os.environ[name])
     payload: dict[str, object] = {
-        "schema": "b12x-runtime-environment-v1",
+        "schema": "b12x-runtime-environment-v2",
         "complete_set_variable_prefixes": list(_RUNTIME_ENVIRONMENT_PREFIXES),
         "set_variables": set_variables,
         "explicit_controls": explicit_controls,
@@ -799,7 +800,9 @@ def _initialize_raw_sample_log(
                 for package in ("cuda-python", "cuda-bindings")
             },
             "gpu": {
-                "cuda_visible_devices": visible_devices,
+                "cuda_visible_devices": sanitize_value(
+                    "CUDA_VISIBLE_DEVICES", visible_devices
+                ) if visible_devices else {"status": "unset"},
                 "logical_index": logical_device,
                 "physical_index": physical_device,
                 "name": torch.cuda.get_device_name(logical_device),
@@ -3471,7 +3474,9 @@ def _run_decode_graph_buckets(args: argparse.Namespace) -> None:
                                         float(err.item()),
                                     )
                                     for err, idx in zip(
-                                        nearest_flat.values, nearest_flat.indices
+                                        nearest_flat.values,
+                                        nearest_flat.indices,
+                                        strict=True,
                                     )
                                 ]
                             )
