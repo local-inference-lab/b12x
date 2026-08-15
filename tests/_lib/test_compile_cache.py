@@ -1180,21 +1180,9 @@ def test_trellis_extension_uses_build_only_and_fd_import(tmp_path, monkeypatch):
         so_path.write_bytes(b"\x7fELFfake_so")
         os.chmod(so_path, 0o755)  # Simulate normal linker output
 
-    class FakeBaton:
-        def try_acquire(self):
-            return True
-        def release(self):
-            pass
-        def wait(self):
-            pass
-
     monkeypatch.setattr(
         "torch.utils.cpp_extension._write_ninja_file_and_build_library",
         fake_build,
-    )
-    monkeypatch.setattr(
-        "torch.utils.cpp_extension.FileBaton",
-        lambda path: FakeBaton(),
     )
     monkeypatch.setattr(
         "torch.utils.cpp_extension._is_cuda_file",
@@ -1213,19 +1201,144 @@ def test_trellis_extension_uses_build_only_and_fd_import(tmp_path, monkeypatch):
     monkeypatch.setattr(small_m, "_load_python_extension_from_fd", fake_load_extension)
 
     try:
-        result = small_m._extension()
-        assert result is fake_module
+        assert small_m._extension() is fake_module
+        # Clearing the process-local memo simulates a fresh process. The
+        # content-addressed artifact is loaded without invoking Ninja again.
+        small_m._extension.cache_clear()
+        assert small_m._extension() is fake_module
         assert build_called["n"] == 1
-        assert extension_load["n"] == 1
-        assert extension_load["names"] == [small_m._extension_name()]
-        assert len(extension_load["fds"]) == 1
+        assert extension_load["n"] == 2
+        assert extension_load["names"] == [small_m._extension_name()] * 2
+        assert len(extension_load["fds"]) == 2
         # The .so was fchmod'd to 0600 after build
-        bd = small_m._trellis_build_dir()
-        import glob
-        gen_dirs = glob.glob(str(Path(bd) / ".gen_*"))
-        assert len(gen_dirs) == 1
-        so_files = list(Path(gen_dirs[0]).glob("*.so"))
+        bd = Path(small_m._trellis_build_dir()) / small_m._extension_name()
+        so_files = list(bd.glob("*.so"))
         assert len(so_files) == 1
         assert (os.stat(so_files[0]).st_mode & 0o777) == 0o600
+        assert (bd / ".b12x-build.lock").is_file()
+        assert (bd / ".b12x-build-complete").read_text() == f"{so_files[0].name}\n"
+    finally:
+        small_m._extension.cache_clear()
+
+
+def test_trellis_extension_concurrent_starters_share_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("B12X_TRELLIS_BUILD_DIR", str(tmp_path / "trellis"))
+    small_m = importlib.import_module("b12x.gemm.trellis_linear._small_m")
+    small_m._extension.cache_clear()
+
+    build_started = threading.Event()
+    release_build = threading.Event()
+    build_count = 0
+
+    def fake_build(**kwargs):
+        nonlocal build_count
+        build_count += 1
+        build_started.set()
+        assert release_build.wait(timeout=5)
+        build_dir = Path(kwargs["build_directory"])
+        (build_dir / f"{kwargs['name']}.so").write_bytes(b"\x7fELFfake_so")
+
+    monkeypatch.setattr(
+        "torch.utils.cpp_extension._write_ninja_file_and_build_library",
+        fake_build,
+    )
+    monkeypatch.setattr("torch.utils.cpp_extension._is_cuda_file", lambda _s: True)
+    fake_module = SimpleNamespace(launch_k6_mcg=object())
+    monkeypatch.setattr(
+        small_m,
+        "_load_python_extension_from_fd",
+        lambda _name, _fd: fake_module,
+    )
+
+    results = []
+    errors = []
+
+    def load_extension():
+        try:
+            results.append(small_m._extension())
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=load_extension) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        assert build_started.wait(timeout=5)
+        release_build.set()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not [thread for thread in threads if thread.is_alive()]
+        assert errors == []
+        assert results == [fake_module, fake_module]
+        assert build_count == 1
+    finally:
+        release_build.set()
+        small_m._extension.cache_clear()
+
+
+def test_trellis_extension_rebuilds_interrupted_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("B12X_TRELLIS_BUILD_DIR", str(tmp_path / "trellis"))
+    small_m = importlib.import_module("b12x.gemm.trellis_linear._small_m")
+    small_m._extension.cache_clear()
+
+    build_count = 0
+
+    def fake_build(**kwargs):
+        nonlocal build_count
+        build_count += 1
+        so_path = Path(kwargs["build_directory"]) / f"{kwargs['name']}.so"
+        so_path.write_bytes(b"\x7fELFpartial")
+        if build_count == 1:
+            raise RuntimeError("interrupted build")
+        so_path.write_bytes(b"\x7fELFcomplete")
+
+    monkeypatch.setattr(
+        "torch.utils.cpp_extension._write_ninja_file_and_build_library",
+        fake_build,
+    )
+    monkeypatch.setattr("torch.utils.cpp_extension._is_cuda_file", lambda _s: True)
+    fake_module = SimpleNamespace(launch_k6_mcg=object())
+    monkeypatch.setattr(
+        small_m,
+        "_load_python_extension_from_fd",
+        lambda _name, _fd: fake_module,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="interrupted build"):
+            small_m._extension()
+        build_dir = Path(small_m._trellis_build_dir()) / small_m._extension_name()
+        assert not (build_dir / ".b12x-build-complete").exists()
+
+        small_m._extension.cache_clear()
+        assert small_m._extension() is fake_module
+        assert build_count == 2
+        assert (build_dir / ".b12x-build-complete").is_file()
+    finally:
+        small_m._extension.cache_clear()
+
+
+def test_trellis_extension_rejects_invalid_cached_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv("B12X_TRELLIS_BUILD_DIR", str(tmp_path / "trellis"))
+    small_m = importlib.import_module("b12x.gemm.trellis_linear._small_m")
+    small_m._extension.cache_clear()
+
+    ext_name = small_m._extension_name()
+    build_dir = Path(
+        small_m._validate_secure_build_dir(
+            Path(small_m._trellis_build_dir()) / ext_name
+        )
+    )
+    outside = tmp_path / "untrusted.so"
+    outside.write_bytes(b"\x7fELFevil")
+    (build_dir / f"{ext_name}.so").symlink_to(outside)
+
+    monkeypatch.setattr(
+        "torch.utils.cpp_extension._write_ninja_file_and_build_library",
+        lambda **_kwargs: pytest.fail("invalid artifacts must not be rebuilt"),
+    )
+    try:
+        with pytest.raises(OSError):
+            small_m._extension()
     finally:
         small_m._extension.cache_clear()

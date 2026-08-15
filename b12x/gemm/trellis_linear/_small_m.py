@@ -6,9 +6,9 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import os
-import secrets
 import stat
-from contextlib import suppress
+import sys
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,6 +18,15 @@ import torch
 _SOURCE_DIR = Path(__file__).resolve().parent / "csrc"
 _SOURCE = _SOURCE_DIR / "trellis_k6_small.cu"
 _VENDORED_FILES = tuple(sorted((_SOURCE_DIR / "vendor").rglob("*.[ch]*")))
+_CFLAGS = ("-O3",)
+_CUDA_CFLAGS = (
+    "-O3",
+    "--use_fast_math",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-gencode=arch=compute_120,code=sm_120",
+)
+_BUILD_COMPLETE_MARKER = ".b12x-build-complete"
 
 
 _GLM_K6_DECODE_SMS = {
@@ -45,6 +54,18 @@ def _available_sms(device_index: int) -> int:
 
 def _extension_name() -> str:
     digest = hashlib.sha256()
+    build_contract = (
+        sys.implementation.cache_tag,
+        torch.__version__,
+        torch.version.cuda,
+        bool(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", False)),
+        os.environ.get("CC"),
+        os.environ.get("CXX"),
+        os.environ.get("CUDA_HOME"),
+        _CFLAGS,
+        _CUDA_CFLAGS,
+    )
+    digest.update(repr(build_contract).encode())
     for path in (_SOURCE, *_VENDORED_FILES):
         if path.is_file():
             digest.update(path.relative_to(_SOURCE_DIR).as_posix().encode())
@@ -191,19 +212,148 @@ def _find_and_validate_so(dir_fd: int, ext_name: str) -> tuple[int, str]:
     Accepts ``<ext_name>.so`` or ``<ext_name>_v<N>.so`` (versioned).
     Fails closed if no or multiple .so files found.
     """
-    matches = [
-        e for e in os.listdir(dir_fd)
-        if e.startswith(ext_name) and e.endswith(".so")
-    ]
+    matches = _extension_so_candidates(dir_fd, ext_name)
     if len(matches) != 1:
         raise RuntimeError(
             f"expected exactly 1 .so for {ext_name}, found {matches}"
         )
 
-
     so_name = matches[0]
     fd = _open_and_validate_so(dir_fd, so_name)
     return fd, so_name
+
+
+def _extension_so_candidates(dir_fd: int, ext_name: str) -> list[str]:
+    """List exact or Torch-versioned extension artifacts."""
+    exact_name = f"{ext_name}.so"
+    version_prefix = f"{ext_name}_v"
+    candidates = []
+    for entry in os.listdir(dir_fd):
+        if entry == exact_name:
+            candidates.append(entry)
+            continue
+        if not entry.startswith(version_prefix) or not entry.endswith(".so"):
+            continue
+        version = entry[len(version_prefix) : -len(".so")]
+        if version.isdigit():
+            candidates.append(entry)
+    return sorted(candidates)
+
+
+def _validate_private_regular(fd: int, label: str) -> None:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"trellis build file {label!r} is not regular")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(
+            f"trellis build file {label!r} owned by uid {st.st_uid}"
+        )
+    if st.st_mode & 0o077:
+        raise RuntimeError(
+            f"trellis build file {label!r} has group/other permission bits"
+        )
+    if st.st_nlink != 1:
+        raise RuntimeError(
+            f"trellis build file {label!r} has {st.st_nlink} hard links"
+        )
+
+
+@contextmanager
+def _locked_build_dir(path: Path):
+    """Hold a process-death-safe lock on a validated build directory."""
+    import fcntl
+
+    dir_fd = _validate_secure_build_dir_fd(path)
+    lock_fd = None
+    try:
+        lock_fd = os.open(
+            ".b12x-build.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        _validate_private_regular(lock_fd, ".b12x-build.lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield dir_fd
+    finally:
+        if lock_fd is not None:
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        os.close(dir_fd)
+
+
+def _completed_extension_name(dir_fd: int, ext_name: str) -> str | None:
+    """Return the atomically published artifact name, or ``None``."""
+    try:
+        fd = os.open(
+            _BUILD_COMPLETE_MARKER,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        _validate_private_regular(fd, _BUILD_COMPLETE_MARKER)
+        payload = os.read(fd, 4096)
+        if os.read(fd, 1):
+            raise RuntimeError("trellis build completion marker is too large")
+    finally:
+        os.close(fd)
+    try:
+        so_name = payload.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("invalid trellis build completion marker") from exc
+    candidates = _extension_so_candidates(dir_fd, ext_name)
+    if candidates != [so_name]:
+        raise RuntimeError(
+            "trellis build completion marker does not match its artifact: "
+            f"marker={so_name!r}, artifacts={candidates}"
+        )
+    return so_name
+
+
+def _discard_incomplete_artifacts(dir_fd: int, ext_name: str) -> None:
+    """Remove only validated artifacts from an unpublished build attempt."""
+    for so_name in _extension_so_candidates(dir_fd, ext_name):
+        fd = _open_and_validate_so(dir_fd, so_name)
+        os.close(fd)
+        os.unlink(so_name, dir_fd=dir_fd)
+
+
+def _publish_completed_extension(dir_fd: int, so_name: str) -> None:
+    """Atomically mark one successfully imported artifact complete."""
+    tmp_name = f"{_BUILD_COMPLETE_MARKER}.tmp"
+    with suppress(FileNotFoundError):
+        os.unlink(tmp_name, dir_fd=dir_fd)
+    fd = os.open(
+        tmp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        payload = f"{so_name}\n".encode("ascii")
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, payload[written:])
+            if count == 0:
+                raise OSError("write returned zero bytes")
+            written += count
+        os.fsync(fd)
+        os.replace(
+            tmp_name,
+            _BUILD_COMPLETE_MARKER,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+        )
+        os.fsync(dir_fd)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        raise
+    finally:
+        os.close(fd)
 
 
 def _load_python_extension_from_fd(name: str, fd: int):
@@ -227,79 +377,53 @@ def _extension():
     produce a self-consistent malicious .so; defend with a trusted
     producer/signature or process isolation.
     """
-    from torch.utils.cpp_extension import (
-        _write_ninja_file_and_build_library,
-        FileBaton,
-    )
+    from torch.utils.cpp_extension import _write_ninja_file_and_build_library
     from torch.utils.cpp_extension import _is_cuda_file
 
-    build_base = _trellis_build_dir()
-    generation = f".gen_{secrets.token_hex(8)}"
-    build_directory = _validate_secure_build_dir(
-        Path(os.path.join(build_base, generation))
-    )
     ext_name = _extension_name()
-    verbose = os.environ.get("B12X_JIT_VERBOSE", "0") == "1"
-    cuda_cflags = [
-        "-O3",
-        "--use_fast_math",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-gencode=arch=compute_120,code=sm_120",
-    ]
-    cflags = ["-O3"]
-    # Build-only: call _write_ninja_file_and_build_library directly
-    # to avoid _jit_compile's _import_module_from_library which executes
-    # the .so before we can validate it.
-    with_cuda = any(_is_cuda_file(s) for s in [str(_SOURCE)])
-    baton = FileBaton(os.path.join(build_directory, "lock"))
-    if baton.try_acquire():
-        try:
+    build_directory = _validate_secure_build_dir(
+        Path(_trellis_build_dir()) / ext_name
+    )
+    with _locked_build_dir(Path(build_directory)) as build_fd:
+        completed_name = _completed_extension_name(build_fd, ext_name)
+        if completed_name is None:
+            _discard_incomplete_artifacts(build_fd, ext_name)
+            # Build-only: avoid _jit_compile's eager import so the produced
+            # library can be descriptor-validated before execution.
             old_umask = os.umask(0o077)
             try:
                 _write_ninja_file_and_build_library(
                     name=ext_name,
                     sources=[str(_SOURCE)],
-                    extra_cflags=cflags,
-                    extra_cuda_cflags=cuda_cflags,
+                    extra_cflags=list(_CFLAGS),
+                    extra_cuda_cflags=list(_CUDA_CFLAGS),
                     extra_sycl_cflags=[],
                     extra_ldflags=[],
                     extra_include_paths=[str(_SOURCE_DIR)],
                     build_directory=build_directory,
-                    verbose=verbose,
-                    with_cuda=with_cuda,
+                    verbose=os.environ.get("B12X_JIT_VERBOSE", "0") == "1",
+                    with_cuda=_is_cuda_file(str(_SOURCE)),
                     with_sycl=False,
                 )
             finally:
                 os.umask(old_umask)
-        finally:
-            baton.release()
-    else:
-        baton.wait()
 
-    # Retain the generation dirfd and open the produced .so
-    # descriptor-relative with no-follow/nlink checks.
-    gen_fd = _validate_secure_build_dir_fd(Path(build_directory))
-    try:
-        so_fd, so_name = _find_and_validate_so(gen_fd, ext_name)
+            so_fd, so_name = _find_and_validate_so(build_fd, ext_name)
+            try:
+                os.fchmod(so_fd, 0o600)
+                _validate_private_regular(so_fd, so_name)
+                module = _load_python_extension_from_fd(ext_name, so_fd)
+            finally:
+                os.close(so_fd)
+            _publish_completed_extension(build_fd, so_name)
+            return module
+
+        so_fd = _open_and_validate_so(build_fd, completed_name)
         try:
-            # Normalize mode to 0600 before any import.
-            os.fchmod(so_fd, 0o600)
-            # Verify mode after fchmod.
-            st = os.fstat(so_fd)
-            if st.st_mode & 0o077:
-                raise RuntimeError(
-                    f"trellis .so {so_name} mode not 0600 after fchmod"
-                )
-            # Execute PyInit_<ext_name> through CPython's extension loader
-            # while the validated inode fd remains open. This source exports
-            # PYBIND11_MODULE, not TORCH_LIBRARY operators.
-            module = _load_python_extension_from_fd(ext_name, so_fd)
+            _validate_private_regular(so_fd, completed_name)
+            return _load_python_extension_from_fd(ext_name, so_fd)
         finally:
             os.close(so_fd)
-    finally:
-        os.close(gen_fd)
-    return module
 
 
 def _validate_secure_build_dir_fd(path: Path) -> int:
