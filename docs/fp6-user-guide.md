@@ -46,6 +46,19 @@ Preview what a run will do without writing anything:
 python scripts/quantize_model_fp6.py --model <dir> --out /tmp/x --arch auto --dry-run
 ```
 
+**Checkpoint path containment.** The converter validates every shard name
+in `model.safetensors.index.json` at load time: only single-component
+`.safetensors` filenames are accepted (no absolute paths, directory
+components, `..` traversal, or Windows drive/UNC forms). Resolved shard
+targets must stay inside the model root. The standard Hugging Face hub
+cache layout — `models--<repo>/snapshots/<rev>/<basename>` symlinking to
+`../../blobs/<digest>` within the same repository — is explicitly trusted
+and accepted. Arbitrary external symlinks, `local_dir` escape links,
+cross-repository blob links, symlinked `blobs` directories, broken links,
+and non-regular files are rejected. Concurrent mutation of model/cache
+ancestor directories and hardlinks whose other names lie outside the
+boundary are outside this containment contract.
+
 ### 1.2 Quant-time knobs
 
 | Flag | Default | What it controls |
