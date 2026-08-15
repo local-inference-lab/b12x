@@ -342,12 +342,73 @@ class FP6DenseWeight:
     out_features_unsharded: int = 0
 
     def __post_init__(self) -> None:
+        self.out_features = int(self.out_features)
+        self.in_features = int(self.in_features)
+        self.out_features_unsharded = int(self.out_features_unsharded)
+        if self.out_features <= 0 or self.in_features <= 0:
+            raise ValueError("FP6 dense dimensions must be positive")
+        if self.in_features % _TILE != 0:
+            raise ValueError(
+                f"FP6 dense in_features must be divisible by {_TILE}, "
+                f"got {self.in_features}"
+            )
+        if self.fmt not in ("e2m3", "e3m2"):
+            raise ValueError(f"unsupported FP6 weight format {self.fmt!r}")
+        if not self.act_fmt:
+            self.act_fmt = self.fmt
+        if self.act_fmt not in ("e2m3", "e3m2", "e4m3"):
+            raise ValueError(f"unsupported FP6 activation format {self.act_fmt!r}")
+
+        packed_shape = (
+            self.out_features,
+            mxfp6_packed_k_bytes(self.in_features),
+        )
+        scale_numel = (
+            ((self.out_features + 127) // 128) * 128
+            * ((self.in_features // SF_VEC_SIZE_FP6 + 3) // 4)
+            * 4
+        )
+        if (
+            not isinstance(self.packed, torch.Tensor)
+            or self.packed.dtype != torch.uint8
+            or tuple(self.packed.shape) != packed_shape
+            or not self.packed.is_contiguous()
+        ):
+            raise ValueError(
+                "FP6 dense packed weight must be contiguous uint8 with shape "
+                f"{packed_shape}"
+            )
+        if (
+            not isinstance(self.scale_storage, torch.Tensor)
+            or self.scale_storage.dtype != torch.uint8
+            or self.scale_storage.ndim != 1
+            or self.scale_storage.numel() != scale_numel
+            or not self.scale_storage.is_contiguous()
+        ):
+            raise ValueError(
+                "FP6 dense scale storage must be contiguous 1-D uint8 with "
+                f"{scale_numel} elements"
+            )
+        if (
+            not isinstance(self.global_scale, torch.Tensor)
+            or self.global_scale.dtype != torch.float32
+            or self.global_scale.shape != (1,)
+            or not self.global_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "FP6 dense global scale must be contiguous float32 with shape (1,)"
+            )
+        if not (
+            self.packed.device
+            == self.scale_storage.device
+            == self.global_scale.device
+        ):
+            raise ValueError("FP6 dense weight tensors must be on one device")
+
         # Cached 1-byte-per-code expansion of ``packed`` (the dense_gemm RHS).
         # Not a dataclass field so it is excluded from ``fields()``/save and is
         # rebuilt lazily after ``to()`` (which constructs a fresh instance).
         self._packed_expanded: Optional[torch.Tensor] = None
-        if not self.act_fmt:
-            self.act_fmt = self.fmt
 
     @property
     def ab_dtype(self) -> str:

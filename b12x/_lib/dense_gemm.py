@@ -89,6 +89,7 @@ from b12x._lib.intrinsics import (
     scatter_add_bf16,
     scatter_add_bf16x2,
     shared_ptr_to_u32,
+    st_global_u32,
     st_global_u64,
     st_shared_u16,
     st_shared_u8,
@@ -3264,7 +3265,7 @@ class DenseGemmKernel:
                     _fq_sg = 0
                     _fq_si = 0
 
-                for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
+                for k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
@@ -4529,7 +4530,9 @@ class DenseGemmKernel:
             tile_k = mxfp6_tile_k() if is_mxfp6_ab_dtype(ab_dtype) else 128
         else:
             tile_k = sf_vec_size * 8
-        return k % tile_k == 0
+        if k % tile_k != 0:
+            return False
+        return True
 
 
 class _DenseGemmLaunch:
@@ -5813,586 +5816,6 @@ def _get_compiled_dense_gemm_fused_quant_a_grouped(
     return tensor_api
 
 
-def _remaining_storage_bytes(tensor: torch.Tensor) -> int:
-    """Bytes remaining in the tensor's storage from its data_ptr."""
-    return (
-        tensor.untyped_storage().nbytes()
-        - tensor.storage_offset() * tensor.element_size()
-    )
-
-
-def _dense_gemm_kernel_span(tensor: torch.Tensor) -> int:
-    """Byte span the kernel reads/writes starting from data_ptr."""
-    return tensor.numel() * tensor.element_size()
-
-
-def _validate_dense_gemm_operand(
-    name: str,
-    tensor: object,
-    *,
-    expected_dtype: torch.dtype,
-    expected_shape: Tuple[int, ...],
-    device: torch.device,
-    accept_alias_dtypes: Tuple[torch.dtype, ...] = (),
-    canonical_strides: Optional[Tuple[int, ...]] = None,
-    require_contiguous: bool = True,
-) -> int:
-    """Validate a single operand tensor before any raw-pointer launch.
-
-    Checks isinstance, exact representation-aware dtype, rank/shape, CUDA
-    device, 16-byte alignment, backing span from data_ptr, and canonical
-    accepted stride/layout.
-
-    Returns the kernel byte span for pairwise overlap checking.
-    """
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm {name} must be a torch.Tensor, "
-            f"got {type(tensor).__name__}"
-        )
-    accepted = (expected_dtype,) + accept_alias_dtypes
-    if tensor.dtype not in accepted:
-        raise ValueError(
-            f"dense_gemm {name} must have dtype {expected_dtype}"
-            + (f" (or {accept_alias_dtypes})" if accept_alias_dtypes else "")
-            + f", got {tensor.dtype}"
-        )
-    if tuple(tensor.shape) != expected_shape:
-        raise ValueError(
-            f"dense_gemm {name} must have shape {expected_shape}, "
-            f"got {tuple(tensor.shape)}"
-        )
-    if tensor.device != device:
-        raise ValueError(
-            f"dense_gemm {name} must be on device {device}, "
-            f"got {tensor.device}"
-        )
-    if not tensor.is_cuda:
-        raise ValueError(
-            f"dense_gemm {name} must be on CUDA, got {tensor.device}"
-        )
-    ptr = tensor.data_ptr()
-    if ptr % 16 != 0:
-        raise ValueError(
-            f"dense_gemm {name} data_ptr must be 16-byte aligned, "
-            f"got alignment {ptr % 16}"
-        )
-    span = _dense_gemm_kernel_span(tensor)
-    remaining = _remaining_storage_bytes(tensor)
-    if remaining < span:
-        raise ValueError(
-            f"dense_gemm {name} has {remaining} backing bytes from data_ptr, "
-            f"but the kernel requires {span}"
-        )
-    if canonical_strides is not None:
-        if tuple(tensor.stride()) != canonical_strides:
-            raise ValueError(
-                f"dense_gemm {name} must use canonical strides "
-                f"{canonical_strides}, got {tuple(tensor.stride())}"
-            )
-    elif require_contiguous and not tensor.is_contiguous():
-        raise ValueError(
-            f"dense_gemm {name} must be contiguous for L=1, "
-            f"got strides {tuple(tensor.stride())}"
-        )
-    return span
-
-
-def _expected_scale_mma_shape(
-    rows: int, k: int, l: int, sf_vec_size: int
-) -> Tuple[int, ...]:
-    """Compute the expected (32, 4, m_tiles, 4, k_tiles, L) scale_mma shape."""
-    m_tiles = (rows + 127) // 128
-    sf_k = k // sf_vec_size
-    k_tiles = (sf_k + 3) // 4
-    return (32, 4, m_tiles, 4, k_tiles, l)
-
-
-def _expected_scale_mma_strides(
-    rows: int, k: int, l: int, sf_vec_size: int
-) -> Tuple[int, ...]:
-    """Canonical permuted physical strides of the scale_mma tensor.
-
-    pack_mxfp8_scales_for_dense_gemm builds contiguous (L, m_tiles, k_tiles,
-    32, 4, 4) then permutes (3,4,1,5,2,0) to yield (32, 4, m_tiles, 4,
-    k_tiles, L) with strides (16, 4, k_tiles*512, 1, 512, m_tiles*k_tiles*512).
-    """
-    m_tiles = (rows + 127) // 128
-    sf_k = k // sf_vec_size
-    k_tiles = (sf_k + 3) // 4
-    return (16, 4, k_tiles * 512, 1, 512, m_tiles * k_tiles * 512)
-
-
-def _check_dense_gemm_overlap(
-    spans: List[Tuple[str, int, int]],
-) -> None:
-    """Reject all pairwise overlapping byte ranges."""
-    n_spans = len(spans)
-    for i in range(n_spans):
-        name_i, ptr_i, span_i = spans[i]
-        for j in range(i + 1, n_spans):
-            name_j, ptr_j, span_j = spans[j]
-            if ptr_i < ptr_j + span_j and ptr_j < ptr_i + span_i:
-                raise ValueError(
-                    f"dense_gemm {name_i} and {name_j} must not overlap: "
-                    f"[0x{ptr_i:x}, 0x{ptr_i + span_i:x}) vs "
-                    f"[0x{ptr_j:x}, 0x{ptr_j + span_j:x})"
-                )
-
-
-def _validate_dense_gemm_caller_inputs(
-    a_torch: object,
-    b_torch: object,
-    sfa_torch: object,
-    sfb_torch: object,
-    alpha: Optional[object],
-    out: Optional[object],
-    *,
-    m: int,
-    n: int,
-    k: int,
-    l: int,
-    a_wire_k: int,
-    expected_b_k: int,
-    caller_ab_torch_dtype: torch.dtype,
-    caller_ab_dtype_aliases: Tuple[torch.dtype, ...],
-    sf_torch_dtype: torch.dtype,
-    c_torch_dtype: torch.dtype,
-    alpha_torch_dtype: torch.dtype,
-    sf_vec_size: int,
-    is_mxfp6: bool,
-    block_fp8: bool,
-    rhs_values_tiled: Optional[object],
-    quantized_c: Optional[Tuple[object, object, object]],
-    row_scale: Optional[object],
-    x_bf16: Optional[object],
-    w_gscale: Optional[object],
-) -> torch.device:
-    """Phase 1: validate caller-original inputs before any side effect.
-
-    No allocation, no expansion, no get_num_sm — just pure validation of
-    the tensors exactly as the caller passed them. Returns the resolved
-    CUDA device.
-    """
-    # Determine device from A, with a type check first.
-    if not isinstance(a_torch, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm A must be a torch.Tensor, "
-            f"got {type(a_torch).__name__}"
-        )
-    device = a_torch.device
-    if device.type != "cuda":
-        raise ValueError(
-            f"dense_gemm operands must be on CUDA, got device {device}"
-        )
-
-    # --- A (LHS values, caller-original wire layout) ---
-    expected_a_k = a_wire_k
-    a_strides = (expected_a_k, 1, m * expected_a_k) if l > 1 else None
-    _validate_dense_gemm_operand(
-        "A", a_torch,
-        expected_dtype=caller_ab_torch_dtype,
-        expected_shape=(m, expected_a_k, l),
-        device=device,
-        accept_alias_dtypes=caller_ab_dtype_aliases,
-        canonical_strides=a_strides,
-    )
-
-    # --- B (RHS values, caller-original wire layout) ---
-    b_strides = (expected_b_k, 1, n * expected_b_k) if l > 1 else None
-    _validate_dense_gemm_operand(
-        "B", b_torch,
-        expected_dtype=caller_ab_torch_dtype,
-        expected_shape=(n, expected_b_k, l),
-        device=device,
-        accept_alias_dtypes=caller_ab_dtype_aliases,
-        canonical_strides=b_strides,
-    )
-
-    # --- SFA / SFB (scale factors) ---
-    if block_fp8:
-        _validate_dense_gemm_operand(
-            "SFA", sfa_torch,
-            expected_dtype=torch.float32,
-            expected_shape=(m, k // 128),
-            device=device,
-        )
-        _validate_dense_gemm_operand(
-            "SFB", sfb_torch,
-            expected_dtype=torch.float32,
-            expected_shape=(n // 128, k // 128),
-            device=device,
-        )
-    else:
-        sfa_shape = _expected_scale_mma_shape(m, k, l, sf_vec_size)
-        sfa_strides = _expected_scale_mma_strides(m, k, l, sf_vec_size)
-        _validate_dense_gemm_operand(
-            "SFA", sfa_torch,
-            expected_dtype=sf_torch_dtype,
-            expected_shape=sfa_shape,
-            device=device,
-            canonical_strides=sfa_strides,
-        )
-        sfb_shape = _expected_scale_mma_shape(n, k, l, sf_vec_size)
-        sfb_strides = _expected_scale_mma_strides(n, k, l, sf_vec_size)
-        _validate_dense_gemm_operand(
-            "SFB", sfb_torch,
-            expected_dtype=sf_torch_dtype,
-            expected_shape=sfb_shape,
-            device=device,
-            canonical_strides=sfb_strides,
-        )
-
-    # --- alpha (if caller-provided; None is resolved later) ---
-    if alpha is not None:
-        _validate_dense_gemm_operand(
-            "alpha", alpha,
-            expected_dtype=alpha_torch_dtype,
-            expected_shape=(1,),
-            device=device,
-        )
-
-    # --- out (caller-provided destination) ---
-    if out is not None:
-        out_strides = (n, 1, m * n) if l > 1 else None
-        _validate_dense_gemm_operand(
-            "out", out,
-            expected_dtype=c_torch_dtype,
-            expected_shape=(m, n, l),
-            device=device,
-            canonical_strides=out_strides,
-        )
-
-    # --- rhs_values_tiled (caller-provided tiled RHS) ---
-    if rhs_values_tiled is not None:
-        if not isinstance(rhs_values_tiled, torch.Tensor):
-            raise TypeError(
-                "dense_gemm rhs_values_tiled must be a torch.Tensor, "
-                f"got {type(rhs_values_tiled).__name__}"
-            )
-        _validate_dense_gemm_operand(
-            "rhs_values_tiled", rhs_values_tiled,
-            expected_dtype=caller_ab_torch_dtype,
-            expected_shape=tuple(rhs_values_tiled.shape),
-            device=device,
-            accept_alias_dtypes=caller_ab_dtype_aliases,
-        )
-
-    # --- quantized C destinations (caller-provided writer tensors) ---
-    if quantized_c is not None:
-        q_values, q_scale_rows, q_scale_mma = quantized_c
-        quant_c_width = n * l
-        _validate_dense_gemm_operand(
-            "quant_c_values", q_values,
-            expected_dtype=torch.float8_e4m3fn,
-            expected_shape=(m, quant_c_width),
-            device=device,
-        )
-        _validate_dense_gemm_operand(
-            "quant_c_scale_rows", q_scale_rows,
-            expected_dtype=torch.float8_e8m0fnu,
-            expected_shape=(m, quant_c_width // 32),
-            device=device,
-        )
-        expected_q_mma_shape = (32, 4, 1, 4, quant_c_width // 128, 1)
-        expected_q_mma_strides = _expected_scale_mma_strides(
-            128, quant_c_width, 1, 32
-        )
-        _validate_dense_gemm_operand(
-            "quant_c_scale_mma", q_scale_mma,
-            expected_dtype=torch.float8_e8m0fnu,
-            expected_shape=expected_q_mma_shape,
-            device=device,
-            canonical_strides=expected_q_mma_strides,
-        )
-
-    # --- row_scale (MX-FP6 epilogue, reader) ---
-    if row_scale is not None:
-        _validate_dense_gemm_operand(
-            "row_scale", row_scale,
-            expected_dtype=c_torch_dtype,
-            expected_shape=(m,),
-            device=device,
-        )
-
-    # --- x_bf16 / w_gscale (MX-FP6 fused quant, readers) ---
-    if x_bf16 is not None:
-        _validate_dense_gemm_operand(
-            "x_bf16", x_bf16,
-            expected_dtype=torch.bfloat16,
-            expected_shape=(m, k),
-            device=device,
-        )
-    if w_gscale is not None:
-        _validate_dense_gemm_operand(
-            "w_gscale", w_gscale,
-            expected_dtype=torch.float32,
-            expected_shape=(1,),
-            device=device,
-        )
-
-    return device
-
-
-def _validate_dense_gemm_launched(
-    a_torch: torch.Tensor,
-    b_launch_torch: torch.Tensor,
-    sfa_torch: torch.Tensor,
-    sfb_torch: torch.Tensor,
-    alpha: torch.Tensor,
-    c_tensor_gpu: torch.Tensor,
-    final_out: Optional[torch.Tensor],
-    *,
-    m: int,
-    n: int,
-    k: int,
-    l: int,
-    expected_a_k: int,
-    expected_b_k: int,
-    launched_ab_torch_dtype: torch.dtype,
-    launched_ab_dtype_aliases: Tuple[torch.dtype, ...],
-    sf_torch_dtype: torch.dtype,
-    c_torch_dtype: torch.dtype,
-    alpha_torch_dtype: torch.dtype,
-    sf_vec_size: int,
-    is_mxfp6: bool,
-    block_fp8: bool,
-    rhs_values_tiled: Optional[torch.Tensor],
-    quantized_c: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    row_scale: Optional[torch.Tensor],
-    x_bf16: Optional[torch.Tensor],
-    w_gscale: Optional[torch.Tensor],
-    split_k_output: bool,
-    split_k_atomic_bf16: bool,
-    split_k_slices: int,
-    device: torch.device,
-) -> None:
-    """Phase 2: validate launched pointers and pairwise non-overlap.
-
-    Runs after expansion, alpha resolution, and any internal allocation.
-    All operands have already been type-checked in phase 1; here we verify
-    the final launched tensors (which may differ from caller originals due
-    to expansion) and check all pairwise byte-range overlaps.
-    """
-    spans: List[Tuple[str, int, int]] = []
-
-    # --- A (possibly expanded) ---
-    a_strides = (expected_a_k, 1, m * expected_a_k) if l > 1 else None
-    spans.append((
-        "A",
-        a_torch.data_ptr(),
-        _validate_dense_gemm_operand(
-            "A", a_torch,
-            expected_dtype=launched_ab_torch_dtype,
-            expected_shape=(m, expected_a_k, l),
-            device=device,
-            accept_alias_dtypes=launched_ab_dtype_aliases,
-            canonical_strides=a_strides,
-        ),
-    ))
-
-    # --- B / rhs_values_tiled (possibly expanded) ---
-    if rhs_values_tiled is not None:
-        spans.append((
-            "rhs_values_tiled",
-            rhs_values_tiled.data_ptr(),
-            _validate_dense_gemm_operand(
-                "rhs_values_tiled", rhs_values_tiled,
-                expected_dtype=launched_ab_torch_dtype,
-                expected_shape=tuple(rhs_values_tiled.shape),
-                device=device,
-                accept_alias_dtypes=launched_ab_dtype_aliases,
-            ),
-        ))
-    else:
-        b_strides = (expected_b_k, 1, n * expected_b_k) if l > 1 else None
-        spans.append((
-            "B",
-            b_launch_torch.data_ptr(),
-            _validate_dense_gemm_operand(
-                "B", b_launch_torch,
-                expected_dtype=launched_ab_torch_dtype,
-                expected_shape=(n, expected_b_k, l),
-                device=device,
-                accept_alias_dtypes=launched_ab_dtype_aliases,
-                canonical_strides=b_strides,
-            ),
-        ))
-
-    # --- SFA / SFB ---
-    if block_fp8:
-        spans.append((
-            "SFA", sfa_torch.data_ptr(),
-            _validate_dense_gemm_operand(
-                "SFA", sfa_torch,
-                expected_dtype=torch.float32,
-                expected_shape=(m, k // 128),
-                device=device,
-            ),
-        ))
-        spans.append((
-            "SFB", sfb_torch.data_ptr(),
-            _validate_dense_gemm_operand(
-                "SFB", sfb_torch,
-                expected_dtype=torch.float32,
-                expected_shape=(n // 128, k // 128),
-                device=device,
-            ),
-        ))
-    else:
-        sfa_shape = _expected_scale_mma_shape(m, k, l, sf_vec_size)
-        sfa_strides = _expected_scale_mma_strides(m, k, l, sf_vec_size)
-        spans.append((
-            "SFA", sfa_torch.data_ptr(),
-            _validate_dense_gemm_operand(
-                "SFA", sfa_torch,
-                expected_dtype=sf_torch_dtype,
-                expected_shape=sfa_shape,
-                device=device,
-                canonical_strides=sfa_strides,
-            ),
-        ))
-        sfb_shape = _expected_scale_mma_shape(n, k, l, sf_vec_size)
-        sfb_strides = _expected_scale_mma_strides(n, k, l, sf_vec_size)
-        spans.append((
-            "SFB", sfb_torch.data_ptr(),
-            _validate_dense_gemm_operand(
-                "SFB", sfb_torch,
-                expected_dtype=sf_torch_dtype,
-                expected_shape=sfb_shape,
-                device=device,
-                canonical_strides=sfb_strides,
-            ),
-        ))
-
-    # --- alpha (always resolved by now) ---
-    spans.append((
-        "alpha", alpha.data_ptr(),
-        _validate_dense_gemm_operand(
-            "alpha", alpha,
-            expected_dtype=alpha_torch_dtype,
-            expected_shape=(1,),
-            device=device,
-        ),
-    ))
-
-    # --- out (caller-provided or internally allocated) ---
-    # --- c_tensor_gpu (the actual kernel C pointer — may be out, split
-    # scratch, or internally allocated output) ---
-    # For split-K non-atomic, c_tensor_gpu is FP32 partials (split_k_slices,
-    # m, n) viewed as (m, n, split_k_slices); the kernel writes FP32 there.
-    if split_k_output and not split_k_atomic_bf16:
-        # Non-atomic split-K: c_tensor_gpu is FP32 partials (M,N,S) with
-        # canonical strides (N, 1, M*N); final_out is the BF16 reducer output.
-        spans.append((
-            "split_scratch", c_tensor_gpu.data_ptr(),
-            _validate_dense_gemm_operand(
-                "split_scratch", c_tensor_gpu,
-                expected_dtype=torch.float32,
-                expected_shape=(m, n, split_k_slices),
-                device=device,
-                canonical_strides=(n, 1, m * n),
-            ),
-        ))
-        if final_out is not None:
-            out_strides = (n, 1, m * n) if l > 1 else None
-            spans.append((
-                "reducer_out", final_out.data_ptr(),
-                _validate_dense_gemm_operand(
-                    "reducer_out", final_out,
-                    expected_dtype=c_torch_dtype,
-                    expected_shape=(m, n, l),
-                    device=device,
-                    canonical_strides=out_strides,
-                ),
-            ))
-    else:
-        c_strides = (n, 1, m * n) if l > 1 else None
-        spans.append((
-            "c_tensor_gpu", c_tensor_gpu.data_ptr(),
-            _validate_dense_gemm_operand(
-                "c_tensor_gpu", c_tensor_gpu,
-                expected_dtype=c_torch_dtype,
-                expected_shape=(m, n, l),
-                device=device,
-                canonical_strides=c_strides,
-            ),
-        ))
-
-    # --- quantized C destinations ---
-    if quantized_c is not None:
-        q_values, q_scale_rows, q_scale_mma = quantized_c
-        quant_c_width = n * l
-        spans.append((
-            "quant_c_values", q_values.data_ptr(),
-            _validate_dense_gemm_operand(
-                "quant_c_values", q_values,
-                expected_dtype=torch.float8_e4m3fn,
-                expected_shape=(m, quant_c_width),
-                device=device,
-            ),
-        ))
-        spans.append((
-            "quant_c_scale_rows", q_scale_rows.data_ptr(),
-            _validate_dense_gemm_operand(
-                "quant_c_scale_rows", q_scale_rows,
-                expected_dtype=torch.float8_e8m0fnu,
-                expected_shape=(m, quant_c_width // 32),
-                device=device,
-            ),
-        ))
-        expected_q_mma_shape = (32, 4, 1, 4, quant_c_width // 128, 1)
-        expected_q_mma_strides = _expected_scale_mma_strides(
-            128, quant_c_width, 1, 32
-        )
-        spans.append((
-            "quant_c_scale_mma", q_scale_mma.data_ptr(),
-            _validate_dense_gemm_operand(
-                "quant_c_scale_mma", q_scale_mma,
-                expected_dtype=torch.float8_e8m0fnu,
-                expected_shape=expected_q_mma_shape,
-                device=device,
-                canonical_strides=expected_q_mma_strides,
-            ),
-        ))
-
-    # --- row_scale ---
-    if row_scale is not None:
-        spans.append((
-            "row_scale", row_scale.data_ptr(),
-            _validate_dense_gemm_operand(
-                "row_scale", row_scale,
-                expected_dtype=c_torch_dtype,
-                expected_shape=(m,),
-                device=device,
-            ),
-        ))
-
-    # --- x_bf16 / w_gscale ---
-    if x_bf16 is not None:
-        spans.append((
-            "x_bf16", x_bf16.data_ptr(),
-            _validate_dense_gemm_operand(
-                "x_bf16", x_bf16,
-                expected_dtype=torch.bfloat16,
-                expected_shape=(m, k),
-                device=device,
-            ),
-        ))
-    if w_gscale is not None:
-        spans.append((
-            "w_gscale", w_gscale.data_ptr(),
-            _validate_dense_gemm_operand(
-                "w_gscale", w_gscale,
-                expected_dtype=torch.float32,
-                expected_shape=(1,),
-                device=device,
-            ),
-        ))
-
-    _check_dense_gemm_overlap(spans)
-
-
 def dense_gemm_fused_quant_a_grouped(
     source: torch.Tensor,
     b: torch.Tensor,
@@ -7134,6 +6557,7 @@ def _dense_gemm_launch_functional_op(
     split_k_output = int(split_k_slices) > 1
     if split_k_output and split_k_atomic_bf16:
         c_tensor_gpu = out
+        out.zero_()
     elif split_k_output:
         split_storage = torch.empty(
             (split_k_slices, m, n),
@@ -7143,47 +6567,7 @@ def _dense_gemm_launch_functional_op(
         c_tensor_gpu = split_storage.permute(1, 2, 0)
     else:
         c_tensor_gpu = out
-    # --- Phase 2: validate all launched pointers + pairwise non-overlap ---
-    _is_mxfp6 = ab_dtype in ("float6_e3m2fn", "float6_e2m3fn")
-    if _is_mxfp6:
-        _func_launched_ab_dtype = torch.uint8
-    elif ab_dtype == "float4_e2m1fn":
-        _func_launched_ab_dtype = torch.float4_e2m1fn_x2
-    else:
-        _func_launched_ab_dtype = torch.float8_e4m3fn
-    _func_sf_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(sf_dtype))
-    _func_c_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(c_dtype))
-    _func_alpha_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(alpha_dtype))
-    _func_expected_a_k = k  # functional op receives expanded K
-    _func_expected_b_k = k  # functional op receives expanded B
-    _func_device = a_tensor_gpu.device
-    _validate_dense_gemm_launched(
-        a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu,
-        alpha_tensor_gpu, c_tensor_gpu, out,
-        m=m, n=n, k=k, l=l,
-        expected_a_k=_func_expected_a_k,
-        expected_b_k=_func_expected_b_k,
-        launched_ab_torch_dtype=_func_launched_ab_dtype,
-        launched_ab_dtype_aliases=(),
-        sf_torch_dtype=_func_sf_dtype,
-        c_torch_dtype=_func_c_dtype,
-        alpha_torch_dtype=_func_alpha_dtype,
-        sf_vec_size=sf_vec_size,
-        is_mxfp6=_is_mxfp6,
-        block_fp8=False,
-        rhs_values_tiled=None,
-        quantized_c=None,
-        row_scale=None,
-        x_bf16=None,
-        w_gscale=None,
-        split_k_output=split_k_output,
-        split_k_atomic_bf16=split_k_atomic_bf16,
-        split_k_slices=split_k_slices,
-        device=_func_device,
-    )
-    # Phase-2 overlap check passed; safe to zero atomic output now.
-    if split_k_output and split_k_atomic_bf16:
-        out.zero_()
+
     _dense_gemm_launch_flat(
         a_tensor_gpu,
         b_tensor_gpu,
@@ -7776,54 +7160,6 @@ def dense_gemm(
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
-    # --- Shallow type checks: every required operand must be a Tensor
-    # before any .ndim/.shape/.dtype access. ---
-    for _name, _t in (
-        ("A", a_torch), ("B", b_torch),
-        ("SFA", sfa_torch), ("SFB", sfb_torch),
-    ):
-        if not isinstance(_t, torch.Tensor):
-            raise TypeError(
-                f"dense_gemm {_name} must be a torch.Tensor, "
-                f"got {type(_t).__name__}"
-            )
-    if out is not None and not isinstance(out, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm out must be a torch.Tensor, got {type(out).__name__}"
-        )
-    if alpha is not None and not isinstance(alpha, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm alpha must be a torch.Tensor, "
-            f"got {type(alpha).__name__}"
-        )
-    if rhs_values_tiled is not None and not isinstance(rhs_values_tiled, torch.Tensor):
-        raise TypeError(
-            "dense_gemm rhs_values_tiled must be a torch.Tensor, "
-            f"got {type(rhs_values_tiled).__name__}"
-        )
-    if row_scale is not None and not isinstance(row_scale, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm row_scale must be a torch.Tensor, "
-            f"got {type(row_scale).__name__}"
-        )
-    if x_bf16 is not None and not isinstance(x_bf16, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm x_bf16 must be a torch.Tensor, "
-            f"got {type(x_bf16).__name__}"
-        )
-    if w_gscale is not None and not isinstance(w_gscale, torch.Tensor):
-        raise TypeError(
-            f"dense_gemm w_gscale must be a torch.Tensor, "
-            f"got {type(w_gscale).__name__}"
-        )
-    if _quantized_c is not None:
-        for _i, _t in enumerate(_quantized_c):
-            if not isinstance(_t, torch.Tensor):
-                raise TypeError(
-                    f"dense_gemm _quantized_c[{_i}] must be a torch.Tensor, "
-                    f"got {type(_t).__name__}"
-                )
-    # sm_count deferred until after phase-1 validation.
     if load_path is not None and load_path not in _DENSE_LOAD_PATHS:
         raise ValueError(
             f"dense_gemm load_path must be one of {_DENSE_LOAD_PATHS}, got {load_path!r}"
@@ -7831,20 +7167,10 @@ def dense_gemm(
     if b_packed and b_preexpanded:
         raise ValueError("b_packed and b_preexpanded are mutually exclusive")
 
-    if a_torch.ndim != 3:
-        raise ValueError(
-            "dense_gemm LHS A must have shape [M,K,L], got "
-            f"{tuple(a_torch.shape)}"
-        )
-    if b_torch.ndim != 3:
-        raise ValueError(
-            "dense_gemm RHS B must have shape [N,K,L], got "
-            f"{tuple(b_torch.shape)}"
-        )
-    m, a_wire_k, l = map(int, a_torch.shape)
-    n = int(b_torch.shape[0])
-    k = a_wire_k
-    # sm_count and tile_k resolved after phase-1 validation below.
+    m, k, l = a_torch.shape
+    n, _, _ = b_torch.shape
+    if sm_count is None:
+        sm_count = get_num_sm(a_torch.device)
     mxfp6_fmt_a: Optional[str] = None
     mxfp6_fmt_b: Optional[str] = None
     if ab_dtype == "float4_e2m1fn":
@@ -7857,7 +7183,11 @@ def dense_gemm(
         is_mxfp8 = True
         is_mxfp6 = False
         mma_k = 32
-        tile_k = 128 if block_fp8 else 0  # resolved after phase-1 validation
+        tile_k = (
+            128
+            if block_fp8
+            else _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
+        )
     elif ab_dtype in ("float6_e3m2fn", "float6_e2m3fn"):
         is_mxfp8 = False
         is_mxfp6 = True
@@ -7928,73 +7258,6 @@ def dense_gemm(
                 f"b_packed expects (N, 3K/4, L); got packed K bytes "
                 f"{b_torch.shape[1]} for logical K {k}"
             )
-    # Wire K for B as passed by the caller (before in-call expansion).
-    # After the MX-FP6 expansion at the load boundary, expanded B has wire_k=k;
-    # only b_packed keeps the 3:4 wire format. The validator runs post-expansion.
-    expected_b_k = (
-        k
-        if is_mxfp6 and (b_preexpanded or not b_packed)
-        else (3 * k) // 4
-        if is_mxfp6
-        else a_wire_k
-    )
-    # --- Phase 1: validate caller-original inputs before any side effect ---
-    # Determine the caller's actual operand dtype (before any ab_cutlass_dtype
-    # rewrite for the kernel). FP6 operands are uint8 byte-containers/packed;
-    # FP4 is float4_e2m1fn_x2; FP8/block_fp8 is float8_e4m3fn.
-    if is_mxfp6:
-        caller_ab_torch_dtype = torch.uint8
-        caller_ab_dtype_aliases: Tuple[torch.dtype, ...] = ()
-    elif ab_dtype == "float4_e2m1fn":
-        caller_ab_torch_dtype = torch.float4_e2m1fn_x2
-        caller_ab_dtype_aliases: Tuple[torch.dtype, ...] = ()
-    else:
-        caller_ab_torch_dtype = torch.float8_e4m3fn
-        caller_ab_dtype_aliases: Tuple[torch.dtype, ...] = ()
-    _caller_sf_torch_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(sf_dtype))
-    _caller_c_torch_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(c_dtype))
-    _caller_alpha_dtype_name = (
-        alpha_dtype if alpha_dtype is not None
-        else ("float32" if alpha is None else str(alpha.dtype).split(".")[-1])
-    )
-    _caller_alpha_torch_dtype = cutlass_to_torch_dtype(
-        get_cutlass_dtype(_caller_alpha_dtype_name)
-    )
-    _caller_device = _validate_dense_gemm_caller_inputs(
-        a_torch,
-        b_torch,
-        sfa_torch,
-        sfb_torch,
-        alpha,
-        out,
-        m=m,
-        n=n,
-        k=k,
-        l=l,
-        a_wire_k=a_wire_k,
-        expected_b_k=(
-            # Phase 1 sees the caller's original B (pre-expansion).
-            (3 * k) // 4 if is_mxfp6 and not b_preexpanded else expected_b_k
-        ),
-        caller_ab_torch_dtype=caller_ab_torch_dtype,
-        caller_ab_dtype_aliases=caller_ab_dtype_aliases,
-        sf_torch_dtype=_caller_sf_torch_dtype,
-        c_torch_dtype=_caller_c_torch_dtype,
-        alpha_torch_dtype=_caller_alpha_torch_dtype,
-        sf_vec_size=sf_vec_size,
-        is_mxfp6=is_mxfp6,
-        block_fp8=block_fp8,
-        rhs_values_tiled=rhs_values_tiled,
-        quantized_c=_quantized_c,
-        row_scale=row_scale,
-        x_bf16=x_bf16,
-        w_gscale=w_gscale,
-    )
-    # --- Resolve sm_count and deferred tile_k now that inputs are validated ---
-    if sm_count is None:
-        sm_count = get_num_sm(_caller_device)
-    if is_mxfp8 and not block_fp8 and tile_k == 0:
-        tile_k = _select_mxfp8_tile_k(m, n, k, expected_m, sm_count)
     if not is_mxfp6 and (
         a_preexpanded
         or b_preexpanded
@@ -8195,51 +7458,11 @@ def dense_gemm(
                 f"{cutlass_to_torch_dtype(c_cutlass_dtype)}, operand device "
                 f"{a_torch.device}"
             )
-    # --- Compute launched-pointer validation params (used in each path) ---
-    if is_mxfp6:
-        launched_ab_torch_dtype = torch.uint8
-    else:
-        launched_ab_torch_dtype = cutlass_to_torch_dtype(ab_cutlass_dtype)
-    _launched_sf_torch_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(sf_dtype))
-    _launched_c_torch_dtype = cutlass_to_torch_dtype(c_cutlass_dtype)
-    _launched_alpha_torch_dtype = cutlass_to_torch_dtype(get_cutlass_dtype(alpha_dtype))
-    _launched_expected_a_k = k if is_mxfp6 else a_wire_k
     if is_mxfp6:
         # Dedicated MX-FP6 launch path (bypasses the torch custom ops, like
         # the quantized-C path): the byte-container operands plus the
         # x_bf16/w_gscale fused-quant tensors flow straight into the compiled
         # launch, and the FP6 fmt/packed axes key the compile cache.
-        if out is None:
-            out = _empty_dense_gemm_output(
-                m,
-                n,
-                l,
-                dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
-                device=a_torch.device,
-            )
-        _validate_dense_gemm_launched(
-            a_torch, b_torch, sfa_torch, sfb_torch, alpha, out, None,
-            m=m, n=n, k=k, l=l,
-            expected_a_k=_launched_expected_a_k,
-            expected_b_k=expected_b_k,
-            launched_ab_torch_dtype=launched_ab_torch_dtype,
-            launched_ab_dtype_aliases=(),
-            sf_torch_dtype=_launched_sf_torch_dtype,
-            c_torch_dtype=_launched_c_torch_dtype,
-            alpha_torch_dtype=_launched_alpha_torch_dtype,
-            sf_vec_size=sf_vec_size,
-            is_mxfp6=is_mxfp6,
-            block_fp8=block_fp8,
-            rhs_values_tiled=rhs_values_tiled,
-            quantized_c=_quantized_c,
-            row_scale=row_scale,
-            x_bf16=x_bf16,
-            w_gscale=w_gscale,
-            split_k_output=split_k_output,
-            split_k_atomic_bf16=split_k_atomic_bf16,
-            split_k_slices=split_k_slices,
-            device=_caller_device,
-        )
         compiled_mxfp6 = _get_compiled_dense_gemm_mxfp6(
             n=n,
             k=k,
@@ -8271,6 +7494,14 @@ def dense_gemm(
             # compiled-kernel key.
             fused_quant=_DENSE_FUSED_QUANT and x_bf16 is not None,
         )
+        if out is None:
+            out = _empty_dense_gemm_output(
+                m,
+                n,
+                l,
+                dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
+                device=a_torch.device,
+            )
         return compiled_mxfp6(
             a_tensor_gpu=a_torch,
             b_tensor_gpu=b_torch,
@@ -8321,29 +7552,6 @@ def dense_gemm(
                 dtype=torch.bfloat16,
                 device=a_torch.device,
             )
-        _validate_dense_gemm_launched(
-            a_torch, b_launch_torch, sfa_torch, sfb_torch, alpha, out, None,
-            m=m, n=n, k=k, l=l,
-            expected_a_k=_launched_expected_a_k,
-            expected_b_k=expected_b_k,
-            launched_ab_torch_dtype=launched_ab_torch_dtype,
-            launched_ab_dtype_aliases=(),
-            sf_torch_dtype=_launched_sf_torch_dtype,
-            c_torch_dtype=_launched_c_torch_dtype,
-            alpha_torch_dtype=_launched_alpha_torch_dtype,
-            sf_vec_size=sf_vec_size,
-            is_mxfp6=is_mxfp6,
-            block_fp8=block_fp8,
-            rhs_values_tiled=rhs_values_tiled,
-            quantized_c=_quantized_c,
-            row_scale=row_scale,
-            x_bf16=x_bf16,
-            w_gscale=w_gscale,
-            split_k_output=split_k_output,
-            split_k_atomic_bf16=split_k_atomic_bf16,
-            split_k_slices=split_k_slices,
-            device=_caller_device,
-        )
         compiled_quant_c = _get_compiled_dense_gemm(
             n=n,
             k=k,
@@ -8443,15 +7651,14 @@ def dense_gemm(
     split_scratch = None
     if split_k_output:
         if out is None:
-            out = _empty_dense_gemm_output(
-                m,
-                n,
-                l,
+            out = torch.empty(
+                (m, n, l),
                 dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
                 device=a_torch.device,
             )
-        # Defer out.zero_() until after phase-2 overlap validation.
-        if not split_k_atomic_bf16:
+        if split_k_atomic_bf16:
+            out.zero_()
+        else:
             split_storage = torch.empty(
                 (split_k_slices, m, n),
                 dtype=torch.float32,
@@ -8459,10 +7666,8 @@ def dense_gemm(
             )
             split_scratch = split_storage.permute(1, 2, 0)
     elif out is None:
-        out = _empty_dense_gemm_output(
-            m,
-            n,
-            l,
+        out = torch.empty(
+            (m, n, l),
             dtype=cutlass_to_torch_dtype(c_cutlass_dtype),
             device=a_torch.device,
         )
@@ -8481,32 +7686,6 @@ def dense_gemm(
         out if split_k_atomic_bf16 else split_scratch if split_k_output else out
     )
     assert c_tensor_gpu is not None
-    _validate_dense_gemm_launched(
-        a_torch, b_launch_torch, sfa_torch, sfb_torch, alpha, c_tensor_gpu, out,
-        m=m, n=n, k=k, l=l,
-        expected_a_k=_launched_expected_a_k,
-        expected_b_k=expected_b_k,
-        launched_ab_torch_dtype=launched_ab_torch_dtype,
-        launched_ab_dtype_aliases=(),
-        sf_torch_dtype=_launched_sf_torch_dtype,
-        c_torch_dtype=_launched_c_torch_dtype,
-        alpha_torch_dtype=_launched_alpha_torch_dtype,
-        sf_vec_size=sf_vec_size,
-        is_mxfp6=is_mxfp6,
-        block_fp8=block_fp8,
-        rhs_values_tiled=rhs_values_tiled,
-        quantized_c=_quantized_c,
-        row_scale=row_scale,
-        x_bf16=x_bf16,
-        w_gscale=w_gscale,
-        split_k_output=split_k_output,
-        split_k_atomic_bf16=split_k_atomic_bf16,
-        split_k_slices=split_k_slices,
-        device=_caller_device,
-    )
-    # Phase-2 overlap check passed; safe to zero atomic output now.
-    if split_k_output and split_k_atomic_bf16:
-        out.zero_()
     if plain_fp8:
         compiled_plain_fp8 = _get_compiled_dense_gemm(
             n=n,
