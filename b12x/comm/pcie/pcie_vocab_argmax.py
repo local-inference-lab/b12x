@@ -53,7 +53,10 @@ def _require_uniform_geometry(
 ) -> None:
     """Reject rank-local geometry before allocating collective resources."""
     geometry = (int(local_vocab_size), int(max_batch_size))
-    peer_geometry = _broadcast_gather_object(geometry, group)
+    # vLLM supplies its metadata-only Gloo TP group here so initialization does
+    # not allocate an NCCL object-collective workspace.  Geometry validation
+    # must preserve the same NCCL-or-Gloo contract as CUDA IPC handle exchange.
+    peer_geometry = _exchange_ipc_handles(geometry, group)
     if any(candidate != geometry for candidate in peer_geometry):
         raise RuntimeError(
             f"vocabulary argmax geometry differs across ranks: {peer_geometry}"

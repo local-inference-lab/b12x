@@ -90,12 +90,25 @@ def test_vocab_argmax_rejects_mismatched_rank_geometry(monkeypatch) -> None:
     group = MagicMock()
     monkeypatch.setattr(
         vocab_argmax_module,
-        "_broadcast_gather_object",
+        "_exchange_ipc_handles",
         lambda geometry, group: [geometry] * 15 + [(2048, 4)],
     )
 
     with pytest.raises(RuntimeError, match="geometry differs across ranks"):
         _require_uniform_geometry(1024, 4, group)
+
+
+def test_vocab_argmax_validates_uniform_geometry_over_gloo(monkeypatch) -> None:
+    group = MagicMock()
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def fake_all_gather(objects, geometry, group):
+        objects[:] = [geometry, geometry]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather)
+
+    _require_uniform_geometry(1024, 4, group)
 
 
 @pytest.mark.parametrize("rank", [-1, 16])
