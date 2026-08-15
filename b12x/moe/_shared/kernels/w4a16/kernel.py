@@ -462,7 +462,17 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    ultra_wide_fc2 = (
+        int(tile_n) == 512
+        and int(tile_k) == 32
+        and int(cta_threads) == 256
+        and _scale_group_size(scale_format) == 32
+    )
+    if (
+        int(tile_n) < 64
+        or (int(tile_k) < 64 and not ultra_wide_fc2)
+        or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -2015,7 +2025,7 @@ class W4A16GemmKernel:
             reduce_slice_idx,
             lock_slot,
             active_size_m,
-            -1,
+            Int32(0),
         )
 
     @cute.jit
@@ -2518,6 +2528,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            -1,
         )
 
         b_scale_cur = cute.make_rmem_tensor((2, 4), Uint32)
@@ -2530,6 +2541,8 @@ class W4A16GemmKernel:
             s_sh_rd,
             Int32(0),
             Int32(0),
+            Int32(0),
+            0,
         )
         a0_regs_cur = cute.make_rmem_tensor((2,), Uint32)
         a0_regs_next = cute.make_rmem_tensor((2,), Uint32)
@@ -2576,6 +2589,7 @@ class W4A16GemmKernel:
             a_rows_per_iter,
             output_n_tile,
             expert_idx,
+            0,
         )
 
         self._finish_tile(
@@ -3031,6 +3045,7 @@ class W4A16GemmKernel:
         a_rows_per_iter: Int32,
         output_n_tile: Int32,
         expert_idx: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
@@ -3052,6 +3067,7 @@ class W4A16GemmKernel:
                             kk,
                             tile_idx,
                             k_tiles,
+                            dynamic_pair_override,
                         )
 
                         self._prefetch_pipeline_step(
@@ -3080,6 +3096,7 @@ class W4A16GemmKernel:
                             a_rows_per_iter,
                             output_n_tile,
                             expert_idx,
+                            dynamic_pair_override,
                         )
 
                         for jj in cutlass.range_constexpr(4):
@@ -3120,6 +3137,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(0),
                     Int32(0),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_cur,
@@ -3930,6 +3949,7 @@ class W4A16GemmKernel:
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
         k_tiles: Int32,
+        dynamic_pair_override: cutlass.Constexpr[int],
     ):
         self._clear_b_scale_register_bundle(b_scale_next)
         self._clear_a_register_bundle_m8(a0_regs_next)
@@ -3945,6 +3965,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     Int32(pipe),
                     Int32(kk + 1),
+                    tile_idx,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -3972,6 +3994,8 @@ class W4A16GemmKernel:
                     s_sh_rd,
                     next_pipe,
                     Int32(0),
+                    next_tile,
+                    dynamic_pair_override,
                 )
                 self._load_a_registers_m8_bundle(
                     a0_regs_next,
@@ -4335,12 +4359,10 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
-                    tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
-                    wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
-                        b_region, tile_base, lane, low_bits
-                    )
-                elif logical_k16 < Int32(8):
+                if (
+                    cutlass.const_expr(int(low_bits) == int(high_bits))
+                    or logical_k16 < Int32(8)
+                ):
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits
@@ -12085,6 +12107,28 @@ def _trellis_dense_buffer(
     return buffer
 
 
+def _use_k6_mcg_small(
+    *,
+    device: torch.device,
+    m: int,
+    trellis_bits: int,
+    trellis_codebook: str,
+    trellis_pair_kind,
+    compute_dtype: torch.dtype,
+    external_hadamard_128,
+) -> bool:
+    """Select the capture-safe K6/MCG kernel only on its compiled target."""
+    return (
+        tuple(torch.cuda.get_device_capability(device)) == (12, 0)
+        and m <= 128
+        and trellis_bits == 6
+        and trellis_codebook == "mcg"
+        and trellis_pair_kind is None
+        and compute_dtype == torch.float16
+        and external_hadamard_128 is None
+    )
+
+
 def _run_trellis256_dense_current_device(
     x: torch.Tensor,
     prepared_dense,
@@ -12167,6 +12211,70 @@ def _run_trellis256_dense_current_device(
     external_hadamard_128 = (
         None if hadamard_128 is None else _resolve_exl3_hadamard_128(hadamard_128)
     )
+
+    # Keep the established K6/MCG decode path independent from the generic
+    # Trellis scheduler. It owns both H128 rotations, needs no GEMM scratch,
+    # and is safe to capture with only caller-owned output/rotation storage.
+    # Compact pair payloads and the newer SQG codebooks use the generic path.
+    use_k6_mcg_small = _use_k6_mcg_small(
+        device=x.device,
+        m=m,
+        trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind,
+        compute_dtype=compute_dtype,
+        external_hadamard_128=external_hadamard_128,
+    )
+    if use_k6_mcg_small:
+        if x.dtype == torch.float16:
+            x_f16 = x
+        else:
+            input_f16 = _trellis_dense_buffer(
+                "input_f16",
+                input_f16,
+                shape=(m, size_k),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            input_f16.copy_(x)
+            x_f16 = input_f16
+        rotated_f16 = _trellis_dense_buffer(
+            "rotated_f16",
+            rotated_f16,
+            shape=(m, size_k),
+            dtype=torch.float16,
+            device=x.device,
+        )
+        if output.dtype == torch.float16:
+            small_output = output
+        else:
+            output_f16 = _trellis_dense_buffer(
+                "output_f16",
+                output_f16,
+                shape=(m, size_n),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            small_output = output_f16
+        from b12x.gemm.trellis_linear._small_m import run_k6_mcg
+
+        trellis_i16 = prepared_dense.trellis.view(torch.int16).view(
+            size_k // 16,
+            size_n // 16,
+            96,
+        )
+        run_k6_mcg(
+            x_f16,
+            trellis_i16,
+            small_output,
+            prepared_dense.suh,
+            rotated_f16,
+            prepared_dense.svh,
+            prepared_dense.workspace,
+        )
+        if output.dtype != torch.float16:
+            output.copy_(small_output)
+        return output
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
