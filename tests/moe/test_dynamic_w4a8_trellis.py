@@ -384,6 +384,7 @@ def test_dynamic_trellis_matches_scaffold(activation: str, m: int) -> None:
 def test_dynamic_w4a8_m1_direct_ignores_inactive_routes() -> None:
     """M=1 direct scheduling must skip every inactive expert route."""
 
+    keepalive: list[dict[str, object]] = []
     got, want = _run_trellis_dynamic(
         activation="silu",
         E=4,
@@ -395,9 +396,38 @@ def test_dynamic_w4a8_m1_direct_ignores_inactive_routes() -> None:
         recipe="w4a8_mx",
         direct=True,
         topk_ids_override=torch.full((1, 2), -1, dtype=torch.int32),
+        keepalive=keepalive,
     )
     torch.testing.assert_close(want, torch.zeros_like(want), rtol=0, atol=0)
     torch.testing.assert_close(got, want, rtol=0, atol=0)
+    packed_a = keepalive[0]["packed_a"]
+    assert isinstance(packed_a, torch.Tensor)
+    assert torch.count_nonzero(packed_a).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dynamic_w4a8_shared_input_ignores_inactive_routes() -> None:
+    """Shared-input scheduling must not materialize an inactive token."""
+
+    keepalive: list[dict[str, object]] = []
+    got, want = _run_trellis_dynamic(
+        activation="silu",
+        E=4,
+        m=3,
+        K=256,
+        n=128,
+        top_k=2,
+        seed=20260815,
+        recipe="w4a8_mx",
+        split_materialized=True,
+        topk_ids_override=torch.full((3, 2), -1, dtype=torch.int32),
+        keepalive=keepalive,
+    )
+    torch.testing.assert_close(want, torch.zeros_like(want), rtol=0, atol=0)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    packed_a = keepalive[0]["packed_a"]
+    assert isinstance(packed_a, torch.Tensor)
+    assert torch.count_nonzero(packed_a).item() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

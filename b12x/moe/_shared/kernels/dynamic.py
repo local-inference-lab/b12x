@@ -2944,43 +2944,66 @@ class MoEDynamicKernelBackend:
             # one thread per K32 quantization block, plus one thread per route.
             # Fold it into phase 0 so the existing resident barrier publishes
             # both the cleared output and the prepared input in one step.
-            m1_blk_idx = flat_tid
-            while m1_blk_idx < mx_blocks_per_row:
-                m1_block_start = m1_blk_idx * Int32(32)
-                m1_values, m1_block_max = _load_bf16x32_to_f32(
-                    a_input,
-                    m1_block_start,
-                )
-                if cutlass.const_expr(self.w4a8_trellis):
-                    m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                        _w4a8_trellis_permute_k32(m1_values),
-                        m1_block_max,
+            m1_lane_id = Int32(tidx) & Int32(31)
+            m1_has_active_route = Int32(0)
+            if m1_lane_id == Int32(0):
+                m1_route_idx = Int32(0)
+                while m1_route_idx < total_pairs:
+                    m1_route_expert_id = topk_ids[m1_route_idx].to(Int32)
+                    if (
+                        m1_route_expert_id >= Int32(0)
+                        and m1_route_expert_id < num_experts
+                    ):
+                        m1_has_active_route = Int32(1)
+                        m1_route_idx = total_pairs
+                    else:
+                        m1_route_idx += Int32(1)
+            m1_has_active_route = cute.arch.shuffle_sync(
+                m1_has_active_route, Int32(0)
+            )
+
+            if m1_has_active_route > Int32(0):
+                m1_blk_idx = flat_tid
+                while m1_blk_idx < mx_blocks_per_row:
+                    m1_block_start = m1_blk_idx * Int32(32)
+                    m1_values, m1_block_max = _load_bf16x32_to_f32(
+                        a_input,
+                        m1_block_start,
                     )
-                else:
-                    m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                        m1_values,
-                        m1_block_max,
+                    if cutlass.const_expr(self.w4a8_trellis):
+                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                            _w4a8_trellis_permute_k32(m1_values),
+                            m1_block_max,
+                        )
+                    else:
+                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                            m1_values,
+                            m1_block_max,
+                        )
+                    for m1_payload_pair in cutlass.range_constexpr(4):
+                        m1_packed64 = (
+                            Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
+                        ) | Uint64(m1_payload[m1_payload_pair * 2])
+                        st_global_u64(
+                            get_ptr_as_int64(
+                                packed_a_storage,
+                                m1_block_start + Int32(m1_payload_pair * 8),
+                            ),
+                            m1_packed64,
+                        )
+                    scale_storage[m1_blk_idx] = Uint8(
+                        m1_mx_scale_byte & Uint32(0xFF)
                     )
-                for m1_payload_pair in cutlass.range_constexpr(4):
-                    m1_packed64 = (
-                        Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
-                    ) | Uint64(m1_payload[m1_payload_pair * 2])
-                    st_global_u64(
-                        get_ptr_as_int64(
-                            packed_a_storage,
-                            m1_block_start + Int32(m1_payload_pair * 8),
-                        ),
-                        m1_packed64,
-                    )
-                scale_storage[m1_blk_idx] = Uint8(m1_mx_scale_byte & Uint32(0xFF))
-                m1_blk_idx += flat_stride
+                    m1_blk_idx += flat_stride
 
             if flat_tid < total_pairs:
-                m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                token_map[m1_physical_row] = Int32(0)
-                token_weights[m1_physical_row] = topk_weights[flat_tid].to(
-                    cutlass.Float32
-                )
+                m1_slot_expert_id = topk_ids[flat_tid].to(Int32)
+                if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
+                    m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
+                    token_map[m1_physical_row] = Int32(0)
+                    token_weights[m1_physical_row] = topk_weights[flat_tid].to(
+                        cutlass.Float32
+                    )
 
         cute.arch.sync_threads()
         self._resident_grid_barrier(
@@ -3148,180 +3171,312 @@ class MoEDynamicKernelBackend:
                         else:
                             cute.arch.sync_warp()
 
-                        if cutlass.const_expr(self.is_w4a8):
-                            # A token's BF16 row is identical for every routed
-                            # expert. The materialized specialization stores one
-                            # quantized row per token and gathers it in FC1; the
-                            # route-expanded path fans it out to each route.
-                            # That path keeps only physical rows in rmem here to
-                            # stay below the two-CTA register-residency limit.
-                            if num_topk == Int32(8):
-                                for cache_slot in cutlass.range_constexpr(8):
-                                    slot = route_slot_base + Int32(cache_slot)
-                                    shared_route_phys_rows[cache_slot] = _ld_shared_i32(
-                                        route_phys_rows_addr + slot * Int32(4)
-                                    )
+                        token_has_active_route = Int32(0)
+                        if lane_id == Int32(0):
+                            active_topk_slot = Int32(0)
+                            while active_topk_slot < num_topk:
+                                slot = route_slot_base + active_topk_slot
+                                if _ld_shared_i32(
+                                    route_phys_rows_addr + slot * Int32(4)
+                                ) >= Int32(0):
+                                    token_has_active_route = Int32(1)
+                                    active_topk_slot = num_topk
+                                else:
+                                    active_topk_slot += Int32(1)
+                        token_has_active_route = cute.arch.shuffle_sync(
+                            token_has_active_route, Int32(0)
+                        )
 
-                                blk_idx = lane_id + token_partition * Int32(32)
-                                while blk_idx < mx_blocks_per_row:
-                                    block_start = blk_idx * Int32(32)
-                                    values, block_max = _load_bf16x32_to_f32(
-                                        a_input,
-                                        token_idx * Int32(a_input.shape[1])
-                                        + block_start,
-                                    )
-                                    if cutlass.const_expr(self.w4a8_trellis):
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                _w4a8_trellis_permute_k32(
-                                                    values
-                                                ),
-                                                block_max,
-                                            )
+                        if token_has_active_route > Int32(0):
+                            if cutlass.const_expr(self.is_w4a8):
+                                # A token's BF16 row is identical for every routed
+                                # expert. The materialized specialization stores one
+                                # quantized row per token and gathers it in FC1; the
+                                # route-expanded path fans it out to each route.
+                                # That path keeps only physical rows in rmem here to
+                                # stay below the two-CTA register-residency limit.
+                                if num_topk == Int32(8):
+                                    for cache_slot in cutlass.range_constexpr(8):
+                                        slot = route_slot_base + Int32(cache_slot)
+                                        shared_route_phys_rows[cache_slot] = _ld_shared_i32(
+                                            route_phys_rows_addr + slot * Int32(4)
                                         )
-                                    else:
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                values, block_max
-                                            )
+
+                                    blk_idx = lane_id + token_partition * Int32(32)
+                                    while blk_idx < mx_blocks_per_row:
+                                        block_start = blk_idx * Int32(32)
+                                        values, block_max = _load_bf16x32_to_f32(
+                                            a_input,
+                                            token_idx * Int32(a_input.shape[1])
+                                            + block_start,
                                         )
-                                    for payload_pair in cutlass.range_constexpr(4):
-                                        packed64 = (
-                                            Uint64(payload[payload_pair * 2 + 1])
-                                            << Uint64(32)
-                                        ) | Uint64(payload[payload_pair * 2])
+                                        if cutlass.const_expr(self.w4a8_trellis):
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    _w4a8_trellis_permute_k32(
+                                                        values
+                                                    ),
+                                                    block_max,
+                                                )
+                                            )
+                                        else:
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    values, block_max
+                                                )
+                                            )
+                                        for payload_pair in cutlass.range_constexpr(4):
+                                            packed64 = (
+                                                Uint64(payload[payload_pair * 2 + 1])
+                                                << Uint64(32)
+                                            ) | Uint64(payload[payload_pair * 2])
+                                            if cutlass.const_expr(
+                                                self.materialize_intermediate
+                                            ):
+                                                output_offset = (
+                                                    token_idx * output_bytes_per_row
+                                                    + block_start
+                                                    + Int32(payload_pair * 8)
+                                                )
+                                                st_global_u64(
+                                                    get_ptr_as_int64(
+                                                        packed_a_storage,
+                                                        output_offset,
+                                                    ),
+                                                    packed64,
+                                                )
+                                            else:
+                                                for cache_slot in cutlass.range_constexpr(
+                                                    8
+                                                ):
+                                                    phys_row = shared_route_phys_rows[
+                                                        cache_slot
+                                                    ]
+                                                    if phys_row >= Int32(0):
+                                                        output_offset = (
+                                                            phys_row * output_bytes_per_row
+                                                            + block_start
+                                                            + Int32(payload_pair * 8)
+                                                        )
+                                                        st_global_u64(
+                                                            get_ptr_as_int64(
+                                                                packed_a_storage,
+                                                                output_offset,
+                                                            ),
+                                                            packed64,
+                                                        )
                                         if cutlass.const_expr(
                                             self.materialize_intermediate
                                         ):
-                                            output_offset = (
-                                                token_idx * output_bytes_per_row
-                                                + block_start
-                                                + Int32(payload_pair * 8)
-                                            )
-                                            st_global_u64(
-                                                get_ptr_as_int64(
-                                                    packed_a_storage,
-                                                    output_offset,
-                                                ),
-                                                packed64,
-                                            )
+                                            scale_storage[
+                                                token_idx * mx_blocks_per_row + blk_idx
+                                            ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         else:
-                                            for cache_slot in cutlass.range_constexpr(
-                                                8
-                                            ):
+                                            for cache_slot in cutlass.range_constexpr(8):
                                                 phys_row = shared_route_phys_rows[
                                                     cache_slot
                                                 ]
                                                 if phys_row >= Int32(0):
-                                                    output_offset = (
-                                                        phys_row * output_bytes_per_row
-                                                        + block_start
-                                                        + Int32(payload_pair * 8)
+                                                    scale_storage[
+                                                        phys_row * mx_blocks_per_row + blk_idx
+                                                    ] = Uint8(
+                                                        mx_scale_byte & Uint32(0xFF)
                                                     )
-                                                    st_global_u64(
-                                                        get_ptr_as_int64(
-                                                            packed_a_storage,
-                                                            output_offset,
-                                                        ),
-                                                        packed64,
-                                                    )
-                                    if cutlass.const_expr(
-                                        self.materialize_intermediate
-                                    ):
-                                        scale_storage[
-                                            token_idx * mx_blocks_per_row + blk_idx
-                                        ] = Uint8(mx_scale_byte & Uint32(0xFF))
-                                    else:
-                                        for cache_slot in cutlass.range_constexpr(8):
-                                            phys_row = shared_route_phys_rows[
-                                                cache_slot
-                                            ]
-                                            if phys_row >= Int32(0):
-                                                scale_storage[
-                                                    phys_row * mx_blocks_per_row + blk_idx
-                                                ] = Uint8(
-                                                    mx_scale_byte & Uint32(0xFF)
+                                        blk_idx += Int32(self.input_warps_per_token * 32)
+                                else:
+                                    blk_idx = lane_id + token_partition * Int32(32)
+                                    while blk_idx < mx_blocks_per_row:
+                                        block_start = blk_idx * Int32(32)
+                                        values, block_max = _load_bf16x32_to_f32(
+                                            a_input,
+                                            token_idx * Int32(a_input.shape[1])
+                                            + block_start,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_trellis):
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    _w4a8_trellis_permute_k32(
+                                                        values
+                                                    ),
+                                                    block_max,
                                                 )
-                                    blk_idx += Int32(self.input_warps_per_token * 32)
-                            else:
-                                blk_idx = lane_id + token_partition * Int32(32)
-                                while blk_idx < mx_blocks_per_row:
-                                    block_start = blk_idx * Int32(32)
-                                    values, block_max = _load_bf16x32_to_f32(
-                                        a_input,
-                                        token_idx * Int32(a_input.shape[1])
-                                        + block_start,
-                                    )
-                                    if cutlass.const_expr(self.w4a8_trellis):
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                _w4a8_trellis_permute_k32(
-                                                    values
-                                                ),
-                                                block_max,
                                             )
-                                        )
-                                    else:
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                values, block_max
+                                        else:
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    values, block_max
+                                                )
                                             )
-                                        )
-                                    for payload_pair in cutlass.range_constexpr(4):
-                                        packed64 = (
-                                            Uint64(payload[payload_pair * 2 + 1])
-                                            << Uint64(32)
-                                        ) | Uint64(payload[payload_pair * 2])
+                                        for payload_pair in cutlass.range_constexpr(4):
+                                            packed64 = (
+                                                Uint64(payload[payload_pair * 2 + 1])
+                                                << Uint64(32)
+                                            ) | Uint64(payload[payload_pair * 2])
+                                            if cutlass.const_expr(
+                                                self.materialize_intermediate
+                                            ):
+                                                output_offset = (
+                                                    token_idx * output_bytes_per_row
+                                                    + block_start
+                                                    + Int32(payload_pair * 8)
+                                                )
+                                                st_global_u64(
+                                                    get_ptr_as_int64(
+                                                        packed_a_storage,
+                                                        output_offset,
+                                                    ),
+                                                    packed64,
+                                                )
+                                            else:
+                                                # CuTe loop-carried values must have
+                                                # a concrete type before entering a
+                                                # dynamic while.  Keep the address
+                                                # offset in rmem and update it for
+                                                # each routed copy below.
+                                                output_offset = Int32(0)
+                                                topk_slot = Int32(0)
+                                                while topk_slot < num_topk:
+                                                    slot = route_slot_base + topk_slot
+                                                    phys_row = _ld_shared_i32(
+                                                        route_phys_rows_addr
+                                                        + slot * Int32(4)
+                                                    )
+                                                    if phys_row >= Int32(0):
+                                                        output_offset = (
+                                                            phys_row * output_bytes_per_row
+                                                            + block_start
+                                                            + Int32(payload_pair * 8)
+                                                        )
+                                                        st_global_u64(
+                                                            get_ptr_as_int64(
+                                                                packed_a_storage,
+                                                                output_offset,
+                                                            ),
+                                                            packed64,
+                                                        )
+                                                    topk_slot += Int32(1)
                                         if cutlass.const_expr(
                                             self.materialize_intermediate
                                         ):
-                                            output_offset = (
-                                                token_idx * output_bytes_per_row
-                                                + block_start
-                                                + Int32(payload_pair * 8)
-                                            )
-                                            st_global_u64(
-                                                get_ptr_as_int64(
-                                                    packed_a_storage,
-                                                    output_offset,
-                                                ),
-                                                packed64,
-                                            )
+                                            scale_storage[
+                                                token_idx * mx_blocks_per_row + blk_idx
+                                            ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         else:
-                                            # CuTe loop-carried values must have
-                                            # a concrete type before entering a
-                                            # dynamic while.  Keep the address
-                                            # offset in rmem and update it for
-                                            # each routed copy below.
-                                            output_offset = Int32(0)
                                             topk_slot = Int32(0)
                                             while topk_slot < num_topk:
                                                 slot = route_slot_base + topk_slot
                                                 phys_row = _ld_shared_i32(
-                                                    route_phys_rows_addr
-                                                    + slot * Int32(4)
+                                                    route_phys_rows_addr + slot * Int32(4)
                                                 )
                                                 if phys_row >= Int32(0):
-                                                    output_offset = (
-                                                        phys_row * output_bytes_per_row
-                                                        + block_start
-                                                        + Int32(payload_pair * 8)
-                                                    )
-                                                    st_global_u64(
-                                                        get_ptr_as_int64(
-                                                            packed_a_storage,
-                                                            output_offset,
-                                                        ),
-                                                        packed64,
+                                                    scale_storage[
+                                                        phys_row * mx_blocks_per_row + blk_idx
+                                                    ] = Uint8(
+                                                        mx_scale_byte & Uint32(0xFF)
                                                     )
                                                 topk_slot += Int32(1)
-                                    if cutlass.const_expr(
-                                        self.materialize_intermediate
-                                    ):
-                                        scale_storage[
-                                            token_idx * mx_blocks_per_row + blk_idx
-                                        ] = Uint8(mx_scale_byte & Uint32(0xFF))
-                                    else:
+                                        blk_idx += Int32(self.input_warps_per_token * 32)
+                            else:
+                                gs_value = shared_input_gs_value
+                                if num_topk == Int32(8):
+                                    for cache_slot in cutlass.range_constexpr(8):
+                                        slot = route_slot_base + Int32(cache_slot)
+                                        phys_row = _ld_shared_i32(
+                                            route_phys_rows_addr + slot * Int32(4)
+                                        )
+                                        route_output_base[cache_slot] = Int32(-1)
+                                        route_scale_base[cache_slot] = Int32(-1)
+                                        if phys_row >= Int32(0):
+                                            route_output_base[cache_slot] = (
+                                                phys_row * output_bytes_per_row
+                                            )
+                                            # Scale storage is tiled in 128-row SF
+                                            # atoms, independently of the MMA tile.
+                                            sf_atom = phys_row >> Int32(7)
+                                            sf_row = phys_row & Int32(127)
+                                            route_scale_base[cache_slot] = (
+                                                sf_atom
+                                                * num_k_tiles
+                                                * Int32(32 * 4 * 4)
+                                                + (sf_row % Int32(32)) * Int32(4 * 4)
+                                                + (sf_row // Int32(32)) * Int32(4)
+                                            )
+
+                                    sf_idx = lane_id
+                                    while sf_idx < sf_blocks_per_row:
+                                        block_start = sf_idx * Int32(16)
+                                        values = cute.make_rmem_tensor(
+                                            (16,), cutlass.Float32
+                                        )
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(16):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx, block_start + Int32(elem_idx)
+                                                ]
+                                            )
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                        packed64 = Uint64(0)
+                                        scale_byte = Uint8(0)
+                                        if self.is_gated and self.fast_math:
+                                            packed64, scale_byte = quantize_block_fp4_fast(
+                                                values, block_max, gs_value
+                                            )
+                                        else:
+                                            packed64, scale_byte = quantize_block_fp4(
+                                                values, block_max, gs_value
+                                            )
+
+                                        k_tile_idx = sf_idx // Int32(4)
+                                        inner_k_idx = sf_idx % Int32(4)
+                                        scale_k_base = (
+                                            k_tile_idx * Int32(32 * 4 * 4) + inner_k_idx
+                                        )
+                                        for cache_slot in cutlass.range_constexpr(8):
+                                            output_base = route_output_base[cache_slot]
+                                            if output_base >= Int32(0):
+                                                output_offset = output_base + sf_idx * Int32(
+                                                    8
+                                                )
+                                                st_global_u64(
+                                                    get_ptr_as_int64(
+                                                        packed_a_storage, output_offset
+                                                    ),
+                                                    packed64,
+                                                )
+                                                scale_storage[
+                                                    route_scale_base[cache_slot]
+                                                    + scale_k_base
+                                                ] = scale_byte
+                                        sf_idx += Int32(32)
+                                else:
+                                    sf_idx = lane_id
+                                    while sf_idx < sf_blocks_per_row:
+                                        block_start = sf_idx * Int32(16)
+                                        values = cute.make_rmem_tensor(
+                                            (16,), cutlass.Float32
+                                        )
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(16):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx, block_start + Int32(elem_idx)
+                                                ]
+                                            )
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                        packed64 = Uint64(0)
+                                        scale_byte = Uint8(0)
+                                        if self.is_gated and self.fast_math:
+                                            packed64, scale_byte = quantize_block_fp4_fast(
+                                                values, block_max, gs_value
+                                            )
+                                        else:
+                                            packed64, scale_byte = quantize_block_fp4(
+                                                values, block_max, gs_value
+                                            )
+
                                         topk_slot = Int32(0)
                                         while topk_slot < num_topk:
                                             slot = route_slot_base + topk_slot
@@ -3329,201 +3484,86 @@ class MoEDynamicKernelBackend:
                                                 route_phys_rows_addr + slot * Int32(4)
                                             )
                                             if phys_row >= Int32(0):
-                                                scale_storage[
-                                                    phys_row * mx_blocks_per_row + blk_idx
-                                                ] = Uint8(
-                                                    mx_scale_byte & Uint32(0xFF)
+                                                output_offset = (
+                                                    phys_row * output_bytes_per_row
+                                                    + sf_idx * Int32(8)
                                                 )
+                                                st_global_u64(
+                                                    get_ptr_as_int64(
+                                                        packed_a_storage, output_offset
+                                                    ),
+                                                    packed64,
+                                                )
+
+                                                # Scale storage uses 128-row SF atoms,
+                                                # independently of the MMA tile.
+                                                k_tile_idx = sf_idx // Int32(4)
+                                                sf_atom = phys_row >> Int32(7)
+                                                sf_row = phys_row & Int32(127)
+                                                outer_m_idx = sf_row % Int32(32)
+                                                inner_m_idx = sf_row // Int32(32)
+                                                inner_k_idx = sf_idx % Int32(4)
+                                                scale_offset = (
+                                                    sf_atom
+                                                    * num_k_tiles
+                                                    * Int32(32 * 4 * 4)
+                                                    + k_tile_idx * Int32(32 * 4 * 4)
+                                                    + outer_m_idx * Int32(4 * 4)
+                                                    + inner_m_idx * Int32(4)
+                                                    + inner_k_idx
+                                                )
+                                                scale_storage[scale_offset] = scale_byte
                                             topk_slot += Int32(1)
-                                    blk_idx += Int32(self.input_warps_per_token * 32)
-                        else:
-                            gs_value = shared_input_gs_value
-                            if num_topk == Int32(8):
-                                for cache_slot in cutlass.range_constexpr(8):
-                                    slot = route_slot_base + Int32(cache_slot)
-                                    phys_row = _ld_shared_i32(
-                                        route_phys_rows_addr + slot * Int32(4)
-                                    )
-                                    route_output_base[cache_slot] = Int32(-1)
-                                    route_scale_base[cache_slot] = Int32(-1)
-                                    if phys_row >= Int32(0):
-                                        route_output_base[cache_slot] = (
-                                            phys_row * output_bytes_per_row
-                                        )
-                                        # Scale storage is tiled in 128-row SF
-                                        # atoms, independently of the MMA tile.
-                                        sf_atom = phys_row >> Int32(7)
-                                        sf_row = phys_row & Int32(127)
-                                        route_scale_base[cache_slot] = (
-                                            sf_atom
-                                            * num_k_tiles
-                                            * Int32(32 * 4 * 4)
-                                            + (sf_row % Int32(32)) * Int32(4 * 4)
-                                            + (sf_row // Int32(32)) * Int32(4)
-                                        )
+                                        sf_idx += Int32(32)
 
-                                sf_idx = lane_id
-                                while sf_idx < sf_blocks_per_row:
-                                    block_start = sf_idx * Int32(16)
-                                    values = cute.make_rmem_tensor(
-                                        (16,), cutlass.Float32
-                                    )
-                                    block_max = cutlass.Float32(0.0)
-                                    for elem_idx in cutlass.range_constexpr(16):
-                                        value = cutlass.Float32(
-                                            a_input[
-                                                token_idx, block_start + Int32(elem_idx)
-                                            ]
-                                        )
-                                        values[elem_idx] = value
-                                        block_max = fmax_f32(block_max, fabs_f32(value))
-                                    packed64 = Uint64(0)
-                                    scale_byte = Uint8(0)
-                                    if self.is_gated and self.fast_math:
-                                        packed64, scale_byte = quantize_block_fp4_fast(
-                                            values, block_max, gs_value
-                                        )
-                                    else:
-                                        packed64, scale_byte = quantize_block_fp4(
-                                            values, block_max, gs_value
-                                        )
+                            if cutlass.const_expr(self.work_is_streaming):
+                                cute.arch.sync_warp()
+                                _threadfence()
+                                cute.arch.sync_warp()
 
-                                    k_tile_idx = sf_idx // Int32(4)
-                                    inner_k_idx = sf_idx % Int32(4)
-                                    scale_k_base = (
-                                        k_tile_idx * Int32(32 * 4 * 4) + inner_k_idx
-                                    )
-                                    for cache_slot in cutlass.range_constexpr(8):
-                                        output_base = route_output_base[cache_slot]
-                                        if output_base >= Int32(0):
-                                            output_offset = output_base + sf_idx * Int32(
-                                                8
-                                            )
-                                            st_global_u64(
-                                                get_ptr_as_int64(
-                                                    packed_a_storage, output_offset
-                                                ),
-                                                packed64,
-                                            )
-                                            scale_storage[
-                                                route_scale_base[cache_slot]
-                                                + scale_k_base
-                                            ] = scale_byte
-                                    sf_idx += Int32(32)
-                            else:
-                                sf_idx = lane_id
-                                while sf_idx < sf_blocks_per_row:
-                                    block_start = sf_idx * Int32(16)
-                                    values = cute.make_rmem_tensor(
-                                        (16,), cutlass.Float32
-                                    )
-                                    block_max = cutlass.Float32(0.0)
-                                    for elem_idx in cutlass.range_constexpr(16):
-                                        value = cutlass.Float32(
-                                            a_input[
-                                                token_idx, block_start + Int32(elem_idx)
-                                            ]
-                                        )
-                                        values[elem_idx] = value
-                                        block_max = fmax_f32(block_max, fabs_f32(value))
-                                    packed64 = Uint64(0)
-                                    scale_byte = Uint8(0)
-                                    if self.is_gated and self.fast_math:
-                                        packed64, scale_byte = quantize_block_fp4_fast(
-                                            values, block_max, gs_value
-                                        )
-                                    else:
-                                        packed64, scale_byte = quantize_block_fp4(
-                                            values, block_max, gs_value
-                                        )
+                                publish_routes = Int32(1)
+                                if cutlass.const_expr(self.is_w4a8):
+                                    self._sync_input_warp_pair(token_owner_warp)
+                                    publish_routes = Int32(1) - token_partition
 
+                                if lane_id == Int32(0) and publish_routes > Int32(0):
                                     topk_slot = Int32(0)
                                     while topk_slot < num_topk:
                                         slot = route_slot_base + topk_slot
                                         phys_row = _ld_shared_i32(
                                             route_phys_rows_addr + slot * Int32(4)
                                         )
-                                        if phys_row >= Int32(0):
-                                            output_offset = (
-                                                phys_row * output_bytes_per_row
-                                                + sf_idx * Int32(8)
-                                            )
-                                            st_global_u64(
-                                                get_ptr_as_int64(
-                                                    packed_a_storage, output_offset
-                                                ),
-                                                packed64,
-                                            )
-
-                                            # Scale storage uses 128-row SF atoms,
-                                            # independently of the MMA tile.
-                                            k_tile_idx = sf_idx // Int32(4)
-                                            sf_atom = phys_row >> Int32(7)
-                                            sf_row = phys_row & Int32(127)
-                                            outer_m_idx = sf_row % Int32(32)
-                                            inner_m_idx = sf_row // Int32(32)
-                                            inner_k_idx = sf_idx % Int32(4)
-                                            scale_offset = (
-                                                sf_atom
-                                                * num_k_tiles
-                                                * Int32(32 * 4 * 4)
-                                                + k_tile_idx * Int32(32 * 4 * 4)
-                                                + outer_m_idx * Int32(4 * 4)
-                                                + inner_m_idx * Int32(4)
-                                                + inner_k_idx
-                                            )
-                                            scale_storage[scale_offset] = scale_byte
-                                        topk_slot += Int32(1)
-                                    sf_idx += Int32(32)
-
-                        if cutlass.const_expr(self.work_is_streaming):
-                            cute.arch.sync_warp()
-                            _threadfence()
-                            cute.arch.sync_warp()
-
-                            publish_routes = Int32(1)
-                            if cutlass.const_expr(self.is_w4a8):
-                                self._sync_input_warp_pair(token_owner_warp)
-                                publish_routes = Int32(1) - token_partition
-
-                            if lane_id == Int32(0) and publish_routes > Int32(0):
-                                topk_slot = Int32(0)
-                                while topk_slot < num_topk:
-                                    slot = route_slot_base + topk_slot
-                                    phys_row = _ld_shared_i32(
-                                        route_phys_rows_addr + slot * Int32(4)
-                                    )
-                                    expert_id = _ld_shared_i32(
-                                        route_expert_ids_addr + slot * Int32(4)
-                                    )
-                                    if phys_row >= Int32(0):
-                                        phys_tile = phys_row // Int32(
-                                            self.tile_shape_mnk[0]
+                                        expert_id = _ld_shared_i32(
+                                            route_expert_ids_addr + slot * Int32(4)
                                         )
-                                        completed = atomic_add_global_i32(
-                                            get_ptr_as_int64(
-                                                tile_write_count, phys_tile
-                                            ),
-                                            Int32(1),
-                                        ) + Int32(1)
-                                        if completed == Int32(
-                                            self.tile_shape_mnk[0]
-                                        ):
-                                            self._publish_ready_tasks(
-                                                task_tail,
-                                                task_ready,
-                                                task_expert,
-                                                task_m_tile,
-                                                task_slice_begin,
-                                                task_slice_count,
-                                                task_valid_rows,
-                                                route_gate_tile_cnt,
-                                                task_slice_chunk,
-                                                expert_id,
-                                                phys_tile,
-                                                Int32(self.tile_shape_mnk[0]),
+                                        if phys_row >= Int32(0):
+                                            phys_tile = phys_row // Int32(
+                                                self.tile_shape_mnk[0]
                                             )
-                                    topk_slot += Int32(1)
+                                            completed = atomic_add_global_i32(
+                                                get_ptr_as_int64(
+                                                    tile_write_count, phys_tile
+                                                ),
+                                                Int32(1),
+                                            ) + Int32(1)
+                                            if completed == Int32(
+                                                self.tile_shape_mnk[0]
+                                            ):
+                                                self._publish_ready_tasks(
+                                                    task_tail,
+                                                    task_ready,
+                                                    task_expert,
+                                                    task_m_tile,
+                                                    task_slice_begin,
+                                                    task_slice_count,
+                                                    task_valid_rows,
+                                                    route_gate_tile_cnt,
+                                                    task_slice_chunk,
+                                                    expert_id,
+                                                    phys_tile,
+                                                    Int32(self.tile_shape_mnk[0]),
+                                                )
+                                        topk_slot += Int32(1)
                 else:
                     warp_item = Int32(0)
                     while warp_item < Int32(_PRODUCER_PAIRS_PER_WARP):
@@ -3574,50 +3614,49 @@ class MoEDynamicKernelBackend:
                                 route_is_valid, Int32(0)
                             )
 
-                            safe_expert_id = expert_id
-                            if route_is_valid == Int32(0):
-                                safe_expert_id = Int32(0)
-                            gs_value = input_global_scale[safe_expert_id].to(
-                                cutlass.Float32
-                            )
-                            if cutlass.const_expr(self.is_w4a8):
-                                # w4a8: per-32 dynamic UE8M0 + E4M3 payload, no
-                                # global scale. Payload stored plain row-major;
-                                # scales stored plain [row, cols//32].
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                blk_idx = lane_id
-                                while blk_idx < mx_blocks_per_row:
-                                    block_start = blk_idx * Int32(32)
-                                    values = cute.make_rmem_tensor(
-                                        (32,), cutlass.Float32
+                            if route_is_valid > Int32(0):
+                                gs_value = cutlass.Float32(0.0)
+                                if cutlass.const_expr(not self.is_w4a8):
+                                    gs_value = input_global_scale[expert_id].to(
+                                        cutlass.Float32
                                     )
-                                    block_max = cutlass.Float32(0.0)
-                                    for elem_idx in cutlass.range_constexpr(32):
-                                        value = cutlass.Float32(
-                                            a_input[
-                                                token_idx, block_start + Int32(elem_idx)
-                                            ]
+                                if cutlass.const_expr(self.is_w4a8):
+                                    # w4a8: per-32 dynamic UE8M0 + E4M3 payload, no
+                                    # global scale. Payload stored plain row-major;
+                                    # scales stored plain [row, cols//32].
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
+                                    blk_idx = lane_id
+                                    while blk_idx < mx_blocks_per_row:
+                                        block_start = blk_idx * Int32(32)
+                                        values = cute.make_rmem_tensor(
+                                            (32,), cutlass.Float32
                                         )
-                                        values[elem_idx] = value
-                                        block_max = fmax_f32(block_max, fabs_f32(value))
-                                    if cutlass.const_expr(self.w4a8_trellis):
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                _w4a8_trellis_permute_k32(
-                                                    values
-                                                ),
-                                                block_max,
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(32):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx, block_start + Int32(elem_idx)
+                                                ]
                                             )
-                                        )
-                                    else:
-                                        payload, mx_scale_byte = (
-                                            quantize_block_fp8_mx(
-                                                values, block_max
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                        if cutlass.const_expr(self.w4a8_trellis):
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    _w4a8_trellis_permute_k32(
+                                                        values
+                                                    ),
+                                                    block_max,
+                                                )
                                             )
-                                        )
-                                    if route_is_valid > Int32(0):
+                                        else:
+                                            payload, mx_scale_byte = (
+                                                quantize_block_fp8_mx(
+                                                    values, block_max
+                                                )
+                                            )
                                         output_offset = (
                                             phys_row * output_bytes_per_row + block_start
                                         )
@@ -3636,39 +3675,38 @@ class MoEDynamicKernelBackend:
                                         scale_storage[
                                             phys_row * mx_blocks_per_row + blk_idx
                                         ] = Uint8(mx_scale_byte & Uint32(0xFF))
-                                    blk_idx += Int32(32)
-                            elif cutlass.const_expr(self.is_w6a8):
-                                # w6a8_mx: MXFP8-E4M3 K/32 byte-container
-                                # payload (same encoding as w4a8's activation
-                                # side, but WITH the calibrated per-expert
-                                # global scale folded in at quantize time),
-                                # stored row-major for the A TMA; scale bytes
-                                # go to the swizzled 128-row SF atoms exactly
-                                # like nvfp4 (sf_idx now indexes K/32 blocks).
-                                sf_idx = lane_id
-                                while sf_idx < sf_blocks_per_row:
-                                    block_start = sf_idx * quant_block_elems
-                                    values = cute.make_rmem_tensor(
-                                        (32,), cutlass.Float32
-                                    )
-                                    block_max = cutlass.Float32(0.0)
-                                    for elem_idx in cutlass.range_constexpr(32):
-                                        value = cutlass.Float32(
-                                            a_input[
-                                                token_idx, block_start + Int32(elem_idx)
-                                            ]
+                                        blk_idx += Int32(32)
+                                elif cutlass.const_expr(self.is_w6a8):
+                                    # w6a8_mx: MXFP8-E4M3 K/32 byte-container
+                                    # payload (same encoding as w4a8's activation
+                                    # side, but WITH the calibrated per-expert
+                                    # global scale folded in at quantize time),
+                                    # stored row-major for the A TMA; scale bytes
+                                    # go to the swizzled 128-row SF atoms exactly
+                                    # like nvfp4 (sf_idx now indexes K/32 blocks).
+                                    sf_idx = lane_id
+                                    while sf_idx < sf_blocks_per_row:
+                                        block_start = sf_idx * quant_block_elems
+                                        values = cute.make_rmem_tensor(
+                                            (32,), cutlass.Float32
                                         )
-                                        values[elem_idx] = value
-                                        block_max = fmax_f32(block_max, fabs_f32(value))
-                                    containers, scale_byte = (
-                                        moe_mxfp6_quantize_input_block_containers(
-                                            values,
-                                            block_max,
-                                            gs_value,
-                                            self.mxfp6_fmt_a,
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(32):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx, block_start + Int32(elem_idx)
+                                                ]
+                                            )
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                        containers, scale_byte = (
+                                            moe_mxfp6_quantize_input_block_containers(
+                                                values,
+                                                block_max,
+                                                gs_value,
+                                                self.mxfp6_fmt_a,
+                                            )
                                         )
-                                    )
-                                    if route_is_valid > Int32(0):
                                         output_offset = (
                                             phys_tile * Int32(self.tile_shape_mnk[0])
                                             + row % Int32(self.tile_shape_mnk[0])
@@ -3700,35 +3738,34 @@ class MoEDynamicKernelBackend:
                                             + inner_k_idx
                                         )
                                         scale_storage[scale_offset] = scale_byte
-                                    sf_idx += Int32(32)
-                            else:
-                                sf_idx = lane_id
-                                while sf_idx < sf_blocks_per_row:
-                                    block_start = sf_idx * Int32(16)
-                                    values = cute.make_rmem_tensor(
-                                        (16,), cutlass.Float32
-                                    )
-                                    block_max = cutlass.Float32(0.0)
-                                    for elem_idx in cutlass.range_constexpr(16):
-                                        value = cutlass.Float32(
-                                            a_input[
-                                                token_idx, block_start + Int32(elem_idx)
-                                            ]
+                                        sf_idx += Int32(32)
+                                else:
+                                    sf_idx = lane_id
+                                    while sf_idx < sf_blocks_per_row:
+                                        block_start = sf_idx * Int32(16)
+                                        values = cute.make_rmem_tensor(
+                                            (16,), cutlass.Float32
                                         )
-                                        values[elem_idx] = value
-                                        block_max = fmax_f32(block_max, fabs_f32(value))
-                                    packed64 = Uint64(0)
-                                    scale_byte = Uint8(0)
-                                    if self.is_gated and self.fast_math:
-                                        packed64, scale_byte = quantize_block_fp4_fast(
-                                            values, block_max, gs_value
-                                        )
-                                    else:
-                                        packed64, scale_byte = quantize_block_fp4(
-                                            values, block_max, gs_value
-                                        )
+                                        block_max = cutlass.Float32(0.0)
+                                        for elem_idx in cutlass.range_constexpr(16):
+                                            value = cutlass.Float32(
+                                                a_input[
+                                                    token_idx, block_start + Int32(elem_idx)
+                                                ]
+                                            )
+                                            values[elem_idx] = value
+                                            block_max = fmax_f32(block_max, fabs_f32(value))
+                                        packed64 = Uint64(0)
+                                        scale_byte = Uint8(0)
+                                        if self.is_gated and self.fast_math:
+                                            packed64, scale_byte = quantize_block_fp4_fast(
+                                                values, block_max, gs_value
+                                            )
+                                        else:
+                                            packed64, scale_byte = quantize_block_fp4(
+                                                values, block_max, gs_value
+                                            )
 
-                                    if route_is_valid > Int32(0):
                                         output_offset = (
                                             phys_tile * Int32(self.tile_shape_mnk[0])
                                             + row % Int32(self.tile_shape_mnk[0])
@@ -3759,39 +3796,36 @@ class MoEDynamicKernelBackend:
                                             + inner_k_idx
                                         )
                                         scale_storage[scale_offset] = scale_byte
-                                    sf_idx += Int32(32)
+                                        sf_idx += Int32(32)
 
-                            if cutlass.const_expr(self.work_is_streaming):
-                                cute.arch.sync_warp()
-                                # When the whole launch has fewer than one M-tile of routed
-                                # rows, only the final partial-tile flush can publish work.
-                                # Skip the per-row fence/counter path in that common micro case.
-                                _threadfence()
-                                cute.arch.sync_warp()
+                                if cutlass.const_expr(self.work_is_streaming):
+                                    cute.arch.sync_warp()
+                                    # When the whole launch has fewer than one M-tile of routed
+                                    # rows, only the final partial-tile flush can publish work.
+                                    # Skip the per-row fence/counter path in that common micro case.
+                                    _threadfence()
+                                    cute.arch.sync_warp()
 
-                                if (
-                                    lane_id == Int32(0)
-                                    and route_is_valid > Int32(0)
-                                ):
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self._publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
-                                        )
+                                    if lane_id == Int32(0):
+                                        completed = atomic_add_global_i32(
+                                            get_ptr_as_int64(tile_write_count, phys_tile),
+                                            Int32(1),
+                                        ) + Int32(1)
+                                        if completed == Int32(self.tile_shape_mnk[0]):
+                                            self._publish_ready_tasks(
+                                                task_tail,
+                                                task_ready,
+                                                task_expert,
+                                                task_m_tile,
+                                                task_slice_begin,
+                                                task_slice_count,
+                                                task_valid_rows,
+                                                route_gate_tile_cnt,
+                                                task_slice_chunk,
+                                                expert_id,
+                                                phys_tile,
+                                                Int32(self.tile_shape_mnk[0]),
+                                            )
                         warp_item += Int32(1)
 
         if cutlass.const_expr(not self.w4a8_m1_materialized):

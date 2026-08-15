@@ -470,6 +470,41 @@ def test_standard_moe_micro_live_graph_oracle(
     )
 
 
+def test_standard_moe_dynamic_prefill_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reach ``integration.tp_moe.dynamic`` at a prefill-sized standard M."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=201)
+    initial = _make_inputs(device, m=128, seed=202, route_shift=0)
+    changed = _make_inputs(device, m=128, seed=203, route_shift=2)
+    initial_reference = _nvfp4_oracle(weights, initial)
+    changed_reference = _nvfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 64
+    assert launch_plan.execution.tile_n == 128
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-dynamic-prefill-m128",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
