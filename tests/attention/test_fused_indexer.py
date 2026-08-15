@@ -540,8 +540,11 @@ def test_fused_indexer_mla_matches_reference(rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
-def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
-    """Direct-K addressing stays exact after the packed-page Int32 boundary."""
+@pytest.mark.parametrize("caller_owned_outputs", [False, True])
+def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets(
+    caller_owned_outputs,
+):
+    """Direct-K addressing and both output modes stay exact past Int32."""
     device = torch.device("cuda")
     record_bytes = 1_077_120
     pid_lo, pages_used = 2000, 64
@@ -560,7 +563,7 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
     rows, heads, topk = 4, 64, 512
     seqlen = pages_used * _PS
     g = torch.Generator(device="cpu").manual_seed(7)
-    pool = torch.zeros(pool_pages * record_bytes, dtype=torch.uint8, device=device)
+    pool = torch.empty(pool_pages * record_bytes, dtype=torch.uint8, device=device)
     k_quant = pool.as_strided((pool_pages, _PS, 128), (record_bytes, 128, 1))
     k_scales = pool.view(torch.float32).as_strided(
         (pool_pages, _PS), (record_bytes // 4, 1), storage_offset=2048
@@ -584,6 +587,12 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
     )
     seqlens = torch.full((rows,), seqlen, dtype=torch.int32, device=device)
 
+    output_kwargs = {}
+    if caller_owned_outputs:
+        output_kwargs = {
+            "out_indices": torch.empty((rows, topk), dtype=torch.int32, device=device),
+            "out_values": torch.empty((rows, topk), dtype=torch.float32, device=device),
+        }
     idx, val = run_fused_paged_indexer(
         q_bytes=q_fp8.view(torch.uint8),
         weights=weights,
@@ -594,8 +603,12 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
         num_heads=heads,
         topk=topk,
         ctas_per_group=8,
+        **output_kwargs,
     )
     torch.cuda.synchronize(device)
+    if caller_owned_outputs:
+        assert idx.data_ptr() == output_kwargs["out_indices"].data_ptr()
+        assert val.data_ptr() == output_kwargs["out_values"].data_ptr()
 
     gold_vals, gold_idx_sets, gold_scores = _golden_topk(
         q_fp8,
@@ -623,3 +636,129 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
         # to ties at the top-k boundary.
         paired = gold_scores[row].index_select(0, idx[row].long())
         assert torch.allclose(val[row].float(), paired.float(), atol=1e-2, rtol=0)
+
+
+def _make_fused_kwargs(*, device, rows=2, heads=16, seqlen=4096, topk=512, seed=7):
+    q_fp8, weights, k_fp8, k_scales, page_table, seqlens = _build_case(
+        rows, heads, seqlen, topk, seed=seed, device=device
+    )
+    return dict(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+    )
+
+
+def _kernel_sentinel(*_args, **_kwargs):
+    raise AssertionError(
+        "device guard regressed: _to_kernel_tensor reached with a wrong-device output"
+    )
+
+
+@pytest.fixture
+def _no_fused_launch(monkeypatch):
+    """Exercise host output handling without launching a paged-pool kernel."""
+    import b12x.attention.nsa_indexer.fused_indexer as fused
+
+    monkeypatch.setattr(fused, "_to_kernel_tensor", lambda tensor, *_args, **_kwargs: tensor)
+    monkeypatch.setattr(fused, "_build_fused_indexer_kernel", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(fused, "_launch_fused", lambda *_args, **_kwargs: None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_paged_indexer_rejects_cpu_out_indices(monkeypatch):
+    """Defense-in-depth: the fused helper rejects a CPU ``out_indices`` before
+    any DLPack conversion or kernel launch.  ``_to_kernel_tensor`` is replaced
+    with a sentinel so a guard regression fails safely."""
+    device = torch.device("cuda")
+    kwargs = _make_fused_kwargs(device=device)
+    bad_out = torch.empty((2, 512), dtype=torch.int32, device="cpu")
+    monkeypatch.setattr(
+        "b12x.attention.nsa_indexer.fused_indexer._to_kernel_tensor",
+        _kernel_sentinel,
+    )
+    with pytest.raises(ValueError, match="out_indices device must match"):
+        run_fused_paged_indexer(out_indices=bad_out, **kwargs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_paged_indexer_rejects_cpu_out_values(monkeypatch):
+    """The fused helper also rejects a wrong-device ``out_values``."""
+    device = torch.device("cuda")
+    kwargs = _make_fused_kwargs(device=device)
+    bad_vals = torch.empty((2, 512), dtype=torch.float32, device="cpu")
+    monkeypatch.setattr(
+        "b12x.attention.nsa_indexer.fused_indexer._to_kernel_tensor",
+        _kernel_sentinel,
+    )
+    with pytest.raises(ValueError, match="out_values device must match"):
+        run_fused_paged_indexer(out_values=bad_vals, **kwargs)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= 2),
+    reason="Two CUDA devices required",
+)
+def test_fused_paged_indexer_rejects_wrong_cuda_device_out_indices(monkeypatch):
+    """A foreign-CUDA ``out_indices`` is rejected before the kernel launch."""
+    device = torch.device("cuda", 0)
+    kwargs = _make_fused_kwargs(device=device)
+    bad_out = torch.empty((2, 512), dtype=torch.int32, device=torch.device("cuda", 1))
+    monkeypatch.setattr(
+        "b12x.attention.nsa_indexer.fused_indexer._to_kernel_tensor",
+        _kernel_sentinel,
+    )
+    with pytest.raises(ValueError, match="out_indices device must match"):
+        run_fused_paged_indexer(out_indices=bad_out, **kwargs)
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= 2),
+    reason="Two CUDA devices required",
+)
+def test_fused_paged_indexer_rejects_wrong_cuda_device_out_values(monkeypatch):
+    """A foreign-CUDA ``out_values`` is rejected before kernel launch."""
+    device = torch.device("cuda", 0)
+    kwargs = _make_fused_kwargs(device=device)
+    bad_vals = torch.empty(
+        (2, 512), dtype=torch.float32, device=torch.device("cuda", 1)
+    )
+    monkeypatch.setattr(
+        "b12x.attention.nsa_indexer.fused_indexer._to_kernel_tensor",
+        _kernel_sentinel,
+    )
+    with pytest.raises(ValueError, match="out_values device must match"):
+        run_fused_paged_indexer(out_values=bad_vals, **kwargs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_paged_indexer_accepts_correct_device_and_preserves_ptr(
+    _no_fused_launch,
+):
+    """Correct-device caller outputs are forwarded unchanged before launch."""
+    device = torch.device("cuda")
+    kwargs = _make_fused_kwargs(device=device)
+    out_indices = torch.empty((2, 512), dtype=torch.int32, device=device)
+    out_values = torch.empty((2, 512), dtype=torch.float32, device=device)
+    idx, val = run_fused_paged_indexer(
+        out_indices=out_indices, out_values=out_values, **kwargs
+    )
+    assert idx.data_ptr() == out_indices.data_ptr()
+    assert val.data_ptr() == out_values.data_ptr()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused indexer")
+def test_fused_paged_indexer_omitted_outputs_allocated_on_q_device(
+    _no_fused_launch,
+):
+    """Omitted outputs are allocated on the query device before launch."""
+    device = torch.device("cuda")
+    kwargs = _make_fused_kwargs(device=device)
+    idx, val = run_fused_paged_indexer(**kwargs)
+    assert idx.device == kwargs["q_bytes"].device
+    assert val.device == kwargs["q_bytes"].device
+    assert idx.dtype == torch.int32
+    assert val.dtype == torch.float32
