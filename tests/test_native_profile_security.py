@@ -341,10 +341,12 @@ class TestPathSwap:
 
 
 class _FakeResponse:
-    """Minimal urlopen context manager returning immediate EOF."""
+    """Minimal bounded-connection response returning configured stream lines."""
 
     def __init__(self, lines=None):
         self._lines = lines or []
+        self.status = 200
+        self.length = 0
 
     def __enter__(self):
         return self
@@ -352,13 +354,51 @@ class _FakeResponse:
     def __exit__(self, *args):
         pass
 
-    def readline(self):
+    def readline(self, _size=-1):
         if self._lines:
             return self._lines.pop(0)
         return b""
 
     def close(self):
         pass
+
+
+class _FakeSocket:
+    def settimeout(self, _timeout):
+        pass
+
+    def shutdown(self, _how):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeConnection:
+    def __init__(self, outcome):
+        self.sock = _FakeSocket()
+        self._outcome = outcome
+
+    def request(self, *_args, **_kwargs):
+        pass
+
+    def getresponse(self):
+        if callable(self._outcome):
+            return self._outcome()
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+    def close(self):
+        pass
+
+
+def _stub_stream_connection(helper, monkeypatch, outcome):
+    monkeypatch.setattr(
+        helper,
+        "_create_connection",
+        lambda *_args, **_kwargs: _FakeConnection(outcome),
+    )
 
 
 class TestStreamRequestSymlinkRejection:
@@ -371,9 +411,7 @@ class TestStreamRequestSymlinkRejection:
             log_link = path / "stream.log"
             log_link.symlink_to(target)
 
-            monkeypatch.setattr(
-                helper.urllib.request, "urlopen", lambda *a, **k: _FakeResponse()
-            )
+            _stub_stream_connection(helper, monkeypatch, _FakeResponse())
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -403,10 +441,9 @@ class TestStreamRequestSymlinkRejection:
             error_link = path / "request.error.txt"
             error_link.symlink_to(target)
 
-            def fake_urlopen(*a, **k):
-                raise ConnectionError("simulated failure")
-
-            monkeypatch.setattr(helper.urllib.request, "urlopen", fake_urlopen)
+            _stub_stream_connection(
+                helper, monkeypatch, ConnectionError("simulated failure")
+            )
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -435,9 +472,7 @@ class TestStreamRequestPositive:
         path, fd = helper._prepare_output_dir(str(tmp_path / "out"), "test-")
         try:
             lines = [b"data: {\"token\": \"hello\"}\n", b""]
-            monkeypatch.setattr(
-                helper.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(lines)
-            )
+            _stub_stream_connection(helper, monkeypatch, _FakeResponse(lines))
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -464,10 +499,9 @@ class TestStreamRequestPositive:
         """A failed stream writes error log with mode 0600."""
         path, fd = helper._prepare_output_dir(str(tmp_path / "out"), "test-")
         try:
-            def fake_urlopen(*a, **k):
-                raise ConnectionError("simulated failure")
-
-            monkeypatch.setattr(helper.urllib.request, "urlopen", fake_urlopen)
+            _stub_stream_connection(
+                helper, monkeypatch, ConnectionError("simulated failure")
+            )
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -505,13 +539,16 @@ class TestStreamRequestFdLifecycle:
             release = threading.Event()
 
             class _DelayedResponse:
+                status = 200
+                length = 0
+
                 def __enter__(self):
                     return self
 
                 def __exit__(self, *a):
                     pass
 
-                def readline(self):
+                def readline(self, _size=-1):
                     if lines:
                         return lines.pop(0)
                     release.wait(timeout=5.0)
@@ -520,9 +557,7 @@ class TestStreamRequestFdLifecycle:
                 def close(self):
                     pass
 
-            monkeypatch.setattr(
-                helper.urllib.request, "urlopen", lambda *a, **k: _DelayedResponse()
-            )
+            _stub_stream_connection(helper, monkeypatch, _DelayedResponse())
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -564,11 +599,11 @@ class TestStreamRequestFdLifecycle:
         try:
             release = threading.Event()
 
-            def fake_urlopen(*a, **k):
+            def delayed_error():
                 release.wait(timeout=5.0)
                 raise ConnectionError("simulated failure after delay")
 
-            monkeypatch.setattr(helper.urllib.request, "urlopen", fake_urlopen)
+            _stub_stream_connection(helper, monkeypatch, delayed_error)
 
             stream = helper.StreamRequest(
                 url="http://fake",
@@ -581,11 +616,11 @@ class TestStreamRequestFdLifecycle:
             )
             stream.start()
 
-            # Close the caller's fd while the stream thread is blocked in urlopen.
+            # Close the caller's fd while the stream connection is blocked.
             os.close(fd)
             fd = -1
 
-            # Release so urlopen raises and the error handler writes.
+            # Release so the connection raises and the error handler writes.
             release.set()
             stream.finished_event.wait(timeout=5.0)
             stream.stop()
@@ -749,7 +784,9 @@ class TestSglangMainFlow:
 
         profile_payloads = []
 
-        def capturing_http_json(url, *, headers, payload=None, timeout_s=3600):
+        def capturing_http_json(
+            url, *, headers, payload=None, timeout_s=3600, **_bounds
+        ):
             if url.endswith("/start_profile"):
                 profile_payloads.append(payload)
             return (200, "{}")
@@ -780,7 +817,9 @@ class TestSglangMainFlow:
 
         profile_payloads = []
 
-        def retargeting_http_json(url, *, headers, payload=None, timeout_s=3600):
+        def retargeting_http_json(
+            url, *, headers, payload=None, timeout_s=3600, **_bounds
+        ):
             if url.endswith("/start_profile"):
                 os.rename(chain, original_chain)
                 (chain / "owned" / "capture").mkdir(parents=True)
@@ -812,7 +851,9 @@ class TestSglangMainFlow:
 
         captured_payloads = []
 
-        def capturing_http_json(url, *, headers, payload=None, timeout_s=3600):
+        def capturing_http_json(
+            url, *, headers, payload=None, timeout_s=3600, **_bounds
+        ):
             if payload is not None and "output_dir" in payload:
                 captured_payloads.append(payload)
             return (200, "{}")
@@ -871,6 +912,9 @@ def fake_curl_dir(tmp_path):
     curl_script.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys, stat\n"
+        "if '--version' in sys.argv:\n"
+        "    print('curl 8.4.0 test-shim')\n"
+        "    raise SystemExit(0)\n"
         "output_file = None\n"
         "args = sys.argv[1:]\n"
         'i = 0\n'
