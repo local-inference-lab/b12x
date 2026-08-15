@@ -933,23 +933,6 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         expected_lse,
     )
 
-# ---------------------------------------------------------------------------
-# Issue #157: adversarial metadata-safety gates for dense MLA.
-#
-# These tests prove that no live dense-MLA metadata can produce an OOB
-# table or cache address. Bind performs shape checks only (no host
-# synchronisation, no allocation). Device-side predicates cap visible
-# cache_length at the first invalid page and use the validated request-local
-# page_table[request, 0] fallback for masked gather records on every invocation,
-# protecting CUDA graph replay after metadata mutation.
-#
-# Discrimination strategy: sentinel pages filled with NaN (BF16) or a
-# maximally distinct value (FP8) are placed where the old unguarded kernel
-# would read. The guarded kernel excludes the invalid suffix and the output
-# stays finite / matches the capped safe reference.
-# ---------------------------------------------------------------------------
-
-
 def _tiny_plan(
     device,
     *,
@@ -1816,11 +1799,8 @@ def test_fp8_post_capture_dead_request_zeroes_output() -> None:
 
 
 @torch.inference_mode()
-def test_bf16_slot1_invalid_with_poisoned_page0_matches_capped_reference() -> None:
-    """BF16: slot 0 valid (page 1), slot 1 mutated to -1 after capture.
-    Global page 0 is NaN poison.  Kernel caps cache_length to page_size
-    (only slot 0 valid), masks tokens 16..31.  Output matches the
-    capped reference and is finite despite poisoned page 0."""
+def test_bf16_invalid_page_is_excluded_without_dropping_later_pages() -> None:
+    """Graph replay excludes a bad page while retaining later valid pages."""
     device = require_b12x()
     torch.manual_seed(20260827)
     page_size = 16
@@ -1834,8 +1814,9 @@ def test_bf16_slot1_invalid_with_poisoned_page0_matches_capped_reference() -> No
     cache[0] = float("nan")  # poison global page 0
     cache[1] = (torch.randn(page_size, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     cache[2] = (torch.randn(page_size, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
-    page_table = torch.tensor([[1, 2, 1, 1]], dtype=torch.int32, device=device)
-    cache_seqlens = torch.tensor([2 * page_size], dtype=torch.int32, device=device)
+    cache[3] = (torch.randn(page_size, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
+    page_table = torch.tensor([[1, 2, 3, 1]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([3 * page_size], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
     output = torch.empty(1, HEADS, VALUE_DIM, dtype=torch.bfloat16, device=device)
     binding = dense_mla.bind(
@@ -1864,9 +1845,10 @@ def test_bf16_slot1_invalid_with_poisoned_page0_matches_capped_reference() -> No
     assert bool(torch.isfinite(captured_output).all().item()), (
         "output must be finite — poisoned page 0 was used"
     )
-    capped_seqlens = torch.tensor([page_size], dtype=torch.int32, device=device)
+    packed_page_table = torch.tensor([[1, 3]], dtype=torch.int32, device=device)
+    packed_seqlens = torch.tensor([2 * page_size], dtype=torch.int32, device=device)
     expected_output, expected_lse = dense_mla.reference(
-        q, cache, page_table, capped_seqlens, cu_seqlens_q
+        q, cache, packed_page_table, packed_seqlens, cu_seqlens_q
     )
     _assert_matches(
         captured_output, captured_lse, expected_output, expected_lse

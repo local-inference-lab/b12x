@@ -26,6 +26,7 @@ from b12x._lib.intrinsics import (
     fp8_e4m3_to_f32,
     get_ptr_as_int64,
     ld_shared_f32,
+    ld_shared_i32,
     ld_shared_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
@@ -237,31 +238,61 @@ def qk_bf16(
 @cute.jit
 def mask_and_scale(
     qk,
+    kv_smem_addr: Int32,
     chunk_begin: Int32,
     visible_begin: Int32,
     visible_end: Int32,
     scale_log2: Float32,
     local_warp: Int32,
     lane: Int32,
+    *,
+    record_bytes: cutlass.Constexpr,
+    record_stride_bytes: cutlass.Constexpr,
 ):
-    """Apply K3 causal bounds and convert scores to the base-2 domain."""
+    """Apply page validity and causal bounds, then convert to base 2."""
     gid = lane >> Int32(2)
-    candidate0 = chunk_begin + local_warp * Int32(16) + gid
-    candidate1 = candidate0 + Int32(8)
-    if candidate0 < visible_begin or candidate0 >= visible_end:
+    local_candidate0 = local_warp * Int32(16) + gid
+    local_candidate1 = local_candidate0 + Int32(8)
+    candidate0 = chunk_begin + local_candidate0
+    candidate1 = chunk_begin + local_candidate1
+    marker0 = ld_shared_i32(
+        kv_smem_addr
+        + local_candidate0 * Int32(record_stride_bytes)
+        + Int32(record_bytes)
+    )
+    marker1 = ld_shared_i32(
+        kv_smem_addr
+        + local_candidate1 * Int32(record_stride_bytes)
+        + Int32(record_bytes)
+    )
+    valid0 = Int32(1)
+    valid1 = Int32(1)
+    if (
+        candidate0 < visible_begin
+        or candidate0 >= visible_end
+        or marker0 < Int32(0)
+    ):
+        valid0 = Int32(0)
         qk[0] = Float32(_MASK)
         qk[1] = Float32(_MASK)
-    if candidate1 < visible_begin or candidate1 >= visible_end:
+    if (
+        candidate1 < visible_begin
+        or candidate1 >= visible_end
+        or marker1 < Int32(0)
+    ):
+        valid1 = Int32(0)
         qk[2] = Float32(_MASK)
         qk[3] = Float32(_MASK)
     for idx in cutlass.range_constexpr(4):
         qk[idx] = qk[idx] * scale_log2
-    return qk
+    return qk, valid0, valid1
 
 
 @cute.jit
 def online_softmax(
     qk,
+    valid0: Int32,
+    valid1: Int32,
     p,
     acc,
     global_max,
@@ -297,6 +328,12 @@ def online_softmax(
     p[1] = exp2_approx(qk[1] - local_max1)
     p[2] = exp2_approx(qk[2] - local_max0)
     p[3] = exp2_approx(qk[3] - local_max1)
+    if valid0 == Int32(0):
+        p[0] = Float32(0.0)
+        p[1] = Float32(0.0)
+    if valid1 == Int32(0):
+        p[2] = Float32(0.0)
+        p[3] = Float32(0.0)
     local_sum0 = p[0] + p[2]
     local_sum1 = p[1] + p[3]
     for offset in (4, 8, 16):

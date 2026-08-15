@@ -241,14 +241,17 @@ class DenseMlaForwardKernel:
                         record_stride_bytes=self.layout.record_stride_bytes,
                         qk_dim=self.qk_dim,
                     )
-                qk = mask_and_scale(
+                qk, valid0, valid1 = mask_and_scale(
                     qk,
+                    kv_buffer_addr,
                     chunk_begin,
                     visible_begin,
                     visible_end,
                     score_scale_log2,
                     local_warp,
                     lane,
+                    record_bytes=self.layout.record_bytes,
+                    record_stride_bytes=self.layout.record_stride_bytes,
                 )
                 probability = [
                     Float32(0.0),
@@ -258,6 +261,8 @@ class DenseMlaForwardKernel:
                 ]
                 probability, warp_scale0, warp_scale1 = online_softmax(
                     qk,
+                    valid0,
+                    valid1,
                     probability,
                     accumulator,
                     global_max,
@@ -452,7 +457,8 @@ class DenseMlaForwardKernel:
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
 
-        # Bound graph-live metadata by the actual table and cache capacities.
+        # Bound graph-live metadata by the actual table capacity. A valid first
+        # page provides the request-local source for masked bulk-copy records.
         max_table_tokens = page_table_width * Int32(self.page_size)
         if cache_length > max_table_tokens:
             cache_length = max_table_tokens
@@ -460,29 +466,6 @@ class DenseMlaForwardKernel:
         first_page = Int32(page_table[request.to(Int64) * page_table_stride])
         if first_page < Int32(0) or first_page >= num_cache_pages:
             cache_length = Int32(0)
-
-        valid_pages = Int32(0)
-        required_pages = (cache_length + Int32(self.page_size) - Int32(1)) // Int32(
-            self.page_size
-        )
-        still_valid = Int32(1)
-        page_idx = Int32(0)
-        while page_idx < required_pages:
-            pid = Int32(
-                page_table[
-                    request.to(Int64) * page_table_stride + page_idx.to(Int64)
-                ]
-            )
-            page_is_valid = Int32(0)
-            if pid >= Int32(0) and pid < num_cache_pages:
-                page_is_valid = Int32(1)
-            valid_pages += still_valid * page_is_valid
-            if page_is_valid == Int32(0):
-                still_valid = Int32(0)
-            page_idx += Int32(1)
-        valid_cache_length = valid_pages * Int32(self.page_size)
-        if valid_cache_length < cache_length:
-            cache_length = valid_cache_length
 
         first_valid_chunk = Int32(0)
         visible_chunks_end = cache_length
@@ -538,11 +521,8 @@ class DenseMlaForwardKernel:
                         ] = Float32(-Float32.inf)
                 entry += Int32(self.block_threads)
 
-            # Issue #157: Zero output for non-merge paths.  The merge
-            # kernel already produces zero when all split LSEs are -inf,
-            # but the direct (non-split or active_splits==1) path writes
-            # only LSE.  Without this, a dead request's output retains
-            # stale/NaN data from before replay.
+            # The merge kernel zeroes empty splits. Direct paths must clear
+            # output here so graph replay cannot retain stale values.
             if active_splits <= Int32(1):
                 total_qh = Int32(self.query_tile * HEADS_PER_TILE)
                 flat = tid
