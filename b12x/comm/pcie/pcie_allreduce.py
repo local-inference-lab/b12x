@@ -86,6 +86,10 @@ class PCIeAllReduce:
                 max_concurrent_channels=max_concurrent_channels,
             )
         else:
+            if int(max_concurrent_channels) != 1:
+                raise ValueError(
+                    "hierarchical all-reduce supports exactly one concurrent channel"
+                )
             if max_size < torch.bfloat16.itemsize:
                 raise ValueError("max_size must hold at least one BF16 element")
             runtime = PCIeHierarchicalAllReduce(
@@ -130,15 +134,8 @@ class PCIeAllReduce:
         return self.algorithm == "oneshot"
 
     def prepare_channels(self, channel_ids: Sequence[str]) -> None:
-        """Prepare named owners when the selected runtime supports them.
-
-        The bounded-degree runtime is a single ordered channel whose device
-        generations are graph-capturable, so named owners require no separate
-        allocation.
-        """
-        prepare = getattr(self._runtime, "prepare_channels", None)
-        if prepare is not None:
-            prepare(channel_ids)
+        """Prepare the runtime's semantic channel owners."""
+        self._runtime.prepare_channels(channel_ids)
 
     def for_stream(
         self,
@@ -146,9 +143,7 @@ class PCIeAllReduce:
         *,
         channel_id: Optional[str] = None,
     ):
-        if self.algorithm == "oneshot":
-            return self._runtime.for_stream(stream, channel_id=channel_id)
-        return self._runtime.for_stream(stream)
+        return self._runtime.for_stream(stream, channel_id=channel_id)
 
     def all_reduce(
         self,
@@ -170,6 +165,7 @@ class PCIeAllReduce:
                 out=out,
                 blocks=blocks,
                 stream=stream,
+                channel_id=channel_id,
             )
         if blocks is not None:
             raise ValueError("blocks is only available for hierarchical all-reduce")
@@ -188,12 +184,10 @@ class PCIeAllReduce:
         *,
         channel_id: Optional[str] = None,
     ):
-        capture = (
-            self._runtime.capture(stream=stream, channel_id=channel_id)
-            if self.algorithm == "oneshot"
-            else self._runtime.capture(stream=stream)
-        )
-        with capture as runtime:
+        with self._runtime.capture(
+            stream=stream,
+            channel_id=channel_id,
+        ) as runtime:
             yield runtime
 
     def close(self) -> None:

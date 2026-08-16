@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -282,8 +282,9 @@ class PCIeHierarchicalAllReduce:
         out: Optional[torch.Tensor] = None,
         blocks: Optional[int] = None,
         stream: object = None,
+        channel_id: Optional[str] = None,
     ) -> torch.Tensor:
-        del stream
+        del stream, channel_id
         if not self.should_allreduce(inp):
             raise ValueError(
                 "input does not satisfy hierarchical all-reduce requirements "
@@ -337,7 +338,22 @@ class PCIeHierarchicalAllReduce:
             )
         return out
 
-    def for_stream(self, stream: object = None) -> "PCIeHierarchicalAllReduce":
+    def prepare_channels(self, channel_ids: Sequence[str]) -> None:
+        """Accept semantic owner names without allocating additional channels.
+
+        The hierarchical runtime has one ordered channel. Owner names provide
+        API compatibility for callers that serialize TP12/TP16 collectives;
+        they do not permit overlapping collective streams.
+        """
+
+        del channel_ids
+
+    def for_stream(
+        self,
+        stream: object = None,
+        *,
+        channel_id: Optional[str] = None,
+    ) -> "PCIeHierarchicalAllReduce":
         """Compatibility with the vLLM PCIe runtime interface.
 
         Synchronization generations live in device memory, so captured graphs
@@ -345,12 +361,17 @@ class PCIeHierarchicalAllReduce:
         single ordered channel; callers must not overlap collective streams.
         """
 
-        del stream
+        del stream, channel_id
         return self
 
     @contextmanager
-    def capture(self, stream: object = None):
-        del stream
+    def capture(
+        self,
+        stream: object = None,
+        *,
+        channel_id: Optional[str] = None,
+    ):
+        del stream, channel_id
         yield self
 
     def register_graph_buffers(self) -> None:

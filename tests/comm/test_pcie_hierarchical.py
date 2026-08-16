@@ -14,6 +14,7 @@ from b12x.comm.pcie.pcie_allreduce import (
     _algorithm_for_world_size,
 )
 from b12x.comm.pcie.pcie_hierarchical import (
+    PCIeHierarchicalAllReduce,
     _buffer_modes_from_env,
     _make_layout,
     _pick_blocks,
@@ -105,6 +106,30 @@ def test_allreduce_factory_forwards_oneshot_channel_capacity(
     )
 
 
+@pytest.mark.parametrize("max_concurrent_channels", [0, 2])
+def test_allreduce_factory_rejects_hierarchical_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+    max_concurrent_channels: int,
+) -> None:
+    hierarchy_factory = MagicMock()
+    exchange_group = object()
+    monkeypatch.setattr(pcie_allreduce.dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(
+        pcie_allreduce,
+        "PCIeHierarchicalAllReduce",
+        hierarchy_factory,
+    )
+
+    with pytest.raises(ValueError, match="exactly one concurrent channel"):
+        PCIeAllReduce.from_exchange_group(
+            exchange_group=exchange_group,  # type: ignore[arg-type]
+            device="cuda:0",
+            max_concurrent_channels=max_concurrent_channels,
+        )
+
+    hierarchy_factory.assert_not_called()
+
+
 def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
     runtime = MagicMock()
     runtime.rank = 0
@@ -135,7 +160,15 @@ def test_allreduce_oneshot_forwards_named_channel_contract() -> None:
 
 def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
     runtime = MagicMock(
-        spec=["rank", "world_size", "device", "for_stream", "all_reduce", "capture"]
+        spec=[
+            "rank",
+            "world_size",
+            "device",
+            "prepare_channels",
+            "for_stream",
+            "all_reduce",
+            "capture",
+        ]
     )
     runtime.rank = 0
     runtime.world_size = 16
@@ -151,14 +184,26 @@ def test_allreduce_hierarchy_accepts_named_channel_contract() -> None:
     with allreduce.capture(stream, channel_id="target"):
         pass
 
-    runtime.for_stream.assert_called_once_with(stream)
+    runtime.prepare_channels.assert_called_once_with(("target", "draft"))
+    runtime.for_stream.assert_called_once_with(stream, channel_id="target")
     runtime.all_reduce.assert_called_once_with(
         inp,
         out=out,
         blocks=None,
         stream=stream,
+        channel_id="target",
     )
-    runtime.capture.assert_called_once_with(stream=stream)
+    runtime.capture.assert_called_once_with(stream=stream, channel_id="target")
+
+
+def test_hierarchical_named_channel_surface_remains_serial() -> None:
+    runtime = object.__new__(PCIeHierarchicalAllReduce)
+    stream = object()
+
+    runtime.prepare_channels(("target", "draft"))
+    assert runtime.for_stream(stream, channel_id="target") is runtime
+    with runtime.capture(stream, channel_id="draft") as captured:
+        assert captured is runtime
 
 
 @pytest.mark.parametrize("world_size", [1, 3, 10, 14, 20])
