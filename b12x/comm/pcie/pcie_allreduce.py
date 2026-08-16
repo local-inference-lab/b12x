@@ -277,8 +277,6 @@ class PCIeAllReduce:
     def _use_island_rs(
         self,
         inp: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
     ) -> bool:
         """Route aligned large messages to the equal-quarter runtime.
 
@@ -302,13 +300,6 @@ class PCIeAllReduce:
         hierarchy_accepts = self._runtime.should_allreduce(inp)
         if not hierarchy_accepts:
             return True
-        # CUDA graph capture cannot create a stable output allocation for the
-        # equal-quarter runtime. Automatic dispatch therefore keeps implicit-
-        # output calls on the hierarchy, whose output allocation is owned by
-        # the captured PyTorch graph. Explicit-output calls remain eligible for
-        # the equal-quarter path.
-        if out is None and getattr(self._island_rs, "capture_active", False) is True:
-            return False
         return (
             inp.numel() > ISLAND_RS_CROSSOVER_ELEMENTS
             and inp.numel() % ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS == 0
@@ -334,7 +325,7 @@ class PCIeAllReduce:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"
                 )
-            if self._use_island_rs(inp, out=out):
+            if self._use_island_rs(inp):
                 return self._island_rs.all_reduce(
                     inp,
                     out=out,
@@ -367,14 +358,16 @@ class PCIeAllReduce:
         channel_id: Optional[str] = None,
     ):
         with ExitStack() as stack:
-            runtime = stack.enter_context(
+            stack.enter_context(
                 self._runtime.capture(stream=stream, channel_id=channel_id)
             )
             if self._island_rs is not None:
                 stack.enter_context(
                     self._island_rs.capture(stream=stream, channel_id=channel_id)
                 )
-            yield runtime
+            # Callers must retain message-size dispatch while recording a
+            # graph; yielding the hierarchy would bypass the island runtime.
+            yield self
 
     def close(self) -> None:
         if self._island_rs is not None:

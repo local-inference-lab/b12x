@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -156,24 +157,34 @@ def test_tp16_auto_routes_by_message_size() -> None:
     )
 
 
-def test_island_capture_rejects_implicit_output_allocation() -> None:
+def test_island_capture_allocates_implicit_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = PCIeIslandRSAllReduce.__new__(PCIeIslandRSAllReduce)
     runtime._closed = False
-    runtime._capture_depth = 0
     runtime.device = torch.device("cpu")
     runtime.max_elements = 8
+    runtime.blocks = None
+    runtime._launcher = MagicMock()
+    runtime._slab_ptrs = ()
+    runtime.stage_offset = 0
+    runtime.part_offset = 0
+    runtime.final_offset = 0
+    runtime.quarter_capacity = 2
     inp = torch.empty(8, dtype=torch.bfloat16)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
 
-    with (
-        runtime.capture(),
-        pytest.raises(RuntimeError, match="preallocated output"),
-    ):
-        runtime.all_reduce(inp)
+    with runtime.capture() as captured:
+        out = captured.all_reduce(inp)
 
-    assert runtime._capture_depth == 0
+    assert captured is runtime
+    assert out.shape == inp.shape
+    assert out.dtype == inp.dtype
+    assert out.device == inp.device
+    runtime._launcher.assert_called_once()
 
 
-def test_tp16_auto_capture_without_output_uses_hierarchy() -> None:
+def test_tp16_auto_implicit_output_uses_island_for_large_aligned_input() -> None:
     hierarchy = MagicMock()
     hierarchy.rank = 0
     hierarchy.world_size = 16
@@ -181,20 +192,36 @@ def test_tp16_auto_capture_without_output_uses_hierarchy() -> None:
     hierarchy.should_allreduce.return_value = True
     island = MagicMock()
     island.should_allreduce.return_value = True
-    island.capture_active = True
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
     inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
 
     allreduce.all_reduce(inp)
 
-    hierarchy.all_reduce.assert_called_once_with(
+    island.all_reduce.assert_called_once_with(
         inp,
         out=None,
         blocks=None,
         stream=None,
         channel_id=None,
     )
-    island.all_reduce.assert_not_called()
+    hierarchy.all_reduce.assert_not_called()
+
+
+def test_tp16_capture_returns_dispatcher() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.capture.return_value = nullcontext(hierarchy)
+    island = MagicMock()
+    island.capture.return_value = nullcontext(island)
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+
+    with allreduce.capture(stream="17", channel_id="target") as captured:
+        assert captured is allreduce
+
+    hierarchy.capture.assert_called_once_with(stream="17", channel_id="target")
+    island.capture.assert_called_once_with(stream="17", channel_id="target")
 
 
 def test_tp16_forced_island_routes_below_crossover(

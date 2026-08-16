@@ -124,7 +124,6 @@ class PCIeIslandRSAllReduce:
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
-        self._capture_depth = 0
         self._launcher = None
         self._mapped_peers = island_rs_peers(self.rank, self.world_size)
 
@@ -176,12 +175,6 @@ class PCIeIslandRSAllReduce:
 
         return self._mapped_peers
 
-    @property
-    def capture_active(self) -> bool:
-        """Whether the runtime is recording work into a CUDA graph."""
-
-        return self._capture_depth > 0
-
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         return (
             not self._closed
@@ -209,11 +202,9 @@ class PCIeIslandRSAllReduce:
                 f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
             )
         if out is None:
-            if self._capture_depth:
-                raise RuntimeError(
-                    "island reduce-scatter requires a preallocated output "
-                    "during CUDA graph capture"
-                )
+            # During CUDA graph capture, PyTorch allocates this tensor from the
+            # graph-private pool. The captured graph retains a fixed address
+            # and replays without allocator activity.
             out = torch.empty_like(inp)
         if (
             out.dtype != inp.dtype
@@ -273,20 +264,16 @@ class PCIeIslandRSAllReduce:
         channel_id: Optional[str] = None,
     ):
         self.for_stream(stream, channel_id=channel_id)
-        self._capture_depth += 1
-        try:
-            if stream is None:
+        if stream is None:
+            yield self
+        else:
+            torch_stream = (
+                stream
+                if hasattr(stream, "cuda_stream")
+                else torch.cuda.ExternalStream(int(stream), device=self.device)
+            )
+            with torch.cuda.stream(torch_stream):
                 yield self
-            else:
-                torch_stream = (
-                    stream
-                    if hasattr(stream, "cuda_stream")
-                    else torch.cuda.ExternalStream(int(stream), device=self.device)
-                )
-                with torch.cuda.stream(torch_stream):
-                    yield self
-        finally:
-            self._capture_depth -= 1
 
     def register_graph_buffers(self) -> None:
         return None

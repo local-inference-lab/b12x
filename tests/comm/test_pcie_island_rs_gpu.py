@@ -9,9 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from b12x.comm.pcie.pcie_allreduce import (
-    ISLAND_RS_CROSSOVER_ELEMENTS,
     ISLAND_RS_MAX_BYTES,
-    ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS,
     PCIeAllReduce,
 )
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
@@ -119,6 +117,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             max_size=ISLAND_RS_MAX_BYTES,
         )
         assert runtime.algorithm == "hierarchical"
+        assert runtime._algorithm_override == "island_rs"
         assert runtime._island_rs is not None
         assert runtime._island_rs.mapped_peer_count == 6
         assert runtime._island_rs.mapped_peers == island_rs_peers(rank, world_size)
@@ -156,11 +155,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             inputs_before,
             strict=True,
         ):
-            use_island = (
-                inp.numel() > ISLAND_RS_CROSSOVER_ELEMENTS
-                and inp.numel() % ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS == 0
-            )
-            assert runtime._use_island_rs(inp) is use_island
+            assert runtime._use_island_rs(inp)
             actual = runtime.all_reduce(inp, out=out)
             assert actual is out
             torch.cuda.synchronize(device)
@@ -222,6 +217,39 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             strict=True,
         ):
             _assert_result(out, expected, inp, before)
+
+        implicit_index = SHAPES.index(28_672)
+        implicit_graph = torch.cuda.CUDAGraph()
+        implicit_stream = torch.cuda.Stream(device=device)
+        with runtime.capture(
+            stream=implicit_stream,
+            channel_id="target-implicit-output",
+        ) as captured:
+            assert captured is runtime
+            with torch.cuda.graph(implicit_graph, stream=implicit_stream):
+                implicit_output = captured.all_reduce(
+                    inputs[implicit_index],
+                    stream=implicit_stream,
+                    channel_id="target-implicit-output",
+                )
+        implicit_output_ptr = implicit_output.data_ptr()
+        implicit_graph_pool = implicit_graph.pool()
+        implicit_output.fill_(float("nan"))
+        torch.cuda.synchronize(device)
+        implicit_allocator_before = _allocator_replay_state(device)
+        for _ in range(100):
+            implicit_graph.replay()
+        torch.cuda.synchronize(device)
+        implicit_allocator_after = _allocator_replay_state(device)
+        assert implicit_allocator_after == implicit_allocator_before
+        assert implicit_output.data_ptr() == implicit_output_ptr
+        assert implicit_graph.pool() == implicit_graph_pool
+        _assert_result(
+            implicit_output,
+            references[implicit_index],
+            inputs[implicit_index],
+            inputs_before[implicit_index],
+        )
     finally:
         if runtime is not None:
             runtime.close()
