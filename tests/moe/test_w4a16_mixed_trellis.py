@@ -11,6 +11,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mixed_trellis_module
 from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
@@ -27,6 +28,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     _check_descriptor_projection_counts,
     _mixed_route_num_experts,
     _validate_mixed_trellis_tier_storage,
+    bind_mixed_trellis3,
     build_ordered_maps,
     build_projection_tiered_maps,
     build_tiered_maps,
@@ -36,7 +38,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     make_mixed_trellis_buffers,
     make_mixed_trellis3_buffers,
     run_mixed_trellis,
-    run_mixed_trellis3,
+    run_bound_mixed_trellis3,
     warmup_mixed_trellis_route_pack,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
@@ -561,7 +563,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_mixed_k3_k4_k5_matches_serial_and_captures() -> None:
+def test_mixed_k3_k4_k5_matches_serial_and_captures(monkeypatch) -> None:
     """Validate MCG K5 dispatch and graph replay in the shared mixed grid."""
 
     torch.manual_seed(20260809)
@@ -630,29 +632,37 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures() -> None:
     other_codebook = "sqg_xor_cheb_t12" if codebook == "mcg" else "mcg"
     mismatched_tier0 = replace(tiers[0], trellis_codebook=other_codebook)
     with pytest.raises(ValueError, match="launch-plan codebook"):
-        run_mixed_trellis3(
-            x,
+        bind_mixed_trellis3(
             mismatched_tier0,
             tiers[1],
             tiers[2],
-            topk_weights,
-            topk_ids,
             global_to_combined,
             descriptor,
             rotations,
             launch,
-            buffers,
         )
 
-    eager = run_mixed_trellis3(
-        x,
+    binding = bind_mixed_trellis3(
         *tiers,
-        topk_weights,
-        topk_ids,
         global_to_combined,
         descriptor,
         rotations,
         launch,
+    )
+
+    def reject_revalidation(**_kwargs):
+        raise AssertionError("bound execution repeated fixed-artifact validation")
+
+    monkeypatch.setattr(
+        mixed_trellis_module,
+        "_validate_mixed_trellis_tier_storage",
+        reject_revalidation,
+    )
+    eager = run_bound_mixed_trellis3(
+        x,
+        topk_weights,
+        topk_ids,
+        binding,
         buffers,
     ).clone()
     torch.cuda.synchronize(device)
@@ -660,15 +670,11 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures() -> None:
     relative = (eager - serial).norm() / serial.norm().clamp_min(1.0e-12)
     assert float(relative) < 4.0e-3
 
-    repeated = run_mixed_trellis3(
+    repeated = run_bound_mixed_trellis3(
         x,
-        *tiers,
         topk_weights,
         topk_ids,
-        global_to_combined,
-        descriptor,
-        rotations,
-        launch,
+        binding,
         buffers,
     )
     torch.cuda.synchronize(device)
@@ -676,15 +682,11 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run_mixed_trellis3(
+        captured = run_bound_mixed_trellis3(
             x,
-            *tiers,
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            rotations,
-            launch,
+            binding,
             buffers,
         )
     graph.replay()
@@ -882,19 +884,23 @@ def test_projection_padded_k345_runner_matches_serial_and_captures() -> None:
         launch, device=device, sms=int(props.multi_processor_count)
     )
 
+    binding = bind_mixed_trellis3(
+        *runner_tiers,
+        global_to_combined,
+        descriptor,
+        rotations,
+        launch,
+        gate_experts=(3, 2, 1),
+        up_experts=(3, 2, 1),
+    )
+
     def run() -> torch.Tensor:
-        return run_mixed_trellis3(
+        return run_bound_mixed_trellis3(
             x,
-            *runner_tiers,
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            rotations,
-            launch,
+            binding,
             buffers,
-            gate_experts=(3, 2, 1),
-            up_experts=(3, 2, 1),
         )
 
     eager = run().clone()
