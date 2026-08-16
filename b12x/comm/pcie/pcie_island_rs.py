@@ -176,6 +176,12 @@ class PCIeIslandRSAllReduce:
 
         return self._mapped_peers
 
+    @property
+    def capture_active(self) -> bool:
+        """Whether the runtime is recording work into a CUDA graph."""
+
+        return self._capture_depth > 0
+
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         return (
             not self._closed

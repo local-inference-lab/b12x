@@ -41,7 +41,7 @@ def test_allreduce_uses_bounded_degree_path_for_large_worlds(
     assert _algorithm_for_world_size(world_size) == "hierarchical"
 
 
-def test_allreduce_factory_builds_tp16_hierarchy(
+def test_allreduce_factory_keeps_tp16_equal_quarter_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = SimpleNamespace(
@@ -78,6 +78,15 @@ def test_allreduce_factory_builds_tp16_hierarchy(
         max_elements=8 * 1024,
         ext_module=None,
     )
+    island_factory.assert_not_called()
+    assert allreduce._island_rs is None
+
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "island_rs")
+    allreduce = PCIeAllReduce.from_exchange_group(
+        exchange_group=exchange_group,  # type: ignore[arg-type]
+        device="cuda:0",
+        max_size=16 * 1024,
+    )
     island_factory.assert_called_once_with(
         exchange_group=exchange_group,
         device="cuda:0",
@@ -91,7 +100,7 @@ def test_allreduce_factory_builds_tp16_hierarchy(
     [
         (8, "auto", 84 * 1024),
         (12, "auto", 84 * 1024),
-        (16, "auto", ISLAND_RS_MAX_BYTES),
+        (16, "auto", 84 * 1024),
         (16, "island_rs", ISLAND_RS_MAX_BYTES),
         (16, "hierarchical", 84 * 1024),
     ],
@@ -162,6 +171,30 @@ def test_island_capture_rejects_implicit_output_allocation() -> None:
         runtime.all_reduce(inp)
 
     assert runtime._capture_depth == 0
+
+
+def test_tp16_auto_capture_without_output_uses_hierarchy() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = True
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    island.capture_active = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
+
+    allreduce.all_reduce(inp)
+
+    hierarchy.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+    island.all_reduce.assert_not_called()
 
 
 def test_tp16_forced_island_routes_below_crossover(

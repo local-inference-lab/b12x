@@ -47,7 +47,7 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 
 
 def _algorithm_override() -> str:
-    """``auto`` picks per message size; the others pin one implementation."""
+    """Select the established runtime or opt into an alternate implementation."""
 
     choice = os.getenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "auto").strip().lower()
     if choice not in ("auto", "hierarchical", "island_rs"):
@@ -61,11 +61,14 @@ def _algorithm_override() -> str:
 def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -> int:
     """Largest all-reduce this runtime expects to win at, for this world size.
 
-    Callers use this policy without duplicating world-size- and
-    implementation-specific thresholds.
+    Callers that force the equal-quarter implementation advertise its complete
+    qualified capacity. Automatic consumers retain their existing limit
+    because a CUDA-graph caller without explicit output storage cannot use the
+    equal-quarter implementation for large messages and may otherwise replace
+    a faster fallback collective with hierarchical all-reduce.
     """
 
-    if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() != "hierarchical":
+    if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() == "island_rs":
         return max(default, ISLAND_RS_MAX_BYTES)
     return default
 
@@ -188,18 +191,22 @@ class PCIeAllReduce:
         max_size: int,
         algorithm_override: str,
     ) -> Any:
-        """Attach the equal-quarter runtime when topology and policy allow it.
+        """Attach the equal-quarter runtime after an explicit policy opt-in.
 
-        Capacity includes :data:`ISLAND_RS_MAX_BYTES` independently of the
-        caller's ``max_size`` so the dispatcher covers the complete crossover
-        band. A coordinated construction failure leaves every rank on the
-        hierarchical runtime and records the reason in the process log.
+        Opt-in capacity includes :data:`ISLAND_RS_MAX_BYTES` independently of
+        the caller's ``max_size``. A coordinated construction failure leaves
+        every rank on the hierarchical runtime and records the reason in the
+        process log.
         """
 
         world_size = dist.get_world_size(group=exchange_group)
         if world_size not in ISLAND_RS_WORLD_SIZES:
             return None
-        if algorithm_override == "hierarchical":
+        # The equal-quarter runtime owns an additional CUDA IPC slab and has a
+        # stricter CUDA-graph output contract than the hierarchical runtime.
+        # Construct it only for an explicit opt-in so unrelated auxiliary IPC
+        # collectives retain the established peer-mapping and setup behavior.
+        if algorithm_override != "island_rs":
             return None
         capacity = max(int(max_size), ISLAND_RS_MAX_BYTES)
         elements = capacity // torch.bfloat16.itemsize
@@ -267,7 +274,12 @@ class PCIeAllReduce:
             self._island_rs.for_stream(stream, channel_id=channel_id)
         return self._runtime.for_stream(stream, channel_id=channel_id)
 
-    def _use_island_rs(self, inp: torch.Tensor) -> bool:
+    def _use_island_rs(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> bool:
         """Route aligned large messages to the equal-quarter runtime.
 
         Small ones stay on the hierarchy, whose critical path is shorter for the
@@ -287,8 +299,16 @@ class PCIeAllReduce:
             return False
         if override == "island_rs":
             return True
-        if not self._runtime.should_allreduce(inp):
+        hierarchy_accepts = self._runtime.should_allreduce(inp)
+        if not hierarchy_accepts:
             return True
+        # CUDA graph capture cannot create a stable output allocation for the
+        # equal-quarter runtime. Automatic dispatch therefore keeps implicit-
+        # output calls on the hierarchy, whose output allocation is owned by
+        # the captured PyTorch graph. Explicit-output calls remain eligible for
+        # the equal-quarter path.
+        if out is None and getattr(self._island_rs, "capture_active", False) is True:
+            return False
         return (
             inp.numel() > ISLAND_RS_CROSSOVER_ELEMENTS
             and inp.numel() % ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS == 0
@@ -314,7 +334,7 @@ class PCIeAllReduce:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"
                 )
-            if self._use_island_rs(inp):
+            if self._use_island_rs(inp, out=out):
                 return self._island_rs.all_reduce(
                     inp,
                     out=out,
