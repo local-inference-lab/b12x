@@ -4,10 +4,10 @@
   "captured_at_utc": "2026-08-16",
   "source": {
     "b12x_repository": "https://github.com/local-inference-lab/b12x.git",
-    "b12x_revision": "e846e16392da980ab6c65193fada13c6e5c7ad31",
-    "b12x_tree": "0cbf988efabed95456eb67c46e286a2d1782f569",
+    "b12x_revision": "33c43ef568ac4dc7633a91fcf566ebeca5e8d611",
+    "b12x_tree": "388208184c3d6194f8d1deceef92e6605baea4cc",
     "benchmark": "benchmarks/benchmark_kimi_k3_pair_topk.py",
-    "benchmark_sha256": "ad699635cfa242a526f81dbb1774255030f5c55548bb0c6e5c2b08e96fa58814",
+    "benchmark_sha256": "4f7aef5e8609d6a0c4051f8b73aea6cf3fb92a93fe6971cca4c7e92ff711ea42",
     "vllm_repository": "https://github.com/local-inference-lab/vllm.git",
     "vllm_revision": "ad848fc4141f201489db18d5453c50b312245a0a",
     "container_image": "voipmonitor/vllm:kimi-k3-ii-vllmf21a391-b12x3be8bc7-cu133-torch213-20260816-r2",
@@ -43,15 +43,15 @@
     "observed_sm_clock_mhz": [2707, 2902],
     "observed_memory_clock_mhz": 13365
   },
-  "command": "docker run --gpus all --network host --ipc host --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864 --entrypoint /bin/bash -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e NCCL_IB_DISABLE=1 -e NCCL_P2P_LEVEL=SYS -v $PWD:/work:ro -v $B12X_CACHE_DIR:/cache/jit -w /work voipmonitor/vllm:kimi-k3-ii-vllmf21a391-b12x3be8bc7-cu133-torch213-20260816-r2 -lc 'unset NCCL_GRAPH_FILE; export PYTHONPATH=/work:/opt/kimi-k3-qsrt/vllm:${PYTHONPATH:-}; /opt/venv/bin/python benchmarks/benchmark_kimi_k3_pair_topk.py --world-size 16 --batch 8 --topk-threads 256 --warmup 100000 --iterations 10000 --samples 5'",
+  "command": "docker run --gpus all --network host --ipc host --shm-size 32g --ulimit memlock=-1 --ulimit stack=67108864 --entrypoint /bin/bash -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e NCCL_IB_DISABLE=1 -e NCCL_P2P_LEVEL=SYS -v $PWD:/work:ro -v $B12X_CACHE_DIR:/cache/jit -w /work voipmonitor/vllm:kimi-k3-ii-vllmf21a391-b12x3be8bc7-cu133-torch213-20260816-r2 -lc 'unset NCCL_GRAPH_FILE; export PYTHONPATH=/work:/opt/kimi-k3-qsrt/vllm:${PYTHONPATH:-}; /opt/venv/bin/python benchmarks/benchmark_kimi_k3_pair_topk.py --world-size 16 --batch 8 --topk-threads 256 --warmup 100 --iterations 1000 --samples 5'",
   "configuration": {
     "tensor_parallel_world_size": 16,
     "token_rows": 8,
     "experts": 896,
     "selected_experts": 16,
     "topk_threads": 256,
-    "warmup_replays_per_graph": 100000,
-    "timed_replays_per_sample": 10000,
+    "warmup_replays_per_graph": 100,
+    "timed_replays_per_sample": 1000,
     "samples_per_arm": 5,
     "arm_order": "alternating reference-first and B12X-first"
   },
@@ -61,29 +61,29 @@
     "near_ties": "expert IDs, FP32 weights, and gathered BF16 projection data match exactly",
     "nonfinite_wide_range": "expert IDs, FP32 weights, finite masks, nonzero masks, and gathered BF16 projection data match exactly",
     "all_negative_infinity": "B12X returns 16 distinct in-range expert IDs per row; FP32 weights, finite masks, nonzero masks, and gathered BF16 projection data match exactly; the vLLM reduction does not define which 16 experts win a complete tie",
-    "cuda_graph_replay": "random-input expert IDs, FP32 weights, and gathered BF16 projection data match exactly",
+    "cuda_graph_replay": "random, tied, near-tied, wide nonfinite, and all-negative-infinity inputs preserve the eager routing contract, finite positive normalized FP32 weights, gathered BF16 projection data, tensor addresses, and allocator usage",
     "targeted_tests": "19 passed, 44 deselected"
   },
   "timing_microseconds": {
     "reference_samples": [
-      54.81452360399999,
-      54.87537989974953,
-      54.82706969487481,
-      54.81560080079362,
-      54.90596489980817
+      55.18312403000891,
+      55.37262401776388,
+      55.55178300710395,
+      55.544102971907705,
+      55.51176401786506
     ],
     "b12x_samples": [
-      41.14031749777496,
-      41.1387074040249,
-      41.10038360231556,
-      41.14788370206952,
-      41.12227589939721
+      41.79493500851095,
+      41.621115000452846,
+      41.919035953469574,
+      41.90381499938667,
+      41.926354984752834
     ],
-    "reference_median": 54.82706969487481,
-    "b12x_median": 41.1387074040249,
-    "saved_median": 13.68836229084991,
-    "speedup": 1.332737,
+    "reference_median": 55.51176401786506,
+    "b12x_median": 41.90381499938667,
+    "saved_median": 13.60794901847839,
+    "speedup": 1.324742,
     "speedup_definition": "reference_median / b12x_median; values greater than one mean the B12X path is faster"
   },
-  "conclusion": "The B12X batched operation is exact for defined expert-order cases, preserves distinct experts for a fully degenerate tie, satisfies CUDA Graph replay requirements, and reduces median TP16 batch-8 gather-plus-selection latency by 24.97 percent."
+  "conclusion": "The B12X batched operation is exact for defined expert-order cases, preserves distinct experts for a fully degenerate tie, satisfies CUDA Graph replay requirements across every tested score class, and reduces median TP16 batch-8 gather-plus-selection latency by 24.51 percent."
 }
