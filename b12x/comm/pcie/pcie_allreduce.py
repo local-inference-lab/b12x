@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from typing import Any, Optional, Sequence
 
 import torch
@@ -369,8 +369,7 @@ class PCIeAllReduce:
 
     def close(self) -> None:
         if self._island_rs is not None:
-            with suppress(Exception):
-                self._island_rs.close()
+            self._island_rs.close()
             self._island_rs = None
         self._runtime.close()
 

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
+import b12x.comm.pcie.pcie_island_rs as pcie_island_rs
 from b12x.comm.pcie import _hierarchical_cute
 from b12x.comm.pcie.pcie_allreduce import (
     ISLAND_RS_MAX_BYTES,
@@ -183,6 +184,79 @@ def test_island_capture_allocates_implicit_output(
     assert out.dtype == inp.dtype
     assert out.device == inp.device
     runtime._launcher.assert_called_once()
+
+
+def test_island_close_coordinates_ipc_teardown_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = PCIeIslandRSAllReduce.__new__(PCIeIslandRSAllReduce)
+    runtime._closed = False
+    runtime.device = torch.device("cuda:0")
+    runtime.group = object()
+    runtime._slab_ptrs = (101, 102, 303)
+    runtime._remote_ptrs = [101, 102]
+    runtime._local_ptr = 303
+    runtime._ipc = MagicMock()
+    events = []
+
+    def close_remote(ptr: int) -> None:
+        assert runtime._slab_ptrs == ()
+        events.append(("close", ptr))
+
+    def free_local(ptr: int) -> None:
+        assert runtime._remote_ptrs == []
+        events.append(("free", ptr))
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device: events.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        pcie_island_rs.dist,
+        "barrier",
+        lambda *, group: events.append(("barrier", group)),
+    )
+    runtime._ipc.cudaIpcCloseMemHandle.side_effect = close_remote
+    runtime._ipc.cudaFree.side_effect = free_local
+
+    runtime.close()
+    runtime.close()
+
+    assert events == [
+        ("synchronize", runtime.device),
+        ("barrier", runtime.group),
+        ("close", 101),
+        ("close", 102),
+        ("barrier", runtime.group),
+        ("free", 303),
+        ("barrier", runtime.group),
+    ]
+    assert runtime._closed
+    assert runtime._slab_ptrs == ()
+    assert runtime._remote_ptrs == []
+    assert runtime._local_ptr == 0
+
+
+def test_allreduce_close_propagates_island_teardown_error() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    island = MagicMock()
+    island.close.side_effect = RuntimeError("island teardown failed")
+    allreduce = PCIeAllReduce(
+        hierarchy,
+        "hierarchical",
+        island,
+        algorithm_override="island_rs",
+    )
+
+    with pytest.raises(RuntimeError, match="island teardown failed"):
+        allreduce.close()
+
+    hierarchy.close.assert_not_called()
+    assert allreduce._island_rs is island
 
 
 def test_tp16_auto_implicit_output_uses_island_for_large_aligned_input() -> None:

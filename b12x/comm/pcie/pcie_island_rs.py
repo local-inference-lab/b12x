@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from typing import Optional, Sequence
 
 import torch
@@ -283,16 +283,17 @@ class PCIeIslandRSAllReduce:
             return
         self._closed = True
         if self.device.type == "cuda":
-            with suppress(Exception):
-                torch.cuda.synchronize(self.device)
+            torch.cuda.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self._slab_ptrs = ()
         for ptr in self._remote_ptrs:
-            with suppress(Exception):
-                self._ipc.cudaIpcCloseMemHandle(ptr)
+            self._ipc.cudaIpcCloseMemHandle(ptr)
         self._remote_ptrs.clear()
+        dist.barrier(group=self.group)
         if self._local_ptr:
-            with suppress(Exception):
-                self._ipc.cudaFree(self._local_ptr)
+            self._ipc.cudaFree(self._local_ptr)
             self._local_ptr = 0
+        dist.barrier(group=self.group)
 
 
 __all__ = [
