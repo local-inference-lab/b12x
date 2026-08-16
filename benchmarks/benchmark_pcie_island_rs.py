@@ -590,16 +590,16 @@ def _worker(
                 graphs[name] = graph
                 correctness[name] = {"eager": eager, "capture": captured}
 
-            cold_order = (
+            first_timed_replay_order = (
                 IMPLEMENTATIONS
                 if shape_index % 2 == 0
                 else tuple(reversed(IMPLEMENTATIONS))
             )
-            cold_samples: dict[str, list[float]] = {
+            first_timed_replay_samples: dict[str, list[float]] = {
                 name: [] for name in IMPLEMENTATIONS
             }
-            for name in cold_order:
-                cold_samples[name].append(
+            for name in first_timed_replay_order:
+                first_timed_replay_samples[name].append(
                     _rank_max_graph_latency(graphs[name], device, iterations=1)
                 )
 
@@ -624,7 +624,9 @@ def _worker(
                     "correctness": correctness[name],
                     "input_data_ptr": inp.data_ptr(),
                     "output_data_ptr": outputs[name].data_ptr(),
-                    "cold_rank_max_microseconds": cold_samples[name],
+                    "first_timed_replay_rank_max_microseconds": (
+                        first_timed_replay_samples[name]
+                    ),
                     "warm_rank_max_microseconds": raw,
                     "median_warm_rank_max_microseconds": float(statistics.median(raw)),
                     "minimum_warm_rank_max_microseconds": min(raw),
@@ -646,7 +648,9 @@ def _worker(
                     "automatic_dispatch": automatic_dispatch,
                     "elements": elements,
                     "bytes": elements * torch.bfloat16.itemsize,
-                    "cold_measurement_order": list(cold_order),
+                    "first_timed_replay_measurement_order": list(
+                        first_timed_replay_order
+                    ),
                     "warm_sample_measurement_order": measured_order,
                     "implementations": arms,
                     "hierarchical_latency_divided_by_equal_quarter_latency": ratio,
@@ -803,10 +807,11 @@ resident. It does not measure end-to-end model throughput.
 
 Both implementations use the same source revision. Each captured CUDA graph is
 replayed and correctness-validated before timed samples. Warm samples alternate
-AB and BA order with equal position counts. The receipt records every cold and
-warm rank-maximum sample, the per-sample order, source hashes, compile manifests
-and objects, PTXAS identity, physical GPU UUIDs, clocks, modes, and correctness
-results.
+AB and BA order with equal position counts. The first timed replay follows the
+correctness replay and is not a cold-start measurement. The receipt records
+every first-timed-replay and warm rank-maximum sample, the per-sample order,
+source hashes, compile manifests and objects, PTXAS identity, physical GPU
+UUIDs, clocks, modes, and correctness results.
 
 ## Results
 
@@ -968,8 +973,8 @@ def main() -> None:
         "captured_graph_replays_validated_before_timing": (
             _captured_graph_replays_validated(results)
         ),
-        "raw_cold_samples_recorded": all(
-            len(arm["cold_rank_max_microseconds"]) == 1
+        "first_timed_replay_samples_recorded": all(
+            len(arm["first_timed_replay_rank_max_microseconds"]) == 1
             for result in results
             for arm in result["implementations"].values()
         ),
@@ -1013,7 +1018,7 @@ def main() -> None:
         *sys.argv[1:],
     ]
     receipt = {
-        "schema": "b12x.tp16-pcie-equal-quarter-benchmark.v3",
+        "schema": "b12x.tp16-pcie-equal-quarter-benchmark.v4",
         "status": status,
         "artifact_kind": "B12X TP16 PCIe all-reduce benchmark receipt",
         "captured_at_utc": datetime.now(UTC).isoformat(),
