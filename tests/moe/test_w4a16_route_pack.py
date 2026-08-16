@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+import b12x.moe._shared.kernels.w4a16.route_pack as route_pack_module
 from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
@@ -81,8 +82,8 @@ def _expected_route_pack(
 def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
     """A fixed-capacity serving arena must not specialize every tail length.
 
-    With a 1536-token serving capacity, top-k 16, and E=896, a 1177-token
-    prefill tail belongs to the 2048-token compile bucket. That bucket exceeds
+    With a 1536-token serving capacity, top-k 16, and 896 experts, a
+    1177-token prefill tail belongs to the 2048-token compile bucket. That bucket
     the fixed arena even though the arena safely covers the live tail. Reuse
     the caller's full capacity so startup warmup and runtime select the same
     Triton constexprs instead of compiling an exact tail specialization.
@@ -100,24 +101,108 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
         bucket_tokens=False,
     )
     device = torch.device("cuda")
+    topk_ids = (
+        torch.arange(tail_tokens * topk, dtype=torch.int32, device=device)
+        .reshape(tail_tokens, topk)
+        .remainder_(num_experts)
+    )
     packed_routes = torch.empty(max_routes, dtype=torch.int32, device=device)
     block_experts = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    packed_route_count = torch.empty(1, dtype=torch.int32, device=device)
 
-    returned_routes, returned_blocks, _ = pack_topk_routes_by_expert(
-        torch.zeros((tail_tokens, topk), dtype=torch.int32, device=device),
+    returned_routes, returned_blocks, returned_count = pack_topk_routes_by_expert(
+        topk_ids,
         block_size,
         num_experts,
         packed_route_indices=packed_routes,
         block_expert_ids=block_experts,
-        packed_route_count=torch.empty(1, dtype=torch.int32, device=device),
+        packed_route_count=packed_route_count,
         expert_offsets=torch.empty(num_experts + 1, dtype=torch.int32, device=device),
         expert_counts=torch.empty(num_experts, dtype=torch.int32, device=device),
     )
+    (
+        expected_ids,
+        expected_valid,
+        expected_count,
+        expected_blocks,
+    ) = _expected_route_pack(topk_ids, block_size, num_experts)
+    sentinel = int(topk_ids.numel())
+    valid_routes = int(expected_count.item())
+    valid_blocks = valid_routes // block_size
 
     assert returned_routes.data_ptr() == packed_routes.data_ptr()
     assert returned_blocks.data_ptr() == block_experts.data_ptr()
+    assert returned_count.data_ptr() == packed_route_count.data_ptr()
     assert returned_routes.numel() == max_routes
     assert returned_blocks.numel() == max_blocks
+    assert torch.equal(returned_count.cpu(), expected_count)
+    assert torch.equal(returned_blocks[:valid_blocks].cpu(), expected_blocks)
+    assert bool(torch.all(returned_blocks[valid_blocks:] == -1).item())
+    assert bool(torch.all(returned_routes[valid_routes:] == sentinel).item())
+
+    host_routes = returned_routes[:valid_routes].cpu().to(torch.int64)
+    payload = host_routes[host_routes < sentinel]
+    assert payload.numel() == int(expected_valid.sum().item())
+    assert torch.equal(payload.sort().values, torch.arange(sentinel))
+    for block, expert in enumerate(expected_blocks.tolist()):
+        block_routes = host_routes[block * block_size : (block + 1) * block_size]
+        block_payload = block_routes[block_routes < sentinel]
+        if block_payload.numel() > 0:
+            assert bool(torch.all(expected_ids[block_payload] == expert).item())
+
+
+def test_small_prefix_reuses_fixed_arena_numel_capacity(monkeypatch) -> None:
+    """Fixed small-prefix arenas must not specialize on each live tail."""
+
+    class LaunchRecorder:
+        def __init__(self) -> None:
+            self.kwargs: list[dict[str, object]] = []
+
+        def __getitem__(self, _grid):
+            def launch(*_args, **kwargs) -> None:
+                self.kwargs.append(kwargs)
+
+            return launch
+
+    small_prefix = LaunchRecorder()
+    sort = LaunchRecorder()
+    monkeypatch.setattr(
+        route_pack_module,
+        "_pack_topk_routes_small_prefix_kernel",
+        small_prefix,
+    )
+    monkeypatch.setattr(route_pack_module, "_pack_topk_routes_sort_kernel", sort)
+
+    max_tokens = 24
+    topk = 1
+    block_size = 8
+    num_experts = 32
+    planned_numel, max_routes, max_blocks = route_pack_capacity(
+        max_tokens * topk,
+        block_size,
+        num_experts,
+        topk=topk,
+        bucket_tokens=False,
+    )
+
+    observed = []
+    for tail_tokens in (17, 23):
+        route_pack_module.pack_topk_routes_by_expert(
+            torch.arange(tail_tokens * topk, dtype=torch.int32).reshape(
+                tail_tokens, topk
+            )
+            % num_experts,
+            block_size,
+            num_experts,
+            packed_route_indices=torch.empty(max_routes, dtype=torch.int32),
+            block_expert_ids=torch.empty(max_blocks, dtype=torch.int32),
+            packed_route_count=torch.empty(1, dtype=torch.int32),
+            expert_offsets=torch.empty(num_experts + 1, dtype=torch.int32),
+            expert_counts=torch.empty(num_experts, dtype=torch.int32),
+        )
+        observed.append(small_prefix.kwargs[-1]["NUMEL_CAPACITY"])
+
+    assert observed == [planned_numel, planned_numel]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
