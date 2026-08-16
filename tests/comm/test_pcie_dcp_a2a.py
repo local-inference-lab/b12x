@@ -13,6 +13,7 @@ from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2APool,
     _SINGLE_CHANNEL_ID,
     _staging_layout,
+    kimi_topk16,
     lse_reduce_scatter_reference,
 )
 
@@ -736,6 +737,14 @@ def test_kimi_topk16_capture_requires_caller_owned_outputs(
             runtime.kimi_topk16(router_logits, correction_bias)
     finally:
         runtime.close()
+
+
+def test_stateless_kimi_topk16_rejects_cpu_tensors() -> None:
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        kimi_topk16(
+            torch.zeros((1, 896), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+        )
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))

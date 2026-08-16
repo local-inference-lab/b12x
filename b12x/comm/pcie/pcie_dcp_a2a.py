@@ -75,6 +75,107 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
     return packed_token_major or capacity_strided_head_major
 
 
+def prepare_kimi_topk16(
+    *,
+    device: torch.device | int | str,
+    threads: int = 256,
+) -> None:
+    """Compile the stateless Kimi-K3 top-16 launcher before graph capture."""
+
+    device_obj = _normalize_device(device)
+    if device_obj.type != "cuda":
+        raise ValueError("Kimi top-16 requires a CUDA device")
+    if _is_current_stream_capturing(device_obj):
+        raise RuntimeError("prepare_kimi_topk16() must run before capture")
+    from ._dcp_a2a_cute import _get_compiled_kimi_topk16
+
+    with torch.cuda.device(device_obj):
+        _get_compiled_kimi_topk16(threads)
+
+
+def kimi_topk16(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    output_weights: Optional[torch.Tensor] = None,
+    output_ids: Optional[torch.Tensor] = None,
+    *,
+    threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select Kimi-K3's 16 routed experts without communication state.
+
+    The operation accepts one to eight assembled FP32 router rows. It launches
+    on the current CUDA stream and is CUDA-graph safe after an eager launch or
+    :func:`prepare_kimi_topk16`. Graph capture requires caller-owned outputs.
+    """
+
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must be a contiguous rank-2 tensor")
+    rows = int(router_logits.shape[0])
+    if rows < 1 or rows > 8:
+        raise ValueError(f"Kimi top-16 rows {rows} must be between 1 and 8")
+    device = router_logits.device
+    if device.type != "cuda":
+        raise ValueError("Kimi top-16 requires CUDA tensors")
+    expected = (
+        (router_logits, (rows, 896), torch.float32, "router_logits"),
+        (correction_bias, (896,), torch.float32, "correction_bias"),
+    )
+    for value, shape, dtype, name in expected:
+        if (
+            value.device != device
+            or value.shape != shape
+            or value.dtype != dtype
+            or not value.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous {shape} {dtype} on {device}")
+
+    capturing = _is_current_stream_capturing(device)
+    if capturing and (output_weights is None or output_ids is None):
+        raise RuntimeError(
+            "Kimi top-16 CUDA graph capture requires caller-owned "
+            "output_weights and output_ids"
+        )
+    if output_weights is None:
+        output_weights = torch.empty((rows, 16), device=device, dtype=torch.float32)
+    if output_ids is None:
+        output_ids = torch.empty((rows, 16), device=device, dtype=torch.int32)
+    outputs = (
+        (output_weights, torch.float32, "output_weights"),
+        (output_ids, torch.int32, "output_ids"),
+    )
+    for value, dtype, name in outputs:
+        if (
+            value.device != device
+            or value.shape != (rows, 16)
+            or value.dtype != dtype
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous {(rows, 16)} {dtype} on {device}"
+            )
+    if capturing:
+        from ._dcp_a2a_cute import is_kimi_topk16_prepared
+
+        if not is_kimi_topk16_prepared(threads):
+            raise RuntimeError(
+                "cold Kimi top-16 CUDA graph capture is not allowed; call "
+                "prepare_kimi_topk16() before capture"
+            )
+
+    from ._dcp_a2a_cute import kimi_topk16 as launch_kimi_topk16
+
+    with torch.cuda.device(device):
+        launch_kimi_topk16(
+            router_logits_ptr=router_logits.data_ptr(),
+            correction_bias_ptr=correction_bias.data_ptr(),
+            output_weights_ptr=output_weights.data_ptr(),
+            output_ids_ptr=output_ids.data_ptr(),
+            rows=rows,
+            threads=threads,
+        )
+    return output_weights, output_ids
+
+
 @dataclass(frozen=True)
 class _StagingLayout:
     signal_bytes: int
@@ -2410,5 +2511,7 @@ __all__ = [
     "PCIeDCPA2A",
     "PCIeDCPA2APool",
     "SUPPORTED_WORLD_SIZES",
+    "kimi_topk16",
     "lse_reduce_scatter_reference",
+    "prepare_kimi_topk16",
 ]

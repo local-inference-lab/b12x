@@ -13,7 +13,9 @@ from .pcie_dcp_a2a import (
     PCIeDCPA2APool as DcpAllToAllPool,
 )
 from .pcie_dcp_a2a import (
+    kimi_topk16,
     lse_reduce_scatter_reference,
+    prepare_kimi_topk16,
 )
 from .pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange as DcpTopKOwnerExchange,
@@ -63,6 +65,8 @@ __all__ = [
     "DcpAllToAllPool",
     "DcpTopKOwnerExchange",
     "VocabParallelArgmax",
+    "kimi_topk16",
+    "prepare_kimi_topk16",
     "autotune_dma_crossovers",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",

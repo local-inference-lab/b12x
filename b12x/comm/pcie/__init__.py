@@ -43,6 +43,8 @@ META = OpMeta(
         "DcpAllToAllPool",
         "DcpTopKOwnerExchange",
         "VocabParallelArgmax",
+        "kimi_topk16",
+        "prepare_kimi_topk16",
         "autotune_dma_crossovers",
         "parse_oneshot_max_size",
         "lse_reduce_scatter_reference",
@@ -74,9 +76,11 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         VocabParallelArgmax,
         autotune_dma_crossovers,
         is_supported,
+        kimi_topk16,
         lse_reduce_scatter_reference,
         owner_stage_reference,
         parse_oneshot_max_size,
+        prepare_kimi_topk16,
     )
 
 install_lazy_api(globals(), META)
