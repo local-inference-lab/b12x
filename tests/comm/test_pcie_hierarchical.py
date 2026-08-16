@@ -10,8 +10,10 @@ import torch
 import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
 from b12x.comm.pcie import _hierarchical_cute
 from b12x.comm.pcie.pcie_allreduce import (
+    ISLAND_RS_MAX_BYTES,
     PCIeAllReduce,
     _algorithm_for_world_size,
+    recommended_max_bytes,
 )
 from b12x.comm.pcie.pcie_hierarchical import (
     PCIeHierarchicalAllReduce,
@@ -24,6 +26,7 @@ from b12x.comm.pcie.pcie_hierarchical import (
     _vectorized_bf16x2_max_elements_from_env,
     _wait_nanosleep_cycles_from_env,
 )
+from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
@@ -47,12 +50,19 @@ def test_allreduce_factory_builds_tp16_hierarchy(
         device=torch.device("cuda:0"),
     )
     hierarchy_factory = MagicMock(return_value=runtime)
+    island_runtime = MagicMock()
+    island_factory = MagicMock(return_value=island_runtime)
     exchange_group = object()
     monkeypatch.setattr(pcie_allreduce.dist, "get_world_size", lambda group: 16)
     monkeypatch.setattr(
         pcie_allreduce,
         "PCIeHierarchicalAllReduce",
         hierarchy_factory,
+    )
+    monkeypatch.setattr(
+        pcie_allreduce,
+        "PCIeIslandRSAllReduce",
+        island_factory,
     )
 
     allreduce = PCIeAllReduce.from_exchange_group(
@@ -68,6 +78,200 @@ def test_allreduce_factory_builds_tp16_hierarchy(
         max_elements=8 * 1024,
         ext_module=None,
     )
+    island_factory.assert_called_once_with(
+        exchange_group=exchange_group,
+        device="cuda:0",
+        max_elements=ISLAND_RS_MAX_BYTES // torch.bfloat16.itemsize,
+    )
+    assert allreduce._island_rs is island_runtime
+
+
+@pytest.mark.parametrize(
+    ("world_size", "algorithm", "expected"),
+    [
+        (8, "auto", 84 * 1024),
+        (12, "auto", 84 * 1024),
+        (16, "auto", ISLAND_RS_MAX_BYTES),
+        (16, "island_rs", ISLAND_RS_MAX_BYTES),
+        (16, "hierarchical", 84 * 1024),
+    ],
+)
+def test_recommended_max_bytes_matches_available_tp_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    algorithm: str,
+    expected: int,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", algorithm)
+    assert recommended_max_bytes(world_size, default=84 * 1024) == expected
+
+
+def test_recommended_max_bytes_rejects_unknown_algorithm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "unknown")
+    with pytest.raises(ValueError, match="must be auto"):
+        recommended_max_bytes(16, default=84 * 1024)
+
+
+def test_tp16_auto_routes_by_message_size() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = True
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    small = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS)
+    large = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
+    small_out = torch.empty_like(small)
+    large_out = torch.empty_like(large)
+
+    allreduce.all_reduce(small, out=small_out)
+    allreduce.all_reduce(large, out=large_out)
+
+    hierarchy.all_reduce.assert_called_once_with(
+        small,
+        out=small_out,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+    island.all_reduce.assert_called_once_with(
+        large,
+        out=large_out,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+
+
+def test_island_capture_rejects_implicit_output_allocation() -> None:
+    runtime = PCIeIslandRSAllReduce.__new__(PCIeIslandRSAllReduce)
+    runtime._closed = False
+    runtime._capture_depth = 0
+    runtime.device = torch.device("cpu")
+    runtime.max_elements = 8
+    inp = torch.empty(8, dtype=torch.bfloat16)
+
+    with (
+        runtime.capture(),
+        pytest.raises(RuntimeError, match="preallocated output"),
+    ):
+        runtime.all_reduce(inp)
+
+    assert runtime._capture_depth == 0
+
+
+def test_tp16_forced_island_routes_below_crossover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "island_rs")
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    inp = torch.empty(2)
+
+    allreduce.all_reduce(inp)
+
+    island.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+    hierarchy.all_reduce.assert_not_called()
+
+
+def test_tp16_auto_uses_island_when_hierarchy_rejects_below_crossover() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = False
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS - 2)
+
+    assert allreduce.should_allreduce(inp)
+    allreduce.all_reduce(inp, stream="17", channel_id="target")
+
+    island.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        blocks=None,
+        stream="17",
+        channel_id="target",
+    )
+    hierarchy.all_reduce.assert_not_called()
+
+
+def test_tp16_auto_keeps_unaligned_large_input_on_hierarchy() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = True
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2 + 2)
+
+    allreduce.all_reduce(inp)
+
+    hierarchy.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+    island.all_reduce.assert_not_called()
+
+
+def test_tp16_forced_hierarchy_does_not_advertise_island_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "hierarchical")
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = False
+    island = MagicMock()
+    island.should_allreduce.return_value = True
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+
+    assert not allreduce.should_allreduce(torch.empty(16_000))
+
+
+def test_tp16_auto_falls_back_when_island_rejects_shape() -> None:
+    hierarchy = MagicMock()
+    hierarchy.rank = 0
+    hierarchy.world_size = 16
+    hierarchy.device = torch.device("cpu")
+    island = MagicMock()
+    island.should_allreduce.return_value = False
+    allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
+    inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
+
+    allreduce.all_reduce(inp)
+
+    hierarchy.all_reduce.assert_called_once_with(
+        inp,
+        out=None,
+        blocks=None,
+        stream=None,
+        channel_id=None,
+    )
+    island.all_reduce.assert_not_called()
 
 
 def test_allreduce_factory_forwards_oneshot_channel_capacity(
