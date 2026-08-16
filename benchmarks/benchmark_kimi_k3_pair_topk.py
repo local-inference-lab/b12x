@@ -209,6 +209,7 @@ def _worker(
         if rank == 0:
             print(
                 "case,ids_valid,ids_exact,ids_unique,weights_exact,"
+                "weights_finite,weights_positive,weights_normalized,"
                 "finite_mask_exact,nonzero_mask_exact,max_abs,down_exact",
                 flush=True,
             )
@@ -272,6 +273,16 @@ def _worker(
                 else ids_exact
             )
             weights_exact = torch.equal(b12x_weights, reference_weights)
+            weights_finite = bool(torch.isfinite(b12x_weights).all().item())
+            weights_positive = bool((b12x_weights > 0).all().item())
+            weights_normalized = bool(
+                torch.allclose(
+                    b12x_weights.sum(dim=1),
+                    torch.ones(batch, device=device, dtype=torch.float32),
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+            )
             finite_mask_exact = torch.equal(
                 torch.isfinite(b12x_weights),
                 torch.isfinite(reference_weights),
@@ -286,6 +297,8 @@ def _worker(
                 print(
                     f"{name},{int(ids_valid)},{int(ids_exact)},"
                     f"{int(ids_unique)},{int(weights_exact)},"
+                    f"{int(weights_finite)},{int(weights_positive)},"
+                    f"{int(weights_normalized)},"
                     f"{int(finite_mask_exact)},{int(nonzero_mask_exact)},"
                     f"{max_abs:.9g},{int(down_exact)}",
                     flush=True,
@@ -293,6 +306,9 @@ def _worker(
             failures = torch.tensor(
                 int(not ids_valid)
                 + int(not weights_exact)
+                + int(not weights_finite)
+                + int(not weights_positive)
+                + int(not weights_normalized)
                 + int(not finite_mask_exact)
                 + int(not nonzero_mask_exact)
                 + int(not down_exact),
@@ -346,15 +362,118 @@ def _worker(
 
         reference_graph = _capture(reference_fn, reference_pool, reference_channel)
         b12x_graph = _capture(b12x_fn, b12x_pool, b12x_channel)
-        reference_graph.replay()
-        b12x_graph.replay()
+        graph_tensors = (
+            benchmark_router,
+            benchmark_bias,
+            reference_down,
+            reference_router,
+            reference_weights,
+            reference_ids,
+            b12x_down,
+            b12x_router,
+            b12x_weights,
+            b12x_ids,
+        )
+        graph_ptrs = tuple(tensor.data_ptr() for tensor in graph_tensors)
+        if rank == 0:
+            print(
+                "graph_case,ids_valid,weights_exact,weights_finite,"
+                "weights_positive,weights_normalized,down_exact,"
+                "addresses_stable,replay_allocation_stable",
+                flush=True,
+            )
+        for name in ("random", "ties", "near_ties", "wide", "all_neg_inf"):
+            replay_router, replay_bias = _case(
+                name,
+                batch=batch,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+            )
+            benchmark_router.copy_(replay_router)
+            benchmark_bias.copy_(replay_bias)
+            torch.cuda.synchronize(device)
+            allocated_before = torch.cuda.memory_allocated(device)
+            reference_graph.replay()
+            b12x_graph.replay()
+            torch.cuda.synchronize(device)
+            allocated_after = torch.cuda.memory_allocated(device)
+
+            replay_ids_exact = torch.equal(b12x_ids, reference_ids)
+            replay_sorted_ids = torch.sort(b12x_ids, dim=1).values
+            replay_ids_unique = bool(
+                (
+                    replay_sorted_ids[:, 1:]
+                    != replay_sorted_ids[:, :-1]
+                ).all().item()
+            )
+            replay_ids_in_range = bool(
+                ((b12x_ids >= 0) & (b12x_ids < 896)).all().item()
+            )
+            replay_ids_valid = (
+                replay_ids_unique and replay_ids_in_range
+                if name == "all_neg_inf"
+                else replay_ids_exact
+            )
+            replay_weights_exact = torch.equal(
+                b12x_weights, reference_weights
+            )
+            replay_weights_finite = bool(
+                torch.isfinite(b12x_weights).all().item()
+            )
+            replay_weights_positive = bool((b12x_weights > 0).all().item())
+            replay_weights_normalized = bool(
+                torch.allclose(
+                    b12x_weights.sum(dim=1),
+                    torch.ones(batch, device=device, dtype=torch.float32),
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+            )
+            replay_down_exact = torch.equal(b12x_down, reference_down)
+            addresses_stable = graph_ptrs == tuple(
+                tensor.data_ptr() for tensor in graph_tensors
+            )
+            replay_allocation_stable = allocated_before == allocated_after
+            if rank == 0:
+                print(
+                    f"{name},{int(replay_ids_valid)},"
+                    f"{int(replay_weights_exact)},"
+                    f"{int(replay_weights_finite)},"
+                    f"{int(replay_weights_positive)},"
+                    f"{int(replay_weights_normalized)},"
+                    f"{int(replay_down_exact)},{int(addresses_stable)},"
+                    f"{int(replay_allocation_stable)}",
+                    flush=True,
+                )
+            replay_failures = torch.tensor(
+                int(not replay_ids_valid)
+                + int(not replay_weights_exact)
+                + int(not replay_weights_finite)
+                + int(not replay_weights_positive)
+                + int(not replay_weights_normalized)
+                + int(not replay_down_exact)
+                + int(not addresses_stable)
+                + int(not replay_allocation_stable),
+                device=device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(replay_failures)
+            if replay_failures.item() != 0:
+                raise AssertionError(
+                    f"{name} CUDA Graph replay violates the routing contract"
+                )
+
+        timing_router, timing_bias = _case(
+            "random",
+            batch=batch,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+        )
+        benchmark_router.copy_(timing_router)
+        benchmark_bias.copy_(timing_bias)
         torch.cuda.synchronize(device)
-        if not torch.equal(b12x_weights, reference_weights):
-            raise AssertionError("captured weights differ")
-        if not torch.equal(b12x_ids, reference_ids):
-            raise AssertionError("captured ids differ")
-        if not torch.equal(b12x_down, reference_down):
-            raise AssertionError("captured down projection differs")
 
         for graph in (reference_graph, b12x_graph):
             for _ in range(warmup):
