@@ -187,9 +187,11 @@ def test_fused_k6_mcg_matches_separate_rotation_pipeline(
         codebook="mcg",
         params_dtype=torch.float16,
     )
-    assert isinstance(
-        weight.k6_mcg_small_m_launch, _k6_mcg_cute.K6McgSmallMCompileResult
-    )
+    launch = weight.k6_mcg_small_m_launch
+    assert isinstance(launch, _k6_mcg_cute.K6McgSmallMCompileResult)
+    if (size_k, size_n) == (6144, 1024):
+        assert launch.grid_x > 1
+        assert launch.launch_grid_x(rows) > launch.grid_x
     source = (torch.randn((rows, size_k), device=device) * 0.05).to(torch.float16)
     noncontiguous = torch.empty((rows, size_k * 2), dtype=torch.float16, device=device)[
         :, ::2
