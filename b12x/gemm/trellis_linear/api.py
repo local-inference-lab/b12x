@@ -17,6 +17,9 @@ from ...moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_pair_dense_weight,
 )
 from . import META
+from ._k6_mcg_cute import (
+    k6_mcg_small_m_scratch_elements as k6_mcg_small_m_scratch_elements,
+)
 
 PreparedWeight = PreparedTrellis256DenseWeight
 
@@ -113,7 +116,10 @@ def is_supported(device=None) -> bool:
 
 
 def clear_caches() -> None:
-    """Clear compiled W4A16 specializations."""
+    """Clear compiled dense Trellis specializations."""
+    from ._k6_mcg_cute import clear_k6_mcg_small_m_cache
+
+    clear_k6_mcg_small_m_cache()
     clear_w4a16_kernel_cache()
 
 
