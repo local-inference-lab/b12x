@@ -12,9 +12,9 @@ resident. It does not measure end-to-end model throughput.
 ## Conditions
 
 - Source repository: `local-inference-lab/b12x`
-- Source revision: `01e9bab08ee1b29fface47ee1258dadbe831a560`
-- Source tree: `b096b95eb5035b4fa6cad6a6787a580de1280db5`
-- Measured worktree: `/mnt/luke/worktrees/b12x-pr220-source-qualified-20260816`
+- Source revision: `aa3d3651b54cd1dd1e66726e0f52b96ce7c3ce5c`
+- Source tree: `461d1cbe8f10eed1ec929541ebe6e034db4daec3`
+- Measured worktree: `/mnt/luke/worktrees/b12x-pr220-source-qualified-r2-20260816`
 - Worktree state before and after timing: clean and unchanged
 - Container image: `voipmonitor/vllm:kimi-k3-tp16-vllm2ddc210-b12x3bce5d8-cu133-torch213-20260816-r1 (image ID sha256:09c00dba1db141c3141a15848293064bc67ac1ff8cc64d3219f413f23f26d4ec)`
 - CUDA runtime: `13.3`
@@ -26,7 +26,7 @@ resident. It does not measure end-to-end model throughput.
 - Warm measurement: 100 alternating warmup
   pairs, 2000 graph replays per sample,
   20 samples per implementation
-- Receipt: `validation/performance/tp16_pcie_island_rs_rtx_pro_6000_blackwell.json`
+- Receipt: `/artifacts/receipt.json`
 
 Both implementations use the same source revision. Each captured CUDA graph is
 replayed and correctness-validated before timed samples. Warm samples alternate
@@ -39,26 +39,27 @@ results.
 
 | BF16 elements | Automatic dispatch | Hierarchical µs | Equal-quarter µs | Hierarchical/equal-quarter |
 | ---: | :--- | ---: | ---: | ---: |
-| 7,168 | hierarchical | 18.075 | 17.913 | 1.009× |
-| 14,336 | equal_quarter | 21.812 | 18.453 | 1.182× |
-| 14,338 | hierarchical | 23.893 | 42.014 | 0.569× |
-| 28,672 | equal_quarter | 29.907 | 20.621 | 1.450× |
-| 57,344 | equal_quarter | 46.169 | 25.650 | 1.800× |
+| 7,168 | hierarchical | 18.079 | 17.882 | 1.011× |
+| 14,336 | equal_quarter | 21.758 | 18.450 | 1.179× |
+| 14,338 | hierarchical | 23.880 | 42.089 | 0.567× |
+| 28,672 | equal_quarter | 29.912 | 20.620 | 1.451× |
+| 57,344 | equal_quarter | 46.185 | 25.658 | 1.800× |
 
 The ratio is hierarchical median latency divided by equal-quarter median
 latency. Values above one mean equal-quarter is faster.
 
-## Correctness and qualification gates
+## Enforced invariants and qualification checks
 
 Every eager result, captured result, and post-measurement result preserves the
 input, is bit-identical across all 16 ranks, and matches the FP32 accumulation
-reference at `rtol=0.02` and `atol=0.125`. Failed qualification checks:
-none.
+reference at `rtol=0.02` and `atol=0.125`. Receipt construction aborts instead
+of writing an artifact when any enforced invariant fails. Enforced invariants:
+source_checkout_clean_before_timing, source_checkout_clean_after_timing, compile_artifact_object_hashes_match_manifests, captured_graph_replays_validated_before_timing, raw_cold_samples_recorded, raw_warm_samples_recorded, correctness_passed. Reportable qualification checks that failed: none.
 
 ## Reproduction
 
 ```bash
-/opt/venv/bin/python3 /mnt/luke/worktrees/b12x-pr220-source-qualified-20260816/benchmarks/benchmark_pcie_island_rs.py --output validation/performance/tp16_pcie_island_rs_rtx_pro_6000_blackwell.json --report validation/performance/tp16_pcie_island_rs_rtx_pro_6000_blackwell.md --source-revision 01e9bab08ee1b29fface47ee1258dadbe831a560 --source-tree b096b95eb5035b4fa6cad6a6787a580de1280db5 --expected-pci-bus-islands '0x03,0x04,0x23,0x24|0x43,0x44,0x63,0x64|0x83,0x84,0xA3,0xA4|0xC3,0xC4,0xE3,0xE4' --warmup 100 --iterations 2000 --samples 20 --required-active-throttle-mask 0x0
+/opt/venv/bin/python /mnt/luke/worktrees/b12x-pr220-source-qualified-r2-20260816/benchmarks/benchmark_pcie_island_rs.py --output /artifacts/receipt.json --report /artifacts/report.md --source-revision aa3d3651b54cd1dd1e66726e0f52b96ce7c3ce5c --source-tree 461d1cbe8f10eed1ec929541ebe6e034db4daec3 --expected-pci-bus-islands '0x03,0x04,0x23,0x24|0x43,0x44,0x63,0x64|0x83,0x84,0xA3,0xA4|0xC3,0xC4,0xE3,0xE4' --warmup 100 --iterations 2000 --samples 20 --required-active-throttle-mask 0x0
 ```
 
 The command requires exactly 16 visible GPUs in the PCI bus order declared by
