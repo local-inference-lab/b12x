@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -19,6 +20,7 @@ from ...moe._shared.kernels.w4a16.prepare import (
 from . import META
 from ._k6_mcg_cute import (
     k6_mcg_small_m_scratch_elements as k6_mcg_small_m_scratch_elements,
+    plan_k6_mcg_small_m,
 )
 
 PreparedWeight = PreparedTrellis256DenseWeight
@@ -35,8 +37,8 @@ def prepare_weight(
     params_dtype: torch.dtype = torch.float16,
     dummy_scale: Optional[torch.Tensor] = None,
 ) -> PreparedWeight:
-    """Validate one native EXL3 dense weight and retain zero-copy views."""
-    return prepare_trellis256_dense_weight(
+    """Validate a native EXL3 weight and bind eligible serving launches."""
+    weight = prepare_trellis256_dense_weight(
         trellis,
         suh,
         svh,
@@ -46,6 +48,10 @@ def prepare_weight(
         params_dtype=params_dtype,
         dummy_scale=dummy_scale,
     )
+    launch = plan_k6_mcg_small_m(weight)
+    if launch is None:
+        return weight
+    return replace(weight, k6_mcg_small_m_launch=launch)
 
 
 def prepare_pair_weight(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -272,6 +272,12 @@ class PreparedTrellis256DenseWeight:
     # required record-major storage order.
     trellis_pair_kind: str | None = None
     trellis_rate_axis: str | None = None
+    # The public dense planner binds a shape- and device-specific cooperative
+    # launch here during weight preparation. Runtime dispatch never compiles or
+    # inserts a launch into a process-global cache.
+    k6_mcg_small_m_launch: object | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def _make_workspace(

@@ -11340,20 +11340,13 @@ def _run_trellis256_dense_current_device(
     if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
 
-    # Keep the large-row prefill path free of small-row module dispatch and
-    # metadata checks. Non-default block sizes remain a generic-kernel control
-    # used by kernel qualification. The public dense API uses 64 as its
-    # automatic geometry value, so 64 remains eligible for this specialization.
+    # Weight preparation binds the cooperative launch only for an unpaired
+    # FP16 K6/MCG payload. Runtime admission therefore checks dynamic input and
+    # call controls without resolving a kernel or duplicating weight policy.
+    small_m_launch = getattr(prepared_dense, "k6_mcg_small_m_launch", None)
     if (
-        hadamard_128 is None
-        and m <= 16
-        and os.environ.get("B12X_DISABLE_STANDALONE_K6", "0") != "1"
-        and trellis_bits == 6
-        and trellis_codebook == "mcg"
-        and trellis_pair_kind is None
-        and trellis_rate_axis is None
-        and compute_dtype == torch.float16
-        and x.dtype == torch.float16
+        small_m_launch is not None
+        and hadamard_128 is None
         and _moe_block_size in (None, 64)
         and _force_tile_config is None
     ):
@@ -11364,13 +11357,6 @@ def _run_trellis256_dense_current_device(
         )
 
         if is_k6_mcg_small_m_eligible(x, prepared_dense):
-            gemm_output = _trellis_dense_buffer(
-                "gemm_output",
-                gemm_output,
-                shape=(m, size_n),
-                dtype=compute_dtype,
-                device=x.device,
-            )
             rotated_f16 = _trellis_dense_buffer(
                 "rotated_f16",
                 rotated_f16,
@@ -11394,7 +11380,6 @@ def _run_trellis256_dense_current_device(
                 prepared_dense,
                 output=output,
                 rotated=rotated_f16,
-                gemm_output=gemm_output,
                 c_tmp=c_tmp,
             )
 

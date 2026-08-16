@@ -15,6 +15,7 @@ explicit pair metadata and must use the generic dense Trellis scheduler.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
 
@@ -51,10 +52,11 @@ _ROUTE_BLOCK = 16
 _TILE_K = 128
 _TILE_N = 128
 _BARRIER_WORDS = 1
+_STANDALONE_K6_DISABLED = os.environ.get("B12X_DISABLE_STANDALONE_K6", "0") == "1"
 
-# These projections dominate GLM-5.2 dense online-K6 decode.  The resident CTA
-# counts minimize full-chain latency on a 188-SM SM120 device while retaining
-# enough unoccupied SMs for the concurrent model streams.
+# The three K-by-N projection shapes below dominate GLM-5.2 dense online-K6
+# decode. The resident CTA counts minimize full-chain latency on a 188-SM
+# SM120 device while retaining capacity for concurrent model streams.
 _GLM_GRID_CTA = {
     (2048, 4096): 64,
     (6144, 1024): 32,
@@ -65,6 +67,7 @@ _GLM_GRID_CTA = {
 @dataclass(frozen=True)
 class K6McgSmallMCompileResult:
     compiled: object
+    device_index: int
     size_k: int
     size_n: int
     grid_x: int
@@ -199,6 +202,7 @@ def is_k6_mcg_small_m_eligible(x: torch.Tensor, prepared) -> bool:
 
 
 def _requested_grid_x(size_k: int, size_n: int) -> int:
+    """Return the measured or conservative GEMM CTA count for one shape."""
     requested = _GLM_GRID_CTA.get((int(size_k), int(size_n)))
     if requested is None:
         n_tiles = int(size_n) // _TILE_N
@@ -208,6 +212,7 @@ def _requested_grid_x(size_k: int, size_n: int) -> int:
 
 
 def _grid_x(size_k: int, size_n: int, resident_ctas: int) -> int:
+    """Cap the GEMM grid so every cooperative CTA can remain resident."""
     return min(_requested_grid_x(size_k, size_n), int(resident_ctas))
 
 
@@ -224,9 +229,10 @@ def k6_mcg_small_m_scratch_elements(size_k: int, size_n: int) -> int:
 class K6McgSmallMKernel:
     """One cooperative grid for H128, split-K MCG GEMM, and H128 output."""
 
-    ABI_VERSION = 1
+    ABI_VERSION = 2
 
     def __init__(self, *, size_k: int, size_n: int):
+        """Build a compile-time specialization for one K-by-N projection."""
         self.size_k = int(size_k)
         self.size_n = int(size_n)
         self.gemm = W4A16GemmKernel(
@@ -257,6 +263,7 @@ class K6McgSmallMKernel:
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
+        """Return every compile-time value that affects generated code."""
         return (
             "k6_mcg_small_m",
             self.ABI_VERSION,
@@ -277,6 +284,7 @@ class K6McgSmallMKernel:
         v3: cutlass.Float32,
         lane: Int32,
     ):
+        """Apply normalized Hadamard-128 to four values in each warp lane."""
         s0 = v0 + v1
         d0 = v0 - v1
         s1 = v2 + v3
@@ -315,6 +323,7 @@ class K6McgSmallMKernel:
         grid_x: Int32,
         active_m: Int32,
     ):
+        """Rotate and scale all live input rows across the cooperative grid."""
         lane = tid & Int32(31)
         warp = tid >> Int32(5)
         warps_per_cta = Int32(self.cta_threads // 32)
@@ -360,6 +369,7 @@ class K6McgSmallMKernel:
         output_n_tile: Int32,
         active_m: Int32,
     ):
+        """Rotate one complete GEMM output tile from shared memory to FP16."""
         lane = tid & Int32(31)
         warp = tid >> Int32(5)
         warps_per_cta = Int32(self.cta_threads // 32)
@@ -402,7 +412,6 @@ class K6McgSmallMKernel:
         self,
         rotated: cute.Tensor,
         trellis: cute.Tensor,
-        gemm_output: cute.Tensor,
         output: cute.Tensor,
         scales: cute.Tensor,
         global_scale: cute.Tensor,
@@ -421,6 +430,7 @@ class K6McgSmallMKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
     ):
+        """Run one split-K Trellis tile and let its final owner store H128."""
         # Compose the unpaired epilogue from B12X's existing Trellis
         # pipeline primitives. Keeping this orchestration local prevents the
         # K6 output transform from changing code generation for generic
@@ -605,7 +615,6 @@ class K6McgSmallMKernel:
                 acc1,
                 acc2,
                 acc3,
-                gemm_output,
                 smem_base,
                 tid,
                 output_n_tile,
@@ -622,13 +631,13 @@ class K6McgSmallMKernel:
         acc1,
         acc2,
         acc3,
-        unused_gemm_output: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
         output_n_tile: Int32,
         block_valid_rows: Int32,
         global_scale_f32: cutlass.Float32,
     ):
+        """Stage the final accumulator tile and apply its output transform."""
         c_sh_stride = Int32(2 * self.gemm.cta_n_blocks + 1)
         c_sh_wr = (
             Int32(4) * c_sh_stride * ((tid & Int32(31)) // Int32(4))
@@ -661,6 +670,7 @@ class K6McgSmallMKernel:
         cta: Int32,
         grid_x: Int32,
     ):
+        """Order input rotation stores before every CTA starts GEMM reads."""
         cute.arch.sync_threads()
         if tid == Int32(0):
             barrier_addr = get_ptr_as_int64(workspace, Int32(self.barrier_count_off))
@@ -678,7 +688,6 @@ class K6McgSmallMKernel:
         trellis: cute.Tensor,
         output_ptr: cute.Pointer,
         rotated_ptr: cute.Pointer,
-        gemm_output_ptr: cute.Pointer,
         scales: cute.Tensor,
         global_scale: cute.Tensor,
         c_tmp: cute.Tensor,
@@ -691,6 +700,7 @@ class K6McgSmallMKernel:
         gemm_grid_x: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Bind pointer layouts and cooperatively launch one projection."""
         rows64 = active_m.to(cutlass.Int64)
         source = cute.make_tensor(
             source_ptr,
@@ -699,10 +709,6 @@ class K6McgSmallMKernel:
         rotated = cute.make_tensor(
             rotated_ptr,
             layout=cute.make_layout((rows64 * Int64(self.size_k),), stride=(1,)),
-        )
-        gemm_output = cute.make_tensor(
-            gemm_output_ptr,
-            layout=cute.make_layout((rows64 * Int64(self.size_n),), stride=(1,)),
         )
         output = cute.make_tensor(
             output_ptr,
@@ -719,7 +725,6 @@ class K6McgSmallMKernel:
             trellis,
             output,
             rotated,
-            gemm_output,
             scales,
             global_scale,
             c_tmp,
@@ -744,7 +749,6 @@ class K6McgSmallMKernel:
         trellis: cute.Tensor,
         output: cute.Tensor,
         rotated: cute.Tensor,
-        gemm_output: cute.Tensor,
         scales: cute.Tensor,
         global_scale: cute.Tensor,
         c_tmp: cute.Tensor,
@@ -755,6 +759,7 @@ class K6McgSmallMKernel:
         active_m: cutlass.Int32,
         gemm_grid_x: cutlass.Int32,
     ):
+        """Execute input H128, split-K GEMM, and output H128 in one grid."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         grid_raw, _, _ = cute.arch.grid_dim()
@@ -782,7 +787,6 @@ class K6McgSmallMKernel:
                 self._emit_tile,
                 rotated,
                 trellis,
-                gemm_output,
                 output,
                 scales,
                 global_scale,
@@ -798,7 +802,7 @@ class K6McgSmallMKernel:
                 rotated,
                 rotated,
                 trellis,
-                gemm_output,
+                output,
                 scales,
                 global_scale,
                 dummy,
@@ -831,19 +835,16 @@ def compile_k6_mcg_small_m(
         return cached
 
     def tensor(dtype, elements: int, *, align: int = 16):
+        """Construct one compile-only compact tensor descriptor."""
         return cute.runtime.make_fake_compact_tensor(
             dtype, (max(int(elements), 1),), assumed_align=align
         )
 
     trellis_elements = (int(size_k) // 16) * (int(size_n) // 16) * 48
-    scratch_elements = max(
-        int(size_n) * _ROUTE_BLOCK,
-        int(grid_x) * _ROUTE_BLOCK * _TILE_N,
-    )
+    scratch_elements = k6_mcg_small_m_scratch_elements(size_k, size_n)
     compile_args = (
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         tensor(cutlass.Int32, trellis_elements),
-        make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16),
         tensor(cutlass.Int32, 1),
@@ -881,6 +882,7 @@ def compile_k6_mcg_small_m(
             )
     result = K6McgSmallMCompileResult(
         compiled=compiled,
+        device_index=device_index,
         size_k=int(size_k),
         size_n=int(size_n),
         grid_x=int(grid_x),
@@ -895,13 +897,28 @@ def compile_k6_mcg_small_m(
     return result
 
 
+def plan_k6_mcg_small_m(prepared) -> K6McgSmallMCompileResult | None:
+    """Bind the cooperative launch for an eligible prepared K6/MCG weight.
+
+    This function is a model-load planning boundary. It resolves the compiled
+    launch before serving and returns ``None`` when the weight must retain the
+    generic dense Trellis scheduler.
+    """
+    if _STANDALONE_K6_DISABLED or not _is_unpaired_k6_mcg_weight(prepared):
+        return None
+    return compile_k6_mcg_small_m(
+        size_k=int(prepared.in_features),
+        size_n=int(prepared.out_features),
+        device=prepared.trellis.device,
+    )
+
+
 def run_k6_mcg_small_m(
     x: torch.Tensor,
     prepared,
     *,
     output: torch.Tensor,
     rotated: torch.Tensor,
-    gemm_output: torch.Tensor,
     c_tmp: torch.Tensor,
 ) -> torch.Tensor:
     """Execute a validated unpaired K6/MCG payload on the current stream."""
@@ -914,7 +931,6 @@ def run_k6_mcg_small_m(
     for name, tensor, shape, dtype in (
         ("output", output, (m, size_n), torch.float16),
         ("rotated", rotated, (m, size_k), torch.float16),
-        ("gemm_output", gemm_output, (m, size_n), torch.float16),
     ):
         if (
             tuple(tensor.shape) != shape
@@ -949,7 +965,23 @@ def run_k6_mcg_small_m(
             "prepared K6/MCG workspace must provide four lock words per SM and "
             "one cooperative barrier word"
         )
-    launch = compile_k6_mcg_small_m(size_k=size_k, size_n=size_n, device=x.device)
+    launch = getattr(prepared, "k6_mcg_small_m_launch", None)
+    device_index = int(x.device.index if x.device.index is not None else 0)
+    if not isinstance(launch, K6McgSmallMCompileResult):
+        raise RuntimeError(
+            "prepared K6/MCG weight has no bound small-row launch; prepare the "
+            "weight through b12x.gemm.trellis_linear.prepare_weight"
+        )
+    if (
+        launch.device_index != device_index
+        or launch.size_k != size_k
+        or launch.size_n != size_n
+    ):
+        raise ValueError(
+            "prepared K6/MCG launch does not match the input device or projection "
+            f"shape: launch=({launch.device_index}, {launch.size_k}, {launch.size_n}), "
+            f"input=({device_index}, {size_k}, {size_n})"
+        )
     launch_grid_x = launch.launch_grid_x(m)
     required_scratch = max(
         k6_mcg_small_m_scratch_elements(size_k, size_n),
@@ -980,12 +1012,6 @@ def run_k6_mcg_small_m(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        make_ptr(
-            cutlass.Float16,
-            gemm_output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
         prepared.scale.view(torch.uint8).view(torch.int32).view(-1),
         prepared.global_scale,
         c_tmp,
@@ -1012,6 +1038,7 @@ def run_k6_mcg_small_m(
 
 
 def clear_k6_mcg_small_m_cache() -> None:
+    """Drop process-global compiled-launch lookup entries."""
     _CACHE.clear()
 
 
@@ -1021,5 +1048,6 @@ __all__ = [
     "compile_k6_mcg_small_m",
     "is_k6_mcg_small_m_eligible",
     "k6_mcg_small_m_scratch_elements",
+    "plan_k6_mcg_small_m",
     "run_k6_mcg_small_m",
 ]
