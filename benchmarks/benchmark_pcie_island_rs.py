@@ -23,6 +23,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -201,7 +202,14 @@ def _physical_gpu_snapshot(
         fields = [field.strip() for field in row]
         if len(fields) != 11:
             raise RuntimeError(f"unexpected nvidia-smi row: {row!r}")
-        records[_pci_bus_number(fields[2])] = fields
+        bus_number = _pci_bus_number(fields[2])
+        if bus_number in records:
+            raise RuntimeError(
+                "nvidia-smi reported an ambiguous PCI bus number: "
+                f"bus={bus_number:#x}, first_uuid={records[bus_number][1]}, "
+                f"second_uuid={fields[1]}"
+            )
+        records[bus_number] = fields
 
     snapshot: list[dict[str, object]] = []
     for logical_index, bus_id in enumerate(expected_bus_ids):
@@ -422,6 +430,63 @@ def _precondition_gpu_mode(device: torch.device) -> None:
     torch.cuda.synchronize(device)
 
 
+def _gpu_mode_snapshot_under_load(
+    rank: int,
+    device: torch.device,
+    expected_bus_ids: tuple[int, ...],
+) -> list[dict[str, object]]:
+    """Read physical GPU state while every rank continuously submits GPU work."""
+
+    ready = threading.Event()
+    stop = threading.Event()
+    load_errors: list[Exception] = []
+
+    def sustain_load() -> None:
+        try:
+            torch.cuda.set_device(device)
+            stream = torch.cuda.Stream(device=device)
+            first_submission = True
+            while not stop.is_set():
+                with torch.cuda.stream(stream):
+                    for _ in range(4):
+                        torch.cuda._sleep(50_000_000)
+                if first_submission:
+                    ready.set()
+                    first_submission = False
+                stream.synchronize()
+        except Exception as error:
+            load_errors.append(error)
+            ready.set()
+
+    load_thread = threading.Thread(
+        target=sustain_load,
+        name=f"gpu-mode-load-rank-{rank}",
+        daemon=True,
+    )
+    load_thread.start()
+    if not ready.wait(timeout=30):
+        stop.set()
+        load_thread.join(timeout=30)
+        raise RuntimeError(f"rank {rank} did not start GPU snapshot load")
+    if load_errors:
+        raise RuntimeError(f"rank {rank} GPU snapshot load failed") from load_errors[0]
+
+    try:
+        dist.barrier()
+        snapshot = _physical_gpu_snapshot(expected_bus_ids) if rank == 0 else []
+        dist.barrier()
+    finally:
+        stop.set()
+        load_thread.join(timeout=30)
+        if load_thread.is_alive():
+            raise RuntimeError(f"rank {rank} GPU snapshot load did not stop")
+        if load_errors:
+            raise RuntimeError(
+                f"rank {rank} GPU snapshot load failed"
+            ) from load_errors[0]
+    return snapshot
+
+
 def _worker(
     rank: int,
     port: int,
@@ -487,15 +552,11 @@ def _worker(
         }
 
         _precondition_gpu_mode(device)
-        dist.barrier()
-        gpu_before_timing = (
-            _physical_gpu_snapshot(
-                tuple(bus for island in expected_islands for bus in island)
-            )
-            if rank == 0
-            else []
+        gpu_before_timing = _gpu_mode_snapshot_under_load(
+            rank,
+            device,
+            tuple(bus for island in expected_islands for bus in island),
         )
-        dist.barrier()
 
         results: list[dict[str, object]] = []
         for shape_index, elements in enumerate(shapes):
@@ -603,15 +664,11 @@ def _worker(
             torch.cuda.synchronize(device)
 
         _precondition_gpu_mode(device)
-        dist.barrier()
-        gpu_after_timing = (
-            _physical_gpu_snapshot(
-                tuple(bus for island in expected_islands for bus in island)
-            )
-            if rank == 0
-            else []
+        gpu_after_timing = _gpu_mode_snapshot_under_load(
+            rank,
+            device,
+            tuple(bus for island in expected_islands for bus in island),
         )
-        dist.barrier()
         if rank == 0:
             artifact_groups = {
                 "initial": sorted(initial_keys),
@@ -705,10 +762,12 @@ def _render_report(receipt: dict[str, object], receipt_path: Path) -> str:
     checks = receipt["qualification_checks"]
     failed = [name for name, passed in checks.items() if not passed]
     failed_text = "none" if not failed else ", ".join(failed)
+    invariants = receipt["enforced_invariants"]
+    invariant_names = ", ".join(invariants)
     source_state = (
         "clean and unchanged"
-        if checks["source_checkout_clean_before_timing"]
-        and checks["source_checkout_clean_after_timing"]
+        if invariants["source_checkout_clean_before_timing"]
+        and invariants["source_checkout_clean_after_timing"]
         and checks["source_checkout_unchanged_during_timing"]
         else "not clean and unchanged; see failed qualification checks"
     )
@@ -758,12 +817,13 @@ results.
 The ratio is hierarchical median latency divided by equal-quarter median
 latency. Values above one mean equal-quarter is faster.
 
-## Correctness and qualification gates
+## Enforced invariants and qualification checks
 
 Every eager result, captured result, and post-measurement result preserves the
 input, is bit-identical across all 16 ranks, and matches the FP32 accumulation
-reference at `rtol=0.02` and `atol=0.125`. Failed qualification checks:
-{failed_text}.
+reference at `rtol=0.02` and `atol=0.125`. Receipt construction aborts instead
+of writing an artifact when any enforced invariant fails. Enforced invariants:
+{invariant_names}. Reportable qualification checks that failed: {failed_text}.
 
 ## Reproduction
 
@@ -889,32 +949,24 @@ def main() -> None:
         gpu_after,
         required_throttle_mask=args.required_active_throttle_mask,
     )
-    qualification_checks = {
+    enforced_invariants = {
         "source_checkout_clean_before_timing": (
             source_before["worktree_state"] == "clean"
         ),
         "source_checkout_clean_after_timing": (
             source_after["worktree_state"] == "clean"
         ),
-        "source_checkout_unchanged_during_timing": source_before == source_after,
-        "compile_cache_initially_empty": not initial_artifacts,
-        "hierarchical_runtime_bound_to_new_compile_artifacts": bool(
-            artifact_groups["hierarchical"]
-        ),
-        "equal_quarter_runtime_bound_to_new_compile_artifacts": bool(
-            artifact_groups["equal_quarter"]
-        ),
-        "all_recorded_compile_artifacts_hash_verified": bool(final_artifacts),
-        "all_runtime_artifact_keys_present": all(
-            key in final_artifacts
-            for group in artifact_groups.values()
-            for key in group
+        "compile_artifact_object_hashes_match_manifests": all(
+            artifact["object_sha256"]
+            == json.loads(
+                (compile_cache_root / artifact["manifest_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )["object_sha256"]
+            for artifact in final_artifacts.values()
         ),
         "captured_graph_replays_validated_before_timing": (
             _captured_graph_replays_validated(results)
-        ),
-        "balanced_warm_measurement_order_recorded": _balanced_orders_recorded(
-            results, args.samples
         ),
         "raw_cold_samples_recorded": all(
             len(arm["cold_rank_max_microseconds"]) == 1
@@ -927,6 +979,31 @@ def main() -> None:
             for arm in result["implementations"].values()
         ),
         "correctness_passed": _all_correctness_passed(results),
+    }
+    violated_invariants = [
+        name for name, passed in enforced_invariants.items() if not passed
+    ]
+    if violated_invariants:
+        raise RuntimeError(
+            "benchmark receipt invariant failed: " + ", ".join(violated_invariants)
+        )
+    qualification_checks = {
+        "source_checkout_unchanged_during_timing": source_before == source_after,
+        "compile_cache_initially_empty": not initial_artifacts,
+        "hierarchical_runtime_bound_to_new_compile_artifacts": bool(
+            artifact_groups["hierarchical"]
+        ),
+        "equal_quarter_runtime_bound_to_new_compile_artifacts": bool(
+            artifact_groups["equal_quarter"]
+        ),
+        "all_runtime_artifact_keys_present": all(
+            key in final_artifacts
+            for group in artifact_groups.values()
+            for key in group
+        ),
+        "balanced_warm_measurement_order_recorded": _balanced_orders_recorded(
+            results, args.samples
+        ),
         **gpu_checks,
     }
     status = "qualified" if all(qualification_checks.values()) else "unqualified"
@@ -936,10 +1013,11 @@ def main() -> None:
         *sys.argv[1:],
     ]
     receipt = {
-        "schema": "b12x.tp16-pcie-equal-quarter-benchmark.v2",
+        "schema": "b12x.tp16-pcie-equal-quarter-benchmark.v3",
         "status": status,
         "artifact_kind": "B12X TP16 PCIe all-reduce benchmark receipt",
         "captured_at_utc": datetime.now(UTC).isoformat(),
+        "enforced_invariants": enforced_invariants,
         "qualification_checks": qualification_checks,
         "comparison": {
             "kind": "within-revision all-reduce implementation comparison",
