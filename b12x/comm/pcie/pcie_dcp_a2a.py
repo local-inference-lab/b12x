@@ -1466,6 +1466,12 @@ class PCIeDCPA2A:
                         f"{name} must be contiguous {shape} {dtype} on "
                         f"{self.device}"
                     )
+            capturing = _is_current_stream_capturing(self.device)
+            if capturing and (output_weights is None or output_ids is None):
+                raise RuntimeError(
+                    "Kimi top-16 CUDA graph capture requires caller-owned "
+                    "output_weights and output_ids"
+                )
             if output_weights is None:
                 output_weights = torch.empty(
                     (rows, 16), device=self.device, dtype=torch.float32
@@ -1489,7 +1495,7 @@ class PCIeDCPA2A:
                         f"{name} must be contiguous {(rows, 16)} {dtype} on "
                         f"{self.device}"
                     )
-            if _is_current_stream_capturing(self.device):
+            if capturing:
                 from ._dcp_a2a_cute import is_kimi_topk16_prepared
 
                 if not is_kimi_topk16_prepared(threads):

@@ -720,6 +720,24 @@ def test_kimi_topk16_rejects_out_of_range_rows(rows: int) -> None:
         runtime.close()
 
 
+def test_kimi_topk16_capture_requires_caller_owned_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((1, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="caller-owned output_weights"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
     monkeypatch: pytest.MonkeyPatch,
