@@ -11,7 +11,17 @@ import pytest
 import torch
 
 from b12x._lib import dense_gemm as dense_module
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics import (
+    FLOAT4_E2M1_MAX,
+    MX_SF_VEC_SIZE,
+    _ue8m0_output_scale_torch,
+    as_grouped_scale_view_mx,
+    fp4_quantize_values_torch,
+    pack_grouped_fp4_values,
+    pow2_ceil_ue8m0_torch,
+    quantize_grouped_nvfp4_torch,
+    swizzle_block_scale,
+)
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import blockscaled
 from b12x.gemm._shared.wo_mxfp8 import (
@@ -123,6 +133,66 @@ def test_mm_nvfp4_matches_flashinfer_cudnn(m, n, k, c_dtype) -> None:
     )
 
     torch.testing.assert_close(actual[:, :, 0], oracle, rtol=0, atol=0)
+
+
+def _make_mxfp4_operand(
+    shape: tuple[int, int, int],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Quantize to MXFP4: E2M1 values, one UE8M0 ceil scale per 32 elements.
+
+    Returns ``((packed, scale_view), dequantized)`` where ``dequantized`` is
+    the exact fp32 tensor the kernel should reproduce.
+    """
+    groups, rows, cols = shape
+    source = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 4
+    blocked = source.float().view(groups, rows, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
+    block_max = blocked.abs().amax(dim=-1, keepdim=True)
+    rounded, byte = pow2_ceil_ue8m0_torch(block_max / FLOAT4_E2M1_MAX)
+    inv = _ue8m0_output_scale_torch(byte)
+    values = fp4_quantize_values_torch(
+        (blocked * inv).clamp(-FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX)
+    )
+    packed = pack_grouped_fp4_values(values.view(groups, rows, cols))
+    swizzled = swizzle_block_scale(byte.squeeze(-1).view(torch.float8_e8m0fnu))
+    scale_view = as_grouped_scale_view_mx(swizzled.view(torch.uint8), rows, cols)
+    dequantized = (values * rounded).view(groups, rows, cols)
+    return (packed, scale_view), dequantized
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "c_dtype"),
+    [
+        (128, 128, 256, "bfloat16"),
+        (256, 512, 256, "bfloat16"),
+        (512, 256, 512, "bfloat16"),
+        (128, 128, 256, "float16"),
+    ],
+)
+def test_mm_mxfp4_matches_dequant_reference(m, n, k, c_dtype) -> None:
+    """MXFP4 (E2M1 + UE8M0/32) through the MmaMXF4Op dispatch path.
+
+    Products of E2M1 values scaled by powers of two are exact in fp32, so the
+    kernel output must match the dequantized einsum bit-for-bit.
+    """
+    require_b12x()
+    torch.manual_seed(7)
+
+    lhs, a_deq = _make_mxfp4_operand((1, m, k))
+    rhs, b_deq = _make_mxfp4_operand((1, n, k))
+
+    out = blockscaled.mm(
+        lhs,
+        rhs,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype=c_dtype,
+        sf_vec_size=MX_SF_VEC_SIZE,
+    )
+
+    out_dtype = torch.bfloat16 if c_dtype == "bfloat16" else torch.float16
+    ref = torch.einsum("gmk,gnk->mng", a_deq, b_deq).to(out_dtype)
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 def test_mm_mxfp8_grouped_batches_use_their_own_scales(
