@@ -15,6 +15,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     _compute_crossover_size,
     _finish_collective_runtime_setup,
     _group_ranks,
+    _object_broadcast_device,
     _OwnedSharedBuffer,
     _require_no_retained_ipc_setup,
     _require_full_grid_residency,
@@ -1323,6 +1324,8 @@ def test_retained_generation_blocks_second_setup_before_cuda_allocation(monkeypa
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
     )
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
 
     with pytest.raises(RuntimeError, match="preparation status") as exc:
         PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -1416,6 +1419,55 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
     )
 
 
+def test_shared_buffer_maps_only_selected_peers(monkeypatch):
+    class FakeIPC:
+        def __init__(self):
+            self.opened = []
+
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, ptr, value, size):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            ptr = {
+                b"remote-1": 2001,
+                b"remote-2": 2002,
+                b"remote-3": 2003,
+            }[handle]
+            self.opened.append(ptr)
+            return ptr
+
+    ipc = FakeIPC()
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 4)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object",
+        lambda local_object, group: (
+            [local_object, (), (), ()]
+            if isinstance(local_object, tuple)
+            else [local_object, b"remote-1", b"remote-2", b"remote-3"]
+        ),
+    )
+
+    shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+        object(),
+        256,
+        zero_fill=True,
+        ipc=ipc,
+        peer_ranks=(1, 3),
+    )
+
+    assert ipc.opened == [2001, 2003]
+    assert shared.local_ptr == 1000
+    assert shared.peer_ptrs == (1000, 2001, 0, 2003)
+    assert shared.remote_ptrs == (2001, 2003)
+
+
 def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
     class FakeIPC:
         def __init__(self):
@@ -1495,6 +1547,15 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
     assert ext.register_graph_buffers_calls == [
         (12345, [[1, 2, 3], [9, 8, 7]], [[0, 64], [16, 80]])
     ]
+
+
+def test_object_broadcast_uses_cpu_for_gloo(monkeypatch):
+    group = object()
+    monkeypatch.setattr(
+        "torch.distributed.get_backend", lambda group=None: "gloo"
+    )
+
+    assert _object_broadcast_device(group) == torch.device("cpu")
 
 
 def test_nonmonotonic_process_group_order_is_preserved_for_handle_slots(

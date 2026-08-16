@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -175,9 +176,18 @@ def test_vocab_argmax_resolves_implicit_cuda_device(
     group = MagicMock()
     launcher = MagicMock()
     ipc = MagicMock()
-    ipc.cudaMalloc.return_value = 1000
-    ipc.cudaIpcGetMemHandleBytes.return_value = b"local"
-    ipc.cudaIpcOpenMemHandleBytes.side_effect = range(2000, 2006)
+    shared = SimpleNamespace(
+        local_ptr=1000,
+        peer_ptrs=tuple(range(16)),
+        remote_ptrs=tuple(range(2000, 2006)),
+    )
+    allocate_shared_buffer = MagicMock(return_value=shared)
+    setup_owners = []
+
+    def run_collective_setup(*, owner, exchange_group, setup):
+        assert exchange_group is group
+        setup_owners.append(owner)
+        return setup()
 
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 16)
@@ -195,8 +205,13 @@ def test_vocab_argmax_resolves_implicit_cuda_device(
     )
     monkeypatch.setattr(
         vocab_argmax_module,
-        "_exchange_ipc_handles",
-        lambda local_handle, group: [local_handle] * 16,
+        "_run_collective_preallocation_setup",
+        run_collective_setup,
+    )
+    monkeypatch.setattr(
+        vocab_argmax_module.PCIeOneshotAllReduce,
+        "_allocate_shared_buffer",
+        allocate_shared_buffer,
     )
 
     runtime = PCIeVocabParallelArgmax(
@@ -206,7 +221,20 @@ def test_vocab_argmax_resolves_implicit_cuda_device(
     )
 
     assert runtime.device == torch.device("cuda:7")
-    ipc.cudaSetDevice.assert_called_once_with(7)
+    assert setup_owners == [
+        "PCIe vocabulary argmax argument validation",
+        "PCIe vocabulary argmax runtime preparation",
+    ]
+    allocate_shared_buffer.assert_called_once_with(
+        group,
+        vocab_argmax_module.SLAB_BYTES,
+        zero_fill=True,
+        ipc=ipc,
+        peer_ranks=(1, 2, 3, 4, 8, 12),
+    )
+    assert ipc.cudaSetDevice.call_count == 2
+    assert runtime._slab_ptrs == tuple(range(16))
+    assert runtime._remote_ptrs == list(range(2000, 2006))
     runtime._closed = True
 
 

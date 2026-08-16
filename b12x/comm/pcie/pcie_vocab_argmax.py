@@ -13,7 +13,11 @@ from torch.distributed import ProcessGroup
 
 from ._cuda_ipc import CudaRTLibrary
 from ._vocab_argmax_cute import SLAB_BYTES, get_vocab_argmax_launcher
-from .pcie_oneshot import _broadcast_gather_object
+from .pcie_oneshot import (
+    PCIeOneshotAllReduce,
+    _broadcast_gather_object,
+    _run_collective_preallocation_setup,
+)
 
 
 ISLAND_SIZE = 4
@@ -112,74 +116,91 @@ class PCIeVocabParallelArgmax:
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
-        self.device = (
-            device
-            if isinstance(device, torch.device)
-            else torch.device(f"cuda:{device}" if isinstance(device, int) else device)
-        )
-        if self.world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(
-                "vocabulary argmax requires "
-                f"{SUPPORTED_WORLD_SIZES}, got TP{self.world_size}"
-            )
-        if self.device.type != "cuda":
-            raise ValueError("vocabulary argmax requires a CUDA device")
-        device_index = self.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-            self.device = torch.device("cuda", device_index)
-        if local_vocab_size <= 0 or local_vocab_size * self.world_size >= 1 << 31:
-            raise ValueError("global vocabulary must fit a positive int32 index")
-        if not 0 < max_batch_size <= MAX_BATCH_SIZE:
-            raise ValueError(f"max_batch_size must be in [1, {MAX_BATCH_SIZE}]")
 
-        self.local_vocab_size = int(local_vocab_size)
-        self.max_batch_size = int(max_batch_size)
+        def normalize_and_validate():
+            device_obj = (
+                device
+                if isinstance(device, torch.device)
+                else torch.device(
+                    f"cuda:{device}" if isinstance(device, int) else device
+                )
+            )
+            if self.world_size not in SUPPORTED_WORLD_SIZES:
+                raise ValueError(
+                    "vocabulary argmax requires "
+                    f"{SUPPORTED_WORLD_SIZES}, got TP{self.world_size}"
+                )
+            if device_obj.type != "cuda":
+                raise ValueError("vocabulary argmax requires a CUDA device")
+            if device_obj.index is None:
+                device_obj = torch.device("cuda", torch.cuda.current_device())
+            normalized_local_vocab_size = int(local_vocab_size)
+            normalized_max_batch_size = int(max_batch_size)
+            if (
+                normalized_local_vocab_size <= 0
+                or normalized_local_vocab_size * self.world_size >= 1 << 31
+            ):
+                raise ValueError("global vocabulary must fit a positive int32 index")
+            if not 0 < normalized_max_batch_size <= MAX_BATCH_SIZE:
+                raise ValueError(
+                    f"max_batch_size must be in [1, {MAX_BATCH_SIZE}]"
+                )
+            return (
+                device_obj,
+                normalized_local_vocab_size,
+                normalized_max_batch_size,
+                _wait_nanosleep_cycles_from_env(),
+            )
+
+        (
+            self.device,
+            self.local_vocab_size,
+            self.max_batch_size,
+            wait_nanosleep_cycles,
+        ) = _run_collective_preallocation_setup(
+            owner="PCIe vocabulary argmax argument validation",
+            exchange_group=exchange_group,
+            setup=normalize_and_validate,
+        )
         _require_uniform_geometry(
             self.local_vocab_size,
             self.max_batch_size,
             exchange_group,
         )
-        self._ipc = CudaRTLibrary()
         self._slab_ptrs: tuple[int, ...] = ()
         self._launcher = None
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
-        self._closed = False
+        self._closed = True
 
-        peer_ptrs = [0] * self.world_size
-        try:
+        def prepare_runtime():
+            self._ipc = CudaRTLibrary()
             with self._cuda_runtime_device():
-                self._local_ptr = self._ipc.cudaMalloc(SLAB_BYTES)
-                self._ipc.cudaMemset(self._local_ptr, 0, SLAB_BYTES)
-                local_handle = self._ipc.cudaIpcGetMemHandleBytes(self._local_ptr)
-                handles = _exchange_ipc_handles(local_handle, exchange_group)
-                peer_ptrs[self.rank] = self._local_ptr
-                for peer in _selected_peers(self.rank, self.world_size):
-                    remote_ptr = self._ipc.cudaIpcOpenMemHandleBytes(handles[peer])
-                    peer_ptrs[peer] = remote_ptr
-                    self._remote_ptrs.append(remote_ptr)
-                self._slab_ptrs = tuple(peer_ptrs)
-                self._launcher = get_vocab_argmax_launcher(
+                launcher = get_vocab_argmax_launcher(
                     self.world_size,
                     self.rank,
                     self.device.index or 0,
-                    wait_nanosleep_cycles=_wait_nanosleep_cycles_from_env(),
+                    wait_nanosleep_cycles=wait_nanosleep_cycles,
                 )
-        except Exception:
-            # Construction cleanup is rank-local. Mark the object closed so
-            # garbage collection cannot enter the collective close protocol.
-            self._closed = True
-            with suppress(Exception), self._cuda_runtime_device():
-                for ptr in self._remote_ptrs:
-                    with suppress(Exception):
-                        self._ipc.cudaIpcCloseMemHandle(ptr)
-                self._remote_ptrs.clear()
-                if self._local_ptr:
-                    with suppress(Exception):
-                        self._ipc.cudaFree(self._local_ptr)
-                    self._local_ptr = 0
-            raise
+            return self._ipc, launcher
+
+        self._ipc, self._launcher = _run_collective_preallocation_setup(
+            owner="PCIe vocabulary argmax runtime preparation",
+            exchange_group=exchange_group,
+            setup=prepare_runtime,
+        )
+        with self._cuda_runtime_device():
+            shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+                exchange_group,
+                SLAB_BYTES,
+                zero_fill=True,
+                ipc=self._ipc,
+                peer_ranks=_selected_peers(self.rank, self.world_size),
+            )
+        self._local_ptr = shared.local_ptr
+        self._slab_ptrs = shared.peer_ptrs
+        self._remote_ptrs = list(shared.remote_ptrs)
+        self._closed = False
 
     @classmethod
     def from_exchange_group(

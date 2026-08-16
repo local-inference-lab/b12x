@@ -57,6 +57,12 @@ def _inputs(
         base[2, local_vocab_size - 1] = float("nan")
     if rank == world_size - 1 and batch > 3:
         base[3, local_vocab_size - 1] = 0.0
+    if rank == 0 and batch > 4:
+        base[4, 5] = float("inf")
+    if rank == world_size - 1 and batch > 4:
+        base[4, local_vocab_size - 1] = float("inf")
+    if batch > 5:
+        base[5].fill_(float("-inf"))
 
     local_scores = (base.float() + bias.float()).bfloat16()
     gathered = [torch.empty_like(local_scores) for _ in range(world_size)]
@@ -68,6 +74,10 @@ def _inputs(
         expected[2] = 3
     if batch > 3:
         expected[3] = 0
+    if batch > 4:
+        expected[4] = 5
+    if batch > 5:
+        expected[5] = 0
     return base, bias, expected
 
 

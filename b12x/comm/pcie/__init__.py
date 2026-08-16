@@ -18,8 +18,9 @@ pools via ``<Class>Pool``.
 - ``VocabParallelArgmax``: TP8/TP12/TP16 fused BF16 add and exact global
   greedy argmax.
 
-Device kernels are authored in Python with CuTe DSL. Host-side CUDA Runtime
-and Driver calls are made from Python.
+Every device kernel is authored in Python with CuTe DSL. Host-side CUDA
+Runtime/Driver calls are also made from Python; this package contains no
+repo-authored C++ or CUDA source and never invokes a native extension build.
 """
 
 from __future__ import annotations

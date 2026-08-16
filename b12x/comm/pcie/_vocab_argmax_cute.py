@@ -195,7 +195,7 @@ def _warp_max_u64(value: Uint64, *, loc=None, ip=None) -> Uint64:
 @cute.jit
 def _wait_for(address: Int64, generation: Uint32, cycles: int) -> None:
     observed = _load_acquire_sys_u32(address)
-    while observed < generation:
+    while observed != generation:
         if cutlass.const_expr(cycles > 0):
             _nanosleep(Uint32(cycles))
         observed = _load_acquire_sys_u32(address)

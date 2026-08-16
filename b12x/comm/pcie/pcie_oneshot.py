@@ -279,12 +279,15 @@ def _object_broadcast_device(group: ProcessGroup) -> torch.device | str:
             backend = dist.get_backend(group)
     except Exception as exc:
         raise RuntimeError(
-            "PCIe oneshot IPC exchange requires a CUDA/NCCL process group"
+            "PCIe object exchange requires a valid process group"
         ) from exc
     backend_name = str(backend).lower()
+    if "gloo" in backend_name:
+        return torch.device("cpu")
     if "nccl" not in backend_name:
         raise RuntimeError(
-            f"PCIe oneshot IPC exchange requires an NCCL process group, got {backend}"
+            "PCIe object exchange requires an NCCL or Gloo process group, "
+            f"got {backend}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("PCIe oneshot IPC exchange requires CUDA")
@@ -2331,8 +2334,21 @@ class PCIeOneshotAllReduce:
         *,
         zero_fill: bool,
         ipc: CudaRTLibrary,
+        peer_ranks: Optional[Sequence[int]] = None,
     ) -> _OwnedSharedBuffer:
         _require_no_retained_ipc_setup(exchange_group)
+        world_size = dist.get_world_size(group=exchange_group)
+        rank = dist.get_rank(group=exchange_group)
+        selected_peers = (
+            set(range(world_size)) - {rank}
+            if peer_ranks is None
+            else {int(peer) for peer in peer_ranks}
+        )
+        if rank in selected_peers or any(
+            not 0 <= peer < world_size for peer in selected_peers
+        ):
+            raise ValueError("peer_ranks must contain valid remote group ranks")
+
         local_ptr: int | None = None
         local_handle: bytes | None = None
         prepare_error: BaseException | None = None
@@ -2435,8 +2451,6 @@ class PCIeOneshotAllReduce:
         peer_ptrs: list[int] = []
         remote_ptrs: list[int] = []
         try:
-            world_size = dist.get_world_size(group=exchange_group)
-            rank = dist.get_rank(group=exchange_group)
             handles = _broadcast_gather_object(local_handle, exchange_group)
         except Exception as exchange_error:
             # No rank has opened an import before handle exchange completes.
@@ -2459,6 +2473,9 @@ class PCIeOneshotAllReduce:
         for idx, handle in enumerate(handles):
             if idx == rank:
                 peer_ptrs.append(local_ptr)
+                continue
+            if idx not in selected_peers:
+                peer_ptrs.append(0)
                 continue
             try:
                 remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
