@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare TP16 hierarchical and equal-quarter PCIe all-reduce latency.
 
-The benchmark keeps both B12X runtimes and a production-shaped DCP IPC pool
-resident. It validates BF16 results against an FP32 sum, captures both
+The benchmark keeps both B12X runtimes and a decode-context-parallel attention
+IPC pool resident. It validates BF16 results against an FP32 sum, captures both
 implementations before timing, alternates their measured order, and reports
 rank-maximum CUDA-event latency. The generated JSON receipt binds the result to
 the clean source checkout, compile artifacts, PTXAS executable, physical GPU
@@ -783,8 +783,9 @@ Status: **{receipt["status"]}**.
 
 This record compares the B12X hierarchical and equal-quarter BF16 all-reduce
 implementations on one TP16 PCIe topology. The comparison measures rank-maximum
-CUDA-graph replay latency while a production-shaped Kimi-K3 DCP IPC pool is
-resident. It does not measure end-to-end model throughput.
+CUDA-graph replay latency while a decode-context-parallel attention IPC pool
+with 96 query heads, 512-dimensional latent heads, and 576-dimensional query
+heads is resident. It does not measure end-to-end model throughput.
 
 ## Conditions
 
