@@ -224,7 +224,7 @@ def test_tp16_capture_returns_dispatcher() -> None:
     island.capture.assert_called_once_with(stream="17", channel_id="target")
 
 
-def test_tp16_forced_island_routes_below_crossover(
+def test_tp16_island_opt_in_keeps_small_input_on_hierarchy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "island_rs")
@@ -232,6 +232,7 @@ def test_tp16_forced_island_routes_below_crossover(
     hierarchy.rank = 0
     hierarchy.world_size = 16
     hierarchy.device = torch.device("cpu")
+    hierarchy.should_allreduce.return_value = True
     island = MagicMock()
     island.should_allreduce.return_value = True
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
@@ -239,14 +240,14 @@ def test_tp16_forced_island_routes_below_crossover(
 
     allreduce.all_reduce(inp)
 
-    island.all_reduce.assert_called_once_with(
+    hierarchy.all_reduce.assert_called_once_with(
         inp,
         out=None,
         blocks=None,
         stream=None,
         channel_id=None,
     )
-    hierarchy.all_reduce.assert_not_called()
+    island.all_reduce.assert_not_called()
 
 
 def test_tp16_auto_uses_island_when_hierarchy_rejects_below_crossover() -> None:

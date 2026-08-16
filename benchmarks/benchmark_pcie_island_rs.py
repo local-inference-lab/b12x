@@ -542,7 +542,7 @@ def _worker(
             hierarchical,
             "hierarchical",
             equal_quarter,
-            algorithm_override="auto",
+            algorithm_override="island_rs",
         )
         hierarchical = None
         equal_quarter = None
@@ -640,12 +640,12 @@ def _worker(
                 arms["equal_quarter"]["median_warm_rank_max_microseconds"]
             )
             ratio = hierarchical_us / equal_quarter_us
-            automatic_dispatch = (
+            size_routed_dispatch = (
                 "equal_quarter" if runtime._use_island_rs(inp) else "hierarchical"
             )
             results.append(
                 {
-                    "automatic_dispatch": automatic_dispatch,
+                    "size_routed_dispatch": size_routed_dispatch,
                     "elements": elements,
                     "bytes": elements * torch.bfloat16.itemsize,
                     "first_timed_replay_measurement_order": list(
@@ -754,7 +754,7 @@ def _render_report(receipt: dict[str, object], receipt_path: Path) -> str:
             "| {elements:,} | {dispatch} | {hierarchical:.3f} | "
             "{equal_quarter:.3f} | {ratio:.3f}× |".format(
                 elements=result["elements"],
-                dispatch=result["automatic_dispatch"],
+                dispatch=result["size_routed_dispatch"],
                 hierarchical=arms["hierarchical"]["median_warm_rank_max_microseconds"],
                 equal_quarter=arms["equal_quarter"][
                     "median_warm_rank_max_microseconds"
@@ -816,7 +816,7 @@ UUIDs, clocks, modes, and correctness results.
 
 ## Results
 
-| BF16 elements | Automatic dispatch | Hierarchical µs | Equal-quarter µs | Hierarchical/equal-quarter |
+| BF16 elements | Size-routed dispatch | Hierarchical µs | Equal-quarter µs | Hierarchical/equal-quarter |
 | ---: | :--- | ---: | ---: | ---: |
 {chr(10).join(rows)}
 

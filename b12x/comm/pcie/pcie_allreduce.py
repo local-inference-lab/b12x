@@ -47,7 +47,7 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 
 
 def _algorithm_override() -> str:
-    """Select the established runtime or opt into an alternate implementation."""
+    """Select the established runtime or enable size-routed island dispatch."""
 
     choice = os.getenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "auto").strip().lower()
     if choice not in ("auto", "hierarchical", "island_rs"):
@@ -295,8 +295,6 @@ class PCIeAllReduce:
         island_accepts = self._island_rs.should_allreduce(inp)
         if not island_accepts:
             return False
-        if override == "island_rs":
-            return True
         hierarchy_accepts = self._runtime.should_allreduce(inp)
         if not hierarchy_accepts:
             return True

@@ -9,7 +9,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from b12x.comm.pcie.pcie_allreduce import (
+    ISLAND_RS_CROSSOVER_ELEMENTS,
     ISLAND_RS_MAX_BYTES,
+    ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS,
     PCIeAllReduce,
 )
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
@@ -155,7 +157,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             inputs_before,
             strict=True,
         ):
-            assert runtime._use_island_rs(inp)
+            use_island = (
+                inp.numel() > ISLAND_RS_CROSSOVER_ELEMENTS
+                and inp.numel() % ISLAND_RS_PREFERRED_ALIGNMENT_ELEMENTS == 0
+            )
+            assert runtime._use_island_rs(inp) is use_island
             actual = runtime.all_reduce(inp, out=out)
             assert actual is out
             torch.cuda.synchronize(device)
