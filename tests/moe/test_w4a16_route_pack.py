@@ -78,6 +78,49 @@ def _expected_route_pack(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
+    """A fixed-capacity serving arena must not specialize every tail length.
+
+    With a 1536-token serving capacity, top-k 16, and E=896, a 1177-token
+    prefill tail belongs to the 2048-token compile bucket. That bucket exceeds
+    the fixed arena even though the arena safely covers the live tail. Reuse
+    the caller's full capacity so startup warmup and runtime select the same
+    Triton constexprs instead of compiling an exact tail specialization.
+    """
+    max_tokens = 1536
+    tail_tokens = 1177
+    topk = 16
+    block_size = 8
+    num_experts = 896
+    _, max_routes, max_blocks = route_pack_capacity(
+        max_tokens * topk,
+        block_size,
+        num_experts,
+        topk=topk,
+        bucket_tokens=False,
+    )
+    device = torch.device("cuda")
+    packed_routes = torch.empty(max_routes, dtype=torch.int32, device=device)
+    block_experts = torch.empty(max_blocks, dtype=torch.int32, device=device)
+
+    returned_routes, returned_blocks, _ = pack_topk_routes_by_expert(
+        torch.zeros((tail_tokens, topk), dtype=torch.int32, device=device),
+        block_size,
+        num_experts,
+        packed_route_indices=packed_routes,
+        block_expert_ids=block_experts,
+        packed_route_count=torch.empty(1, dtype=torch.int32, device=device),
+        expert_offsets=torch.empty(num_experts + 1, dtype=torch.int32, device=device),
+        expert_counts=torch.empty(num_experts, dtype=torch.int32, device=device),
+    )
+
+    assert returned_routes.data_ptr() == packed_routes.data_ptr()
+    assert returned_blocks.data_ptr() == block_experts.data_ptr()
+    assert returned_routes.numel() == max_routes
+    assert returned_blocks.numel() == max_blocks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_route_pack_capacity_error_reports_live_contract() -> None:
     topk_ids = torch.zeros((17, 8), dtype=torch.int32, device="cuda")
 
