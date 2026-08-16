@@ -45,6 +45,7 @@ def test_allreduce_uses_bounded_degree_path_for_large_worlds(
 def test_allreduce_factory_keeps_tp16_equal_quarter_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("B12X_PCIE_ALLREDUCE_ALGORITHM", raising=False)
     runtime = SimpleNamespace(
         rank=0,
         world_size=16,
@@ -193,7 +194,10 @@ def test_tp16_auto_implicit_output_uses_island_for_large_aligned_input() -> None
     island = MagicMock()
     island.should_allreduce.return_value = True
     allreduce = PCIeAllReduce(hierarchy, "hierarchical", island)
-    inp = torch.empty(pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2)
+    inp = torch.empty(
+        pcie_allreduce.ISLAND_RS_CROSSOVER_ELEMENTS * 2,
+        dtype=torch.bfloat16,
+    )
 
     allreduce.all_reduce(inp)
 
