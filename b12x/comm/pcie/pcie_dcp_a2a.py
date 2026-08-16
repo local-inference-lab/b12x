@@ -753,10 +753,13 @@ class PCIeDCPA2A:
             )
 
     def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
-        """Compile/load the TP16 Kimi fused launcher before graph capture."""
+        """Compile/load the Kimi fused launcher before graph capture."""
 
-        if self.world_size != 16:
-            raise ValueError("Kimi paired gather+top-k requires TP16")
+        if self.world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                "Kimi paired gather+top-k requires a supported PCIe DCP "
+                f"world size, got {self.world_size}"
+            )
         if _is_current_stream_capturing(self.device):
             raise RuntimeError(
                 "prepare_graph_all_gather_pair_kimi_topk() must run before capture"
@@ -764,7 +767,13 @@ class PCIeDCPA2A:
         from ._dcp_a2a_cute import _get_compiled_all_gather_pair
 
         with torch.cuda.device(self.device):
-            _get_compiled_all_gather_pair(16, self.rank, 512, True, True)
+            _get_compiled_all_gather_pair(
+                self.world_size,
+                self.rank,
+                512,
+                True,
+                True,
+            )
 
     def _validate(
         self,
@@ -1270,15 +1279,30 @@ class PCIeDCPA2A:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather Kimi-K3's TP16 latent row and select its 16 experts."""
+        """Gather Kimi-K3's sharded latent row and select its 16 experts."""
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
-        if self.world_size != 16:
-            raise ValueError("Kimi paired gather+top-k requires TP16")
+        if self.world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                "Kimi paired gather+top-k requires a supported PCIe DCP "
+                f"world size, got TP{self.world_size}"
+            )
+        local_down_width = 3584 // self.world_size
+        local_router_width = 896 // self.world_size
         expected = (
-            (local_down, (1, 224), torch.bfloat16, "local_down"),
-            (local_router, (1, 56), torch.float32, "local_router"),
+            (
+                local_down,
+                (1, local_down_width),
+                torch.bfloat16,
+                "local_down",
+            ),
+            (
+                local_router,
+                (1, local_router_width),
+                torch.float32,
+                "local_router",
+            ),
             (correction_bias, (896,), torch.float32, "correction_bias"),
         )
         for value, shape, dtype, name in expected:
@@ -1317,7 +1341,7 @@ class PCIeDCPA2A:
             from ._dcp_a2a_cute import is_all_gather_pair_prepared
 
             if not is_all_gather_pair_prepared(
-                16,
+                self.world_size,
                 self.rank,
                 512,
                 True,
@@ -1363,6 +1387,7 @@ class PCIeDCPA2A:
 
         with torch.cuda.device(self.device):
             all_gather_pair_kimi_topk(
+                world_size=self.world_size,
                 rank=self.rank,
                 local_down_ptr=local_down.data_ptr(),
                 local_router_ptr=local_router.data_ptr(),
