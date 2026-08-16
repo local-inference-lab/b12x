@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,14 +22,22 @@ from b12x.moe._shared.kernels.w4a16.kernel import (
 )
 from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
+    W4A16MixedTrellis3Kernel,
     W4A16MixedTrellisKernel,
+    _check_descriptor_projection_counts,
+    _mixed_route_num_experts,
     _validate_mixed_trellis_tier_storage,
     build_ordered_maps,
+    build_projection_tiered_maps,
     build_tiered_maps,
     combine_trellis_rotations,
     compile_mixed_trellis,
+    compile_mixed_trellis3,
     make_mixed_trellis_buffers,
+    make_mixed_trellis3_buffers,
     run_mixed_trellis,
+    run_mixed_trellis3,
+    warmup_mixed_trellis_route_pack,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_moe_weights,
@@ -73,12 +82,16 @@ def test_mixed_kernel_uses_runtime_expert_bounds() -> None:
 
     assert "tier0_num_experts" in call_parameters
     assert "tier1_num_experts" in call_parameters
+    assert "tier0_up_experts" in call_parameters
+    assert "tier1_up_experts" in call_parameters
     assert "self.tier0.num_experts" not in emit_source
     assert "self.tier1.num_experts" not in emit_source
     assert "self.total_experts" not in emit_source
     assert "self.total_experts" not in kernel_source
-    assert "local_expert < tier0_num_experts" in emit_source
-    assert "local_expert < tier1_num_experts" in emit_source
+    assert "local_expert < tier0_gate_experts" in emit_source
+    assert "local_expert < tier1_gate_experts" in emit_source
+    assert "local_expert < tier0_up_experts" in emit_source
+    assert "local_expert < tier1_up_experts" in emit_source
 
 
 def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
@@ -123,6 +136,51 @@ def test_mixed_runtime_rejects_invalid_raw_tier_storage() -> None:
             validate(candidate)
 
 
+def test_projection_tight_storage_requires_coupled_exact_counts() -> None:
+    device = torch.device("cpu")
+    experts, hidden, intermediate, bits = 4, 128, 128, 3
+    stride = (hidden // 16) * (intermediate // 16) * (8 * bits)
+
+    def tier(planes):
+        return SimpleNamespace(
+            num_experts=experts,
+            w13=torch.empty(planes * stride, dtype=torch.int32),
+            w2=torch.empty(experts * stride, dtype=torch.int32),
+            w13_scale=torch.empty(4, dtype=torch.uint8),
+            w2_scale=torch.empty(4, dtype=torch.uint8),
+            w13_global_scale=torch.empty(experts, dtype=torch.float32),
+            w2_global_scale=torch.empty(experts, dtype=torch.float32),
+        )
+
+    def validate(candidate, gate=None, up=None):
+        _validate_mixed_trellis_tier_storage(
+            name="tier0",
+            tier=candidate,
+            expected_experts=experts,
+            bits=bits,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            device=device,
+            gate_experts=gate,
+            up_experts=up,
+        )
+
+    # Physical [1 gate | 3 up] is the exact four-plane target contract.
+    validate(tier(4), gate=1, up=3)
+
+    with pytest.raises(ValueError, match="exactly 4 projection planes"):
+        validate(tier(5), gate=1, up=3)
+    with pytest.raises(ValueError, match="paired gate_experts/up_experts"):
+        validate(tier(4), gate=1)
+    with pytest.raises(ValueError, match="projection counts"):
+        validate(tier(5), gate=5, up=0)
+
+    # Omitting projection counts requires one gate and one up plane per slot.
+    with pytest.raises(ValueError, match="exactly 8 projection planes"):
+        validate(tier(4))
+    validate(tier(8))
+
+
 def _sm12x_available() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -130,10 +188,21 @@ def _sm12x_available() -> bool:
     return major == 12 and minor in (0, 1)
 
 
-def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
+@pytest.mark.parametrize(
+    ("kernel_type", "entry_name"),
+    [
+        (W4A16MixedTrellisKernel, "kernel"),
+        (W4A16MixedTrellis3Kernel, "kernel3"),
+    ],
+)
+def test_mixed_kernel_tracks_shared_moe_body_contract(
+    kernel_type: type, entry_name: str
+) -> None:
     """Keep the direct CuTe call aligned with the shared driver's ABI."""
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(W4A16MixedTrellisKernel.kernel)))
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(getattr(kernel_type, entry_name)))
+    )
     calls = [
         node
         for node in ast.walk(tree)
@@ -492,6 +561,356 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_mixed_k3_k4_k5_matches_serial_and_captures() -> None:
+    """Validate MCG K5 dispatch and graph replay in the shared mixed grid."""
+
+    torch.manual_seed(20260809)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m, hidden, intermediate, topk = 2, 128, 128, 3
+    codebook = "mcg"
+    tiers = tuple(
+        _prepared(
+            experts=2,
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            seed=300 + bits,
+            device=device,
+            codebook=codebook,
+        )
+        for bits in (3, 4, 5)
+    )
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 2, 4], [5, 3, 1]], dtype=torch.int32, device=device)
+    topk_weights = torch.tensor(
+        [[0.5, 0.3, 0.2], [0.25, 0.25, 0.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+    tier_maps = (
+        torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32, device=device),
+        torch.tensor([-1, -1, 0, 1, -1, -1], dtype=torch.int32, device=device),
+        torch.tensor([-1, -1, -1, -1, 0, 1], dtype=torch.int32, device=device),
+    )
+    serial = sum(
+        (
+            _serial_tier(x, tier, topk_weights, topk_ids, expert_map)
+            for tier, expert_map in zip(tiers, tier_maps, strict=True)
+        ),
+        torch.zeros((m, hidden), dtype=torch.float32, device=device),
+    )
+    props = torch.cuda.get_device_properties(device)
+    launch = compile_mixed_trellis3(
+        size_m=m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tier0_num_experts=2,
+        tier1_num_experts=2,
+        tier2_num_experts=2,
+        top_k=topk,
+        max_m_blocks=8,
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=(128, 128, 128, 128),
+        trellis_codebook=codebook,
+    )
+    assert launch.local_memory_bytes == 0
+    global_to_combined, descriptor = build_projection_tiered_maps(
+        [0, 0, 1, 1, 2, 2],
+        [0, 0, 1, 1, 2, 2],
+        [0, 0, 1, 1, 2, 2],
+        tier_slots=(2, 2, 2),
+        device=device,
+    )
+    rotations = combine_trellis_rotations(*tiers)
+    buffers = make_mixed_trellis3_buffers(
+        launch, device=device, sms=int(props.multi_processor_count)
+    )
+
+    other_codebook = "sqg_xor_cheb_t12" if codebook == "mcg" else "mcg"
+    mismatched_tier0 = replace(tiers[0], trellis_codebook=other_codebook)
+    with pytest.raises(ValueError, match="launch-plan codebook"):
+        run_mixed_trellis3(
+            x,
+            mismatched_tier0,
+            tiers[1],
+            tiers[2],
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            rotations,
+            launch,
+            buffers,
+        )
+
+    eager = run_mixed_trellis3(
+        x,
+        *tiers,
+        topk_weights,
+        topk_ids,
+        global_to_combined,
+        descriptor,
+        rotations,
+        launch,
+        buffers,
+    ).clone()
+    torch.cuda.synchronize(device)
+    assert not torch.isnan(eager).any()
+    relative = (eager - serial).norm() / serial.norm().clamp_min(1.0e-12)
+    assert float(relative) < 4.0e-3
+
+    repeated = run_mixed_trellis3(
+        x,
+        *tiers,
+        topk_weights,
+        topk_ids,
+        global_to_combined,
+        descriptor,
+        rotations,
+        launch,
+        buffers,
+    )
+    torch.cuda.synchronize(device)
+    assert torch.equal(repeated, eager)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_mixed_trellis3(
+            x,
+            *tiers,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            rotations,
+            launch,
+            buffers,
+        )
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, eager)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_mixed_k3_k4_k5_partition_reuses_one_compiled_object() -> None:
+    """Three-tier checkpoint counts are runtime data, not JIT geometry."""
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+
+    def compile_partition(counts: tuple[int, int, int]):
+        return compile_mixed_trellis3(
+            size_m=2,
+            hidden_size=128,
+            intermediate_size=128,
+            tier0_num_experts=counts[0],
+            tier1_num_experts=counts[1],
+            tier2_num_experts=counts[2],
+            top_k=3,
+            max_m_blocks=8,
+            sms=int(props.multi_processor_count),
+            max_shared_mem=int(props.shared_memory_per_block_optin),
+            force_tile_config=(128, 128, 128, 128),
+        )
+
+    counts_a = (2, 2, 2)
+    counts_b = (3, 2, 1)
+    launch_a = compile_partition(counts_a)
+    launch_b = compile_partition(counts_b)
+
+    assert launch_a.compiled is launch_b.compiled
+    assert (
+        launch_a.tier0_num_experts,
+        launch_a.tier1_num_experts,
+        launch_a.tier2_num_experts,
+    ) == counts_a
+    assert (
+        launch_b.tier0_num_experts,
+        launch_b.tier1_num_experts,
+        launch_b.tier2_num_experts,
+    ) == counts_b
+
+
+@pytest.mark.parametrize(
+    ("codebook", "bits", "message"),
+    [
+        ("sqg_xor_cheb_t12", (3, 4, 5), "only the MCG codebook"),
+        ("mcg", (3, 4, 6), "one K3, one K4, and one K5 tier"),
+        ("mcg", (3, 3, 5), "one K3, one K4, and one K5 tier"),
+    ],
+)
+def test_compile_mixed_trellis3_rejects_unqualified_formats(
+    codebook: str,
+    bits: tuple[int, int, int],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        compile_mixed_trellis3(
+            size_m=1,
+            hidden_size=128,
+            intermediate_size=128,
+            tier0_num_experts=1,
+            tier1_num_experts=1,
+            tier2_num_experts=1,
+            top_k=1,
+            max_m_blocks=3,
+            sms=1,
+            max_shared_mem=1,
+            force_tile_config=(128, 128, 128, 128),
+            tier0_bits=bits[0],
+            tier1_bits=bits[1],
+            tier2_bits=bits[2],
+            trellis_codebook=codebook,
+        )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_projection_padded_launch_uses_exact_route_namespace() -> None:
+    """Projection padding must not enlarge routing or its JIT specialization."""
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    launch = compile_mixed_trellis3(
+        size_m=2,
+        hidden_size=128,
+        intermediate_size=128,
+        tier0_num_experts=3,
+        tier1_num_experts=3,
+        tier2_num_experts=1,
+        route_num_experts=6,
+        top_k=3,
+        max_m_blocks=8,
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=(128, 128, 128, 128),
+    )
+    buffers = make_mixed_trellis3_buffers(
+        launch, device=device, sms=int(props.multi_processor_count)
+    )
+    route_map = torch.arange(6, dtype=torch.int32, device=device)
+
+    assert launch.topk_sum.num_experts == 7
+    assert launch.topk_sum.route_num_experts == 6
+    assert warmup_mixed_trellis_route_pack(launch, buffers, expert_map=route_map) > 0
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_projection_padded_k345_runner_matches_serial_and_captures() -> None:
+    """Exercise the complete runner when descriptor slots exceed routes."""
+
+    torch.manual_seed(20260810)
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    m, hidden, intermediate, topk = 2, 128, 128, 3
+    tiers = tuple(
+        _prepared(
+            experts=experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            seed=500 + bits,
+            device=device,
+            codebook="mcg",
+        )
+        for bits, experts in ((3, 3), (4, 3), (5, 1))
+    )
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 3, 5], [4, 2, 1]], dtype=torch.int32, device=device)
+    topk_weights = torch.tensor(
+        [[0.5, 0.3, 0.2], [0.25, 0.25, 0.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+    tier_maps = (
+        torch.tensor([0, 1, 2, -1, -1, -1], dtype=torch.int32, device=device),
+        torch.tensor([-1, -1, -1, 0, 1, -1], dtype=torch.int32, device=device),
+        torch.tensor([-1, -1, -1, -1, -1, 0], dtype=torch.int32, device=device),
+    )
+    serial = sum(
+        (
+            _serial_tier(x, tier, topk_weights, topk_ids, expert_map)
+            for tier, expert_map in zip(tiers, tier_maps, strict=True)
+        ),
+        torch.zeros((m, hidden), dtype=torch.float32, device=device),
+    )
+    tier1_w13_stride = int(tiers[1].w13.numel()) // 6
+    tier1_w13 = tiers[1].w13.reshape(6, tier1_w13_stride)
+    runner_tiers = (
+        tiers[0],
+        replace(
+            tiers[1],
+            w13=torch.cat((tier1_w13[:2], tier1_w13[3:5])).contiguous(),
+        ),
+        tiers[2],
+    )
+    global_to_combined, descriptor = build_projection_tiered_maps(
+        [0, 0, 0, 1, 1, 2],
+        [0, 0, 0, 1, 1, 2],
+        [0, 0, 0, 1, 1, 2],
+        tier_slots=(3, 3, 1),
+        device=device,
+    )
+
+    def padded_rows(name: str) -> torch.Tensor:
+        rows = [getattr(tiers[0], name), getattr(tiers[1], name)[:2]]
+        rows.extend((getattr(tiers[2], name), getattr(tiers[1], name)[2:]))
+        return torch.cat(rows).contiguous()
+
+    rotations = MixedTrellisRotations(
+        intermediate=padded_rows("intermediate_rotations"),
+        gate_suh=padded_rows("gate_suh"),
+        up_suh=padded_rows("up_suh"),
+        down_svh=padded_rows("down_svh"),
+    )
+    launch = compile_mixed_trellis3(
+        size_m=m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tier0_num_experts=3,
+        tier1_num_experts=3,
+        tier2_num_experts=1,
+        route_num_experts=6,
+        top_k=topk,
+        max_m_blocks=8,
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=(128, 128, 128, 128),
+        trellis_codebook="mcg",
+    )
+    buffers = make_mixed_trellis3_buffers(
+        launch, device=device, sms=int(props.multi_processor_count)
+    )
+
+    def run() -> torch.Tensor:
+        return run_mixed_trellis3(
+            x,
+            *runner_tiers,
+            topk_weights,
+            topk_ids,
+            global_to_combined,
+            descriptor,
+            rotations,
+            launch,
+            buffers,
+            gate_experts=(3, 2, 1),
+            up_experts=(3, 2, 1),
+        )
+
+    eager = run().clone()
+    torch.cuda.synchronize(device)
+    relative = (eager - serial).norm() / serial.norm().clamp_min(1.0e-12)
+    assert float(relative) < 4.0e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, eager)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
     """A physical one-row H rotation must stay broadcast through mixed K3/K4."""
 
@@ -502,8 +921,7 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
 
     def shared_row() -> torch.Tensor:
         return (
-            0.875
-            + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
+            0.875 + 0.25 * torch.rand((1, hidden), generator=generator, device=device)
         ).to(torch.float16)
 
     shared_h = (shared_row(), shared_row(), shared_row())
@@ -854,6 +1272,170 @@ def test_build_tiered_maps_rejects_invalid_partitions() -> None:
         build_tiered_maps((0, 1), (1, 2), device=torch.device("cpu"))
     with pytest.raises(ValueError, match="disjoint partition"):
         build_tiered_maps((0, 4), (1, 2), device=torch.device("cpu"))
+
+
+def test_build_tiered_maps_repeats_projection_independent_descriptor_row() -> None:
+    route, descriptor = build_tiered_maps((2, 0), (3, 1), device=torch.device("cpu"))
+    assert route.tolist() == [1, 3, 0, 2]
+    rows = descriptor.reshape(3, 4)
+    assert rows[0].tolist() == [0, 1, 1 << 8, (1 << 8) | 1]
+    assert torch.equal(rows[0], rows[1])
+    assert torch.equal(rows[0], rows[2])
+
+
+def test_build_projection_tiered_maps_pads_each_row_to_slot_stride() -> None:
+    gate = [0] * 129 + [1] * 127
+    up = [0] * 128 + [1] * 128
+    down = [0] * 77 + [1] * 179
+    route, descriptor = build_projection_tiered_maps(
+        gate,
+        up,
+        down,
+        tier_slots=(129, 128),
+        device=torch.device("cpu"),
+    )
+
+    assert route.dtype == torch.int32
+    assert route.tolist() == list(range(256))
+    assert _mixed_route_num_experts(route, 256) == 256
+    rows = descriptor.reshape(3, 257)
+    assert torch.equal(rows[:, -1], torch.full((3,), -1, dtype=torch.int32))
+    assert rows[0, 128].item() == 128
+    assert rows[0, 129].item() == 1 << 8
+    assert rows[1, 127].item() == 127
+    assert rows[1, 128].item() == 1 << 8
+    assert rows[2, 76].item() == 76
+    assert rows[2, 77].item() == 1 << 8
+
+
+def test_projection_route_namespace_must_fit_the_map() -> None:
+    route = torch.arange(4, dtype=torch.int32)
+    with pytest.raises(ValueError, match="compiled route namespace"):
+        _mixed_route_num_experts(route, 5)
+
+
+def test_descriptor_projection_count_check_fails_closed() -> None:
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
+        _check_descriptor_projection_counts,
+        build_tiered_maps,
+    )
+
+    gate = [0] * 129 + [1] * 127
+    up = [0] * 128 + [1] * 128
+    down = [0] * 77 + [1] * 179
+    _, descriptor = build_projection_tiered_maps(
+        gate,
+        up,
+        down,
+        tier_slots=(129, 128),
+        device=torch.device("cpu"),
+    )
+    total = 257
+    # The builder publishes the encoded counts; matching launch counts pass.
+    assert descriptor._mt_projection_counts == ((129, 127), (128, 128))
+    _check_descriptor_projection_counts(
+        descriptor, total, gate_counts=(129, 127), up_counts=(128, 128)
+    )
+    # A mismatched count is rejected instead of silently skipping experts.
+    with pytest.raises(ValueError, match="disagree with the descriptor"):
+        _check_descriptor_projection_counts(
+            descriptor, total, gate_counts=(1, 3), up_counts=(128, 128)
+        )
+    # Descriptors from other producers derive the counts from the map itself,
+    # then memoize them on the tensor.
+    stripped = descriptor.clone()
+    assert not hasattr(stripped, "_mt_projection_counts")
+    with pytest.raises(ValueError, match="disagree with the descriptor"):
+        _check_descriptor_projection_counts(
+            stripped, total, gate_counts=(129, 128), up_counts=(128, 128)
+        )
+    assert stripped._mt_projection_counts == ((129, 127), (128, 128))
+    _check_descriptor_projection_counts(
+        stripped, total, gate_counts=(129, 127), up_counts=(128, 128)
+    )
+    # The projection-independent builder publishes one partition for both FC1
+    # projections, matching run_mixed_trellis's launch-count defaults.
+    _, shared = build_tiered_maps([0, 2, 4], [1, 3], device=torch.device("cpu"))
+    assert shared._mt_projection_counts == ((3, 2), (3, 2))
+    _check_descriptor_projection_counts(shared, 5, gate_counts=(3, 2), up_counts=(3, 2))
+
+
+def test_build_projection_tiered_maps_supports_an_empty_tier() -> None:
+    tiers = [0] * 256
+    route, descriptor = build_projection_tiered_maps(
+        tiers,
+        tiers,
+        tiers,
+        tier_slots=(256, 0),
+        device=torch.device("cpu"),
+    )
+    assert route.tolist() == list(range(256))
+    rows = descriptor.reshape(3, 256)
+    assert rows[:, 255].tolist() == [255, 255, 255]
+
+
+def test_build_projection_tiered_maps_supports_three_tiers() -> None:
+    gate = [0, 1, 2, 0, 1, 2]
+    up = [2, 1, 0, 2, 1, 0]
+    down = [0, 0, 1, 1, 2, 2]
+
+    route, descriptor = build_projection_tiered_maps(
+        gate,
+        up,
+        down,
+        tier_slots=(2, 2, 2),
+        device=torch.device("cpu"),
+    )
+
+    assert route.tolist() == list(range(6))
+    assert descriptor.reshape(3, 6).tolist() == [
+        [0, 1 << 8, 2 << 8, 1, (1 << 8) | 1, (2 << 8) | 1],
+        [2 << 8, 1 << 8, 0, (2 << 8) | 1, (1 << 8) | 1, 1],
+        [0, 1, 1 << 8, (1 << 8) | 1, 2 << 8, (2 << 8) | 1],
+    ]
+    assert descriptor._mt_projection_counts == ((2, 2, 2), (2, 2, 2))
+    _check_descriptor_projection_counts(
+        descriptor,
+        6,
+        gate_counts=(2, 2, 2),
+        up_counts=(2, 2, 2),
+    )
+
+    with pytest.raises(ValueError, match="cannot address all gate/up locals"):
+        build_projection_tiered_maps(
+            [2],
+            [2],
+            [2],
+            tier_slots=(1, 1, 0),
+            device=torch.device("cpu"),
+        )
+
+
+@pytest.mark.parametrize("slots", [(256,), (256, 0, 0, 0)])
+def test_build_projection_tiered_maps_rejects_wrong_slot_arity(slots) -> None:
+    with pytest.raises(ValueError, match="exactly two or three"):
+        build_projection_tiered_maps(
+            [0], [0], [0], tier_slots=slots, device=torch.device("cpu")
+        )
+
+
+@pytest.mark.parametrize("slots", [(-1, 2), (300, -44)])
+def test_build_projection_tiered_maps_rejects_invalid_slots(slots) -> None:
+    with pytest.raises(ValueError, match=r"\[0, 256\]"):
+        build_projection_tiered_maps(
+            [0], [0], [0], tier_slots=slots, device=torch.device("cpu")
+        )
+
+
+def test_build_projection_tiered_maps_rejects_per_tier_underallocation() -> None:
+    with pytest.raises(ValueError, match="cannot address all gate/up locals"):
+        build_projection_tiered_maps(
+            [0] * 129 + [1] * 127,
+            [0] * 128 + [1] * 128,
+            [0] * 256,
+            tier_slots=(128, 128),
+            device=torch.device("cpu"),
+        )
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
