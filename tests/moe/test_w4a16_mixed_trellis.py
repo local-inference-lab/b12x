@@ -28,6 +28,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     _check_descriptor_projection_counts,
     _mixed_route_num_experts,
     _validate_mixed_trellis_tier_storage,
+    bind_mixed_trellis,
     bind_mixed_trellis3,
     build_ordered_maps,
     build_projection_tiered_maps,
@@ -37,7 +38,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     compile_mixed_trellis3,
     make_mixed_trellis_buffers,
     make_mixed_trellis3_buffers,
-    run_mixed_trellis,
+    run_bound_mixed_trellis,
     run_bound_mixed_trellis3,
     warmup_mixed_trellis_route_pack,
 )
@@ -235,7 +236,7 @@ def test_mixed_kernel_tracks_shared_moe_body_contract(
 def test_mixed_runtime_tracks_topk_sum_contract() -> None:
     """Keep the direct compiled top-k launch aligned with its runtime ABI."""
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(run_mixed_trellis)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(run_bound_mixed_trellis)))
     calls = [
         node
         for node in ast.walk(tree)
@@ -255,6 +256,16 @@ def test_mixed_runtime_tracks_topk_sum_contract() -> None:
         "m",
         "stream",
     ]
+
+
+def test_bound_mixed_runtime_does_not_revalidate_fixed_artifacts() -> None:
+    """Serving validates only request tensors and preallocated capacity."""
+
+    source = textwrap.dedent(inspect.getsource(run_bound_mixed_trellis))
+    assert "_validate_mixed_trellis_tier_storage" not in source
+    assert "_check_descriptor_projection_counts" not in source
+    assert ".w13" not in source
+    assert ".rotations" not in source
 
 
 def test_mixed_dispatch_calls_shared_tile_primitive() -> None:
@@ -437,6 +448,14 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     buffers = make_mixed_trellis_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
     )
+    binding = bind_mixed_trellis(
+        tier0,
+        tier1,
+        global_to_combined,
+        descriptor,
+        rotations,
+        launch,
+    )
     assert buffers.fc2.data_ptr() == buffers.rotation_gate.data_ptr()
 
     misaligned_x = torch.empty(m * hidden + 1, dtype=torch.bfloat16, device=device)[
@@ -445,16 +464,11 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     assert misaligned_x.is_contiguous()
     assert misaligned_x.data_ptr() % 16 != 0
     with pytest.raises(ValueError, match=r"input.*16-byte alignment"):
-        run_mixed_trellis(
+        run_bound_mixed_trellis(
             misaligned_x,
-            tier0,
-            tier1,
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            rotations,
-            launch,
+            binding,
             buffers,
         )
 
@@ -470,29 +484,20 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         down_svh=rotations.down_svh,
     )
     with pytest.raises(ValueError, match=r"intermediate rotations.*16-byte alignment"):
-        run_mixed_trellis(
-            x,
+        bind_mixed_trellis(
             tier0,
             tier1,
-            topk_weights,
-            topk_ids,
             global_to_combined,
             descriptor,
             misaligned_rotations,
             launch,
-            buffers,
         )
 
-    eager = run_mixed_trellis(
+    eager = run_bound_mixed_trellis(
         x,
-        tier0,
-        tier1,
         topk_weights,
         topk_ids,
-        global_to_combined,
-        descriptor,
-        rotations,
-        launch,
+        binding,
         buffers,
     )
     torch.cuda.synchronize(device)
@@ -501,16 +506,11 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     relative = (eager - serial).norm() / serial.norm().clamp_min(1.0e-12)
     assert float(relative) < 4.0e-3
 
-    repeat = run_mixed_trellis(
+    repeat = run_bound_mixed_trellis(
         x,
-        tier0,
-        tier1,
         topk_weights,
         topk_ids,
-        global_to_combined,
-        descriptor,
-        rotations,
-        launch,
+        binding,
         buffers,
     )
     torch.cuda.synchronize(device)
@@ -518,16 +518,11 @@ def test_mixed_k3_k4_matches_serial_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run_mixed_trellis(
+        captured = run_bound_mixed_trellis(
             x,
-            tier0,
-            tier1,
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            rotations,
-            launch,
+            binding,
             buffers,
         )
     graph.replay()
@@ -543,16 +538,19 @@ def test_mixed_k3_k4_matches_serial_and_captures(
     ) + _serial_tier(x, tier1, topk_weights, topk_ids, skipped_map1)
     skipped_global_to_combined = global_to_combined.clone()
     skipped_global_to_combined[3] = -1
-    skipped = run_mixed_trellis(
-        x,
+    skipped_binding = bind_mixed_trellis(
         tier0,
         tier1,
-        topk_weights,
-        topk_ids,
         skipped_global_to_combined,
         descriptor,
         rotations,
         launch,
+    )
+    skipped = run_bound_mixed_trellis(
+        x,
+        topk_weights,
+        topk_ids,
+        skipped_binding,
         buffers,
     )
     torch.cuda.synchronize(device)
@@ -1010,54 +1008,52 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
         expanded_launch, device=device, sms=int(props.multi_processor_count)
     )
     with pytest.raises(ValueError, match=r"gate SUH.*512 elements"):
-        run_mixed_trellis(
-            x,
+        bind_mixed_trellis(
             tier0,
             tier1,
-            topk_weights,
-            topk_ids,
             global_to_combined,
             descriptor,
             broadcast_rotations,
             expanded_launch,
-            expanded_buffers,
         )
     with pytest.raises(ValueError, match=r"gate SUH.*128 elements"):
-        run_mixed_trellis(
-            x,
+        bind_mixed_trellis(
             tier0,
             tier1,
-            topk_weights,
-            topk_ids,
             global_to_combined,
             descriptor,
             expanded_rotations,
             broadcast_launch,
-            broadcast_buffers,
         )
 
-    broadcast = run_mixed_trellis(
-        x,
+    broadcast_binding = bind_mixed_trellis(
         tier0,
         tier1,
-        topk_weights,
-        topk_ids,
         global_to_combined,
         descriptor,
         broadcast_rotations,
         broadcast_launch,
-        broadcast_buffers,
-    ).clone()
-    expanded = run_mixed_trellis(
-        x,
+    )
+    expanded_binding = bind_mixed_trellis(
         tier0,
         tier1,
-        topk_weights,
-        topk_ids,
         global_to_combined,
         descriptor,
         expanded_rotations,
         expanded_launch,
+    )
+    broadcast = run_bound_mixed_trellis(
+        x,
+        topk_weights,
+        topk_ids,
+        broadcast_binding,
+        broadcast_buffers,
+    ).clone()
+    expanded = run_bound_mixed_trellis(
+        x,
+        topk_weights,
+        topk_ids,
+        expanded_binding,
         expanded_buffers,
     ).clone()
     torch.cuda.synchronize(device)
@@ -1067,16 +1063,11 @@ def test_mixed_k3_k4_shared_h_matches_expanded_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run_mixed_trellis(
+        captured = run_bound_mixed_trellis(
             x,
-            tier0,
-            tier1,
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            broadcast_rotations,
-            broadcast_launch,
+            broadcast_binding,
             broadcast_buffers,
         )
     graph.replay()
@@ -1203,24 +1194,15 @@ def test_mixed_runtime_partition_reuses_one_compiled_object_abba(
     assert launch_restored_sms.sms == int(props.multi_processor_count)
 
     def run_partition(
-        tiers: tuple[object, object],
         topk_ids: torch.Tensor,
-        launch,
+        binding,
         buffers,
-        global_to_combined: torch.Tensor,
-        descriptor: torch.Tensor,
-        rotations,
     ) -> torch.Tensor:
-        return run_mixed_trellis(
+        return run_bound_mixed_trellis(
             x,
-            tiers[0],
-            tiers[1],
             topk_weights,
             topk_ids,
-            global_to_combined,
-            descriptor,
-            rotations,
-            launch,
+            binding,
             buffers,
         )
 
@@ -1234,21 +1216,15 @@ def test_mixed_runtime_partition_reuses_one_compiled_object_abba(
     buffers_b = make_mixed_trellis_buffers(
         launch_b, device=device, sms=int(props.multi_processor_count)
     )
+    binding_a = bind_mixed_trellis(*tiers_a, *maps_a, rotations_a, launch_a)
+    binding_b = bind_mixed_trellis(*tiers_b, *maps_b, rotations_b, launch_b)
     serial_a = serial_partition(x, tiers_a, topk_weights, topk_ids_a)
     serial_b = serial_partition(x, tiers_b, topk_weights, topk_ids_b)
 
-    output_a1 = run_partition(
-        tiers_a, topk_ids_a, launch_a, buffers_a, *maps_a, rotations_a
-    ).clone()
-    output_b1 = run_partition(
-        tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
-    ).clone()
-    output_b2 = run_partition(
-        tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
-    ).clone()
-    output_a2 = run_partition(
-        tiers_a, topk_ids_a, launch_a, buffers_a, *maps_a, rotations_a
-    ).clone()
+    output_a1 = run_partition(topk_ids_a, binding_a, buffers_a).clone()
+    output_b1 = run_partition(topk_ids_b, binding_b, buffers_b).clone()
+    output_b2 = run_partition(topk_ids_b, binding_b, buffers_b).clone()
+    output_a2 = run_partition(topk_ids_a, binding_a, buffers_a).clone()
     torch.cuda.synchronize(device)
 
     for actual, expected in (
@@ -1265,9 +1241,7 @@ def test_mixed_runtime_partition_reuses_one_compiled_object_abba(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_b = run_partition(
-            tiers_b, topk_ids_b, launch_b, buffers_b, *maps_b, rotations_b
-        )
+        captured_b = run_partition(topk_ids_b, binding_b, buffers_b)
     graph.replay()
     torch.cuda.synchronize(device)
     assert torch.equal(captured_b, output_b1)
@@ -1360,7 +1334,7 @@ def test_descriptor_projection_count_check_fails_closed() -> None:
         stripped, total, gate_counts=(129, 127), up_counts=(128, 128)
     )
     # The projection-independent builder publishes one partition for both FC1
-    # projections, matching run_mixed_trellis's launch-count defaults.
+    # projections, matching the binding contract's launch-count defaults.
     _, shared = build_tiered_maps([0, 2, 4], [1, 3], device=torch.device("cpu"))
     assert shared._mt_projection_counts == ((3, 2), (3, 2))
     _check_descriptor_projection_counts(shared, 5, gate_counts=(3, 2), up_counts=(3, 2))
@@ -1507,16 +1481,19 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
         buffers = make_mixed_trellis_buffers(
             launch, device=device, sms=int(props.multi_processor_count)
         )
-        output = run_mixed_trellis(
-            x,
+        binding = bind_mixed_trellis(
             prepared_tiers[0],
             prepared_tiers[1],
-            topk_weights,
-            topk_ids,
             global_to_combined,
             descriptor,
             combine_trellis_rotations(*prepared_tiers),
             launch,
+        )
+        output = run_bound_mixed_trellis(
+            x,
+            topk_weights,
+            topk_ids,
+            binding,
             buffers,
         ).clone()
         phase_outputs = (
@@ -1631,16 +1608,19 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
     buffers = make_mixed_trellis_buffers(
         launch, device=device, sms=int(props.multi_processor_count)
     )
-    mixed = run_mixed_trellis(
-        x,
+    binding = bind_mixed_trellis(
         tier0,
         tier1,
-        topk_weights,
-        topk_ids,
         global_to_combined,
         descriptor,
         combine_trellis_rotations(tier0, tier1),
         launch,
+    )
+    mixed = run_bound_mixed_trellis(
+        x,
+        topk_weights,
+        topk_ids,
+        binding,
         buffers,
     )
     torch.cuda.synchronize(device)

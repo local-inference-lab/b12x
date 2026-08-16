@@ -97,6 +97,30 @@ class MixedTrellisRotations:
 
 
 @dataclass(frozen=True)
+class MixedTrellisBinding:
+    """Validated fixed artifacts for a two-tier launch."""
+
+    launch: MixedTrellisCompileResult
+    tiers: tuple[MixedTrellisTier, MixedTrellisTier]
+    global_to_combined: torch.Tensor
+    descriptor_map: torch.Tensor
+    rotations: MixedTrellisRotations
+    gate_counts: tuple[int, int]
+    up_counts: tuple[int, int]
+    fc2_counts: tuple[int, int]
+    total_experts: int
+    route_num_experts: int
+    device: torch.device
+    tier_pointers: tuple[tuple[object, ...], ...]
+    descriptor_map_ptr: object
+    intermediate_rotations_ptr: object
+    gate_suh_ptr: object
+    up_suh_ptr: object
+    global_to_combined_ptr: object
+    down_svh_ptr: object
+
+
+@dataclass(frozen=True)
 class MixedTrellis3Binding:
     """Validated fixed artifacts for a three-tier launch."""
 
@@ -515,9 +539,8 @@ class W4A16MixedTrellisKernel:
         tier1_fc2 = cutlass.Int64(tier1_fc2_experts)
         # The w13 descriptor is sized by the gate count so the GEMM's
         # cute.size(w13)//2 up-block base lands at gate_count*proj_stride over
-        # a tight [gate|up] buffer. When projection counts are omitted,
-        # run_mixed_trellis requires one gate and one up plane for every tier
-        # slot.
+        # a tight [gate|up] buffer. When projection counts are omitted, the
+        # binding contract requires one gate and one up plane per tier slot.
         tier0_gate = cutlass.Int64(tier0_gate_experts)
         tier1_gate = cutlass.Int64(tier1_gate_experts)
         tier1_experts = cutlass.Int64(tier1_num_experts)
@@ -2383,9 +2406,9 @@ def build_tiered_maps(
     # Per-expert tiering is the degenerate case where all three rows are
     # identical, reproducing single-row behaviour bit-for-bit.
     descriptor = descriptor_row.repeat(3).contiguous()
-    # Publish the per-tier gate/up counts this descriptor encodes so
-    # run_mixed_trellis can fail closed on mismatched caller counts without a
-    # device sync. Per-expert tiering has gate == up == the tier partition.
+    # Preserve the per-tier gate/up counts encoded by the descriptor so binding
+    # can reject a mismatched storage contract without a device synchronization.
+    # Per-expert tiering has gate == up == the tier partition.
     counts = (len(tier0_ids), len(tier1_ids))
     descriptor._mt_projection_counts = (counts, counts)
     return global_to_combined, descriptor
@@ -2476,8 +2499,8 @@ def build_projection_tiered_maps(
                 rows[base : base + num_experts], dtype=torch.int32, device=device
             )
         )
-    # Publish the gate/up counts this descriptor encodes so run_mixed_trellis
-    # can fail closed on mismatched caller counts without a device sync.
+    # Preserve the gate/up counts encoded by the descriptor so binding can
+    # reject a mismatched storage contract without a device synchronization.
     descriptor._mt_projection_counts = (
         projection_counts[0],
         projection_counts[1],
@@ -2670,400 +2693,25 @@ def _validate_mixed_trellis_tier_storage(
             )
 
 
-def run_mixed_trellis(
-    x: torch.Tensor,
-    tier0: MixedTrellisTier,
-    tier1: MixedTrellisTier,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    global_to_combined: torch.Tensor,
-    descriptor_map: torch.Tensor,
-    rotations: MixedTrellisRotations,
-    launch: MixedTrellisCompileResult,
-    buffers: MixedTrellisBuffers,
-    gate_experts: tuple[int, int] | None = None,
-    up_experts: tuple[int, int] | None = None,
-) -> torch.Tensor:
-    def projection_counts(name, values, defaults):
-        if values is None:
-            return defaults
-        if (
-            not isinstance(values, tuple)
-            or len(values) != 2
-            or any(
-                not isinstance(value, int) or isinstance(value, bool)
-                for value in values
-            )
-        ):
-            raise TypeError(f"mixed Trellis {name} must be a pair of integer counts")
-        return values
-
-    if (gate_experts is None) != (up_experts is None):
-        raise ValueError(
-            "mixed Trellis projection-tight storage requires paired "
-            "gate_experts/up_experts"
-        )
-    defaults = (
-        int(launch.tier0_num_experts),
-        int(launch.tier1_num_experts),
-    )
-    _gate0, _gate1 = projection_counts("gate_experts", gate_experts, defaults)
-    _up0, _up1 = projection_counts("up_experts", up_experts, defaults)
-    m = int(x.shape[0])
-    if m <= 0:
-        raise ValueError(f"mixed Trellis requires at least one active row, got {m}")
-    if m > launch.size_m:
-        raise ValueError(f"active rows {m} exceed launch capacity {launch.size_m}")
-    expected_input_dtype = (
-        torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
-    )
-    for name, tensor, expected_dtype in (
-        ("input", x, expected_input_dtype),
-        ("topk_ids", topk_ids, launch.route_ids_dtype),
-        ("topk_weights", topk_weights, torch.float32),
-    ):
-        if tensor.dtype != expected_dtype:
-            raise TypeError(
-                f"mixed Trellis {name} must be {expected_dtype}, got {tensor.dtype}"
-            )
-        if not tensor.is_contiguous():
-            raise ValueError(f"mixed Trellis {name} must be contiguous")
-    if int(x.data_ptr()) % 16 != 0:
-        raise ValueError("mixed Trellis input must have at least 16-byte alignment")
-    for name, tier, expected_experts in (
-        ("tier0", tier0, launch.tier0_num_experts),
-        ("tier1", tier1, launch.tier1_num_experts),
-    ):
-        actual_experts = int(tier.num_experts)
-        if actual_experts != int(expected_experts):
-            raise ValueError(
-                f"mixed Trellis {name} has {actual_experts} experts, expected "
-                f"the launch-plan count {int(expected_experts)}"
-            )
-        tier_codebook = str(tier.trellis_codebook).lower()
-        if tier_codebook != launch.trellis_codebook:
-            raise ValueError(
-                f"mixed Trellis {name} uses codebook {tier_codebook!r}, expected "
-                f"the launch-plan codebook {launch.trellis_codebook!r}"
-            )
-    _validate_mixed_trellis_tier_storage(
-        name="tier0",
-        tier=tier0,
-        expected_experts=launch.tier0_num_experts,
-        bits=launch.tier0_bits,
-        hidden_size=launch.hidden_size,
-        intermediate_size=launch.intermediate_size,
-        device=x.device,
-        gate_experts=_gate0,
-        up_experts=_up0,
-    )
-    _validate_mixed_trellis_tier_storage(
-        name="tier1",
-        tier=tier1,
-        expected_experts=launch.tier1_num_experts,
-        bits=launch.tier1_bits,
-        hidden_size=launch.hidden_size,
-        intermediate_size=launch.intermediate_size,
-        device=x.device,
-        gate_experts=_gate1,
-        up_experts=_up1,
-    )
-    total_experts = launch.tier0_num_experts + launch.tier1_num_experts
-    route_num_experts = _mixed_route_num_experts(
-        global_to_combined, int(launch.topk_sum.route_num_experts)
-    )
-    for name, mapping, expected_entries in (
-        ("global_to_combined", global_to_combined, route_num_experts),
-        ("descriptor_map", descriptor_map, 3 * total_experts),
-    ):
-        # Descriptor rows use the padded weight-slot stride, while the route
-        # map covers only real global experts.
-        if (
-            mapping.dtype != torch.int32
-            or mapping.device != x.device
-            or not mapping.is_contiguous()
-            or int(mapping.numel()) != expected_entries
-        ):
-            raise ValueError(
-                f"mixed Trellis {name} must be contiguous int32 on {x.device} "
-                f"with {expected_entries} elements"
-            )
-    _check_descriptor_projection_counts(
-        descriptor_map,
-        total_experts,
-        gate_counts=(_gate0, _gate1),
-        up_counts=(_up0, _up1),
-    )
-    for name, table, expected_elements in (
-        (
-            "intermediate rotations",
-            rotations.intermediate,
-            total_experts * 3 * launch.intermediate_size,
-        ),
-        (
-            "gate SUH",
-            rotations.gate_suh,
-            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
-        ),
-        (
-            "up SUH",
-            rotations.up_suh,
-            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
-        ),
-        (
-            "down SVH",
-            rotations.down_svh,
-            (1 if launch.broadcast_svh else total_experts) * launch.hidden_size,
-        ),
-    ):
-        if (
-            table.dtype != torch.float16
-            or table.device != x.device
-            or not table.is_contiguous()
-            or int(table.numel()) != expected_elements
-            or int(table.data_ptr()) % 16 != 0
-        ):
-            raise ValueError(
-                f"mixed Trellis {name} must be contiguous fp16 on {x.device} "
-                f"with {expected_elements} elements and at least 16-byte alignment"
-            )
-    required_route_slots = max_packed_route_slots(
-        m * launch.top_k, launch.moe_block_size, route_num_experts
-    )
-    required_route_blocks = (
-        required_route_slots + launch.moe_block_size - 1
-    ) // launch.moe_block_size
-    if required_route_blocks > launch.max_m_blocks:
-        raise RuntimeError(
-            "mixed Trellis request requires "
-            f"{required_route_blocks} route blocks, but the launch supports "
-            f"{launch.max_m_blocks}"
-        )
-    if buffers.packed_route_indices.numel() < required_route_slots:
-        raise RuntimeError(
-            "mixed Trellis packed-route buffer is below request capacity"
-        )
-    if buffers.block_expert_ids.numel() < required_route_blocks:
-        raise RuntimeError(
-            "mixed Trellis block-expert buffer is below request capacity"
-        )
-    packed, block_experts, packed_count = pack_topk_routes_by_expert(
-        topk_ids,
-        launch.moe_block_size,
-        route_num_experts,
-        expert_map=global_to_combined,
-        packed_route_indices=buffers.packed_route_indices,
-        block_expert_ids=buffers.block_expert_ids,
-        packed_route_count=buffers.packed_route_count,
-        expert_offsets=buffers.expert_offsets,
-        expert_counts=buffers.expert_counts,
-    )
-    stream = current_cuda_stream()
-    launch.compiled(
-        make_ptr(
-            _cutlass_element_dtype(launch.rotation_input_dtype),
-            x.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        buffers.rotation_gate.view(-1),
-        buffers.rotation_up.view(-1),
-        make_ptr(
-            cutlass.Int32,
-            tier0.w13.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier0.w2.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier0.w13_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier0.w2_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            tier0.w13_global_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            tier0.w2_global_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier1.w13.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier1.w2.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier1.w13_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            tier1.w2_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            tier1.w13_global_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            tier1.w2_global_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        buffers.fc1.view(-1),
-        buffers.activated.view(-1),
-        buffers.fc2.view(-1),
-        packed,
-        block_experts,
-        packed_count,
-        make_ptr(
-            cutlass.Int32,
-            descriptor_map.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            topk_weights.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        buffers.fc1_scratch,
-        buffers.fc2_scratch,
-        buffers.workspace,
-        make_ptr(
-            cutlass.Float16,
-            rotations.intermediate.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float16,
-            rotations.gate_suh.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float16,
-            rotations.up_suh.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Uint8,
-            launch.trellis_lut.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        Int32(launch.tier0_num_experts),
-        Int32(launch.tier1_num_experts),
-        Int32(int(tier0.w2_global_scale.numel())),
-        Int32(int(tier1.w2_global_scale.numel())),
-        m,
-        max(int(launch.blocks_per_sm) * int(launch.sms), 1),
-        stream,
-        # Keyword, so the positional chain above stays intact.
-        tier0_gate_experts=Int32(_gate0),
-        tier1_gate_experts=Int32(_gate1),
-        tier0_up_experts=Int32(_up0),
-        tier1_up_experts=Int32(_up1),
-    )
-    launch.topk_sum.compiled(
-        make_ptr(
-            cutlass.Float16,
-            buffers.fc2.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            buffers.output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Float32,
-            topk_weights.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        make_ptr(
-            cutlass.Int32 if topk_ids.dtype == torch.int32 else cutlass.Int64,
-            topk_ids.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4 if topk_ids.dtype == torch.int32 else 8,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            global_to_combined.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        make_ptr(
-            cutlass.Float16,
-            rotations.down_svh.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        Int32(launch.topk_sum.num_experts),
-        Int32(launch.topk_sum.route_num_experts),
-        m,
-        stream,
-    )
-    return buffers.output[:m]
-
-
-def _mixed_trellis3_projection_counts(
+def _mixed_trellis_projection_counts(
     name: str,
-    values: tuple[int, int, int] | None,
-    defaults: tuple[int, int, int],
-) -> tuple[int, int, int]:
+    values: tuple[int, int] | None,
+    defaults: tuple[int, int],
+) -> tuple[int, int]:
     if values is None:
         return defaults
     if (
         not isinstance(values, tuple)
-        or len(values) != 3
+        or len(values) != 2
         or any(
             not isinstance(value, int) or isinstance(value, bool) for value in values
         )
     ):
-        raise TypeError(
-            f"three-tier mixed Trellis {name} must contain three integer counts"
-        )
+        raise TypeError(f"mixed Trellis {name} must contain two integer counts")
     return tuple(int(value) for value in values)
 
 
-def _mixed_trellis3_tier_pointers(tier: MixedTrellisTier) -> tuple[object, ...]:
+def _mixed_trellis_tier_pointers(tier: MixedTrellisTier) -> tuple[object, ...]:
     return (
         make_ptr(
             cutlass.Int32,
@@ -3102,6 +2750,355 @@ def _mixed_trellis3_tier_pointers(tier: MixedTrellisTier) -> tuple[object, ...]:
             assumed_align=16,
         ),
     )
+
+
+def bind_mixed_trellis(
+    tier0: MixedTrellisTier,
+    tier1: MixedTrellisTier,
+    global_to_combined: torch.Tensor,
+    descriptor_map: torch.Tensor,
+    rotations: MixedTrellisRotations,
+    launch: MixedTrellisCompileResult,
+    *,
+    gate_experts: tuple[int, int] | None = None,
+    up_experts: tuple[int, int] | None = None,
+) -> MixedTrellisBinding:
+    """Validate immutable K3/K4 artifacts and bind their launch pointers."""
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("mixed Trellis artifacts must be bound before capture")
+    if (gate_experts is None) != (up_experts is None):
+        raise ValueError(
+            "mixed Trellis projection-tight storage requires paired "
+            "gate_experts/up_experts"
+        )
+    counts = (
+        int(launch.tier0_num_experts),
+        int(launch.tier1_num_experts),
+    )
+    gate_counts = _mixed_trellis_projection_counts("gate_experts", gate_experts, counts)
+    up_counts = _mixed_trellis_projection_counts("up_experts", up_experts, counts)
+    tiers = (tier0, tier1)
+    bits = (launch.tier0_bits, launch.tier1_bits)
+    device = tier0.w13.device
+    for tier_id, (tier, expected_experts, tier_bits) in enumerate(
+        zip(tiers, counts, bits, strict=True)
+    ):
+        actual_experts = int(tier.num_experts)
+        if actual_experts != expected_experts:
+            raise ValueError(
+                f"mixed Trellis tier{tier_id} has {actual_experts} experts, "
+                f"expected the launch-plan count {expected_experts}"
+            )
+        tier_codebook = str(tier.trellis_codebook).lower()
+        if tier_codebook != launch.trellis_codebook:
+            raise ValueError(
+                f"mixed Trellis tier{tier_id} uses codebook {tier_codebook!r}, "
+                f"expected the launch-plan codebook {launch.trellis_codebook!r}"
+            )
+        _validate_mixed_trellis_tier_storage(
+            name=f"tier{tier_id}",
+            tier=tier,
+            expected_experts=expected_experts,
+            bits=tier_bits,
+            hidden_size=launch.hidden_size,
+            intermediate_size=launch.intermediate_size,
+            device=device,
+            gate_experts=gate_counts[tier_id],
+            up_experts=up_counts[tier_id],
+        )
+
+    total_experts = sum(counts)
+    route_num_experts = _mixed_route_num_experts(
+        global_to_combined, int(launch.topk_sum.route_num_experts)
+    )
+    for name, mapping, expected_entries in (
+        ("global_to_combined", global_to_combined, route_num_experts),
+        ("descriptor_map", descriptor_map, 3 * total_experts),
+    ):
+        if (
+            mapping.dtype != torch.int32
+            or mapping.device != device
+            or not mapping.is_contiguous()
+            or int(mapping.numel()) != expected_entries
+        ):
+            raise ValueError(
+                f"mixed Trellis {name} must be contiguous int32 on {device} "
+                f"with {expected_entries} elements"
+            )
+    _check_descriptor_projection_counts(
+        descriptor_map,
+        total_experts,
+        gate_counts=gate_counts,
+        up_counts=up_counts,
+    )
+    for name, table, expected_elements in (
+        (
+            "intermediate rotations",
+            rotations.intermediate,
+            total_experts * 3 * launch.intermediate_size,
+        ),
+        (
+            "gate SUH",
+            rotations.gate_suh,
+            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
+        ),
+        (
+            "up SUH",
+            rotations.up_suh,
+            (1 if launch.broadcast_suh else total_experts) * launch.hidden_size,
+        ),
+        (
+            "down SVH",
+            rotations.down_svh,
+            (1 if launch.broadcast_svh else total_experts) * launch.hidden_size,
+        ),
+    ):
+        if (
+            table.dtype != torch.float16
+            or table.device != device
+            or not table.is_contiguous()
+            or int(table.numel()) != expected_elements
+            or int(table.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                f"mixed Trellis {name} must be contiguous fp16 on {device} "
+                f"with {expected_elements} elements and at least 16-byte alignment"
+            )
+
+    return MixedTrellisBinding(
+        launch=launch,
+        tiers=tiers,
+        global_to_combined=global_to_combined,
+        descriptor_map=descriptor_map,
+        rotations=rotations,
+        gate_counts=gate_counts,
+        up_counts=up_counts,
+        fc2_counts=tuple(int(tier.w2_global_scale.numel()) for tier in tiers),
+        total_experts=total_experts,
+        route_num_experts=route_num_experts,
+        device=device,
+        tier_pointers=tuple(_mixed_trellis_tier_pointers(tier) for tier in tiers),
+        descriptor_map_ptr=make_ptr(
+            cutlass.Int32,
+            descriptor_map.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        intermediate_rotations_ptr=make_ptr(
+            cutlass.Float16,
+            rotations.intermediate.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        gate_suh_ptr=make_ptr(
+            cutlass.Float16,
+            rotations.gate_suh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        up_suh_ptr=make_ptr(
+            cutlass.Float16,
+            rotations.up_suh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        global_to_combined_ptr=make_ptr(
+            cutlass.Int32,
+            global_to_combined.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        down_svh_ptr=make_ptr(
+            cutlass.Float16,
+            rotations.down_svh.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+    )
+
+
+def run_bound_mixed_trellis(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    binding: MixedTrellisBinding,
+    buffers: MixedTrellisBuffers,
+) -> torch.Tensor:
+    """Run a graph-safe K3/K4 launch from a validated binding."""
+
+    launch = binding.launch
+    if x.ndim != 2 or int(x.shape[1]) != int(launch.hidden_size):
+        raise ValueError(
+            "mixed Trellis input must have shape "
+            f"[M, {int(launch.hidden_size)}], got {tuple(x.shape)}"
+        )
+    m = int(x.shape[0])
+    if m <= 0:
+        raise ValueError(f"mixed Trellis requires at least one active row, got {m}")
+    if m > launch.size_m:
+        raise ValueError(f"active rows {m} exceed launch capacity {launch.size_m}")
+    expected_route_shape = (m, int(launch.top_k))
+    for name, tensor in (("topk_ids", topk_ids), ("topk_weights", topk_weights)):
+        if tuple(tensor.shape) != expected_route_shape:
+            raise ValueError(
+                f"mixed Trellis {name} must have shape {expected_route_shape}, "
+                f"got {tuple(tensor.shape)}"
+            )
+    expected_input_dtype = (
+        torch.bfloat16 if launch.rotation_input_dtype == "bf16" else torch.float16
+    )
+    for name, tensor, expected_dtype in (
+        ("input", x, expected_input_dtype),
+        ("topk_ids", topk_ids, launch.route_ids_dtype),
+        ("topk_weights", topk_weights, torch.float32),
+    ):
+        if tensor.dtype != expected_dtype:
+            raise TypeError(
+                f"mixed Trellis {name} must be {expected_dtype}, got {tensor.dtype}"
+            )
+        if tensor.device != binding.device:
+            raise ValueError(
+                f"mixed Trellis {name} must be on {binding.device}, got {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"mixed Trellis {name} must be contiguous")
+    if int(x.data_ptr()) % 16 != 0:
+        raise ValueError("mixed Trellis input must have at least 16-byte alignment")
+
+    required_route_slots = max_packed_route_slots(
+        m * launch.top_k, launch.moe_block_size, binding.route_num_experts
+    )
+    required_route_blocks = (
+        required_route_slots + launch.moe_block_size - 1
+    ) // launch.moe_block_size
+    if required_route_blocks > launch.max_m_blocks:
+        raise RuntimeError(
+            "mixed Trellis request requires "
+            f"{required_route_blocks} route blocks, but the launch supports "
+            f"{launch.max_m_blocks}"
+        )
+    if buffers.packed_route_indices.numel() < required_route_slots:
+        raise RuntimeError(
+            "mixed Trellis packed-route buffer is below request capacity"
+        )
+    if buffers.block_expert_ids.numel() < required_route_blocks:
+        raise RuntimeError(
+            "mixed Trellis block-expert buffer is below request capacity"
+        )
+    packed, block_experts, packed_count = pack_topk_routes_by_expert(
+        topk_ids,
+        launch.moe_block_size,
+        binding.route_num_experts,
+        expert_map=binding.global_to_combined,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
+    )
+    stream = current_cuda_stream()
+    launch.compiled(
+        make_ptr(
+            _cutlass_element_dtype(launch.rotation_input_dtype),
+            x.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        buffers.rotation_gate.view(-1),
+        buffers.rotation_up.view(-1),
+        *binding.tier_pointers[0],
+        *binding.tier_pointers[1],
+        buffers.fc1.view(-1),
+        buffers.activated.view(-1),
+        buffers.fc2.view(-1),
+        packed,
+        block_experts,
+        packed_count,
+        binding.descriptor_map_ptr,
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        buffers.fc1_scratch,
+        buffers.fc2_scratch,
+        buffers.workspace,
+        binding.intermediate_rotations_ptr,
+        binding.gate_suh_ptr,
+        binding.up_suh_ptr,
+        make_ptr(
+            cutlass.Uint8,
+            launch.trellis_lut.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        Int32(launch.tier0_num_experts),
+        Int32(launch.tier1_num_experts),
+        Int32(binding.fc2_counts[0]),
+        Int32(binding.fc2_counts[1]),
+        m,
+        max(int(launch.blocks_per_sm) * int(launch.sms), 1),
+        stream,
+        tier0_gate_experts=Int32(binding.gate_counts[0]),
+        tier1_gate_experts=Int32(binding.gate_counts[1]),
+        tier0_up_experts=Int32(binding.up_counts[0]),
+        tier1_up_experts=Int32(binding.up_counts[1]),
+    )
+    launch.topk_sum.compiled(
+        make_ptr(
+            cutlass.Float16,
+            buffers.fc2.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            buffers.output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float32,
+            topk_weights.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Int32 if topk_ids.dtype == torch.int32 else cutlass.Int64,
+            topk_ids.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4 if topk_ids.dtype == torch.int32 else 8,
+        ),
+        binding.global_to_combined_ptr,
+        binding.down_svh_ptr,
+        Int32(launch.topk_sum.num_experts),
+        Int32(launch.topk_sum.route_num_experts),
+        m,
+        stream,
+    )
+    return buffers.output[:m]
+
+
+def _mixed_trellis3_projection_counts(
+    name: str,
+    values: tuple[int, int, int] | None,
+    defaults: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    if values is None:
+        return defaults
+    if (
+        not isinstance(values, tuple)
+        or len(values) != 3
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in values
+        )
+    ):
+        raise TypeError(
+            f"three-tier mixed Trellis {name} must contain three integer counts"
+        )
+    return tuple(int(value) for value in values)
 
 
 def bind_mixed_trellis3(
@@ -3234,7 +3231,7 @@ def bind_mixed_trellis3(
         total_experts=total_experts,
         route_num_experts=route_num_experts,
         device=device,
-        tier_pointers=tuple(_mixed_trellis3_tier_pointers(tier) for tier in tiers),
+        tier_pointers=tuple(_mixed_trellis_tier_pointers(tier) for tier in tiers),
         descriptor_map_ptr=make_ptr(
             cutlass.Int32,
             descriptor_map.data_ptr(),
@@ -3445,11 +3442,13 @@ def run_bound_mixed_trellis3(
 
 __all__ = [
     "MixedTrellisBuffers",
+    "MixedTrellisBinding",
     "MixedTrellisCompileResult",
     "MixedTrellis3CompileResult",
     "MixedTrellis3Binding",
     "MixedTrellisRotations",
     "W4A16MixedTrellis3Kernel",
+    "bind_mixed_trellis",
     "bind_mixed_trellis3",
     "build_ordered_maps",
     "build_projection_tiered_maps",
@@ -3459,7 +3458,7 @@ __all__ = [
     "compile_mixed_trellis3",
     "make_mixed_trellis_buffers",
     "make_mixed_trellis3_buffers",
-    "run_mixed_trellis",
+    "run_bound_mixed_trellis",
     "run_bound_mixed_trellis3",
     "warmup_mixed_trellis_route_pack",
 ]
