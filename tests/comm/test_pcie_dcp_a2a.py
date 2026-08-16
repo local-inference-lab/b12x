@@ -707,6 +707,19 @@ def test_kimi_topk16_dispatches_compact_outputs(
     runtime.close()
 
 
+@pytest.mark.parametrize("rows", (0, 9))
+def test_kimi_topk16_rejects_out_of_range_rows(rows: int) -> None:
+    runtime = _make_kimi_runtime(2)
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    try:
+        with pytest.raises(ValueError, match="must be between 1"):
+            runtime.kimi_topk16(router_logits, correction_bias)
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
 def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
     monkeypatch: pytest.MonkeyPatch,

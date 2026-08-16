@@ -103,6 +103,9 @@ def _case(
         bias = torch.sin(torch.arange(896, device=device, dtype=torch.float32))
         logits[0, 17] = float("nan")
         bias[33] = float("inf")
+    elif name == "all_neg_inf":
+        logits = torch.zeros((batch, 896), device=device)
+        bias = torch.full((896,), float("-inf"), device=device)
     else:
         raise ValueError(name)
     local_width = 896 // world_size
@@ -205,13 +208,13 @@ def _worker(
     try:
         if rank == 0:
             print(
-                "case,ids_exact,weights_exact,finite_mask_exact,"
-                "nonzero_mask_exact,max_abs,down_exact",
+                "case,ids_valid,ids_exact,ids_unique,weights_exact,"
+                "finite_mask_exact,nonzero_mask_exact,max_abs,down_exact",
                 flush=True,
             )
         benchmark_router: torch.Tensor | None = None
         benchmark_bias: torch.Tensor | None = None
-        for name in ("random", "ties", "near_ties", "wide"):
+        for name in ("random", "ties", "near_ties", "wide", "all_neg_inf"):
             local_router, bias = _case(
                 name,
                 batch=batch,
@@ -252,6 +255,22 @@ def _worker(
             )
             torch.cuda.synchronize(device)
             ids_exact = torch.equal(b12x_ids, reference_ids)
+            sorted_ids = torch.sort(b12x_ids, dim=1).values
+            ids_unique = bool(
+                ((sorted_ids[:, 1:] != sorted_ids[:, :-1]).all()).item()
+            )
+            ids_in_range = bool(
+                ((b12x_ids >= 0) & (b12x_ids < 896)).all().item()
+            )
+            # When every corrected selection score is negative infinity, all
+            # experts are tied. vLLM's reduction order does not define which
+            # 16 tied IDs win, but a valid top-k must still return 16 distinct
+            # in-range experts per row.
+            ids_valid = (
+                ids_unique and ids_in_range
+                if name == "all_neg_inf"
+                else ids_exact
+            )
             weights_exact = torch.equal(b12x_weights, reference_weights)
             finite_mask_exact = torch.equal(
                 torch.isfinite(b12x_weights),
@@ -265,13 +284,14 @@ def _worker(
             down_exact = torch.equal(b12x_down, reference_down)
             if rank == 0:
                 print(
-                    f"{name},{int(ids_exact)},{int(weights_exact)},"
+                    f"{name},{int(ids_valid)},{int(ids_exact)},"
+                    f"{int(ids_unique)},{int(weights_exact)},"
                     f"{int(finite_mask_exact)},{int(nonzero_mask_exact)},"
                     f"{max_abs:.9g},{int(down_exact)}",
                     flush=True,
                 )
             failures = torch.tensor(
-                int(not ids_exact)
+                int(not ids_valid)
                 + int(not weights_exact)
                 + int(not finite_mask_exact)
                 + int(not nonzero_mask_exact)
@@ -336,20 +356,34 @@ def _worker(
         if not torch.equal(b12x_down, reference_down):
             raise AssertionError("captured down projection differs")
 
-        reference_samples_us = _measure(
-            reference_graph,
-            device=device,
-            warmup=warmup,
-            iterations=iterations,
-            samples=samples,
-        )
-        b12x_samples_us = _measure(
-            b12x_graph,
-            device=device,
-            warmup=warmup,
-            iterations=iterations,
-            samples=samples,
-        )
+        for graph in (reference_graph, b12x_graph):
+            for _ in range(warmup):
+                graph.replay()
+        torch.cuda.synchronize(device)
+        reference_samples_us: list[float] = []
+        b12x_samples_us: list[float] = []
+        for sample in range(samples):
+            ordered_graphs = (
+                (
+                    (reference_graph, reference_samples_us),
+                    (b12x_graph, b12x_samples_us),
+                )
+                if sample % 2 == 0
+                else (
+                    (b12x_graph, b12x_samples_us),
+                    (reference_graph, reference_samples_us),
+                )
+            )
+            for graph, sample_sink in ordered_graphs:
+                sample_sink.extend(
+                    _measure(
+                        graph,
+                        device=device,
+                        warmup=0,
+                        iterations=iterations,
+                        samples=1,
+                    )
+                )
         if rank == 0:
             reference_us = statistics.median(reference_samples_us)
             b12x_us = statistics.median(b12x_samples_us)

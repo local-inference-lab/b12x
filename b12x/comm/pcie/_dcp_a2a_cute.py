@@ -1679,6 +1679,9 @@ class _KimiTopK16Launch:
             unbiased_scores: cute.struct.Align[
                 cute.struct.MemRange[Float32, 896], 16
             ]
+            active_experts: cute.struct.Align[
+                cute.struct.MemRange[Int32, 896], 16
+            ]
             warp_keys: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint64, 16], 16
             ]
@@ -1688,6 +1691,9 @@ class _KimiTopK16Launch:
             cute.make_layout((896,), stride=(1,))
         )
         unbiased_scores = storage.unbiased_scores.get_tensor(
+            cute.make_layout((896,), stride=(1,))
+        )
+        active_experts = storage.active_experts.get_tensor(
             cute.make_layout((896,), stride=(1,))
         )
         warp_keys = storage.warp_keys.get_tensor(
@@ -1714,10 +1720,13 @@ class _KimiTopK16Launch:
                     selection = Float32(float("inf"))
                 else:
                     selection = Float32(float("-inf"))
+            # Canonicalize signed zero because packed keys distinguish -0.0
+            # from +0.0 and expert ties require one deterministic ordering.
             if selection == Float32(0.0):
                 selection = Float32(0.0)
             selection_scores[expert] = selection
             unbiased_scores[expert] = unbiased
+            active_experts[expert] = Int32(1)
             expert += Int32(self._threads)
         cute.arch.sync_threads()
 
@@ -1732,9 +1741,11 @@ class _KimiTopK16Launch:
             thread_key = cutlass.Uint64(0)
             candidate = Int32(tidx)
             while candidate < Int32(896):
-                candidate_key = _kimi_pack_key(
-                    selection_scores[candidate], candidate
-                )
+                candidate_key = cutlass.Uint64(0)
+                if active_experts[candidate] != Int32(0):
+                    candidate_key = _kimi_pack_key(
+                        selection_scores[candidate], candidate
+                    )
                 thread_key = cutlass.max(thread_key, candidate_key)
                 candidate += Int32(self._threads)
             warp_key = _kimi_warp_max_key(thread_key)
@@ -1752,7 +1763,7 @@ class _KimiTopK16Launch:
                 final_expert = _kimi_key_expert(selected_key)
                 selected_ids[selected] = final_expert
                 selected_weights[selected] = unbiased_scores[final_expert]
-                selection_scores[final_expert] = Float32(_KIMI_NEG_INF)
+                active_experts[final_expert] = Int32(0)
             cute.arch.sync_threads()
 
         weight_sum = Float32(0.0)

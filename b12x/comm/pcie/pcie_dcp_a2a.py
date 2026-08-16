@@ -1435,10 +1435,11 @@ class PCIeDCPA2A:
                     "router_logits must be a contiguous rank-2 tensor"
                 )
             rows = int(router_logits.shape[0])
-            if rows <= 0 or rows > min(self.max_batch_size, 8):
+            capacity = min(self.max_batch_size, 8)
+            if rows <= 0 or rows > capacity:
                 raise ValueError(
-                    f"Kimi top-16 rows {rows} exceed the supported capacity "
-                    f"{min(self.max_batch_size, 8)}"
+                    f"Kimi top-16 rows {rows} must be between 1 and the "
+                    f"supported capacity {capacity}"
                 )
             expected = (
                 (
