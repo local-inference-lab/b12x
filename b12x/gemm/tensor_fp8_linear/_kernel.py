@@ -96,12 +96,6 @@ def _activation_scale_mma(
     )
 
 
-def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
-    if int(out_features) < 64:
-        return {"mma_tiler_mn": (64, 32), "swap_ab": True}
-    return {}
-
-
 def is_tensor_fp8_linear_supported() -> tuple[bool, str | None]:
     if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
         return False, "CUTLASS DSL does not expose cute.nvgpu.warp.MmaMXF8Op"
@@ -195,7 +189,6 @@ def _tensor_fp8_linear_fused_op(
         expected_m=expected_m,
         stream=stream_int,
         plain_fp8=True,
-        **_dense_gemm_kwargs_for_n(out_features),
     )[:, :, 0]
 
 

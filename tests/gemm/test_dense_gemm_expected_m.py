@@ -5,10 +5,12 @@ These are pure CPU/logic tests (no kernel launch): they pin the per-regime tile
 mapping and the M-independence-within-regime contract that lets one compiled
 kernel per (N,K,expected_m) be reused for all live M under frozen resolution.
 """
+
 from __future__ import annotations
 
 import cutlass
 import pytest
+import torch
 
 import b12x._lib.dense_gemm as dense_module
 from b12x._lib.dense_gemm import (
@@ -18,14 +20,192 @@ from b12x._lib.dense_gemm import (
     _dense_gemm_policy_for,
     _dense_gemm_target_occupancy,
     _dense_spark_policy_for_sm_count,
+    _select_default_dense_gemm_plan,
     _select_default_mma_tiler_mn,
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
+    dense_gemm,
 )
 
 SM = 188  # RTX PRO 6000 Blackwell
 SPARK_SM = 20  # DGX Spark GB10
 WIDE_N = 4096  # n > 1536 -> the MXFP8 wide-N regime that the hint tunes
+
+
+def _unaligned_dense_operands(
+    rows: int,
+    columns: int,
+    width: int,
+    groups: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    lhs = (
+        torch.empty((rows, width, groups), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+    rhs = (
+        torch.empty((columns, width, groups), dtype=torch.float8_e4m3fn),
+        torch.empty((1,), dtype=torch.float8_e8m0fnu),
+    )
+    return lhs, rhs
+
+
+def test_unswapped_tma_epilogue_rejects_unaligned_output_row_stride() -> None:
+    lhs, rhs = _unaligned_dense_operands(2, 132, 128, 1)
+
+    with pytest.raises(ValueError, match="16-byte-aligned C row stride"):
+        dense_gemm(
+            lhs,
+            rhs,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            sm_count=SM,
+            mma_tiler_mn=(64, 64),
+            load_path="tma",
+            swap_ab=False,
+        )
+
+
+def test_grouped_unaligned_output_requires_padding() -> None:
+    lhs, rhs = _unaligned_dense_operands(1, 132, 128, 2)
+
+    with pytest.raises(
+        ValueError,
+        match="pad N; swapped output storage is unsupported when L > 1",
+    ):
+        dense_gemm(
+            lhs,
+            rhs,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            sm_count=SM,
+            mma_tiler_mn=(64, 64),
+            load_path="tma",
+            swap_ab=False,
+        )
+
+
+def test_grouped_output_rejects_swapped_storage() -> None:
+    lhs, rhs = _unaligned_dense_operands(1, 132, 128, 2)
+
+    with pytest.raises(ValueError, match=r"swapped dense_gemm.*supports L=1 only"):
+        dense_gemm(
+            lhs,
+            rhs,
+            ab_dtype="float8_e4m3fn",
+            sf_dtype="float8_e8m0fnu",
+            c_dtype="bfloat16",
+            sf_vec_size=32,
+            sm_count=SM,
+            mma_tiler_mn=(64, 64),
+            load_path="tma",
+            swap_ab=True,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "rows",
+        "columns",
+        "width",
+        "expected_m",
+        "select_swapped_output_storage",
+        "expected_tile",
+        "expected_swap",
+    ),
+    (
+        (1, 132, 7168, 1, False, (16, 64), False),
+        (2, 132, 7168, 2, True, (64, 32), True),
+        (8, 132, 7168, 8, True, (64, 32), True),
+        (512, 132, 7168, 512, True, (128, 64), True),
+        (2, 128, 7168, 2, False, (64, 64), False),
+        (1, 32, 7168, 1, False, (16, 64), False),
+        (1, 32, 7168, 1, True, (64, 32), True),
+        (2, 16386, 1024, 2048, True, (128, 128), True),
+    ),
+)
+def test_default_plan_adapts_to_output_storage(
+    rows: int,
+    columns: int,
+    width: int,
+    expected_m: int,
+    select_swapped_output_storage: bool,
+    expected_tile: tuple[int, int],
+    expected_swap: bool,
+) -> None:
+    plan = _select_default_dense_gemm_plan(
+        rows,
+        columns,
+        width,
+        SM,
+        is_mxfp8=True,
+        expected_m=expected_m,
+        select_swapped_output_storage=select_swapped_output_storage,
+    )
+
+    assert plan.mma_tiler_mn == expected_tile
+    assert plan.swap_ab is expected_swap
+
+
+def test_wide_unaligned_output_uses_supported_bk128_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, object] = {}
+
+    def compile_dense_gemm(**kwargs):
+        recorded.update(kwargs)
+
+        def launch(**_kwargs) -> None:
+            return None
+
+        return launch
+
+    monkeypatch.setattr(
+        dense_module,
+        "_get_compiled_dense_gemm",
+        compile_dense_gemm,
+    )
+    lhs, rhs = _unaligned_dense_operands(2, 16386, 1024, 1)
+    out = torch.empty((2, 16386, 1), dtype=torch.bfloat16)
+    alpha = torch.ones(1, dtype=torch.float32)
+
+    result = dense_gemm(
+        lhs,
+        rhs,
+        out=out,
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype="bfloat16",
+        sf_vec_size=32,
+        sm_count=SM,
+        expected_m=2048,
+        alpha=alpha,
+        plain_fp8=True,
+    )
+
+    assert result is out
+    assert recorded["tile_k"] == 128
+    assert recorded["mma_tiler_mn"] == (128, 128)
+    assert recorded["swap_ab"] is True
+    assert dense_module.DenseGemmKernel.can_implement(
+        recorded["ab_dtype"],
+        recorded["sf_dtype"],
+        recorded["sf_vec_size"],
+        recorded["c_dtype"],
+        recorded["mma_tiler_mn"],
+        recorded["cluster_shape_mn"],
+        16386,
+        1024,
+        1,
+        "k",
+        "k",
+        "n",
+        load_path=recorded["load_path"],
+        swap_ab=recorded["swap_ab"],
+    )
 
 
 def _tile(m, *, expected_m=None, n=WIDE_N, k=None, sm_count=SM):
@@ -190,10 +370,7 @@ def test_expected_m_short_k_large_n_keeps_spark_prefill_plan():
                 k=1024,
                 sm_count=SPARK_SM,
             ) == (64, 128)
-            assert (
-                _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM)
-                == 128
-            )
+            assert _select_mxfp8_tile_k(live_m, 16384, 1024, em, SPARK_SM) == 128
         policy = _dense_gemm_policy_for(
             m=64,
             n=16384,
@@ -237,8 +414,7 @@ def test_wo_b_prefill_switches_to_bm128_bk64_at_2k():
     assert _select_mxfp8_tile_k(1024, n, k, 1024, SM) == 128
     for em in (2048, 4096, 8192):
         tiles = {
-            _tile(live_m, expected_m=em, n=n, k=k)
-            for live_m in (1, 64, 2048, 8192)
+            _tile(live_m, expected_m=em, n=n, k=k) for live_m in (1, 64, 2048, 8192)
         }
         assert tiles == {(128, 128)}, (n, k, em, tiles)
         assert _select_mxfp8_tile_k(1, n, k, em, SM) == 64
@@ -365,12 +541,8 @@ def test_expected_m_prefill_hint_for_narrow_n():
     # decode winner, while declared prefill still moves to the prefill tile.
     narrow = 1024
     base = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True)
-    decode = _select_default_mma_tiler_mn(
-        64, narrow, SM, is_mxfp8=True, expected_m=1
-    )
-    small = _select_default_mma_tiler_mn(
-        64, narrow, SM, is_mxfp8=True, expected_m=64
-    )
+    decode = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=1)
+    small = _select_default_mma_tiler_mn(64, narrow, SM, is_mxfp8=True, expected_m=64)
     prefill = _select_default_mma_tiler_mn(
         64, narrow, SM, is_mxfp8=True, expected_m=512
     )

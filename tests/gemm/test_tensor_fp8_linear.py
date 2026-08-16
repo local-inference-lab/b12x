@@ -52,6 +52,50 @@ def test_mm_matches_static_tensor_fp8_reference() -> None:
     )
 
 
+def test_mm_writes_all_rows_for_unaligned_output_stride() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260814)
+
+    source, weight, output_scale, packed = _make_inputs(3, 128, 132)
+    actual = tensor_fp8_linear.mm(source, packed)
+    expected = (source.float() @ weight.float().T) * output_scale
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+
+
+def test_wide_unaligned_output_uses_expected_m_under_cuda_graph() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260816)
+
+    source, weight, output_scale, packed = _make_inputs(2, 1024, 16386)
+    tensor_fp8_linear.mm(source, packed, expected_m=2048)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tensor_fp8_linear.mm(source, packed, expected_m=2048)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = (source.float() @ weight.float().T) * output_scale
+
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-3,
+    )
+
+
 def test_mm_pads_k32_to_dense_tile() -> None:
     require_b12x()
     require_mxf8_mma()
@@ -96,7 +140,9 @@ def test_mm_uses_plain_fp8_mma_not_scale_storage() -> None:
 
 
 def test_is_supported_honors_kernel_probe(monkeypatch) -> None:
-    monkeypatch.setattr(tensor_fp8_api, "default_is_supported", lambda *args, **kw: True)
+    monkeypatch.setattr(
+        tensor_fp8_api, "default_is_supported", lambda *args, **kw: True
+    )
     monkeypatch.setattr(
         tensor_fp8_api,
         "_kernel_is_supported",
