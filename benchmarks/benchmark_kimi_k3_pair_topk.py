@@ -1,10 +1,10 @@
-"""Benchmark Kimi paired projection gathering with fused expert selection.
+"""Benchmark Kimi paired projection gathering with batched expert selection.
 
 The benchmark covers tensor-parallel worlds of two, four, eight, and sixteen
-ranks (TP2, TP4, TP8, and TP16). It compares a separate paired gather plus vLLM
-``grouped_topk`` against the fused B12X operation. Expert IDs and projection
-data must match exactly. Router weights may differ by at most one FP32 rounding
-step because the implementations use different parallel reduction orders.
+ranks (TP2, TP4, TP8, and TP16) and token batches from one through eight. It
+compares paired gathering followed by vLLM ``topk_sigmoid`` against the same
+gather followed by B12X Kimi top-16 selection. Expert IDs, router weights, and
+projection data must match exactly.
 """
 
 from __future__ import annotations
@@ -21,8 +21,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import vllm._custom_ops as ops
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    vllm_topk_sigmoid,
+)
 
 
 def _free_port() -> int:
@@ -73,22 +75,31 @@ def _measure(
 def _case(
     name: str,
     *,
+    batch: int,
     rank: int,
     world_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if name == "random":
         generator = torch.Generator(device=device).manual_seed(12004)
-        logits = torch.randn((1, 896), generator=generator, device=device)
+        logits = torch.randn((batch, 896), generator=generator, device=device)
         bias = torch.randn((896,), generator=generator, device=device).mul_(0.02)
     elif name == "ties":
-        logits = torch.zeros((1, 896), device=device)
+        logits = torch.zeros((batch, 896), device=device)
         bias = torch.zeros((896,), device=device)
     elif name == "near_ties":
-        logits = torch.linspace(-1e-5, 1e-5, 896, device=device).view(1, 896)
+        logits = (
+            torch.linspace(-1e-5, 1e-5, 896, device=device)
+            .view(1, 896)
+            .repeat(batch, 1)
+        )
         bias = torch.linspace(1e-5, -1e-5, 896, device=device)
     elif name == "wide":
-        logits = torch.linspace(-80.0, 80.0, 896, device=device).view(1, 896)
+        logits = (
+            torch.linspace(-80.0, 80.0, 896, device=device)
+            .view(1, 896)
+            .repeat(batch, 1)
+        )
         bias = torch.sin(torch.arange(896, device=device, dtype=torch.float32))
         logits[0, 17] = float("nan")
         bias[33] = float("inf")
@@ -101,19 +112,6 @@ def _case(
     return local, bias.contiguous()
 
 
-def _equal_with_matching_nan(actual: torch.Tensor, expected: torch.Tensor) -> bool:
-    finite = torch.isfinite(actual) & torch.isfinite(expected)
-    finite_close = torch.where(
-        finite,
-        torch.isclose(actual, expected, rtol=2.0**-23, atol=0.0),
-        torch.ones_like(finite),
-    )
-    special_equal = torch.eq(actual, expected) | (
-        torch.isnan(actual) & torch.isnan(expected)
-    )
-    return bool(torch.all(finite_close & torch.where(finite, True, special_equal)))
-
-
 def _worker(
     rank: int,
     world_size: int,
@@ -121,6 +119,8 @@ def _worker(
     warmup: int,
     iterations: int,
     samples: int,
+    batch: int,
+    topk_threads: int,
 ) -> None:
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -131,46 +131,69 @@ def _worker(
         world_size=world_size,
     )
     reference_pool: PCIeDCPA2APool | None = None
-    fused_pool: PCIeDCPA2APool | None = None
+    b12x_pool: PCIeDCPA2APool | None = None
     try:
         query_head_dim = 10752 // world_size
         reference_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
-            max_batch_size=1,
+            max_batch_size=batch,
             total_heads=world_size,
             head_dim=query_head_dim,
             query_head_dim=query_head_dim,
         )
-        fused_pool = PCIeDCPA2APool.from_process_group(
+        b12x_pool = PCIeDCPA2APool.from_process_group(
             process_group=dist.group.WORLD,
             device=device,
-            max_batch_size=1,
+            max_batch_size=batch,
             total_heads=world_size,
             head_dim=query_head_dim,
             query_head_dim=query_head_dim,
         )
         reference_channel = "k3-pair-topk:reference"
-        fused_channel = "k3-pair-topk:fused"
+        b12x_channel = "k3-pair-topk:b12x"
         reference_pool.prepare_channels((reference_channel,))
-        fused_pool.prepare_channels((fused_channel,))
+        b12x_pool.prepare_channels((b12x_channel,))
+        b12x_pool.prepare_graph_kimi_topk16(
+            threads=topk_threads, channel_id=b12x_channel
+        )
 
         local_down_width = 3584 // world_size
         down_local = (
-            torch.arange(local_down_width, device=device, dtype=torch.float32)
-            .add_(rank * local_down_width)
+            torch.arange(
+                batch * local_down_width,
+                device=device,
+                dtype=torch.float32,
+            )
+            .view(batch, local_down_width)
+            .add_(rank * batch * local_down_width)
             .to(torch.bfloat16)
-            .view(1, local_down_width)
         )
-        reference_down = torch.empty((1, 3584), device=device, dtype=torch.bfloat16)
-        reference_router = torch.empty((1, 896), device=device, dtype=torch.float32)
-        fused_down = torch.empty_like(reference_down)
-        fused_weights = torch.empty((1, 16), device=device, dtype=torch.float32)
-        fused_ids = torch.empty((1, 16), device=device, dtype=torch.int32)
+        reference_down = torch.empty(
+            (batch, 3584), device=device, dtype=torch.bfloat16
+        )
+        reference_router = torch.empty(
+            (batch, 896), device=device, dtype=torch.float32
+        )
+        reference_weights = torch.empty(
+            (batch, 16), device=device, dtype=torch.float32
+        )
+        reference_ids = torch.empty(
+            (batch, 16), device=device, dtype=torch.int32
+        )
+        reference_token_expert = torch.empty_like(reference_ids)
+        b12x_down = torch.empty_like(reference_down)
+        b12x_router = torch.empty_like(reference_router)
+        b12x_weights = torch.empty(
+            (batch, 16), device=device, dtype=torch.float32
+        )
+        b12x_ids = torch.empty(
+            (batch, 16), device=device, dtype=torch.int32
+        )
     except Exception:
-        if fused_pool is not None:
+        if b12x_pool is not None:
             with suppress(Exception):
-                fused_pool.close()
+                b12x_pool.close()
         if reference_pool is not None:
             with suppress(Exception):
                 reference_pool.close()
@@ -191,6 +214,7 @@ def _worker(
         for name in ("random", "ties", "near_ties", "wide"):
             local_router, bias = _case(
                 name,
+                batch=batch,
                 rank=rank,
                 world_size=world_size,
                 device=device,
@@ -202,38 +226,43 @@ def _worker(
                 reference_router,
                 channel_id=reference_channel,
             )
-            reference_weights, reference_ids = ops.grouped_topk(
+            vllm_topk_sigmoid(
+                reference_weights,
+                reference_ids,
+                reference_token_expert,
                 reference_router,
-                1,
-                1,
-                16,
                 True,
-                1.0,
                 bias,
-                1,
+                1.0,
             )
-            fused_pool.all_gather_pair_kimi_topk(
+            b12x_pool.all_gather_pair(
                 down_local,
                 local_router,
+                b12x_down,
+                b12x_router,
+                channel_id=b12x_channel,
+            )
+            b12x_pool.kimi_topk16(
+                b12x_router,
                 bias,
-                fused_down,
-                fused_weights,
-                fused_ids,
-                channel_id=fused_channel,
+                b12x_weights,
+                b12x_ids,
+                threads=topk_threads,
+                channel_id=b12x_channel,
             )
             torch.cuda.synchronize(device)
-            ids_exact = torch.equal(fused_ids, reference_ids)
-            weights_exact = _equal_with_matching_nan(fused_weights, reference_weights)
+            ids_exact = torch.equal(b12x_ids, reference_ids)
+            weights_exact = torch.equal(b12x_weights, reference_weights)
             finite_mask_exact = torch.equal(
-                torch.isfinite(fused_weights),
+                torch.isfinite(b12x_weights),
                 torch.isfinite(reference_weights),
             )
             nonzero_mask_exact = torch.equal(
-                fused_weights != 0,
+                b12x_weights != 0,
                 reference_weights != 0,
             )
-            max_abs = float((fused_weights - reference_weights).abs().max().item())
-            down_exact = torch.equal(fused_down, reference_down)
+            max_abs = float((b12x_weights - reference_weights).abs().max().item())
+            down_exact = torch.equal(b12x_down, reference_down)
             if rank == 0:
                 print(
                     f"{name},{int(ids_exact)},{int(weights_exact)},"
@@ -252,16 +281,15 @@ def _worker(
             )
             dist.all_reduce(failures)
             if failures.item() != 0:
-                raise AssertionError(f"{name} differs from the grouped_topk reference")
+                raise AssertionError(
+                    f"{name} differs from the vLLM topk_sigmoid reference"
+                )
             if name == "random":
                 benchmark_router = local_router
                 benchmark_bias = bias
 
         assert benchmark_router is not None and benchmark_bias is not None
-        reference_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
-
         def reference_fn() -> None:
-            nonlocal reference_outputs
             reference_pool.all_gather_pair(
                 down_local,
                 benchmark_router,
@@ -269,39 +297,43 @@ def _worker(
                 reference_router,
                 channel_id=reference_channel,
             )
-            reference_outputs = ops.grouped_topk(
+            vllm_topk_sigmoid(
+                reference_weights,
+                reference_ids,
+                reference_token_expert,
                 reference_router,
-                1,
-                1,
-                16,
                 True,
-                1.0,
                 benchmark_bias,
-                1,
+                1.0,
             )
 
-        def fused_fn() -> None:
-            fused_pool.all_gather_pair_kimi_topk(
+        def b12x_fn() -> None:
+            b12x_pool.all_gather_pair(
                 down_local,
                 benchmark_router,
+                b12x_down,
+                b12x_router,
+                channel_id=b12x_channel,
+            )
+            b12x_pool.kimi_topk16(
+                b12x_router,
                 benchmark_bias,
-                fused_down,
-                fused_weights,
-                fused_ids,
-                channel_id=fused_channel,
+                b12x_weights,
+                b12x_ids,
+                threads=topk_threads,
+                channel_id=b12x_channel,
             )
 
         reference_graph = _capture(reference_fn, reference_pool, reference_channel)
-        fused_graph = _capture(fused_fn, fused_pool, fused_channel)
+        b12x_graph = _capture(b12x_fn, b12x_pool, b12x_channel)
         reference_graph.replay()
-        fused_graph.replay()
+        b12x_graph.replay()
         torch.cuda.synchronize(device)
-        assert reference_outputs is not None
-        if not _equal_with_matching_nan(fused_weights, reference_outputs[0]):
+        if not torch.equal(b12x_weights, reference_weights):
             raise AssertionError("captured weights differ")
-        if not torch.equal(fused_ids, reference_outputs[1]):
+        if not torch.equal(b12x_ids, reference_ids):
             raise AssertionError("captured ids differ")
-        if not torch.equal(fused_down, reference_down):
+        if not torch.equal(b12x_down, reference_down):
             raise AssertionError("captured down projection differs")
 
         reference_samples_us = _measure(
@@ -311,8 +343,8 @@ def _worker(
             iterations=iterations,
             samples=samples,
         )
-        fused_samples_us = _measure(
-            fused_graph,
+        b12x_samples_us = _measure(
+            b12x_graph,
             device=device,
             warmup=warmup,
             iterations=iterations,
@@ -320,30 +352,32 @@ def _worker(
         )
         if rank == 0:
             reference_us = statistics.median(reference_samples_us)
-            fused_us = statistics.median(fused_samples_us)
+            b12x_us = statistics.median(b12x_samples_us)
             print(
                 "reference_samples_us," + json.dumps(reference_samples_us),
                 flush=True,
             )
             print(
-                "fused_samples_us," + json.dumps(fused_samples_us),
+                "b12x_samples_us," + json.dumps(b12x_samples_us),
                 flush=True,
             )
             print(
-                "speedup_definition,reference_median_us/fused_median_us; "
-                "values greater than one mean the fused path is faster",
+                "speedup_definition,reference_median_us/b12x_median_us; "
+                "values greater than one mean the B12X path is faster",
                 flush=True,
             )
             print(
-                "world_size,reference_us,fused_us,speedup,saved_us\n"
-                f"{world_size},{reference_us:.6f},{fused_us:.6f},"
-                f"{reference_us / fused_us:.6f},{reference_us - fused_us:.6f}",
+                "world_size,batch,topk_threads,reference_us,b12x_us,"
+                "speedup,saved_us\n"
+                f"{world_size},{batch},{topk_threads},{reference_us:.6f},"
+                f"{b12x_us:.6f},"
+                f"{reference_us / b12x_us:.6f},{reference_us - b12x_us:.6f}",
                 flush=True,
             )
     finally:
-        if fused_pool is not None:
+        if b12x_pool is not None:
             with suppress(Exception):
-                fused_pool.close()
+                b12x_pool.close()
         if reference_pool is not None:
             with suppress(Exception):
                 reference_pool.close()
@@ -357,11 +391,17 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--topk-threads", type=int, default=256)
     args = parser.parse_args()
     if args.world_size not in (2, 4, 8, 16):
         raise SystemExit(
             "Kimi paired gather+top-k benchmark requires TP2, TP4, TP8, or TP16"
         )
+    if args.batch < 1 or args.batch > 8:
+        raise SystemExit("Kimi paired gather+top-k batch must be between 1 and 8")
+    if args.topk_threads not in (128, 256, 512):
+        raise SystemExit("Kimi top-k threads must be 128, 256, or 512")
     mp.spawn(
         _worker,
         args=(
@@ -370,6 +410,8 @@ def main() -> None:
             args.warmup,
             args.iterations,
             args.samples,
+            args.batch,
+            args.topk_threads,
         ),
         nprocs=args.world_size,
         join=True,

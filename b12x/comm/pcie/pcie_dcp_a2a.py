@@ -775,6 +775,18 @@ class PCIeDCPA2A:
                 True,
             )
 
+    def prepare_graph_kimi_topk16(self, *, threads: int = 256) -> None:
+        """Compile/load batched Kimi expert selection before graph capture."""
+
+        if _is_current_stream_capturing(self.device):
+            raise RuntimeError(
+                "prepare_graph_kimi_topk16() must run before capture"
+            )
+        from ._dcp_a2a_cute import _get_compiled_kimi_topk16
+
+        with torch.cuda.device(self.device):
+            _get_compiled_kimi_topk16(threads)
+
     def _validate(
         self,
         partial_output: torch.Tensor,
@@ -1403,6 +1415,118 @@ class PCIeDCPA2A:
                 ),
             )
 
+    def kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: Optional[torch.Tensor] = None,
+        output_ids: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select Kimi-K3's 16 routed experts for one to eight tokens."""
+
+        with _device_guard(self.device):
+            self._check_stream()
+            if self._closed:
+                raise RuntimeError("PCIeDCPA2A is closed")
+            if router_logits.ndim != 2:
+                raise ValueError(
+                    "router_logits must be a contiguous rank-2 tensor"
+                )
+            rows = int(router_logits.shape[0])
+            if rows <= 0 or rows > min(self.max_batch_size, 8):
+                raise ValueError(
+                    f"Kimi top-16 rows {rows} exceed the supported capacity "
+                    f"{min(self.max_batch_size, 8)}"
+                )
+            expected = (
+                (
+                    router_logits,
+                    (rows, 896),
+                    torch.float32,
+                    "router_logits",
+                ),
+                (
+                    correction_bias,
+                    (896,),
+                    torch.float32,
+                    "correction_bias",
+                ),
+            )
+            for value, shape, dtype, name in expected:
+                if (
+                    value.device != self.device
+                    or value.shape != shape
+                    or value.dtype != dtype
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous {shape} {dtype} on "
+                        f"{self.device}"
+                    )
+            if output_weights is None:
+                output_weights = torch.empty(
+                    (rows, 16), device=self.device, dtype=torch.float32
+                )
+            if output_ids is None:
+                output_ids = torch.empty(
+                    (rows, 16), device=self.device, dtype=torch.int32
+                )
+            outputs = (
+                (output_weights, torch.float32, "output_weights"),
+                (output_ids, torch.int32, "output_ids"),
+            )
+            for value, dtype, name in outputs:
+                if (
+                    value.device != self.device
+                    or value.shape != (rows, 16)
+                    or value.dtype != dtype
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous {(rows, 16)} {dtype} on "
+                        f"{self.device}"
+                    )
+            if _is_current_stream_capturing(self.device):
+                from ._dcp_a2a_cute import is_kimi_topk16_prepared
+
+                if not is_kimi_topk16_prepared(threads):
+                    raise RuntimeError(
+                        "cold PCIe DCP Kimi top-16 CUDA graph capture is not "
+                        "allowed; call prepare_graph_kimi_topk16() before "
+                        "capture"
+                    )
+            self._launch_kimi_topk16(
+                router_logits,
+                correction_bias,
+                output_weights,
+                output_ids,
+                threads=threads,
+            )
+            return output_weights, output_ids
+
+    def _launch_kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: torch.Tensor,
+        output_ids: torch.Tensor,
+        *,
+        threads: int,
+    ) -> None:
+        from ._dcp_a2a_cute import kimi_topk16
+
+        with torch.cuda.device(self.device):
+            kimi_topk16(
+                router_logits_ptr=router_logits.data_ptr(),
+                correction_bias_ptr=correction_bias.data_ptr(),
+                output_weights_ptr=output_weights.data_ptr(),
+                output_ids_ptr=output_ids.data_ptr(),
+                rows=int(router_logits.shape[0]),
+                threads=threads,
+            )
+
     def _closed_import_indices(self) -> set[tuple[int, int]]:
         closed = getattr(self, "_closed_ipc_import_indices", None)
         if closed is None:
@@ -1947,6 +2071,20 @@ class PCIeDCPA2APool:
                 stream, channel_id=channel_id
             ).prepare_graph_all_gather_pair_kimi_topk()
 
+    def prepare_graph_kimi_topk16(
+        self,
+        *,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> None:
+        """Prepare batched Kimi expert selection before graph capture."""
+
+        with _device_guard(self.device):
+            self.for_stream(
+                stream, channel_id=channel_id
+            ).prepare_graph_kimi_topk16(threads=threads)
+
     def lse_reduce_scatter(
         self,
         partial_output: torch.Tensor,
@@ -2108,6 +2246,35 @@ class PCIeDCPA2APool:
             out_down,
             topk_weights,
             topk_ids,
+        )
+
+    def kimi_topk16(
+        self,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        output_weights: Optional[torch.Tensor] = None,
+        output_ids: Optional[torch.Tensor] = None,
+        *,
+        threads: int = 256,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        channel = self.for_stream(stream, channel_id=channel_id)
+        if stream is not None and self.device.type == "cuda":
+            with torch.cuda.stream(stream):
+                return channel.kimi_topk16(
+                    router_logits,
+                    correction_bias,
+                    output_weights,
+                    output_ids,
+                    threads=threads,
+                )
+        return channel.kimi_topk16(
+            router_logits,
+            correction_bias,
+            output_weights,
+            output_ids,
+            threads=threads,
         )
 
     @contextmanager

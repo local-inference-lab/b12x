@@ -48,6 +48,7 @@ _GRAPH_ARRIVED_INDEX = _SELF_COUNTER_WORDS + 2
 _PREPARED_LSE_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_GATHER_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_PAIR_LAUNCHERS: set[tuple[object, ...]] = set()
+_PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
 
 
 @dsl_user_op
@@ -1628,6 +1629,154 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 )
 
 
+class _KimiTopK16Launch:
+    """Select Kimi-K3's 16 routed experts in one CTA per token."""
+
+    def __init__(self, threads: int) -> None:
+        self._threads = int(threads)
+
+    @cute.jit
+    def __call__(
+        self,
+        router_logits: cute.Pointer,
+        correction_bias: cute.Pointer,
+        output_weights: cute.Pointer,
+        output_ids: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            router_logits,
+            correction_bias,
+            output_weights,
+            output_ids,
+        ).launch(
+            grid=(rows, 1, 1),
+            block=(self._threads, 1, 1),
+            max_number_threads=(512, 1, 1),
+            min_blocks_per_mp=1,
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        router_logits: cute.Pointer,
+        correction_bias: cute.Pointer,
+        output_weights: cute.Pointer,
+        output_ids: cute.Pointer,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        smem_alloc = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SharedStorage:
+            selection_scores: cute.struct.Align[
+                cute.struct.MemRange[Float32, 896], 16
+            ]
+            unbiased_scores: cute.struct.Align[
+                cute.struct.MemRange[Float32, 896], 16
+            ]
+            warp_keys: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint64, 16], 16
+            ]
+
+        storage = smem_alloc.allocate(SharedStorage)
+        selection_scores = storage.selection_scores.get_tensor(
+            cute.make_layout((896,), stride=(1,))
+        )
+        unbiased_scores = storage.unbiased_scores.get_tensor(
+            cute.make_layout((896,), stride=(1,))
+        )
+        warp_keys = storage.warp_keys.get_tensor(
+            cute.make_layout((16,), stride=(1,))
+        )
+
+        row_offset = Int64(bidx) * Int64(896)
+        expert = Int32(tidx)
+        while expert < Int32(896):
+            router_value = cute.arch.load(
+                router_logits + row_offset + Int64(expert), Float32
+            )
+            bias = cute.arch.load(
+                correction_bias + Int64(expert), Float32
+            )
+            unbiased = Float32(1.0) / (
+                Float32(1.0) + cute.math.exp(-router_value, fastmath=True)
+            )
+            if not cute.math.isfinite(unbiased):
+                unbiased = Float32(0.0)
+            selection = unbiased + bias
+            if not cute.math.isfinite(selection):
+                if selection > Float32(0.0):
+                    selection = Float32(float("inf"))
+                else:
+                    selection = Float32(float("-inf"))
+            if selection == Float32(0.0):
+                selection = Float32(0.0)
+            selection_scores[expert] = selection
+            unbiased_scores[expert] = unbiased
+            expert += Int32(self._threads)
+        cute.arch.sync_threads()
+
+        # Each round reduces one candidate per thread, then merges the warp
+        # winners. The selected key is invalidated in shared memory before the
+        # following round. Packed keys preserve lower-ID tie-breaking.
+        lane = Int32(tidx) % Int32(32)
+        warp = Int32(tidx) // Int32(32)
+        selected_ids = cute.make_rmem_tensor((16,), Int32)
+        selected_weights = cute.make_rmem_tensor((16,), Float32)
+        for selected in cutlass.range_constexpr(16):
+            thread_key = cutlass.Uint64(0)
+            candidate = Int32(tidx)
+            while candidate < Int32(896):
+                candidate_key = _kimi_pack_key(
+                    selection_scores[candidate], candidate
+                )
+                thread_key = cutlass.max(thread_key, candidate_key)
+                candidate += Int32(self._threads)
+            warp_key = _kimi_warp_max_key(thread_key)
+            if lane == Int32(0):
+                warp_keys[warp] = warp_key
+            cute.arch.sync_threads()
+            if Int32(tidx) == Int32(0):
+                selected_key = warp_keys[0]
+                for source_warp in cutlass.range_constexpr(
+                    1, self._threads // 32
+                ):
+                    selected_key = cutlass.max(
+                        selected_key, warp_keys[source_warp]
+                    )
+                final_expert = _kimi_key_expert(selected_key)
+                selected_ids[selected] = final_expert
+                selected_weights[selected] = unbiased_scores[final_expert]
+                selection_scores[final_expert] = Float32(_KIMI_NEG_INF)
+            cute.arch.sync_threads()
+
+        weight_sum = Float32(0.0)
+        if Int32(tidx) == Int32(0):
+            for selected in cutlass.range_constexpr(16):
+                weight_sum += selected_weights[selected]
+
+        if Int32(tidx) == Int32(0):
+            output_offset = Int64(bidx) * Int64(16)
+            denominator = Float32(1.0)
+            if weight_sum > Float32(0.0):
+                denominator = weight_sum
+            scale = Float32(1.0) / denominator
+            for selected in cutlass.range_constexpr(16):
+                cute.arch.store(
+                    output_weights + output_offset + Int64(selected),
+                    selected_weights[selected] * scale,
+                )
+                cute.arch.store(
+                    output_ids + output_offset + Int64(selected),
+                    selected_ids[selected],
+                )
+
+
 def _pad_ptrs(values: Sequence[int], world_size: int) -> tuple[int, ...]:
     if len(values) != world_size:
         raise ValueError("pointer bundle does not match DCP world size")
@@ -2041,6 +2190,59 @@ def _get_compiled_all_gather_pair(
     return run
 
 
+def is_kimi_topk16_prepared(threads: int = 256) -> bool:
+    return int(threads) in _PREPARED_KIMI_TOPK_LAUNCHERS
+
+
+@functools.cache
+def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
+    normalized_threads = int(threads)
+    if normalized_threads not in (128, 256, 512):
+        raise ValueError("Kimi top-16 threads must be 128, 256, or 512")
+    launch = _KimiTopK16Launch(normalized_threads)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile",
+        target=launch,
+        cache_key=(normalized_threads,),
+    )
+    p_f32 = _f32_ptr(16)
+    p_i32 = _i32_ptr(16)
+    raw = b12x_compile(
+        launch,
+        p_f32,
+        p_f32,
+        p_f32,
+        p_i32,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.dcp_a2a.kimi_topk16",
+            1,
+            (normalized_threads,),
+            labels=("threads",),
+        ),
+    )
+
+    def run(
+        router_logits_ptr: int,
+        correction_bias_ptr: int,
+        output_weights_ptr: int,
+        output_ids_ptr: int,
+        rows: int,
+    ) -> None:
+        raw(
+            _f32_ptr(router_logits_ptr),
+            _f32_ptr(correction_bias_ptr),
+            _f32_ptr(output_weights_ptr),
+            _i32_ptr(output_ids_ptr),
+            int(rows),
+            current_cuda_stream(),
+        )
+
+    _PREPARED_KIMI_TOPK_LAUNCHERS.add(normalized_threads)
+    return run
+
+
 def lse_reduce_scatter(
     *,
     world_size: int,
@@ -2234,9 +2436,28 @@ def all_gather_pair_kimi_topk(
     )
 
 
+def kimi_topk16(
+    *,
+    router_logits_ptr: int,
+    correction_bias_ptr: int,
+    output_weights_ptr: int,
+    output_ids_ptr: int,
+    rows: int,
+    threads: int = 256,
+) -> None:
+    _get_compiled_kimi_topk16(threads)(
+        router_logits_ptr,
+        correction_bias_ptr,
+        output_weights_ptr,
+        output_ids_ptr,
+        rows,
+    )
+
+
 __all__ = [
     "all_gather_heads",
     "all_gather_pair",
     "all_gather_pair_kimi_topk",
+    "kimi_topk16",
     "lse_reduce_scatter",
 ]

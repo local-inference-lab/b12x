@@ -137,12 +137,32 @@ class _FakeKimiRuntime(PCIeDCPA2A):
         topk_weights.fill_(1.0 / 16.0)
         topk_ids.copy_(torch.arange(16, dtype=torch.int32).view(1, 16))
 
+    def _launch_kimi_topk16(
+        self,
+        router_logits,
+        correction_bias,
+        output_weights,
+        output_ids,
+        *,
+        threads,
+    ):
+        del router_logits, correction_bias, threads
+        output_weights.fill_(1.0 / 16.0)
+        output_ids.copy_(
+            torch.arange(16, dtype=torch.int32)
+            .view(1, 16)
+            .expand(output_ids.shape[0], -1)
+        )
+
 def _make_runtime() -> PCIeDCPA2A:
     return _FakeRuntime()
 
 
 def _make_kimi_runtime(
-    world_size: int, ext: _FakeExt | None = None
+    world_size: int,
+    ext: _FakeExt | None = None,
+    *,
+    max_batch_size: int = 8,
 ) -> PCIeDCPA2A:
     query_head_dim = 7168 // world_size + 3584 // world_size
     return _FakeKimiRuntime(
@@ -152,12 +172,12 @@ def _make_kimi_runtime(
         signal_ptrs=tuple(range(100, 100 + world_size)),
         staging0_ptrs=tuple(range(200, 200 + world_size)),
         staging1_ptrs=tuple(range(300, 300 + world_size)),
-        max_batch_size=1,
+        max_batch_size=max_batch_size,
         total_heads=world_size,
         head_dim=query_head_dim,
-        output_capacity_elems=world_size * query_head_dim,
-        lse_offset=world_size * query_head_dim * 2,
-        lse_capacity=world_size,
+        output_capacity_elems=max_batch_size * world_size * query_head_dim,
+        lse_offset=max_batch_size * world_size * query_head_dim * 2,
+        lse_capacity=max_batch_size * world_size,
         query_head_dim=query_head_dim,
         ext_module=ext or _FakeExt(),
     )
@@ -661,6 +681,29 @@ def test_kimi_pair_topk_dispatches_compact_outputs(world_size: int) -> None:
     assert ids.shape == (1, 16)
     torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
     assert torch.equal(ids, torch.arange(16, dtype=torch.int32).view(1, 16))
+    runtime.close()
+
+
+@pytest.mark.parametrize("world_size", (2, 4, 8, 16))
+@pytest.mark.parametrize("rows", (1, 8))
+def test_kimi_topk16_dispatches_compact_outputs(
+    world_size: int, rows: int
+) -> None:
+    runtime = _make_kimi_runtime(world_size)
+    router_logits = torch.arange(
+        rows * 896, dtype=torch.float32
+    ).view(rows, 896)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    weights, ids = runtime.kimi_topk16(router_logits, correction_bias)
+
+    assert weights.shape == (rows, 16)
+    assert ids.shape == (rows, 16)
+    torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / 16.0))
+    assert torch.equal(
+        ids,
+        torch.arange(16, dtype=torch.int32).view(1, 16).expand(rows, -1),
+    )
     runtime.close()
 
 
