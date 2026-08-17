@@ -23,6 +23,8 @@ not index shared route storage whose extent was compiled for a smaller M.
 - Runtime implementation tree: `dc1d9340849219f99b5ba93e915b0fbd10967028`
 - Test-complete revision: `6a41770fb1514c4db03b4ff552380ec6821a3ae9`
 - Test-complete tree: `5ea752169a9c4a2863f51f16ed77cc85371f1353`
+- Compile-ABI qualification revision:
+  `97dfe7f837fa5383c5424cbdb2ccfabf57c4480c`
 - Comparison revision for valid FC2 routes:
   `debaafe156c9824396178d53e01e5f15d2a2a04a`
 - Comparison tree: `ec6edd9da4687f83519fd37bd7322ea0800f0ace`
@@ -94,10 +96,26 @@ docker run --rm --gpus device=0 --ipc=host \
 Result: three parametrized tests passed and Compute Sanitizer reported
 `ERROR SUMMARY: 0 errors`.
 
-An extended W4A16 and micro-Trellis selector produced 67 passes, 16 skips, and
-two failures. Both failures require a caller-owned CUDA Graph output buffer and
-reproduce unchanged at comparison revision `debaafe156c9824396178d53e01e5f15d2a2a04a`;
-they are not introduced by inactive-route handling.
+The generic direct-micro compiler receives the resident-expert limit before
+the runtime M, grid extent, and CUDA stream arguments. GPU compile tests cover
+the fused body and both split phases, preventing a positional ABI change from
+binding the stream as an integer launch parameter.
+
+A composed source qualification combined this implementation with the mixed
+Trellis runtime from B12X PR #223 at revision
+`e99775f552c4f28cf1f345ded28bb77a57ea6a83`. The following suites produced
+309 passes and 18 skips:
+
+- `tests/gemm/test_trellis_k6_mcg_cute.py`
+- `tests/moe/test_w4a16_e2e.py`
+- `tests/moe/test_w4a16_mixed_trellis.py`
+- `tests/moe/test_w4a16_route_pack_warmup.py`
+- `tests/moe/test_moe_launch_param_regression.py`
+- `tests/test_packaging.py`
+
+The result covers native and Trellis routes, fused and split NVFP4 compilation,
+eager execution, CUDA Graph replay, mixed K3/K4/K5 dispatch, route packing,
+and packaged source availability.
 
 ## FC2 valid-route latency diagnostic
 
