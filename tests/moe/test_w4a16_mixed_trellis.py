@@ -627,8 +627,11 @@ def test_mixed_k3_k4_k5_matches_serial_and_captures(monkeypatch) -> None:
         launch, device=device, sms=int(props.multi_processor_count)
     )
 
-    other_codebook = "sqg_xor_cheb_t12" if codebook == "mcg" else "mcg"
-    mismatched_tier0 = replace(tiers[0], trellis_codebook=other_codebook)
+    other_codebook = "sqg_e4m3" if codebook == "mcg" else "mcg"
+    assert tiers[0].trellis is not None
+    mismatched_tier0 = replace(
+        tiers[0], trellis=replace(tiers[0].trellis, codebook=other_codebook)
+    )
     with pytest.raises(ValueError, match="launch-plan codebook"):
         bind_mixed_trellis3(
             mismatched_tier0,
