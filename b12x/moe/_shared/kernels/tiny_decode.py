@@ -231,7 +231,14 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc1_per_rt
             nt = rem // Int32(c["fc1_ktg"])
             ktg = rem % Int32(c["fc1_ktg"])
-            eid = Int64(Int32(topk_ids[rt_idx]))
+            route_eid = Int32(topk_ids[rt_idx])
+            route_active = route_eid >= Int32(0) and route_eid < Int32(c["weight_E"])
+            # vLLM represents CUDA-graph padding and non-local EP routes with
+            # an expert id outside [0, weight_E). Keep every address in range;
+            # inactive routes retain the pre-zeroed intermediate and output.
+            eid = Int64(0)
+            if route_active:
+                eid = Int64(route_eid)
             tok = rt_idx // Int32(c["num_topk"])
             we_base = w13_base + eid * Int64(c["w13_words"] * 4)
             se_base = sfb13_base + eid * Int64(c["sfb13_bytes"])
@@ -292,7 +299,7 @@ class MoETinyDecodeKernelBackend:
             acc1 = warp_reduce(acc1, lambda a, b: a + b, width=4)
             acc2 = warp_reduce(acc2, lambda a, b: a + b, width=4)
             acc3 = warp_reduce(acc3, lambda a, b: a + b, width=4)
-            if cgrp == Int32(0):
+            if route_active and cgrp == Int32(0):
                 ibase_rt = inter_base + Int64(rt_idx) * Int64(c["two_n"] * 4)
                 accs = (acc0, acc1, acc2, acc3)
                 for v in cutlass.range_constexpr(4):
@@ -326,7 +333,11 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc2_per_rt
             nt = rem // Int32(c["fc2_ktg"])
             ktg = rem % Int32(c["fc2_ktg"])
-            eid = Int64(Int32(topk_ids[rt_idx]))
+            route_eid = Int32(topk_ids[rt_idx])
+            route_active = route_eid >= Int32(0) and route_eid < Int32(c["weight_E"])
+            eid = Int64(0)
+            if route_active:
+                eid = Int64(route_eid)
             tok = rt_idx // Int32(c["num_topk"])
             rw = Float32(topk_weights[rt_idx])
             we_base = w2_base + eid * Int64(c["w2_words"] * 4)
@@ -433,7 +444,7 @@ class MoETinyDecodeKernelBackend:
             o1 = cute.arch.shuffle_sync_bfly(acc1, offset=4)
             o2 = cute.arch.shuffle_sync_bfly(acc2, offset=4)
             o3 = cute.arch.shuffle_sync_bfly(acc3, offset=4)
-            if cgrp == Int32(0):
+            if route_active and cgrp == Int32(0):
                 if (r8 % Int32(2)) == Int32(0):
                     ob = out_base + Int64(tok) * Int64(c["k"] * 2)
                     accs = (acc0, acc1, acc2, acc3)
