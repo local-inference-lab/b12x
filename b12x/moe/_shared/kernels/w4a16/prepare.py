@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import torch
 
 from b12x.moe._shared.trellis_codebooks import (
-    MCG,
     SQG_E4M3,
     normalize_codebook,
     validate_codebook_bits,

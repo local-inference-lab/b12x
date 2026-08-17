@@ -15,7 +15,7 @@ from b12x.gemm.trellis_linear import _k6_mcg_cute
 def _weight_descriptor(**overrides):
     descriptor = {
         "params_dtype": torch.float16,
-        "weight_layout": "trellis3_t256",
+        "weight_layout": "trellis_t256",
         "num_experts": 1,
         "trellis_bits": 6,
         "trellis_codebook": "mcg",
@@ -36,7 +36,7 @@ def _weight_descriptor(**overrides):
         ({"weight_layout": "mxfp4"}, False),
         ({"num_experts": 2}, False),
         ({"trellis_bits": 5}, False),
-        ({"trellis_codebook": "sqg_xor_cheb_t12"}, False),
+        ({"trellis_codebook": "sqg_e4m3"}, False),
         ({"trellis_pair_kind": "P24", "trellis_rate_axis": "n"}, False),
         ({"trellis_pair_kind": "P33", "trellis_rate_axis": "k"}, False),
         ({"trellis_pair_kind": "P24"}, False),

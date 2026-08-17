@@ -1,6 +1,6 @@
 """Cooperative SM120 dense K6/MCG execution for small row counts.
 
-The kernel executes the complete EXL3 dense-linear transform in one resident
+The kernel executes the complete native Trellis dense-linear transform in one resident
 grid:
 
 ``fp16(x * suh) -> H128 -> K6/MCG GEMM -> H128 -> fp16(* svh)``.
@@ -176,7 +176,7 @@ def _is_unpaired_k6_mcg_weight(prepared) -> bool:
     """Return whether a prepared weight has the unpaired K6/MCG contract."""
     return bool(
         getattr(prepared, "params_dtype", None) == torch.float16
-        and getattr(prepared, "weight_layout", None) == "trellis3_t256"
+        and getattr(prepared, "weight_layout", None) == "trellis_t256"
         and int(getattr(prepared, "num_experts", 0)) == 1
         and int(getattr(prepared, "trellis_bits", 0)) == 6
         and str(getattr(prepared, "trellis_codebook", "")).lower() == "mcg"
@@ -247,7 +247,7 @@ class K6McgSmallMKernel:
             moe_block_size=_ROUTE_BLOCK,
             max_m_blocks=1,
             element_dtype="fp16",
-            weight_layout="trellis3_t256",
+            weight_layout="trellis_t256",
             scale_format="e4m3_k32",
             w13_layout="packed",
             trellis_bits=6,
