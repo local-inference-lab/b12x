@@ -11,7 +11,8 @@ regimes (micro / dynamic / tiny-decode / w4a16) are selected declaratively by
 ``plan_execution``.
 
 Weight lifecycle (host-side, one-time):
-    ``plan_weights`` -> ``prepare_weights`` -> ``ExpertWeights``
+    ``plan_weights`` -> ``prepare_weights`` / ``adopt_btx_weights``
+    -> ``ExpertWeights``
 Runtime lifecycle:
     ``plan(Caps)`` -> ``bind`` / ``bind_sparse`` / ``bind_route``
     (allocation-free views) -> ``run`` / ``run_sparse`` / ``route``
@@ -60,6 +61,7 @@ META = OpMeta(
         "plan_execution",
         "plan_weights",
         "prepare_weights",
+        "adopt_btx_weights",
         "prepare_fc2_weights",
         "prewarm_fc2",
         "bind",
@@ -113,6 +115,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         required_nbytes,
         plan_execution,
         plan_weights,
+        adopt_btx_weights,
         prepare_weights,
         prepare_fc2_weights,
         prewarm_fc2,
