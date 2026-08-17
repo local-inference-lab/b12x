@@ -1084,6 +1084,137 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
+    m: int,
+) -> None:
+    """Native small-M execution must not address weights for inactive routes."""
+    experts, hidden_size, intermediate_size = 4, 128, 192
+    topk, activation = 2, "situ"
+    rows = 2 * intermediate_size
+    torch.manual_seed(20260817 + m)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0(
+        (experts, hidden_size, intermediate_size // 32), offset=1
+    )
+    global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+    intermediate_cache2 = torch.zeros(
+        2 * m * fc2_n_chunks * 128 * topk,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    inputs = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(
+        0, experts, (m, topk), dtype=torch.int32, device="cuda"
+    )
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            inputs,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+
+    inactive_ids = topk_ids.clone()
+    inactive_ids[-1] = torch.tensor(
+        [-1, experts], dtype=torch.int32, device="cuda"
+    )
+    if m > 1:
+        inactive_ids[0, 0] = -1
+    topk_ids.copy_(inactive_ids)
+    original_weights = topk_weights.clone()
+    active = (inactive_ids >= 0) & (inactive_ids < experts)
+    reference_ids = torch.where(
+        active, inactive_ids, torch.zeros_like(inactive_ids)
+    )
+    reference_weights = torch.where(
+        active, topk_weights, torch.zeros_like(topk_weights)
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        inputs,
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        reference_ids,
+        reference_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        w13_layout="w31",
+    )
+
+    eager = launch().clone()
+    torch.cuda.synchronize()
+    _assert_matches_oracle(eager, expected, activation=activation)
+    torch.testing.assert_close(
+        eager[-1], torch.zeros_like(eager[-1]), rtol=0, atol=0
+    )
+
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+    torch.testing.assert_close(topk_ids, inactive_ids, rtol=0, atol=0)
+    torch.testing.assert_close(topk_weights, original_weights, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_e8m0_native_aligned_generic_fc1_uses_k32_scale_stride() -> None:
     """K/32 scales keep their native expert stride in aligned generic FC1."""
     experts, hidden_size, intermediate_size = 8, 512, 128

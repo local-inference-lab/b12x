@@ -771,6 +771,7 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
             compile_time_phase=compile_time_phase,
+            stage_inactive_routes=True,
         )
 
 
