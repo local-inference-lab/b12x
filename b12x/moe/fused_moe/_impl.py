@@ -2591,7 +2591,9 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis_t256"
-        route_E = requested_route_E if full_rotation else int(weight_E)
+        # Route metadata must address every physical weight and every global
+        # router ID accepted through route_expert_map.
+        route_E = max(int(weight_E), requested_route_E)
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(

@@ -99,6 +99,27 @@ def _subset_router_caps() -> fused_moe.Caps:
     )
 
 
+def _mapped_packed_caps() -> fused_moe.Caps:
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="compressed_tensors",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        w13_layout="w13",
+    )
+    return fused_moe.Caps(
+        max_tokens=8,
+        num_topk=2,
+        route_num_experts=12,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+
 def test_required_nbytes_avoids_launch_prewarm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -157,6 +178,20 @@ def test_non_trellis_core_sizes_routes_for_weight_experts(
     assert specs["packed_route_indices"].shape == (512,)
     assert specs["block_expert_ids"].shape == (64,)
     assert specs["expert_offsets"].shape == (161,)
+
+
+def test_mapped_packed_plan_covers_global_route_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+
+    plan = fused_moe.plan(_mapped_packed_caps())
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    assert plan._core_workspace_plan.weight_E == 8
+    assert plan._core_workspace_plan.route_E == 12
+    assert specs["expert_offsets"].shape == (13,)
+    assert specs["expert_counts"].shape == (12,)
 
 
 def test_unpinned_small_capacity_matches_reachable_block_8(
