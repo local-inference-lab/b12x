@@ -94,6 +94,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from ._route_pack_cache import route_pack_prewarm_key
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -6701,11 +6702,14 @@ def _plan_full_rotation_w4a16_launches(
                         device=core_plan.device,
                     )
                 for token_count in route_pack_warmup_token_counts(capacity_tokens):
-                    route_pack_key = (
+                    route_pack_key = route_pack_prewarm_key(
                         core_plan.device.type,
                         int(torch.cuda.current_device()),
-                        str(route_ids_dtype),
-                        token_count * core_plan.num_topk,
+                        route_ids_dtype,
+                        token_count,
+                        core_plan.num_topk,
+                        capacity_route_slots,
+                        capacity_m_blocks,
                         int(block_size_m),
                         int(core_plan.route_E),
                         mapped,
@@ -7069,11 +7073,14 @@ def _prewarm_w4a16_planned_launches(
                         )
                 continue
 
-            route_pack_key = (
+            route_pack_key = route_pack_prewarm_key(
                 workspace.device.type,
                 int(torch.cuda.current_device()),
-                str(torch.int32),
-                int(token_count) * int(workspace.num_topk),
+                torch.int32,
+                token_count,
+                workspace.num_topk,
+                workspace.packed_route_indices.numel(),
+                workspace.block_expert_ids.numel(),
                 int(block_size_m),
                 int(workspace.route_E),
                 bool(False),

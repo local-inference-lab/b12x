@@ -195,6 +195,24 @@ def test_btx_uniform_prepared_owner_preserves_public_plan_contract(tmp_path) -> 
     assert adopted.w1_fp4.data_ptr() == from_atoms.w1_fp4.data_ptr()
     assert adopted.w2_fp4.data_ptr() == from_atoms.w2_fp4.data_ptr()
 
+    torch.manual_seed(20260817)
+    x = (torch.randn((4, hidden), device=device) * 0.05).to(torch.float16)
+    ids, router_weights = _routing(4, experts, 2, device, 20260817)
+    original_output = _serve(
+        from_atoms,
+        x=x,
+        ids=ids,
+        router_weights=router_weights,
+    )
+    adopted_output = _serve(
+        adopted,
+        x=x,
+        ids=ids,
+        router_weights=router_weights,
+    )
+    assert torch.count_nonzero(original_output).item() > 0
+    assert torch.equal(adopted_output, original_output)
+
     mismatched = fused_moe.plan_weights(
         quant_modes="w4a16",
         source_format="btx",
