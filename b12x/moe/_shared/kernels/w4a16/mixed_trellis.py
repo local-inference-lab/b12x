@@ -28,8 +28,12 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.w4a16_layout import (
+    MixedTrellisBufferLayout,
+    plan_mixed_trellis_buffers,
+)
 
-from .host import max_packed_route_slots, packed_gemm_scratch_elements
+from .host import max_packed_route_slots
 from .kernel import (
     _SQG_XOR_CHEB_T12_LUT_ENTRIES,
     _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
@@ -1013,73 +1017,91 @@ def compile_mixed_trellis(
     return result
 
 
+def mixed_trellis_buffer_layout(
+    launch: MixedTrellisCompileResult,
+    *,
+    sms: int,
+) -> MixedTrellisBufferLayout:
+    if int(sms) != int(launch.sms):
+        raise ValueError(
+            f"buffer SMS count {sms} does not match launch SMS count {launch.sms}"
+        )
+    return plan_mixed_trellis_buffers(
+        size_m=launch.size_m,
+        hidden_size=launch.hidden_size,
+        intermediate_size=launch.intermediate_size,
+        top_k=launch.top_k,
+        total_experts=launch.tier0_num_experts + launch.tier1_num_experts,
+        moe_block_size=launch.moe_block_size,
+        max_m_blocks=launch.max_m_blocks,
+        blocks_per_sm=launch.blocks_per_sm,
+        sms=launch.sms,
+    )
+
+
 def make_mixed_trellis_buffers(
     launch: MixedTrellisCompileResult,
     *,
     device: torch.device,
     sms: int,
 ) -> MixedTrellisBuffers:
-    capacity_rows = launch.size_m * launch.top_k
-    total_experts = launch.tier0_num_experts + launch.tier1_num_experts
-    route_slots = max_packed_route_slots(
-        capacity_rows, launch.moe_block_size, total_experts
-    )
-    route_blocks = (route_slots + launch.moe_block_size - 1) // launch.moe_block_size
-    if route_blocks > launch.max_m_blocks:
-        raise ValueError(
-            "mixed Trellis route buffers require "
-            f"{route_blocks} blocks, but the launch was compiled for "
-            f"{launch.max_m_blocks}"
-        )
-    fc1_cols = 2 * launch.intermediate_size
+    layout = mixed_trellis_buffer_layout(launch, sms=sms)
     # FC1 consumes rotation_gate before the grid-wide activation barrier. FC2
     # starts only after that barrier, so its output can safely reuse the same
     # storage without changing either phase's tensor layout.
     rotation_gate = torch.empty(
-        (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
+        (layout.capacity_rows, layout.hidden_size),
+        dtype=torch.float16,
+        device=device,
     )
     return MixedTrellisBuffers(
         rotation_gate=rotation_gate,
         rotation_up=torch.empty(
-            (capacity_rows, launch.hidden_size), dtype=torch.float16, device=device
+            (layout.capacity_rows, layout.hidden_size),
+            dtype=torch.float16,
+            device=device,
         ),
-        fc1=torch.empty((capacity_rows, fc1_cols), dtype=torch.float16, device=device),
+        fc1=torch.empty(
+            (layout.capacity_rows, layout.fc1_cols),
+            dtype=torch.float16,
+            device=device,
+        ),
         activated=torch.empty(
-            (capacity_rows, launch.intermediate_size),
+            (layout.capacity_rows, layout.intermediate_size),
             dtype=torch.float16,
             device=device,
         ),
         fc2=rotation_gate,
         output=torch.empty(
-            (launch.size_m, launch.hidden_size), dtype=torch.float32, device=device
+            (layout.size_m, layout.hidden_size),
+            dtype=torch.float32,
+            device=device,
         ),
-        packed_route_indices=torch.empty(route_slots, dtype=torch.int32, device=device),
-        block_expert_ids=torch.empty(route_blocks, dtype=torch.int32, device=device),
+        packed_route_indices=torch.empty(
+            layout.route_slots, dtype=torch.int32, device=device
+        ),
+        block_expert_ids=torch.empty(
+            layout.route_blocks, dtype=torch.int32, device=device
+        ),
         packed_route_count=torch.empty(1, dtype=torch.int32, device=device),
-        expert_offsets=torch.empty(total_experts + 1, dtype=torch.int32, device=device),
-        expert_counts=torch.empty(total_experts, dtype=torch.int32, device=device),
+        expert_offsets=torch.empty(
+            layout.total_experts + 1, dtype=torch.int32, device=device
+        ),
+        expert_counts=torch.empty(
+            layout.total_experts, dtype=torch.int32, device=device
+        ),
         fc1_scratch=torch.empty(
-            packed_gemm_scratch_elements(
-                size_n=fc1_cols,
-                route_slots=route_slots,
-                moe_block_size=launch.moe_block_size,
-                sms=sms,
-            ),
+            layout.fc1_scratch_elements,
             dtype=torch.float32,
             device=device,
         ),
         fc2_scratch=torch.empty(
-            packed_gemm_scratch_elements(
-                size_n=launch.hidden_size,
-                route_slots=route_slots,
-                moe_block_size=launch.moe_block_size,
-                sms=sms,
-            ),
+            layout.fc2_scratch_elements,
             dtype=torch.float32,
             device=device,
         ),
         workspace=torch.zeros(
-            max(sms * 4, launch.blocks_per_sm * sms) + 2,
+            layout.workspace_elements,
             dtype=torch.int32,
             device=device,
         ),
@@ -1530,6 +1552,7 @@ def run_mixed_trellis(
 
 
 __all__ = [
+    "MixedTrellisBufferLayout",
     "MixedTrellisBuffers",
     "MixedTrellisCompileResult",
     "MixedTrellisRotations",
@@ -1538,5 +1561,6 @@ __all__ = [
     "combine_trellis_rotations",
     "compile_mixed_trellis",
     "make_mixed_trellis_buffers",
+    "mixed_trellis_buffer_layout",
     "run_mixed_trellis",
 ]

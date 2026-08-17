@@ -28,6 +28,7 @@ from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     combine_trellis_rotations,
     compile_mixed_trellis,
     make_mixed_trellis_buffers,
+    mixed_trellis_buffer_layout,
     run_mixed_trellis,
 )
 from b12x.moe._shared.kernels.w4a16.prepare import (
@@ -62,6 +63,24 @@ def test_mixed_kernel_cache_key_is_tier_partition_agnostic() -> None:
     assert _mixed_cache_key(206, 50) == _mixed_cache_key(160, 96)
     assert _mixed_cache_key(192, 64) == _mixed_cache_key(206, 50)
     assert _mixed_cache_key(96, 32) == _mixed_cache_key(80, 16)
+
+
+def test_mixed_buffer_layout_rejects_launch_sms_mismatch() -> None:
+    launch = SimpleNamespace(
+        size_m=64,
+        hidden_size=128,
+        intermediate_size=128,
+        top_k=2,
+        tier0_num_experts=2,
+        tier1_num_experts=2,
+        moe_block_size=32,
+        max_m_blocks=8,
+        blocks_per_sm=1,
+        sms=188,
+    )
+
+    with pytest.raises(ValueError, match="does not match launch SMS count"):
+        mixed_trellis_buffer_layout(launch, sms=128)
 
 
 def test_mixed_kernel_uses_runtime_expert_bounds() -> None:
