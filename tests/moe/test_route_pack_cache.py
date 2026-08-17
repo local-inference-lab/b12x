@@ -25,15 +25,12 @@ def _key(
     )
 
 
-def test_route_pack_prewarm_separates_equal_routed_row_counts() -> None:
-    assert _key(token_count=3, top_k=1) != _key(token_count=1, top_k=3)
-
-
-def test_route_pack_prewarm_separates_caller_owned_arenas() -> None:
-    assert _key(packed_route_slots=256, route_blocks=4) != _key(
-        packed_route_slots=320,
-        route_blocks=5,
-    )
+def test_route_pack_prewarm_key_includes_each_launch_dimension() -> None:
+    baseline = _key()
+    assert baseline != _key(token_count=4)
+    assert baseline != _key(top_k=2)
+    assert baseline != _key(packed_route_slots=320)
+    assert baseline != _key(route_blocks=5)
 
 
 def test_route_pack_prewarm_rejects_nonpositive_dimensions() -> None:
