@@ -1,5 +1,5 @@
 {
-  "status": "qualified",
+  "status": "research-only",
   "purpose": "Compare B12X batched Kimi-K3 top-16 expert selection with paired projection gathering against paired gathering followed by the vLLM topk_sigmoid reference.",
   "captured_at_utc": "2026-08-16",
   "source": {
@@ -13,6 +13,13 @@
     "container_image": "voipmonitor/vllm:kimi-k3-ii-vllmf21a391-b12x3be8bc7-cu133-torch213-20260816-r2",
     "container_digest": "sha256:9230c19c6b16ca6216613360619b0cca2356dba65c2297c99817750b3f9e4b83"
   },
+  "limitations": [
+    "The source worktree identity was not captured.",
+    "The compiled CuTe artifact identity was not captured.",
+    "The JIT cache identity was not captured.",
+    "The CUTLASS and PTXAS version-to-artifact map was not captured.",
+    "Cold compile, load, capture, and replay samples were not captured; the preserved timing samples are warm CUDA Graph replay measurements."
+  ],
   "hardware": {
     "gpu_model": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "gpu_count": 16,
@@ -60,30 +67,31 @@
     "ties": "expert IDs, FP32 weights, and gathered BF16 projection data match exactly",
     "near_ties": "expert IDs, FP32 weights, and gathered BF16 projection data match exactly",
     "nonfinite_wide_range": "expert IDs, FP32 weights, finite masks, nonzero masks, and gathered BF16 projection data match exactly",
-    "all_negative_infinity": "B12X returns 16 distinct in-range expert IDs per row; FP32 weights, finite masks, nonzero masks, and gathered BF16 projection data match exactly; the vLLM reduction does not define which 16 experts win a complete tie",
-    "cuda_graph_replay": "random, tied, near-tied, wide nonfinite, and all-negative-infinity inputs preserve the eager routing contract, finite positive normalized FP32 weights, gathered BF16 projection data, tensor addresses, and allocator usage",
+    "all_negative_infinity": "The captured run verified only 16 distinct in-range B12X expert IDs per row; it did not record the exact ID order required by the deterministic [0, 1, ..., 15] contract. FP32 weights, finite masks, nonzero masks, and gathered BF16 projection data match exactly.",
+    "cuda_graph_replay": "The captured run verified random, tied, near-tied, and wide nonfinite inputs against the eager routing checks; for all-negative-infinity input it verified only distinct in-range IDs. All cases preserved finite positive normalized FP32 weights, gathered BF16 projection data, tensor addresses, and allocator usage; exact deterministic all-negative-infinity ID order was not recorded.",
     "targeted_tests": "19 passed, 44 deselected"
   },
   "timing_microseconds": {
-    "reference_samples": [
+    "sample_classification": "warm CUDA Graph replay measurements after 100 warmup replays per graph",
+    "reference_warm_samples": [
       55.18312403000891,
       55.37262401776388,
       55.55178300710395,
       55.544102971907705,
       55.51176401786506
     ],
-    "b12x_samples": [
+    "b12x_warm_samples": [
       41.79493500851095,
       41.621115000452846,
       41.919035953469574,
       41.90381499938667,
       41.926354984752834
     ],
-    "reference_median": 55.51176401786506,
-    "b12x_median": 41.90381499938667,
-    "saved_median": 13.60794901847839,
-    "speedup": 1.324742,
-    "speedup_definition": "reference_median / b12x_median; values greater than one mean the B12X path is faster"
+    "reference_warm_median": 55.51176401786506,
+    "b12x_warm_median": 41.90381499938667,
+    "warm_saved_median": 13.60794901847839,
+    "warm_speedup": 1.324742,
+    "warm_speedup_definition": "reference_warm_median / b12x_warm_median; values greater than one mean the B12X path was faster in these preserved warm samples"
   },
-  "conclusion": "The B12X batched operation is exact for defined expert-order cases, preserves distinct experts for a fully degenerate tie, satisfies CUDA Graph replay requirements across every tested score class, and reduces median TP16 batch-8 gather-plus-selection latency by 24.51 percent."
+  "interpretation": "The preserved warm samples are research-only observations. No qualified performance conclusion is asserted because the worktree, compiled artifact, JIT cache, CUTLASS/PTXAS mapping, and cold-sample provenance are incomplete."
 }

@@ -3,8 +3,9 @@
 The benchmark covers tensor-parallel worlds of two, four, eight, and sixteen
 ranks (TP2, TP4, TP8, and TP16) and token batches from one through eight. It
 compares paired gathering followed by vLLM ``topk_sigmoid`` against the same
-gather followed by B12X Kimi top-16 selection. Expert IDs, router weights, and
-projection data must match exactly.
+gather followed by B12X Kimi top-16 selection. Expert IDs match the reference
+for defined oracle cases; a complete negative-infinity tie selects experts
+zero through fifteen in order. Router weights and projection data match exactly.
 """
 
 from __future__ import annotations
@@ -193,6 +194,11 @@ def _worker(
         b12x_ids = torch.empty(
             (batch, 16), device=device, dtype=torch.int32
         )
+        all_neg_inf_ids = (
+            torch.arange(16, device=device, dtype=torch.int32)
+            .view(1, 16)
+            .expand(batch, -1)
+        )
     except Exception:
         if b12x_pool is not None:
             with suppress(Exception):
@@ -208,7 +214,8 @@ def _worker(
     try:
         if rank == 0:
             print(
-                "case,ids_valid,ids_exact,ids_unique,weights_exact,"
+                "case,ids_valid,ids_reference_exact,ids_contract_exact,"
+                "ids_unique,ids_in_range,weights_exact,"
                 "weights_finite,weights_positive,weights_normalized,"
                 "finite_mask_exact,nonzero_mask_exact,max_abs,down_exact",
                 flush=True,
@@ -263,15 +270,13 @@ def _worker(
             ids_in_range = bool(
                 ((b12x_ids >= 0) & (b12x_ids < 896)).all().item()
             )
-            # When every corrected selection score is negative infinity, all
-            # experts are tied. vLLM's reduction order does not define which
-            # 16 tied IDs win, but a valid top-k must still return 16 distinct
-            # in-range experts per row.
-            ids_valid = (
-                ids_unique and ids_in_range
-                if name == "all_neg_inf"
-                else ids_exact
+            # vLLM emits duplicate expert zero for the complete tie. B12X
+            # deterministically selects the lowest sixteen expert IDs.
+            ids_contract_exact = torch.equal(
+                b12x_ids,
+                all_neg_inf_ids if name == "all_neg_inf" else reference_ids,
             )
+            ids_valid = ids_contract_exact
             weights_exact = torch.equal(b12x_weights, reference_weights)
             weights_finite = bool(torch.isfinite(b12x_weights).all().item())
             weights_positive = bool((b12x_weights > 0).all().item())
@@ -296,7 +301,8 @@ def _worker(
             if rank == 0:
                 print(
                     f"{name},{int(ids_valid)},{int(ids_exact)},"
-                    f"{int(ids_unique)},{int(weights_exact)},"
+                    f"{int(ids_contract_exact)},{int(ids_unique)},"
+                    f"{int(ids_in_range)},{int(weights_exact)},"
                     f"{int(weights_finite)},{int(weights_positive)},"
                     f"{int(weights_normalized)},"
                     f"{int(finite_mask_exact)},{int(nonzero_mask_exact)},"
@@ -318,7 +324,7 @@ def _worker(
             dist.all_reduce(failures)
             if failures.item() != 0:
                 raise AssertionError(
-                    f"{name} differs from the vLLM topk_sigmoid reference"
+                    f"{name} violates the expert-selection contract"
                 )
             if name == "random":
                 benchmark_router = local_router
@@ -377,7 +383,9 @@ def _worker(
         graph_ptrs = tuple(tensor.data_ptr() for tensor in graph_tensors)
         if rank == 0:
             print(
-                "graph_case,ids_valid,weights_exact,weights_finite,"
+                "graph_case,ids_valid,ids_reference_exact,"
+                "ids_contract_exact,ids_unique,ids_in_range,weights_exact,"
+                "weights_finite,"
                 "weights_positive,weights_normalized,down_exact,"
                 "addresses_stable,replay_allocation_stable",
                 flush=True,
@@ -410,11 +418,11 @@ def _worker(
             replay_ids_in_range = bool(
                 ((b12x_ids >= 0) & (b12x_ids < 896)).all().item()
             )
-            replay_ids_valid = (
-                replay_ids_unique and replay_ids_in_range
-                if name == "all_neg_inf"
-                else replay_ids_exact
+            replay_ids_contract_exact = torch.equal(
+                b12x_ids,
+                all_neg_inf_ids if name == "all_neg_inf" else reference_ids,
             )
+            replay_ids_valid = replay_ids_contract_exact
             replay_weights_exact = torch.equal(
                 b12x_weights, reference_weights
             )
@@ -438,6 +446,10 @@ def _worker(
             if rank == 0:
                 print(
                     f"{name},{int(replay_ids_valid)},"
+                    f"{int(replay_ids_exact)},"
+                    f"{int(replay_ids_contract_exact)},"
+                    f"{int(replay_ids_unique)},"
+                    f"{int(replay_ids_in_range)},"
                     f"{int(replay_weights_exact)},"
                     f"{int(replay_weights_finite)},"
                     f"{int(replay_weights_positive)},"

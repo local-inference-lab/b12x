@@ -8,12 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from b12x.comm.pcie import kimi_topk16
 from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
     _SINGLE_CHANNEL_ID,
     _staging_layout,
-    kimi_topk16,
     lse_reduce_scatter_reference,
 )
 
@@ -154,6 +154,7 @@ class _FakeKimiRuntime(PCIeDCPA2A):
             .view(1, 16)
             .expand(output_ids.shape[0], -1)
         )
+
 
 def _make_runtime() -> PCIeDCPA2A:
     return _FakeRuntime()
@@ -745,6 +746,21 @@ def test_stateless_kimi_topk16_rejects_cpu_tensors() -> None:
             torch.zeros((1, 896), dtype=torch.float32),
             torch.zeros(896, dtype=torch.float32),
         )
+
+
+def test_stateless_kimi_topk16_requires_no_communication_state() -> None:
+    parameters = inspect.signature(kimi_topk16).parameters
+    communication_state = {
+        "rank",
+        "world_size",
+        "process_group",
+        "runtime",
+        "pool",
+        "dcp_pool",
+        "channel",
+        "channel_id",
+    }
+    assert communication_state.isdisjoint(parameters)
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8, 16))
