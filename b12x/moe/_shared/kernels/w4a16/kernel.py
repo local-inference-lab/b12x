@@ -11351,12 +11351,11 @@ def _run_trellis256_dense_current_device(
         and _force_tile_config is None
     ):
         from b12x.gemm.trellis_linear._k6_mcg_cute import (
-            is_k6_mcg_small_m_eligible,
             k6_mcg_small_m_scratch_elements,
             run_k6_mcg_small_m,
         )
 
-        if is_k6_mcg_small_m_eligible(x, prepared_dense):
+        if small_m_launch.accepts_input(x):
             rotated_f16 = _trellis_dense_buffer(
                 "rotated_f16",
                 rotated_f16,

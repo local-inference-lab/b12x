@@ -78,6 +78,20 @@ class K6McgSmallMCompileResult:
     registers_per_thread: int
     local_memory_bytes: int
 
+    def accepts_input(self, x: torch.Tensor) -> bool:
+        """Return whether a runtime input matches this bound launch."""
+        return bool(
+            isinstance(x, torch.Tensor)
+            and x.is_cuda
+            and x.dtype == torch.float16
+            and x.ndim == 2
+            and x.is_contiguous()
+            and 1 <= int(x.shape[0]) <= _MAX_ROWS
+            and int(x.shape[1]) == self.size_k
+            and int(x.device.index if x.device.index is not None else 0)
+            == self.device_index
+        )
+
     def launch_grid_x(self, rows: int) -> int:
         """Return the CTA count needed to rotate each H128 block once."""
         warps_per_cta = self.cta_threads // 32
@@ -922,10 +936,14 @@ def run_k6_mcg_small_m(
     c_tmp: torch.Tensor,
 ) -> torch.Tensor:
     """Execute a validated unpaired K6/MCG payload on the current stream."""
-    if not is_k6_mcg_small_m_eligible(x, prepared):
-        raise ValueError(
-            "input and prepared weight do not satisfy K6/MCG small-row ABI"
+    launch = getattr(prepared, "k6_mcg_small_m_launch", None)
+    if not isinstance(launch, K6McgSmallMCompileResult):
+        raise RuntimeError(
+            "prepared K6/MCG weight has no bound small-row launch; prepare the "
+            "weight through b12x.gemm.trellis_linear.prepare_weight"
         )
+    if not launch.accepts_input(x):
+        raise ValueError("input does not satisfy the bound K6/MCG small-row ABI")
     m, size_k = (int(v) for v in x.shape)
     size_n = int(prepared.out_features)
     for name, tensor, shape, dtype in (
@@ -965,22 +983,10 @@ def run_k6_mcg_small_m(
             "prepared K6/MCG workspace must provide four lock words per SM and "
             "one cooperative barrier word"
         )
-    launch = getattr(prepared, "k6_mcg_small_m_launch", None)
-    device_index = int(x.device.index if x.device.index is not None else 0)
-    if not isinstance(launch, K6McgSmallMCompileResult):
-        raise RuntimeError(
-            "prepared K6/MCG weight has no bound small-row launch; prepare the "
-            "weight through b12x.gemm.trellis_linear.prepare_weight"
-        )
-    if (
-        launch.device_index != device_index
-        or launch.size_k != size_k
-        or launch.size_n != size_n
-    ):
+    if launch.size_n != size_n:
         raise ValueError(
-            "prepared K6/MCG launch does not match the input device or projection "
-            f"shape: launch=({launch.device_index}, {launch.size_k}, {launch.size_n}), "
-            f"input=({device_index}, {size_k}, {size_n})"
+            "prepared K6/MCG launch does not match the projection output size: "
+            f"launch={launch.size_n}, prepared={size_n}"
         )
     launch_grid_x = launch.launch_grid_x(m)
     required_scratch = max(

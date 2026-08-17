@@ -96,6 +96,24 @@ def test_rotation_grid_and_gemm_grid_have_independent_capacity() -> None:
     assert launch.launch_grid_x(16) == 97
 
 
+def test_bound_launch_rejects_non_cuda_runtime_inputs() -> None:
+    launch = _k6_mcg_cute.K6McgSmallMCompileResult(
+        compiled=None,
+        device_index=0,
+        size_k=128,
+        size_n=128,
+        grid_x=1,
+        cta_threads=256,
+        resident_ctas=1,
+        blocks_per_sm=1,
+        shared_memory_bytes=0,
+        registers_per_thread=0,
+        local_memory_bytes=0,
+    )
+
+    assert not launch.accepts_input(torch.empty((1, 128), dtype=torch.float16))
+
+
 def _sm12x_available() -> bool:
     if not torch.cuda.is_available():
         return False
