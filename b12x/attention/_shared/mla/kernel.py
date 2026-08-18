@@ -128,10 +128,10 @@ _MLA_SM120_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
 # Opt-in while being validated: unset/0 -> off; 1/true/on/yes -> on.
 _MLA_SM120_DSV4_H16_NATIVE_ENV = "B12X_MLA_SM120_DSV4_H16_NATIVE"
 
-# Native KVarN exact-pool producer vectorization. Default-off after the bounded
-# C1 exact-graph trace regressed; read per call so isolated runs can A/B the
-# producer without changing graph classification, exact-pool ownership, or the
-# mixed K5 specialization.
+# Opt-in vectorized exact-pool KVarN producer. Unset or non-truthy selects the
+# scalar producer. The value is read per call and affects only producer
+# vectorization: graph classification, exact-pool ownership, and the mixed K5
+# specialization are unchanged in both settings.
 _MLA_SM120_KVARN_EXACT_FAST_IO_ENV = (
     "B12X_MLA_SM120_KVARN_EXACT_FAST_IO"
 )
@@ -2925,7 +2925,7 @@ def _sparse_mla_decode_grid_flat_launch(
             )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.sm120.decode",
-        # v18: latent_scale == 1.0 is folded out at trace time, producing a
+        # v19: latent_scale == 1.0 is folded out at trace time, producing a
         # cubin without the outer-scale multiply; the identity and dynamic
         # variants must not share a cache entry.
         19,

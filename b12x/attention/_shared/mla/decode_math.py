@@ -989,6 +989,27 @@ def s1_qk_nope_nvfp4_bf16(
 
 
 @cute.jit
+def s1_qk_nope_kvarn_bf16(
+    qk, q_base: Int32, kv_base: Int32, warp_first_cand: Int32, lane: Int32,
+    *, num_scales: cutlass.Constexpr, quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr, kv_smem_stride: cutlass.Constexpr,
+):
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    row = kv_base + (warp_first_cand + gid) * Int32(kv_smem_stride)
+    for blk in cutlass.range_constexpr(num_scales):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk * quant_tile + ks * 16)
+            bc = ko + tid * Int32(2)
+            b0 = _ld_u16_zext(row, bc * Int32(2)) | (_ld_u16_zext(row, (bc + Int32(1)) * Int32(2)) << Uint32(16))
+            bc1 = bc + Int32(8)
+            b1 = _ld_u16_zext(row, bc1 * Int32(2)) | (_ld_u16_zext(row, (bc1 + Int32(1)) * Int32(2)) << Uint32(16))
+            ab = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_base, ab))
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1)
+    return qk
 
 @cute.jit
 def s1_qk_nope_block_scaled_glm_h8_swap_ab(
@@ -2407,6 +2428,42 @@ def s6_xv_nope_nvfp4_bf16(
 
 
 @cute.jit
+def s6_xv_nope_kvarn_bf16(
+    acc_nope, sm_p_addr: Int32, kv_base: Int32, warp_id: Int32, lane: Int32,
+    *, n_v_chunks: cutlass.Constexpr, v_chunk: cutlass.Constexpr,
+    bi: cutlass.Constexpr, kv_smem_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr, nt_per_warp_xv: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
+):
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            col = Int32(vc * v_chunk) + (Int32(nt * n_warps) + warp_id) * Int32(8) + gid
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for ks in cutlass.range_constexpr(bi // 16):
+                kb = Int32(ks * 16)
+                ab = (a_row * Int32(sm_p_stride) + kb + a_col) * Int32(2)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_addr + ab)
+                e = kb + tid * Int32(2)
+                r0 = kv_base + e * Int32(kv_smem_stride)
+                r1 = r0 + Int32(kv_smem_stride)
+                r8 = r0 + Int32(8 * kv_smem_stride)
+                r9 = r0 + Int32(9 * kv_smem_stride)
+                b0 = _ld_u16_zext(r0, col * Int32(2)) | (_ld_u16_zext(r1, col * Int32(2)) << Uint32(16))
+                b1 = _ld_u16_zext(r8, col * Int32(2)) | (_ld_u16_zext(r9, col * Int32(2)) << Uint32(16))
+                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1)
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] += xv0
+            acc_nope[at][1] += xv1
+            acc_nope[at][2] += xv2
+            acc_nope[at][3] += xv3
+    return acc_nope
 
 @cute.jit
 def s6_xv_nope_glm_h8_swap_ab(

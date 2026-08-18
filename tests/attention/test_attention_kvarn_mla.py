@@ -150,15 +150,31 @@ def test_stage_rejects_unknown_block_stride() -> None:
 
 
 def _assert_record_matches(got: torch.Tensor, expect: torch.Tensor, where: str) -> None:
-    """Codes and RoPE must be bit-exact; FP8 scales may differ by one fp32 ULP
-    (Triton amax/448 rounding vs torch IEEE division)."""
-    assert torch.equal(got[:_LATENT_DIM], expect[:_LATENT_DIM]), f"codes {where}"
-    assert torch.allclose(
-        got[_RECORD_SCALE_OFFSET : _RECORD_SCALE_OFFSET + 16].view(torch.float32),
-        expect[_RECORD_SCALE_OFFSET : _RECORD_SCALE_OFFSET + 16].view(torch.float32),
-        rtol=2e-7,
-        atol=0.0,
-    ), f"scales {where}"
+    """Staged latents must agree within one FP8 quantization step.
+
+    The kernel's ``amax / 448`` fp32 division can round one ULP away from the
+    torch reference; at a rounding tie that legitimately flips one E4M3 code,
+    so the compared quantity is the dequantized latent (codes x scales) with a
+    one-step bound. RoPE stays bit-exact.
+    """
+    got_codes = got[:_LATENT_DIM].view(torch.float8_e4m3fn).to(torch.float32)
+    exp_codes = expect[:_LATENT_DIM].view(torch.float8_e4m3fn).to(torch.float32)
+    got_scales = got[_RECORD_SCALE_OFFSET : _RECORD_SCALE_OFFSET + 16].view(
+        torch.float32
+    )
+    exp_scales = expect[_RECORD_SCALE_OFFSET : _RECORD_SCALE_OFFSET + 16].view(
+        torch.float32
+    )
+    assert torch.allclose(got_scales, exp_scales, rtol=2e-7, atol=0.0), (
+        f"scales {where}"
+    )
+    groups = torch.arange(_LATENT_DIM) // 128
+    got_val = got_codes * got_scales[groups]
+    exp_val = exp_codes * exp_scales[groups]
+    step = exp_scales[groups]  # one E4M3 step at these magnitudes
+    assert torch.allclose(got_val, exp_val, rtol=0.13, atol=step.max().item() * 0.02), (
+        f"latent {where}"
+    )
     assert torch.equal(got[_RECORD_ROPE_OFFSET:], expect[_RECORD_ROPE_OFFSET:]), f"rope {where}"
 
 def test_stage_k5_records_match_reference() -> None:
@@ -348,3 +364,246 @@ def test_compact_history_materialize_round_trip() -> None:
         check_token(t)
     # Padded tail rows stay untouched.
     assert (output[512:].cpu() == 0x5A).all()
+
+
+def test_native_packed_decode_matches_reference() -> None:
+    """Decode straight from a packed K5 tile via the CuTeDSL SM120 grid.
+
+    This is the scale_format=KVARN_K5 path: it traces the KVarN QK/PV math
+    in ``_shared/mla`` (s1/s6 KVarN helpers), so it fails at trace time if
+    that dispatch surface is broken. Requires the CUTLASS DSL.
+    """
+    device = require_b12x()
+    pytest.importorskip("cutlass")
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        pytest.skip("native KVarN decode grid requires SM120")
+    import math
+
+    from b12x.attention.kvarn_mla import native_packed_k5_decode
+
+    tile, latent, rope = _make_packed_tile(_K5, torch.Generator().manual_seed(5), device)
+    k5_cache = tile.reshape(1, 1, _K5["tile"])
+    q = torch.randn(1, 64, 576, dtype=torch.bfloat16, device=device)
+    selected = torch.full((1, 2048), -1, dtype=torch.int32, device=device)
+    selected[0, :64] = torch.arange(64, dtype=torch.int32, device=device)
+    valid_counts = torch.tensor([64], dtype=torch.int32, device=device)
+    block_to_pool_slot = torch.tensor([-1], dtype=torch.int32, device=device)
+    latent_pool = torch.zeros(1, _GROUP, _LATENT_DIM, dtype=torch.float8_e4m3fn, device=device)
+    rope_pool = torch.zeros(1, _GROUP, _ROPE_DIM, dtype=torch.bfloat16, device=device)
+    output = torch.zeros(1, 64, 512, dtype=torch.bfloat16, device=device)
+    output_lse = torch.zeros(1, 64, dtype=torch.float32, device=device)
+    split_output = torch.zeros(1, 64, 1, 512, dtype=torch.bfloat16, device=device)
+    split_lse = torch.zeros(1, 64, 1, dtype=torch.float32, device=device)
+    num_chunks_ptr = torch.zeros(1, dtype=torch.int32, device=device)
+    sm_scale = 1.0 / math.sqrt(576)
+
+    out, lse = native_packed_k5_decode(
+        q, selected, valid_counts, k5_cache, block_to_pool_slot,
+        latent_pool, rope_pool, split_output, split_lse, num_chunks_ptr,
+        output, output_lse, sm_scale=sm_scale, candidate_envelope=64,
+    )
+    torch.cuda.synchronize()
+
+    qn = q[0, :, :512].float()
+    qr = q[0, :, 512:].float()
+    k_lat = latent.to(device).float()
+    k_rop = rope.to(device).float()
+    scores = (qn @ k_lat.T + qr @ k_rop.T) * sm_scale
+    ref = torch.softmax(scores, dim=-1) @ k_lat
+    ref_lse = torch.logsumexp(scores, dim=-1)
+    cos = torch.nn.functional.cosine_similarity(
+        out[0].float().flatten(), ref.flatten(), dim=0
+    )
+    assert cos.item() >= 0.9995, f"decode cosine {cos.item()}"
+    assert (lse[0] - ref_lse).abs().max().item() < 0.5, (
+        f"lse drift {(lse[0] - ref_lse).abs().max().item()}"
+    )
+
+
+def test_scaled_offsets_survive_int32_boundary() -> None:
+    """Page/block/rank x byte-stride products must address past 2**31 bytes.
+
+    Live pages and cache blocks at the tail of pool-sized arenas, per the
+    64-bit addressing contract: small sequential test ids can never catch a
+    32-bit offset overflow.
+    """
+    device = require_b12x()
+    gen = torch.Generator(device="cpu").manual_seed(13)
+
+    # --- packed K5 staging past INT32_MAX / 30848 (~69,586 blocks) ---
+    tail_block = 70_000 - 1
+    tile, latent, rope = _make_packed_tile(_K5, gen, device)
+    arena = torch.zeros(tail_block + 1, 1, _K5["tile"], dtype=torch.uint8, device=device)
+    arena[tail_block] = tile
+    physical_slots = torch.tensor(
+        [tail_block * 64 + 5, tail_block * 64 + 63], dtype=torch.int32, device=device
+    )
+    block_to_pool_slot = torch.full((tail_block + 1,), -1, dtype=torch.int32, device=device)
+    output = torch.zeros(2, _RECORD_BYTES, dtype=torch.uint8, device=device)
+    stage_k5_as_fp8_records(
+        physical_slots,
+        arena,
+        block_to_pool_slot,
+        torch.zeros(1, _GROUP, _LATENT_DIM, dtype=torch.bfloat16, device=device),
+        torch.zeros(1, _GROUP, _ROPE_DIM, dtype=torch.bfloat16, device=device),
+        output,
+    )
+    torch.cuda.synchronize()
+    _assert_record_matches(
+        output[0].cpu(), _reference_record(latent[5], rope[5]), "tail block token 5"
+    )
+    _assert_record_matches(
+        output[1].cpu(), _reference_record(latent[63], rope[63]), "tail block token 63"
+    )
+    del arena
+
+    # --- compact wire staging + materialization past INT32_MAX / 26752 pages ---
+    padded_pages = 100_000  # 100,000 x 26,752 > 2**31 bytes
+    num_reqs = 1
+    k4_tiles = [_make_packed_tile(_K4, gen, device)[0] for _ in range(4)]
+    k4_cache = torch.stack(k4_tiles).reshape(4, 1, _K4["tile"]).contiguous()
+    latent_pool = (
+        torch.randn(1, _GROUP, _LATENT_DIM, generator=gen).to(torch.float8_e4m3fn).to(device)
+    )
+    rope_pool = (
+        torch.randn(1, _GROUP, _ROPE_DIM, generator=gen).to(torch.bfloat16).to(device)
+    )
+    b2p = torch.tensor([0, -1, -1, -1], dtype=torch.int32, device=device)
+    page_starts = torch.tensor([padded_pages - 4], dtype=torch.int32, device=device)
+    page_lens = torch.tensor([4], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device)
+    padded_exact_pages = num_reqs * 16
+    wire = torch.zeros(
+        compact_kvarn_native_rank_nbytes(padded_pages, padded_exact_pages),
+        dtype=torch.uint8,
+        device=device,
+    )
+    stage_compact_kvarn_native_history(
+        block_table, page_starts, page_lens, k4_cache, b2p,
+        latent_pool, rope_pool, wire,
+        padded_pages=padded_pages, padded_exact_pages=padded_exact_pages,
+    )
+    torch.cuda.synchronize()
+    for local in range(4):
+        page = padded_pages - 4 + local
+        assert torch.equal(
+            wire[page * _K4["tile"] : (page + 1) * _K4["tile"]],
+            k4_cache[local].reshape(-1),
+        ), f"tail page {page} lost its tile"
+    index = wire[
+        padded_pages * _K4["tile"] : padded_pages * _K4["tile"] + 4 * padded_pages
+    ].view(torch.int32).cpu()
+    assert index[padded_pages - 4].item() == 0  # sink page 0, exact
+    assert (index[padded_pages - 3 :] == -1).all()
+
+    # --- two-rank gather: rank 1's wire base sits past 2**31 bytes ---
+    rank_wire_bytes = wire.numel()
+    gathered = torch.zeros(2 * rank_wire_bytes, dtype=torch.uint8, device=device)
+    gathered[rank_wire_bytes:] = wire  # rank 1 carries the staged wire
+    rank_page_starts = torch.tensor(
+        [[0], [padded_pages - 4]], dtype=torch.int32, device=device
+    )
+    rank_page_lens = torch.tensor([[0], [4]], dtype=torch.int32, device=device)
+    token_starts = torch.tensor([[0], [0]], dtype=torch.int32, device=device)
+    token_lens = torch.tensor([[0], [256]], dtype=torch.int32, device=device)
+    padded_tokens = 256
+    output = torch.full(
+        (2 * padded_tokens, _RECORD_BYTES), 0x77, dtype=torch.uint8, device=device
+    )
+    materialize_compact_kvarn_native_records(
+        gathered, rank_page_starts, rank_page_lens, token_starts, token_lens,
+        output, padded_tokens=padded_tokens, padded_pages=padded_pages,
+        padded_exact_pages=padded_exact_pages,
+    )
+    torch.cuda.synchronize()
+
+    rank1_wire = wire.cpu()
+    index_rank1 = index
+    for t in (0, 5, 63, 128, 255):
+        page = padded_pages - 4 + t // 64
+        token = t % 64
+        exact_id = index_rank1[page].item()
+        if exact_id >= 0:
+            latent_ref = (
+                rank1_wire[
+                    padded_pages * (_K4["tile"] + 4) + exact_id * _GROUP * _LATENT_DIM :
+                ]
+                .view(torch.float8_e4m3fn)[token * _LATENT_DIM : (token + 1) * _LATENT_DIM]
+                .to(torch.float32)
+            )
+            rope_base = padded_pages * (_K4["tile"] + 4) + padded_exact_pages * _GROUP * _LATENT_DIM
+            rope_ref = (
+                rank1_wire[rope_base + exact_id * _GROUP * _ROPE_DIM * 2 :]
+                .view(torch.bfloat16)[token * _ROPE_DIM : (token + 1) * _ROPE_DIM]
+            )
+        else:
+            tile_bytes = rank1_wire[page * _K4["tile"] : (page + 1) * _K4["tile"]]
+            latent_ref, rope_ref = _reference_packed_latent(tile_bytes, _K4, token)
+        row = padded_tokens + t  # rank 1 rows live past rank 0's rows
+        _assert_record_matches(
+            output[row].cpu(),
+            _reference_record(latent_ref, rope_ref),
+            f"rank1 tail token {t}",
+        )
+
+
+def test_exact_pages_outside_sink_tail_window_stay_packed() -> None:
+    """Pool-marked body pages (outside sink/tail) must not write exact wire.
+
+    With page_len=20 the mappable window is pages {0,1} (sink) and {6..19}
+    (tail). Blocks 2 and 5 carry exact pool slots but sit in the body: the
+    staging must keep them packed instead of computing a negative or aliased
+    exact id (which ``tl.device_assert`` only catches in debug builds).
+    """
+    device = require_b12x()
+    gen = torch.Generator(device="cpu").manual_seed(17)
+    num_blocks = 20
+    tiles = [_make_packed_tile(_K4, gen, device)[0] for _ in range(num_blocks)]
+    k4_cache = torch.stack(tiles).reshape(num_blocks, 1, _K4["tile"]).contiguous()
+    latent_pool = (
+        torch.randn(2, _GROUP, _LATENT_DIM, generator=gen).to(torch.float8_e4m3fn).to(device)
+    )
+    rope_pool = (
+        torch.randn(2, _GROUP, _ROPE_DIM, generator=gen).to(torch.bfloat16).to(device)
+    )
+    b2p = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
+    b2p[0] = 0  # sink page 0: valid exact
+    b2p[2] = 1  # body page: outside the window
+    b2p[5] = 1  # body page: outside the window
+    page_starts = torch.tensor([0], dtype=torch.int32, device=device)
+    page_lens = torch.tensor([20], dtype=torch.int32, device=device)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).reshape(1, -1)
+    padded_pages = 20
+    padded_exact_pages = 16
+    wire = torch.zeros(
+        compact_kvarn_native_rank_nbytes(padded_pages, padded_exact_pages),
+        dtype=torch.uint8,
+        device=device,
+    )
+    stage_compact_kvarn_native_history(
+        block_table, page_starts, page_lens, k4_cache, b2p,
+        latent_pool, rope_pool, wire,
+        padded_pages=padded_pages, padded_exact_pages=padded_exact_pages,
+    )
+    torch.cuda.synchronize()
+    index = wire[
+        padded_pages * _K4["tile"] : padded_pages * _K4["tile"] + 4 * padded_pages
+    ].view(torch.int32).cpu()
+    assert index[0].item() == 0  # sink page staged exact
+    assert index[2].item() == -1  # body page stays packed
+    assert index[5].item() == -1  # body page stays packed
+    # Body pages 2 and 5 still carry their packed tiles verbatim.
+    for page in (2, 5):
+        assert torch.equal(
+            wire[page * _K4["tile"] : (page + 1) * _K4["tile"]],
+            k4_cache[page].reshape(-1),
+        )
+    # Only exact id 0 was written into the exact region.
+    latent_base = padded_pages * (_K4["tile"] + 4)
+    exact_region = wire[
+        latent_base : latent_base + padded_exact_pages * _GROUP * _LATENT_DIM
+    ]
+    nonzero_pages = (
+        exact_region.view(-1, _GROUP * _LATENT_DIM).any(dim=1).nonzero().flatten()
+    )
+    assert nonzero_pages.tolist() == [0]

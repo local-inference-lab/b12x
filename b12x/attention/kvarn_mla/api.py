@@ -140,7 +140,7 @@ def _stage_k5_as_fp8_records_kernel(
     if raw_exact:
         valid = True
     else:
-        physical_slot = tl.load(physical_slots_ptr + row)
+        physical_slot = tl.load(physical_slots_ptr + row).to(tl.int64)
         block = physical_slot // _TL_K5_GROUP
         token = physical_slot % _TL_K5_GROUP
         valid = (physical_slot >= 0) & (block >= 0) & (block < num_blocks)
@@ -158,7 +158,7 @@ def _stage_k5_as_fp8_records_kernel(
         dims = scale_groups[:, None] * 128 + group_dims[None, :]
         if raw_exact:
             latent = (
-                tl.load(raw_latent_ptr + row * 512 + dims)
+                tl.load(raw_latent_ptr + row.to(tl.int64) * 512 + dims)
                 .to(tl.float8e4nv)
                 .to(tl.bfloat16)
                 .to(tl.float32)
@@ -166,7 +166,7 @@ def _stage_k5_as_fp8_records_kernel(
         else:
             exact = pool_slot >= 0
             body = ~exact
-            safe_pool_slot = tl.maximum(pool_slot, 0)
+            safe_pool_slot = tl.maximum(pool_slot, 0).to(tl.int64)
             record = k5_cache_ptr + block * cache_stride_block
             indices = dims * _TL_K5_GROUP + token
             codes = _unpack_k5(record, indices, body, bits).to(tl.float32)
@@ -208,7 +208,8 @@ def _stage_k5_as_fp8_records_kernel(
             -_TL_FP8_E4M3_MAX,
         ).to(tl.float8e4nv)
         output_row = (
-            tl.load(output_slots_ptr + row) if scatter_output else row
+            (tl.load(output_slots_ptr + row).to(tl.int64) if scatter_output
+             else row.to(tl.int64))
         )
         output_record = output_ptr + output_row * output_stride_row
         fp8_output = output_record.to(tl.pointer_type(tl.float8e4nv))
@@ -221,7 +222,9 @@ def _stage_k5_as_fp8_records_kernel(
 
         rope_dims = tl.arange(0, _TL_K5_ROPE_DIM)
         if raw_exact:
-            rope = tl.load(raw_rope_ptr + row * _TL_K5_ROPE_DIM + rope_dims)
+            rope = tl.load(
+                raw_rope_ptr + row.to(tl.int64) * _TL_K5_ROPE_DIM + rope_dims
+            )
         else:
             body_rope = tl.load(
                 (record + rope_offset).to(tl.pointer_type(tl.bfloat16))
@@ -309,7 +312,10 @@ def _native_exact_id(req_id, local_page, page_len, exact):
         ~exact | (within_req < _NATIVE_EXACT_PAGES_PER_REQ),
         "exact CKV page capacity exceeded",
     )
-    return req_id * _NATIVE_EXACT_PAGES_PER_REQ + within_req
+    in_window = mapped & (within_req >= 0) & (
+        within_req < _NATIVE_EXACT_PAGES_PER_REQ
+    )
+    return in_window, req_id * _NATIVE_EXACT_PAGES_PER_REQ + within_req
 
 
 @triton.jit
@@ -350,8 +356,9 @@ def _stage_compact_kvarn_native_index_kernel(
         ~valid | (pool_slot < num_pool_slots),
         "native CKV exact pool mapping is out of range",
     )
-    exact = valid & (pool_slot >= 0)
-    exact_id = _native_exact_id(req, local_page, page_len, exact)
+    pool_mapped = valid & (pool_slot >= 0)
+    in_window, exact_id = _native_exact_id(req, local_page, page_len, pool_mapped)
+    exact = pool_mapped & in_window
     tl.device_assert(
         ~exact | (exact_id < padded_exact_pages),
         "native CKV exact wire capacity exceeded",
@@ -392,11 +399,14 @@ def _stage_compact_kvarn_native_packed_kernel(
     offsets = chunk * BLOCK + tl.arange(0, BLOCK)
     mask = valid & (offsets < _K4_TILE_BYTES)
     values = tl.load(
-        k4_cache_ptr + tl.maximum(block, 0) * _K4_TILE_BYTES + offsets,
+        k4_cache_ptr + tl.maximum(block, 0).to(tl.int64) * _K4_TILE_BYTES
+        + offsets,
         mask=mask,
         other=0,
     )
-    tl.store(wire_ptr + page * _K4_TILE_BYTES + offsets, values, mask=mask)
+    tl.store(
+        wire_ptr + page.to(tl.int64) * _K4_TILE_BYTES + offsets, values, mask=mask
+    )
 
 
 @triton.jit
@@ -435,8 +445,9 @@ def _stage_compact_kvarn_native_exact_kernel(
         mask=valid,
         other=-1,
     )
-    exact = valid & (pool_slot >= 0) & (pool_slot < num_pool_slots)
-    exact_id = _native_exact_id(req, local_page, page_len, exact)
+    pool_mapped = valid & (pool_slot >= 0) & (pool_slot < num_pool_slots)
+    in_window, exact_id = _native_exact_id(req, local_page, page_len, pool_mapped)
+    exact = pool_mapped & in_window
     offsets = chunk * BLOCK + tl.arange(0, BLOCK)
     latent_bytes = _K5_GROUP * _K5_LATENT_DIM
     rope_bytes = _K5_GROUP * _K5_ROPE_DIM * 2
@@ -446,7 +457,7 @@ def _stage_compact_kvarn_native_exact_kernel(
     )
     latent_values = tl.load(
         latent_pool_ptr.to(tl.pointer_type(tl.uint8))
-        + pool_slot * latent_bytes
+        + pool_slot.to(tl.int64) * latent_bytes
         + offsets,
         mask=latent_mask,
         other=0,
@@ -462,12 +473,18 @@ def _stage_compact_kvarn_native_exact_kernel(
     latent_base = padded_pages * (_K4_TILE_BYTES + 4)
     rope_base = latent_base + padded_exact_pages * latent_bytes
     tl.store(
-        wire_ptr + latent_base + exact_id * latent_bytes + offsets,
+        wire_ptr
+        + latent_base
+        + exact_id.to(tl.int64) * latent_bytes
+        + offsets,
         latent_values,
         mask=latent_mask,
     )
     tl.store(
-        wire_ptr + rope_base + exact_id * rope_bytes + rope_offsets,
+        wire_ptr
+        + rope_base
+        + exact_id.to(tl.int64) * rope_bytes
+        + rope_offsets,
         rope_values,
         mask=rope_mask,
     )
@@ -513,7 +530,7 @@ def _materialize_compact_kvarn_native_records_kernel(
     )
     tl.device_assert(~valid | (page < padded_pages), "native CKV page overflow")
     token = local_token % _K5_GROUP
-    rank_wire = gathered_wire_ptr + rank * rank_wire_bytes
+    rank_wire = gathered_wire_ptr + rank.to(tl.int64) * rank_wire_bytes
     index_ptr = (
         rank_wire + padded_pages * _K4_TILE_BYTES
     ).to(tl.pointer_type(tl.int32))
@@ -529,7 +546,7 @@ def _materialize_compact_kvarn_native_records_kernel(
     scale_groups = tl.arange(0, 4)
     group_dims = tl.arange(0, 128)
     dims = scale_groups[:, None] * 128 + group_dims[None, :]
-    packed_record = rank_wire + page * _K4_TILE_BYTES
+    packed_record = rank_wire + page.to(tl.int64) * _K4_TILE_BYTES
     indices = dims * _K5_GROUP + token
     codes = _unpack_k5(packed_record, indices, body, 4).to(tl.float32)
     fp16_record = packed_record.to(tl.pointer_type(tl.float16))
@@ -555,7 +572,7 @@ def _materialize_compact_kvarn_native_records_kernel(
     rope_base = latent_base + padded_exact_pages * latent_bytes
     exact_latent = tl.load(
         (rank_wire + latent_base).to(tl.pointer_type(tl.float8e4nv))
-        + exact_id * latent_bytes
+        + exact_id.to(tl.int64) * latent_bytes
         + token * _K5_LATENT_DIM
         + dims,
         mask=exact,
@@ -572,7 +589,7 @@ def _materialize_compact_kvarn_native_records_kernel(
         tl.minimum(latent / scales[:, None], _TL_FP8_E4M3_MAX),
         -_TL_FP8_E4M3_MAX,
     ).to(tl.float8e4nv)
-    output_record = output_ptr + row * output_stride_row
+    output_record = output_ptr + row.to(tl.int64) * output_stride_row
     tl.store(
         output_record.to(tl.pointer_type(tl.float8e4nv)) + dims,
         quantized,
@@ -753,7 +770,7 @@ def stage_compact_kvarn_native_history(
         or not k4_cache.is_contiguous()
         or k4_cache.stride(0) != int(_K4_TILE_BYTES)
     ):
-        raise ValueError("native CKV requires contiguous K4 pages with stride26752")
+        raise ValueError("native CKV requires contiguous K4 pages with stride 26752")
     if (
         block_to_pool_slot.dtype != torch.int32
         or block_to_pool_slot.ndim != 1
