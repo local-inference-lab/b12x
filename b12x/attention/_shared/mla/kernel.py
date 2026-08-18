@@ -38,6 +38,9 @@ from .decode_math import (
     s0_load_q_bf16_to_smem,
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
+    kvarn_hadamard_bf16_smem,
+    kvarn_hadamard_output_bf16,
+    kvarn_quantize_hadamard_q_fp8,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
@@ -55,6 +58,7 @@ from .decode_math import (
     s7_epilogue,
 )
 from .io import io_issue_gather
+from ...kvarn_mla.io import io_issue_kvarn_k5_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
     ModelType,
@@ -124,15 +128,62 @@ _MLA_SM120_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
 # Opt-in while being validated: unset/0 -> off; 1/true/on/yes -> on.
 _MLA_SM120_DSV4_H16_NATIVE_ENV = "B12X_MLA_SM120_DSV4_H16_NATIVE"
 
+# Native KVarN exact-pool producer vectorization. Default-off after the bounded
+# C1 exact-graph trace regressed; read per call so isolated runs can A/B the
+# producer without changing graph classification, exact-pool ownership, or the
+# mixed K5 specialization.
+_MLA_SM120_KVARN_EXACT_FAST_IO_ENV = (
+    "B12X_MLA_SM120_KVARN_EXACT_FAST_IO"
+)
+
 # FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
 # (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
 # gap looks small but require more than this many integer waves are rejected.
 _CEIL_WAVES_MAX = 3
 
+# Packed-latent tile geometry per KVarN width (G64/512/64 latent+RoPE layout):
+# (cache_block_stride, s_col_offset, zp_offset, s_row_offset, rope_offset).
+# Rows mirror KVarNMLAConfig.latent_* offsets; 2-bit is the K2V2-style shared
+# latent (18,560 B tile). Offsets are all mod-16 aligned.
+_KVARN_PACKED_TILE_GEOMETRY: dict[int, tuple[int, int, int, int, int]] = {
+    2: (18_560, 8_192, 9_216, 10_240, 10_368),
+    4: (26_752, 16_384, 17_408, 18_432, 18_560),
+    5: (30_848, 20_480, 21_504, 22_528, 22_656),
+}
+
 # Observability: the most recent decode split plan (read by benchmarks / the
 # P9c AutoTuner sweep to report num_splits_used). Pure side-channel -- does NOT
 # affect numerics or the launch. Keys are informational.
 LAST_DECODE_PLAN: dict = {}
+LAST_KVARN_DECODE_PLAN: dict = {}
+
+
+def native_kvarn_ckv_materialize_records(
+    gathered_wire: torch.Tensor,
+    rank_page_starts: torch.Tensor,
+    rank_page_lens: torch.Tensor,
+    rank_token_starts: torch.Tensor,
+    rank_token_lens: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    padded_tokens: int,
+    padded_pages: int,
+    padded_exact_pages: int,
+) -> None:
+    """Read compact K4/exact wire into canonical rows for unchanged extend."""
+    from ...kvarn_mla.api import materialize_compact_kvarn_native_records
+
+    materialize_compact_kvarn_native_records(
+        gathered_wire,
+        rank_page_starts,
+        rank_page_lens,
+        rank_token_starts,
+        rank_token_lens,
+        output,
+        padded_tokens=padded_tokens,
+        padded_pages=padded_pages,
+        padded_exact_pages=padded_exact_pages,
+    )
 
 
 def _env_num_splits_override() -> int:
@@ -166,6 +217,11 @@ def _env_dsv4_h16_native_mode() -> bool | None:
     if text in {"0", "false", "off", "no"}:
         return False
     return None
+
+
+def _env_kvarn_exact_fast_io_enabled() -> bool:
+    raw = os.environ.get(_MLA_SM120_KVARN_EXACT_FAST_IO_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
 # Auto H8/H16 policy constants (measured on RTX PRO 6000 Blackwell, 188 SMs).
@@ -393,6 +449,11 @@ class UnifiedDecodeKernel:
         native_glm_h8=False,
         native_dsv4_h8=False,
         native_dsv4_h16=False,
+        native_kvarn=False,
+        native_kvarn_bits=5,
+        native_kvarn_exact_pool=False,
+        fuse_kvarn_hadamard=False,
+        kvarn_exact_fast_io=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -433,6 +494,37 @@ class UnifiedDecodeKernel:
         # Native H16: two independent 8-head H8 groups (4 math warps each)
         # sharing the CTA's packed KV stage. Grid keeps HPB=16 head blocks.
         self.native_dsv4_h16 = bool(native_dsv4_h16)
+        self.native_kvarn = bool(native_kvarn)
+        self.native_kvarn_bits = int(native_kvarn_bits)
+        if self.native_kvarn and self.native_kvarn_bits not in (2, 4, 5):
+            raise ValueError(
+                "native KVarN decode requires two/four/five-bit packed rows"
+            )
+        self.native_kvarn_exact_pool = bool(native_kvarn_exact_pool)
+        if self.native_kvarn_exact_pool and not self.native_kvarn:
+            raise ValueError("exact-pool mode requires native KVarN decode")
+        self.fuse_kvarn_hadamard = bool(fuse_kvarn_hadamard)
+        if self.fuse_kvarn_hadamard and not self.native_kvarn:
+            raise ValueError("fuse_kvarn_hadamard requires native KVarN decode")
+        # Exact E4M3 H32 reuses one gathered BI64 tile across two independent
+        # 16-head FP8 math groups. The prototype exact H16 trait keeps one
+        # 16-head BF16 group; mixed K5 retains the same geometry without exact
+        # ownership semantics.
+        self.native_kvarn_exact_h32 = bool(
+            self.native_kvarn_exact_pool
+            and traits.scale_format == ScaleFormat.KVARN_EXACT
+        )
+        self.native_kvarn_exact_h16 = bool(
+            self.native_kvarn_exact_pool
+            and traits.scale_format == ScaleFormat.KVARN_EXACT_BF16
+        )
+        if self.native_kvarn_exact_pool and not (
+            self.native_kvarn_exact_h32 or self.native_kvarn_exact_h16
+        ):
+            raise ValueError("exact-pool mode requires an exact KVarN trait")
+        self.kvarn_exact_fast_io = bool(
+            kvarn_exact_fast_io and self.native_kvarn_exact_h32
+        )
         self.native_h8 = self.native_glm_h8 or self.native_dsv4_h8
         if self.native_dsv4_h8 or self.native_dsv4_h16:
             packed_span = int(layout.kv_bufs) * int(
@@ -463,7 +555,10 @@ class UnifiedDecodeKernel:
         # head_base computation is byte-identical to the pre-P10 kernel.
         self.head_block_offset = int(head_block_offset)
         self.math_threads = int(traits.math_threads)
-        self.block_threads = 320 if self.native_dsv4_h16 else int(traits.block_threads)
+        if self.native_kvarn and not self.native_kvarn_exact_h32:
+            self.block_threads = 512
+        else:
+            self.block_threads = int(traits.block_threads)
         self.io_threads = self.block_threads - self.math_threads
 
     @cute.jit
@@ -590,6 +685,25 @@ class UnifiedDecodeKernel:
             min_blocks_per_mp=1,
             stream=stream,
         )
+
+    @cute.jit
+    def call_kvarn(
+        self, q_all: cute.Tensor, kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor, mid_out: cute.Tensor, mid_lse: cute.Tensor,
+        sm_scale_log2: Float32, topk_length: cute.Tensor,
+        stride_kv_block: Int64, block_to_pool_slot: cute.Tensor,
+        latent_pool: cute.Tensor, rope_pool: cute.Tensor,
+        num_tokens: Int32, stream: cuda.CUstream,
+    ):
+        self.kernel_kvarn(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, topk_length, stride_kv_block,
+            block_to_pool_slot, latent_pool, rope_pool,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1], min_blocks_per_mp=1, stream=stream,
+        )
+
 
     @cute.jit
     def call_extra_pertok(
@@ -1278,8 +1392,26 @@ class UnifiedDecodeKernel:
             )
 
     @cute.kernel
+    def kernel_kvarn(
+        self, q_all: cute.Tensor, kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor, mid_out: cute.Tensor, mid_lse: cute.Tensor,
+        sm_scale_log2: Float32, topk_length: cute.Tensor,
+        stride_kv_block: Int64, block_to_pool_slot: cute.Tensor,
+        latent_pool: cute.Tensor, rope_pool: cute.Tensor,
+    ):
+        self._kernel_body(
+            q_all, kv_cache_u8, swa_indices, mid_out, mid_lse,
+            sm_scale_log2, Float32(1.0), Int32(0), stride_kv_block,
+            kv_cache_u8, swa_indices, Int32(0), Int32(0), stride_kv_block,
+            topk_length, swa_indices, block_to_pool_slot, latent_pool, rope_pool,
+            has_extra=False, per_token_len=True,
+        )
+
+
+    @cute.kernel
     def kernel_extra(
         self,
+
         q_all: cute.Tensor,
         kv_cache_u8: cute.Tensor,
         swa_indices: cute.Tensor,
@@ -1314,6 +1446,7 @@ class UnifiedDecodeKernel:
             stride_extra_kv_block,
             swa_indices,
             extra_indices,  # length tensors unused (per_token_len=False)
+            swa_indices, kv_cache_u8, kv_cache_u8,
             has_extra=True,
             per_token_len=False,
         )
@@ -1354,6 +1487,7 @@ class UnifiedDecodeKernel:
             stride_kv_block,
             topk_length,
             swa_indices,
+            swa_indices, kv_cache_u8, kv_cache_u8,
             has_extra=False,
             per_token_len=True,
         )
@@ -1397,6 +1531,7 @@ class UnifiedDecodeKernel:
             stride_extra_kv_block,
             topk_length,
             extra_topk_length,
+            swa_indices, kv_cache_u8, kv_cache_u8,
             has_extra=True,
             per_token_len=True,
         )
@@ -1420,11 +1555,15 @@ class UnifiedDecodeKernel:
         stride_extra_kv_block: Int64,
         topk_length: cute.Tensor,
         extra_topk_length: cute.Tensor,
+        block_to_pool_slot: cute.Tensor,
+        latent_pool: cute.Tensor,
+        rope_pool: cute.Tensor,
         *,
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
     ):
         t = self.traits
+        cand_window = int(t.bi) if self.native_kvarn else _CAND_WINDOW
         L = self.layout
         tid = Int32(cute.arch.thread_idx()[0])
         lane = cute.arch.lane_idx()
@@ -1466,12 +1605,12 @@ class UnifiedDecodeKernel:
         split_first_chunk = split_idx * cps
         split_last_chunk = split_first_chunk + cps
 
-        main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-            _CAND_WINDOW
+        main_valid_chunks = (section_len + Int32(cand_window - 1)) // Int32(
+            cand_window
         )
         if main_valid_chunks < Int32(0):
             main_valid_chunks = Int32(0)
-        max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+        max_main_chunks = Int32((self.topk + cand_window - 1) // cand_window)
         if main_valid_chunks > max_main_chunks:
             main_valid_chunks = max_main_chunks
         main_chunk_end = split_last_chunk
@@ -1484,13 +1623,13 @@ class UnifiedDecodeKernel:
         extra_first_chunk = split_first_chunk
         extra_chunk_count = Int32(0)
         if cutlass.const_expr(has_extra):
-            extra_valid_chunks = (extra_section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-                _CAND_WINDOW
+            extra_valid_chunks = (extra_section_len + Int32(cand_window - 1)) // Int32(
+                cand_window
             )
             if extra_valid_chunks < Int32(0):
                 extra_valid_chunks = Int32(0)
             max_extra_chunks = Int32(
-                (self.extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+                (self.extra_topk + cand_window - 1) // cand_window
             )
             if extra_valid_chunks > max_extra_chunks:
                 extra_valid_chunks = max_extra_chunks
@@ -1506,6 +1645,18 @@ class UnifiedDecodeKernel:
 
         active_chunks = main_chunk_count + extra_chunk_count
         if active_chunks == Int32(0):
+            if cutlass.const_expr(self.num_splits == 1):
+                linear = tid
+                while linear < Int32(self.valid_hpb * t.d_v):
+                    empty_head = linear // Int32(t.d_v)
+                    empty_dim = linear - empty_head * Int32(t.d_v)
+                    mid_out[
+                        token_idx,
+                        head_base + empty_head,
+                        split_idx,
+                        empty_dim,
+                    ] = cutlass.BFloat16(0.0)
+                    linear += Int32(self.block_threads)
             if tid < Int32(self.valid_hpb):
                 mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
             _exit_thread()
@@ -1517,7 +1668,15 @@ class UnifiedDecodeKernel:
         q_fp8_addr = shared_ptr_to_u32(st.q_fp8.data_ptr())
         q_rope_addr = shared_ptr_to_u32(st.q_rope.data_ptr())
         kv_fp8_addr = shared_ptr_to_u32(st.kv_fp8.data_ptr())
-        if cutlass.const_expr(t.has_extra_cache or t.latent_scale_per_token):
+        if cutlass.const_expr(
+            t.has_extra_cache
+            or t.latent_scale_per_token
+            or t.scale_format in (
+                ScaleFormat.KVARN_K5,
+                ScaleFormat.KVARN_EXACT,
+                ScaleFormat.KVARN_EXACT_BF16,
+            )
+        ):
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
         else:
             kv_sc_addr = Int32(0)
@@ -1623,6 +1782,11 @@ class UnifiedDecodeKernel:
             warp_sel = warp_id & Int32(3)
             tid_sel = tid - group * Int32(128)
             warp_first_cand = warp_sel * Int32(16)
+        if cutlass.const_expr(self.native_kvarn_exact_h32):
+            group = warp_id >> Int32(3)
+            warp_sel = warp_id & Int32(7)
+            tid_sel = tid - group * Int32(256)
+            warp_first_cand = warp_sel * Int32(8)
 
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
@@ -1638,6 +1802,8 @@ class UnifiedDecodeKernel:
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
                 buf = Int32(lc) & Int32(1)
+                if cutlass.const_expr(self.native_kvarn):
+                    buf = Int32(0)
 
                 cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
 
@@ -1670,8 +1836,8 @@ class UnifiedDecodeKernel:
                 if cutlass.const_expr(has_extra):
                     if ci >= num_main_chunks:
                         cis = ci - num_main_chunks
-                        g_start = cis * Int32(_CAND_WINDOW)
-                        g_end = g_start + Int32(_CAND_WINDOW)
+                        g_start = cis * Int32(cand_window)
+                        g_end = g_start + Int32(cand_window)
                         if g_end > extra_section_len:
                             g_end = extra_section_len
                         io_issue_gather(
@@ -1690,8 +1856,8 @@ class UnifiedDecodeKernel:
                             **io_kw,
                         )
                     else:
-                        g_start = ci * Int32(_CAND_WINDOW)
-                        g_end = g_start + Int32(_CAND_WINDOW)
+                        g_start = ci * Int32(cand_window)
+                        g_end = g_start + Int32(cand_window)
                         if g_end > section_len:
                             g_end = section_len
                         io_issue_gather(
@@ -1710,40 +1876,67 @@ class UnifiedDecodeKernel:
                             **io_kw,
                         )
                 else:
-                    g_start = ci * Int32(_CAND_WINDOW)
-                    g_end = g_start + Int32(_CAND_WINDOW)
+                    g_start = ci * Int32(cand_window)
+                    g_end = g_start + Int32(cand_window)
                     if g_end > section_len:
                         g_end = section_len
-                    io_issue_gather(
-                        kv_cache_u8,
-                        topk_row,
-                        kv_fp8_addr + buf * kv_fp8_buf,
-                        kv_rope_addr + buf * kv_rope_buf,
-                        kv_sc_addr + buf * kv_sc_buf,
-                        tok_buf_view,
-                        mbar_base + buf,
-                        g_start,
-                        g_end,
-                        Int32(self.page_block_size),
-                        stride_kv_block,
-                        io_lane,
-                        **io_kw,
-                    )
+                    if cutlass.const_expr(self.native_kvarn):
+                        (
+                            cache_block_stride,
+                            s_col_off,
+                            zp_off,
+                            s_row_off,
+                            rope_off,
+                        ) = _KVARN_PACKED_TILE_GEOMETRY[
+                            self.native_kvarn_bits
+                        ]
+                        io_issue_kvarn_k5_gather(
+                            kv_cache_u8, topk_row, block_to_pool_slot,
+                            latent_pool, rope_pool,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            tok_buf_view, mbar_base + buf, g_start, g_end, io_lane,
+                            Int32(block_to_pool_slot.shape[0]),
+                            Int32(latent_pool.shape[0]),
+                            cache_block_stride=cache_block_stride,
+                            packed_bits=self.native_kvarn_bits,
+                            s_col_offset=s_col_off,
+                            zp_offset=zp_off,
+                            s_row_offset=s_row_off,
+                            rope_offset=rope_off,
+                            kv_smem_stride=staged_kv_stride,
+                            rope_smem_stride=t.d_rope,
+                            io_threads=self.io_threads,
+                            exact_fp8=(t.scale_format == ScaleFormat.KVARN_EXACT),
+                            exact_pool_only=self.native_kvarn_exact_pool,
+                            exact_fast_io=self.kvarn_exact_fast_io,
+                        )
+                    else:
+                        io_issue_gather(
+                            kv_cache_u8, topk_row,
+                            kv_fp8_addr + buf * kv_fp8_buf,
+                            kv_rope_addr + buf * kv_rope_buf,
+                            kv_sc_addr + buf * kv_sc_buf,
+                            tok_buf_view, mbar_base + buf, g_start, g_end,
+                            Int32(self.page_block_size), stride_kv_block, io_lane,
+                            **io_kw,
+                        )
                 prod_idx += Int32(1)
                 if prod_idx == Int32(n_buf):
                     prod_idx = Int32(0)
                     prod_phase ^= Int32(1)
 
         else:
-            # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
+            # MATH WARPS (CONSUMER): normally 8; exact H32 uses 16 as two
+            # independent 8-warp H16 groups over one shared gathered KV tile.
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
 
-            # ── Native H16 per-group staging bases. Identity aliases when the
-            #    two-group mode is off (const_expr; zero IR change). Each group
-            #    strides its cooperative loops by nt_stage=128 threads while
-            #    every named barrier spans the full bt_stage=256-thread math
-            #    domain (barrier_threads override), so the groups share one
-            #    barrier schedule but touch disjoint staging halves. ──
+            # Per-group staging bases. Identity aliases when grouping is off.
+            # DSV4 H16 runs two 128-thread H8 groups; KVarN exact H32 runs two
+            # 256-thread H16 groups. Cooperative loop strides remain local to
+            # a group while named barriers span the full math domain, keeping
+            # both groups in lockstep before the producer can reuse the tile.
             q_fp8_stage = q_fp8_addr
             q_rope_stage = q_rope_addr
             q_sc_stage_view = q_sc_view
@@ -1754,8 +1947,29 @@ class UnifiedDecodeKernel:
             sm_p_stage = sm_p_full_addr
             w_head_sc_stage_view = w_head_sc_view
             head_base_stage = head_base
-            nt_stage = 128 if self.native_dsv4_h16 else self.math_threads
-            bt_stage = self.math_threads if self.native_dsv4_h16 else 0
+            stage_hpb = (
+                8
+                if (self.native_h8 or self.native_dsv4_h16)
+                else (16 if self.native_kvarn_exact_h32 else t.hpb)
+            )
+            valid_hpb_stage = (
+                8
+                if self.native_dsv4_h16
+                else (16 if self.native_kvarn_exact_h32 else self.valid_hpb)
+            )
+            nt_stage = (
+                128
+                if self.native_dsv4_h16
+                else (256 if self.native_kvarn_exact_h32 else self.math_threads)
+            )
+            bt_stage = (
+                self.math_threads
+                if (self.native_dsv4_h16 or self.native_kvarn_exact_h32)
+                else 0
+            )
+            n_warps_stage = (
+                8 if self.native_kvarn_exact_h32 else (self.math_threads // 32)
+            )
             if cutlass.const_expr(self.native_dsv4_h16):
                 head_base_stage = head_base + group * Int32(8)
                 q_fp8_stage = q_fp8_addr + group * Int32(8 * t.q_nope_stride)
@@ -1780,18 +1994,47 @@ class UnifiedDecodeKernel:
                     + group * Int32((L.w_head_sc2_off - L.w_head_sc_off) // 4),
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
+            if cutlass.const_expr(self.native_kvarn_exact_h32):
+                head_base_stage = head_base + group * Int32(16)
+                q_fp8_stage = q_fp8_addr + group * Int32(
+                    16 * t.q_nope_stride * (2 if self.fuse_kvarn_hadamard else 1)
+                )
+                q_rope_stage = q_rope_addr + group * Int32(16 * L.q_rope_stride * 2)
+                q_sc_stage_view = cute.make_tensor(
+                    q_sc_view.iterator + group * Int32(16 * t.num_scales),
+                    cute.make_layout(int(16 * t.num_scales)),
+                )
+                amax_stage_view = cute.make_tensor(
+                    amax_view.iterator + group * Int32(16 * t.num_scales),
+                    cute.make_layout(int(16 * t.num_scales)),
+                )
+                reduce_max_stage = reduce_max_addr + group * Int32(8 * 16 * 4)
+                reduce_sum_stage = reduce_sum_addr + group * Int32(8 * 16 * 4)
+                w_fp8_stage = w_fp8_addr + group * Int32(2 * 16 * (t.bi + 16))
+                sm_p_stage = sm_p_full_addr + group * Int32(16 * L.sm_p_full_stride * 2)
+                w_head_sc_stage_view = cute.make_tensor(
+                    w_head_sc_view.iterator + group * Int32(t.n_v_chunks * 16),
+                    cute.make_layout(int(t.n_v_chunks * 16)),
+                )
 
-            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+            if cutlass.const_expr(
+                t.scale_format in (
+                    ScaleFormat.NVFP4_E4M3,
+                    ScaleFormat.KVARN_K5,
+                    ScaleFormat.KVARN_EXACT_BF16,
+                )
+                or self.fuse_kvarn_hadamard
+            ):
                 s0_load_q_bf16_to_smem(
                     q_token,
                     q_fp8_stage,
                     q_rope_stage,
                     head_base_stage,
-                    Int32(self.valid_hpb),
+                    Int32(valid_hpb_stage),
                     tid_sel,
                     d_nope=t.d_nope,
                     d_rope=t.d_rope,
-                    hpb=t.hpb,
+                    hpb=stage_hpb,
                     q_nope_bf16_stride=t.q_nope_stride,
                     q_rope_stride=L.q_rope_stride,
                     num_threads=nt_stage,
@@ -1806,14 +2049,14 @@ class UnifiedDecodeKernel:
                     q_rope_stage,
                     amax_stage_view,
                     head_base_stage,
-                    Int32(8 if self.native_dsv4_h16 else self.valid_hpb),
+                    Int32(valid_hpb_stage),
                     tid_sel,
                     d_nope=t.d_nope,
                     d_rope=t.d_rope,
                     d_qk=t.d_nope + t.d_rope,
                     quant_tile=t.quant_tile,
                     num_scales=t.num_scales,
-                    hpb=(8 if (self.native_h8 or self.native_dsv4_h16) else t.hpb),
+                    hpb=stage_hpb,
                     q_nope_stride=t.q_nope_stride,
                     q_rope_stride=L.q_rope_stride,
                     num_threads=nt_stage,
@@ -1824,6 +2067,36 @@ class UnifiedDecodeKernel:
                     vectorized_rope_copy=(self.native_dsv4_h8 or self.native_dsv4_h16),
                     packed_q_scale_words=self.native_dsv4_h16,
                 )
+            q_nope_math_stage = q_fp8_stage
+            if cutlass.const_expr(self.fuse_kvarn_hadamard):
+                kvarn_hadamard_bf16_smem(
+                    q_fp8_stage,
+                    tid_sel,
+                    hpb=stage_hpb,
+                    row_stride=t.q_nope_stride,
+                    num_threads=nt_stage,
+                    barrier_id=2,
+                    barrier_threads=bt_stage,
+                )
+                if cutlass.const_expr(t.scale_format == ScaleFormat.KVARN_EXACT):
+                    kvarn_quantize_hadamard_q_fp8(
+                        q_fp8_addr,
+                        q_fp8_addr,
+                        shared_ptr_to_u32(st.q_sc.data_ptr()),
+                        group,
+                        tid,
+                        tid_sel,
+                        lane,
+                        groups=2,
+                        hpb_per_group=16,
+                        q_stride=t.q_nope_stride,
+                        num_group_threads=256,
+                        barrier_id=2,
+                        barrier_threads=self.math_threads,
+                    )
+                    q_nope_math_stage = (
+                        q_fp8_addr + group * Int32(16 * t.q_nope_stride)
+                    )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope_acc_elems = 8 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 4
@@ -1841,6 +2114,7 @@ class UnifiedDecodeKernel:
 
             cons_phase = Int32(0)
             cons_idx = Int32(0)
+            has_valid_candidate = Int32(0)
 
             for lc in cutlass.range(active_chunks, unroll=1):
                 active_idx = Int32(lc)
@@ -1848,8 +2122,10 @@ class UnifiedDecodeKernel:
                 if cutlass.const_expr(has_extra):
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
-                split_cand_start = ci * Int32(_CAND_WINDOW)
+                split_cand_start = ci * Int32(cand_window)
                 buf = Int32(lc) & Int32(1)
+                if cutlass.const_expr(self.native_kvarn):
+                    buf = Int32(0)
 
                 kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
                 kv_rope_b = kv_rope_addr + buf * kv_rope_buf
@@ -1874,6 +2150,21 @@ class UnifiedDecodeKernel:
 
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
                 cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                if cutlass.const_expr(self.native_kvarn):
+                    # Every math warp redundantly reduces the 64 staged slot
+                    # statuses. This avoids shared scratch/barriers and leaves
+                    # a uniform per-split predicate for the neutral epilogue.
+                    chunk_valid = Int32(0)
+                    if Int32(tok_buf_view[lane]) >= Int32(0):
+                        chunk_valid += Int32(1)
+                    if Int32(tok_buf_view[lane + Int32(32)]) >= Int32(0):
+                        chunk_valid += Int32(1)
+                    for offset in (16, 8, 4, 2, 1):
+                        chunk_valid += cute.arch.shuffle_sync_bfly(
+                            chunk_valid, offset=offset
+                        )
+                    if chunk_valid > Int32(0):
+                        has_valid_candidate = Int32(1)
 
                 # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
                 # discarded the per-group e4m3 mantissa headroom and cost ~0.003
@@ -1931,9 +2222,9 @@ class UnifiedDecodeKernel:
                     sec_len = section_len
                     if cutlass.const_expr(has_extra):
                         if ci >= num_main_chunks:
-                            sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                            sc_start = (ci - num_main_chunks) * Int32(cand_window)
                             sec_len = extra_section_len
-                    sc_end = sc_start + Int32(_CAND_WINDOW)
+                    sc_end = sc_start + Int32(cand_window)
                     if sc_end > sec_len:
                         sc_end = sec_len
                     qk = s3_mask_and_scale_glm_h8_swap_ab(
@@ -2026,9 +2317,9 @@ class UnifiedDecodeKernel:
                 else:
                     qk = s1_qk_nope_block_scaled(
                         qk,
-                        q_fp8_addr,
+                        q_nope_math_stage,
                         kv_fp8_b,
-                        q_sc_view,
+                        q_sc_stage_view,
                         kv_sc_b,
                         warp_first_cand,
                         lane,
@@ -2043,7 +2334,7 @@ class UnifiedDecodeKernel:
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
-                        q_rope_addr,
+                        q_rope_stage,
                         kv_rope_b,
                         warp_first_cand,
                         lane,
@@ -2058,9 +2349,9 @@ class UnifiedDecodeKernel:
                         sc_start = split_cand_start
                         sec_len = section_len
                         if ci >= num_main_chunks:
-                            sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                            sc_start = (ci - num_main_chunks) * Int32(cand_window)
                             sec_len = extra_section_len
-                        sc_end = sc_start + Int32(_CAND_WINDOW)
+                        sc_end = sc_start + Int32(cand_window)
                         if sc_end > sec_len:
                             sc_end = sec_len
                         qk = s3_mask_and_scale(
@@ -2074,7 +2365,7 @@ class UnifiedDecodeKernel:
                             lane,
                         )
                     else:
-                        split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                        split_cand_end = split_cand_start + Int32(cand_window)
                         if split_cand_end > section_len:
                             split_cand_end = section_len
                         qk = s3_mask_and_scale(
@@ -2096,19 +2387,20 @@ class UnifiedDecodeKernel:
                         acc_rope,
                         global_max,
                         global_sum,
-                        reduce_max_addr,
-                        reduce_sum_addr,
+                        reduce_max_stage,
+                        reduce_sum_stage,
                         False,
-                        warp_id,
+                        warp_sel,
                         lane,
-                        tid,
+                        tid_sel,
                         n_v_chunks=t.n_v_chunks,
-                        hpb=t.hpb,
-                        n_warps=8,
-                        valid_hpb=self.valid_hpb,
-                        num_threads=self.math_threads,
+                        hpb=stage_hpb,
+                        n_warps=n_warps_stage,
+                        valid_hpb=valid_hpb_stage,
+                        num_threads=nt_stage,
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
+                        barrier_threads=bt_stage,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2118,16 +2410,16 @@ class UnifiedDecodeKernel:
                     ]
                     s5_fill_sm_p_full(
                         w_pre,
-                        sm_p_full_addr,
-                        w_head_sc_view,
-                        warp_id,
+                        sm_p_stage,
+                        w_head_sc_stage_view,
+                        warp_sel,
                         lane,
-                        tid,
+                        tid_sel,
                         bi=t.bi,
                         sm_p_stride=L.sm_p_full_stride,
                         n_v_chunks=t.n_v_chunks,
-                        hpb=t.hpb,
-                        num_threads=self.math_threads,
+                        hpb=stage_hpb,
+                        num_threads=nt_stage,
                         barrier_id=3,
                     )
                     cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
@@ -2136,27 +2428,28 @@ class UnifiedDecodeKernel:
                         acc_nope,
                         kv_fp8_b,
                         kv_sc_b,
-                        w_head_sc_view,
-                        w_fp8_addr,
-                        warp_id,
+                        w_head_sc_stage_view,
+                        w_fp8_stage,
+                        warp_sel,
                         lane,
-                        tid,
+                        tid_sel,
                         latent_scale,
                         n_v_chunks=t.n_v_chunks,
                         v_chunk=t.quant_tile,
-                        hpb=t.hpb,
+                        hpb=stage_hpb,
                         bi=t.bi,
                         kv_smem_stride=t.kv_smem_stride,
                         w_fp8_stride=t.bi + 16,
-                        n_warps=8,
+                        n_warps=n_warps_stage,
                         scale_bytes_per_token=8,
                         nt_per_warp_xv=t.nt_per_warp_xv,
                         scale_format=t.scale_format,
-                        num_threads=self.math_threads,
+                        num_threads=nt_stage,
                         barrier_id=3,
-                        sm_p_full_addr=sm_p_full_addr,
+                        sm_p_full_addr=sm_p_stage,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        barrier_threads=bt_stage,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -2185,7 +2478,7 @@ class UnifiedDecodeKernel:
                             bi=t.bi,
                             sm_p_stride=L.sm_p_full_stride,
                             d_rope=t.d_rope,
-                            n_warps=8,
+                            n_warps=(self.math_threads // 32),
                         )
 
                 for at in cutlass.range_constexpr(n_acc_tiles):
@@ -2237,23 +2530,32 @@ class UnifiedDecodeKernel:
 
             # mid_out[token, head_base + h, split, dim]: (HPB, D_V) view for this
             # (token, head_block, split). mid_out stride = (h*S*Dv, S*Dv, Dv, 1).
-            out_o = cute.make_tensor(
+            out_o_global = cute.make_tensor(
                 mid_out.iterator
                 + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
                 + head_base_stage.to(Int64) * Int64(self.mid_out_stride_head)
                 + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
                 cute.make_layout(
-                    (t.hpb, t.d_v),
+                    (stage_hpb, t.d_v),
                     stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
                 ),
             )
+            out_o = out_o_global
+            if cutlass.const_expr(self.fuse_kvarn_hadamard):
+                q_bf16_view = st.q_fp8.get_tensor(
+                    cute.make_layout(int(L.q_fp8_bytes // 2))
+                )
+                out_o = cute.make_tensor(
+                    q_bf16_view.iterator + group * Int32(16 * 512),
+                    cute.make_layout((stage_hpb, t.d_v), stride=(t.d_v, 1)),
+                )
             # mid_lse[token, head_base + h, split]: (HPB,) view.
             out_lse = cute.make_tensor(
                 mid_lse.iterator
                 + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
                 + head_base_stage.to(Int64) * Int64(self.mid_lse_stride_head)
                 + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
-                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
+                cute.make_layout((stage_hpb,), stride=(self.mid_lse_stride_head,)),
             )
             s7_epilogue(
                 fin_acc_nope,
@@ -2268,15 +2570,51 @@ class UnifiedDecodeKernel:
                 v_chunk=t.quant_tile,
                 d_nope=t.d_nope,
                 d_rope=t.d_rope,
-                n_warps=(4 if (self.native_h8 or self.native_dsv4_h16) else 8),
-                valid_hpb=(8 if self.native_dsv4_h16 else self.valid_hpb),
+                n_warps=(
+                    4
+                    if (self.native_h8 or self.native_dsv4_h16)
+                    else n_warps_stage
+                ),
+                valid_hpb=valid_hpb_stage,
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),
+                natural_lse=(self.native_kvarn and self.num_splits == 1),
             )
 
+            if cutlass.const_expr(self.fuse_kvarn_hadamard):
+                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                kvarn_hadamard_output_bf16(
+                    q_fp8_addr + group * Int32(16 * 512 * 2),
+                    out_o_global,
+                    tid_sel,
+                    hpb=stage_hpb,
+                    num_threads=nt_stage,
+                    barrier_id=3,
+                    barrier_threads=bt_stage,
+                )
+
+            if cutlass.const_expr(self.native_kvarn):
+                if has_valid_candidate == Int32(0):
+                    # Finite QK masking deliberately keeps S4 NaN-free, so a
+                    # wholly invalid split otherwise looks like a live uniform
+                    # softmax. Override it with the sparse-attention identity.
+                    cute.arch.barrier(
+                        barrier_id=3, number_of_threads=self.math_threads
+                    )
+                    if cutlass.const_expr(self.num_splits == 1):
+                        linear = tid_sel
+                        while linear < Int32(stage_hpb * t.d_v):
+                            empty_head = linear // Int32(t.d_v)
+                            empty_dim = linear - empty_head * Int32(t.d_v)
+                            out_o_global[empty_head, empty_dim] = (
+                                cutlass.BFloat16(0.0)
+                            )
+                            linear += Int32(nt_stage)
+                    if tid_sel < Int32(valid_hpb_stage):
+                        out_lse[tid_sel] = Float32(-Float32.inf)
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
     c = from_dlpack(x, assumed_align=align)
@@ -2590,9 +2928,6 @@ def _sparse_mla_decode_grid_flat_launch(
         # v18: latent_scale == 1.0 is folded out at trace time, producing a
         # cubin without the outer-scale multiply; the identity and dynamic
         # variants must not share a cache entry.
-        # v19: latent_scale_per_token joins the key (per-candidate fp32 scale
-        # read from kv_sc smem). In that mode the launch scalar is dead, so the
-        # identity fold is forced ON -- no per-scalar variants get compiled.
         19,
         key_field(
             "latent_scale_identity",
@@ -2610,6 +2945,165 @@ def _sparse_mla_decode_grid_flat_launch(
         compile_args=args,
         runtime_args=args,
     )
+
+
+def _kvarn_mla_decode_grid_flat_launch(
+    q_all, kv_flat, selected_indices, mid_out, mid_lse, valid_counts,
+    block_to_pool_slot, latent_pool, rope_pool, sm_scale, num_splits,
+    chunks_per_split, exact_pool_only, fuse_kvarn_hadamard, packed_bits,
+    exact_h16=False,
+) -> None:
+    exact_h16 = bool(exact_h16)
+    if exact_h16 and not exact_pool_only:
+        raise ValueError("KVarN exact H16 requires exact-pool-only decode")
+    packed_bits = int(packed_bits)
+    if packed_bits not in _KVARN_PACKED_TILE_GEOMETRY:
+        raise ValueError(
+            "native KVarN decode requires packed_bits in "
+            f"{sorted(_KVARN_PACKED_TILE_GEOMETRY)}"
+        )
+    cache_block_stride = _KVARN_PACKED_TILE_GEOMETRY[packed_bits][0]
+    kvarn_exact_fast_io = bool(
+        exact_pool_only and not exact_h16 and _env_kvarn_exact_fast_io_enabled()
+    )
+    rows, heads, q_head_dim = map(int, q_all.shape)
+    scale_format = (
+        ScaleFormat.KVARN_EXACT_BF16
+        if exact_h16
+        else (ScaleFormat.KVARN_EXACT if exact_pool_only else ScaleFormat.KVARN_K5)
+    )
+    traits = make_unified_traits(ModelType.GLM_NSA, 1, scale_format, fp8_rope=False)
+    layout = make_smem_layout(traits)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (
+        _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+        _to_cute(kv_flat, cutlass.Uint8, align=16),
+        _to_cute(selected_indices, cutlass.Int32, align=4, dynamic_layout=True),
+        _to_cute(mid_out, cutlass.BFloat16, align=16, dynamic_layout=True),
+        _to_cute(mid_lse, cutlass.Float32, align=4, dynamic_layout=True),
+        Float32(float(sm_scale) * LOG2_E),
+        _to_cute(valid_counts, cutlass.Int32, align=4, dynamic_layout=True),
+        Int64(cache_block_stride),
+        _to_cute(block_to_pool_slot, cutlass.Int32, align=4),
+        _to_cute(latent_pool, cutlass.Float8E4M3FN, align=16),
+        _to_cute(rope_pool, cutlass.BFloat16, align=16),
+        Int32(rows), stream,
+    )
+    kernel = UnifiedDecodeKernel(
+        traits, layout, (int(selected_indices.shape[1]) + traits.bi - 1) // traits.bi,
+        int(chunks_per_split), h_blocks=heads // traits.hpb,
+        num_splits=int(num_splits), num_heads=heads, q_head_dim=q_head_dim,
+        topk=int(selected_indices.shape[1]), extra_topk=0,
+        q_stride=tuple(q_all.stride()), swa_indices_stride0=int(selected_indices.stride(0)),
+        extra_indices_stride0=int(selected_indices.stride(0)),
+        mid_out_stride=tuple(mid_out.stride()), mid_lse_stride=tuple(mid_lse.stride()),
+        valid_hpb=traits.hpb, per_token_len=True, native_kvarn=True,
+        native_kvarn_bits=packed_bits,
+        native_kvarn_exact_pool=exact_pool_only,
+        fuse_kvarn_hadamard=fuse_kvarn_hadamard,
+        kvarn_exact_fast_io=kvarn_exact_fast_io,
+    )
+    kernel_id = (
+        "attention.kvarn_mla.sm120.decode.exact_h16"
+        if exact_h16
+        else "attention.kvarn_mla.sm120.decode"
+    )
+    spec_fields = [
+        key_field("rows", rows), key_field("heads", heads),
+        key_field("packed_bits", packed_bits),
+        key_field("topk", int(selected_indices.shape[1])),
+        key_field("num_splits", int(num_splits)),
+        key_field("chunks_per_split", int(chunks_per_split)),
+        key_field("exact_pool_only", int(bool(exact_pool_only))),
+        key_field("fuse_kvarn_hadamard", int(bool(fuse_kvarn_hadamard))),
+        key_field("kvarn_exact_fast_io", int(kvarn_exact_fast_io)),
+        tensor_key("q", q_all, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.exact(q_head_dim))),
+        tensor_key("selected", selected_indices, dims=(DimKey.dynamic(), DimKey.exact(int(selected_indices.shape[1])))),
+        tensor_key("mid_out", mid_out, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits), DimKey.exact(512))),
+        tensor_key("cache", kv_flat, dims=(DimKey.exact(int(kv_flat.numel())),)),
+        tensor_key("block_map", block_to_pool_slot, dims=(DimKey.exact(int(block_to_pool_slot.shape[0])),)),
+        tensor_key("latent_pool", latent_pool, dims=(DimKey.exact(int(latent_pool.shape[0])), DimKey.exact(64), DimKey.exact(512))),
+        tensor_key("rope_pool", rope_pool, dims=(DimKey.exact(int(rope_pool.shape[0])), DimKey.exact(64), DimKey.exact(64))),
+        tensor_key("mid_lse", mid_lse, dims=(DimKey.dynamic(), DimKey.exact(heads), DimKey.bucket(num_splits))),
+    ]
+    if exact_h16:
+        spec_fields.insert(0, key_field("exact_h16", 1))
+    spec = KernelCompileSpec.from_fields(kernel_id, 1 if exact_h16 else 4, *spec_fields)
+    LAST_KVARN_DECODE_PLAN.clear()
+    LAST_KVARN_DECODE_PLAN.update(
+        exact_h16=exact_h16,
+        packed_bits=packed_bits,
+        marker=(
+            "b12x::kvarn_mla_sm120_decode_grid_exact_h16"
+            if exact_h16
+            else "b12x::kvarn_mla_sm120_decode_grid"
+        ),
+        heads_per_cta=traits.hpb,
+        block_threads=kernel.block_threads,
+        math_mode="bf16" if exact_h16 else ("fp8" if exact_pool_only else "bf16"),
+    )
+    b12x_launch(
+        kernel.call_kvarn, compile_spec=spec, compile_args=args, runtime_args=args
+    )
+
+
+@torch.library.custom_op("b12x::kvarn_mla_sm120_decode_grid", mutates_args=("mid_out", "mid_lse"))
+def _kvarn_mla_decode_grid_op(
+    q_all: torch.Tensor, kv_flat: torch.Tensor, selected_indices: torch.Tensor,
+    mid_out: torch.Tensor, mid_lse: torch.Tensor, valid_counts: torch.Tensor,
+    block_to_pool_slot: torch.Tensor, latent_pool: torch.Tensor,
+    rope_pool: torch.Tensor, sm_scale: float, num_splits: int,
+    chunks_per_split: int, exact_pool_only: bool, fuse_kvarn_hadamard: bool,
+    packed_bits: int,
+) -> None:
+    _kvarn_mla_decode_grid_flat_launch(
+        q_all, kv_flat, selected_indices, mid_out, mid_lse, valid_counts,
+        block_to_pool_slot, latent_pool, rope_pool, sm_scale, num_splits,
+        chunks_per_split, exact_pool_only, fuse_kvarn_hadamard, packed_bits,
+    )
+
+
+@_kvarn_mla_decode_grid_op.register_fake
+def _kvarn_mla_decode_grid_fake(
+    q_all: torch.Tensor, kv_flat: torch.Tensor, selected_indices: torch.Tensor,
+    mid_out: torch.Tensor, mid_lse: torch.Tensor, valid_counts: torch.Tensor,
+    block_to_pool_slot: torch.Tensor, latent_pool: torch.Tensor,
+    rope_pool: torch.Tensor, sm_scale: float, num_splits: int,
+    chunks_per_split: int, exact_pool_only: bool, fuse_kvarn_hadamard: bool,
+    packed_bits: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "b12x::kvarn_mla_sm120_decode_grid_exact_h16",
+    mutates_args=("mid_out", "mid_lse"),
+)
+def _kvarn_mla_decode_grid_exact_h16_op(
+    q_all: torch.Tensor, kv_flat: torch.Tensor, selected_indices: torch.Tensor,
+    mid_out: torch.Tensor, mid_lse: torch.Tensor, valid_counts: torch.Tensor,
+    block_to_pool_slot: torch.Tensor, latent_pool: torch.Tensor,
+    rope_pool: torch.Tensor, sm_scale: float, num_splits: int,
+    chunks_per_split: int, exact_pool_only: bool, fuse_kvarn_hadamard: bool,
+) -> None:
+    _kvarn_mla_decode_grid_flat_launch(
+        q_all, kv_flat, selected_indices, mid_out, mid_lse, valid_counts,
+        block_to_pool_slot, latent_pool, rope_pool, sm_scale, num_splits,
+        chunks_per_split, exact_pool_only, fuse_kvarn_hadamard, 5,
+        exact_h16=True,
+    )
+
+
+@_kvarn_mla_decode_grid_exact_h16_op.register_fake
+def _kvarn_mla_decode_grid_exact_h16_fake(
+    q_all: torch.Tensor, kv_flat: torch.Tensor, selected_indices: torch.Tensor,
+    mid_out: torch.Tensor, mid_lse: torch.Tensor, valid_counts: torch.Tensor,
+    block_to_pool_slot: torch.Tensor, latent_pool: torch.Tensor,
+    rope_pool: torch.Tensor, sm_scale: float, num_splits: int,
+    chunks_per_split: int, exact_pool_only: bool, fuse_kvarn_hadamard: bool,
+) -> None:
+    return None
+
 
 
 @torch.library.custom_op(
@@ -2855,8 +3349,6 @@ def run_unified_decode(
                 f"NVFP4 cache record must be 368 or 432 bytes, got {record_bytes}"
             )
         fp8_rope_override = record_bytes == 368
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY.
     if latent_scale_per_token:
         if scale_format != ScaleFormat.NVFP4_E4M3:
             raise ValueError(
@@ -2866,7 +3358,7 @@ def run_unified_decode(
         if not bool(fp8_rope_override):
             raise ValueError(
                 "SM120 sparse MLA decode latent_scale_per_token requires the "
-                "fp8-rope 368-byte NVFP4 record; got the 432-byte record"
+                "fp8-rope 368-byte NVFP4 record"
             )
     traits = make_unified_traits(
         model_type,
