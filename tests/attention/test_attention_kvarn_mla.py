@@ -428,6 +428,15 @@ def test_scaled_offsets_survive_int32_boundary() -> None:
     32-bit offset overflow.
     """
     device = require_b12x()
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < 10 << 30:
+        pytest.skip("int32-boundary arenas need ~10 GiB of free device memory")
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None and psutil.virtual_memory().available < (4 << 30):
+        pytest.skip("int32-boundary reference needs ~4 GiB of free host memory")
     gen = torch.Generator(device="cpu").manual_seed(13)
 
     # --- packed K5 staging past INT32_MAX / 30848 (~69,586 blocks) ---
