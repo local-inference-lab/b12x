@@ -6677,17 +6677,6 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
         )
-        if cutlass.const_expr(self.prefill_fused_sum_fp32):
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
-            out_idx = Int64(cta * Int32(self.cta_threads) + tid)
-            out_stride = Int64(grid_x * Int32(self.cta_threads))
-            out_elements = Int64(active_m) * Int64(self.hidden_size)
-            while out_idx < out_elements:
-                fc1_bf16_flat[out_idx] = self._cast_elem(
-                    fc2_bf16_flat[out_idx].to(cutlass.Float32)
-                )
-                out_idx += out_stride
-
     @cute.jit
     def _sqg_smem_copy(
         self,
@@ -9434,14 +9423,7 @@ def compile_w4a16_fused_moe(
     )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (
-            max(
-                compile_routed_rows * fc1_cols,
-                compile_size_m * hidden_size,
-            )
-            if kernel.prefill_fused_sum_fp32
-            else compile_routed_rows * fc1_cols,
-        ),
+        (compile_routed_rows * fc1_cols,),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
@@ -12501,7 +12483,7 @@ def run_w4a16_moe(
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
     required_cache13_elements = (
-        max(capacity_routed_rows * fc1_cols, capacity_m * hidden_size)
+        capacity_routed_rows * fc1_cols
         if use_prefill_fused_sum
         else capacity_routed_rows * max(fc1_cols, hidden_size)
     )
@@ -12522,15 +12504,7 @@ def run_w4a16_moe(
             "intermediate_cache2 is smaller than the selected W4A16 launch capacity: "
             f"capacity_rows={capacity_m}, topk={topk}"
         )
-    fc1_out_elements = (
-        required_cache13_elements
-        if use_prefill_fused_sum
-        else capacity_routed_rows * fc1_cols
-    )
-    # The fused kernel reuses the FC1 backing allocation for its final BF16
-    # output cast. Expose the complete declared extent to CuTeDSL while FC1 and
-    # activation stages continue to index only their routed-row prefix.
-    fc1_out = intermediate_cache13_flat[:fc1_out_elements]
+    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
     if use_prefill_fused_sum:
         assert prefill_sum_accum is not None
@@ -12806,7 +12780,7 @@ def run_w4a16_moe(
 
     if use_prefill_fused_sum:
         assert prefill_sum_accum is not None
-        output.copy_(intermediate_cache13_flat[: m * hidden_size].view(m, hidden_size))
+        output.copy_(prefill_sum_accum[: m * hidden_size].view(m, hidden_size))
         return output
     if use_tc_decode:
         # FC2 already wrote the top-k-summed result into `output`.

@@ -362,7 +362,7 @@ def plan_w4a16_buffers(
             sms=scratch_sms,
         ),
         intermediate_cache13_elements=(
-            max(routed_rows * fc1_cols, int(m) * hidden_size)
+            routed_rows * fc1_cols
             if use_prefill_fused_sum
             else routed_rows * max(fc1_cols, hidden_size)
         ),
