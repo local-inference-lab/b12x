@@ -1097,9 +1097,19 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    ("m", "route_ids_dtype"),
+    [
+        (1, torch.int32),
+        (2, torch.int32),
+        (4, torch.int32),
+        (8, torch.int32),
+        (1, torch.int64),
+    ],
+)
 def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
     m: int,
+    route_ids_dtype: torch.dtype,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Native small-M execution must not address weights for inactive routes."""
@@ -1165,7 +1175,9 @@ def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
         device="cuda",
     )
     inputs = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
-    topk_ids = torch.randint(0, experts, (m, topk), dtype=torch.int32, device="cuda")
+    topk_ids = torch.randint(
+        0, experts, (m, topk), dtype=route_ids_dtype, device="cuda"
+    )
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
 
     def launch() -> torch.Tensor:
@@ -1197,7 +1209,10 @@ def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
     assert direct_launches == 2
 
     inactive_ids = topk_ids.clone()
-    inactive_ids[-1] = torch.tensor([-1, experts], dtype=torch.int32, device="cuda")
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    inactive_ids[-1] = torch.tensor(
+        [-1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
     if m > 1:
         inactive_ids[0, 0] = -1
     topk_ids.copy_(inactive_ids)
@@ -3405,8 +3420,10 @@ def test_w4a16_fc2_only_consumes_contiguous_bf16_and_native_mxfp4() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("intermediate_size", [256, 512])
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
 def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
     intermediate_size: int,
+    route_ids_dtype: torch.dtype,
 ) -> None:
     experts, hidden_size, routes = 2, 128, 3
     w2 = torch.empty(
@@ -3425,7 +3442,10 @@ def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
     intermediate = torch.ones(
         (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
     )
-    route_ids = torch.tensor([0, -1, experts], dtype=torch.int32, device="cuda")
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    route_ids = torch.tensor(
+        [0, -1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
     route_weights = torch.tensor([0.25, 0.5, 1.0], dtype=torch.float32, device="cuda")
     original_ids = route_ids.clone()
     original_weights = route_weights.clone()
@@ -3450,7 +3470,7 @@ def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
     torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
 
     graph_output = torch.empty_like(actual)
-    prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=torch.int32)
+    prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=route_ids_dtype)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run_w4a16_fc2_e8m0(

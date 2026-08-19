@@ -569,16 +569,15 @@ class MoEMicroKernelBackend:
         each route against the resident expert count supplied by the caller.
         Invalid routes address expert zero with an exact-zero effective weight.
         """
-        raw_expert = Int32(topk_ids[eid_addr])
-        expert = raw_expert
-        weight = Float32(topk_weights[eid_addr])
         if cutlass.const_expr(self.compile_time_phase == 2):
+            raw_expert = Int64(topk_ids[eid_addr])
             expert = Int32(0)
             weight = Float32(0.0)
-            if raw_expert >= Int32(0) and raw_expert < route_expert_limit:
-                expert = raw_expert
+            if raw_expert >= Int64(0) and raw_expert < Int64(route_expert_limit):
+                expert = Int32(raw_expert)
                 weight = Float32(topk_weights[eid_addr])
-        return expert, weight
+            return expert, weight
+        return Int32(topk_ids[eid_addr]), Float32(topk_weights[eid_addr])
 
     @cute.jit
     def _scale_byte_to_f32(self, byte: Uint32) -> Float32:
@@ -2459,14 +2458,14 @@ class MoEMicroKernelBackend:
             )
             route_slot = Int32(tidx)
             while route_slot < Int32(self.route_slots):
-                raw_expert = Int32(topk_ids[route_slot])
+                raw_expert = Int64(topk_ids[route_slot])
                 expert = Int32(0)
                 weight = Float32(0.0)
                 if (
-                    raw_expert >= Int32(0)
-                    and raw_expert < route_expert_limit
+                    raw_expert >= Int64(0)
+                    and raw_expert < Int64(route_expert_limit)
                 ):
-                    expert = raw_expert
+                    expert = Int32(raw_expert)
                     weight = Float32(topk_weights[route_slot])
                 staged_ids[route_slot] = expert
                 staged_weights[route_slot] = weight
