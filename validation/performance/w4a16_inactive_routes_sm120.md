@@ -31,6 +31,10 @@ not index shared route storage whose extent was compiled for a smaller M.
   `97dfe7f837fa5383c5424cbdb2ccfabf57c4480c`
 - Route-width qualification revision:
   `0e167cdd7d32fbb5b6dcaed88c263ac1fa236c26`
+- Production composition base revision:
+  `c25cdba2c1df7a69b2d7771e4243e12a8fbf19d5`
+- Production composition tree:
+  `9b916c2641c85c0ac78a2fa6c4bea0214a0d2cd8`
 - Comparison revision for valid FC2 routes:
   `debaafe156c9824396178d53e01e5f15d2a2a04a`
 - Comparison tree: `ec6edd9da4687f83519fd37bd7322ea0800f0ace`
@@ -123,15 +127,13 @@ the runtime M, grid extent, and CUDA stream arguments. GPU compile tests cover
 the fused body and both split phases, preventing a positional ABI change from
 binding the stream as an integer launch parameter.
 
-A composed source qualification combined this implementation with the mixed
-Trellis runtime from B12X PR #223 at revision
-`e99775f552c4f28cf1f345ded28bb77a57ea6a83`. The following suites produced
-309 passes and 18 skips:
+A composed source qualification applied this implementation to B12X master
+`c25cdba2c1df7a69b2d7771e4243e12a8fbf19d5`. The following suites produced
+329 passes and 18 skips:
 
-- `tests/gemm/test_trellis_k6_mcg_cute.py`
 - `tests/moe/test_w4a16_e2e.py`
 - `tests/moe/test_w4a16_mixed_trellis.py`
-- `tests/moe/test_w4a16_route_pack_warmup.py`
+- `tests/moe/test_w4a16_route_pack.py`
 - `tests/moe/test_moe_launch_param_regression.py`
 - `tests/test_packaging.py`
 
