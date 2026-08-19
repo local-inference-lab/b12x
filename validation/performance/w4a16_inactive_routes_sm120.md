@@ -33,7 +33,7 @@ not index shared route storage whose extent was compiled for a smaller M.
   `0e167cdd7d32fbb5b6dcaed88c263ac1fa236c26`
 - Production composition base revision:
   `c25cdba2c1df7a69b2d7771e4243e12a8fbf19d5`
-- Production composition tree:
+- Runtime-code qualification tree:
   `9b916c2641c85c0ac78a2fa6c4bea0214a0d2cd8`
 - Comparison revision for valid FC2 routes:
   `debaafe156c9824396178d53e01e5f15d2a2a04a`
