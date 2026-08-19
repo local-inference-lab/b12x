@@ -304,10 +304,7 @@ def test_low_level_buffer_plan_bounds_large_m_route_reduction(
     fc1_cols = 2 * 192
     assert materialized.intermediate_cache13_elements == routed_rows * 7168
     assert materialized.prefill_sum_accum_elements == 0
-    assert fused.intermediate_cache13_elements == max(
-        routed_rows * fc1_cols,
-        4096 * 7168,
-    )
+    assert fused.intermediate_cache13_elements == routed_rows * fc1_cols
     assert fused.prefill_sum_accum_elements == 4096 * 7168
     assert rotation.intermediate_cache13_elements == routed_rows * 7168
     assert rotation.prefill_sum_accum_elements == 0

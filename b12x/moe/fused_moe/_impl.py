@@ -2772,10 +2772,7 @@ def _plan_core_workspace(
             collect_activation_amax=collect_activation_amax,
         )
         intermediate_cache13_elements = (
-            max(
-                routed_capacity * fc1_cols,
-                token_capacity * int(k),
-            )
+            routed_capacity * fc1_cols
             if use_prefill_fused_sum
             else routed_capacity * max(fc1_cols, int(k))
         )

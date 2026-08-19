@@ -109,7 +109,6 @@ from b12x.moe._shared.kernels.w4a16.host import (
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
     prefill_fused_sum_eligible,
-    prefill_fused_sum_enabled,
     select_route_block_size_m,
     validate_activation,
 )
@@ -12175,7 +12174,7 @@ def run_w4a16_moe(
     prefill_fused_sum_requested = (
         preplanned_prefill_fused_sum
         if fused_launch is not None
-        else prefill_fused_sum_enabled()
+        else prefill_sum_accum is not None
     )
     use_prefill_fused_sum = prefill_fused_sum_eligible(
         dtype=element_dtype,

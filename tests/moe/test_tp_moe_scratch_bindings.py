@@ -569,7 +569,7 @@ def test_w4a16_prefill_route_reduction_shrinks_caller_owned_scratch(
     )
     assert "prefill_sum_accum" not in materialized_specs
     assert fused_specs["intermediate_cache13"].shape == (
-        max(routed_rows * fc1_cols, 4096 * 7168),
+        routed_rows * fc1_cols,
     )
     assert fused_specs["prefill_sum_accum"].shape == (4096 * 7168,)
     assert fused_specs["prefill_sum_accum"].dtype == torch.float32

@@ -2837,6 +2837,15 @@ def bench_e2e() -> None:
         default=5,
         help="Repeat the timed measurement this many times per batch size and aggregate the results.",
     )
+    parser.add_argument(
+        "--timing-json",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "write every CUDA-event timing sample and the benchmark command "
+            "to this JSON file"
+        ),
+    )
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument(
@@ -3073,6 +3082,8 @@ def bench_e2e() -> None:
         raise ValueError("--quant-mode w4a16 currently supports --graph-mode single-op")
     if use_w4a16 and args.tp_parallel:
         raise ValueError("--quant-mode w4a16 currently does not support --tp-parallel")
+    if args.timing_json is not None and args.graph_mode != "single-op":
+        raise ValueError("--timing-json currently requires --graph-mode single-op")
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
     if args.routing_repeat_period < 0:
@@ -3388,9 +3399,15 @@ def bench_e2e() -> None:
         print(f" {spec.tp_size} ranks done.")
 
     batch_results: dict[int, BatchResult] = {}
+    raw_timing_runs: dict[str, dict[str, dict[str, list[list[float]]]]] = {}
     accuracy_failures: list[str] = []
     reference_warnings: list[str] = []
     for batch_size in batch_sizes:
+        batch_timing_runs: dict[str, dict[str, list[list[float]]]] = {
+            "eager": {},
+            "cuda_graph": {},
+        }
+        raw_timing_runs[str(batch_size)] = batch_timing_runs
         print(f"\n{'=' * 70}")
         print(f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)")
         print(f"{'=' * 70}")
@@ -3815,6 +3832,11 @@ def bench_e2e() -> None:
             )
             ref_stats = summarize_timing_runs(ref_runs_ms) if ref_runs_ms else None
             backend_stats = summarize_timing_runs(backend_runs_ms)
+            if ref_kernel_name is not None and ref_kernel_runs_ms:
+                batch_timing_runs["eager"][ref_kernel_name] = ref_kernel_runs_ms
+            if ref_name is not None and ref_runs_ms:
+                batch_timing_runs["eager"][ref_name] = ref_runs_ms
+            batch_timing_runs["eager"][backend_label] = backend_runs_ms
             ratio_nograph = RatioStats(ratio_runs) if ratio_runs else None
 
             if ref_kernel_stats is not None and ref_kernel_name is not None:
@@ -3865,6 +3887,7 @@ def bench_e2e() -> None:
                     ]
                     stats = summarize_timing_runs(graph_runs)
                     graph_stats_by_name[name] = stats
+                    batch_timing_runs["cuda_graph"][name] = graph_runs
                     print(f" {fmt_timing_stats(stats)}")
                 except Exception as exc:
                     print(f" FAILED ({type(exc).__name__}: {exc})")
@@ -4036,6 +4059,25 @@ def bench_e2e() -> None:
         for f in reference_warnings:
             print(f)
         print(f"{'=' * 70}\033[0m")
+    if args.timing_json is not None:
+        args.timing_json.parent.mkdir(parents=True, exist_ok=True)
+        args.timing_json.write_text(
+            json.dumps(
+                {
+                    "schema": "b12x.moe-benchmark-timing.v1",
+                    "command": sys.argv,
+                    "model_profile": args.model_profile,
+                    "quant_mode": args.quant_mode,
+                    "warmup_iterations": args.warmup,
+                    "timed_iterations_per_repeat": args.iters,
+                    "repeats": args.repeats,
+                    "samples_ms": raw_timing_runs,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     if accuracy_failures:
         print(f"\n\033[1;31m{'=' * 70}")
         print("  ACCURACY CHECK FAILED")
