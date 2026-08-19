@@ -267,6 +267,46 @@ def test_low_level_buffer_plan_honors_explicit_block_m() -> None:
         )
 
 
+def test_low_level_buffer_plan_bounds_large_m_route_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = SimpleNamespace(
+        num_experts=896,
+        hidden_size=7168,
+        intermediate_size=192,
+        is_gated=True,
+    )
+    plan_kwargs = dict(
+        prepared=prepared,
+        m=4096,
+        topk=16,
+        route_num_experts=896,
+        sms=188,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.delenv("B12X_W4A16_PREFILL_FUSED_SUM", raising=False)
+    materialized = plan_w4a16_buffers(**plan_kwargs)
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    fused = plan_w4a16_buffers(**plan_kwargs)
+    rotation = plan_w4a16_buffers(**plan_kwargs, full_rotation=True)
+    fp16 = plan_w4a16_buffers(**{**plan_kwargs, "dtype": torch.float16})
+
+    routed_rows = 4096 * 16
+    fc1_cols = 2 * 192
+    assert materialized.intermediate_cache13_elements == routed_rows * 7168
+    assert materialized.prefill_sum_accum_elements == 0
+    assert fused.intermediate_cache13_elements == max(
+        routed_rows * fc1_cols,
+        4096 * 7168,
+    )
+    assert fused.prefill_sum_accum_elements == 4096 * 7168
+    assert rotation.intermediate_cache13_elements == routed_rows * 7168
+    assert rotation.prefill_sum_accum_elements == 0
+    assert fp16.intermediate_cache13_elements == routed_rows * 7168
+    assert fp16.prefill_sum_accum_elements == 0
+
+
 def test_planned_route_block_overrides_live_batch_heuristic() -> None:
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _resolve_route_block_size_m,

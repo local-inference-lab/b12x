@@ -525,6 +525,61 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
 
 
+def test_w4a16_prefill_route_reduction_shrinks_caller_owned_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    weight_plan = _weight_plan(
+        "w4a16",
+        source_format="fp4_e8m0_k32",
+        experts=896,
+        k=7168,
+        n=192,
+        activation="situ",
+    )
+    base_caps = dict(
+        max_tokens=4096,
+        core_token_counts=(4096,),
+        num_topk=16,
+        route_num_experts=896,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+    monkeypatch.delenv("B12X_W4A16_PREFILL_FUSED_SUM", raising=False)
+    materialized = plan_tp_moe_scratch(TPMoEScratchCaps(**base_caps))
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    fused = plan_tp_moe_scratch(TPMoEScratchCaps(**base_caps))
+    calibrated = plan_tp_moe_scratch(
+        TPMoEScratchCaps(**base_caps, collect_activation_amax=True)
+    )
+
+    def specs(plan):
+        return {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    materialized_specs = specs(materialized)
+    fused_specs = specs(fused)
+    calibrated_specs = specs(calibrated)
+    routed_rows = 4096 * 16
+    fc1_cols = 2 * 192
+
+    assert materialized_specs["intermediate_cache13"].shape == (
+        routed_rows * 7168,
+    )
+    assert "prefill_sum_accum" not in materialized_specs
+    assert fused_specs["intermediate_cache13"].shape == (
+        max(routed_rows * fc1_cols, 4096 * 7168),
+    )
+    assert fused_specs["prefill_sum_accum"].shape == (4096 * 7168,)
+    assert fused_specs["prefill_sum_accum"].dtype == torch.float32
+    assert calibrated_specs["intermediate_cache13"].shape == (
+        routed_rows * 7168,
+    )
+    assert "prefill_sum_accum" not in calibrated_specs
+    assert fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
+
+
 def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

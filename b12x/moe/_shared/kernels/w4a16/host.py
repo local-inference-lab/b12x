@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from b12x._lib.env import env_flag
 from b12x.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     is_gated_moe_activation,
@@ -16,6 +17,13 @@ from b12x.moe._shared.kernels.activations import (
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
+def prefill_fused_sum_enabled() -> bool:
+    """Enable direct FP32 route reduction for large-M W4A16 launches.
+
+    The FC2 epilogue uses relaxed FP32 global reductions. Disable this path
+    when bitwise-identical route accumulation order is required.
+    """
+    return env_flag("W4A16_PREFILL_FUSED_SUM")
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,7 @@ class W4A16PackedBuffers:
     intermediate_cache13: torch.Tensor
     intermediate_cache2: torch.Tensor
     output: torch.Tensor
+    prefill_sum_accum: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
     fc2_c_tmp: torch.Tensor | None = None
     packed_route_indices: torch.Tensor | None = None
@@ -55,6 +64,7 @@ class W4A16BufferPlan:
     intermediate_cache2_elements: int
     block_size_m: int
     rotation_a_elements: int = 0
+    prefill_sum_accum_elements: int = 0
 
 
 def validate_activation(activation: str) -> bool:
@@ -248,6 +258,7 @@ def plan_w4a16_buffers(
     topk: int,
     route_num_experts: int | None = None,
     sms: int,
+    dtype: torch.dtype | None = None,
     full_rotation: bool = False,
     block_size_m: int | None = None,
 ) -> W4A16BufferPlan:
@@ -280,6 +291,12 @@ def plan_w4a16_buffers(
     if int(m) <= 8 and bool(prepared.is_gated):
         gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
+    use_prefill_fused_sum = bool(
+        prefill_fused_sum_enabled()
+        and dtype == torch.bfloat16
+        and not full_rotation
+        and int(m) > 8
+    )
     return W4A16BufferPlan(
         routed_rows=routed_rows,
         fc1_cols=fc1_cols,
@@ -297,10 +314,19 @@ def plan_w4a16_buffers(
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
-        intermediate_cache13_elements=routed_rows * max(fc1_cols, hidden_size),
+        intermediate_cache13_elements=(
+            max(routed_rows * fc1_cols, int(m) * hidden_size)
+            if use_prefill_fused_sum
+            else routed_rows * max(fc1_cols, hidden_size)
+        ),
         intermediate_cache2_elements=routed_rows * intermediate_size,
         block_size_m=block_size_m,
         rotation_a_elements=(routed_rows * hidden_size if full_rotation else 0),
+        prefill_sum_accum_elements=(
+            int(m) * hidden_size
+            if use_prefill_fused_sum
+            else 0
+        ),
     )
 
 
@@ -327,6 +353,7 @@ def make_w4a16_packed_buffers(
         topk=topk,
         route_num_experts=route_num_experts,
         sms=sms,
+        dtype=dtype,
         full_rotation=full_rotation,
         block_size_m=block_size_m,
     )
@@ -375,6 +402,15 @@ def make_w4a16_packed_buffers(
             (m, prepared.hidden_size),
             dtype=torch.float32 if full_rotation else dtype,
             device=device,
+        ),
+        prefill_sum_accum=(
+            torch.empty(
+                (plan.prefill_sum_accum_elements,),
+                dtype=torch.float32,
+                device=device,
+            )
+            if plan.prefill_sum_accum_elements
+            else None
         ),
         fc1_c_tmp=fc1_c_tmp,
         fc2_c_tmp=fc2_c_tmp,
