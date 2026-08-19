@@ -2135,6 +2135,14 @@ def test_w4a16_prefill_fused_sum_is_graph_safe_and_matches_oracle(
         _assert_matches_oracle(actual, expected, activation=activation)
     repeat_metrics = compare_to_reference(first_replay, second_replay)
     assert repeat_metrics.cos >= 0.999999, repeat_metrics
+    torch.testing.assert_close(
+        second_replay,
+        buffers.prefill_sum_accum[: m * hidden_size]
+        .view(m, hidden_size)
+        .to(second_replay.dtype),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

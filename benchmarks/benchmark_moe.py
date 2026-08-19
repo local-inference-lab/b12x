@@ -3055,6 +3055,10 @@ def bench_e2e() -> None:
         )
     if args.force_mxfp4 and args.quant_mode != "w4a8_mx":
         raise ValueError("--force-mxfp4 requires --quant-mode w4a8_mx")
+    if args.compare_prefill_fused_sum and not use_w4a16:
+        raise ValueError(
+            "--compare-prefill-fused-sum requires --quant-mode w4a16"
+        )
     if args.flashinfer_tune_max_num_tokens <= 0:
         raise ValueError("--flashinfer-tune-max-num-tokens must be positive")
     if (
@@ -3606,74 +3610,87 @@ def bench_e2e() -> None:
         if args.compare_prefill_fused_sum:
             env_name = "B12X_W4A16_PREFILL_FUSED_SUM"
             original_value = os.environ.get(env_name)
-            os.environ[env_name] = "0"
-            standard_buffers = make_backend_w4a16_buffers(
-                backend_w4a16_weights,
-                m=batch_size,
-                topk=spec.top_k,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            standard_output_storage = torch.empty_like(x)
-            standard_output = w4a16_moe(
-                x,
-                backend_w4a16_weights,
-                topk_weights,
-                topk_ids,
-                activation=args.activation,
-                fast_math=args.fast_math,
-                intermediate_cache13=standard_buffers.intermediate_cache13,
-                intermediate_cache2=standard_buffers.intermediate_cache2,
-                output=standard_output_storage,
-                prefill_sum_accum=standard_buffers.prefill_sum_accum,
-                fc1_c_tmp=standard_buffers.fc1_c_tmp,
-                fc2_c_tmp=standard_buffers.fc2_c_tmp,
-                packed_route_indices=standard_buffers.packed_route_indices,
-                block_expert_ids=standard_buffers.block_expert_ids,
-                packed_route_count=standard_buffers.packed_route_count,
-                expert_offsets=standard_buffers.expert_offsets,
-                expert_counts=standard_buffers.expert_counts,
-                **activation_params.kwargs(),
-            ).clone()
-            os.environ[env_name] = "1"
-            fused_sum_buffers = make_backend_w4a16_buffers(
-                backend_w4a16_weights,
-                m=batch_size,
-                topk=spec.top_k,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            fused_sum_output_storage = torch.empty_like(x)
-
-            def run_fused_sum_comparison() -> torch.Tensor:
-                return w4a16_moe(
+            try:
+                os.environ[env_name] = "0"
+                standard_buffers = make_backend_w4a16_buffers(
+                    backend_w4a16_weights,
+                    m=batch_size,
+                    topk=spec.top_k,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                standard_output_storage = torch.empty_like(x)
+                standard_output = w4a16_moe(
                     x,
                     backend_w4a16_weights,
                     topk_weights,
                     topk_ids,
                     activation=args.activation,
                     fast_math=args.fast_math,
-                    intermediate_cache13=fused_sum_buffers.intermediate_cache13,
-                    intermediate_cache2=fused_sum_buffers.intermediate_cache2,
-                    output=fused_sum_output_storage,
-                    prefill_sum_accum=fused_sum_buffers.prefill_sum_accum,
-                    fc1_c_tmp=fused_sum_buffers.fc1_c_tmp,
-                    fc2_c_tmp=fused_sum_buffers.fc2_c_tmp,
-                    packed_route_indices=fused_sum_buffers.packed_route_indices,
-                    block_expert_ids=fused_sum_buffers.block_expert_ids,
-                    packed_route_count=fused_sum_buffers.packed_route_count,
-                    expert_offsets=fused_sum_buffers.expert_offsets,
-                    expert_counts=fused_sum_buffers.expert_counts,
+                    intermediate_cache13=standard_buffers.intermediate_cache13,
+                    intermediate_cache2=standard_buffers.intermediate_cache2,
+                    output=standard_output_storage,
+                    prefill_sum_accum=standard_buffers.prefill_sum_accum,
+                    fc1_c_tmp=standard_buffers.fc1_c_tmp,
+                    fc2_c_tmp=standard_buffers.fc2_c_tmp,
+                    packed_route_indices=standard_buffers.packed_route_indices,
+                    block_expert_ids=standard_buffers.block_expert_ids,
+                    packed_route_count=standard_buffers.packed_route_count,
+                    expert_offsets=standard_buffers.expert_offsets,
+                    expert_counts=standard_buffers.expert_counts,
                     **activation_params.kwargs(),
+                ).clone()
+                os.environ[env_name] = "1"
+                fused_sum_buffers = make_backend_w4a16_buffers(
+                    backend_w4a16_weights,
+                    m=batch_size,
+                    topk=spec.top_k,
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
+                fused_sum_output_storage = torch.empty_like(x)
+                fused_activation_kwargs = activation_params.kwargs()
 
-            fused_sum_output = run_fused_sum_comparison().clone()
-            fused_sum_repeat = run_fused_sum_comparison().clone()
-            torch.cuda.synchronize()
-            if original_value is None:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = original_value
+                def run_fused_sum_comparison(
+                    input_tensor=x,
+                    prepared_weights=backend_w4a16_weights,
+                    route_weights=topk_weights,
+                    route_ids=topk_ids,
+                    buffers=fused_sum_buffers,
+                    output_storage=fused_sum_output_storage,
+                    activation=args.activation,
+                    fast_math=args.fast_math,
+                    activation_kwargs=fused_activation_kwargs,
+                ) -> torch.Tensor:
+                    return w4a16_moe(
+                        input_tensor,
+                        prepared_weights,
+                        route_weights,
+                        route_ids,
+                        activation=activation,
+                        fast_math=fast_math,
+                        intermediate_cache13=buffers.intermediate_cache13,
+                        intermediate_cache2=buffers.intermediate_cache2,
+                        output=output_storage,
+                        prefill_sum_accum=buffers.prefill_sum_accum,
+                        fc1_c_tmp=buffers.fc1_c_tmp,
+                        fc2_c_tmp=buffers.fc2_c_tmp,
+                        packed_route_indices=buffers.packed_route_indices,
+                        block_expert_ids=buffers.block_expert_ids,
+                        packed_route_count=buffers.packed_route_count,
+                        expert_offsets=buffers.expert_offsets,
+                        expert_counts=buffers.expert_counts,
+                        **activation_kwargs,
+                    )
+
+                fused_sum_output = run_fused_sum_comparison().clone()
+                fused_sum_repeat = run_fused_sum_comparison().clone()
+                torch.cuda.synchronize()
+            finally:
+                if original_value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = original_value
             fused_sum_metrics = compare_to_reference(
                 fused_sum_output, standard_output
             )
@@ -3692,6 +3709,14 @@ def bench_e2e() -> None:
                     "prefill fused sum repeat", fused_sum_repeat_metrics
                 )
             )
+            if (
+                not math.isfinite(fused_sum_metrics.cos)
+                or fused_sum_metrics.cos < 0.9999
+            ):
+                accuracy_failures.append(
+                    f"  bs={batch_size} prefill fused sum vs standard: "
+                    f"cos={fused_sum_metrics.cos:.6f} < 0.999900"
+                )
 
         if ref_output is not None:
             ref_compare_metrics = compare_to_reference(backend_out, ref_output)

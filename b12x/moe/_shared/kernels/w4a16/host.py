@@ -17,6 +17,8 @@ from b12x.moe._shared.kernels.activations import (
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
+
+
 def prefill_fused_sum_enabled() -> bool:
     """Enable direct FP32 route reduction for large-M W4A16 launches.
 
@@ -24,6 +26,41 @@ def prefill_fused_sum_enabled() -> bool:
     when bitwise-identical route accumulation order is required.
     """
     return env_flag("W4A16_PREFILL_FUSED_SUM")
+
+
+def prefill_fused_sum_eligible(
+    *,
+    dtype: torch.dtype | str,
+    m: int,
+    full_rotation: bool,
+    weight_layout: str,
+    collect_activation_amax: bool,
+    enabled: bool | None = None,
+) -> bool:
+    """Return whether one W4A16 launch may use direct route reduction.
+
+    Args:
+        dtype: Activation element dtype as a PyTorch dtype or kernel dtype name.
+        m: Logical token rows represented by the launch.
+        full_rotation: Whether the launch uses full-rotation Trellis weights.
+        weight_layout: Prepared W4A16 weight layout.
+        collect_activation_amax: Whether the launch records activation maxima.
+        enabled: Frozen feature selection. ``None`` reads the process setting.
+
+    Returns:
+        ``True`` when planning and execution may use the FP32 accumulator.
+    """
+    if enabled is None:
+        enabled = prefill_fused_sum_enabled()
+    element_dtype = str(dtype).removeprefix("torch.")
+    return bool(
+        enabled
+        and element_dtype in {"bfloat16", "bf16"}
+        and int(m) > 8
+        and not full_rotation
+        and weight_layout in {"packed", "modelopt"}
+        and not collect_activation_amax
+    )
 
 
 @dataclass(frozen=True)
@@ -261,6 +298,9 @@ def plan_w4a16_buffers(
     dtype: torch.dtype | None = None,
     full_rotation: bool = False,
     block_size_m: int | None = None,
+    weight_layout: str | None = None,
+    collect_activation_amax: bool = False,
+    prefill_fused_sum: bool | None = None,
 ) -> W4A16BufferPlan:
     routed_rows = int(m) * int(topk)
     route_num_experts = (
@@ -291,11 +331,18 @@ def plan_w4a16_buffers(
     if int(m) <= 8 and bool(prepared.is_gated):
         gemm_route_slots = max(gemm_route_slots, routed_rows * block_size_m)
     scratch_sms = int(sms)
-    use_prefill_fused_sum = bool(
-        prefill_fused_sum_enabled()
-        and dtype == torch.bfloat16
-        and not full_rotation
-        and int(m) > 8
+    weight_layout = str(
+        weight_layout
+        if weight_layout is not None
+        else getattr(prepared, "weight_layout", "packed")
+    )
+    use_prefill_fused_sum = prefill_fused_sum_eligible(
+        dtype=dtype if dtype is not None else "",
+        m=m,
+        full_rotation=full_rotation,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        enabled=prefill_fused_sum,
     )
     return W4A16BufferPlan(
         routed_rows=routed_rows,

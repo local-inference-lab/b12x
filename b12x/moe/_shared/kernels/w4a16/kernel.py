@@ -108,6 +108,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     plan_w4a16_buffers,
+    prefill_fused_sum_eligible,
     prefill_fused_sum_enabled,
     select_route_block_size_m,
     validate_activation,
@@ -9433,7 +9434,14 @@ def compile_w4a16_fused_moe(
     )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_routed_rows * fc1_cols,),
+        (
+            max(
+                compile_routed_rows * fc1_cols,
+                compile_size_m * hidden_size,
+            )
+            if kernel.prefill_fused_sum_fp32
+            else compile_routed_rows * fc1_cols,
+        ),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
@@ -12182,14 +12190,18 @@ def run_w4a16_moe(
     # TC-decode requires the inline direct-topk route path (no route-pack).
     use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
 
-    use_prefill_fused_sum = bool(
-        prefill_fused_sum_enabled()
-        and not collect_activation_amax
-        and (fused_launch is None or preplanned_prefill_fused_sum)
-        and not full_rotation
-        and weight_layout in {"packed", "modelopt"}
-        and element_dtype == "bf16"
-        and int(m) > _TC_DECODE_MAX_M
+    prefill_fused_sum_requested = (
+        preplanned_prefill_fused_sum
+        if fused_launch is not None
+        else prefill_fused_sum_enabled()
+    )
+    use_prefill_fused_sum = prefill_fused_sum_eligible(
+        dtype=element_dtype,
+        m=m,
+        full_rotation=full_rotation,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        enabled=prefill_fused_sum_requested,
     )
     use_fused_topk_sum = bool(use_tc_decode or use_prefill_fused_sum)
 
@@ -12311,6 +12323,9 @@ def run_w4a16_moe(
         dtype=(prepared_dtype if full_rotation else a_input.dtype),
         full_rotation=full_rotation,
         block_size_m=block_size_m,
+        weight_layout=weight_layout,
+        collect_activation_amax=collect_activation_amax,
+        prefill_fused_sum=use_prefill_fused_sum,
     )
     intermediate_size = int(prepared.intermediate_size)
     fc1_cols = buffer_plan.fc1_cols
@@ -12497,7 +12512,7 @@ def run_w4a16_moe(
             f"available_elements={intermediate_cache13_flat.numel()}, "
             f"required_elements={required_cache13_elements}, "
             f"fused_topk_sum={use_fused_topk_sum}, "
-            f"prefill_enabled={prefill_fused_sum_enabled()}, "
+            f"prefill_fused_sum={use_prefill_fused_sum}, "
             f"collect_activation_amax={collect_activation_amax}, "
             f"full_rotation={full_rotation}, weight_layout={weight_layout}, "
             f"element_dtype={element_dtype}"
@@ -12507,7 +12522,15 @@ def run_w4a16_moe(
             "intermediate_cache2 is smaller than the selected W4A16 launch capacity: "
             f"capacity_rows={capacity_m}, topk={topk}"
         )
-    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
+    fc1_out_elements = (
+        required_cache13_elements
+        if use_prefill_fused_sum
+        else capacity_routed_rows * fc1_cols
+    )
+    # The fused kernel reuses the FC1 backing allocation for its final BF16
+    # output cast. Expose the complete declared extent to CuTeDSL while FC1 and
+    # activation stages continue to index only their routed-row prefix.
+    fc1_out = intermediate_cache13_flat[:fc1_out_elements]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
     if use_prefill_fused_sum:
         assert prefill_sum_accum is not None

@@ -291,6 +291,14 @@ def test_low_level_buffer_plan_bounds_large_m_route_reduction(
     fused = plan_w4a16_buffers(**plan_kwargs)
     rotation = plan_w4a16_buffers(**plan_kwargs, full_rotation=True)
     fp16 = plan_w4a16_buffers(**{**plan_kwargs, "dtype": torch.float16})
+    trellis = plan_w4a16_buffers(
+        **plan_kwargs,
+        weight_layout="trellis_t256",
+    )
+    activation_amax = plan_w4a16_buffers(
+        **plan_kwargs,
+        collect_activation_amax=True,
+    )
 
     routed_rows = 4096 * 16
     fc1_cols = 2 * 192
@@ -305,6 +313,10 @@ def test_low_level_buffer_plan_bounds_large_m_route_reduction(
     assert rotation.prefill_sum_accum_elements == 0
     assert fp16.intermediate_cache13_elements == routed_rows * 7168
     assert fp16.prefill_sum_accum_elements == 0
+    assert trellis.intermediate_cache13_elements == routed_rows * 7168
+    assert trellis.prefill_sum_accum_elements == 0
+    assert activation_amax.intermediate_cache13_elements == routed_rows * 7168
+    assert activation_amax.prefill_sum_accum_elements == 0
 
 
 def test_planned_route_block_overrides_live_batch_heuristic() -> None:

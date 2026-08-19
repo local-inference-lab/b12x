@@ -1557,7 +1557,7 @@ def red_add_global_v4_f32(
     loc=None,
     ip=None,
 ):
-    """No-return vector add reduction for four aligned FP32 elements."""
+    """Reduce-add four FP32 elements at a 16-byte-aligned address."""
     llvm.inline_asm(
         None,
         [
