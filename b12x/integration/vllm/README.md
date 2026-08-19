@@ -55,6 +55,7 @@ vllm serve "$B12X_FP6_MODEL_DIR" \
 |---|---|---|
 | `B12X_ENABLE_FP6` | off | Master gate |
 | `B12X_FP6_MODEL_DIR` | — | Checkpoint path for spawned workers |
+| `B12X_QSRT_MODEL_DIR` | — | QSRT checkpoint path used to locate `b12x-qsrt-manifest.json` |
 | `B12X_MOE_WARM_MS` | auto | Override MoE decode warm-run token counts |
 | `B12X_DYNAMIC_DETERMINISTIC_OUTPUT` | off | Deterministic MoE combine (KLD scoring) |
 | `B12X_DISABLE_BF16_GEMV` | off | Disable small-N bf16 GEMV routing |

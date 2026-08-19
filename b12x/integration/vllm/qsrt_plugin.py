@@ -25,7 +25,6 @@ CHECKPOINT_KIND = "qwen38_dense_mlp_qsrt_k5_rank16_checkpoint_v1"
 DESCRIPTOR_SHA256 = "17cf4ca9ef1e3a07c3354c12f7ac887b4e081b1668bea61eb37d8f2b410bb968"
 RANK = 16
 BITS = 5
-_MAX_CAPTURE_M = 512
 _DEFAULT_CAPTURE_MS = (1, 2, 4, 8, 16)
 _COMPONENT_DTYPES = {
     "trellis": torch.int16,
@@ -37,7 +36,7 @@ _COMPONENT_DTYPES = {
 
 _registered = False
 _CONFIG_CLS: Optional[type] = None
-_WARMED_GEOMETRIES: set[tuple[int, int, int, int, int]] = set()
+_WARMED_GEOMETRIES: set[tuple[int, int, int, int, int, int]] = set()
 _SHARED_BUFFERS: dict[tuple[int, int, int, int], Any] = {}
 _SHARED_PAIR_BUFFERS: dict[tuple[int, int, int, int], Any] = {}
 logger = logging.getLogger("b12x.vllm_qsrt")
@@ -68,6 +67,7 @@ def _projection_group(prefix: str, modules: set[str]) -> str | None:
 
 
 def _validate_quantization_config(config: dict[str, Any]) -> tuple[str, ...]:
+    _workspace_capacity_rows(config)
     modules = config.get("modules")
     if (
         config.get("quant_method") != QUANT_NAME
@@ -107,7 +107,21 @@ def _device_index(device: torch.device) -> int:
     return torch.cuda.current_device() if device.index is None else int(device.index)
 
 
-def _capture_sizes() -> tuple[int, ...]:
+def _workspace_capacity_rows(config: dict[str, Any]) -> int:
+    """Return the checkpoint-declared upper bound for shared row storage."""
+
+    value = config.get("workspace_capacity_rows")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            "B12X QSRT quantization configuration requires a positive "
+            "workspace_capacity_rows"
+        )
+    return value
+
+
+def _capture_sizes(capacity_rows: int) -> tuple[int, ...]:
+    if capacity_rows <= 0:
+        raise ValueError("B12X QSRT workspace capacity must be positive")
     sizes = set(_DEFAULT_CAPTURE_MS)
     configured_sizes: set[int] = set()
     try:
@@ -122,23 +136,27 @@ def _capture_sizes() -> tuple[int, ...]:
             configured_sizes = {int(value) for value in configured}
     except Exception:
         logger.debug("vLLM CUDA-graph sizes are unavailable", exc_info=True)
-    unsupported = sorted(value for value in configured_sizes if value > _MAX_CAPTURE_M)
+    unsupported = sorted(value for value in configured_sizes if value > capacity_rows)
     if unsupported:
         raise NotImplementedError(
-            "B12X QSRT CUDA graphs support at most "
-            f"{_MAX_CAPTURE_M} rows; configured sizes include {unsupported}"
+            "B12X QSRT CUDA-graph rows exceed the declared workspace capacity "
+            f"{capacity_rows}: {unsupported}"
         )
     sizes.update(configured_sizes)
-    return tuple(sorted(value for value in sizes if 1 <= value <= _MAX_CAPTURE_M))
+    return tuple(sorted(value for value in sizes if 1 <= value <= capacity_rows))
 
 
-def _shared_buffers(weight: Any, rows: int) -> Any:
+def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
+    if rows <= 0 or rows > capacity_rows:
+        raise ValueError(
+            f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
+        )
     base = weight.base
     key = (
         _device_index(base.trellis.device),
-        int(rows),
+        int(capacity_rows),
         int(base.in_features),
         int(base.out_features),
     )
@@ -151,21 +169,24 @@ def _shared_buffers(weight: Any, rows: int) -> Any:
             )
         buffers = trellis_linear.make_buffers(
             weight,
-            size_m=rows,
+            size_m=capacity_rows,
             input_dtype=torch.bfloat16,
         )
-        if rows <= _MAX_CAPTURE_M:
-            _SHARED_BUFFERS[key] = buffers
-    return buffers
+        _SHARED_BUFFERS[key] = buffers
+    return trellis_linear.view_buffers(buffers, size_m=rows)
 
 
-def _shared_pair_buffers(weight: Any, rows: int) -> Any:
+def _shared_pair_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
+    if rows <= 0 or rows > capacity_rows:
+        raise ValueError(
+            f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
+        )
     base = weight.left
     key = (
         _device_index(base.trellis.device),
-        int(rows),
+        int(capacity_rows),
         int(base.in_features),
         int(base.out_features),
     )
@@ -177,12 +198,11 @@ def _shared_pair_buffers(weight: Any, rows: int) -> Any:
             )
         buffers = trellis_linear.make_pair_buffers(
             weight,
-            size_m=rows,
+            size_m=capacity_rows,
             input_dtype=torch.bfloat16,
         )
-        if rows <= _MAX_CAPTURE_M:
-            _SHARED_PAIR_BUFFERS[key] = buffers
-    return buffers
+        _SHARED_PAIR_BUFFERS[key] = buffers
+    return trellis_linear.view_pair_buffers(buffers, size_m=rows)
 
 
 def _run_weight(
@@ -261,10 +281,10 @@ def register_b12x_qsrt() -> None:
         return
     try:
         from vllm.logger import init_logger
-
+    except ImportError:
+        logger.debug("vLLM logger is unavailable; using stdlib logging", exc_info=True)
+    else:
         logger = init_logger("vllm.b12x_qsrt")
-    except Exception:
-        pass
 
     from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
     from vllm.model_executor.layers.quantization import register_quantization_config
@@ -272,6 +292,9 @@ def register_b12x_qsrt() -> None:
     from vllm.model_executor.utils import set_weight_attrs
 
     class _VllmQSRTLinearMethod(LinearMethodBase):  # type: ignore[misc]
+        def __init__(self, workspace_capacity_rows: int) -> None:
+            self.workspace_capacity_rows = int(workspace_capacity_rows)
+
         def create_weights(
             self,
             layer: Any,
@@ -387,12 +410,17 @@ def register_b12x_qsrt() -> None:
                 dtype=a_parameter.dtype,
                 device=a_parameter.device,
             )
-            sizes = _capture_sizes()
+            capacity_rows = self.workspace_capacity_rows
+            sizes = _capture_sizes(capacity_rows)
+            if stacked:
+                _shared_pair_buffers(weight, capacity_rows, capacity_rows)
+            else:
+                _shared_buffers(weight, capacity_rows, capacity_rows)
             for rows in sizes:
                 if stacked:
-                    _shared_pair_buffers(weight, rows)
+                    _shared_pair_buffers(weight, rows, capacity_rows)
                 else:
-                    _shared_buffers(weight, rows)
+                    _shared_buffers(weight, rows, capacity_rows)
             for rows in sizes:
                 if stacked:
                     geometry = (
@@ -401,6 +429,7 @@ def register_b12x_qsrt() -> None:
                         rows,
                         int(weight.left.in_features),
                         int(weight.left.out_features),
+                        capacity_rows,
                     )
                     device = weight.left.trellis.device
                     input_features = int(weight.left.in_features)
@@ -411,6 +440,7 @@ def register_b12x_qsrt() -> None:
                         rows,
                         int(weight.base.in_features),
                         int(weight.base.out_features),
+                        capacity_rows,
                     )
                     device = weight.base.trellis.device
                     input_features = int(weight.base.in_features)
@@ -425,10 +455,14 @@ def register_b12x_qsrt() -> None:
                     trellis_linear.run_additive_pair(
                         x,
                         weight,
-                        buffers=_shared_pair_buffers(weight, rows),
+                        buffers=_shared_pair_buffers(weight, rows, capacity_rows),
                     )
                 else:
-                    _run_weight(x, weight, _shared_buffers(weight, rows))
+                    _run_weight(
+                        x,
+                        weight,
+                        _shared_buffers(weight, rows, capacity_rows),
+                    )
                 _WARMED_GEOMETRIES.add(geometry)
             device = (
                 weight.left.trellis.device if stacked else weight.base.trellis.device
@@ -448,6 +482,7 @@ def register_b12x_qsrt() -> None:
                 raise ValueError("B12X QSRT requires contiguous BF16 activations")
             x2d = x.reshape(-1, x.shape[-1])
             rows = int(x2d.shape[0])
+            capacity_rows = self.workspace_capacity_rows
             weight = layer.b12x_qsrt_weight
             if layer.b12x_qsrt_group == "gate_up":
                 from b12x.gemm import trellis_linear
@@ -455,10 +490,10 @@ def register_b12x_qsrt() -> None:
                 result = trellis_linear.run_additive_pair(
                     x2d,
                     weight,
-                    buffers=_shared_pair_buffers(weight, rows),
+                    buffers=_shared_pair_buffers(weight, rows, capacity_rows),
                 )
             else:
-                buffers = _shared_buffers(weight, rows)
+                buffers = _shared_buffers(weight, rows, capacity_rows)
                 result = _run_weight(x2d, weight, buffers)
             if x.dim() > 2:
                 result = result.reshape(*x.shape[:-1], result.shape[-1])
@@ -486,9 +521,10 @@ def register_b12x_qsrt() -> None:
             super().__init__()
             self._config = dict(config)
             self._modules = set(_validate_quantization_config(self._config))
+            self._workspace_capacity_rows = _workspace_capacity_rows(self._config)
             self._model_dir = model_dir or os.environ.get(MODEL_DIR_ENV) or None
             self._manifest_validated = False
-            self._method = _VllmQSRTLinearMethod()
+            self._method = _VllmQSRTLinearMethod(self._workspace_capacity_rows)
 
         def __reduce__(self):
             return (_rebuild_config, (self._config, self._model_dir))

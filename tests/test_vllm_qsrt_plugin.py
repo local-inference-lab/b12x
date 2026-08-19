@@ -16,6 +16,7 @@ from b12x.integration.vllm.qsrt_plugin import (
     _parameter_loader,
     _projection_group,
     _validate_quantization_config,
+    _workspace_capacity_rows,
 )
 
 
@@ -28,6 +29,7 @@ def _config() -> dict[str, object]:
         "descriptor_sha256": DESCRIPTOR_SHA256,
         "rank": RANK,
         "tensor_parallel_size": 1,
+        "workspace_capacity_rows": 8192,
         "modules": [
             f"model.language_model.layers.{layer}.mlp.{projection}"
             for layer in range(64)
@@ -56,11 +58,19 @@ def test_quantization_config_claims_only_complete_decoder_mlps() -> None:
     )
 
 
-def test_quantization_config_rejects_an_incomplete_layer() -> None:
+def test_quantization_config_rejects_a_short_module_inventory() -> None:
     config = _config()
     config["modules"] = config["modules"][:-1]
     with pytest.raises(ValueError, match="incompatible"):
         _validate_quantization_config(config)
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5])
+def test_workspace_capacity_requires_a_positive_integer(value: object) -> None:
+    config = _config()
+    config["workspace_capacity_rows"] = value
+    with pytest.raises(ValueError, match="workspace_capacity_rows"):
+        _workspace_capacity_rows(config)
 
 
 def test_stacked_payload_loader_is_exactly_once_and_dtype_strict() -> None:
@@ -102,12 +112,12 @@ def test_capture_sizes_include_vllm_graph_geometries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_vllm_config(monkeypatch, [32, 64, 128])
-    assert _capture_sizes() == (1, 2, 4, 8, 16, 32, 64, 128)
+    assert _capture_sizes(256) == (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 def test_capture_sizes_reject_rows_outside_packed_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_vllm_config(monkeypatch, [512, 1024])
-    with pytest.raises(NotImplementedError, match="at most 512 rows"):
-        _capture_sizes()
+    with pytest.raises(NotImplementedError, match="capacity 512"):
+        _capture_sizes(512)

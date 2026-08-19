@@ -29,6 +29,52 @@ def _sm12x_available() -> bool:
     return major == 12 and minor in (0, 1)
 
 
+def _capacity_buffers(capacity: int) -> api.Buffers:
+    def matrix(width: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.empty((capacity, width), dtype=dtype)
+
+    return api.Buffers(
+        output=matrix(7),
+        gemm_output=matrix(7),
+        c_tmp=torch.empty(31, dtype=torch.float32),
+        input_f16=matrix(5, torch.float16),
+        rotated_f16=matrix(5, torch.float16),
+        rotated_compute=matrix(5),
+        gemm_output_f16=matrix(7, torch.float16),
+        output_f16=matrix(7, torch.float16),
+        low_rank_hidden=matrix(16),
+    )
+
+
+def test_capacity_buffer_views_reuse_storage_without_cache_growth() -> None:
+    capacity = 8
+    buffers = _capacity_buffers(capacity)
+    view = api.view_buffers(buffers, size_m=3)
+    assert view.output.shape == (3, 7)
+    assert view.low_rank_hidden is not None
+    assert view.low_rank_hidden.shape == (3, 16)
+    assert view.output.data_ptr() == buffers.output.data_ptr()
+    assert view.c_tmp is buffers.c_tmp
+    assert view.output.is_contiguous()
+
+    pair = api.PairBuffers(
+        base=buffers,
+        output=torch.empty((capacity, 14), dtype=torch.bfloat16),
+        low_rank_hidden=torch.empty((2, capacity, 16), dtype=torch.bfloat16),
+    )
+    pair_view = api.view_pair_buffers(pair, size_m=3)
+    assert pair_view.output.shape == (3, 14)
+    assert pair_view.low_rank_hidden.shape == (2, 3, 16)
+    assert pair_view.output.data_ptr() == pair.output.data_ptr()
+    assert pair_view.low_rank_hidden.data_ptr() == pair.low_rank_hidden.data_ptr()
+    assert pair_view.low_rank_hidden.is_contiguous()
+
+    with pytest.raises(ValueError, match=r"\[1, 8\]"):
+        api.view_buffers(buffers, size_m=9)
+    with pytest.raises(ValueError, match=r"\[1, 8\]"):
+        api.view_pair_buffers(pair, size_m=0)
+
+
 def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
     value = window.astype(np.uint64)
     value = ((value * _MCG) & np.uint64(0xFFFFFFFF)).astype(np.uint32)

@@ -287,7 +287,10 @@ def _validate_archives(
                 raise ValueError("selected Qwen recovery overlay metadata differs")
         identity.update(
             {
-                "factor_source": "selected 50M-token full-model QAT overlay",
+                "factor_source": (
+                    "rank-16 dense-MLP factors selected by the completed "
+                    "full-depth quantization-aware recovery report"
+                ),
                 "recovery_report": str(complete_path),
                 "recovery_report_sha256": _sha256(complete_path),
                 "selected_overlay": str(overlay_path),
@@ -419,12 +422,12 @@ def _run_case(
     b_before = weight.b.clone()
     eager = packed_run().clone()
     pointers_before = _tensor_pointers(packed_buffers)
+    packed_buffers.output.fill_(float("nan"))
     packed_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(packed_graph):
         captured = packed_run()
     torch.cuda.synchronize(device)
-    capture_matches_eager = bool(torch.equal(captured, eager))
-    packed_buffers.output.fill_(float("nan"))
+    capture_preserves_poison = bool(torch.isnan(packed_buffers.output).all())
     allocated_before_replay = torch.cuda.memory_allocated(device)
     packed_graph.replay()
     packed_graph.replay()
@@ -493,7 +496,7 @@ def _run_case(
     correctness = {
         "output": output_metrics,
         "linear_jacobian_vector_product": jvp_metrics,
-        "capture_matches_eager_bit_exact": capture_matches_eager,
+        "capture_preserves_output_poison": capture_preserves_poison,
         "replay_matches_eager_bit_exact": replay_matches_eager,
         "buffer_pointers_stable": pointers_before == pointers_after,
         "replay_allocation_stable": allocated_before_replay == allocated_after_replay,
@@ -502,7 +505,7 @@ def _run_case(
     correctness["passed"] = bool(
         output_metrics["passed"]
         and jvp_metrics["passed"]
-        and capture_matches_eager
+        and capture_preserves_poison
         and replay_matches_eager
         and pointers_before == pointers_after
         and allocated_before_replay == allocated_after_replay
@@ -510,6 +513,7 @@ def _run_case(
     )
     timing: dict[str, Any] = {
         "hot": {name: _summary(values) for name, values in hot.items()},
+        "hot_samples_us": hot,
         "hot_packed_over_decoded": (
             statistics.median(hot["packed_k5_rank16"])
             / statistics.median(hot["decoded_bf16_rank16"])
@@ -517,6 +521,7 @@ def _run_case(
     }
     if cold is not None:
         timing["cold"] = {name: _summary(values) for name, values in cold.items()}
+        timing["cold_samples_us"] = cold
         timing["cold_packed_over_decoded"] = statistics.median(
             cold["packed_k5_rank16"]
         ) / statistics.median(cold["decoded_bf16_rank16"])
@@ -603,12 +608,12 @@ def _run_pair_case(
     b_before = weight.b.clone()
     eager = packed_run().clone()
     pointers_before = _pair_tensor_pointers(packed_buffers)
+    packed_buffers.output.fill_(float("nan"))
     packed_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(packed_graph):
         captured = packed_run()
     torch.cuda.synchronize(device)
-    capture_matches_eager = bool(torch.equal(captured, eager))
-    packed_buffers.output.fill_(float("nan"))
+    capture_preserves_poison = bool(torch.isnan(packed_buffers.output).all())
     allocated_before_replay = torch.cuda.memory_allocated(device)
     packed_graph.replay()
     packed_graph.replay()
@@ -689,7 +694,7 @@ def _run_pair_case(
     correctness = {
         "output": output_metrics,
         "linear_jacobian_vector_product": jvp_metrics,
-        "capture_matches_eager_bit_exact": capture_matches_eager,
+        "capture_preserves_output_poison": capture_preserves_poison,
         "replay_matches_eager_bit_exact": replay_matches_eager,
         "buffer_pointers_stable": pointers_before == pointers_after,
         "replay_allocation_stable": allocated_before_replay == allocated_after_replay,
@@ -698,7 +703,7 @@ def _run_pair_case(
     correctness["passed"] = bool(
         output_metrics["passed"]
         and jvp_metrics["passed"]
-        and capture_matches_eager
+        and capture_preserves_poison
         and replay_matches_eager
         and pointers_before == pointers_after
         and allocated_before_replay == allocated_after_replay
@@ -706,6 +711,7 @@ def _run_pair_case(
     )
     timing: dict[str, Any] = {
         "hot": {name: _summary(values) for name, values in hot.items()},
+        "hot_samples_us": hot,
         "hot_packed_over_decoded": (
             statistics.median(hot["packed_pair_k5_rank16"])
             / statistics.median(hot["decoded_fused_bf16_rank16"])
@@ -713,6 +719,7 @@ def _run_pair_case(
     }
     if cold is not None:
         timing["cold"] = {name: _summary(values) for name, values in cold.items()}
+        timing["cold_samples_us"] = cold
         timing["cold_packed_over_decoded"] = statistics.median(
             cold["packed_pair_k5_rank16"]
         ) / statistics.median(cold["decoded_fused_bf16_rank16"])
@@ -741,7 +748,6 @@ def _run_pair_case(
             + packed_buffers.output.numel() * packed_buffers.output.element_size()
             + packed_buffers.low_rank_hidden.numel()
             * packed_buffers.low_rank_hidden.element_size(),
-            "factor_kernel_launches": 2,
         },
     }
 
@@ -753,7 +759,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--recovery-root",
         type=Path,
-        help="completed QAT run whose selected overlay replaces the initial factors",
+        help=(
+            "completed full-depth quantization-aware recovery directory whose "
+            "report selects the factor overlay"
+        ),
     )
     parser.add_argument("--qsrt-root", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
@@ -849,6 +858,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "gate_up_factor_execution": (
                 "one shared rank-16 projection launch and one shared output launch"
             ),
+            "gate_up_factor_kernel_launches_expected": 2,
         },
         "archives": archive_identity,
         "device": {
@@ -929,7 +939,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     result["completed_unix_ns"] = time.time_ns()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(f".{args.output.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    temporary.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     temporary.replace(args.output)
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] != "passed":

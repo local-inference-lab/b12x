@@ -96,6 +96,76 @@ class PairBuffers:
     low_rank_hidden: torch.Tensor
 
 
+def view_buffers(buffers: Buffers, *, size_m: int) -> Buffers:
+    """Return exact-row views backed by one preallocated buffer capacity."""
+
+    if not isinstance(buffers, Buffers):
+        raise TypeError("dense Trellis buffer views require Buffers")
+    capacity = int(buffers.output.shape[0])
+    size_m = int(size_m)
+    if size_m <= 0 or size_m > capacity:
+        raise ValueError(
+            f"dense Trellis row count must be in [1, {capacity}], got {size_m}"
+        )
+
+    def rows(name: str, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.ndim != 2 or int(tensor.shape[0]) != capacity:
+            raise ValueError(
+                f"dense Trellis {name} does not share the {capacity}-row capacity"
+            )
+        return tensor[:size_m]
+
+    def required_rows(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        result = rows(name, tensor)
+        assert result is not None
+        return result
+
+    if size_m == capacity:
+        return buffers
+    return Buffers(
+        output=required_rows("output", buffers.output),
+        gemm_output=required_rows("gemm_output", buffers.gemm_output),
+        c_tmp=buffers.c_tmp,
+        input_f16=rows("input_f16", buffers.input_f16),
+        rotated_f16=required_rows("rotated_f16", buffers.rotated_f16),
+        rotated_compute=rows("rotated_compute", buffers.rotated_compute),
+        gemm_output_f16=rows("gemm_output_f16", buffers.gemm_output_f16),
+        output_f16=rows("output_f16", buffers.output_f16),
+        low_rank_hidden=rows("low_rank_hidden", buffers.low_rank_hidden),
+    )
+
+
+def view_pair_buffers(buffers: PairBuffers, *, size_m: int) -> PairBuffers:
+    """Return exact-row paired views backed by one preallocated capacity."""
+
+    if not isinstance(buffers, PairBuffers):
+        raise TypeError("paired Trellis buffer views require PairBuffers")
+    if buffers.output.ndim != 2 or buffers.low_rank_hidden.ndim != 3:
+        raise ValueError("paired Trellis capacity storage has incompatible ranks")
+    capacity = int(buffers.output.shape[0])
+    size_m = int(size_m)
+    if (
+        size_m <= 0
+        or size_m > capacity
+        or tuple(buffers.low_rank_hidden.shape[:2]) != (2, capacity)
+        or int(buffers.base.output.shape[0]) != capacity
+    ):
+        raise ValueError(
+            f"paired Trellis row count must be in [1, {capacity}], got {size_m}"
+        )
+    if size_m == capacity:
+        return buffers
+    rank = int(buffers.low_rank_hidden.shape[2])
+    hidden = buffers.low_rank_hidden.view(-1, rank)[: 2 * size_m]
+    return PairBuffers(
+        base=view_buffers(buffers.base, size_m=size_m),
+        output=buffers.output[:size_m],
+        low_rank_hidden=hidden.view(2, size_m, rank),
+    )
+
+
 def prepare_additive_weight(
     base: PreparedWeight,
     a: torch.Tensor,

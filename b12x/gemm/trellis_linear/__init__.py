@@ -7,8 +7,9 @@ views; execution performs input rotation, a W4A16 or direct E4M3-W4A8 GEMM,
 and output rotation. Optional additive rank-16 branches evaluate native BF16
 tensor-core stages while retaining the packed base weight. Equal-shaped
 gate/up factors share one projection launch and one output launch.
-Callers that need CUDA-graph capture can allocate all stable storage with
-:func:`make_buffers` or :func:`make_pair_buffers`.
+Callers allocate stable capacity with :func:`make_buffers` or
+:func:`make_pair_buffers` and obtain allocation-free exact-row views with
+:func:`view_buffers` or :func:`view_pair_buffers`.
 """
 
 from __future__ import annotations
@@ -36,6 +37,8 @@ META = OpMeta(
         "run",
         "run_additive",
         "run_additive_pair",
+        "view_buffers",
+        "view_pair_buffers",
         "is_supported",
         "clear_caches",
     ),
@@ -78,6 +81,8 @@ if TYPE_CHECKING:
         run,
         run_additive,
         run_additive_pair,
+        view_buffers,
+        view_pair_buffers,
     )
 
 install_lazy_api(globals(), META)

@@ -22,7 +22,8 @@ prefix:
 
 The reconstruction profile is `sqg_fp16_d3l`, exposed to B12X as the
 `sqg_fp16` codebook. The plugin rejects another bitrate, profile descriptor,
-rank, tensor-parallel size, module inventory, tensor shape, or dtype. The
+rank, tensor-parallel size, module inventory, shared-workspace row capacity,
+tensor shape, or dtype. The
 checkpoint manifest must bind the K5 artifact, rank panel, completed recovery
 report, and selected factor overlay. Manifest, `config.json`, and tensor-index
 hashes are checked before a claimed linear is constructed.
@@ -44,15 +45,17 @@ one A launch and one B launch. A complete 64-layer decoder therefore dispatches
 per-projection adapters.
 
 Every CUDA-graph-visible output and scratch tensor has a stable owner. The
-plugin allocates configured capture row counts during weight processing and
-reuses gate/up and down-projection storage by geometry. Qwen3.8 decoder layers
+checkpoint's `workspace_capacity_rows` value bounds one buffer pool allocated
+during weight processing. Exact-row views of that fixed pool serve eager and
+CUDA-graph execution without device allocation or cache growth. Qwen3.8 decoder layers
 execute in source order: the following activation consumes a gate/up output,
 and the following decoder layer's input normalization consumes a down output,
 before the same storage address is written again. CUDA stream ordering retains
 that lifetime rule during graph capture and replay. Capture with an unprepared
-row count or factor geometry fails closed. A device outside SM120/SM121, TP
+factor geometry fails closed, and a request above the declared row capacity is
+rejected. A device outside SM120/SM121, TP
 greater than one, activation dtype other than BF16, bias, non-contiguous input,
-and capture sizes above 512 rows are unsupported.
+and capture sizes above the declared workspace capacity are unsupported.
 
 ## vLLM registration and launch
 
