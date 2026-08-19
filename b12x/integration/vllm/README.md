@@ -1,6 +1,7 @@
-# b12x FP6 vLLM integration
+# B12X vLLM quantization plugins
 
-Thin vLLM adapter for b12x MX-FP6 (W6A6/W6A8) checkpoints.  This mirrors
+Thin vLLM adapters for B12X MX-FP6 (W6A6/W6A8) and Qwen3.8 dense-MLP QSRT K5
+checkpoints. The MX-FP6 adapter mirrors
 how the maintainer's private fork wires NVFP4: the glue lives in
 ``b12x/integration/`` and calls the public ``plan`` / ``bind`` / ``run``
 APIs — b12x itself does not auto-load into vLLM.
@@ -11,6 +12,7 @@ APIs — b12x itself does not auto-load into vLLM.
 |---|---|
 | `fp6_serving.py` | Framework-agnostic quant methods (`B12XFP6MoEMethod`, `B12XFP6LinearMethod`) |
 | `plugin.py` | vLLM ``QuantizationConfig`` + weight loaders + entry point |
+| `qsrt_plugin.py` | TP1 Qwen3.8 K5/rank-16 config, exact weight loaders, graph storage, and entry point |
 
 ## Install into a vLLM fork
 
@@ -28,6 +30,7 @@ point if you install b12x with vLLM present):
 ```toml
 [project.entry-points."vllm.general_plugins"]
 b12x_fp6 = "b12x.integration.vllm.plugin:register_b12x_fp6"
+b12x_qsrt = "b12x.integration.vllm.qsrt_plugin:register_b12x_qsrt"
 ```
 
 ### 3. Launch
@@ -57,5 +60,8 @@ vllm serve "$B12X_FP6_MODEL_DIR" \
 | `B12X_DISABLE_BF16_GEMV` | off | Disable small-N bf16 GEMV routing |
 | `TORCH_COMPILE_DISABLE=1` | — | Required for bit-identical KLD (vLLM Inductor) |
 
-See [docs/mxfp6-vllm-integration.md](../../docs/mxfp6-vllm-integration.md) for
+The Qwen3.8 QSRT checkpoint contract and launch are specified in
+[qwen38-qsrt-vllm-integration.md](../../../docs/qwen38-qsrt-vllm-integration.md).
+
+See [docs/mxfp6-vllm-integration.md](../../../docs/mxfp6-vllm-integration.md) for
 the full lifecycle and maintainer drop-in instructions.

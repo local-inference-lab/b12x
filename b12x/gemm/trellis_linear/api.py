@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from ..._lib.gating import default_is_supported
+from ...moe._shared.kernels.w4a16.host import (
+    _W4A16_ALLOWED_ROUTED_SIZES,
+    packed_gemm_scratch_elements,
+)
 from ...moe._shared.kernels.w4a16.kernel import (
     clear_w4a16_kernel_cache,
     run_trellis256_dense,
@@ -17,8 +22,279 @@ from ...moe._shared.kernels.w4a16.prepare import (
     prepare_trellis256_pair_dense_weight,
 )
 from . import META
+from ._low_rank import (
+    clear_low_rank_caches,
+    run_low_rank_additive,
+    run_low_rank_pair_add,
+    run_low_rank_pair_project,
+)
 
 PreparedWeight = PreparedTrellis256DenseWeight
+
+
+@dataclass(frozen=True)
+class PreparedAdditiveWeight:
+    """Packed Trellis weight plus an additive BF16 rank-16 correction.
+
+    ``a_t`` is the preparation-time rank-major copy of the checkpoint's
+    ``[in_features, rank]`` A factor. ``b`` retains the checkpoint's
+    ``[out_features, rank]`` B factor by reference. Execution evaluates
+    ``base(x) + (x @ a_t.T) @ b.T`` without materializing a decoded base matrix.
+    """
+
+    base: PreparedWeight
+    a_t: torch.Tensor
+    b: torch.Tensor
+    rank: int
+
+
+@dataclass(frozen=True)
+class PreparedAdditivePair:
+    """Two same-shaped packed weights with jointly executed rank-16 factors."""
+
+    left: PreparedWeight
+    right: PreparedWeight
+    a_t: torch.Tensor
+    b: torch.Tensor
+    rank: int
+
+
+@dataclass(frozen=True)
+class Buffers:
+    """Caller-owned storage for one fixed-shape dense Trellis execution."""
+
+    output: torch.Tensor
+    gemm_output: torch.Tensor
+    c_tmp: torch.Tensor
+    rotated_f16: torch.Tensor
+    input_f16: Optional[torch.Tensor] = None
+    rotated_compute: Optional[torch.Tensor] = None
+    gemm_output_f16: Optional[torch.Tensor] = None
+    output_f16: Optional[torch.Tensor] = None
+    low_rank_hidden: Optional[torch.Tensor] = None
+
+    def run_kwargs(self) -> dict[str, Optional[torch.Tensor]]:
+        """Return keyword arguments accepted by :func:`run`."""
+        return {
+            "output": self.output,
+            "gemm_output": self.gemm_output,
+            "c_tmp": self.c_tmp,
+            "input_f16": self.input_f16,
+            "rotated_f16": self.rotated_f16,
+            "rotated_compute": self.rotated_compute,
+            "gemm_output_f16": self.gemm_output_f16,
+            "output_f16": self.output_f16,
+        }
+
+
+@dataclass(frozen=True)
+class PairBuffers:
+    """Caller-owned storage for one fixed-shape paired dense execution."""
+
+    base: Buffers
+    output: torch.Tensor
+    low_rank_hidden: torch.Tensor
+
+
+def prepare_additive_weight(
+    base: PreparedWeight,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> PreparedAdditiveWeight:
+    """Bind BF16 factors and create the native rank-major A layout."""
+    if not isinstance(base, PreparedTrellis256DenseWeight):
+        raise TypeError("additive Trellis preparation requires a prepared dense weight")
+    rank = int(a.shape[1]) if isinstance(a, torch.Tensor) and a.ndim == 2 else 0
+    if (
+        not isinstance(a, torch.Tensor)
+        or not isinstance(b, torch.Tensor)
+        or a.ndim != 2
+        or b.ndim != 2
+        or tuple(a.shape) != (int(base.in_features), rank)
+        or tuple(b.shape) != (int(base.out_features), rank)
+        or rank != 16
+    ):
+        raise ValueError(
+            "low-rank factors must have shapes [in_features, 16] and [out_features, 16]"
+        )
+    if base.params_dtype != torch.bfloat16:
+        raise TypeError("native additive Trellis execution requires BF16 compute")
+    for name, factor in (("a", a), ("b", b)):
+        if (
+            factor.device != base.trellis.device
+            or factor.dtype != base.params_dtype
+            or not factor.is_contiguous()
+            or int(factor.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                f"low-rank factor {name} must be contiguous, 16-byte-aligned "
+                f"{base.params_dtype} storage on {base.trellis.device}"
+            )
+    a_t = a.T.contiguous()
+    if int(a_t.data_ptr()) % 16 != 0:
+        raise RuntimeError("rank-major low-rank factor storage is not aligned")
+    return PreparedAdditiveWeight(base=base, a_t=a_t, b=b, rank=rank)
+
+
+def prepare_additive_pair(
+    left: PreparedWeight,
+    right: PreparedWeight,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> PreparedAdditivePair:
+    """Bind two equal-geometry packed bases to stacked gate/up factors."""
+    if not isinstance(left, PreparedTrellis256DenseWeight) or not isinstance(
+        right, PreparedTrellis256DenseWeight
+    ):
+        raise TypeError("paired additive preparation requires two dense weights")
+    if (
+        left.in_features != right.in_features
+        or left.out_features != right.out_features
+        or left.params_dtype != torch.bfloat16
+        or right.params_dtype != torch.bfloat16
+        or left.trellis.device != right.trellis.device
+        or left.trellis_bits != right.trellis_bits
+        or left.trellis_codebook != right.trellis_codebook
+    ):
+        raise ValueError("paired additive bases must share BF16 geometry and device")
+    expected_a = (2, int(left.in_features), 16)
+    expected_b = (2, int(left.out_features), 16)
+    if (
+        not isinstance(a, torch.Tensor)
+        or not isinstance(b, torch.Tensor)
+        or tuple(a.shape) != expected_a
+        or tuple(b.shape) != expected_b
+    ):
+        raise ValueError(
+            f"paired factors must have shapes {expected_a} and {expected_b}"
+        )
+    for name, factor in (("a", a), ("b", b)):
+        if (
+            factor.device != left.trellis.device
+            or factor.dtype != torch.bfloat16
+            or not factor.is_contiguous()
+            or int(factor.data_ptr()) % 16 != 0
+        ):
+            raise ValueError(
+                f"paired low-rank factor {name} must be contiguous, aligned BF16 "
+                f"storage on {left.trellis.device}"
+            )
+    a_t = a.transpose(1, 2).contiguous()
+    if int(a_t.data_ptr()) % 16 != 0:
+        raise RuntimeError("paired rank-major factor storage is not aligned")
+    return PreparedAdditivePair(
+        left=left,
+        right=right,
+        a_t=a_t,
+        b=b,
+        rank=16,
+    )
+
+
+def make_buffers(
+    weight: PreparedWeight | PreparedAdditiveWeight,
+    *,
+    size_m: int,
+    input_dtype: torch.dtype,
+) -> Buffers:
+    """Allocate all storage needed by one fixed-shape eager or graph run."""
+    if isinstance(weight, PreparedAdditiveWeight):
+        base = weight.base
+        rank: int | None = weight.rank
+    elif isinstance(weight, PreparedTrellis256DenseWeight):
+        base = weight
+        rank = None
+    else:
+        raise TypeError("dense Trellis buffers require a prepared weight")
+    size_m = int(size_m)
+    if size_m <= 0:
+        raise ValueError(f"dense Trellis M must be positive, got {size_m}")
+    if input_dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"dense Trellis input must be fp16 or bf16, got {input_dtype}")
+    if rank is not None and input_dtype != torch.bfloat16:
+        raise TypeError(
+            "additive Trellis execution requires input and factor dtypes to match"
+        )
+    device = base.trellis.device
+    size_k = int(base.in_features)
+    size_n = int(base.out_features)
+    compute_dtype = base.params_dtype
+
+    def empty(shape: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    c_tmp_elements = max(
+        packed_gemm_scratch_elements(
+            size_n=size_n,
+            route_slots=((size_m + block_size - 1) // block_size) * block_size,
+            moe_block_size=block_size,
+            sms=sms,
+        )
+        for block_size in _W4A16_ALLOWED_ROUTED_SIZES
+    )
+
+    return Buffers(
+        output=empty((size_m, size_n), input_dtype),
+        gemm_output=empty((size_m, size_n), compute_dtype),
+        c_tmp=torch.empty(
+            (c_tmp_elements,),
+            dtype=torch.float32,
+            device=device,
+        ),
+        input_f16=(
+            empty((size_m, size_k), torch.float16)
+            if input_dtype == torch.bfloat16
+            else None
+        ),
+        rotated_f16=empty((size_m, size_k), torch.float16),
+        rotated_compute=(
+            empty((size_m, size_k), torch.bfloat16)
+            if compute_dtype == torch.bfloat16
+            else None
+        ),
+        gemm_output_f16=(
+            empty((size_m, size_n), torch.float16)
+            if compute_dtype == torch.bfloat16
+            else None
+        ),
+        output_f16=(
+            empty((size_m, size_n), torch.float16)
+            if input_dtype == torch.bfloat16
+            else None
+        ),
+        low_rank_hidden=(
+            empty((size_m, rank), input_dtype) if rank is not None else None
+        ),
+    )
+
+
+def make_pair_buffers(
+    weight: PreparedAdditivePair,
+    *,
+    size_m: int,
+    input_dtype: torch.dtype,
+) -> PairBuffers:
+    """Allocate stable storage for one paired gate/up execution."""
+    if not isinstance(weight, PreparedAdditivePair):
+        raise TypeError("paired Trellis buffers require a prepared additive pair")
+    if input_dtype != torch.bfloat16:
+        raise TypeError("paired additive Trellis execution requires BF16 input")
+    base = make_buffers(weight.left, size_m=size_m, input_dtype=input_dtype)
+    device = weight.left.trellis.device
+    return PairBuffers(
+        base=base,
+        output=torch.empty(
+            (int(size_m), 2 * int(weight.left.out_features)),
+            dtype=input_dtype,
+            device=device,
+        ),
+        low_rank_hidden=torch.empty(
+            (2, int(size_m), weight.rank),
+            dtype=input_dtype,
+            device=device,
+        ),
+    )
 
 
 def prepare_weight(
@@ -107,14 +383,154 @@ def run(
     )
 
 
+def run_additive(
+    x: torch.Tensor,
+    weight: PreparedAdditiveWeight,
+    *,
+    low_rank_hidden: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    gemm_output: Optional[torch.Tensor] = None,
+    c_tmp: Optional[torch.Tensor] = None,
+    input_f16: Optional[torch.Tensor] = None,
+    rotated_f16: Optional[torch.Tensor] = None,
+    rotated_compute: Optional[torch.Tensor] = None,
+    gemm_output_f16: Optional[torch.Tensor] = None,
+    output_f16: Optional[torch.Tensor] = None,
+    hadamard_128=None,
+    _moe_block_size: int = 64,
+    _force_tile_config: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Execute packed Trellis GEMM and add a fixed low-rank branch.
+
+    The operation is inference-only. Supplying the buffers returned by
+    :func:`make_buffers` avoids allocation and pointer changes during replay.
+    """
+    if not isinstance(weight, PreparedAdditiveWeight):
+        raise TypeError("run_additive requires a prepared additive weight")
+    if x.dtype != weight.a_t.dtype:
+        raise TypeError("additive Trellis input and factor dtypes must match")
+    expected_hidden = (int(x.shape[0]), weight.rank) if x.ndim == 2 else ()
+    if low_rank_hidden is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Trellis dense low_rank_hidden is not initialized for CUDA graph "
+                "capture; provide caller-owned storage"
+            )
+        low_rank_hidden = torch.empty(
+            expected_hidden,
+            dtype=x.dtype,
+            device=x.device,
+        )
+    elif (
+        tuple(low_rank_hidden.shape) != expected_hidden
+        or low_rank_hidden.dtype != x.dtype
+        or low_rank_hidden.device != x.device
+        or not low_rank_hidden.is_contiguous()
+        or int(low_rank_hidden.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            "low_rank_hidden must be contiguous, 16-byte-aligned storage with "
+            f"shape {expected_hidden}, dtype {x.dtype}, and device {x.device}"
+        )
+    result = run(
+        x,
+        weight.base,
+        output=output,
+        gemm_output=gemm_output,
+        c_tmp=c_tmp,
+        input_f16=input_f16,
+        rotated_f16=rotated_f16,
+        rotated_compute=rotated_compute,
+        gemm_output_f16=gemm_output_f16,
+        output_f16=output_f16,
+        hadamard_128=hadamard_128,
+        _moe_block_size=_moe_block_size,
+        _force_tile_config=_force_tile_config,
+    )
+    run_low_rank_additive(
+        x,
+        weight.a_t,
+        weight.b,
+        low_rank_hidden,
+        result,
+    )
+    return result
+
+
+def run_additive_pair(
+    x: torch.Tensor,
+    weight: PreparedAdditivePair,
+    *,
+    buffers: PairBuffers,
+    hadamard_128=None,
+    _moe_block_size: int = 64,
+    _force_tile_config: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    """Execute two packed bases with a two-launch paired rank-16 branch."""
+    if not isinstance(weight, PreparedAdditivePair):
+        raise TypeError("run_additive_pair requires a prepared additive pair")
+    if not isinstance(buffers, PairBuffers):
+        raise TypeError("run_additive_pair requires caller-owned pair buffers")
+    if x.ndim != 2:
+        raise ValueError("paired additive input must be a matrix")
+    expected_output = (int(x.shape[0]), 2 * int(weight.left.out_features))
+    expected_hidden = (2, int(x.shape[0]), weight.rank)
+    if (
+        x.dtype != torch.bfloat16
+        or x.device != weight.left.trellis.device
+        or not x.is_contiguous()
+        or tuple(buffers.output.shape) != expected_output
+        or tuple(buffers.low_rank_hidden.shape) != expected_hidden
+    ):
+        raise ValueError(
+            "paired additive input or caller-owned storage is incompatible"
+        )
+    run_low_rank_pair_project(
+        x,
+        weight.a_t,
+        weight.b,
+        buffers.low_rank_hidden,
+        buffers.output,
+    )
+    kwargs = buffers.base.run_kwargs()
+    left = run(
+        x,
+        weight.left,
+        hadamard_128=hadamard_128,
+        _moe_block_size=_moe_block_size,
+        _force_tile_config=_force_tile_config,
+        **kwargs,
+    )
+    width = int(weight.left.out_features)
+    buffers.output[:, :width].copy_(left)
+    right = run(
+        x,
+        weight.right,
+        hadamard_128=hadamard_128,
+        _moe_block_size=_moe_block_size,
+        _force_tile_config=_force_tile_config,
+        **kwargs,
+    )
+    buffers.output[:, width:].copy_(right)
+    run_low_rank_pair_add(
+        x,
+        weight.a_t,
+        weight.b,
+        buffers.low_rank_hidden,
+        buffers.output,
+    )
+    return buffers.output
+
+
 def is_supported(device=None) -> bool:
     """True when the SM120/SM121 Trellis kernel stack is available."""
     return default_is_supported(device, requires=META.requires)
 
 
 def clear_caches() -> None:
-    """Clear compiled W4A16 specializations."""
+    """Clear compiled W4A16 and additive low-rank specializations."""
     clear_w4a16_kernel_cache()
+    clear_low_rank_caches()
 
 
 __all__ = list(META.entry_points)
