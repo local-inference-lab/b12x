@@ -771,6 +771,9 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
             compile_time_phase=compile_time_phase,
+            # Fused direct launches have a compile-time route-table extent.
+            # FC2-only uses runtime M and sanitizes each route inside FC2.
+            stage_inactive_routes=int(compile_time_phase) != 2,
         )
 
 
@@ -9191,12 +9194,13 @@ def _compile_w4a16_small_m_direct(
         dummy(cutlass.BFloat16),
         barrier_fake,
         barrier_fake,
+        Int32(num_experts),
         Int32(m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            1,
+            2,
             ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
@@ -9328,12 +9332,13 @@ def _compile_w4a16_fc2_direct(
         dummy(cutlass.BFloat16),
         barrier_fake,
         barrier_fake,
+        Int32(expert_capacity),
         Int32(2),
         Int32(kernel.grid_x),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.fc2_direct",
-            3,
+            4,
             ("device_index", int(device.index or 0)),
             ("hidden_size", int(hidden_size)),
             ("intermediate_size", int(intermediate_size)),
@@ -10544,6 +10549,7 @@ def _w4a16_small_m_direct_launch_flat(
         ptr(cutlass.BFloat16, output),
         barrier_count,
         barrier_epoch,
+        Int32(num_experts),
         Int32(m),
         Int32(direct_launch.grid_x),
         cuda.CUstream(stream_int),
@@ -10691,6 +10697,7 @@ def _w4a16_fc2_direct_launch_flat(
         ptr(cutlass.BFloat16, output),
         barrier_count,
         barrier_epoch,
+        Int32(num_experts),
         Int32(m),
         Int32(launch.grid_x),
         cuda.CUstream(stream_int),
