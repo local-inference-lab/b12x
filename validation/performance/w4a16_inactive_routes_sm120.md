@@ -11,6 +11,10 @@ contribution must be exactly zero. Valid routes retain their identifiers and
 weights. Caller-owned route tensors remain unchanged in eager execution and
 CUDA Graph replay.
 
+Route validity is evaluated at the source tensor width. An `int64` identifier
+is narrowed to the kernel's `int32` expert address only after the range check,
+so values such as `2**32` cannot alias a resident expert.
+
 Fixed-M fused launches sanitize their compile-time-bounded route table in
 shared memory. FC2-only launches accept runtime M, so they validate each route
 inline against the runtime resident-expert count. The FC2 implementation must
@@ -25,6 +29,8 @@ not index shared route storage whose extent was compiled for a smaller M.
 - Test-complete tree: `5ea752169a9c4a2863f51f16ed77cc85371f1353`
 - Compile-ABI qualification revision:
   `97dfe7f837fa5383c5424cbdb2ccfabf57c4480c`
+- Route-width qualification revision:
+  `0e167cdd7d32fbb5b6dcaed88c263ac1fa236c26`
 - Comparison revision for valid FC2 routes:
   `debaafe156c9824396178d53e01e5f15d2a2a04a`
 - Comparison tree: `ec6edd9da4687f83519fd37bd7322ea0800f0ace`
@@ -70,6 +76,22 @@ Result: five parametrized tests passed. The invalid identifiers included `-1`,
 512-element intermediate widths. Assertions covered finite output, nonzero
 valid-route output, exact-zero inactive rows, an independent constant oracle,
 stable graph replay, and immutable route inputs.
+
+Source-width validation used the same CUDA 13.3, PyTorch 2.13, and CUTLASS DSL
+4.6.2 runtime:
+
+```bash
+python -m pytest -q tests/moe/test_w4a16_e2e.py \
+  -k 'test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay or test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3' \
+  --maxfail=1
+```
+
+Result: nine tests passed. Fused execution covered `int32` route tables at
+M=1, 2, 4, and 8 plus an `int64` route table at M=1. FC2-only execution covered
+`int32` and `int64` route tables with 256- and 512-element intermediate widths.
+Both `int64` paths used `2**32` as an inactive identifier. The tests verify
+eager output, CUDA Graph replay, exact-zero inactive contributions, valid-route
+oracle parity, and immutable route tensors.
 
 The same invalid-route cases were executed under Compute Sanitizer:
 
