@@ -28,6 +28,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 from safetensors import safe_open
 import torch
 
@@ -150,12 +151,20 @@ def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, Any]:
             dim=0,
         ).item()
     )
+    # CUDA's quantile implementation rejects tensors above its element-count
+    # limit. Error metrics are outside the timed region, so preserve an exact
+    # percentile by moving only oversized reductions to CPU.
+    p99_absolute_error: float
+    if flat_error.is_cuda and flat_error.numel() > (1 << 24):
+        p99_absolute_error = float(np.quantile(flat_error.cpu().numpy(), 0.99))
+    else:
+        p99_absolute_error = float(torch.quantile(flat_error, 0.99).item())
     return {
         "finite": bool(torch.isfinite(actual).all()),
         "relative_l2": relative_l2,
         "cosine": cosine,
         "mean_absolute_error": float(flat_error.mean().item()),
-        "p99_absolute_error": float(torch.quantile(flat_error, 0.99).item()),
+        "p99_absolute_error": p99_absolute_error,
         "maximum_absolute_error": float(flat_error.max().item()),
         "passed": (
             bool(torch.isfinite(actual).all())

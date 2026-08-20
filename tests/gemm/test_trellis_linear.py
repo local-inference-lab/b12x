@@ -75,6 +75,61 @@ def test_capacity_buffer_views_reuse_storage_without_cache_growth() -> None:
         api.view_pair_buffers(pair, size_m=0)
 
 
+def test_trellis_mutating_custom_ops_support_fake_tensor_tracing() -> None:
+    """Every opaque serving operator must expose its mutation schema to Dynamo."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        source = torch.empty((3, 128), dtype=torch.float16)
+        destination = torch.empty_like(source)
+        optional_scale = torch.empty(0, dtype=torch.float16)
+        torch.ops.b12x.trellis_hadamard_128(
+            source,
+            destination,
+            optional_scale,
+            optional_scale,
+            False,
+            False,
+            1.0,
+        )
+
+        rotated = torch.empty((3, 256), dtype=torch.bfloat16)
+        trellis = torch.empty((16, 16, 80), dtype=torch.int16)
+        scales = torch.empty((16, 16), dtype=torch.float16)
+        global_scale = torch.ones(1, dtype=torch.float32)
+        workspace = torch.empty(4096, dtype=torch.int32)
+        c_tmp = torch.empty(256, dtype=torch.float32)
+        output = torch.empty((3, 256), dtype=torch.bfloat16)
+        torch.ops.b12x.trellis256_dense_gemm(
+            rotated,
+            trellis,
+            scales,
+            global_scale,
+            workspace,
+            c_tmp,
+            output,
+            5,
+            "sqg_fp16",
+            "",
+            "",
+            64,
+            64,
+            128,
+        )
+
+        rank = 16
+        a_t = torch.empty((rank, 256), dtype=torch.bfloat16)
+        b = torch.empty((256, rank), dtype=torch.bfloat16)
+        hidden = torch.empty((3, rank), dtype=torch.bfloat16)
+        torch.ops.b12x.trellis_low_rank_additive(
+            rotated,
+            a_t,
+            b,
+            hidden,
+            output,
+        )
+
+
 def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
     value = window.astype(np.uint64)
     value = ((value * _MCG) & np.uint64(0xFFFFFFFF)).astype(np.uint32)

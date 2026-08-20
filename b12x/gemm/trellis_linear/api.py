@@ -32,6 +32,11 @@ from ._low_rank import (
 PreparedWeight = PreparedTrellis256DenseWeight
 
 
+def _has_16_byte_alignment(tensor: torch.Tensor) -> bool:
+    """Check real storage while allowing fake-tensor graph tracing."""
+    return torch.compiler.is_compiling() or int(tensor.data_ptr()) % 16 == 0
+
+
 @dataclass(frozen=True)
 class PreparedAdditiveWeight:
     """Packed Trellis weight plus an additive BF16 rank-16 correction.
@@ -101,9 +106,11 @@ def view_buffers(buffers: Buffers, *, size_m: int) -> Buffers:
 
     if not isinstance(buffers, Buffers):
         raise TypeError("dense Trellis buffer views require Buffers")
+    compiling = torch.compiler.is_compiling()
     capacity = int(buffers.output.shape[0])
-    size_m = int(size_m)
-    if size_m <= 0 or size_m > capacity:
+    if not compiling:
+        size_m = int(size_m)
+    if not compiling and (size_m <= 0 or size_m > capacity):
         raise ValueError(
             f"dense Trellis row count must be in [1, {capacity}], got {size_m}"
         )
@@ -111,7 +118,9 @@ def view_buffers(buffers: Buffers, *, size_m: int) -> Buffers:
     def rows(name: str, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if tensor is None:
             return None
-        if tensor.ndim != 2 or int(tensor.shape[0]) != capacity:
+        if not compiling and (
+            tensor.ndim != 2 or int(tensor.shape[0]) != capacity
+        ):
             raise ValueError(
                 f"dense Trellis {name} does not share the {capacity}-row capacity"
             )
@@ -122,7 +131,7 @@ def view_buffers(buffers: Buffers, *, size_m: int) -> Buffers:
         assert result is not None
         return result
 
-    if size_m == capacity:
+    if not compiling and size_m == capacity:
         return buffers
     return Buffers(
         output=required_rows("output", buffers.output),
@@ -142,11 +151,15 @@ def view_pair_buffers(buffers: PairBuffers, *, size_m: int) -> PairBuffers:
 
     if not isinstance(buffers, PairBuffers):
         raise TypeError("paired Trellis buffer views require PairBuffers")
-    if buffers.output.ndim != 2 or buffers.low_rank_hidden.ndim != 3:
+    compiling = torch.compiler.is_compiling()
+    if not compiling and (
+        buffers.output.ndim != 2 or buffers.low_rank_hidden.ndim != 3
+    ):
         raise ValueError("paired Trellis capacity storage has incompatible ranks")
     capacity = int(buffers.output.shape[0])
-    size_m = int(size_m)
-    if (
+    if not compiling:
+        size_m = int(size_m)
+    if not compiling and (
         size_m <= 0
         or size_m > capacity
         or tuple(buffers.low_rank_hidden.shape[:2]) != (2, capacity)
@@ -155,7 +168,7 @@ def view_pair_buffers(buffers: PairBuffers, *, size_m: int) -> PairBuffers:
         raise ValueError(
             f"paired Trellis row count must be in [1, {capacity}], got {size_m}"
         )
-    if size_m == capacity:
+    if not compiling and size_m == capacity:
         return buffers
     rank = int(buffers.low_rank_hidden.shape[2])
     hidden = buffers.low_rank_hidden.view(-1, rank)[: 2 * size_m]
@@ -479,7 +492,9 @@ def run_additive(
         raise TypeError("run_additive requires a prepared additive weight")
     if x.dtype != weight.a_t.dtype:
         raise TypeError("additive Trellis input and factor dtypes must match")
-    expected_hidden = (int(x.shape[0]), weight.rank) if x.ndim == 2 else ()
+    compiling = torch.compiler.is_compiling()
+    rows = x.shape[0] if compiling else int(x.shape[0])
+    expected_hidden = (rows, weight.rank) if x.ndim == 2 else ()
     if low_rank_hidden is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -492,11 +507,11 @@ def run_additive(
             device=x.device,
         )
     elif (
-        tuple(low_rank_hidden.shape) != expected_hidden
+        (not compiling and tuple(low_rank_hidden.shape) != expected_hidden)
         or low_rank_hidden.dtype != x.dtype
         or low_rank_hidden.device != x.device
         or not low_rank_hidden.is_contiguous()
-        or int(low_rank_hidden.data_ptr()) % 16 != 0
+        or not _has_16_byte_alignment(low_rank_hidden)
     ):
         raise ValueError(
             "low_rank_hidden must be contiguous, 16-byte-aligned storage with "
@@ -543,14 +558,16 @@ def run_additive_pair(
         raise TypeError("run_additive_pair requires caller-owned pair buffers")
     if x.ndim != 2:
         raise ValueError("paired additive input must be a matrix")
-    expected_output = (int(x.shape[0]), 2 * int(weight.left.out_features))
-    expected_hidden = (2, int(x.shape[0]), weight.rank)
+    compiling = torch.compiler.is_compiling()
+    rows = x.shape[0] if compiling else int(x.shape[0])
+    expected_output = (rows, 2 * int(weight.left.out_features))
+    expected_hidden = (2, rows, weight.rank)
     if (
         x.dtype != torch.bfloat16
         or x.device != weight.left.trellis.device
         or not x.is_contiguous()
-        or tuple(buffers.output.shape) != expected_output
-        or tuple(buffers.low_rank_hidden.shape) != expected_hidden
+        or (not compiling and tuple(buffers.output.shape) != expected_output)
+        or (not compiling and tuple(buffers.low_rank_hidden.shape) != expected_hidden)
     ):
         raise ValueError(
             "paired additive input or caller-owned storage is incompatible"

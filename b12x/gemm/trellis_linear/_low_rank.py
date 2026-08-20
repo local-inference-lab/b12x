@@ -15,6 +15,17 @@ _WARMED_PAIR_PROJECT_SIGNATURES: set[tuple[int, int, int, int]] = set()
 _WARMED_PAIR_ADD_SIGNATURES: set[tuple[int, int, int, int]] = set()
 
 
+def _has_16_byte_alignment(tensor: torch.Tensor) -> bool:
+    """Check storage alignment when a real tensor pointer is observable.
+
+    TorchDynamo traces with fake tensors whose storage pointer is intentionally
+    unavailable. PyTorch CUDA allocations satisfy the alignment contract, and
+    caller-owned buffers are checked during the required eager warmup before a
+    compiled or CUDA-graph execution.
+    """
+    return torch.compiler.is_compiling() or int(tensor.data_ptr()) % 16 == 0
+
+
 @triton.jit
 def _project_kernel(
     x,
@@ -412,6 +423,9 @@ def run_low_rank_additive(
     output: torch.Tensor,
 ) -> None:
     """Project through BF16 rank factors and add into caller-owned output."""
+    if torch.compiler.is_compiling():
+        torch.ops.b12x.trellis_low_rank_additive(x, a_t, b, hidden, output)
+        return
     if (
         x.ndim != 2
         or a_t.ndim != 2
@@ -443,7 +457,7 @@ def run_low_rank_additive(
         or not tensor.is_cuda
         or tensor.device != x.device
         or not tensor.is_contiguous()
-        or int(tensor.data_ptr()) % 16 != 0
+        or not _has_16_byte_alignment(tensor)
         for tensor in tensors
     ):
         raise ValueError(
@@ -459,6 +473,8 @@ def _validate_pair_storage(
     hidden: torch.Tensor,
     output: torch.Tensor,
 ) -> tuple[int, int, int, int]:
+    if torch.compiler.is_compiling():
+        return 0, 0, 0, 0
     if (
         x.ndim != 2
         or a_t.ndim != 3
@@ -490,7 +506,7 @@ def _validate_pair_storage(
         or not tensor.is_cuda
         or tensor.device != x.device
         or not tensor.is_contiguous()
-        or int(tensor.data_ptr()) % 16 != 0
+        or not _has_16_byte_alignment(tensor)
         for tensor in tensors
     ):
         raise ValueError(

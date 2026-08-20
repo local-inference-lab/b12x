@@ -163,7 +163,9 @@ def _capture_sizes(capacity_rows: int) -> tuple[int, ...]:
 def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
-    if rows <= 0 or rows > capacity_rows:
+    if not torch.compiler.is_compiling() and (
+        rows <= 0 or rows > capacity_rows
+    ):
         raise ValueError(
             f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
         )
@@ -193,7 +195,9 @@ def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
 def _shared_pair_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
-    if rows <= 0 or rows > capacity_rows:
+    if not torch.compiler.is_compiling() and (
+        rows <= 0 or rows > capacity_rows
+    ):
         raise ValueError(
             f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
         )
@@ -499,7 +503,11 @@ def register_b12x_qsrt() -> None:
             if x.dtype != torch.bfloat16 or not x.is_contiguous():
                 raise ValueError("B12X QSRT requires contiguous BF16 activations")
             x2d = x.reshape(-1, x.shape[-1])
-            rows = int(x2d.shape[0])
+            rows = (
+                x2d.shape[0]
+                if torch.compiler.is_compiling()
+                else int(x2d.shape[0])
+            )
             capacity_rows = self.workspace_capacity_rows
             weight = layer.b12x_qsrt_weight
             if layer.b12x_qsrt_group == "gate_up":
