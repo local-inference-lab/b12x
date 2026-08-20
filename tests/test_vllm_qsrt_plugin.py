@@ -15,6 +15,7 @@ from b12x.integration.vllm.qsrt_plugin import (
     _norm_key,
     _parameter_loader,
     _projection_group,
+    _select_linear_method,
     _validate_quantization_config,
     _workspace_capacity_rows,
 )
@@ -55,6 +56,30 @@ def test_quantization_config_claims_only_complete_decoder_mlps() -> None:
             modules,
         )
         is None
+    )
+
+
+def test_linear_method_selection_preserves_unclaimed_bf16_modules() -> None:
+    modules = set(_validate_quantization_config(_config()))
+    packed = object()
+    unquantized = object()
+    assert (
+        _select_linear_method(
+            "language_model.model.layers.7.mlp.gate_up_proj",
+            modules,
+            packed_method=packed,
+            unquantized_method=unquantized,
+        )
+        is packed
+    )
+    assert (
+        _select_linear_method(
+            "visual.merger.linear_fc1",
+            modules,
+            packed_method=packed,
+            unquantized_method=unquantized,
+        )
+        is unquantized
     )
 
 

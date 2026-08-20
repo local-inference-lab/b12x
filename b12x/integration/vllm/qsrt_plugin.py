@@ -66,6 +66,20 @@ def _projection_group(prefix: str, modules: set[str]) -> str | None:
     return None
 
 
+def _select_linear_method(
+    prefix: str,
+    modules: set[str],
+    *,
+    packed_method: Any,
+    unquantized_method: Any,
+) -> Any:
+    """Select packed execution only for the declared decoder MLP inventory."""
+
+    if _projection_group(prefix, modules) is None:
+        return unquantized_method
+    return packed_method
+
+
 def _validate_quantization_config(config: dict[str, Any]) -> tuple[str, ...]:
     _workspace_capacity_rows(config)
     modules = config.get("modules")
@@ -286,7 +300,11 @@ def register_b12x_qsrt() -> None:
     else:
         logger = init_logger("vllm.b12x_qsrt")
 
-    from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+    from vllm.model_executor.layers.linear import (
+        LinearBase,
+        LinearMethodBase,
+        UnquantizedLinearMethod,
+    )
     from vllm.model_executor.layers.quantization import register_quantization_config
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
     from vllm.model_executor.utils import set_weight_attrs
@@ -525,6 +543,7 @@ def register_b12x_qsrt() -> None:
             self._model_dir = model_dir or os.environ.get(MODEL_DIR_ENV) or None
             self._manifest_validated = False
             self._method = _VllmQSRTLinearMethod(self._workspace_capacity_rows)
+            self._unquantized_method = UnquantizedLinearMethod()
 
         def __reduce__(self):
             return (_rebuild_config, (self._config, self._model_dir))
@@ -607,11 +626,15 @@ def register_b12x_qsrt() -> None:
         def get_quant_method(self, layer: Any, prefix: str):
             if not isinstance(layer, LinearBase):
                 return None
-            group = _projection_group(prefix, self._modules)
-            if group is None:
-                return None
-            self._validate_manifest()
-            return self._method
+            method = _select_linear_method(
+                prefix,
+                self._modules,
+                packed_method=self._method,
+                unquantized_method=self._unquantized_method,
+            )
+            if method is self._method:
+                self._validate_manifest()
+            return method
 
     _CONFIG_CLS = B12XQSRTConfig
     _registered = True
