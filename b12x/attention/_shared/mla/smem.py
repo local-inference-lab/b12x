@@ -205,7 +205,15 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     n_v_chunks = traits.n_v_chunks
     kv_smem_stride = traits.kv_smem_stride
     q_nope_stride = traits.q_nope_stride
-    bufs = _KV_BUF_COUNT
+    bufs = (
+        1
+        if traits.scale_format in (
+            ScaleFormat.KVARN_K5,
+            ScaleFormat.KVARN_EXACT,
+            ScaleFormat.KVARN_EXACT_BF16,
+        )
+        else _KV_BUF_COUNT
+    )
 
     off = 0
 
@@ -219,7 +227,16 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 
     # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
     q_fp8_off = off
-    q_element_bytes = 2 if traits.scale_format == ScaleFormat.NVFP4_E4M3 else 1
+    q_element_bytes = (
+        2
+        if traits.scale_format in (
+            ScaleFormat.NVFP4_E4M3,
+            ScaleFormat.KVARN_K5,
+            ScaleFormat.KVARN_EXACT,
+            ScaleFormat.KVARN_EXACT_BF16,
+        )
+        else 1
+    )
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
 
@@ -242,6 +259,14 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     if traits.has_extra_cache:
         # DSV4: 8 footer bytes/token (7 UE8M0 + 1 pad). Separately gathered.
         kv_sc_stride = 8  # SCALE_BYTES_PER_TOKEN
+        kv_sc_buf_bytes = bi * kv_sc_stride
+        off = kv_sc_off + kv_sc_buf_bytes * bufs
+    elif traits.scale_format in (
+        ScaleFormat.KVARN_K5,
+        ScaleFormat.KVARN_EXACT,
+        ScaleFormat.KVARN_EXACT_BF16,
+    ):
+        kv_sc_stride = 8
         kv_sc_buf_bytes = bi * kv_sc_stride
         off = kv_sc_off + kv_sc_buf_bytes * bufs
     elif traits.latent_scale_per_token:
@@ -293,7 +318,15 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     token_idx_off = off
     token_idx_buf_bytes = bi * 4
-    token_idx_bufs = _TOKEN_IDX_BUF_COUNT
+    token_idx_bufs = (
+        1
+        if traits.scale_format in (
+            ScaleFormat.KVARN_K5,
+            ScaleFormat.KVARN_EXACT,
+            ScaleFormat.KVARN_EXACT_BF16,
+        )
+        else _TOKEN_IDX_BUF_COUNT
+    )
     off = token_idx_off + token_idx_buf_bytes * token_idx_bufs
 
     # --- static sm_p_full (bf16), 128B-aligned for the S6b ldmatrix.x4 read. ---
@@ -393,7 +426,15 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
                 int(layout.kv_sc_buf_bytes * layout.kv_bufs),
             ]
         }
-        if (traits.has_extra_cache or traits.latent_scale_per_token)
+        if (
+            traits.has_extra_cache
+            or traits.latent_scale_per_token
+            or traits.scale_format in (
+                ScaleFormat.KVARN_K5,
+                ScaleFormat.KVARN_EXACT,
+                ScaleFormat.KVARN_EXACT_BF16,
+            )
+        )
         else {}
     )
     w_head_sc2_field = (
@@ -408,13 +449,21 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         if traits.has_extra_cache
         else {}
     )
+    q_is_bf16 = traits.scale_format in (
+        ScaleFormat.NVFP4_E4M3,
+        ScaleFormat.KVARN_K5,
+        ScaleFormat.KVARN_EXACT,
+        ScaleFormat.KVARN_EXACT_BF16,
+    )
+    q_element_type = cutlass.BFloat16 if q_is_bf16 else cutlass.Uint8
+    q_elements = int(layout.q_fp8_bytes // 2) if q_is_bf16 else int(layout.q_fp8_bytes)
     SharedStorage.__annotations__ = {
         # Q staging (single buffer). q_rope first (FlashInfer OFF_Q_ROPE = 0).
         "q_rope": cute.struct.Align[
             cute.struct.MemRange[cutlass.BFloat16, int(layout.q_rope_bytes // 2)],
             128,
         ],
-        "q_fp8": cute.struct.MemRange[cutlass.Uint8, int(layout.q_fp8_bytes)],
+        "q_fp8": cute.struct.MemRange[q_element_type, q_elements],
         "q_sc": cute.struct.MemRange[cutlass.Float32, int(layout.q_sc_bytes // 4)],
         # Double-buffered KV. 128B-align the big nope region.
         "kv_fp8": cute.struct.Align[
@@ -479,7 +528,15 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
         "token_idx": layout.token_idx_off,
         "sm_p_full": layout.sm_p_full_off,
     }
-    if traits.has_extra_cache or traits.latent_scale_per_token:
+    if (
+        traits.has_extra_cache
+        or traits.latent_scale_per_token
+        or traits.scale_format in (
+            ScaleFormat.KVARN_K5,
+            ScaleFormat.KVARN_EXACT,
+            ScaleFormat.KVARN_EXACT_BF16,
+        )
+    ):
         expected_offsets["kv_sc"] = layout.kv_sc_off
     if traits.has_extra_cache:
         expected_offsets["w_head_sc2"] = layout.w_head_sc2_off
