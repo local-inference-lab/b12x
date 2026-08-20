@@ -183,7 +183,7 @@ def compressed_sparse_mla_decode_forward(
             name="indexed_k_cache",
         )
         indexed_indices_2d = _normalize_index_matrix(
-            indexed_indices, name="indexed_indices"
+            indexed_indices, name="indexed_indices", allow_row_shared=True
         )
         if indexed_indices_2d.device != q3.device:
             raise ValueError("indexed_indices must be on the same device as q_all")
@@ -359,7 +359,7 @@ def _run_sm120_compressed_prefill(
         extra_kwargs = dict(
             extra_kv_cache=indexed_k_cache,
             extra_indices=_normalize_index_matrix(
-                indexed_indices, name="indexed_indices"
+                indexed_indices, name="indexed_indices", allow_row_shared=True
             ),
             extra_topk_length=indexed_topk_lengths,
             extra_page_block_size=int(indexed_page_size),

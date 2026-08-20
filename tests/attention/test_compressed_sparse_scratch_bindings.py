@@ -679,6 +679,26 @@ def test_compressed_sparse_mla_bind_accepts_row_shared_page_table() -> None:
     assert binding.indexed_page_table.stride() == (0, 1)
 
 
+def test_compressed_sparse_mla_bind_accepts_row_shared_indexed_indices() -> None:
+    workspace = _workspace(topk=6, max_page_table_width=5)
+    q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
+    swa_indices = torch.empty((4, 2), dtype=torch.int32)
+    swa_lengths = torch.empty((4,), dtype=torch.int32)
+    indexed_indices = torch.empty((1, 4), dtype=torch.int32).expand(4, -1)
+    indexed_lengths = torch.empty((4,), dtype=torch.int32)
+
+    binding = workspace.bind_compressed_sparse_mla(
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+    )
+
+    assert binding.indexed_indices is indexed_indices
+    assert binding.indexed_indices.stride() == (0, 1)
+
+
 def test_workspace_bind_sparse_mla_returns_common_binding_type() -> None:
     workspace = _workspace(topk=6, max_page_table_width=5)
     q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
