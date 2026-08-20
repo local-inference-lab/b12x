@@ -998,7 +998,7 @@ def _run_mimo_v25_fp8_decode_graph_case(
 
 
 @torch.inference_mode()
-def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
+def test_mimo_v25_decode_graph_no_split_compile_key_tracks_batch_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_b12x()
@@ -1083,7 +1083,7 @@ def test_mimo_v25_decode_graph_no_split_compile_key_reuses_batch_buckets(
     bind_no_split_decode(4)
 
     assert len(captured_specs) == 2
-    assert captured_specs[0] == captured_specs[1]
+    assert captured_specs[0] != captured_specs[1]
 
 
 @torch.inference_mode()

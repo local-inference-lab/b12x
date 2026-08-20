@@ -211,7 +211,7 @@ result["semantic_environment"] = {
 }
 print(json.dumps(result, sort_keys=True))
 """
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     cache_dir = tmp_path / "provenance-compile-cache"
 
     def run_fresh_process() -> str:

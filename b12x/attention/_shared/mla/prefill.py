@@ -58,8 +58,9 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * rec
     else:
         expected = int(page_size) * COMPRESSED_MLA_BYTES_PER_TOKEN
-    # The runtime page stride is part of the cache contract. It can be either
-    # the exact payload width or a larger packed/padded stride.
+    if model_type == ModelType.GLM_NSA and cache.is_contiguous():
+        return expected
+    # The runtime page stride is part of the packed/padded cache contract.
     if cache.ndim >= 2:
         stride = int(cache.stride(0)) * int(cache.element_size())
         if stride < expected:

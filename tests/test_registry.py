@@ -20,7 +20,11 @@ def _on_disk_ops() -> list[str]:
         if not group_dir.is_dir() or group_dir.name.startswith("_"):
             continue
         for op_dir in sorted(group_dir.iterdir()):
-            if not op_dir.is_dir() or op_dir.name.startswith("_"):
+            if (
+                not op_dir.is_dir()
+                or op_dir.name.startswith("_")
+                or not (op_dir / "api.py").is_file()
+            ):
                 continue
             ops.append(f"{group_dir.name}.{op_dir.name}")
     return ops

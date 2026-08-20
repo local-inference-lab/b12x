@@ -356,6 +356,7 @@ class EPMoEScratchPlan:
             block_expert_ids=views["block_expert_ids"],
             packed_route_count=views["packed_route_count"],
             expert_offsets=views["expert_offsets"],
+            expert_counts=views["expert_counts"],
         )
 
 
@@ -430,6 +431,7 @@ def plan_ep_moe_scratch(caps: EPMoEScratchCaps) -> EPMoEScratchPlan:
             ("block_expert_ids", route_blocks, torch.int32),
             ("packed_route_count", 1, torch.int32),
             ("expert_offsets", caps.global_num_experts + 1, torch.int32),
+            ("expert_counts", caps.global_num_experts, torch.int32),
         )
     )
     scratch_specs = (
@@ -472,6 +474,7 @@ class EPMoEFP4Binding:
     block_expert_ids: torch.Tensor
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
+    expert_counts: torch.Tensor
 
     def run(self) -> torch.Tensor:
         return b12x_ep_moe_fp4(binding=self)
@@ -514,6 +517,7 @@ def b12x_ep_moe_fp4(*, binding: EPMoEFP4Binding) -> torch.Tensor:
         block_expert_ids=binding.block_expert_ids,
         packed_route_count=binding.packed_route_count,
         expert_offsets=binding.expert_offsets,
+        expert_counts=binding.expert_counts,
         expert_map=binding.expert_map.tensor,
         apply_router_weight_on_input=binding.apply_router_weight_on_input,
         fast_math=binding.fast_math,

@@ -145,8 +145,10 @@ def test_mixed_kernel_tracks_shared_moe_body_contract() -> None:
 
     driver_parameters = inspect.signature(W4A16FusedMoeKernel._moe_body).parameters
     assert len(calls[0].args) + len(calls[0].keywords) == len(driver_parameters) - 1
-    assert [ast.unparse(arg) for arg in calls[0].args[-10:]] == [
+    assert [ast.unparse(arg) for arg in calls[0].args[-12:]] == [
         "descriptor_map",
+        "trellis_lut_addr",
+        "trellis_lut_addr",
         "total_experts",
         "total_experts",
         "smem_base",
@@ -945,7 +947,7 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
     m, hidden, intermediate, topk = 3072, 6144, 512, 8
-    tile_config = (128, 128, 32, 512)
+    tile_config = (128, 128, 64, 256)
     tier0_experts, tier1_experts = 192, 64
     tier0 = _prepared(
         experts=tier0_experts,

@@ -52,7 +52,7 @@ def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
 
     assert select(num_tokens=4, hidden_size=4096, compute_capability=(12, 1)) == 0
     assert select(num_tokens=8, hidden_size=4096, compute_capability=(12, 1)) == 512
-    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == 1024
+    assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == 128
     assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == 0
     assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 0
 
@@ -136,6 +136,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             "tma",
             False,
             False,
+            False,
             None,
         )
         torch.ops.b12x.dense_gemm_launch(
@@ -170,6 +171,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             "tma",
             False,
             False,
+            False,
             123,
         )
 
@@ -192,7 +194,7 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
         comb = torch.empty((2, 24), dtype=torch.float32)
         norm_weight = torch.empty((4096,), dtype=torch.float32)
 
-        torch.ops.b12x.mhc_pre_partial_launch(residual, fn, partials, True)
+        torch.ops.b12x.mhc_pre_partial_launch(residual, fn, partials, out, True)
         torch.ops.b12x.mhc_post_pre_partial_launch(
             x,
             residual,

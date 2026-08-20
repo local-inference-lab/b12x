@@ -146,6 +146,7 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_mode="w4a16",
+        output=torch.empty_like(x),
     )
     expected = _reference_w4a16(
         x,
@@ -328,7 +329,10 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
         n=2048,
         activation="silu",
         trellis_bits=3,
+        trellis_codebook="mcg",
+        trellis_pair_kinds=None,
         trellis_tile_config=None,
+        coupled_hadamard=False,
         qsrt_storage_format=None,
     )
     fused_calls: list[dict[str, object]] = []
@@ -737,6 +741,7 @@ def test_w4a16_fp4_e8m0_k32_kernel_matches_raw_e8m0_oracle(
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=10.0 if activation == "silu" else None,
         )
 
@@ -3019,6 +3024,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
         block_expert_ids=buffers.block_expert_ids,
         packed_route_count=buffers.packed_route_count,
         expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
         swiglu_limit=swiglu_limit,
     )
     torch.cuda.synchronize()
@@ -3043,6 +3049,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             swiglu_limit=swiglu_limit,
         )
     graph.replay()
@@ -3130,6 +3137,7 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
         )

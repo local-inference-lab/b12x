@@ -2191,12 +2191,7 @@ def _capture_backend_graph(
         )
         capture_plan = workspace.plan
         replay_plan = None
-    elif window_left >= 0:
-        if fixed_split_pages is not None or graph_ctas_per_sm is not None:
-            raise ValueError(
-                "sliding decode graph replay uses the production workspace "
-                "policy; fixed split and CTA overrides are not supported"
-            )
+    elif fixed_split_pages is None and graph_ctas_per_sm is None:
         workspace.prepare_decode_graph_replay_state(
             batch=int(capture_page_table.shape[0]),
             total_q_capacity=int(q.shape[0]),

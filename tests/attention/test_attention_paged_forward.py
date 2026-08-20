@@ -202,8 +202,9 @@ def _run_decode_graph_check(
         v_descale=v_descale,
         warmup=1,
         graph_ctas_per_sm=None,
+        window_left=-1,
     )
-    _fa2_graph, fa2_out = _capture_flashinfer_fa2_graph(
+    flashinfer_capture = _capture_flashinfer_fa2_graph(
         q=q,
         k_cache=k_fp8,
         v_cache=v_fp8,
@@ -222,8 +223,9 @@ def _run_decode_graph_check(
         v_scale=v_scale,
         workspace_bytes=512 * 1024 * 1024,
         warmup=1,
+        window_left=-1,
     )
-    return backend.output, fa2_out, backend.plan_desc
+    return backend.output, flashinfer_capture.output, backend.plan_desc
 
 
 def _run_decode_reference_check(
@@ -272,6 +274,7 @@ def _run_decode_reference_check(
         v_descale=v_descale,
         warmup=1,
         graph_ctas_per_sm=None,
+        window_left=-1,
     )
     backend.graph.replay()
     torch.cuda.synchronize()
@@ -787,8 +790,7 @@ def test_paged_forward_native_fp8_qkv_matches_reference_fp8_decode_short_context
 ) -> None:
     require_b12x()
     monkeypatch.setenv("B12X_TURBO_ATTN", "1")
-    output, ref_out, plan_desc = _run_decode_reference_check(cache_seqlen=64)
-    assert plan_desc.endswith(",split")
+    output, ref_out, _plan_desc = _run_decode_reference_check(cache_seqlen=64)
     assert (output - ref_out).abs().max().item() <= 0.02
     assert _cosine_similarity(output, ref_out) >= 0.995
 

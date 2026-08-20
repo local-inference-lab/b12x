@@ -20,40 +20,12 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
         indices = torch.empty((2, 4), dtype=torch.int32)
         lengths = torch.empty((2,), dtype=torch.int32)
         scalar_i32 = torch.empty((1,), dtype=torch.int32)
-        sm_scale_t = torch.empty((1,), dtype=torch.float32)
         tmp_output = torch.empty((2, 2, 4, 512), dtype=torch.bfloat16)
         tmp_lse = torch.empty((2, 2, 4), dtype=torch.float32)
         attn_sink = torch.empty((2,), dtype=torch.float32)
         output = torch.empty((2, 2, 512), dtype=torch.bfloat16)
 
-        torch.ops.b12x.compressed_mla_split_decode_forward(
-            q_all,
-            cache,
-            indices,
-            lengths,
-            cache,
-            indices,
-            lengths,
-            indices,
-            sm_scale_t,
-            scalar_i32,
-            scalar_i32,
-            tmp_output,
-            tmp_lse,
-            attn_sink,
-            2,
-            64,
-            1024,
-            64,
-            1024,
-            True,
-            True,
-            False,
-            False,
-            True,
-            False,
-        )
-        torch.ops.b12x.sparse_mla_split_decode_merge(
+        torch.ops.b12x.sparse_mla_sm120_split_decode_merge(
             tmp_output,
             tmp_lse,
             scalar_i32,
@@ -62,6 +34,7 @@ def test_b12x_mla_custom_ops_have_fake_dispatch() -> None:
             tmp_output,
             tmp_lse,
             output,
+            4,
             True,
         )
 

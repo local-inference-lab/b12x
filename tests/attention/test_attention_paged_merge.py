@@ -25,6 +25,8 @@ def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
         True,
         True,
         False,
+        False,
+        False,
     )
     b2 = _build_merge_kernel(
         torch.bfloat16,
@@ -34,10 +36,12 @@ def test_b1_regular_decode_graph_uses_four_merge_warps() -> None:
         True,
         True,
         False,
+        False,
+        False,
     )
 
-    assert b1.bdy == 4
-    assert b2.bdy == 3
+    assert b1.bdx * b1.bdy // 32 == 4
+    assert b2.bdx * b2.bdy // 32 == 3
 
 
 def _merge_reference_base2(

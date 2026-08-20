@@ -2575,7 +2575,7 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
-        route_E = requested_route_E if full_rotation else int(weight_E)
+        route_E = max(int(weight_E), requested_route_E)
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
@@ -2780,12 +2780,12 @@ def _plan_core_workspace(
             _TensorAllocSpec("block_expert_ids", (route_blocks_capacity,), torch.int32),
             _TensorAllocSpec("packed_route_count", (1,), torch.int32),
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
+            _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
         ]
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
             tensor_specs.extend(
                 (
-                    _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
                     _TensorAllocSpec(
                         "full_rotation_output",
                         (max_tokens, int(k)),
@@ -10710,11 +10710,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             block_expert_ids=block_expert_ids,
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
-            expert_counts=(
-                _require_binding_field(binding, "expert_counts")
-                if full_rotation
-                else None
-            ),
+            expert_counts=_require_binding_field(binding, "expert_counts"),
             expert_map=binding.route_expert_map,
             output_expert_map=binding.output_expert_map,
             activation_amax=activation_amax,

@@ -367,6 +367,7 @@ def _run_nano35_serving_case(m: int, weights: _Nano35Weights) -> None:
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
             fused_launch=fused,
             topk_sum_launch=topk_sum,
         )

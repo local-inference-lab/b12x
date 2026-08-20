@@ -118,15 +118,15 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     plan = plan_block_fp8_linear_scratch(
         BlockFP8LinearScratchCaps(
             device="cpu",
-            max_tokens=4,
+            max_tokens=9,
             in_features=128,
             out_features=256,
         )
     )
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    source = torch.empty((3, 128), dtype=torch.bfloat16)
-    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
+    source = torch.empty((9, 128), dtype=torch.bfloat16)
+    output = torch.empty((9, 256, 1), dtype=torch.bfloat16)
     packed = _packed_weight()
     binding = plan.bind(
         scratch=scratch,
@@ -156,7 +156,7 @@ def test_block_fp8_linear_binding_supplies_runtime_tensors(monkeypatch) -> None:
     assert calls["source_tk"].data_ptr() == source.data_ptr()
     assert calls["x_q_out"] is binding.x_q
     assert calls["dense_out"] is output
-    assert out.shape == (3, 256)
+    assert out.shape == (9, 256)
 
 
 def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:

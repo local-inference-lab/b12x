@@ -8,6 +8,7 @@ import torch
 import b12x.attention.nsa_indexer._impl as indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
 import b12x.attention._shared.mla.compressed_api as compressed_mla_impl
+import b12x.attention._shared.mla.kernel as compressed_mla_kernel
 import b12x.attention.nsa_indexer.paged as paged_indexer_impl
 from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_MLA_DSV4_PAGE_SIZE,
@@ -809,14 +810,14 @@ def test_compressed_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> 
         raise AssertionError("binding path should not stage compressed MLA inputs")
 
     def fake_forward(**kwargs):
-        forward_binding = kwargs["binding"]
-        calls["q_all"] = forward_binding.q_all
-        calls["swa_indices"] = forward_binding.swa_indices
-        calls["swa_lengths"] = forward_binding.swa_lengths
-        forward_binding.tmp_output.zero_()
+        calls["q_all"] = kwargs["q_all"]
+        calls["swa_indices"] = kwargs["swa_indices"]
+        calls["swa_lengths"] = kwargs["swa_topk_lengths"]
+        return kwargs["workspace"].output_buffer
 
     monkeypatch.setattr(compressed_mla_impl, "_stage_fixed_compressed_mla_inputs", fail_stage)
-    monkeypatch.setattr(compressed_mla_impl, "run_compressed_mla_split_decode_forward", fake_forward)
+    monkeypatch.setattr(compressed_mla_impl, "_use_sm120_sparse_mla", lambda **_: True)
+    monkeypatch.setattr(compressed_mla_kernel, "run_unified_decode", fake_forward)
 
     out = compressed_mla_impl.compressed_mla_decode_forward(
         binding=binding,
