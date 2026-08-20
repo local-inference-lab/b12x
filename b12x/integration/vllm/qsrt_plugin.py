@@ -136,6 +136,9 @@ def _workspace_capacity_rows(config: dict[str, Any]) -> int:
 def _capture_sizes(capacity_rows: int) -> tuple[int, ...]:
     if capacity_rows <= 0:
         raise ValueError("B12X QSRT workspace capacity must be positive")
+    # Warm common eager-decode rows even when vLLM declares a different graph
+    # capture set. Every row view shares one capacity-sized allocation, so this
+    # bounded warmup does not create row-indexed persistent storage.
     sizes = set(_DEFAULT_CAPTURE_MS)
     configured_sizes: set[int] = set()
     try:
@@ -163,9 +166,7 @@ def _capture_sizes(capacity_rows: int) -> tuple[int, ...]:
 def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
-    if not torch.compiler.is_compiling() and (
-        rows <= 0 or rows > capacity_rows
-    ):
+    if not torch.compiler.is_compiling() and (rows <= 0 or rows > capacity_rows):
         raise ValueError(
             f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
         )
@@ -195,9 +196,7 @@ def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
 def _shared_pair_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
-    if not torch.compiler.is_compiling() and (
-        rows <= 0 or rows > capacity_rows
-    ):
+    if not torch.compiler.is_compiling() and (rows <= 0 or rows > capacity_rows):
         raise ValueError(
             f"B12X QSRT row count must be in [1, {capacity_rows}], got {rows}"
         )
@@ -503,11 +502,7 @@ def register_b12x_qsrt() -> None:
             if x.dtype != torch.bfloat16 or not x.is_contiguous():
                 raise ValueError("B12X QSRT requires contiguous BF16 activations")
             x2d = x.reshape(-1, x.shape[-1])
-            rows = (
-                x2d.shape[0]
-                if torch.compiler.is_compiling()
-                else int(x2d.shape[0])
-            )
+            rows = x2d.shape[0] if torch.compiler.is_compiling() else int(x2d.shape[0])
             capacity_rows = self.workspace_capacity_rows
             weight = layer.b12x_qsrt_weight
             if layer.b12x_qsrt_group == "gate_up":
