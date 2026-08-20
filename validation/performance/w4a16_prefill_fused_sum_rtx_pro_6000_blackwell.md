@@ -1,7 +1,9 @@
 # W4A16 bounded prefill reduction qualification
 
-Status: **qualified** for the hardware, tensor shape, source revision, and
-serving composition recorded below.
+Status: **qualified** for the full-model serving hardware, source composition,
+and launch contract recorded below. The isolated kernel latency comparison is
+**diagnostic** because its A-B-B-A run did not retain a contemporaneous GPU-mode
+sample.
 
 ## Purpose
 
@@ -14,7 +16,7 @@ into one FP32 row per input token. Its purpose is to bound scratch memory so a
 The machine-readable receipt
 `w4a16_prefill_fused_sum_rtx_pro_6000_blackwell.json.gz` contains every
 CUDA-event timing sample from the A-B-B-A kernel comparison. Its SHA-256 is
-`c54ceb70b29977c30cb6c7b0bcec6a85a615dfddb92aa7c3a9497b00c7a60992`.
+`65db1e3220c45246e0eede79da4d9ebb448f27c631bfcf23194a5248efdeb551`.
 
 ## Source and hardware
 
@@ -32,7 +34,17 @@ CUDA-event timing sample from the A-B-B-A kernel comparison. Its SHA-256 is
 - Driver: `610.57.04`
 - Microbenchmark GPU: physical GPU 0,
   `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`
+- Microbenchmark GPU UUID:
+  `GPU-d8438b2d-f000-a617-5dcc-0197ce0365a3`
 - Full-model hardware: 16 GPUs of the same type
+
+The two persistent MoE artifacts use CUTLASS DSL 4.6.2 and PTXAS
+`Cuda compilation tools, release 13.3, V13.3.27`:
+
+| Arm | Compile-cache key | Object SHA-256 |
+|---|---|---|
+| Materialized BF16 routes | `d44aed42740f285a69b9bd972756111de92eb4ec8f7a21e683be3750a58eeeb6` | `34c5396f3d9f140fad4fed016d11516f19e8e063bff3729764811abf85e0f96a` |
+| FP32 bounded reduction | `19a9b91e405c43b3eea9751b6ac02bf85c94918e254bfe005a064cf37eb67579` | `fb313da8431a46cc86ab1a2e6972dcf0f10af76554ea7a71cc666a617aa494b3` |
 
 ## Scratch contract
 
@@ -73,6 +85,11 @@ as a kernel-latency optimization. Its serving gain comes from replacing four
 1,024-token MoE launches with one 4,096-token launch under the same physical KV
 allocation.
 
+The A-B-B-A processes did not retain P-state or throttle-mask snapshots. Their
+latency ratio is diagnostic rather than hardware-qualified. The full-model
+measurement below retained 7,072 GPU-mode samples and is the authoritative
+serving-performance result.
+
 Reproduce either arm with this command and set the feature flag to `0` or `1`:
 
 ```bash
@@ -98,6 +115,12 @@ The serving test uses the official `moonshotai/Kimi-K3` MXFP4 target, the
 B12X MLA, disabled prefix caching, and a 1,325,000,000-byte FP8 KV allocation
 per rank. `MAX_NUM_BATCHED_TOKENS=4102` reserves six DSpark slots and leaves an
 exact 4,096-token prefill scheduler limit.
+
+The complete launch command, source-composition procedure, benchmark command,
+and machine-readable serving receipt are published in the
+[Kimi-K3 full-MXFP4 4096-token prefill profile](https://github.com/local-inference-lab/rtx6kpro/blob/master/models/kimi-k3/full-mxfp4-p4096-prefill.md).
+The compressed receipt beside this document also contains every measured
+request's time to first token and effective prefill throughput.
 
 | Prompt tokens | Four 1,024-token MoE launches | One 4,096-token MoE launch | Change |
 |---:|---:|---:|---:|
