@@ -75,6 +75,9 @@ from ._impl import (
 from ._impl import (
     b12x_sparse_moe_fp4 as run_sparse,
 )
+from ._btx_adoption import (
+    adopt_prepared_btx_weights as adopt_btx_weights,
+)
 from . import META
 
 
@@ -107,6 +110,7 @@ __all__ = [
     "plan_execution",
     "plan_weights",
     "prepare_weights",
+    "adopt_btx_weights",
     "prepare_fc2_weights",
     "prewarm_fc2",
     "bind",

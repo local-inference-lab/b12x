@@ -143,6 +143,96 @@ def _routing(m, experts, topk, device, seed):
 
 
 @requires_sm12x
+def test_btx_uniform_prepared_owner_preserves_public_plan_contract(tmp_path) -> None:
+    """A native owner can cross a checkpoint adapter without repacking."""
+
+    device = _device()
+    experts, hidden, intermediate = 4, 256, 512
+    config = BtxSynthConfig(
+        codebook="mcg",
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        moe_layer_indices=(1,),
+        bits=3,
+        extent_alignment_slots=4,
+        seed=20260817,
+    )
+    manifest = write_btx_checkpoint(tmp_path, config)
+    layer = read_btx_layer(
+        tmp_path,
+        manifest,
+        1,
+        first_slot=0,
+        slot_count=config.atom_slots,
+    )
+    plan = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="btx",
+        activation="situ",
+        params_dtype=torch.float16,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        trellis_bits=3,
+        trellis_codebook="mcg",
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    from_atoms = fused_moe.prepare_weights(
+        plan=plan,
+        params_dtype=torch.float16,
+        btx_layer=layer,
+        btx_device=device,
+    )
+    native = from_atoms.representation_for("w4a16")
+
+    adopted = fused_moe.adopt_btx_weights(
+        plan=plan,
+        prepared=native,
+    )
+
+    assert adopted.representation_for("w4a16") is native
+    assert adopted.w1_fp4.data_ptr() == from_atoms.w1_fp4.data_ptr()
+    assert adopted.w2_fp4.data_ptr() == from_atoms.w2_fp4.data_ptr()
+
+    torch.manual_seed(20260817)
+    x = (torch.randn((4, hidden), device=device) * 0.05).to(torch.float16)
+    ids, router_weights = _routing(4, experts, 2, device, 20260817)
+    original_output = _serve(
+        from_atoms,
+        x=x,
+        ids=ids,
+        router_weights=router_weights,
+    )
+    adopted_output = _serve(
+        adopted,
+        x=x,
+        ids=ids,
+        router_weights=router_weights,
+    )
+    assert torch.count_nonzero(original_output).item() > 0
+    assert torch.equal(adopted_output, original_output)
+
+    mismatched = fused_moe.plan_weights(
+        quant_modes="w4a16",
+        source_format="btx",
+        activation="situ",
+        params_dtype=torch.float16,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        trellis_bits=4,
+        trellis_codebook="mcg",
+        trellis_tile_config=(64, 256, 64, 256),
+    )
+    with pytest.raises(ValueError, match="codebook, bitrate, or tile"):
+        fused_moe.adopt_btx_weights(
+            plan=mismatched,
+            prepared=native,
+        )
+
+
+@requires_sm12x
 @pytest.mark.parametrize(
     ("codebook", "bits"),
     [
