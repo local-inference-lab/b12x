@@ -2,8 +2,8 @@
 
 Status: **qualified** for the full-model serving hardware, source composition,
 and launch contract recorded below. The isolated kernel latency comparison is
-**diagnostic** because its A-B-B-A run did not retain a contemporaneous GPU-mode
-sample.
+**diagnostic** because its alternating materialized/fused process sequence did
+not retain a contemporaneous GPU-mode sample.
 
 ## Purpose
 
@@ -118,7 +118,7 @@ exact 4,096-token prefill scheduler limit.
 
 The complete launch command, source-composition procedure, benchmark command,
 and machine-readable serving receipt are published in the
-[Kimi-K3 full-MXFP4 4096-token prefill profile](https://github.com/local-inference-lab/rtx6kpro/blob/master/models/kimi-k3/full-mxfp4-p4096-prefill.md).
+[Kimi-K3 full-MXFP4 4096-token prefill profile](https://github.com/local-inference-lab/rtx6kpro/blob/15d7347108673ad73aff51fdb40e74fc292401a3/models/kimi-k3/full-mxfp4-p4096-prefill.md).
 The compressed receipt beside this document also contains every measured
 request's time to first token and effective prefill throughput.
 
