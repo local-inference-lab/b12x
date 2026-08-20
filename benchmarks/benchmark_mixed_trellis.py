@@ -446,7 +446,6 @@ def main() -> None:
             print(
                 f"m={m:4d} serial={serial_med:9.2f}us mixed={mixed_med:9.2f}us "
                 f"speedup={serial_med / mixed_med:6.3f}x rel={float(rel):.3e} "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}/{serial_buffer_bytes / 2**20:.1f}MiB"
             )
         elif args.variant in ("serial", "serial-overlap"):
@@ -460,7 +459,6 @@ def main() -> None:
             assert launch is not None
             print(
                 f"m={m:4d} variant=mixed time={mixed_med:9.2f}us "
-                f"regs={launch.registers_per_thread} local={launch.local_memory_bytes} "
                 f"buffers={mixed_buffer_bytes / 2**20:.1f}MiB"
             )
 

@@ -401,8 +401,7 @@ def main() -> None:
         f"rel={float(relative):.6e} "
         f"cos={float(cosine):.9f} "
         f"serial={serial_us:.2f}us mixed={mixed_us:.2f}us "
-        f"speedup={serial_us / mixed_us:.3f}x allocated={allocated:.3f}GiB "
-        f"regs={launch.registers_per_thread} local={launch.local_memory_bytes}"
+        f"speedup={serial_us / mixed_us:.3f}x allocated={allocated:.3f}GiB"
     )
 
 

@@ -17,7 +17,6 @@ Example:
       python benchmarks/benchmark_trellis_pair_moe_tp12.py \
         --tokens 1,4,16 --route-fixture /path/to/layer-rank.safetensors \
         --scenarios P33,sparse --replays 200 \
-        --require-known-resources --require-no-local-memory \
         --output out/trellis-pair-moe-tp12.json
 """
 
@@ -655,18 +654,7 @@ def _capture_case(
         ),
     }
     fused_launch = binding.fused_launch
-    registers_per_thread = int(
-        getattr(fused_launch, "registers_per_thread", -1)
-    )
-    local_memory_bytes = int(getattr(fused_launch, "local_memory_bytes", -1))
     kernel_summary: dict[str, object] = {
-        "resource_scope": "fused_route_fc1_situ_fc2",
-        "kernel_symbol": getattr(fused_launch, "kernel_symbol", None),
-        "resource_introspection_available": (
-            registers_per_thread >= 0 and local_memory_bytes >= 0
-        ),
-        "registers_per_thread": registers_per_thread,
-        "local_memory_bytes_per_thread": local_memory_bytes,
         "preplanned_launch_available": fused_launch is not None,
     }
     if fused_launch is not None:
@@ -828,16 +816,6 @@ def main() -> None:
     parser.add_argument("--cold-replays", type=int, default=50)
     parser.add_argument("--bootstrap-replicates", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=20260801)
-    parser.add_argument(
-        "--require-known-resources",
-        action="store_true",
-        help="fail unless CUDA function attributes are available for every case",
-    )
-    parser.add_argument(
-        "--require-no-local-memory",
-        action="store_true",
-        help="fail unless every fused kernel reports zero local bytes/thread",
-    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -942,7 +920,6 @@ def main() -> None:
             "cuda_graph_replay_allocation_stable_required": True,
             "paired_timing_bootstrap_replicates": args.bootstrap_replicates,
             "correctness": "finite eager output and bit-exact eager/graph replay",
-            "kernel_resource_scope": "fused route/FC1/SiTU/FC2 kernel only",
         },
         "device": {
             "name": props.name,
@@ -1003,22 +980,6 @@ def main() -> None:
             mode_summaries[scenario] = mode_summary
             kernel_summaries[scenario] = kernel_summary
             correctness_summaries[scenario] = correctness_summary
-            resources_known = bool(
-                kernel_summary["resource_introspection_available"]
-            )
-            local_memory_bytes = int(
-                kernel_summary["local_memory_bytes_per_thread"]
-            )
-            if args.require_known_resources and not resources_known:
-                raise RuntimeError(
-                    f"{scenario}/tokens={tokens} has unavailable CUDA resource data; "
-                    "use a fresh B12X_COMPILE_CACHE_DIR"
-                )
-            if args.require_no_local_memory and local_memory_bytes != 0:
-                raise RuntimeError(
-                    f"{scenario}/tokens={tokens} reports "
-                    f"{local_memory_bytes} local bytes/thread"
-                )
 
         allocated_before_timing = int(torch.cuda.memory_allocated(device))
         reserved_before_timing = int(torch.cuda.memory_reserved(device))

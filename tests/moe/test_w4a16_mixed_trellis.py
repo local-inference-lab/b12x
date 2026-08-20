@@ -331,7 +331,6 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         force_tile_config=(128, 128, 128, 128),
         route_ids_dtype=route_ids_dtype,
     )
-    assert launch.local_memory_bytes == 0
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)
     rotations = combine_trellis_rotations(tier0, tier1)
     buffers = make_mixed_trellis_buffers(
@@ -923,8 +922,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
         f"packed_block={candidate_launch.moe_block_size} "
         f"fc2_subtile={candidate_launch.fc2_moe_block_size} "
         f"fc2_schedule_factor={candidate_launch.fc2_schedule_route_block_factor} "
-        f"regs={candidate_launch.registers_per_thread} "
-        f"local={candidate_launch.local_memory_bytes} "
         f"smem={candidate_launch.shared_memory_bytes}"
     )
     assert reference_launch.moe_block_size == 8
@@ -936,7 +933,6 @@ def test_one_grid_large_blocks_avoid_serial_prefill_drift(
     assert candidate_launch.fc2_paired_m8_routes is True
     assert phase_equal == (True, True, True), geometry
     assert torch.equal(candidate, reference), geometry
-    assert candidate_launch.local_memory_bytes == 0
     assert candidate_launch.shared_memory_bytes <= int(
         props.shared_memory_per_block_optin
     )

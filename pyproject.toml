@@ -1,6 +1,6 @@
 [project]
 name = "b12x"
-version = "1.2.4"
+version = "1.2.5"
 description = "DGX Spark and RTX 6000-focused inference kernel library."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"

@@ -8,7 +8,6 @@ from functools import partial
 from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
-import cuda.bindings.runtime as cuda_runtime
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -636,12 +635,6 @@ class W4A16FusedMoeCompileResult:
     full_rotation: bool = False
     coupled_hadamard: bool = False
     rotation_input_dtype: str = "fp16"
-    # CUDA function attributes are available after a fresh compile.  The
-    # on-disk object-cache loader does not currently expose the CUDA-dialect
-    # introspection surface, so cached entries retain the sentinel values.
-    kernel_symbol: str | None = None
-    registers_per_thread: int = -1
-    local_memory_bytes: int = -1
     cta_threads: int = -1
     shared_memory_bytes: int = -1
 
@@ -10241,12 +10234,6 @@ def compile_w4a16_fused_moe(
         ),
         dsl_compile_options=OptLevel(2),
     )
-    resources = _query_w4a16_kernel_resources(compiled)
-    kernel_symbol = None
-    registers_per_thread = -1
-    local_memory_bytes = -1
-    if resources is not None:
-        kernel_symbol, registers_per_thread, local_memory_bytes = resources
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
         size_m=size_m,
@@ -10286,55 +10273,11 @@ def compile_w4a16_fused_moe(
         full_rotation=full_rotation,
         coupled_hadamard=coupled_hadamard,
         rotation_input_dtype=rotation_input_dtype,
-        kernel_symbol=kernel_symbol,
-        registers_per_thread=registers_per_thread,
-        local_memory_bytes=local_memory_bytes,
         cta_threads=kernel.cta_threads,
         shared_memory_bytes=kernel.shared_words * 4,
     )
     _FUSED_CACHE[cache_key] = result
     return result
-
-
-
-
-def _query_w4a16_kernel_resources(compiled: object) -> tuple[str, int, int] | None:
-    """Return (symbol, registers/thread, local bytes/thread) for a one-kernel
-    CUDA-dialect compile result, or None when the object does not expose the
-    introspection surface (e.g. an on-disk object-cache reload)."""
-
-    kernel_info = getattr(compiled, "kernel_info", None)
-    to_executor = getattr(compiled, "to", None)
-    if not isinstance(kernel_info, dict) or not callable(to_executor):
-        return None
-    symbols = tuple(kernel_info)
-    if len(symbols) != 1 or not isinstance(symbols[0], str) or not symbols[0]:
-        return None
-    executor = to_executor(int(torch.cuda.current_device()))
-    libraries = tuple(
-        getattr(getattr(executor, "jit_module", None), "cuda_library", None) or ()
-    )
-    if len(libraries) != 1:
-        return None
-    success = cuda_runtime.cudaError_t(0)
-    kernel_status, kernel_handle = cuda_runtime.cudaLibraryGetKernel(
-        libraries[0], symbols[0].encode("utf-8")
-    )
-    if kernel_status != success:
-        raise RuntimeError(
-            f"cudaLibraryGetKernel failed for {symbols[0]}: {kernel_status}"
-        )
-    attributes_status, attributes = cuda_runtime.cudaFuncGetAttributes(kernel_handle)
-    if attributes_status != success:
-        raise RuntimeError(
-            f"cudaFuncGetAttributes failed for {symbols[0]}: {attributes_status}"
-        )
-    registers_per_thread = int(getattr(attributes, "numRegs", -1))
-    local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
-    if registers_per_thread < 0 or local_memory_bytes < 0:
-        raise RuntimeError(f"incomplete CUDA function attributes for {symbols[0]}")
-    return symbols[0], registers_per_thread, local_memory_bytes
-
 
 def _w4a16_weight_flat_elements(
     *,

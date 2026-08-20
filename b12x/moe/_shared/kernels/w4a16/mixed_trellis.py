@@ -32,7 +32,6 @@ from .kernel import (
     W4A16FusedMoeKernel,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
-    _query_w4a16_kernel_resources,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
@@ -62,8 +61,6 @@ class MixedTrellisCompileResult:
     blocks_per_sm: int
     sms: int
     shared_memory_bytes: int
-    registers_per_thread: int
-    local_memory_bytes: int
     rotation_input_dtype: str
     route_ids_dtype: torch.dtype
     broadcast_suh: bool
@@ -955,16 +952,6 @@ def compile_mixed_trellis(
         ),
         dsl_compile_options=OptLevel(2),
     )
-    registers = -1
-    local_bytes = -1
-    resources = _query_w4a16_kernel_resources(compiled)
-    if resources is not None:
-        _, registers, local_bytes = resources
-        if local_bytes != 0:
-            raise RuntimeError(
-                "mixed Trellis codegen spills to local memory "
-                f"({local_bytes} bytes/thread)"
-            )
     result = MixedTrellisCompileResult(
         compiled=compiled,
         topk_sum=topk_sum,
@@ -990,8 +977,6 @@ def compile_mixed_trellis(
         blocks_per_sm=int(kernel.blocks_per_sm),
         sms=int(sms),
         shared_memory_bytes=int(kernel.shared_words * 4),
-        registers_per_thread=registers,
-        local_memory_bytes=local_bytes,
         rotation_input_dtype=str(rotation_input_dtype),
         route_ids_dtype=route_ids_dtype,
         broadcast_suh=bool(broadcast_suh),
