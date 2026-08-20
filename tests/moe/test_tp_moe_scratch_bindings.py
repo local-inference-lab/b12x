@@ -525,6 +525,61 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     assert plan_4080.shapes_and_dtypes() == plan_4096.shapes_and_dtypes()
 
 
+def test_w4a16_prefill_route_reduction_shrinks_caller_owned_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
+    weight_plan = _weight_plan(
+        "w4a16",
+        source_format="fp4_e8m0_k32",
+        experts=896,
+        k=7168,
+        n=192,
+        activation="situ",
+    )
+    base_caps = dict(
+        max_tokens=4096,
+        core_token_counts=(4096,),
+        num_topk=16,
+        route_num_experts=896,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a16",
+    )
+
+    monkeypatch.delenv("B12X_W4A16_PREFILL_FUSED_SUM", raising=False)
+    materialized = plan_tp_moe_scratch(TPMoEScratchCaps(**base_caps))
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    fused = plan_tp_moe_scratch(TPMoEScratchCaps(**base_caps))
+    calibrated = plan_tp_moe_scratch(
+        TPMoEScratchCaps(**base_caps, collect_activation_amax=True)
+    )
+
+    def specs(plan):
+        return {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    materialized_specs = specs(materialized)
+    fused_specs = specs(fused)
+    calibrated_specs = specs(calibrated)
+    routed_rows = 4096 * 16
+    fc1_cols = 2 * 192
+
+    assert materialized_specs["intermediate_cache13"].shape == (
+        routed_rows * 7168,
+    )
+    assert "prefill_sum_accum" not in materialized_specs
+    assert fused_specs["intermediate_cache13"].shape == (
+        routed_rows * fc1_cols,
+    )
+    assert fused_specs["prefill_sum_accum"].shape == (4096 * 7168,)
+    assert fused_specs["prefill_sum_accum"].dtype == torch.float32
+    assert calibrated_specs["intermediate_cache13"].shape == (
+        routed_rows * 7168,
+    )
+    assert "prefill_sum_accum" not in calibrated_specs
+    assert fused.layout.core_workspace_nbytes < materialized.layout.core_workspace_nbytes
+
+
 def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -814,9 +869,15 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
     fused = object()
 
     def _fake_w4a16_prewarm(
-        workspace, *, token_counts, collect_activation_amax=False, **_kwargs
+        workspace,
+        *,
+        token_counts,
+        collect_activation_amax=False,
+        prefill_fused_sum=False,
+        **_kwargs,
     ) -> None:
         captured["collect_activation_amax"] = bool(collect_activation_amax)
+        captured["prefill_fused_sum"] = bool(prefill_fused_sum)
         workspace.planned_fused_moe_launches = {
             (
                 "packed",
@@ -864,9 +925,55 @@ def test_w4a16_materialize_can_prewarm_activation_amax_variant(
     )
 
     assert captured["collect_activation_amax"] is True
+    assert captured["prefill_fused_sum"] is False
     assert workspace.planned_collect_activation_amax is True
+    assert workspace.planned_prefill_fused_sum_fp32 is False
     assert selected is fused
     assert topk_sum is not None
+
+
+def test_w4a16_materialize_freezes_prefill_reduction_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def _fake_w4a16_prewarm(
+        workspace,
+        *,
+        token_counts,
+        prefill_fused_sum=False,
+        **_kwargs,
+    ) -> None:
+        captured["prefill_fused_sum"] = bool(prefill_fused_sum)
+        monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    monkeypatch.setattr(
+        tp_moe_impl,
+        "_prewarm_w4a16_planned_launches",
+        _fake_w4a16_prewarm,
+    )
+    pool = tp_moe_impl.allocate_tp_moe_workspace_pool(frozen=True)
+    weight_plan = _weight_plan(
+        "w4a16",
+        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+    )
+
+    tp_moe_impl.materialize_tp_moe_arena_workspaces(
+        pool,
+        caps=_caps(
+            max_tokens=16,
+            weight_plan=weight_plan,
+            core_token_counts=(16,),
+            route_num_experts=0,
+        ),
+    )
+
+    workspace = next(iter(pool.workspaces.values()))
+    assert captured["prefill_fused_sum"] is True
+    assert workspace.planned_prefill_fused_sum_fp32 is True
+    assert workspace.prefill_sum_accum is not None
 
 
 def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(

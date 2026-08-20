@@ -256,6 +256,7 @@ class TPW4A16Workspace:
     routed_rows_capacity: int
     intermediate_cache13: torch.Tensor
     intermediate_cache2: torch.Tensor
+    prefill_sum_accum: torch.Tensor | None
     fc1_c_tmp: torch.Tensor
     fc2_c_tmp: torch.Tensor
     packed_route_indices: torch.Tensor
@@ -281,6 +282,7 @@ class TPW4A16Workspace:
     planned_swiglu_beta: float = 0.0
     planned_scale_format: str = "e4m3_k16"
     planned_collect_activation_amax: bool = False
+    planned_prefill_fused_sum_fp32: bool = False
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[object, object] = field(default_factory=dict)
     # Mapped direct-route launches, keyed by exact live token count. These
@@ -696,6 +698,7 @@ class _TPCoreWorkspacePlan:
     trellis_codebook: str | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
+    prefill_fused_sum_fp32: bool = False
     tensor_specs: Tuple[_TensorAllocSpec, ...] = ()
 
 
@@ -1033,6 +1036,7 @@ class TPMoEFP4Binding:
     materialized_intermediate: torch.Tensor | None = None
     intermediate_cache13: torch.Tensor | None = None
     intermediate_cache2: torch.Tensor | None = None
+    prefill_sum_accum: torch.Tensor | None = None
     fc1_c_tmp: torch.Tensor | None = None
     fc2_c_tmp: torch.Tensor | None = None
     packed_route_indices: torch.Tensor | None = None
@@ -2412,6 +2416,7 @@ def _build_tp_moe_fp4_binding_from_views(
             routed_rows_capacity=plan.routed_rows,
             intermediate_cache13=tensors["intermediate_cache13"],
             intermediate_cache2=tensors["intermediate_cache2"],
+            prefill_sum_accum=tensors.get("prefill_sum_accum"),
             fc1_c_tmp=tensors["fc1_c_tmp"],
             fc2_c_tmp=tensors["fc2_c_tmp"],
             packed_route_indices=tensors["packed_route_indices"],
@@ -2550,6 +2555,7 @@ def _plan_core_workspace(
     trellis_codebook: str | None = None,
     coupled_hadamard: bool = False,
     apply_router_weight_on_input: bool = False,
+    collect_activation_amax: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
@@ -2569,6 +2575,7 @@ def _plan_core_workspace(
         from b12x.moe._shared.kernels.w4a16.host import (
             max_packed_route_slots,
             packed_gemm_scratch_elements,
+            prefill_fused_sum_eligible,
             route_block_sizes_for_capacity,
             select_route_block_size_m,
         )
@@ -2757,10 +2764,22 @@ def _plan_core_workspace(
                 // _dtype_nbytes(dtype),
             )
         cache_dtype = torch.float16 if full_rotation else dtype
+        use_prefill_fused_sum = prefill_fused_sum_eligible(
+            dtype=dtype,
+            m=token_capacity,
+            full_rotation=full_rotation,
+            weight_layout=weight_layout,
+            collect_activation_amax=collect_activation_amax,
+        )
+        intermediate_cache13_elements = (
+            routed_capacity * fc1_cols
+            if use_prefill_fused_sum
+            else routed_capacity * max(fc1_cols, int(k))
+        )
         tensor_specs = [
             _TensorAllocSpec(
                 "intermediate_cache13",
-                (routed_capacity * max(fc1_cols, int(k)),),
+                (intermediate_cache13_elements,),
                 cache_dtype,
             ),
             _TensorAllocSpec(
@@ -2778,6 +2797,14 @@ def _plan_core_workspace(
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
             _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
         ]
+        if use_prefill_fused_sum:
+            tensor_specs.append(
+                _TensorAllocSpec(
+                    "prefill_sum_accum",
+                    (token_capacity * int(k),),
+                    torch.float32,
+                )
+            )
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
             tensor_specs.extend(
@@ -2828,6 +2855,7 @@ def _plan_core_workspace(
             trellis_codebook=trellis_codebook,
             coupled_hadamard=bool(coupled_hadamard),
             route_block_size_m=w4a16_block_size_m,
+            prefill_fused_sum_fp32=use_prefill_fused_sum,
             tensor_specs=tuple(tensor_specs),
         )
 
@@ -3245,6 +3273,7 @@ def _materialize_workspace_from_core_arena(
             routed_rows_capacity=plan.routed_rows,
             intermediate_cache13=tensors["intermediate_cache13"],
             intermediate_cache2=tensors["intermediate_cache2"],
+            prefill_sum_accum=tensors.get("prefill_sum_accum"),
             fc1_c_tmp=tensors["fc1_c_tmp"],
             fc2_c_tmp=tensors["fc2_c_tmp"],
             packed_route_indices=tensors["packed_route_indices"],
@@ -3267,6 +3296,7 @@ def _materialize_workspace_from_core_arena(
             trellis_codebook=plan.trellis_codebook,
             coupled_hadamard=plan.coupled_hadamard,
             route_block_size_m=plan.route_block_size_m,
+            planned_prefill_fused_sum_fp32=plan.prefill_fused_sum_fp32,
             volatile_launch_state=bool(volatile_launch_state),
         )
     if a1_gscale is None or a2_gscale is None:
@@ -6099,13 +6129,17 @@ def _validate_frozen_w4a16_launch(
             f"scale_format={scale_format!r}, "
             f"collect_activation_amax={bool(collect_activation_amax)}"
         )
+    fused_reduces_routes = bool(
+        getattr(fused, "tc_decode_fused_sum", False)
+        or getattr(fused, "prefill_fused_sum_fp32", False)
+    )
     has_topk_sum = planned_capacity in workspace.planned_topk_sum_launches
     if workspace.full_rotation:
         has_topk_sum = any(
             isinstance(key, tuple) and key[0] == planned_capacity
             for key in workspace.planned_topk_sum_launches
         )
-    if not has_topk_sum:
+    if not fused_reduces_routes and not has_topk_sum:
         raise RuntimeError(
             "frozen W4A16 MoE workspace is missing its preplanned top-k sum launch "
             f"for capacity={planned_capacity}"
@@ -6173,6 +6207,11 @@ def _w4a16_preplanned_launches(
     fused = workspace.planned_fused_moe_launches.get(
         (weight_layout, scale_format, planned_capacity, collect_activation_amax)
     )
+    if fused is not None and bool(
+        getattr(fused, "tc_decode_fused_sum", False)
+        or getattr(fused, "prefill_fused_sum_fp32", False)
+    ):
+        return fused, None
     topk_sum_key: object = planned_capacity
     if workspace.full_rotation:
         topk_sum_key = (
@@ -6494,6 +6533,7 @@ def plan_tp_moe_arena_layout(
             ),
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
@@ -6832,6 +6872,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         ),
         coupled_hadamard=caps.weight_plan.coupled_hadamard,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
+        collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
         swiglu_limit=launch_plan.swiglu_limit,
         swiglu_alpha=launch_plan.swiglu_alpha,
@@ -6883,6 +6924,7 @@ def _prewarm_w4a16_planned_launches(
     weight_layout: str = "packed",
     w13_layout: str = "w13",
     collect_activation_amax: bool = False,
+    prefill_fused_sum: bool = False,
 ) -> None:
     """Resolve every W4A16 kernel shape owned by a frozen arena.
 
@@ -6903,6 +6945,7 @@ def _prewarm_w4a16_planned_launches(
     collect_activation_amax = bool(collect_activation_amax)
 
     from b12x.moe._shared.kernels.w4a16.host import (
+        prefill_fused_sum_eligible,
         route_pack_capacity,
         select_route_block_size_m,
     )
@@ -6965,6 +7008,14 @@ def _prewarm_w4a16_planned_launches(
                 token_count,
                 collect_activation_amax,
             )
+            build_prefill_fused_sum = prefill_fused_sum_eligible(
+                dtype=element_dtype,
+                m=token_count,
+                full_rotation=full_rotation,
+                weight_layout=weight_layout,
+                collect_activation_amax=collect_activation_amax,
+                enabled=prefill_fused_sum,
+            )
             # Rotation-table row count belongs to the prepared artifact, which
             # is not bound until after the workspace is frozen. Resolve both
             # full-rotation specializations now so either artifact contract is
@@ -6991,6 +7042,7 @@ def _prewarm_w4a16_planned_launches(
                     weight_layout=weight_layout,
                     scale_format=scale_format,
                     w13_layout=w13_layout,
+                    prefill_fused_sum_fp32=build_prefill_fused_sum,
                     collect_activation_amax=collect_activation_amax,
                     trellis_bits=workspace.trellis_bits,
                     trellis_codebook=workspace.trellis_codebook or SQG_E4M3,
@@ -7027,7 +7079,7 @@ def _prewarm_w4a16_planned_launches(
                                 topk_sum_launches[(token_count, ids_dtype, mapped)] = (
                                     resolved_topk_sum
                                 )
-            else:
+            elif not build_prefill_fused_sum:
                 topk_sum_launches[token_count] = compile_w4a16_topk_sum(
                     m=token_count,
                     topk=workspace.num_topk,
@@ -7333,6 +7385,7 @@ def materialize_tp_moe_arena_workspaces(
             ),
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
@@ -7378,6 +7431,14 @@ def materialize_tp_moe_arena_workspaces(
                     != w4a16_scale_format
                     or bool(getattr(existing, "planned_collect_activation_amax", False))
                     != collect_activation_amax
+                    or bool(
+                        getattr(
+                            existing,
+                            "planned_prefill_fused_sum_fp32",
+                            False,
+                        )
+                    )
+                    != core_plan.prefill_fused_sum_fp32
                 ):
                     pass
                 else:
@@ -7434,6 +7495,9 @@ def materialize_tp_moe_arena_workspaces(
             materialized.planned_swiglu_alpha = plan.swiglu_alpha
             materialized.planned_swiglu_beta = plan.swiglu_beta
             materialized.planned_collect_activation_amax = collect_activation_amax
+            materialized.planned_prefill_fused_sum_fp32 = (
+                core_plan.prefill_fused_sum_fp32
+            )
             t_prewarm0 = time.perf_counter() if _B12X_TIMING else 0.0
             _prewarm_w4a16_planned_launches(
                 materialized,
@@ -7446,6 +7510,7 @@ def materialize_tp_moe_arena_workspaces(
                 weight_layout=w4a16_weight_layout,
                 w13_layout=w13_layout,
                 collect_activation_amax=collect_activation_amax,
+                prefill_fused_sum=core_plan.prefill_fused_sum_fp32,
             )
             if _B12X_TIMING:
                 prewarm_ms += (time.perf_counter() - t_prewarm0) * 1000.0
@@ -7727,6 +7792,7 @@ def build_tp_moe_fp4_binding(
             routed_rows_capacity=workspace.routed_rows_capacity,
             intermediate_cache13=workspace.intermediate_cache13,
             intermediate_cache2=workspace.intermediate_cache2,
+            prefill_sum_accum=workspace.prefill_sum_accum,
             fc1_c_tmp=workspace.fc1_c_tmp,
             fc2_c_tmp=workspace.fc2_c_tmp,
             packed_route_indices=workspace.packed_route_indices,
@@ -10687,6 +10753,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             )
         intermediate_cache13 = _require_binding_field(binding, "intermediate_cache13")
         intermediate_cache2 = _require_binding_field(binding, "intermediate_cache2")
+        prefill_sum_accum = binding.prefill_sum_accum
         fc1_c_tmp = _require_binding_field(binding, "fc1_c_tmp")
         fc2_c_tmp = _require_binding_field(binding, "fc2_c_tmp")
         packed_route_indices = _require_binding_field(binding, "packed_route_indices")
@@ -10724,6 +10791,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
             intermediate_cache13=intermediate_cache13,
             intermediate_cache2=intermediate_cache2,
+            prefill_sum_accum=prefill_sum_accum,
             output=scatter_output,
             fc1_c_tmp=fc1_c_tmp,
             fc2_c_tmp=fc2_c_tmp,
