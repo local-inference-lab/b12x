@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -9,6 +11,8 @@ import torch
 from b12x.integration.vllm.qsrt_plugin import (
     BITS,
     DESCRIPTOR_SHA256,
+    QUALITY_SELECTION_FILENAME,
+    QUALITY_SELECTION_KIND,
     QUANT_NAME,
     RANK,
     _capture_sizes,
@@ -16,6 +20,8 @@ from b12x.integration.vllm.qsrt_plugin import (
     _parameter_loader,
     _projection_group,
     _select_linear_method,
+    _sha256,
+    _validate_quality_selection_receipt,
     _validate_quantization_config,
     _workspace_capacity_rows,
 )
@@ -88,6 +94,60 @@ def test_quantization_config_rejects_a_short_module_inventory() -> None:
     config["modules"] = config["modules"][:-1]
     with pytest.raises(ValueError, match="incompatible"):
         _validate_quantization_config(config)
+
+
+def test_quality_selection_receipt_binds_the_selected_overlay(tmp_path: Path) -> None:
+    report = {
+        "kind": QUALITY_SELECTION_KIND,
+        "schema_version": 1,
+        "status": "implemented",
+        "classification": "research-only",
+        "source_recovery": {
+            "complete_report_sha256": "a" * 64,
+            "adapter_manifest_sha256": "b" * 64,
+        },
+        "selected_overlay": {
+            "sha256": "c" * 64,
+            "step": 100,
+            "rank": RANK,
+            "variant": "weighted",
+            "tensor_count": 384,
+        },
+        "selection_contract": {
+            "metric": "strict-overlap-filtered token mean KLD",
+            "partition": "analysis",
+            "direction": "lower",
+        },
+    }
+    path = tmp_path / QUALITY_SELECTION_FILENAME
+    path.parent.mkdir()
+    path.write_text(json.dumps(report))
+    digest = _sha256(path)
+    config = {
+        "quality_selection_report": QUALITY_SELECTION_FILENAME,
+        "quality_selection_report_sha256": digest,
+    }
+    manifest = {
+        "build": {
+            "quality_selection_report_sha256": digest,
+            "recovery_report_sha256": "a" * 64,
+            "adapter_manifest_sha256": "b" * 64,
+            "recovery_overlay_sha256": "c" * 64,
+        },
+        "quality_selection": {
+            "status": "implemented",
+            "classification": "research-only",
+            "file": QUALITY_SELECTION_FILENAME,
+            "sha256": digest,
+            "selected_step": 100,
+            "selected_overlay_sha256": "c" * 64,
+        },
+    }
+
+    _validate_quality_selection_receipt(tmp_path, manifest, config)
+    path.write_text('{"status": "tampered"}\n')
+    with pytest.raises(ValueError, match="content differs"):
+        _validate_quality_selection_receipt(tmp_path, manifest, config)
 
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, 1.5])

@@ -22,6 +22,8 @@ QUANT_NAME = "b12x_qsrt"
 MODEL_DIR_ENV = "B12X_QSRT_MODEL_DIR"
 MANIFEST_FILENAME = "b12x-qsrt-manifest.json"
 CHECKPOINT_KIND = "qwen38_dense_mlp_qsrt_k5_rank16_checkpoint_v1"
+QUALITY_SELECTION_FILENAME = "b12x-qsrt-receipts/quality-selection.json"
+QUALITY_SELECTION_KIND = "qwen38_full_depth_mlp_adapter_quality_selection_v1"
 DESCRIPTOR_SHA256 = "17cf4ca9ef1e3a07c3354c12f7ac887b4e081b1668bea61eb37d8f2b410bb968"
 RANK = 16
 BITS = 5
@@ -53,6 +55,67 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_quality_selection_receipt(
+    root: Path,
+    manifest: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    """Validate an optional post-training checkpoint-selection receipt."""
+
+    filename = config.get("quality_selection_report")
+    expected_sha256 = config.get("quality_selection_report_sha256")
+    receipt = manifest.get("quality_selection")
+    if filename is None and expected_sha256 is None and receipt is None:
+        return
+    build = manifest.get("build")
+    if (
+        filename != QUALITY_SELECTION_FILENAME
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or not isinstance(build, dict)
+        or build.get("quality_selection_report_sha256") != expected_sha256
+        or not isinstance(receipt, dict)
+        or receipt.get("status") != "implemented"
+        or receipt.get("classification") != "research-only"
+        or receipt.get("file") != filename
+        or receipt.get("sha256") != expected_sha256
+        or receipt.get("selected_overlay_sha256")
+        != build.get("recovery_overlay_sha256")
+    ):
+        raise ValueError("B12X QSRT quality selection receipt is incompatible")
+    path = root / filename
+    if not path.is_file() or _sha256(path) != expected_sha256:
+        raise ValueError("B12X QSRT quality selection content differs")
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+    source_recovery = document.get("source_recovery")
+    selected = document.get("selected_overlay")
+    contract = document.get("selection_contract")
+    if (
+        document.get("kind") != QUALITY_SELECTION_KIND
+        or document.get("schema_version") != 1
+        or document.get("status") != "implemented"
+        or document.get("classification") != "research-only"
+        or not isinstance(source_recovery, dict)
+        or source_recovery.get("complete_report_sha256")
+        != build.get("recovery_report_sha256")
+        or source_recovery.get("adapter_manifest_sha256")
+        != build.get("adapter_manifest_sha256")
+        or not isinstance(selected, dict)
+        or selected.get("sha256") != build.get("recovery_overlay_sha256")
+        or selected.get("step") != receipt.get("selected_step")
+        or selected.get("rank") != RANK
+        or selected.get("variant") != "weighted"
+        or selected.get("tensor_count") != 384
+        or not isinstance(contract, dict)
+        or contract.get("metric") != "strict-overlap-filtered token mean KLD"
+        or contract.get("partition") != "analysis"
+        or contract.get("direction") != "lower"
+    ):
+        raise ValueError("B12X QSRT quality selection report is incompatible")
 
 
 def _projection_group(prefix: str, modules: set[str]) -> str | None:
@@ -624,6 +687,7 @@ def register_b12x_qsrt() -> None:
                 != self._config.get("recovery_overlay_sha256")
             ):
                 raise ValueError("B12X QSRT checkpoint manifest is incompatible")
+            _validate_quality_selection_receipt(root, document, self._config)
             self._manifest_validated = True
 
         def get_quant_method(self, layer: Any, prefix: str):
@@ -649,6 +713,8 @@ __all__ = [
     "DESCRIPTOR_SHA256",
     "MANIFEST_FILENAME",
     "MODEL_DIR_ENV",
+    "QUALITY_SELECTION_FILENAME",
+    "QUALITY_SELECTION_KIND",
     "QUANT_NAME",
     "RANK",
     "register_b12x_qsrt",
