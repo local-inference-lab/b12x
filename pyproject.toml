@@ -33,6 +33,7 @@ build-backend = "setuptools.build_meta"
 
 [project.entry-points."vllm.general_plugins"]
 b12x_fp6 = "b12x.integration.vllm.plugin:register_b12x_fp6"
+b12x_qsrt = "b12x.integration.vllm.qsrt_plugin:register_b12x_qsrt"
 
 [tool.setuptools.packages.find]
 where = ["."]

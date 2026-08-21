@@ -6,20 +6,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch._dynamo.exc import Unsupported
 
 from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
-from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_cheb_normal_e4m3_direct_lut_cpu,
     sqg_xor_cheb_t12_direct_lut_cpu,
 )
-from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
-from b12x.moe._shared.kernels.activations import (
-    SITU_DEFAULT_BETA,
-    SITU_DEFAULT_LINEAR_BETA,
-)
+from b12x._lib.quant.sqg_fp16_d3l import sqg_fp16_d3l_direct_lut_cpu
 from b12x.moe._shared.kernels.w4a16.kernel import _trellis256_dense_launch_geometry
+
 _MCG = np.uint64(0xCBAC1FED)
 _MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)
@@ -31,6 +28,191 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability()
     return major == 12 and minor in (0, 1)
+
+
+def _capacity_buffers(capacity: int) -> api.Buffers:
+    def matrix(width: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        return torch.empty((capacity, width), dtype=dtype)
+
+    return api.Buffers(
+        output=matrix(7),
+        gemm_output=matrix(7),
+        c_tmp=torch.empty(31, dtype=torch.float32),
+        input_f16=matrix(5, torch.float16),
+        rotated_f16=matrix(5, torch.float16),
+        rotated_compute=matrix(5),
+        gemm_output_f16=matrix(7, torch.float16),
+        output_f16=matrix(7, torch.float16),
+        low_rank_hidden=matrix(16),
+    )
+
+
+def test_capacity_buffer_views_reuse_storage_without_cache_growth() -> None:
+    capacity = 8
+    buffers = _capacity_buffers(capacity)
+    view = api.view_buffers(buffers, size_m=3)
+    assert view.output.shape == (3, 7)
+    assert view.low_rank_hidden is not None
+    assert view.low_rank_hidden.shape == (3, 16)
+    assert view.output.data_ptr() == buffers.output.data_ptr()
+    assert view.c_tmp is buffers.c_tmp
+    assert view.output.is_contiguous()
+
+    pair = api.PairBuffers(
+        base=buffers,
+        output=torch.empty((capacity, 14), dtype=torch.bfloat16),
+        low_rank_hidden=torch.empty((2, capacity, 16), dtype=torch.bfloat16),
+    )
+    pair_view = api.view_pair_buffers(pair, size_m=3)
+    assert pair_view.output.shape == (3, 14)
+    assert pair_view.low_rank_hidden.shape == (2, 3, 16)
+    assert pair_view.output.data_ptr() == pair.output.data_ptr()
+    assert pair_view.low_rank_hidden.data_ptr() == pair.low_rank_hidden.data_ptr()
+    assert pair_view.low_rank_hidden.is_contiguous()
+
+    with pytest.raises(ValueError, match=r"\[1, 8\]"):
+        api.view_buffers(buffers, size_m=9)
+    with pytest.raises(ValueError, match=r"\[1, 8\]"):
+        api.view_pair_buffers(pair, size_m=0)
+
+
+def test_trellis_mutating_custom_ops_support_fake_tensor_tracing() -> None:
+    """Every opaque serving operator must expose its mutation schema to Dynamo."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        source = torch.empty((3, 128), dtype=torch.float16)
+        destination = torch.empty_like(source)
+        optional_scale = torch.empty(0, dtype=torch.float16)
+        torch.ops.b12x.trellis_hadamard_128(
+            source,
+            destination,
+            optional_scale,
+            optional_scale,
+            False,
+            False,
+            1.0,
+        )
+
+        rotated = torch.empty((3, 256), dtype=torch.bfloat16)
+        trellis = torch.empty((16, 16, 80), dtype=torch.int16)
+        scales = torch.empty((16, 16), dtype=torch.float16)
+        global_scale = torch.ones(1, dtype=torch.float32)
+        workspace = torch.empty(4096, dtype=torch.int32)
+        c_tmp = torch.empty(256, dtype=torch.float32)
+        output = torch.empty((3, 256), dtype=torch.bfloat16)
+        torch.ops.b12x.trellis256_dense_gemm(
+            rotated,
+            trellis,
+            scales,
+            global_scale,
+            workspace,
+            c_tmp,
+            output,
+            5,
+            "sqg_fp16",
+            "",
+            "",
+            64,
+            64,
+            128,
+        )
+
+        rank = 16
+        a_t = torch.empty((rank, 256), dtype=torch.bfloat16)
+        b = torch.empty((256, rank), dtype=torch.bfloat16)
+        hidden = torch.empty((3, rank), dtype=torch.bfloat16)
+        torch.ops.b12x.trellis_low_rank_additive(
+            rotated,
+            a_t,
+            b,
+            hidden,
+            output,
+        )
+
+
+def test_dense_compilation_preserves_static_buffer_validation(
+) -> None:
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    expected = {
+        "shape": (2, 4),
+        "dtype": torch.float32,
+        "device": torch.device("cpu"),
+    }
+
+    def validate(buffer: torch.Tensor) -> torch.Tensor:
+        checked = w4a16_kernel._trellis_dense_buffer(
+            "output", buffer, **expected
+        )
+        return checked + 1
+
+    compiled = torch.compile(validate, backend="eager", fullgraph=True)
+    valid = torch.empty((2, 4), dtype=torch.float32)
+    assert torch.equal(compiled(valid), valid + 1)
+
+    invalid = (
+        torch.empty((2, 5), dtype=torch.float32),
+        torch.empty((2, 4), dtype=torch.float16),
+        torch.empty((4, 2), dtype=torch.float32).T,
+    )
+    for buffer in invalid:
+        # Full-graph Dynamo wraps the user validation error observed during
+        # tracing as Unsupported instead of allowing an invalid graph.
+        with pytest.raises(Unsupported, match="Observed exception"):
+            compiled(buffer)
+
+
+@pytest.mark.parametrize(
+    ("misaligned_name", "misaligned_index", "dtype", "shape"),
+    [
+        ("rotated_compute", 0, torch.bfloat16, (2, 4)),
+        ("c_tmp", 5, torch.float32, (32,)),
+        ("gemm_output", 6, torch.bfloat16, (2, 4)),
+    ],
+)
+def test_compiled_dense_operator_checks_real_kernel_pointer_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+    misaligned_name: str,
+    misaligned_index: int,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    elements = 1
+    for extent in shape:
+        elements *= extent
+    storage = torch.empty(elements + 1, dtype=dtype)
+    misaligned = storage[1:].view(shape)
+    assert misaligned.is_contiguous()
+    assert int(misaligned.data_ptr()) % 16 != 0
+
+    arguments = [
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        torch.empty((1, 1, 5), dtype=torch.int16),
+        torch.empty((1,), dtype=torch.float16),
+        torch.ones((1,), dtype=torch.float32),
+        torch.empty((32,), dtype=torch.int32),
+        torch.empty((32,), dtype=torch.float32),
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        5,
+        "sqg_fp16",
+        "",
+        "",
+        64,
+        64,
+        128,
+    ]
+    arguments[misaligned_index] = misaligned
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_trellis256_dense_gemm_flat",
+        lambda *_args: pytest.fail("misaligned storage reached the kernel launcher"),
+    )
+
+    with pytest.raises(ValueError, match=misaligned_name):
+        w4a16_kernel._trellis256_dense_gemm_op(*arguments)
 
 
 def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
@@ -70,10 +252,6 @@ def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
     )
 
 
-
-
-
-
 @lru_cache(maxsize=None)
 def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     if bits not in (2, 3, 4):
@@ -85,9 +263,7 @@ def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_cheb_normal_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_cheb_normal_e4m3_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_cheb_normal_e4m3_table(bits)[indices]
 
@@ -103,11 +279,16 @@ def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_xor_cheb_t12_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
+def _decode_sqg_xor_cheb_t12_fp16(window: np.ndarray, bits: int) -> np.ndarray:
     indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
     return _sqg_xor_cheb_t12_table(bits)[indices]
+
+
+@lru_cache(maxsize=None)
+def _sqg_fp16_d3l_table(bits: int) -> np.ndarray:
+    if bits not in (5, 6):
+        raise ValueError(f"unsupported SQG-FP16-D3L test rate K{bits}")
+    return sqg_fp16_d3l_direct_lut_cpu(bits).numpy()
 
 
 def _decode_lane(
@@ -128,9 +309,7 @@ def _decode_lane(
         first = tile_words[..., first_word % width].astype(np.uint64)
         last = tile_words[..., last_word % width].astype(np.uint64)
         merged = (first << np.uint64(32)) | last
-        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(
-            np.uint32
-        )
+        window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
         elif codebook == "mul1-e4m3":
@@ -139,6 +318,8 @@ def _decode_lane(
             values.append(_decode_sqg_cheb_normal_e4m3_fp16(window, bits))
         elif codebook == "sqg_e4m3":
             values.append(_decode_sqg_xor_cheb_t12_fp16(window, bits))
+        elif codebook == "sqg_fp16":
+            values.append(_sqg_fp16_d3l_table(bits)[window])
         else:
             raise ValueError(f"unsupported test codebook {codebook!r}")
     return np.stack(values, axis=-1).astype(np.float16)
@@ -159,9 +340,7 @@ def _reconstruct_native(
         for n_tile in range(n_tiles):
             lanes = np.stack(
                 [
-                    _decode_lane(
-                        words[k_tile, n_tile], lane, bits, codebook=codebook
-                    )
+                    _decode_lane(words[k_tile, n_tile], lane, bits, codebook=codebook)
                     for lane in range(32)
                 ]
             )
@@ -193,13 +372,8 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
     scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
     scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
-    return (
-        (blocks / scale)
-        .to(torch.float8_e4m3fn)
-        .float()
-        .mul(scale)
-        .reshape(m, k)
-    )
+    return (blocks / scale).to(torch.float8_e4m3fn).float().mul(scale).reshape(m, k)
+
 
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
     tensors = tuple(torch.empty(0) for _ in range(3))
@@ -278,6 +452,21 @@ def test_prepare_pair_weight_rejects_malformed_descriptor_before_cuda(
         )
 
 
+def test_prepare_additive_weight_requires_rank_16(monkeypatch) -> None:
+    monkeypatch.setattr(api, "PreparedTrellis256DenseWeight", SimpleNamespace)
+    base = SimpleNamespace(
+        in_features=3,
+        out_features=4,
+        params_dtype=torch.bfloat16,
+        trellis=torch.empty(0, dtype=torch.bfloat16),
+    )
+    a = torch.empty((3, 8), dtype=torch.bfloat16)
+    b = torch.empty((4, 8), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=r"\[in_features, 16\]"):
+        trellis_linear.prepare_additive_weight(base, a, b)
+
+
 def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
     x = torch.empty(0)
     weight = SimpleNamespace()
@@ -325,6 +514,113 @@ def test_run_delegates_caller_owned_capture_storage(monkeypatch) -> None:
     assert seen["kwargs"]["output_f16"] is output_f16
 
 
+def test_run_additive_uses_caller_owned_rank_storage(monkeypatch) -> None:
+    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    a = torch.arange(48, dtype=torch.float32).reshape(3, 16)
+    b = torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    output = torch.ones((2, 4), dtype=torch.float32)
+    hidden = torch.empty((2, 16), dtype=torch.float32)
+    base = SimpleNamespace()
+    weight = api.PreparedAdditiveWeight(base=base, a_t=a.T.contiguous(), b=b, rank=16)
+    seen = {}
+
+    def fake_run(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return output
+
+    def fake_additive(x_value, a_t_value, b_value, hidden_value, output_value):
+        seen["additive"] = (x_value, a_t_value, b_value, hidden_value, output_value)
+        hidden_value.copy_(x_value @ a_t_value.T)
+        output_value.addmm_(hidden_value, b_value.T)
+
+    monkeypatch.setattr(api, "run", fake_run)
+    monkeypatch.setattr(api, "run_low_rank_additive", fake_additive)
+    expected = output.clone() + (x @ a) @ b.T
+    actual = trellis_linear.run_additive(
+        x,
+        weight,
+        low_rank_hidden=hidden,
+        output=output,
+    )
+
+    assert actual is output
+    assert torch.equal(actual, expected)
+    assert torch.equal(hidden, x @ a)
+    assert seen["args"] == (x, base)
+    assert seen["kwargs"]["output"] is output
+    assert all(
+        observed is expected
+        for observed, expected in zip(
+            seen["additive"],
+            (x, weight.a_t, b, hidden, output),
+            strict=True,
+        )
+    )
+
+
+def test_run_additive_pair_preserves_bases_before_shared_buffer_reuse(
+    monkeypatch,
+) -> None:
+    x = torch.ones((2, 4), dtype=torch.bfloat16)
+    left = SimpleNamespace(
+        in_features=4,
+        out_features=3,
+        trellis=torch.empty(0, dtype=torch.int16),
+        trellis_bits=5,
+        trellis_codebook="sqg_fp16",
+    )
+    right = SimpleNamespace(
+        in_features=4,
+        out_features=3,
+        trellis=torch.empty(0, dtype=torch.int16),
+        trellis_bits=5,
+        trellis_codebook="sqg_fp16",
+    )
+    weight = api.PreparedAdditivePair(
+        left=left,
+        right=right,
+        a_t=torch.empty((2, 16, 4), dtype=torch.bfloat16),
+        b=torch.empty((2, 3, 16), dtype=torch.bfloat16),
+        rank=16,
+    )
+    base_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    base_buffers = api.Buffers(
+        output=base_output,
+        gemm_output=torch.empty_like(base_output),
+        c_tmp=torch.empty(1),
+        rotated_f16=torch.empty((2, 4), dtype=torch.float16),
+    )
+    buffers = api.PairBuffers(
+        base=base_buffers,
+        output=torch.empty((2, 6), dtype=torch.bfloat16),
+        low_rank_hidden=torch.empty((2, 2, 16), dtype=torch.bfloat16),
+    )
+    events = []
+
+    def fake_project(*_args):
+        events.append("project")
+
+    def fake_run(_x, base, **kwargs):
+        events.append("left" if base is left else "right")
+        kwargs["output"].fill_(1 if base is left else 2)
+        return kwargs["output"]
+
+    def fake_add(*_args):
+        events.append("add")
+        buffers.output.add_(3)
+
+    monkeypatch.setattr(api, "run_low_rank_pair_project", fake_project)
+    monkeypatch.setattr(api, "run", fake_run)
+    monkeypatch.setattr(api, "run_low_rank_pair_add", fake_add)
+    actual = trellis_linear.run_additive_pair(x, weight, buffers=buffers)
+
+    assert actual is buffers.output
+    assert events == ["project", "left", "right", "add"]
+    assert torch.equal(actual[:, :3], torch.full((2, 3), 4, dtype=torch.bfloat16))
+    assert torch.equal(actual[:, 3:], torch.full((2, 3), 5, dtype=torch.bfloat16))
+
+
 def test_is_supported_uses_standard_sm12x_gate(monkeypatch) -> None:
     seen = {}
 
@@ -369,6 +665,7 @@ def test_dense_launch_geometry_avoids_short_spill_waves(
         )
         == expected
     )
+
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 def test_trellis_dense_cuda_graph_replay_is_stable() -> None:
@@ -502,9 +799,7 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
         params_dtype=torch.float16,
     )
     assert weight.trellis_codebook == "sqg_e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="sqg_e4m3"
-    ).to(device)
+    reference_weight = _reconstruct_native(trellis, codebook="sqg_e4m3").to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
     def identity_hadamard(
@@ -538,6 +833,189 @@ def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("bits", [5, 6])
+def test_dense_sqg_fp16_additive_matches_reference_and_captures(bits: int) -> None:
+    """Close packed K5/K6 plus a rank-16 branch through eager and graph paths."""
+
+    torch.manual_seed(0xD3F16 + bits)
+    device = torch.device("cuda", torch.cuda.current_device())
+    m = 3
+    features = 128
+    rank = 16
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (features // 16, features // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    scale = torch.ones(features, dtype=torch.float16, device=device)
+    base = trellis_linear.prepare_weight(
+        trellis,
+        scale,
+        scale.clone(),
+        codebook="sqg_fp16",
+        params_dtype=torch.bfloat16,
+    )
+    a = (torch.randn((features, rank), device=device) * 1.0e-2).to(torch.bfloat16)
+    b = (torch.randn((features, rank), device=device) * 1.0e-2).to(torch.bfloat16)
+    weight = trellis_linear.prepare_additive_weight(base, a, b)
+    a_t_before = weight.a_t.clone()
+    b_before = weight.b.clone()
+    buffers = trellis_linear.make_buffers(
+        weight,
+        size_m=m,
+        input_dtype=torch.bfloat16,
+    )
+    x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.bfloat16)
+
+    def identity_hadamard(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        _left_scale,
+        _right_scale,
+        _scale: float,
+    ) -> None:
+        destination.copy_(source)
+
+    actual = trellis_linear.run_additive(
+        x,
+        weight,
+        low_rank_hidden=buffers.low_rank_hidden,
+        hadamard_128=identity_hadamard,
+        **buffers.run_kwargs(),
+    ).clone()
+    torch.cuda.synchronize(device)
+
+    reference_weight = _reconstruct_native(
+        trellis,
+        codebook="sqg_fp16",
+    ).to(device=device, dtype=torch.bfloat16)
+    rotated_x = x.to(torch.float16).to(torch.bfloat16)
+    reference_base = (rotated_x @ reference_weight).to(torch.float16).to(torch.bfloat16)
+    expected = reference_base + (x @ a) @ b.T
+    relative_error = (actual - expected).float().norm() / expected.float().norm()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = trellis_linear.run_additive(
+            x,
+            weight,
+            low_rank_hidden=buffers.low_rank_hidden,
+            hadamard_128=identity_hadamard,
+            **buffers.run_kwargs(),
+        )
+    buffers.output.fill_(float("nan"))
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+    assert torch.equal(captured, actual)
+    assert allocated_after == allocated_before
+    assert torch.equal(weight.a_t, a_t_before)
+    assert torch.equal(weight.b, b_before)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_dense_sqg_fp16_additive_pair_matches_reference_and_captures() -> None:
+    """Close paired gate/up factors through eager and CUDA-graph execution."""
+
+    torch.manual_seed(0xD3F162)
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = 3
+    features = 128
+    trellises = [
+        torch.randint(
+            -32768,
+            32767,
+            (features // 16, features // 16, 16 * 5),
+            dtype=torch.int16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    scale = torch.ones(features, dtype=torch.float16, device=device)
+    bases = [
+        trellis_linear.prepare_weight(
+            trellis,
+            scale.clone(),
+            scale.clone(),
+            codebook="sqg_fp16",
+            params_dtype=torch.bfloat16,
+        )
+        for trellis in trellises
+    ]
+    a = (torch.randn((2, features, 16), device=device) * 1.0e-2).to(torch.bfloat16)
+    b = (torch.randn((2, features, 16), device=device) * 1.0e-2).to(torch.bfloat16)
+    weight = trellis_linear.prepare_additive_pair(*bases, a, b)
+    buffers = trellis_linear.make_pair_buffers(
+        weight,
+        size_m=rows,
+        input_dtype=torch.bfloat16,
+    )
+    x = (torch.randn((rows, features), device=device) * 1.0e-3).to(torch.bfloat16)
+
+    def identity_hadamard(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        _left_scale,
+        _right_scale,
+        _scale: float,
+    ) -> None:
+        destination.copy_(source)
+
+    actual = trellis_linear.run_additive_pair(
+        x,
+        weight,
+        buffers=buffers,
+        hadamard_128=identity_hadamard,
+    ).clone()
+    torch.cuda.synchronize(device)
+
+    expected_parts = []
+    rotated_x = x.to(torch.float16).to(torch.bfloat16)
+    for index, trellis in enumerate(trellises):
+        decoded = _reconstruct_native(trellis, codebook="sqg_fp16").to(
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        base = (rotated_x @ decoded).to(torch.float16).to(torch.bfloat16)
+        hidden = (x @ a[index]).to(torch.bfloat16)
+        correction = (hidden @ b[index].T).to(torch.bfloat16)
+        expected_parts.append((base + correction).to(torch.bfloat16))
+    expected = torch.cat(expected_parts, dim=1)
+    relative_error = (actual - expected).float().norm() / expected.float().norm()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = trellis_linear.run_additive_pair(
+            x,
+            weight,
+            buffers=buffers,
+            hadamard_128=identity_hadamard,
+        )
+    buffers.output.fill_(float("nan"))
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+    assert torch.equal(captured, actual)
+    assert allocated_after == allocated_before
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
@@ -607,11 +1085,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
     suh = torch.ones(reference_weight.shape[0], dtype=torch.float16, device=device)
     svh = torch.ones(reference_weight.shape[1], dtype=torch.float16, device=device)
     codebook_kwargs = (
-        {
-            "mcg": torch.tensor(
-                0xCBAC1FED, dtype=torch.uint32, device=device
-            )
-        }
+        {"mcg": torch.tensor(0xCBAC1FED, dtype=torch.uint32, device=device)}
         if codebook == "mcg"
         else {"codebook": codebook}
     )
@@ -686,12 +1160,6 @@ def test_dense_pair_matches_independent_reference_and_captures(
     graph.replay()
     torch.cuda.synchronize(device)
     assert torch.equal(captured, actual)
-
-
-
-
-
-
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
