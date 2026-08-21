@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch._dynamo.exc import Unsupported
 
 from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import api
@@ -131,18 +132,24 @@ def test_trellis_mutating_custom_ops_support_fake_tensor_tracing() -> None:
 
 
 def test_dense_compilation_preserves_static_buffer_validation(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
 
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     expected = {
         "shape": (2, 4),
         "dtype": torch.float32,
         "device": torch.device("cpu"),
     }
+
+    def validate(buffer: torch.Tensor) -> torch.Tensor:
+        checked = w4a16_kernel._trellis_dense_buffer(
+            "output", buffer, **expected
+        )
+        return checked + 1
+
+    compiled = torch.compile(validate, backend="eager", fullgraph=True)
     valid = torch.empty((2, 4), dtype=torch.float32)
-    assert w4a16_kernel._trellis_dense_buffer("output", valid, **expected) is valid
+    assert torch.equal(compiled(valid), valid + 1)
 
     invalid = (
         torch.empty((2, 5), dtype=torch.float32),
@@ -150,8 +157,10 @@ def test_dense_compilation_preserves_static_buffer_validation(
         torch.empty((4, 2), dtype=torch.float32).T,
     )
     for buffer in invalid:
-        with pytest.raises(ValueError, match="output must be contiguous"):
-            w4a16_kernel._trellis_dense_buffer("output", buffer, **expected)
+        # Full-graph Dynamo wraps the user validation error observed during
+        # tracing as Unsupported instead of allowing an invalid graph.
+        with pytest.raises(Unsupported, match="Observed exception"):
+            compiled(buffer)
 
 
 @pytest.mark.parametrize(
