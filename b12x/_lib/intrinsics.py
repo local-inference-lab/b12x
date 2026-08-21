@@ -1547,6 +1547,37 @@ def red_add_global_f32(addr: Int64, val: Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_v4_f32(
+    addr: Int64,
+    val0: Float32,
+    val1: Float32,
+    val2: Float32,
+    val3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Reduce-add four FP32 elements at a 16-byte-aligned address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(val0).ir_value(loc=loc, ip=ip),
+            Float32(val1).ir_value(loc=loc, ip=ip),
+            Float32(val2).ir_value(loc=loc, ip=ip),
+            Float32(val3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.v4.f32.add [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cvt_bf16x2_to_f16x2(packed: Uint32, *, loc=None, ip=None) -> Uint32:
     """Convert a u32 holding two bf16 (lo, hi) into an f16x2 u32 (lo, hi)."""
     return Uint32(

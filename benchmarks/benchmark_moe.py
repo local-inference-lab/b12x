@@ -342,6 +342,22 @@ MODEL_PROFILES = {
             top_k=8,
         ),
     ),
+    "kimi-k3-mxfp4-shape": ModelProfile(
+        label="Kimi-K3 MXFP4 TP16 (shape)",
+        checkpoint_family="kimi_k3_mxfp4_shape",
+        default_layer_idx=1,
+        tp_size=16,
+        hf_repo_id=None,
+        default_activation="situ",
+        default_quant_mode="w4a16",
+        default_validate="none",
+        shape=ShapeSpec(
+            hidden_size=7168,
+            intermediate_size=3072,
+            num_experts=896,
+            top_k=16,
+        ),
+    ),
     "dsv4f-nvfp4": ModelProfile(
         label="DSV4F NVFP4 (shape)",
         checkpoint_family="dsv4f_nvfp4_shape",
@@ -803,11 +819,14 @@ def load_expert_weights(
         "nano35_w4a16_shape",
         "dsv4f_shape",
         "dsv4f_nvfp4_shape",
+        "kimi_k3_mxfp4_shape",
         "laguna_s21_shape",
         "minimax_m3_shape",
     }:
         shape_source_format = (
-            "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"
+            "fp4_e8m0_k32"
+            if checkpoint_family in {"dsv4f_shape", "kimi_k3_mxfp4_shape"}
+            else "modelopt_nvfp4"
         )
         return make_shape_only_expert_weights(
             spec,
@@ -2818,6 +2837,15 @@ def bench_e2e() -> None:
         default=5,
         help="Repeat the timed measurement this many times per batch size and aggregate the results.",
     )
+    parser.add_argument(
+        "--timing-json",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "write every CUDA-event timing sample and the benchmark command "
+            "to this JSON file"
+        ),
+    )
     parser.add_argument("--batch-size-profile", choices=sorted(BATCH_SIZE_PROFILES), default="micro")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument(
@@ -2907,6 +2935,14 @@ def bench_e2e() -> None:
         ),
     )
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
+    parser.add_argument(
+        "--compare-prefill-fused-sum",
+        action="store_true",
+        help=(
+            "compare W4A16 direct FP32 prefill route reduction with the "
+            "materialized-route reduction before timing"
+        ),
+    )
     parser.add_argument(
         "--oracle-mode",
         choices=[
@@ -3028,6 +3064,10 @@ def bench_e2e() -> None:
         )
     if args.force_mxfp4 and args.quant_mode != "w4a8_mx":
         raise ValueError("--force-mxfp4 requires --quant-mode w4a8_mx")
+    if args.compare_prefill_fused_sum and not use_w4a16:
+        raise ValueError(
+            "--compare-prefill-fused-sum requires --quant-mode w4a16"
+        )
     if args.flashinfer_tune_max_num_tokens <= 0:
         raise ValueError("--flashinfer-tune-max-num-tokens must be positive")
     if (
@@ -3042,6 +3082,8 @@ def bench_e2e() -> None:
         raise ValueError("--quant-mode w4a16 currently supports --graph-mode single-op")
     if use_w4a16 and args.tp_parallel:
         raise ValueError("--quant-mode w4a16 currently does not support --tp-parallel")
+    if args.timing_json is not None and args.graph_mode != "single-op":
+        raise ValueError("--timing-json currently requires --graph-mode single-op")
     if args.graph_only and not args.cuda_graph:
         raise ValueError("--graph-only requires --cuda-graph")
     if args.routing_repeat_period < 0:
@@ -3357,9 +3399,15 @@ def bench_e2e() -> None:
         print(f" {spec.tp_size} ranks done.")
 
     batch_results: dict[int, BatchResult] = {}
+    raw_timing_runs: dict[str, dict[str, dict[str, list[list[float]]]]] = {}
     accuracy_failures: list[str] = []
     reference_warnings: list[str] = []
     for batch_size in batch_sizes:
+        batch_timing_runs: dict[str, dict[str, list[list[float]]]] = {
+            "eager": {},
+            "cuda_graph": {},
+        }
+        raw_timing_runs[str(batch_size)] = batch_timing_runs
         print(f"\n{'=' * 70}")
         print(f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)")
         print(f"{'=' * 70}")
@@ -3454,12 +3502,14 @@ def bench_e2e() -> None:
                         intermediate_cache13=backend_w4a16_buffers.intermediate_cache13,
                         intermediate_cache2=backend_w4a16_buffers.intermediate_cache2,
                         output=backend_output,
+                        prefill_sum_accum=backend_w4a16_buffers.prefill_sum_accum,
                         fc1_c_tmp=backend_w4a16_buffers.fc1_c_tmp,
                         fc2_c_tmp=backend_w4a16_buffers.fc2_c_tmp,
                         packed_route_indices=backend_w4a16_buffers.packed_route_indices,
                         block_expert_ids=backend_w4a16_buffers.block_expert_ids,
                         packed_route_count=backend_w4a16_buffers.packed_route_count,
                         expert_offsets=backend_w4a16_buffers.expert_offsets,
+                        expert_counts=backend_w4a16_buffers.expert_counts,
                         **activation_params.kwargs(),
                     )
                 assert backend_binding is not None
@@ -3574,6 +3624,117 @@ def bench_e2e() -> None:
         backend_out = backend_e2e().clone()
         torch.cuda.synchronize()
 
+        if args.compare_prefill_fused_sum:
+            env_name = "B12X_W4A16_PREFILL_FUSED_SUM"
+            original_value = os.environ.get(env_name)
+            try:
+                os.environ[env_name] = "0"
+                standard_buffers = make_backend_w4a16_buffers(
+                    backend_w4a16_weights,
+                    m=batch_size,
+                    topk=spec.top_k,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                standard_output_storage = torch.empty_like(x)
+                standard_output = w4a16_moe(
+                    x,
+                    backend_w4a16_weights,
+                    topk_weights,
+                    topk_ids,
+                    activation=args.activation,
+                    fast_math=args.fast_math,
+                    intermediate_cache13=standard_buffers.intermediate_cache13,
+                    intermediate_cache2=standard_buffers.intermediate_cache2,
+                    output=standard_output_storage,
+                    prefill_sum_accum=standard_buffers.prefill_sum_accum,
+                    fc1_c_tmp=standard_buffers.fc1_c_tmp,
+                    fc2_c_tmp=standard_buffers.fc2_c_tmp,
+                    packed_route_indices=standard_buffers.packed_route_indices,
+                    block_expert_ids=standard_buffers.block_expert_ids,
+                    packed_route_count=standard_buffers.packed_route_count,
+                    expert_offsets=standard_buffers.expert_offsets,
+                    expert_counts=standard_buffers.expert_counts,
+                    **activation_params.kwargs(),
+                ).clone()
+                os.environ[env_name] = "1"
+                fused_sum_buffers = make_backend_w4a16_buffers(
+                    backend_w4a16_weights,
+                    m=batch_size,
+                    topk=spec.top_k,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                fused_sum_output_storage = torch.empty_like(x)
+                fused_activation_kwargs = activation_params.kwargs()
+
+                def run_fused_sum_comparison(
+                    input_tensor=x,
+                    prepared_weights=backend_w4a16_weights,
+                    route_weights=topk_weights,
+                    route_ids=topk_ids,
+                    buffers=fused_sum_buffers,
+                    output_storage=fused_sum_output_storage,
+                    activation=args.activation,
+                    fast_math=args.fast_math,
+                    activation_kwargs=fused_activation_kwargs,
+                ) -> torch.Tensor:
+                    return w4a16_moe(
+                        input_tensor,
+                        prepared_weights,
+                        route_weights,
+                        route_ids,
+                        activation=activation,
+                        fast_math=fast_math,
+                        intermediate_cache13=buffers.intermediate_cache13,
+                        intermediate_cache2=buffers.intermediate_cache2,
+                        output=output_storage,
+                        prefill_sum_accum=buffers.prefill_sum_accum,
+                        fc1_c_tmp=buffers.fc1_c_tmp,
+                        fc2_c_tmp=buffers.fc2_c_tmp,
+                        packed_route_indices=buffers.packed_route_indices,
+                        block_expert_ids=buffers.block_expert_ids,
+                        packed_route_count=buffers.packed_route_count,
+                        expert_offsets=buffers.expert_offsets,
+                        expert_counts=buffers.expert_counts,
+                        **activation_kwargs,
+                    )
+
+                fused_sum_output = run_fused_sum_comparison().clone()
+                fused_sum_repeat = run_fused_sum_comparison().clone()
+                torch.cuda.synchronize()
+            finally:
+                if original_value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = original_value
+            fused_sum_metrics = compare_to_reference(
+                fused_sum_output, standard_output
+            )
+            fused_sum_repeat_metrics = compare_to_reference(
+                fused_sum_repeat, fused_sum_output
+            )
+            print(
+                "  "
+                + format_oracle_metrics(
+                    "prefill fused sum vs standard", fused_sum_metrics
+                )
+            )
+            print(
+                "  "
+                + format_oracle_metrics(
+                    "prefill fused sum repeat", fused_sum_repeat_metrics
+                )
+            )
+            if (
+                not math.isfinite(fused_sum_metrics.cos)
+                or fused_sum_metrics.cos < 0.9999
+            ):
+                accuracy_failures.append(
+                    f"  bs={batch_size} prefill fused sum vs standard: "
+                    f"cos={fused_sum_metrics.cos:.6f} < 0.999900"
+                )
+
         if ref_output is not None:
             ref_compare_metrics = compare_to_reference(backend_out, ref_output)
             print(f"  {format_oracle_metrics(f'{backend_label} vs {ref_name}', ref_compare_metrics)}")
@@ -3671,6 +3832,11 @@ def bench_e2e() -> None:
             )
             ref_stats = summarize_timing_runs(ref_runs_ms) if ref_runs_ms else None
             backend_stats = summarize_timing_runs(backend_runs_ms)
+            if ref_kernel_name is not None and ref_kernel_runs_ms:
+                batch_timing_runs["eager"][ref_kernel_name] = ref_kernel_runs_ms
+            if ref_name is not None and ref_runs_ms:
+                batch_timing_runs["eager"][ref_name] = ref_runs_ms
+            batch_timing_runs["eager"][backend_label] = backend_runs_ms
             ratio_nograph = RatioStats(ratio_runs) if ratio_runs else None
 
             if ref_kernel_stats is not None and ref_kernel_name is not None:
@@ -3721,6 +3887,7 @@ def bench_e2e() -> None:
                     ]
                     stats = summarize_timing_runs(graph_runs)
                     graph_stats_by_name[name] = stats
+                    batch_timing_runs["cuda_graph"][name] = graph_runs
                     print(f" {fmt_timing_stats(stats)}")
                 except Exception as exc:
                     print(f" FAILED ({type(exc).__name__}: {exc})")
@@ -3892,6 +4059,25 @@ def bench_e2e() -> None:
         for f in reference_warnings:
             print(f)
         print(f"{'=' * 70}\033[0m")
+    if args.timing_json is not None:
+        args.timing_json.parent.mkdir(parents=True, exist_ok=True)
+        args.timing_json.write_text(
+            json.dumps(
+                {
+                    "schema": "b12x.moe-benchmark-timing.v1",
+                    "command": sys.argv,
+                    "model_profile": args.model_profile,
+                    "quant_mode": args.quant_mode,
+                    "warmup_iterations": args.warmup,
+                    "timed_iterations_per_repeat": args.iters,
+                    "repeats": args.repeats,
+                    "samples_ms": raw_timing_runs,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     if accuracy_failures:
         print(f"\n\033[1;31m{'=' * 70}")
         print("  ACCURACY CHECK FAILED")

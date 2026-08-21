@@ -2170,6 +2170,152 @@ def test_w4a16_tc_decode_preplanned_launch_matches_oracle(m: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_prefill_fused_sum_is_graph_safe_and_matches_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large-M route reduction uses fixed caller-owned scratch across replay.
+
+    Relaxed FP32 atomics may change the final BF16 rounding bit when CTA order
+    changes. Every replay must remain finite, nonzero, and close to the same
+    FP32 oracle without allocating or changing scratch addresses.
+    """
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "1")
+    torch.manual_seed(20260819)
+    m = 32
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0, experts, (m, topk), device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    prepared = prepare_w4a16_weights(
+        *weights,
+        activation=activation,
+        params_dtype=x.dtype,
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    assert buffers.prefill_sum_accum is not None
+    assert buffers.prefill_sum_accum.dtype == torch.float32
+    assert buffers.prefill_sum_accum.numel() == m * hidden_size
+
+    props = torch.cuda.get_device_properties(x.device)
+    block_size_m = select_route_block_size_m(m, topk, experts)
+    _, _, max_m_blocks = route_pack_capacity(
+        m * topk,
+        block_size_m,
+        experts,
+        topk=topk,
+    )
+    fused_launch = compile_w4a16_fused_moe(
+        size_m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=experts,
+        top_k=topk,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=block_size_m,
+        max_m_blocks=max_m_blocks,
+        element_dtype="bf16",
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(
+            getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+        ),
+        weight_layout="packed",
+        scale_format="e4m3_k16",
+        w13_layout="packed",
+        prefill_fused_sum_fp32=True,
+    )
+    assert fused_launch.prefill_fused_sum_fp32
+    assert not fused_launch.tc_decode_fused_sum
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            prefill_sum_accum=buffers.prefill_sum_accum,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            fused_launch=fused_launch,
+        )
+
+    expected = _reference_w4a16(
+        x,
+        *weights,
+        topk_ids,
+        topk_weights,
+        activation=activation,
+    )
+    eager = run().clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    pointer_contract = (
+        buffers.intermediate_cache13.data_ptr(),
+        buffers.intermediate_cache2.data_ptr(),
+        buffers.prefill_sum_accum.data_ptr(),
+        buffers.output.data_ptr(),
+    )
+    buffers.prefill_sum_accum.fill_(float("nan"))
+    allocated_before_replay = torch.cuda.memory_allocated()
+    graph.replay()
+    torch.cuda.synchronize()
+    allocated_after_replay = torch.cuda.memory_allocated()
+    first_replay = captured.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    second_replay = captured.clone()
+
+    assert pointer_contract == (
+        buffers.intermediate_cache13.data_ptr(),
+        buffers.intermediate_cache2.data_ptr(),
+        buffers.prefill_sum_accum.data_ptr(),
+        buffers.output.data_ptr(),
+    )
+    assert allocated_after_replay == allocated_before_replay
+    for actual in (eager, first_replay, second_replay):
+        assert bool(torch.isfinite(actual).all().item())
+        assert bool(torch.count_nonzero(actual).item())
+        _assert_matches_oracle(actual, expected, activation=activation)
+    repeat_metrics = compare_to_reference(first_replay, second_replay)
+    assert repeat_metrics.cos >= 0.999999, repeat_metrics
+    torch.testing.assert_close(
+        second_replay,
+        buffers.prefill_sum_accum[: m * hidden_size]
+        .view(m, hidden_size)
+        .to(second_replay.dtype),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("m", [1, 4, 6])
 def test_w4a16_small_m_packed_direct_topk_routes_matches_oracle(m: int) -> None:
     torch.manual_seed(20260524 + m)
