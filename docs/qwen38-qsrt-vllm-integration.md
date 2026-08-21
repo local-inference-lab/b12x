@@ -81,4 +81,8 @@ It checks packed output and input-vector Jacobian parity against independently
 decoded controls, immutable payloads and factors, bit-exact eager/graph replay,
 pointer and allocation stability, and interleaved hot/cold latency. The paired
 gate/up case compares against one fused BF16 base GEMM plus a rank-32
-block-diagonal control correction.
+block-diagonal control correction. Pass `--recovery-root` with
+`--quality-selection-report` when packaging selected an optimizer boundary from
+an external KLD panel. The benchmark validates the recovery report, the complete
+candidate population, the KLD ranking, and the selected overlay content before
+loading any factor.

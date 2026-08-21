@@ -226,6 +226,9 @@ def _load_qsrt_contract(qsrt_root: Path) -> dict[str, Any]:
         validate_completed_layer,
         validate_final_report as validate_artifact_report,
     )
+    from qsrt.qwen38_serving_checkpoint import (  # noqa: PLC0415
+        validate_recovery_selection,
+    )
 
     return {
         "load_layer_factors": load_layer_factors,
@@ -235,6 +238,7 @@ def _load_qsrt_contract(qsrt_root: Path) -> dict[str, Any]:
         "layer_filename": layer_filename,
         "validate_completed_layer": validate_completed_layer,
         "validate_artifact_report": validate_artifact_report,
+        "validate_recovery_selection": validate_recovery_selection,
     }
 
 
@@ -244,6 +248,7 @@ def _validate_archives(
     artifact_root: Path,
     adapter_root: Path,
     recovery_root: Path | None,
+    quality_selection_report: Path | None,
     expected_adapter_manifest_sha256: str,
 ) -> dict[str, Any]:
     artifact_manifest, _, artifact_manifest_sha256 = contract[
@@ -271,21 +276,12 @@ def _validate_archives(
         "factor_source": "sealed activation-weighted rank-16 initialization",
     }
     if recovery_root is not None:
-        complete_path = recovery_root / "complete.json"
-        complete = json.loads(complete_path.read_text())
-        overlay_record = complete.get("selected_overlay", {})
-        overlay_path = Path(str(overlay_record.get("path", ""))).resolve()
-        if (
-            complete.get("kind") != "qwen38_full_depth_mlp_adapter_recovery_report_v1"
-            or complete.get("status") != "complete"
-            or complete.get("adapter_installation", {}).get("adapter_manifest_sha256")
-            != adapter_manifest_sha256
-            or not overlay_path.is_file()
-            or overlay_path.parent != recovery_root
-            or overlay_path.stat().st_size != overlay_record.get("bytes")
-            or _sha256(overlay_path) != overlay_record.get("sha256")
-        ):
-            raise ValueError("Qwen recovery report does not bind one selected overlay")
+        selection = contract["validate_recovery_selection"](
+            recovery_root,
+            adapter_manifest_sha256=adapter_manifest_sha256,
+            quality_selection_report=quality_selection_report,
+        )
+        overlay_path = selection.overlay
         with safe_open(str(overlay_path), framework="pt", device="cpu") as handle:
             metadata = handle.metadata() or {}
             if (
@@ -298,14 +294,29 @@ def _validate_archives(
             {
                 "factor_source": (
                     "rank-16 dense-MLP factors selected by the completed "
-                    "full-depth quantization-aware recovery report"
+                    "quality-analysis report"
+                    if quality_selection_report is not None
+                    else (
+                        "rank-16 dense-MLP factors selected by the completed "
+                        "full-depth quantization-aware recovery report"
+                    )
                 ),
-                "recovery_report": str(complete_path),
-                "recovery_report_sha256": _sha256(complete_path),
+                "recovery_report": str(recovery_root / "complete.json"),
+                "recovery_report_sha256": selection.report_sha256,
                 "selected_overlay": str(overlay_path),
-                "selected_overlay_sha256": overlay_record["sha256"],
+                "selected_overlay_sha256": selection.overlay_sha256,
             }
         )
+        if selection.quality_selection_path is not None:
+            identity["quality_selection_report"] = str(
+                selection.quality_selection_path
+            )
+            identity["quality_selection_report_sha256"] = (
+                selection.quality_selection_sha256
+            )
+            identity["selected_optimizer_step"] = selection.quality_selection[
+                "selected_overlay"
+            ]["step"]
     return identity
 
 
@@ -773,6 +784,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             "report selects the factor overlay"
         ),
     )
+    parser.add_argument(
+        "--quality-selection-report",
+        type=Path,
+        help=(
+            "content-bound analysis report that selects one saved optimizer "
+            "boundary instead of the trainer's screening choice"
+        ),
+    )
     parser.add_argument("--qsrt-root", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument(
@@ -803,6 +822,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(
             "layer, replay counts, or adapter manifest identity is invalid"
         )
+    if args.quality_selection_report is not None and args.recovery_root is None:
+        raise SystemExit("--quality-selection-report requires --recovery-root")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     major, minor = torch.cuda.get_device_capability()
@@ -818,11 +839,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.recovery_root is None
         else args.recovery_root.expanduser().resolve()
     )
+    quality_selection_report = (
+        None
+        if args.quality_selection_report is None
+        else args.quality_selection_report.expanduser().resolve()
+    )
     archive_identity = _validate_archives(
         contract,
         artifact_root=artifact_root,
         adapter_root=adapter_root,
         recovery_root=recovery_root,
+        quality_selection_report=quality_selection_report,
         expected_adapter_manifest_sha256=args.expected_adapter_manifest_sha256,
     )
     selected_overlay = (
