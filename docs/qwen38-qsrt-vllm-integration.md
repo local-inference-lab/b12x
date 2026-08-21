@@ -1,8 +1,10 @@
 # Qwen3.8 dense-MLP QSRT K5 serving
 
 Status: **research-only**. The loader and packed operators are implemented.
-SM120 numerical, CUDA-graph, full-model quality, and latency qualification are
-required before deployment.
+SM120 packed-operator numerical and direct CUDA-graph execution are qualified
+by the sealed-layer benchmark. Whole-model CUDA-graph execution is unsupported
+and rejected because it has not passed end-to-end correctness qualification.
+Full-model quality and latency qualification are required before deployment.
 
 ## Checkpoint contract
 
@@ -44,18 +46,16 @@ one A launch and one B launch. A complete 64-layer decoder therefore dispatches
 256 factor kernels instead of the 384 kernels produced by independent
 per-projection adapters.
 
-Every CUDA-graph-visible output and scratch tensor has a stable owner. The
+Every packed-operator output and scratch tensor has a stable owner. The
 checkpoint's `workspace_capacity_rows` value bounds one buffer pool allocated
 during weight processing. Exact-row views of that fixed pool serve eager and
-CUDA-graph execution without device allocation or cache growth. Qwen3.8 decoder layers
-execute in source order: the following activation consumes a gate/up output,
-and the following decoder layer's input normalization consumes a down output,
-before the same storage address is written again. CUDA stream ordering retains
-that lifetime rule during graph capture and replay. Capture with an unprepared
-factor geometry fails closed, and a request above the declared row capacity is
-rejected. A device outside SM120/SM121, TP
-greater than one, activation dtype other than BF16, bias, non-contiguous input,
-and capture sizes above the declared workspace capacity are unsupported.
+compiled execution without device allocation or cache growth. Direct graph
+capture of one packed projection is qualified by the sealed-layer benchmark,
+but whole-model vLLM graph replay is outside the implemented contract. The
+plugin rejects that runtime before loading weights. A request above the
+declared row capacity is rejected. A device outside SM120/SM121, TP greater
+than one, activation dtype other than BF16, bias, non-contiguous input, and
+whole-model CUDA graphs are unsupported.
 
 ## vLLM registration and launch
 
@@ -73,8 +73,14 @@ validate its manifest:
 export B12X_QSRT_MODEL_DIR=/models/Qwen3.8-27B-QSRT-K5-R16
 vllm serve "$B12X_QSRT_MODEL_DIR" \
   --tensor-parallel-size 1 \
-  --dtype bfloat16
+  --dtype bfloat16 \
+  --compilation-config \
+    '{"cudagraph_mode":"NONE","custom_ops":["-apply_rotary_emb"]}'
 ```
+
+This configuration retains `torch.compile` and disables only CUDA graphs.
+Omitting it, or selecting a non-`NONE` CUDA-graph mode, fails before checkpoint
+weights are loaded.
 
 `benchmarks/benchmark_qwen38_qsrt_k5_dense.py` validates a real sealed layer.
 It checks packed output and input-vector Jacobian parity against independently

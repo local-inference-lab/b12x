@@ -226,6 +226,41 @@ def _capture_sizes(capacity_rows: int) -> tuple[int, ...]:
     return tuple(sorted(value for value in sizes if 1 <= value <= capacity_rows))
 
 
+def _require_cudagraphs_disabled(vllm_config: Any | None = None) -> None:
+    """Reject whole-model CUDA-graph replay for the QSRT linear method.
+
+    The packed kernels support direct CUDA-graph capture in isolation, but
+    whole-model vLLM graph replay lacks end-to-end correctness qualification
+    and is outside the implemented contract. ``torch.compile`` remains
+    supported when its CUDA-graph mode is disabled.
+    """
+
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            vllm_config = get_current_vllm_config()
+        except Exception:
+            logger.debug("vLLM CUDA-graph mode is unavailable", exc_info=True)
+            return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    mode_name = getattr(mode, "name", None)
+    disabled = (
+        mode == 0
+        or mode_name == "NONE"
+        or (isinstance(mode, str) and mode.upper() == "NONE")
+    )
+    if not disabled:
+        raise ValueError(
+            "B12X QSRT requires CUDA graphs to be disabled for whole-model "
+            "execution. Set --compilation-config "
+            "'{\"cudagraph_mode\":\"NONE\","
+            "\"custom_ops\":[\"-apply_rotary_emb\"]}'. torch.compile "
+            "may remain enabled."
+        )
+
+
 def _shared_buffers(weight: Any, rows: int, capacity_rows: int) -> Any:
     from b12x.gemm import trellis_linear
 
@@ -608,6 +643,7 @@ def register_b12x_qsrt() -> None:
             self._workspace_capacity_rows = _workspace_capacity_rows(self._config)
             self._model_dir = model_dir or os.environ.get(MODEL_DIR_ENV) or None
             self._manifest_validated = False
+            self._cudagraph_mode_validated = False
             self._method = _VllmQSRTLinearMethod(self._workspace_capacity_rows)
             self._unquantized_method = UnquantizedLinearMethod()
 
@@ -700,6 +736,9 @@ def register_b12x_qsrt() -> None:
                 unquantized_method=self._unquantized_method,
             )
             if method is self._method:
+                if not self._cudagraph_mode_validated:
+                    _require_cudagraphs_disabled()
+                    self._cudagraph_mode_validated = True
                 self._validate_manifest()
             return method
 

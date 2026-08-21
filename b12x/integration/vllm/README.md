@@ -12,7 +12,7 @@ APIs — b12x itself does not auto-load into vLLM.
 |---|---|
 | `fp6_serving.py` | Framework-agnostic quant methods (`B12XFP6MoEMethod`, `B12XFP6LinearMethod`) |
 | `plugin.py` | vLLM ``QuantizationConfig`` + weight loaders + entry point |
-| `qsrt_plugin.py` | TP1 Qwen3.8 K5/rank-16 config, exact weight loaders, graph storage, and entry point |
+| `qsrt_plugin.py` | TP1 Qwen3.8 K5/rank-16 config, exact weight loaders, bounded workspace, and entry point |
 
 ## Install into a vLLM fork
 

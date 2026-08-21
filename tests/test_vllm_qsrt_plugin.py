@@ -19,6 +19,7 @@ from b12x.integration.vllm.qsrt_plugin import (
     _norm_key,
     _parameter_loader,
     _projection_group,
+    _require_cudagraphs_disabled,
     _select_linear_method,
     _sha256,
     _validate_quality_selection_receipt,
@@ -206,3 +207,23 @@ def test_capture_sizes_reject_rows_outside_packed_contract(
     _install_fake_vllm_config(monkeypatch, [512, 1024])
     with pytest.raises(NotImplementedError, match="capacity 512"):
         _capture_sizes(512)
+
+
+@pytest.mark.parametrize("mode", [0, SimpleNamespace(name="NONE"), "NONE"])
+def test_cuda_graph_contract_allows_disabled_modes(mode: object) -> None:
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=mode)
+    )
+    _require_cudagraphs_disabled(config)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [None, SimpleNamespace(name="FULL_AND_PIECEWISE"), "PIECEWISE"],
+)
+def test_cuda_graph_contract_rejects_graph_replay(mode: object) -> None:
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=mode)
+    )
+    with pytest.raises(ValueError, match="requires CUDA graphs to be disabled"):
+        _require_cudagraphs_disabled(config)
