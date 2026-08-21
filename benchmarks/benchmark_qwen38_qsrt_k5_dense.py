@@ -788,8 +788,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--quality-selection-report",
         type=Path,
         help=(
-            "content-bound analysis report that selects one saved optimizer "
-            "boundary instead of the trainer's screening choice"
+            "content-bound KLD ranking report that names the saved optimizer "
+            "boundary supplying the rank-16 factor overlay; without it, the "
+            "completion report under --recovery-root selects the overlay"
         ),
     )
     parser.add_argument("--qsrt-root", type=Path, required=True)

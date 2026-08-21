@@ -11439,6 +11439,13 @@ def _trellis256_dense_gemm_op(
     force_tile_k: int,
     force_tile_n: int,
 ) -> None:
+    for name, tensor in (
+        ("rotated_compute", rotated_compute),
+        ("c_tmp", c_tmp),
+        ("gemm_output", gemm_output),
+    ):
+        if int(tensor.data_ptr()) % 16 != 0:
+            raise ValueError(f"{name} must be at least 16-byte aligned")
     _trellis256_dense_gemm_flat(
         rotated_compute,
         trellis,
@@ -11542,12 +11549,11 @@ def _trellis_dense_buffer(
     device: torch.device,
 ) -> torch.Tensor:
     """Validate caller-owned dense scratch or allocate it before capture."""
-    if torch.compiler.is_compiling():
-        if buffer is None:
-            raise RuntimeError(
-                f"compiled Trellis execution requires caller-owned {name} storage"
-            )
-        return buffer
+    compiling = torch.compiler.is_compiling()
+    if compiling and buffer is None:
+        raise RuntimeError(
+            f"compiled Trellis execution requires caller-owned {name} storage"
+        )
     if buffer is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -11555,13 +11561,21 @@ def _trellis_dense_buffer(
                 "provide caller-owned storage"
             )
         return torch.empty(shape, dtype=dtype, device=device)
+    # FakeTensor tracing preserves static metadata, but the row extent is
+    # symbolic and the storage pointer is unavailable. Kernel-facing pointers
+    # are checked inside the opaque GEMM operator before it launches.
     if (
-        tuple(buffer.shape) != shape
+        buffer.ndim != 2
+        or int(buffer.shape[1]) != int(shape[1])
         or buffer.dtype != dtype
         or buffer.device != device
         or not buffer.is_contiguous()
-        or not (
-            torch.compiler.is_compiling() or int(buffer.data_ptr()) % 16 == 0
+        or (
+            not compiling
+            and (
+                int(buffer.shape[0]) != int(shape[0])
+                or int(buffer.data_ptr()) % 16 != 0
+            )
         )
     ):
         raise ValueError(
@@ -11650,9 +11664,9 @@ def _run_trellis256_dense_current_device(
         dtype=x.dtype,
         device=x.device,
     )
-    if c_tmp is not None and not (
-        torch.compiler.is_compiling() or int(c_tmp.data_ptr()) % 16 == 0
-    ):
+    # FakeTensor tracing cannot expose a storage pointer. The opaque GEMM
+    # operator checks the real c_tmp pointer immediately before kernel launch.
+    if c_tmp is not None and not compiling and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
 
     gemm_output = _trellis_dense_buffer(

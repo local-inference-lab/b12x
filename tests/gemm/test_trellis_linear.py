@@ -130,6 +130,82 @@ def test_trellis_mutating_custom_ops_support_fake_tensor_tracing() -> None:
         )
 
 
+def test_dense_compilation_preserves_static_buffer_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    expected = {
+        "shape": (2, 4),
+        "dtype": torch.float32,
+        "device": torch.device("cpu"),
+    }
+    valid = torch.empty((2, 4), dtype=torch.float32)
+    assert w4a16_kernel._trellis_dense_buffer("output", valid, **expected) is valid
+
+    invalid = (
+        torch.empty((2, 5), dtype=torch.float32),
+        torch.empty((2, 4), dtype=torch.float16),
+        torch.empty((4, 2), dtype=torch.float32).T,
+    )
+    for buffer in invalid:
+        with pytest.raises(ValueError, match="output must be contiguous"):
+            w4a16_kernel._trellis_dense_buffer("output", buffer, **expected)
+
+
+@pytest.mark.parametrize(
+    ("misaligned_name", "misaligned_index", "dtype", "shape"),
+    [
+        ("rotated_compute", 0, torch.bfloat16, (2, 4)),
+        ("c_tmp", 5, torch.float32, (32,)),
+        ("gemm_output", 6, torch.bfloat16, (2, 4)),
+    ],
+)
+def test_compiled_dense_operator_checks_real_kernel_pointer_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+    misaligned_name: str,
+    misaligned_index: int,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    elements = 1
+    for extent in shape:
+        elements *= extent
+    storage = torch.empty(elements + 1, dtype=dtype)
+    misaligned = storage[1:].view(shape)
+    assert misaligned.is_contiguous()
+    assert int(misaligned.data_ptr()) % 16 != 0
+
+    arguments = [
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        torch.empty((1, 1, 5), dtype=torch.int16),
+        torch.empty((1,), dtype=torch.float16),
+        torch.ones((1,), dtype=torch.float32),
+        torch.empty((32,), dtype=torch.int32),
+        torch.empty((32,), dtype=torch.float32),
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        5,
+        "sqg_fp16",
+        "",
+        "",
+        64,
+        64,
+        128,
+    ]
+    arguments[misaligned_index] = misaligned
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_trellis256_dense_gemm_flat",
+        lambda *_args: pytest.fail("misaligned storage reached the kernel launcher"),
+    )
+
+    with pytest.raises(ValueError, match=misaligned_name):
+        w4a16_kernel._trellis256_dense_gemm_op(*arguments)
+
+
 def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
     value = window.astype(np.uint64)
     value = ((value * _MCG) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
