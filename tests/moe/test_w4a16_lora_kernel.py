@@ -17,14 +17,25 @@ def _projection_oracle(
     *,
     scale: float,
     input_row_divisor: int,
-    route_weights: torch.Tensor | None,
+    token_row_divisor: int | None = None,
+    token_lora_mapping: torch.Tensor | None = None,
+    adapter_slot: int = 0,
+    route_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ranks: list[torch.Tensor] = []
     rows: list[torch.Tensor] = []
+    token_divisor = (
+        input_row_divisor if token_row_divisor is None else token_row_divisor
+    )
     for route, expert in enumerate(expert_ids.cpu().tolist()):
         input_row = route // input_row_divisor
+        active = token_lora_mapping is None or int(
+            token_lora_mapping[route // token_divisor].item()
+        ) == int(adapter_slot)
         rank_value = (
-            adapter_a[expert].float() @ x[input_row].float()
+            (adapter_a[expert].float() @ x[input_row].float())
+            if active
+            else torch.zeros(4, dtype=torch.float32, device=x.device)
         ).to(torch.bfloat16)
         delta = adapter_b[expert].float() @ rank_value.float()
         multiplier = float(scale)
@@ -118,3 +129,100 @@ def test_w4a16_static_lora_projection_matches_oracle_eager_and_graph(
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(destination, base)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_static_lora_projection_graph_replays_live_token_mapping() -> None:
+    torch.manual_seed(20260822)
+    device = torch.device("cuda")
+    experts, tokens, topk = 5, 6, 2
+    width, output_width = 257, 193
+    routes = tokens * topk
+    # FC2 geometry: one activation row per route, but adapter selection remains
+    # one entry per original token.
+    x = (torch.randn(routes, width, device=device) * 0.05).to(torch.bfloat16)
+    adapter_a = (torch.randn(experts, 4, width, device=device) * 0.03).to(
+        torch.bfloat16
+    )
+    adapter_b = (torch.randn(experts, output_width, 4, device=device) * 0.04).to(
+        torch.bfloat16
+    )
+    expert_ids = torch.randint(0, experts, (routes,), device=device, dtype=torch.int32)
+    base = (torch.randn(routes, output_width, device=device) * 0.1).to(torch.bfloat16)
+    rank_scratch = torch.empty(routes, 4, dtype=torch.bfloat16, device=device)
+    destination = base.clone()
+    token_mapping = torch.tensor(
+        [0, -1, 0, -1, 0, -1],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    def run() -> torch.Tensor:
+        return run_w4a16_static_lora_projection(
+            x,
+            adapter_a,
+            adapter_b,
+            expert_ids,
+            destination,
+            rank_scratch,
+            scale=0.5,
+            input_row_divisor=1,
+            token_row_divisor=topk,
+            token_lora_mapping=token_mapping,
+            adapter_slot=0,
+        )
+
+    expected, expected_rank = _projection_oracle(
+        x,
+        adapter_a,
+        adapter_b,
+        expert_ids,
+        base,
+        scale=0.5,
+        input_row_divisor=1,
+        token_row_divisor=topk,
+        token_lora_mapping=token_mapping,
+        adapter_slot=0,
+        route_weights=None,
+    )
+    run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(rank_scratch, expected_rank, rtol=0.0, atol=0.0078125)
+    torch.testing.assert_close(destination, expected, rtol=0.0, atol=0.0078125)
+
+    graph = torch.cuda.CUDAGraph()
+    destination.copy_(base)
+    with torch.cuda.graph(graph):
+        run()
+
+    # Change only live metadata after capture. The same graph must now apply
+    # LoRA to the complementary tokens.
+    token_mapping.mul_(-1).sub_(1)
+    destination.copy_(base)
+    expected_flipped, expected_rank_flipped = _projection_oracle(
+        x,
+        adapter_a,
+        adapter_b,
+        expert_ids,
+        base,
+        scale=0.5,
+        input_row_divisor=1,
+        token_row_divisor=topk,
+        token_lora_mapping=token_mapping,
+        adapter_slot=0,
+        route_weights=None,
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        rank_scratch,
+        expected_rank_flipped,
+        rtol=0.0,
+        atol=0.0078125,
+    )
+    torch.testing.assert_close(
+        destination,
+        expected_flipped,
+        rtol=0.0,
+        atol=0.0078125,
+    )

@@ -11741,6 +11741,8 @@ def _run_w4a16_static_lora_staged(
         rank_scratch,
         scale=adapter.w13_scale,
         input_row_divisor=topk,
+        token_lora_mapping=adapter.token_lora_mapping,
+        adapter_slot=adapter.adapter_slot,
     )
 
     activation_launch = compile_w4a16_activation(
@@ -11819,6 +11821,9 @@ def _run_w4a16_static_lora_staged(
         fc2_out,
         rank_scratch,
         scale=adapter.w2_scale,
+        token_row_divisor=topk,
+        token_lora_mapping=adapter.token_lora_mapping,
+        adapter_slot=adapter.adapter_slot,
         route_weights=route_weights,
     )
     _w4a16_topk_sum_launch_flat(
@@ -12096,6 +12101,15 @@ def run_w4a16_moe(
         if topk_ids.dtype != torch.int32 or not topk_ids.is_cuda:
             raise TypeError(
                 "W4A16 static expert LoRA requires CUDA int32 topk_ids"
+            )
+        if (
+            static_lora.token_lora_mapping is not None
+            and int(static_lora.token_lora_mapping.numel()) < int(m)
+        ):
+            raise ValueError(
+                "W4A16 static expert LoRA token_lora_mapping must contain at "
+                f"least {int(m)} entries, got "
+                f"{int(static_lora.token_lora_mapping.numel())}"
             )
         if lora_rank_scratch is None:
             raise ValueError(

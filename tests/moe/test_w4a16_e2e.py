@@ -743,6 +743,11 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
         dtype=torch.int32,
     )
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    token_lora_mapping = torch.tensor(
+        [0 if token % 2 == 0 else -1 for token in range(m)],
+        dtype=torch.int32,
+        device="cuda",
+    )
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
     prepared = prepare_tp_moe_fp4_experts(
         a=x,
@@ -772,6 +777,8 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
         ).to(torch.bfloat16),
         w13_scale=0.75,
         w2_scale=0.5,
+        token_lora_mapping=token_lora_mapping,
+        adapter_slot=0,
     )
     plan = fused_moe.plan(
         fused_moe.Caps(
@@ -834,6 +841,28 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
     graph_output = output.clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
+
+    # The graph reads vLLM-style adapter selection from live device metadata.
+    # Replaying it as a base-only batch must suppress every LoRA delta without
+    # recapturing or replacing the adapter object.
+    token_lora_mapping.fill_(-1)
+    output.fill_(float("nan"))
+    graph.replay()
+    base_graph_output = output.clone()
+    torch.cuda.synchronize()
+    base_expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+    )
+    base_metrics = compare_to_reference(base_graph_output, base_expected)
+    assert base_metrics.cos > 0.9975, base_metrics
 
 
 @pytest.mark.parametrize("scale_format", ["e4m3_k16", "e8m0_k32"])

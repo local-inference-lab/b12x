@@ -24,11 +24,15 @@ def _w4a16_static_lora_shrink_kernel(
     x,
     adapter_a,
     expert_ids,
+    token_lora_mapping,
     rank_scratch,
     NUM_ROUTES: tl.constexpr,
     WIDTH: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     INPUT_ROW_DIVISOR: tl.constexpr,
+    TOKEN_ROW_DIVISOR: tl.constexpr,
+    ADAPTER_SLOT: tl.constexpr,
+    HAS_TOKEN_LORA_MAPPING: tl.constexpr,
     RANK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -38,6 +42,11 @@ def _w4a16_static_lora_shrink_kernel(
     valid_expert = (expert >= 0) & (expert < NUM_EXPERTS)
     safe_expert = tl.maximum(0, tl.minimum(expert, NUM_EXPERTS - 1))
     input_row = route // INPUT_ROW_DIVISOR
+    token_row = route // TOKEN_ROW_DIVISOR
+    adapter_active = True
+    if HAS_TOKEN_LORA_MAPPING:
+        adapter_active = tl.load(token_lora_mapping + token_row) == ADAPTER_SLOT
+    valid_expert = valid_expert & adapter_active
 
     accumulator = 0.0
     offsets = tl.arange(0, BLOCK_K)
@@ -147,6 +156,9 @@ def run_w4a16_static_lora_projection(
     *,
     scale: float,
     input_row_divisor: int = 1,
+    token_row_divisor: int | None = None,
+    token_lora_mapping: torch.Tensor | None = None,
+    adapter_slot: int = 0,
     route_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Add one routed rank-4 projection to a caller-owned destination.
@@ -225,6 +237,30 @@ def run_w4a16_static_lora_projection(
             "expert_ids must contain exactly input_rows * input_row_divisor "
             f"routes, got {num_routes} for {int(x.shape[0])} * {divisor}"
         )
+    token_divisor = divisor if token_row_divisor is None else int(token_row_divisor)
+    if token_divisor <= 0 or num_routes % token_divisor != 0:
+        raise ValueError(
+            "token_row_divisor must be positive and divide the route count, "
+            f"got {token_divisor} for {num_routes} routes"
+        )
+    adapter_slot = int(adapter_slot)
+    if adapter_slot < 0:
+        raise ValueError("adapter_slot must be non-negative")
+    if token_lora_mapping is not None:
+        _validate_projection_tensor(
+            token_lora_mapping,
+            name="token_lora_mapping",
+            dtype=torch.int32,
+            device=device,
+            ndim=1,
+        )
+        required_mapping_rows = num_routes // token_divisor
+        if int(token_lora_mapping.numel()) < required_mapping_rows:
+            raise ValueError(
+                "token_lora_mapping must contain at least "
+                f"{required_mapping_rows} entries, got "
+                f"{int(token_lora_mapping.numel())}"
+            )
     if tuple(destination.shape) != (num_routes, output_width):
         raise ValueError(
             f"destination must have shape {(num_routes, output_width)}, "
@@ -257,11 +293,15 @@ def run_w4a16_static_lora_projection(
         x,
         adapter_a,
         expert_ids,
+        token_lora_mapping if token_lora_mapping is not None else expert_ids,
         rank_scratch,
         NUM_ROUTES=num_routes,
         WIDTH=width,
         NUM_EXPERTS=num_experts,
         INPUT_ROW_DIVISOR=divisor,
+        TOKEN_ROW_DIVISOR=token_divisor,
+        ADAPTER_SLOT=adapter_slot,
+        HAS_TOKEN_LORA_MAPPING=token_lora_mapping is not None,
         RANK=_RANK,
         BLOCK_K=_SHRINK_BLOCK_K,
         num_warps=4,

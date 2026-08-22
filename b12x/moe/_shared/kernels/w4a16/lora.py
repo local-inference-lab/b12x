@@ -25,6 +25,11 @@ class W4A16StaticExpertLoRA:
     w2_b: torch.Tensor  # [experts, hidden, rank]
     w13_scale: float = 1.0
     w2_scale: float = 1.0
+    # Optional graph-dynamic vLLM-style token map. ``-1`` selects the base
+    # model and ``adapter_slot`` selects this one loaded adapter. Other slots
+    # are left untouched by this deliberately single-adapter contract.
+    token_lora_mapping: torch.Tensor | None = None
+    adapter_slot: int = 0
 
     @property
     def rank(self) -> int:
@@ -77,6 +82,26 @@ def validate_w4a16_static_expert_lora(
         value = float(getattr(adapter, name))
         if not math.isfinite(value):
             raise ValueError(f"{name} must be finite, got {value}")
+
+    mapping = adapter.token_lora_mapping
+    if mapping is not None:
+        if not isinstance(mapping, torch.Tensor):
+            raise TypeError("token_lora_mapping must be a torch.Tensor")
+        if mapping.ndim != 1:
+            raise ValueError("token_lora_mapping must be rank 1")
+        if mapping.dtype != torch.int32:
+            raise TypeError(
+                "token_lora_mapping must be torch.int32, "
+                f"got {mapping.dtype}"
+            )
+        if mapping.device != device:
+            raise ValueError(
+                f"token_lora_mapping must be on {device}, got {mapping.device}"
+            )
+        if not mapping.is_contiguous():
+            raise ValueError("token_lora_mapping must be contiguous")
+    if int(adapter.adapter_slot) < 0:
+        raise ValueError("adapter_slot must be non-negative")
 
 
 __all__ = [

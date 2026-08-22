@@ -741,6 +741,11 @@ def moe_reference_w4a16_f32(
 
     for t in range(m):
         x_f32 = x[t].float()
+        lora_active = static_lora is not None and (
+            static_lora.token_lora_mapping is None
+            or int(static_lora.token_lora_mapping[t].item())
+            == int(static_lora.adapter_slot)
+        )
         for k_idx in range(top_k):
             eid = int(topk_ids[t, k_idx].item())
             router_w = float(topk_weights[t, k_idx].item())
@@ -770,7 +775,7 @@ def moe_reference_w4a16_f32(
                 )
                 gate_out = (gate_dequant @ x_f32) * alpha_fc1
                 up_out = (up_dequant @ x_f32) * alpha_fc1
-                if static_lora is not None:
+                if lora_active:
                     hidden_rank = static_lora.w13_a[eid].float() @ x_f32
                     w13_delta = (
                         static_lora.w13_b[eid].float() @ hidden_rank
@@ -805,7 +810,7 @@ def moe_reference_w4a16_f32(
                 block_size=block_size,
             )
             down_out = (down_dequant @ intermediate) * alpha_fc2
-            if static_lora is not None:
+            if lora_active:
                 intermediate_rank = static_lora.w2_a[eid].float() @ intermediate
                 down_out = down_out + (
                     static_lora.w2_b[eid].float() @ intermediate_rank
