@@ -19,6 +19,10 @@ from b12x.moe._shared.kernels.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
+from b12x.moe._shared.kernels.w4a16.lora import (
+    W4A16StaticExpertLoRA,
+    validate_w4a16_static_expert_lora,
+)
 
 
 @dataclass(frozen=True)
@@ -702,6 +706,7 @@ def moe_reference_w4a16_f32(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    static_lora: W4A16StaticExpertLoRA | None = None,
 ) -> torch.Tensor:
     activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
         _normalize_reference_swiglu_params(
@@ -714,6 +719,18 @@ def moe_reference_w4a16_f32(
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     del E
     is_gated = is_gated_moe_activation(activation)
+    if static_lora is not None:
+        if not is_gated:
+            raise NotImplementedError(
+                "W4A16 static expert LoRA requires a gated activation"
+            )
+        validate_w4a16_static_expert_lora(
+            static_lora,
+            num_experts=int(w1_fp4.shape[0]),
+            hidden_size=K,
+            intermediate_size=I_tp,
+            device=x.device,
+        )
 
     block_size = 16
     fp4_lut = _make_fp4_lut(x.device)
@@ -753,6 +770,13 @@ def moe_reference_w4a16_f32(
                 )
                 gate_out = (gate_dequant @ x_f32) * alpha_fc1
                 up_out = (up_dequant @ x_f32) * alpha_fc1
+                if static_lora is not None:
+                    hidden_rank = static_lora.w13_a[eid].float() @ x_f32
+                    w13_delta = (
+                        static_lora.w13_b[eid].float() @ hidden_rank
+                    ) * float(static_lora.w13_scale)
+                    gate_out = gate_out + w13_delta[:I_tp]
+                    up_out = up_out + w13_delta[I_tp:]
                 intermediate = _apply_gated_activation(
                     gate_out,
                     up_out,
@@ -781,6 +805,11 @@ def moe_reference_w4a16_f32(
                 block_size=block_size,
             )
             down_out = (down_dequant @ intermediate) * alpha_fc2
+            if static_lora is not None:
+                intermediate_rank = static_lora.w2_a[eid].float() @ intermediate
+                down_out = down_out + (
+                    static_lora.w2_b[eid].float() @ intermediate_rank
+                ) * float(static_lora.w2_scale)
             output[t] += router_w * down_out
 
     return output

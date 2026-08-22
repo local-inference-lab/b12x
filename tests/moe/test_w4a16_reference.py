@@ -12,6 +12,10 @@ from b12x.moe._shared.kernels.reference import (
 from b12x.moe._shared.kernels.reference_flashinfer import (
     prepare_flashinfer_trtllm_fp4_e8m0_k32_weights,
 )
+from b12x.moe._shared.kernels.w4a16.lora import (
+    W4A16StaticExpertLoRA,
+    validate_w4a16_static_expert_lora,
+)
 from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend as NVFP4MoEMicroKernelBackend
 from tests._reference.w4a16_reference import moe_reference_w4a16
 
@@ -247,6 +251,168 @@ def test_w4a16_f32_oracle_uses_weight_only_scales_without_activation_quant() -> 
         actual,
         torch.full((1, hidden), 3072.0, dtype=torch.float32),
     )
+
+
+def _static_lora_zeros(
+    *,
+    experts: int,
+    hidden: int,
+    intermediate: int,
+) -> W4A16StaticExpertLoRA:
+    return W4A16StaticExpertLoRA(
+        w13_a=torch.zeros(experts, 4, hidden, dtype=torch.bfloat16),
+        w13_b=torch.zeros(experts, 2 * intermediate, 4, dtype=torch.bfloat16),
+        w2_a=torch.zeros(experts, 4, intermediate, dtype=torch.bfloat16),
+        w2_b=torch.zeros(experts, hidden, 4, dtype=torch.bfloat16),
+    )
+
+
+def test_w4a16_static_lora_zero_delta_preserves_reference_bit_exactly() -> None:
+    experts, hidden, intermediate, topk = 2, 16, 16, 2
+    x = torch.arange(hidden, dtype=torch.float32).reshape(1, hidden).to(torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+    w13 = _packed_fp4_constant(
+        0.5,
+        groups=experts,
+        rows=2 * intermediate,
+        cols=hidden,
+    )
+    w2 = _packed_fp4_constant(
+        0.5,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+    w13_scale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=2 * intermediate,
+        cols=hidden,
+    )
+    w2_scale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+    alphas = torch.ones(experts, dtype=torch.float32)
+    args = (
+        x,
+        w13,
+        w13_scale,
+        alphas,
+        w2,
+        w2_scale,
+        alphas,
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden,
+        intermediate,
+    )
+
+    baseline = moe_reference_w4a16_f32(*args)
+    adapted = moe_reference_w4a16_f32(
+        *args,
+        static_lora=_static_lora_zeros(
+            experts=experts,
+            hidden=hidden,
+            intermediate=intermediate,
+        ),
+    )
+
+    assert torch.equal(adapted, baseline)
+
+
+def test_w4a16_static_lora_applies_w13_before_swiglu_and_w2_before_reduction() -> None:
+    experts, hidden, intermediate = 1, 16, 16
+    x = torch.zeros(1, hidden, dtype=torch.bfloat16)
+    x[0, 0] = 1.0
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    topk_weights = torch.full((1, 1), 0.25, dtype=torch.float32)
+    w13 = _packed_fp4_constant(
+        0.0,
+        groups=experts,
+        rows=2 * intermediate,
+        cols=hidden,
+    )
+    w2 = _packed_fp4_constant(
+        0.0,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+    w13_scale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=2 * intermediate,
+        cols=hidden,
+    )
+    w2_scale = _blockscale_constant(
+        1.0,
+        groups=experts,
+        rows=hidden,
+        cols=intermediate,
+    )
+    adapter = _static_lora_zeros(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    adapter.w13_a[0, 0, 0] = 1.0
+    adapter.w13_b[0, 0, 0] = 2.0
+    adapter.w13_b[0, intermediate, 0] = 3.0
+    adapter.w2_a[0, 0, 0] = 1.0
+    adapter.w2_b[0, 0, 0] = 4.0
+    adapter = W4A16StaticExpertLoRA(
+        w13_a=adapter.w13_a,
+        w13_b=adapter.w13_b,
+        w2_a=adapter.w2_a,
+        w2_b=adapter.w2_b,
+        w13_scale=0.5,
+        w2_scale=0.25,
+    )
+
+    actual = moe_reference_w4a16_f32(
+        x,
+        w13,
+        w13_scale,
+        torch.ones(experts, dtype=torch.float32),
+        w2,
+        w2_scale,
+        torch.ones(experts, dtype=torch.float32),
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden,
+        intermediate,
+        static_lora=adapter,
+    )
+
+    gate = torch.tensor(1.0)
+    up = torch.tensor(1.5)
+    intermediate_value = gate * torch.sigmoid(gate) * up
+    expected = torch.zeros_like(actual)
+    expected[0, 0] = 0.25 * intermediate_value
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_w4a16_static_lora_rejects_non_rank4_contract() -> None:
+    adapter = W4A16StaticExpertLoRA(
+        w13_a=torch.zeros(1, 8, 16, dtype=torch.bfloat16),
+        w13_b=torch.zeros(1, 32, 8, dtype=torch.bfloat16),
+        w2_a=torch.zeros(1, 8, 16, dtype=torch.bfloat16),
+        w2_b=torch.zeros(1, 16, 8, dtype=torch.bfloat16),
+    )
+    with pytest.raises(ValueError, match="requires rank 4"):
+        validate_w4a16_static_expert_lora(
+            adapter,
+            num_experts=1,
+            hidden_size=16,
+            intermediate_size=16,
+            device=torch.device("cpu"),
+        )
 
 
 def test_w4a16_fp4_e8m0_k32_oracle_uses_raw_k32_scale_grid() -> None:
