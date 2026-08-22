@@ -9,6 +9,9 @@ from .._shared.execution import (
 from .._shared.routing import (
     route_topk,
 )
+from .._shared.kernels.w4a16.lora import (
+    W4A16StaticExpertLoRA as StaticExpertLoRA,
+)
 from ._impl import (
     B12XFP4ExpertWeights as ExpertWeights,
 )
@@ -102,6 +105,7 @@ __all__ = [
     "ExpertWeights",
     "Routing",
     "WeightsPlan",
+    "StaticExpertLoRA",
     "plan",
     "required_nbytes",
     "plan_execution",

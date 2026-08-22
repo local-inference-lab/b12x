@@ -61,6 +61,7 @@ from b12x.moe._shared.kernels.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
+from b12x.moe._shared.kernels.w4a16.lora import W4A16StaticExpertLoRA
 from b12x.moe._shared.kernels.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
     MoEMicroKernelBackend,
@@ -263,6 +264,7 @@ class TPW4A16Workspace:
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
     expert_counts: torch.Tensor | None = None
+    lora_rank_scratch: torch.Tensor | None = None
     full_rotation_output: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
@@ -901,6 +903,7 @@ class TPMoEScratchPlan:
         layer_idx: int | None = None,
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
+        static_lora: W4A16StaticExpertLoRA | None = None,
     ) -> "TPMoEFP4Binding":
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -961,6 +964,7 @@ class TPMoEScratchPlan:
             layer_idx=layer_idx,
             route_expert_map=route_expert_map,
             output_expert_map=output_expert_map,
+            static_lora=static_lora,
             fused_launch=None,
             topk_sum_launch=None,
         )
@@ -1040,6 +1044,8 @@ class TPMoEFP4Binding:
     packed_route_count: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
     expert_counts: torch.Tensor | None = None
+    static_lora: W4A16StaticExpertLoRA | None = None
+    lora_rank_scratch: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
     kernel_workspace: torch.Tensor | None = None
@@ -2234,6 +2240,7 @@ def _build_tp_moe_fp4_binding_from_views(
     layer_idx: int | None = None,
     route_expert_map: torch.Tensor | None = None,
     output_expert_map: torch.Tensor | None = None,
+    static_lora: W4A16StaticExpertLoRA | None = None,
     fused_launch: object | None = None,
     topk_sum_launch: object | None = None,
 ) -> TPMoEFP4Binding:
@@ -2278,6 +2285,13 @@ def _build_tp_moe_fp4_binding_from_views(
             f"scratch plan quant_mode={plan.quant_mode!r} cannot bind "
             f"quant_mode={quant_mode!r}"
         )
+    if static_lora is not None:
+        if quant_mode != "w4a16" or plan.implementation != "w4a16":
+            raise ValueError("static_lora requires a W4A16 scratch plan")
+        if plan.full_rotation:
+            raise NotImplementedError(
+                "static_lora is not supported by the full-rotation Trellis plan"
+            )
     plan_activation = activation
     if quant_mode != "w4a16":
         plan_activation = _get_activation_kernel_spec(
@@ -2405,6 +2419,7 @@ def _build_tp_moe_fp4_binding_from_views(
         swiglu_beta=swiglu_beta,
         activation_amax=activation_amax,
         layer_idx=layer_idx,
+        static_lora=static_lora,
     )
     if plan.implementation == "w4a16":
         return TPMoEFP4Binding(
@@ -2419,6 +2434,11 @@ def _build_tp_moe_fp4_binding_from_views(
             packed_route_count=tensors["packed_route_count"],
             expert_offsets=tensors["expert_offsets"],
             expert_counts=tensors.get("expert_counts"),
+            lora_rank_scratch=(
+                tensors.get("lora_rank_scratch")
+                if static_lora is not None
+                else None
+            ),
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=(
                 tensors.get("rotation_a_gate")
@@ -2778,6 +2798,18 @@ def _plan_core_workspace(
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
             _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
         ]
+        if not full_rotation:
+            # One rank-4 BF16 row per routed token. The allocation is tiny
+            # (8 bytes per route) and keeping it in every ordinary W4A16 arena
+            # lets an adapter be attached at bind time without replacing the
+            # caller-owned scratch plan or allocating during graph capture.
+            tensor_specs.append(
+                _TensorAllocSpec(
+                    "lora_rank_scratch",
+                    (routed_capacity, 4),
+                    torch.bfloat16,
+                )
+            )
         if full_rotation:
             max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
             tensor_specs.extend(
@@ -3252,6 +3284,7 @@ def _materialize_workspace_from_core_arena(
             packed_route_count=tensors["packed_route_count"],
             expert_offsets=tensors["expert_offsets"],
             expert_counts=tensors.get("expert_counts"),
+            lora_rank_scratch=tensors.get("lora_rank_scratch"),
             full_rotation_output=tensors.get("full_rotation_output"),
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=(
@@ -7509,6 +7542,7 @@ def build_tp_moe_fp4_binding(
     layer_idx: int | None = None,
     route_expert_map: torch.Tensor | None = None,
     output_expert_map: torch.Tensor | None = None,
+    static_lora: W4A16StaticExpertLoRA | None = None,
 ) -> TPMoEFP4Binding:
     workspace = scratch
     if not isinstance(experts, B12XFP4ExpertWeights):
@@ -7542,6 +7576,8 @@ def build_tp_moe_fp4_binding(
         source_format=source_format,
         quant_mode=quant_mode,
     )
+    if static_lora is not None and quant_mode != "w4a16":
+        raise ValueError("static_lora requires quant_mode='w4a16'")
     collect_activation_amax = activation_amax is not None
     unit_scale_contract = bool(unit_scale_contract and quant_mode == "w4a16")
     activation = experts.activation
@@ -7639,6 +7675,7 @@ def build_tp_moe_fp4_binding(
         layer_idx=layer_idx,
         route_expert_map=route_expert_map,
         output_expert_map=output_expert_map,
+        static_lora=static_lora,
     )
     if isinstance(workspace, TPW4A16Workspace):
         if quant_mode != "w4a16":
@@ -7713,6 +7750,16 @@ def build_tp_moe_fp4_binding(
             use_route_expert_map=route_expert_map is not None,
             use_output_expert_map=output_expert_map is not None,
         )
+        if static_lora is not None:
+            if workspace.full_rotation:
+                raise NotImplementedError(
+                    "static_lora is not supported by the full-rotation Trellis path"
+                )
+            # The first correctness path composes LoRA around the standalone
+            # W4A16 FC1/FC2 launches. It deliberately does not pass the ordinary
+            # fused-MoE launch into run_w4a16_moe.
+            fused_launch = None
+            topk_sum_launch = None
         return TPMoEFP4Binding(
             **common_kwargs,
             implementation=workspace.implementation,
@@ -7734,6 +7781,9 @@ def build_tp_moe_fp4_binding(
             packed_route_count=workspace.packed_route_count,
             expert_offsets=workspace.expert_offsets,
             expert_counts=workspace.expert_counts,
+            lora_rank_scratch=(
+                workspace.lora_rank_scratch if static_lora is not None else None
+            ),
             rotation_a_gate=workspace.rotation_a_gate,
             rotation_a_up=workspace.rotation_a_up,
             kernel_workspace=workspace.kernel_workspace,
@@ -10475,6 +10525,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     activation_amax = binding.activation_amax
     layer_idx = binding.layer_idx
     unit_scale_contract = binding.unit_scale_contract
+    static_lora = binding.static_lora
     source_format = experts.source_format
     w13_layout = experts.w13_layout
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
@@ -10732,6 +10783,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
             expert_counts=_require_binding_field(binding, "expert_counts"),
+            static_lora=static_lora,
+            lora_rank_scratch=(
+                _require_binding_field(binding, "lora_rank_scratch")
+                if static_lora is not None
+                else None
+            ),
             expert_map=binding.route_expert_map,
             output_expert_map=binding.output_expert_map,
             activation_amax=activation_amax,
