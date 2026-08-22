@@ -599,12 +599,14 @@ def _assert_matches_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("native_modelopt", [False, True])
-def test_w4a16_static_lora_staged_matches_oracle_and_graph(
+@pytest.mark.parametrize("m", [1, 17])
+def test_w4a16_static_lora_matches_oracle_and_graph(
     native_modelopt: bool,
+    m: int,
 ) -> None:
     torch.manual_seed(20260821 + int(native_modelopt))
     experts, hidden_size, intermediate_size = 8, 128, 128
-    m, topk, activation = 17, 2, "silu"
+    topk, activation = 2, "silu"
     weights = _make_weights(
         experts=experts,
         hidden_size=hidden_size,

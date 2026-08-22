@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Performance gate for the correctness-first W4A16 expert-LoRA path.
+"""Performance gate for the hybrid W4A16 expert-LoRA path.
 
 This benchmark deliberately uses the DeepSeek-V4-Flash TP4 expert geometry:
 256 experts, H=4096, I_tp=512, top-k=6, BF16 activations, and native ModelOpt
-FP4 storage.  It compares B12X's untouched small-M fused decode path with the
-staged static rank-4 expert-LoRA implementation under CUDA graph replay.
+FP4 storage. It compares B12X's untouched small-M fused decode path with the
+static rank-4 expert-LoRA implementation under CUDA graph replay. Single-token
+decode augments the fused direct kernel; larger batches retain the staged
+tensor-core implementation selected by the production dispatcher.
 
 The base FP4 payload is synthetic because its values do not affect launch
 geometry.  When ``--adapter`` is supplied, the rank-4 tensors are loaded from
@@ -343,6 +345,7 @@ def main() -> None:
         base_norm = base_output.float().norm().clamp_min(1e-30)
         measurement = {
             "tokens": m,
+            "lora_path": "direct_augmented" if m == 1 else "staged",
             "base_us": base_us,
             "lora_us": lora_us,
             "base_median_us": base_median,

@@ -114,7 +114,9 @@ from b12x.moe._shared.kernels.w4a16.lora import (
     validate_w4a16_static_expert_lora,
 )
 from b12x.moe._shared.kernels.w4a16.lora_kernel import (
+    run_w4a16_static_lora_output_sum,
     run_w4a16_static_lora_projection,
+    run_w4a16_static_lora_shrink,
 )
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -679,6 +681,7 @@ class _W4A16SmallMDirectLaunch(NamedTuple):
     activation: str
     fast_math: bool
     topk_ids_dtype: torch.dtype
+    static_expert_lora: bool = False
 
 
 class _W4A16FC2DirectLaunch(NamedTuple):
@@ -754,6 +757,10 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
         swiglu_beta: float | None = None,
         w13_layout: str = "w13",
         compile_time_phase: int = 0,
+        static_expert_lora: bool = False,
+        lora_has_token_mapping: bool = False,
+        lora_adapter_slot: int = 0,
+        lora_w13_scale: float = 1.0,
     ):
         super().__init__(
             sf_vec_size=16,
@@ -772,6 +779,10 @@ class MoEMicroKernelW4A16SmallMDirect(MoEMicroKernelBackend):
             swiglu_beta=swiglu_beta,
             w13_layout=w13_layout,
             compile_time_phase=compile_time_phase,
+            static_expert_lora=static_expert_lora,
+            lora_has_token_mapping=lora_has_token_mapping,
+            lora_adapter_slot=lora_adapter_slot,
+            lora_w13_scale=lora_w13_scale,
         )
 
 
@@ -8424,6 +8435,10 @@ def _compile_w4a16_small_m_direct(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     w13_layout: str = "w13",
+    static_expert_lora: bool = False,
+    lora_has_token_mapping: bool = False,
+    lora_adapter_slot: int = 0,
+    lora_w13_scale: float = 1.0,
 ) -> _W4A16SmallMDirectLaunch:
     if topk_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
@@ -8450,6 +8465,10 @@ def _compile_w4a16_small_m_direct(
         swiglu_alpha,
         swiglu_beta,
         w13_layout,
+        bool(static_expert_lora),
+        bool(lora_has_token_mapping),
+        int(lora_adapter_slot),
+        float(lora_w13_scale),
     )
     cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
     if cached is not None:
@@ -8466,6 +8485,10 @@ def _compile_w4a16_small_m_direct(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
+        static_expert_lora=bool(static_expert_lora),
+        lora_has_token_mapping=bool(lora_has_token_mapping),
+        lora_adapter_slot=int(lora_adapter_slot),
+        lora_w13_scale=float(lora_w13_scale),
     )
     kernel.configure(
         int(m),
@@ -8508,9 +8531,19 @@ def _compile_w4a16_small_m_direct(
         Int32(m),
         Int32(kernel.grid_x),
         current_cuda_stream(),
+        *(
+            (
+                dummy(cutlass.BFloat16),
+                dummy(cutlass.BFloat16),
+                dummy(cutlass.Int32),
+                dummy(cutlass.BFloat16),
+            )
+            if static_expert_lora
+            else ()
+        ),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            2,
+            3,
             ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
@@ -8525,6 +8558,10 @@ def _compile_w4a16_small_m_direct(
             ("swiglu_alpha", swiglu_alpha),
             ("swiglu_beta", swiglu_beta),
             ("w13_layout", w13_layout),
+            ("static_expert_lora", bool(static_expert_lora)),
+            ("lora_has_token_mapping", bool(lora_has_token_mapping)),
+            ("lora_adapter_slot", int(lora_adapter_slot)),
+            ("lora_w13_scale", float(lora_w13_scale)),
             ("grid_x", int(kernel.grid_x)),
         ),
     )
@@ -8539,6 +8576,7 @@ def _compile_w4a16_small_m_direct(
         activation=activation,
         fast_math=bool(fast_math),
         topk_ids_dtype=topk_ids_dtype,
+        static_expert_lora=bool(static_expert_lora),
     )
     _SMALL_M_DIRECT_CACHE[cache_key] = launch
     return launch
@@ -9928,6 +9966,212 @@ def _w4a16_small_m_direct_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     w13_layout: str,
+    stream_int: int,
+) -> None:
+    return None
+
+
+def _w4a16_small_m_direct_lora_launch_flat(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    lora_w13_b: torch.Tensor,
+    lora_rank_scratch: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    lora_activated: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    w13_layout: str,
+    has_token_lora_mapping: bool,
+    adapter_slot: int,
+    lora_w13_scale: float,
+    stream_int: int,
+) -> None:
+    swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
+    direct_launch = _compile_w4a16_small_m_direct(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        fast_math=bool(fast_math),
+        topk_ids_dtype=topk_ids.dtype,
+        scale_format=scale_format,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        w13_layout=w13_layout,
+        static_expert_lora=True,
+        lora_has_token_mapping=bool(has_token_lora_mapping),
+        lora_adapter_slot=int(adapter_slot),
+        lora_w13_scale=float(lora_w13_scale),
+        device=a_input.device,
+    )
+
+    def ptr(dt, tensor: torch.Tensor):
+        return make_ptr(dt, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    ids_dtype = cutlass.Int64 if topk_ids.dtype == torch.int64 else cutlass.Int32
+    direct_launch.compiled(
+        ptr(cutlass.BFloat16, a_input),
+        ptr(cutlass.Uint8, w13_u8),
+        ptr(cutlass.Uint8, w13_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w13_global_scale),
+        ptr(cutlass.Float32, w13_global_scale),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(cutlass.Uint32, inter_u32.view(torch.uint32)),
+        ptr(cutlass.Uint8, w2_u8),
+        ptr(cutlass.Uint8, w2_scale_u8.view(torch.uint8)),
+        ptr(cutlass.Float32, w2_global_scale),
+        ptr(ids_dtype, topk_ids),
+        ptr(cutlass.Float32, topk_weights),
+        ptr(cutlass.BFloat16, output),
+        barrier_count,
+        barrier_epoch,
+        Int32(m),
+        Int32(direct_launch.grid_x),
+        cuda.CUstream(stream_int),
+        ptr(cutlass.BFloat16, lora_w13_b),
+        ptr(cutlass.BFloat16, lora_rank_scratch),
+        ptr(cutlass.Int32, token_lora_mapping),
+        ptr(cutlass.BFloat16, lora_activated),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::w4a16_small_m_direct_lora_launch",
+    mutates_args="unknown",
+)
+def _w4a16_small_m_direct_lora_launch_op(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    lora_w13_b: torch.Tensor,
+    lora_rank_scratch: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    lora_activated: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    w13_layout: str,
+    has_token_lora_mapping: bool,
+    adapter_slot: int,
+    lora_w13_scale: float,
+    stream_int: int,
+) -> None:
+    _w4a16_small_m_direct_lora_launch_flat(
+        a_input=a_input,
+        w13_u8=w13_u8,
+        w13_scale_u8=w13_scale_u8,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        inter_u32=inter_u32,
+        w2_u8=w2_u8,
+        w2_scale_u8=w2_scale_u8,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output=output,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+        lora_w13_b=lora_w13_b,
+        lora_rank_scratch=lora_rank_scratch,
+        token_lora_mapping=token_lora_mapping,
+        lora_activated=lora_activated,
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        fast_math=fast_math,
+        scale_format=scale_format,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        w13_layout=w13_layout,
+        has_token_lora_mapping=has_token_lora_mapping,
+        adapter_slot=adapter_slot,
+        lora_w13_scale=lora_w13_scale,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_small_m_direct_lora_launch_op.register_fake
+def _w4a16_small_m_direct_lora_launch_fake(
+    a_input: torch.Tensor,
+    w13_u8: torch.Tensor,
+    w13_scale_u8: torch.Tensor,
+    w13_global_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    inter_u32: torch.Tensor,
+    w2_u8: torch.Tensor,
+    w2_scale_u8: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+    lora_w13_b: torch.Tensor,
+    lora_rank_scratch: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    lora_activated: torch.Tensor,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    scale_format: str,
+    has_swiglu_limit: bool,
+    swiglu_limit_value: float,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    w13_layout: str,
+    has_token_lora_mapping: bool,
+    adapter_slot: int,
+    lora_w13_scale: float,
     stream_int: int,
 ) -> None:
     return None
@@ -12247,6 +12491,177 @@ def run_w4a16_moe(
 
     current_stream = current_cuda_stream()
     stream = current_stream if stream is None else stream
+    use_direct_static_lora = bool(
+        static_lora is not None
+        # The exact DS4F TP4 rank-4 gate shows that preserving the fused
+        # direct kernel wins for single-token decode. At m>=2 the staged
+        # tensor-core path amortizes its route-pack/launch costs better.
+        and int(m) == 1
+        and (not collect_activation_amax)
+        and _small_m_direct_supported(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=int(prepared.intermediate_size),
+            num_experts=int(prepared.num_experts),
+            topk=topk,
+            activation=activation,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            element_dtype=element_dtype,
+            weight_layout=weight_layout,
+            w13_layout=w13_layout,
+            scale_format=scale_format,
+            expert_map=expert_map,
+        )
+    )
+    if use_direct_static_lora:
+        assert static_lora is not None
+        assert lora_rank_scratch is not None
+        if int(stream) != int(current_stream):
+            raise NotImplementedError(
+                "direct W4A16 static expert LoRA currently requires the current "
+                "Torch CUDA stream"
+            )
+        if not intermediate_cache13.is_contiguous():
+            raise ValueError(
+                "W4A16 small-M direct LoRA path requires contiguous "
+                "intermediate_cache13"
+            )
+        if not intermediate_cache2.is_contiguous() or not output.is_contiguous():
+            raise ValueError(
+                "W4A16 small-M direct LoRA path requires contiguous "
+                "intermediate_cache2 and output"
+            )
+        if (
+            intermediate_cache13.dtype != a_input.dtype
+            or intermediate_cache2.dtype != a_input.dtype
+        ):
+            raise TypeError(
+                f"intermediate caches must be {a_input.dtype} for the W4A16 "
+                "small-M direct LoRA path"
+            )
+        if int(prepared.workspace.numel()) < 2:
+            raise ValueError(
+                "prepared W4A16 workspace is too small for small-M direct LoRA"
+            )
+
+        intermediate_size = int(prepared.intermediate_size)
+        routed_rows = int(m) * int(topk)
+        required_activated = routed_rows * intermediate_size
+        if int(intermediate_cache2.numel()) < required_activated:
+            raise ValueError(
+                "intermediate_cache2 is smaller than the W4A16 small-M direct "
+                "LoRA activated scratch requirement: "
+                f"have={int(intermediate_cache2.numel())}, "
+                f"need={required_activated}"
+            )
+        lora_activated = intermediate_cache2.view(-1)[:required_activated].view(
+            routed_rows, intermediate_size
+        )
+        rank_scratch = lora_rank_scratch.view(-1)[: routed_rows * 4].view(
+            routed_rows, 4
+        )
+        route_ids = topk_ids.view(-1)
+        route_weights = topk_weights.view(-1)
+
+        run_w4a16_static_lora_shrink(
+            a_input,
+            static_lora.w13_a,
+            route_ids,
+            rank_scratch,
+            input_row_divisor=topk,
+            token_row_divisor=topk,
+            token_lora_mapping=static_lora.token_lora_mapping,
+            adapter_slot=static_lora.adapter_slot,
+        )
+
+        fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+        inter_u32_per_m = fc2_n_chunks * 128 * topk
+        inter_u32 = intermediate_cache13.view(-1).view(torch.uint32)
+        if int(inter_u32.numel()) < m * inter_u32_per_m:
+            raise ValueError(
+                "intermediate_cache13 is smaller than the W4A16 small-M direct "
+                "LoRA scratch requirement: "
+                f"have_u32={int(inter_u32.numel())}, "
+                f"need_u32={m * inter_u32_per_m}"
+            )
+        micro_w13_scale = getattr(prepared, "micro_w13_scale", None)
+        micro_w2_scale = getattr(prepared, "micro_w2_scale", None)
+        micro_w13_global = getattr(prepared, "micro_w13_global_scale", None)
+        micro_w2_global = getattr(prepared, "micro_w2_global_scale", None)
+        if (
+            micro_w13_scale is None
+            or micro_w2_scale is None
+            or micro_w13_global is None
+            or micro_w2_global is None
+        ):
+            raise RuntimeError(
+                "W4A16 small-M direct LoRA path requires prepared micro scale "
+                "metadata"
+            )
+        barrier_count = prepared.workspace[-2:-1]
+        barrier_epoch = prepared.workspace[-1:]
+        if _small_m_direct_host_barrier_reset_enabled():
+            barrier_count.zero_()
+            barrier_epoch.zero_()
+        token_lora_mapping = (
+            static_lora.token_lora_mapping
+            if static_lora.token_lora_mapping is not None
+            else route_ids[:m]
+        )
+        torch.ops.b12x.w4a16_small_m_direct_lora_launch(
+            a_input,
+            prepared.w13.view(torch.uint8),
+            micro_w13_scale,
+            micro_w13_global,
+            micro_w2_global,
+            inter_u32[: m * inter_u32_per_m],
+            prepared.w2.view(torch.uint8),
+            micro_w2_scale,
+            topk_ids,
+            topk_weights,
+            output,
+            barrier_count,
+            barrier_epoch,
+            static_lora.w13_b,
+            rank_scratch,
+            token_lora_mapping,
+            lora_activated,
+            m,
+            hidden_size,
+            intermediate_size,
+            int(prepared.num_experts),
+            topk,
+            activation,
+            bool(fast_math),
+            scale_format,
+            swiglu_limit is not None,
+            float(swiglu_limit or 0.0),
+            float(swiglu_alpha),
+            float(swiglu_beta),
+            w13_layout,
+            static_lora.token_lora_mapping is not None,
+            int(static_lora.adapter_slot),
+            float(static_lora.w13_scale),
+            int(stream),
+        )
+        run_w4a16_static_lora_output_sum(
+            lora_activated,
+            static_lora.w2_a,
+            static_lora.w2_b,
+            route_ids,
+            route_weights,
+            output,
+            rank_scratch,
+            scale=static_lora.w2_scale,
+            topk=topk,
+            token_lora_mapping=static_lora.token_lora_mapping,
+            adapter_slot=static_lora.adapter_slot,
+        )
+        return output
+
     if (
         static_lora is None
         and (not collect_activation_amax)

@@ -124,6 +124,61 @@ def _w4a16_static_lora_expand_add_kernel(
     tl.store(destination + destination_offsets, updated, mask=column_mask)
 
 
+@triton.jit
+def _w4a16_static_lora_expand_token_sum_kernel(
+    rank_scratch,
+    adapter_b,
+    expert_ids,
+    route_weights,
+    destination,
+    SCALE: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    TOPK: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Add routed LoRA FC2 deltas directly to the token-summed output."""
+
+    token = tl.program_id(0)
+    output_block = tl.program_id(1)
+    columns = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    column_mask = columns < OUTPUT_WIDTH
+    delta = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for route_in_token in tl.static_range(0, TOPK):
+        route = token * TOPK + route_in_token
+        expert = tl.load(expert_ids + route).to(tl.int32)
+        valid_expert = (expert >= 0) & (expert < NUM_EXPERTS)
+        safe_expert = tl.maximum(0, tl.minimum(expert, NUM_EXPERTS - 1))
+        b_base = safe_expert * (OUTPUT_WIDTH * RANK) + columns * RANK
+        rank_base = route * RANK
+        route_delta = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for rank in tl.static_range(0, RANK):
+            rank_value = tl.load(rank_scratch + rank_base + rank).to(tl.float32)
+            b_value = tl.load(
+                adapter_b + b_base + rank,
+                mask=column_mask & valid_expert,
+                other=0.0,
+            ).to(tl.float32)
+            route_delta += rank_value * b_value
+        route_weight = tl.load(route_weights + route).to(tl.float32)
+        delta += tl.where(valid_expert, route_delta * route_weight, 0.0)
+
+    destination_offsets = token * OUTPUT_WIDTH + columns
+    previous = tl.load(
+        destination + destination_offsets,
+        mask=column_mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        destination + destination_offsets,
+        previous + delta * SCALE,
+        mask=column_mask & (token < NUM_TOKENS),
+    )
+
+
 def _validate_projection_tensor(
     tensor: torch.Tensor,
     *,
@@ -144,6 +199,209 @@ def _validate_projection_tensor(
         raise ValueError(f"{name} must be a CUDA tensor")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def run_w4a16_static_lora_shrink(
+    x: torch.Tensor,
+    adapter_a: torch.Tensor,
+    expert_ids: torch.Tensor,
+    rank_scratch: torch.Tensor,
+    *,
+    input_row_divisor: int = 1,
+    token_row_divisor: int | None = None,
+    token_lora_mapping: torch.Tensor | None = None,
+    adapter_slot: int = 0,
+) -> torch.Tensor:
+    """Compute the routed rank-4 contraction into caller-owned scratch."""
+
+    if not isinstance(x, torch.Tensor):
+        raise TypeError("x must be a torch.Tensor")
+    device = x.device
+    _validate_projection_tensor(
+        x,
+        name="x",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=2,
+    )
+    _validate_projection_tensor(
+        adapter_a,
+        name="adapter_a",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=3,
+    )
+    _validate_projection_tensor(
+        expert_ids,
+        name="expert_ids",
+        dtype=torch.int32,
+        device=device,
+        ndim=1,
+    )
+    _validate_projection_tensor(
+        rank_scratch,
+        name="rank_scratch",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=2,
+    )
+
+    num_experts, rank, width = (int(v) for v in adapter_a.shape)
+    if rank != _RANK:
+        raise ValueError(f"adapter_a rank must be {_RANK}, got {rank}")
+    if int(x.shape[1]) != width:
+        raise ValueError(f"x width must be {width}, got {int(x.shape[1])}")
+    num_routes = int(expert_ids.numel())
+    divisor = int(input_row_divisor)
+    if divisor <= 0:
+        raise ValueError(f"input_row_divisor must be positive, got {divisor}")
+    if num_routes != int(x.shape[0]) * divisor:
+        raise ValueError(
+            "expert_ids must contain exactly input_rows * input_row_divisor "
+            f"routes, got {num_routes} for {int(x.shape[0])} * {divisor}"
+        )
+    token_divisor = divisor if token_row_divisor is None else int(token_row_divisor)
+    if token_divisor <= 0 or num_routes % token_divisor != 0:
+        raise ValueError(
+            "token_row_divisor must be positive and divide the route count, "
+            f"got {token_divisor} for {num_routes} routes"
+        )
+    adapter_slot = int(adapter_slot)
+    if adapter_slot < 0:
+        raise ValueError("adapter_slot must be non-negative")
+    if token_lora_mapping is not None:
+        _validate_projection_tensor(
+            token_lora_mapping,
+            name="token_lora_mapping",
+            dtype=torch.int32,
+            device=device,
+            ndim=1,
+        )
+        required_mapping_rows = num_routes // token_divisor
+        if int(token_lora_mapping.numel()) < required_mapping_rows:
+            raise ValueError(
+                "token_lora_mapping must contain at least "
+                f"{required_mapping_rows} entries, got "
+                f"{int(token_lora_mapping.numel())}"
+            )
+    if tuple(rank_scratch.shape) != (num_routes, _RANK):
+        raise ValueError(
+            f"rank_scratch must have shape {(num_routes, _RANK)}, "
+            f"got {tuple(rank_scratch.shape)}"
+        )
+
+    _w4a16_static_lora_shrink_kernel[(num_routes, _RANK)](
+        x,
+        adapter_a,
+        expert_ids,
+        token_lora_mapping if token_lora_mapping is not None else expert_ids,
+        rank_scratch,
+        NUM_ROUTES=num_routes,
+        WIDTH=width,
+        NUM_EXPERTS=num_experts,
+        INPUT_ROW_DIVISOR=divisor,
+        TOKEN_ROW_DIVISOR=token_divisor,
+        ADAPTER_SLOT=adapter_slot,
+        HAS_TOKEN_LORA_MAPPING=token_lora_mapping is not None,
+        RANK=_RANK,
+        BLOCK_K=_SHRINK_BLOCK_K,
+        num_warps=4,
+    )
+    return rank_scratch
+
+
+def run_w4a16_static_lora_output_sum(
+    x: torch.Tensor,
+    adapter_a: torch.Tensor,
+    adapter_b: torch.Tensor,
+    expert_ids: torch.Tensor,
+    route_weights: torch.Tensor,
+    destination: torch.Tensor,
+    rank_scratch: torch.Tensor,
+    *,
+    scale: float,
+    topk: int,
+    token_lora_mapping: torch.Tensor | None = None,
+    adapter_slot: int = 0,
+) -> torch.Tensor:
+    """Add a routed rank-4 projection directly to token-summed output."""
+
+    topk = int(topk)
+    if topk <= 0:
+        raise ValueError("topk must be positive")
+    if int(expert_ids.numel()) != int(destination.shape[0]) * topk:
+        raise ValueError("expert_ids must contain destination_rows * topk routes")
+    run_w4a16_static_lora_shrink(
+        x,
+        adapter_a,
+        expert_ids,
+        rank_scratch,
+        token_row_divisor=topk,
+        token_lora_mapping=token_lora_mapping,
+        adapter_slot=adapter_slot,
+    )
+
+    device = x.device
+    _validate_projection_tensor(
+        adapter_b,
+        name="adapter_b",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=3,
+    )
+    _validate_projection_tensor(
+        route_weights,
+        name="route_weights",
+        dtype=torch.float32,
+        device=device,
+        ndim=1,
+    )
+    _validate_projection_tensor(
+        destination,
+        name="destination",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=2,
+    )
+    num_experts, output_width, output_rank = (
+        int(v) for v in adapter_b.shape
+    )
+    if num_experts != int(adapter_a.shape[0]) or output_rank != _RANK:
+        raise ValueError(
+            "adapter_b must have shape "
+            f"({int(adapter_a.shape[0])}, output_width, {_RANK}), "
+            f"got {tuple(adapter_b.shape)}"
+        )
+    num_routes = int(expert_ids.numel())
+    if int(route_weights.numel()) != num_routes:
+        raise ValueError(f"route_weights must contain {num_routes} values")
+    if int(destination.shape[1]) != output_width:
+        raise ValueError(
+            f"destination width must be {output_width}, "
+            f"got {int(destination.shape[1])}"
+        )
+    scale = float(scale)
+    if not math.isfinite(scale):
+        raise ValueError(f"scale must be finite, got {scale}")
+
+    _w4a16_static_lora_expand_token_sum_kernel[
+        (int(destination.shape[0]), triton.cdiv(output_width, _EXPAND_BLOCK_N))
+    ](
+        rank_scratch,
+        adapter_b,
+        expert_ids,
+        route_weights,
+        destination,
+        SCALE=scale,
+        NUM_TOKENS=int(destination.shape[0]),
+        TOPK=topk,
+        OUTPUT_WIDTH=output_width,
+        NUM_EXPERTS=num_experts,
+        RANK=_RANK,
+        BLOCK_N=_EXPAND_BLOCK_N,
+        num_warps=4,
+    )
+    return destination
 
 
 def run_w4a16_static_lora_projection(
@@ -326,4 +584,8 @@ def run_w4a16_static_lora_projection(
     return destination
 
 
-__all__ = ["run_w4a16_static_lora_projection"]
+__all__ = [
+    "run_w4a16_static_lora_output_sum",
+    "run_w4a16_static_lora_projection",
+    "run_w4a16_static_lora_shrink",
+]
