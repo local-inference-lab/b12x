@@ -1,19 +1,19 @@
 {
-  "command": "benchmarks/benchmark_mxfp8_staged_input.py --iterations 9",
+  "command": "benchmarks/benchmark_mxfp8_staged_input.py --iterations 9 --output validation/performance/mxfp8_staged_input_sm120.json",
   "concatenated": {
-    "live_before_bytes": 738590720,
-    "median_ms": 5.925695896148682,
-    "peak_bytes": 1395524096,
+    "live_before_bytes": 679870464,
+    "median_ms": 5.929887771606445,
+    "peak_bytes": 1278083584,
     "samples_ms": [
-      5.9402241706848145,
-      5.952864170074463,
-      5.9306559562683105,
-      5.919712066650391,
-      5.912288188934326,
-      5.914944171905518,
-      5.923903942108154,
-      5.949215888977051,
-      5.925695896148682
+      5.918399810791016,
+      5.909120082855225,
+      5.870240211486816,
+      5.932703971862793,
+      5.924191951751709,
+      5.9323201179504395,
+      5.929887771606445,
+      6.221183776855469,
+      6.231040000915527
     ]
   },
   "geometry": {
@@ -24,10 +24,37 @@
     "tokens": 4096
   },
   "gpu": {
-    "compute_capability": [12, 0],
+    "compute_capability": [
+      12,
+      0
+    ],
     "cuda_runtime": "13.3",
     "device": 0,
     "driver_version": "610.57.04",
+    "mode": {
+      "available": true,
+      "captured_unix_ns": 1787429685215256476,
+      "command": [
+        "nvidia-smi",
+        "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+        "--format=csv,noheader,nounits"
+      ],
+      "fields": {
+        "clocks.current.memory": "13365",
+        "clocks.current.sm": "2572",
+        "clocks_throttle_reasons.active": "0x0000000000000004",
+        "compute_mode": "Default",
+        "index": "0",
+        "persistence_mode": "Enabled",
+        "power.draw": "163.81",
+        "power.limit": "600.00",
+        "pstate": "P1",
+        "temperature.gpu": "31",
+        "uuid": "GPU-d8438b2d-f000-a617-5dcc-0197ce0365a3"
+      },
+      "nvidia_smi_uuid": "GPU-d8438b2d-f000-a617-5dcc-0197ce0365a3",
+      "torch_uuid": "d8438b2d-f000-a617-5dcc-0197ce0365a3"
+    },
     "multiprocessors": 188,
     "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     "torch_version": "2.13.0"
@@ -36,27 +63,32 @@
     "bitwise_equal": true,
     "max_absolute_difference": 0.0
   },
-  "schema": "b12x.mxfp8-staged-input.v1",
+  "schema": "b12x.mxfp8-staged-input.v2",
   "source": {
-    "repository": "local-inference-lab/b12x",
-    "revision": "a2d6f82bedb5a7b8b935823c6cdfb6acce09caf5",
+    "repository": "https://github.com/local-inference-lab/b12x.git",
+    "revision": "4b8662a67afe0c42597e38b53d6d35cdcb14c205",
+    "worktree": "/root/vllm/worktrees/b12x-mxfp8-staged-input-20260822",
     "worktree_state": "clean",
     "worktree_status": []
   },
   "staged": {
-    "live_before_bytes": 632160768,
-    "median_ms": 5.934112071990967,
-    "peak_bytes": 808321536,
+    "live_before_bytes": 573440512,
+    "median_ms": 5.8436479568481445,
+    "peak_bytes": 663355904,
     "samples_ms": [
-      5.702655792236328,
-      5.969279766082764,
-      5.912511825561523,
-      5.8600640296936035,
-      5.935679912567139,
-      5.8758721351623535,
-      5.934112071990967,
-      6.01423978805542,
-      5.985599994659424
+      5.881824016571045,
+      5.817728042602539,
+      5.825727939605713,
+      5.862368106842041,
+      5.846144199371338,
+      5.829535961151123,
+      5.8436479568481445,
+      5.821280002593994,
+      6.144288063049316
     ]
+  },
+  "timing": {
+    "samples_interleaved": true,
+    "source_construction_included": false
   }
 }
