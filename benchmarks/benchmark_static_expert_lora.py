@@ -16,8 +16,12 @@ the real adapter and TP-sliced for the selected rank.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
+import os
 import statistics
+import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -41,6 +45,50 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_FULL = 2048
 TOPK = 6
 RANK = 4
+
+
+def _command_metadata(
+    argv: list[str], *, cwd: Path | None = None
+) -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"argv": argv, "error": repr(error)}
+    return {
+        "argv": argv,
+        "returncode": int(completed.returncode),
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+    }
+
+
+def _gpu_snapshot() -> dict[str, object]:
+    fields = (
+        "timestamp,driver_version,index,uuid,name,pstate,compute_mode,"
+        "power.draw,power.limit,temperature.gpu,clocks.current.sm,"
+        "clocks.current.memory,clocks_event_reasons.active,gpu_recovery_action"
+    )
+    return _command_metadata(
+        [
+            "nvidia-smi",
+            f"--query-gpu={fields}",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
@@ -217,10 +265,33 @@ def main() -> None:
         source_format="modelopt_nvfp4",
         w13_layout="up_gate",
     )
+    repo_root = Path(__file__).resolve().parents[1]
+    gpu_props = torch.cuda.get_device_properties(0)
+    evidence: dict[str, object] = {
+        "command": [sys.executable, *sys.argv],
+        "container_image": os.environ.get("B12X_BENCH_CONTAINER_IMAGE"),
+        "git_commit": _command_metadata(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root
+        ),
+        "git_status": _command_metadata(
+            ["git", "status", "--short", "--branch"], cwd=repo_root
+        ),
+        "gpu_before": _gpu_snapshot(),
+    }
 
     results: dict[str, object] = {
+        "evidence": evidence,
         "gpu": torch.cuda.get_device_name(0),
-        "torch": torch.__version__,
+        "runtime": {
+            "python": sys.version,
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cutlass_dsl": _package_version("nvidia-cutlass-dsl"),
+            "triton": _package_version("triton"),
+            "gpu_capability": [int(gpu_props.major), int(gpu_props.minor)],
+            "gpu_multi_processor_count": int(gpu_props.multi_processor_count),
+            "gpu_total_memory": int(gpu_props.total_memory),
+        },
         "shape": {
             "experts": EXPERTS,
             "hidden_size": HIDDEN_SIZE,
@@ -355,6 +426,7 @@ def main() -> None:
             "relative_output_delta": float((delta / base_norm).item()),
             "base_finite": bool(torch.isfinite(base_output).all().item()),
             "lora_finite": bool(torch.isfinite(lora_output).all().item()),
+            "lora_nonzero_delta": bool(delta.item() > 0.0),
             "small_m_direct_baseline": _small_m_direct_supported(
                 m=m,
                 hidden_size=HIDDEN_SIZE,
@@ -386,6 +458,7 @@ def main() -> None:
         "max_allocated_bytes": torch.cuda.max_memory_allocated(),
         "max_reserved_bytes": torch.cuda.max_memory_reserved(),
     }
+    evidence["gpu_after"] = _gpu_snapshot()
     rendered = json.dumps(results, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.write_text(rendered + "\n")
