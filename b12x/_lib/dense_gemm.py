@@ -565,7 +565,7 @@ class DenseGemmKernel:
 
     Key architectural differences from the tcgen05 donor path:
     - No TMEM, no tcgen05, no 2-CTA instructions, no multi-cluster
-    - Warp-level MMA: MmaMXF4NVF4Op atom m16n8k64, atom_layout=(4,2,1)
+    - Warp-level MMA: MmaMXF4NVF4Op/MmaMXF4Op atom m16n8k64, atom_layout=(4,2,1)
     - 256 MMA threads + 32 DMA = 288 total threads
     - PipelineTmaAsync (not PipelineTmaUmma)
     - Manual atom unroll workaround for CuTe DSL compiler SF address space bug
@@ -866,11 +866,20 @@ class DenseGemmKernel:
                 self.sf_dtype,
             )
         else:
-            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-                self.a_dtype,
-                self.acc_dtype,
-                self.sf_dtype,
-            )
+            # MmaMXF4Op requires sf_vec_size=32 (MXF4, E8M0 scales);
+            # MmaMXF4NVF4Op requires sf_vec_size=16 (NVF4, E4M3 scales).
+            if self.sf_dtype == cutlass.Float8E8M0FNU:
+                mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                    self.a_dtype,
+                    self.acc_dtype,
+                    self.sf_dtype,
+                )
+            else:
+                mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                    self.a_dtype,
+                    self.acc_dtype,
+                    self.sf_dtype,
+                )
         atom_shape = self.atom_shape
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
@@ -1278,7 +1287,8 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        frag = sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        return self._group_sf_fragment_k_modes(frag)
 
     def _partition_fragment_SFB(
         self,
@@ -1286,7 +1296,22 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        frag = sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        return self._group_sf_fragment_k_modes(frag)
+
+    @staticmethod
+    def _group_sf_fragment_k_modes(frag: cute.Tensor) -> cute.Tensor:
+        """Collapse the SF fragment to (V, MN-tile, K-block) rank 3.
+
+        For MXF4 (sf_vec_size=32, two scales per m16n8k64 atom) the helper
+        returns the per-stage K decomposition as two trailing modes
+        (in-block group, K tile). Their colex order matches ascending K, so
+        grouping them yields the single K-block mode the mainloop slices
+        with ``k_block_idx`` — same profile as the NVF4/MXF8 paths.
+        """
+        if cutlass.const_expr(cute.rank(frag) > 3):
+            frag = cute.group_modes(frag, 2, cute.rank(frag))
+        return frag
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
         return sm120_utils.thrfrg_SFA(sfa_tensor, tiled_mma)
