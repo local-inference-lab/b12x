@@ -10066,7 +10066,12 @@ def _w4a16_small_m_direct_lora_launch_flat(
         ptr(cutlass.BFloat16, lora_w13_b),
         ptr(cutlass.BFloat16, lora_w13_b_up),
         ptr(cutlass.BFloat16, lora_rank_scratch),
-        ptr(cutlass.Int32, token_lora_mapping),
+        ptr(
+            cutlass.Int64
+            if token_lora_mapping.dtype == torch.int64
+            else cutlass.Int32,
+            token_lora_mapping,
+        ),
         ptr(cutlass.BFloat16, lora_activated),
     )
 

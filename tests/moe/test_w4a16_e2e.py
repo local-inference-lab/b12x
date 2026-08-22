@@ -601,10 +601,12 @@ def _assert_matches_oracle(
 @pytest.mark.parametrize("native_modelopt", [False, True])
 @pytest.mark.parametrize("split_w13_b", [False, True])
 @pytest.mark.parametrize("m", [1, 17])
+@pytest.mark.parametrize("mapping_dtype", [torch.int32, torch.int64])
 def test_w4a16_static_lora_matches_oracle_and_graph(
     native_modelopt: bool,
     split_w13_b: bool,
     m: int,
+    mapping_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(20260821 + int(native_modelopt))
     experts, hidden_size, intermediate_size = 8, 128, 128
@@ -649,6 +651,8 @@ def test_w4a16_static_lora_matches_oracle_and_graph(
         ),
         w13_scale=0.75,
         w2_scale=0.5,
+        token_lora_mapping=torch.zeros(m, dtype=mapping_dtype, device="cuda"),
+        adapter_slot=0,
     )
     if native_modelopt:
         prepared = prepare_w4a16_modelopt_native_weights(

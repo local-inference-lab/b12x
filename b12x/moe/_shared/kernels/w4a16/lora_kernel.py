@@ -246,7 +246,7 @@ def _validate_projection_tensor(
     tensor: torch.Tensor,
     *,
     name: str,
-    dtype: torch.dtype,
+    dtype: torch.dtype | tuple[torch.dtype, ...],
     device: torch.device,
     ndim: int,
 ) -> None:
@@ -254,8 +254,10 @@ def _validate_projection_tensor(
         raise TypeError(f"{name} must be a torch.Tensor")
     if tensor.ndim != ndim:
         raise ValueError(f"{name} must have {ndim} dimensions, got {tensor.ndim}")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
+    allowed_dtypes = dtype if isinstance(dtype, tuple) else (dtype,)
+    if tensor.dtype not in allowed_dtypes:
+        expected = " or ".join(str(value) for value in allowed_dtypes)
+        raise TypeError(f"{name} must be {expected}, got {tensor.dtype}")
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
     if not tensor.is_cuda:
@@ -336,7 +338,7 @@ def run_w4a16_static_lora_shrink(
         _validate_projection_tensor(
             token_lora_mapping,
             name="token_lora_mapping",
-            dtype=torch.int32,
+            dtype=(torch.int32, torch.int64),
             device=device,
             ndim=1,
         )
@@ -571,7 +573,7 @@ def run_w4a16_static_lora_projection(
         _validate_projection_tensor(
             token_lora_mapping,
             name="token_lora_mapping",
-            dtype=torch.int32,
+            dtype=(torch.int32, torch.int64),
             device=device,
             ndim=1,
         )

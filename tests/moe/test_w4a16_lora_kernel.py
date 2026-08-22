@@ -176,7 +176,10 @@ def test_w4a16_static_lora_projection_matches_oracle_eager_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_w4a16_static_lora_projection_graph_replays_live_token_mapping() -> None:
+@pytest.mark.parametrize("mapping_dtype", [torch.int32, torch.int64])
+def test_w4a16_static_lora_projection_graph_replays_live_token_mapping(
+    mapping_dtype: torch.dtype,
+) -> None:
     torch.manual_seed(20260822)
     device = torch.device("cuda")
     experts, tokens, topk = 5, 6, 2
@@ -197,7 +200,7 @@ def test_w4a16_static_lora_projection_graph_replays_live_token_mapping() -> None
     destination = base.clone()
     token_mapping = torch.tensor(
         [0, -1, 0, -1, 0, -1],
-        dtype=torch.int32,
+        dtype=mapping_dtype,
         device=device,
     )
 

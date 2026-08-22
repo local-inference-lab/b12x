@@ -32,8 +32,9 @@ class W4A16StaticExpertLoRA:
     w13_scale: float = 1.0
     w2_scale: float = 1.0
     # Optional graph-dynamic vLLM-style token map. ``-1`` selects the base
-    # model and ``adapter_slot`` selects this one loaded adapter. Other slots
-    # are left untouched by this deliberately single-adapter contract.
+    # model and ``adapter_slot`` selects this one loaded adapter. Both int32
+    # and vLLM's canonical int64 mapping are accepted. Other slots are left
+    # untouched by this deliberately single-adapter contract.
     token_lora_mapping: torch.Tensor | None = None
     adapter_slot: int = 0
 
@@ -102,9 +103,9 @@ def validate_w4a16_static_expert_lora(
             raise TypeError("token_lora_mapping must be a torch.Tensor")
         if mapping.ndim != 1:
             raise ValueError("token_lora_mapping must be rank 1")
-        if mapping.dtype != torch.int32:
+        if mapping.dtype not in (torch.int32, torch.int64):
             raise TypeError(
-                "token_lora_mapping must be torch.int32, "
+                "token_lora_mapping must be torch.int32 or torch.int64, "
                 f"got {mapping.dtype}"
             )
         if mapping.device != device:
