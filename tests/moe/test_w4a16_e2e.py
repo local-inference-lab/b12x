@@ -719,6 +719,123 @@ def test_w4a16_static_lora_staged_matches_oracle_and_graph(
     torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> None:
+    """Exercise the public plan -> bind -> run serving boundary with LoRA."""
+
+    from b12x.moe import fused_moe
+
+    torch.manual_seed(20260822)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    m, topk, activation = 7, 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.2).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a_gscale,
+        w1_fp4=weights[0],
+        w1_blockscale=weights[1],
+        w1_alphas=weights[2],
+        a2_gscale=a_gscale,
+        w2_fp4=weights[3],
+        w2_blockscale=weights[4],
+        w2_alphas=weights[5],
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    adapter = fused_moe.StaticExpertLoRA(
+        w13_a=(
+            torch.randn(experts, 4, hidden_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w13_b=(
+            torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w2_a=(
+            torch.randn(experts, 4, intermediate_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w2_b=(
+            torch.randn(experts, hidden_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w13_scale=0.75,
+        w2_scale=0.5,
+    )
+    plan = fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=m,
+            num_topk=topk,
+            route_num_experts=0,
+            device=x.device,
+            weight_plan=prepared.plan,
+            quant_mode="w4a16",
+            core_token_counts=(m,),
+            frozen=True,
+        )
+    )
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    output = torch.empty_like(x)
+    binding = fused_moe.bind(
+        plan,
+        scratch=scratch,
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        input_scales_static=True,
+        static_lora=adapter,
+    )
+    assert binding.static_lora is adapter
+    assert binding.lora_rank_scratch is not None
+    assert binding.lora_rank_scratch.numel() >= m * topk * 4
+    assert binding.fused_launch is None
+
+    expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        static_lora=adapter,
+    )
+    eager = fused_moe.run(binding=binding).clone()
+    torch.cuda.synchronize()
+    metrics = compare_to_reference(eager, expected)
+    assert bool(torch.isfinite(eager).all().item())
+    assert metrics.cos > 0.9975, metrics
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_moe.run(binding=binding)
+    output.fill_(float("nan"))
+    graph.replay()
+    graph_output = output.clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
+
+
 @pytest.mark.parametrize("scale_format", ["e4m3_k16", "e8m0_k32"])
 @pytest.mark.parametrize("m", [1, 3, 8])
 def test_w4a16_packed_weights_do_not_route_to_small_m_direct(
