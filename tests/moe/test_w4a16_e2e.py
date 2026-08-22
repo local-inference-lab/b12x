@@ -599,9 +599,11 @@ def _assert_matches_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("native_modelopt", [False, True])
+@pytest.mark.parametrize("split_w13_b", [False, True])
 @pytest.mark.parametrize("m", [1, 17])
 def test_w4a16_static_lora_matches_oracle_and_graph(
     native_modelopt: bool,
+    split_w13_b: bool,
     m: int,
 ) -> None:
     torch.manual_seed(20260821 + int(native_modelopt))
@@ -622,19 +624,29 @@ def test_w4a16_static_lora_matches_oracle_and_graph(
         dtype=torch.int32,
     )
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    packed_w13_b = (
+        torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
+    ).to(torch.bfloat16)
     adapter = W4A16StaticExpertLoRA(
         w13_a=(
             torch.randn(experts, 4, hidden_size, device="cuda") * 0.025
         ).to(torch.bfloat16),
         w13_b=(
-            torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
-        ).to(torch.bfloat16),
+            packed_w13_b[:, :intermediate_size].contiguous()
+            if split_w13_b
+            else packed_w13_b
+        ),
         w2_a=(
             torch.randn(experts, 4, intermediate_size, device="cuda") * 0.025
         ).to(torch.bfloat16),
         w2_b=(
             torch.randn(experts, hidden_size, 4, device="cuda") * 0.04
         ).to(torch.bfloat16),
+        w13_b_up=(
+            packed_w13_b[:, intermediate_size:].contiguous()
+            if split_w13_b
+            else None
+        ),
         w13_scale=0.75,
         w2_scale=0.5,
     )

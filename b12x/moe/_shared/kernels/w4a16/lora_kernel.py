@@ -125,6 +125,69 @@ def _w4a16_static_lora_expand_add_kernel(
 
 
 @triton.jit
+def _w4a16_static_lora_expand_pair_add_kernel(
+    rank_scratch,
+    gate_b,
+    up_b,
+    expert_ids,
+    destination,
+    SCALE: tl.constexpr,
+    NUM_ROUTES: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Expand vLLM's separate gate/up B buffers into fused FC1 output."""
+
+    route = tl.program_id(0)
+    output_block = tl.program_id(1)
+    columns = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    column_mask = columns < OUTPUT_WIDTH
+
+    expert = tl.load(expert_ids + route).to(tl.int32)
+    valid_expert = (expert >= 0) & (expert < NUM_EXPERTS)
+    safe_expert = tl.maximum(0, tl.minimum(expert, NUM_EXPERTS - 1))
+    b_base = safe_expert * (OUTPUT_WIDTH * RANK) + columns * RANK
+    rank_base = route * RANK
+
+    gate_delta = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    up_delta = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for rank in tl.static_range(0, RANK):
+        rank_value = tl.load(rank_scratch + rank_base + rank).to(tl.float32)
+        gate_value = tl.load(
+            gate_b + b_base + rank,
+            mask=column_mask & valid_expert,
+            other=0.0,
+        ).to(tl.float32)
+        up_value = tl.load(
+            up_b + b_base + rank,
+            mask=column_mask & valid_expert,
+            other=0.0,
+        ).to(tl.float32)
+        gate_delta += rank_value * gate_value
+        up_delta += rank_value * up_value
+
+    destination_base = route * (2 * OUTPUT_WIDTH)
+    gate_offsets = destination_base + columns
+    up_offsets = destination_base + OUTPUT_WIDTH + columns
+    old_gate = tl.load(
+        destination + gate_offsets,
+        mask=column_mask,
+        other=0.0,
+    ).to(tl.float32)
+    old_up = tl.load(
+        destination + up_offsets,
+        mask=column_mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate_out = tl.where(valid_expert, old_gate + gate_delta * SCALE, old_gate)
+    up_out = tl.where(valid_expert, old_up + up_delta * SCALE, old_up)
+    tl.store(destination + gate_offsets, gate_out, mask=column_mask)
+    tl.store(destination + up_offsets, up_out, mask=column_mask)
+
+
+@triton.jit
 def _w4a16_static_lora_expand_token_sum_kernel(
     rank_scratch,
     adapter_b,
@@ -584,8 +647,99 @@ def run_w4a16_static_lora_projection(
     return destination
 
 
+def run_w4a16_static_lora_split_w13_projection(
+    x: torch.Tensor,
+    adapter_a: torch.Tensor,
+    gate_b: torch.Tensor,
+    up_b: torch.Tensor,
+    expert_ids: torch.Tensor,
+    destination: torch.Tensor,
+    rank_scratch: torch.Tensor,
+    *,
+    scale: float,
+    input_row_divisor: int = 1,
+    token_lora_mapping: torch.Tensor | None = None,
+    adapter_slot: int = 0,
+) -> torch.Tensor:
+    """Add separate gate/up rank-4 B factors to fused ``[gate, up]`` FC1.
+
+    vLLM deliberately owns the two B slices as independent contiguous
+    allocations.  This path consumes those allocations directly, avoiding a
+    per-forward concatenate and preserving CUDA-graph pointer stability.
+    """
+
+    device = x.device
+    for name, tensor in (("gate_b", gate_b), ("up_b", up_b)):
+        _validate_projection_tensor(
+            tensor,
+            name=name,
+            dtype=torch.bfloat16,
+            device=device,
+            ndim=3,
+        )
+    _validate_projection_tensor(
+        destination,
+        name="destination",
+        dtype=torch.bfloat16,
+        device=device,
+        ndim=2,
+    )
+
+    num_experts = int(adapter_a.shape[0])
+    if gate_b.shape != up_b.shape:
+        raise ValueError(
+            "gate_b and up_b must have identical shapes, got "
+            f"{tuple(gate_b.shape)} and {tuple(up_b.shape)}"
+        )
+    if int(gate_b.shape[0]) != num_experts or int(gate_b.shape[2]) != _RANK:
+        raise ValueError(
+            "gate_b and up_b must have shape "
+            f"({num_experts}, output_width, {_RANK}), got "
+            f"{tuple(gate_b.shape)}"
+        )
+    output_width = int(gate_b.shape[1])
+    num_routes = int(expert_ids.numel())
+    if tuple(destination.shape) != (num_routes, 2 * output_width):
+        raise ValueError(
+            "destination must have shape "
+            f"{(num_routes, 2 * output_width)}, got {tuple(destination.shape)}"
+        )
+    scale = float(scale)
+    if not math.isfinite(scale):
+        raise ValueError(f"scale must be finite, got {scale}")
+
+    run_w4a16_static_lora_shrink(
+        x,
+        adapter_a,
+        expert_ids,
+        rank_scratch,
+        input_row_divisor=input_row_divisor,
+        token_row_divisor=input_row_divisor,
+        token_lora_mapping=token_lora_mapping,
+        adapter_slot=adapter_slot,
+    )
+    _w4a16_static_lora_expand_pair_add_kernel[
+        (num_routes, triton.cdiv(output_width, _EXPAND_BLOCK_N))
+    ](
+        rank_scratch,
+        gate_b,
+        up_b,
+        expert_ids,
+        destination,
+        SCALE=scale,
+        NUM_ROUTES=num_routes,
+        OUTPUT_WIDTH=output_width,
+        NUM_EXPERTS=num_experts,
+        RANK=_RANK,
+        BLOCK_N=_EXPAND_BLOCK_N,
+        num_warps=4,
+    )
+    return destination
+
+
 __all__ = [
     "run_w4a16_static_lora_output_sum",
     "run_w4a16_static_lora_projection",
     "run_w4a16_static_lora_shrink",
+    "run_w4a16_static_lora_split_w13_projection",
 ]

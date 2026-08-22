@@ -6,6 +6,7 @@ import torch
 from b12x.moe._shared.kernels.w4a16.lora_kernel import (
     run_w4a16_static_lora_output_sum,
     run_w4a16_static_lora_projection,
+    run_w4a16_static_lora_split_w13_projection,
 )
 
 
@@ -269,6 +270,76 @@ def test_w4a16_static_lora_projection_graph_replays_live_token_mapping() -> None
         rtol=0.0,
         atol=0.0078125,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_static_lora_split_w13_matches_packed_oracle_and_graph() -> None:
+    torch.manual_seed(20260824)
+    device = torch.device("cuda")
+    experts, tokens, topk = 5, 7, 2
+    width, intermediate = 257, 193
+    routes = tokens * topk
+    x = (torch.randn(tokens, width, device=device) * 0.05).to(torch.bfloat16)
+    adapter_a = (torch.randn(experts, 4, width, device=device) * 0.03).to(
+        torch.bfloat16
+    )
+    gate_b = (torch.randn(experts, intermediate, 4, device=device) * 0.04).to(
+        torch.bfloat16
+    )
+    up_b = (torch.randn(experts, intermediate, 4, device=device) * 0.04).to(
+        torch.bfloat16
+    )
+    packed_b = torch.cat((gate_b, up_b), dim=1)
+    expert_ids = torch.randint(0, experts, (routes,), device=device, dtype=torch.int32)
+    base = (torch.randn(routes, 2 * intermediate, device=device) * 0.1).to(
+        torch.bfloat16
+    )
+    rank_scratch = torch.empty(routes, 4, dtype=torch.bfloat16, device=device)
+    destination = base.clone()
+    token_mapping = torch.tensor(
+        [0, -1, 0, -1, 0, -1, 0], dtype=torch.int32, device=device
+    )
+    expected, expected_rank = _projection_oracle(
+        x,
+        adapter_a,
+        packed_b,
+        expert_ids,
+        base,
+        scale=0.625,
+        input_row_divisor=topk,
+        token_lora_mapping=token_mapping,
+        adapter_slot=0,
+    )
+
+    def run() -> torch.Tensor:
+        return run_w4a16_static_lora_split_w13_projection(
+            x,
+            adapter_a,
+            gate_b,
+            up_b,
+            expert_ids,
+            destination,
+            rank_scratch,
+            scale=0.625,
+            input_row_divisor=topk,
+            token_lora_mapping=token_mapping,
+            adapter_slot=0,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(rank_scratch, expected_rank, rtol=0.0, atol=0.0078125)
+    torch.testing.assert_close(destination, expected, rtol=0.0, atol=0.0078125)
+
+    destination.copy_(base)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    token_mapping.fill_(-1)
+    destination.copy_(base)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(destination, base)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

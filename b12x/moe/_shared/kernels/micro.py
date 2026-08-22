@@ -407,6 +407,7 @@ class MoEMicroKernelBackend:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         static_expert_lora: bool = False,
+        lora_split_w13_b: bool = False,
         lora_has_token_mapping: bool = False,
         lora_adapter_slot: int = 0,
         lora_w13_scale: float = 1.0,
@@ -455,6 +456,8 @@ class MoEMicroKernelBackend:
             raise ValueError(
                 "static expert LoRA requires the fused gated W4A16 ModelOpt path"
             )
+        if lora_split_w13_b and not static_expert_lora:
+            raise ValueError("split W13 LoRA B requires static expert LoRA")
         if int(lora_adapter_slot) < 0:
             raise ValueError("lora_adapter_slot must be non-negative")
         self.scale_format = scale_format
@@ -489,6 +492,7 @@ class MoEMicroKernelBackend:
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         self.trellis_coupled = bool(trellis_coupled)
         self.static_expert_lora = bool(static_expert_lora)
+        self.lora_split_w13_b = bool(lora_split_w13_b)
         self.lora_has_token_mapping = bool(lora_has_token_mapping)
         self.lora_adapter_slot = int(lora_adapter_slot)
         self.lora_w13_scale = float(lora_w13_scale)
@@ -517,6 +521,7 @@ class MoEMicroKernelBackend:
             self.trellis_bits,
             self.trellis_coupled,
             self.static_expert_lora,
+            self.lora_split_w13_b,
             self.lora_has_token_mapping,
             self.lora_adapter_slot,
             self.lora_w13_scale,
@@ -2417,6 +2422,7 @@ class MoEMicroKernelBackend:
         trellis_lut: cute.Tensor,
         trellis_rotations: cute.Tensor,
         lora_w13_b: cute.Tensor,
+        lora_w13_b_up: cute.Tensor,
         lora_rank_scratch: cute.Tensor,
         token_lora_mapping: cute.Tensor,
         lora_activated: cute.Tensor,
@@ -5265,6 +5271,7 @@ class MoEMicroKernelBackend:
                                 if adapter_active > Int32(0):
                                     rank_base = route_idx * Int32(4)
                                     b_base = eid * Int32(cfg.two_n * 4)
+                                    split_b_base = eid * Int32(cfg.n * 4)
                                     gate_delta = Float32(0.0)
                                     up_delta = Float32(0.0)
                                     for lora_r in cutlass.range_constexpr(4):
@@ -5273,20 +5280,36 @@ class MoEMicroKernelBackend:
                                                 rank_base + Int32(lora_r)
                                             ]
                                         )
-                                        gate_delta += rank_value * Float32(
-                                            lora_w13_b[
-                                                b_base
-                                                + i * Int32(4)
-                                                + Int32(lora_r)
-                                            ]
-                                        )
-                                        up_delta += rank_value * Float32(
-                                            lora_w13_b[
-                                                b_base
-                                                + (Int32(cfg.n) + i) * Int32(4)
-                                                + Int32(lora_r)
-                                            ]
-                                        )
+                                        if cutlass.const_expr(self.lora_split_w13_b):
+                                            gate_delta += rank_value * Float32(
+                                                lora_w13_b[
+                                                    split_b_base
+                                                    + i * Int32(4)
+                                                    + Int32(lora_r)
+                                                ]
+                                            )
+                                            up_delta += rank_value * Float32(
+                                                lora_w13_b_up[
+                                                    split_b_base
+                                                    + i * Int32(4)
+                                                    + Int32(lora_r)
+                                                ]
+                                            )
+                                        else:
+                                            gate_delta += rank_value * Float32(
+                                                lora_w13_b[
+                                                    b_base
+                                                    + i * Int32(4)
+                                                    + Int32(lora_r)
+                                                ]
+                                            )
+                                            up_delta += rank_value * Float32(
+                                                lora_w13_b[
+                                                    b_base
+                                                    + (Int32(cfg.n) + i) * Int32(4)
+                                                    + Int32(lora_r)
+                                                ]
+                                            )
                                     gate_red += gate_delta * Float32(
                                         self.lora_w13_scale
                                     )
@@ -5862,6 +5885,7 @@ class MoEMicroKernelBackend:
         grid_x: Int32,
         stream,
         lora_w13_b_ptr: cute.Pointer | None = None,
+        lora_w13_b_up_ptr: cute.Pointer | None = None,
         lora_rank_ptr: cute.Pointer | None = None,
         token_lora_mapping_ptr: cute.Pointer | None = None,
         lora_activated_ptr: cute.Pointer | None = None,
@@ -5965,9 +5989,23 @@ class MoEMicroKernelBackend:
             (
                 cute.make_tensor(
                     lora_w13_b_ptr,
-                    cute.make_layout(Int64(cfg.weight_E * cfg.two_n * 4)),
+                    cute.make_layout(
+                        Int64(
+                            cfg.weight_E
+                            * (cfg.n if self.lora_split_w13_b else cfg.two_n)
+                            * 4
+                        )
+                    ),
                 )
                 if cutlass.const_expr(lora_w13_b_ptr is not None)
+                else barrier_count
+            ),
+            (
+                cute.make_tensor(
+                    lora_w13_b_up_ptr,
+                    cute.make_layout(Int64(cfg.weight_E * cfg.n * 4)),
+                )
+                if cutlass.const_expr(lora_w13_b_up_ptr is not None)
                 else barrier_count
             ),
             (

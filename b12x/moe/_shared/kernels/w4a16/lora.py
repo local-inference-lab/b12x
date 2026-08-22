@@ -13,16 +13,22 @@ class W4A16StaticExpertLoRA:
     """One BF16 rank-4 adapter already sharded for tensor parallelism.
 
     ``w13_b`` is in logical ``[gate, up]`` order after tensor-parallel
-    sharding. ``w13_a`` and ``w2_b`` are replicated across TP ranks;
-    ``w13_b`` is sharded on its output rows and ``w2_a`` on its input columns.
-    The contract intentionally excludes adapter selection and expert-parallel
-    remapping.
+    sharding.  vLLM stores those two output slices in independent allocations;
+    that layout can be represented without a graph-time concatenate by passing
+    gate rows in ``w13_b`` and up rows in ``w13_b_up``. ``w13_a`` and ``w2_b``
+    are replicated across TP ranks; W13 B is sharded on its output rows and
+    ``w2_a`` on its input columns.  The contract intentionally excludes expert
+    parallel remapping and supports one live adapter slot.
     """
 
     w13_a: torch.Tensor  # [experts, rank, hidden]
     w13_b: torch.Tensor  # [experts, 2 * intermediate_tp, rank]
     w2_a: torch.Tensor  # [experts, rank, intermediate_tp]
     w2_b: torch.Tensor  # [experts, hidden, rank]
+    # Optional vLLM-native split representation.  When present, ``w13_b`` is
+    # the gate half [experts, intermediate_tp, rank] and this is the up half
+    # with the same shape.  Both remain caller-owned contiguous tensors.
+    w13_b_up: torch.Tensor | None = None
     w13_scale: float = 1.0
     w2_scale: float = 1.0
     # Optional graph-dynamic vLLM-style token map. ``-1`` selects the base
@@ -57,12 +63,19 @@ def validate_w4a16_static_expert_lora(
     if rank != 4:
         raise ValueError(f"W4A16 static expert LoRA requires rank 4, got {rank}")
 
+    split_w13_b = adapter.w13_b_up is not None
     expected_shapes = {
         "w13_a": (num_experts, rank, hidden_size),
-        "w13_b": (num_experts, 2 * intermediate_size, rank),
+        "w13_b": (
+            num_experts,
+            intermediate_size if split_w13_b else 2 * intermediate_size,
+            rank,
+        ),
         "w2_a": (num_experts, rank, intermediate_size),
         "w2_b": (num_experts, hidden_size, rank),
     }
+    if split_w13_b:
+        expected_shapes["w13_b_up"] = (num_experts, intermediate_size, rank)
     for name, expected_shape in expected_shapes.items():
         tensor = getattr(adapter, name)
         if not isinstance(tensor, torch.Tensor):

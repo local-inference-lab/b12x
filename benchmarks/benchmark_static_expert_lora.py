@@ -148,6 +148,7 @@ def _load_adapter(
     tp_size: int,
     tp_rank: int,
     token_mapping: torch.Tensor,
+    split_w13_b: bool,
 ) -> W4A16StaticExpertLoRA:
     if INTERMEDIATE_FULL % tp_size:
         raise ValueError("full intermediate size must divide evenly across TP")
@@ -161,41 +162,44 @@ def _load_adapter(
         w2_b = handle.get_tensor(_adapter_key(layer, "lora_B_down"))
 
     # The fused projection has two independent I-sized halves. Slice each
-    # half for TP, then restore the adapter contract's logical [gate, up].
-    w13_b = torch.cat(
-        (
-            w13_b_full[:, start:stop, :],
-            w13_b_full[
-                :, INTERMEDIATE_FULL + start : INTERMEDIATE_FULL + stop, :
-            ],
-        ),
-        dim=1,
-    )
+    # half for TP, preserving vLLM's independent allocations when requested.
+    w13_b_gate = w13_b_full[:, start:stop, :]
+    w13_b_up = w13_b_full[
+        :, INTERMEDIATE_FULL + start : INTERMEDIATE_FULL + stop, :
+    ]
     w2_a = w2_a_full[:, :, start:stop]
-    tensors = [w13_a, w13_b, w2_a, w2_b]
+    tensors = [w13_a, w13_b_gate, w13_b_up, w2_a, w2_b]
     tensors = [
         tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()
         for tensor in tensors
     ]
+    gate_b, up_b = tensors[1], tensors[2]
     return W4A16StaticExpertLoRA(
         w13_a=tensors[0],
-        w13_b=tensors[1],
-        w2_a=tensors[2],
-        w2_b=tensors[3],
+        w13_b=gate_b if split_w13_b else torch.cat((gate_b, up_b), dim=1),
+        w13_b_up=up_b if split_w13_b else None,
+        w2_a=tensors[3],
+        w2_b=tensors[4],
         token_lora_mapping=token_mapping,
         adapter_slot=0,
     )
 
 
 def _synthetic_adapter(
-    *, intermediate_size: int, token_mapping: torch.Tensor
+    *,
+    intermediate_size: int,
+    token_mapping: torch.Tensor,
+    split_w13_b: bool,
 ) -> W4A16StaticExpertLoRA:
     def make(shape: tuple[int, ...], scale: float) -> torch.Tensor:
         return (torch.randn(shape, device="cuda") * scale).to(torch.bfloat16)
 
+    gate_b = make((EXPERTS, intermediate_size, RANK), 0.04)
+    up_b = make((EXPERTS, intermediate_size, RANK), 0.04)
     return W4A16StaticExpertLoRA(
         w13_a=make((EXPERTS, RANK, HIDDEN_SIZE), 0.025),
-        w13_b=make((EXPERTS, 2 * intermediate_size, RANK), 0.04),
+        w13_b=gate_b if split_w13_b else torch.cat((gate_b, up_b), dim=1),
+        w13_b_up=up_b if split_w13_b else None,
         w2_a=make((EXPERTS, RANK, intermediate_size), 0.025),
         w2_b=make((EXPERTS, HIDDEN_SIZE, RANK), 0.04),
         token_lora_mapping=token_mapping,
@@ -239,6 +243,11 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=7)
+    parser.add_argument(
+        "--split-w13-b",
+        action="store_true",
+        help="benchmark vLLM's independent gate/up W13 B allocations",
+    )
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -305,6 +314,7 @@ def main() -> None:
             "rank": RANK,
         },
         "adapter": None if args.adapter is None else str(args.adapter),
+        "split_w13_b": bool(args.split_w13_b),
         "measurements": [],
     }
 
@@ -331,11 +341,13 @@ def main() -> None:
                 tp_size=args.tp_size,
                 tp_rank=args.tp_rank,
                 token_mapping=token_mapping,
+                split_w13_b=args.split_w13_b,
             )
             if args.adapter is not None
             else _synthetic_adapter(
                 intermediate_size=intermediate_size,
                 token_mapping=token_mapping,
+                split_w13_b=args.split_w13_b,
             )
         )
 

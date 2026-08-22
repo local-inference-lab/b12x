@@ -777,11 +777,21 @@ def moe_reference_w4a16_f32(
                 up_out = (up_dequant @ x_f32) * alpha_fc1
                 if lora_active:
                     hidden_rank = static_lora.w13_a[eid].float() @ x_f32
-                    w13_delta = (
-                        static_lora.w13_b[eid].float() @ hidden_rank
-                    ) * float(static_lora.w13_scale)
-                    gate_out = gate_out + w13_delta[:I_tp]
-                    up_out = up_out + w13_delta[I_tp:]
+                    if static_lora.w13_b_up is None:
+                        w13_delta = (
+                            static_lora.w13_b[eid].float() @ hidden_rank
+                        ) * float(static_lora.w13_scale)
+                        gate_delta = w13_delta[:I_tp]
+                        up_delta = w13_delta[I_tp:]
+                    else:
+                        gate_delta = (
+                            static_lora.w13_b[eid].float() @ hidden_rank
+                        ) * float(static_lora.w13_scale)
+                        up_delta = (
+                            static_lora.w13_b_up[eid].float() @ hidden_rank
+                        ) * float(static_lora.w13_scale)
+                    gate_out = gate_out + gate_delta
+                    up_out = up_out + up_delta
                 intermediate = _apply_gated_activation(
                     gate_out,
                     up_out,
