@@ -109,6 +109,13 @@ from b12x.moe._shared.kernels.w4a16.host import (
     select_route_block_size_m,
     validate_activation,
 )
+from b12x.moe._shared.kernels.w4a16.lora import (
+    W4A16StaticExpertLoRA,
+    validate_w4a16_static_expert_lora,
+)
+from b12x.moe._shared.kernels.w4a16.lora_kernel import (
+    run_w4a16_static_lora_projection,
+)
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
 )
@@ -583,6 +590,7 @@ class W4A16GemmCompileResult:
     trellis_codebook: str = SQG_E4M3
     trellis_pair_kind: str | None = None
     trellis_rate_axis: str | None = None
+    source_n_rotation: int = 0
 
 
 @dataclass(frozen=True)
@@ -8681,6 +8689,7 @@ def compile_w4a16_gemm(
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
+    source_n_rotation: int = 0,
 ) -> W4A16GemmCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -8707,6 +8716,7 @@ def compile_w4a16_gemm(
         trellis_codebook=trellis_codebook,
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
+        source_n_rotation=int(source_n_rotation),
         dense_route_fast_path=bool(dense_route_fast_path),
         schedule_whole_tiles=weight_layout == "trellis_t256",
     )
@@ -8714,6 +8724,7 @@ def compile_w4a16_gemm(
         "w4a16_gemm",
         device,
         kernel.__cache_key__,
+        "modelopt_u8_abi_v1" if weight_layout == "modelopt" else "i32_abi_v1",
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -8727,17 +8738,29 @@ def compile_w4a16_gemm(
     compile_route_blocks = 1
     compile_route_slots = compile_route_blocks * int(moe_block_size)
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    if weight_layout == "trellis_t256":
+    if weight_layout == "modelopt":
+        b_fake_elements = num_experts * size_n * (size_k // 2)
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (b_fake_elements,),
+            assumed_align=16,
+        )
+    elif weight_layout == "trellis_t256":
         b_fake_elements = (
             num_experts * (size_k // 16) * (size_n // 16) * (8 * int(trellis_bits))
         )
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (b_fake_elements,),
+            assumed_align=16,
+        )
     else:
         b_fake_elements = num_experts * (size_k // 16) * (size_n // 16 * 32)
-    b_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b_fake_elements,),
-        assumed_align=16,
-    )
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (b_fake_elements,),
+            assumed_align=16,
+        )
     c_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -8839,6 +8862,7 @@ def compile_w4a16_gemm(
         trellis_codebook=str(trellis_codebook).lower(),
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
+        source_n_rotation=int(source_n_rotation),
     )
     _CACHE[cache_key] = result
     return result
@@ -10991,6 +11015,7 @@ def _compile_w4a16_gemm_launch(
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
+    source_n_rotation: int = 0,
     route_slots: int | None = None,
     force_tile_config: tuple[int, int] | None = None,
 ) -> _W4A16GemmLaunch:
@@ -11048,6 +11073,7 @@ def _compile_w4a16_gemm_launch(
         trellis_codebook=trellis_codebook,
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
+        source_n_rotation=int(source_n_rotation),
         dense_route_fast_path=bool(dense_route_fast_path),
     )
     if route_slots is None:
@@ -11536,6 +11562,277 @@ def _w4a16_stream_is_capturing(
     return int(status) != 0
 
 
+def _launch_w4a16_standalone_gemm(
+    *,
+    launch: _W4A16GemmLaunch,
+    a: torch.Tensor,
+    b_arg: torch.Tensor,
+    destination: torch.Tensor,
+    scales_i32: torch.Tensor,
+    global_scale: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    topk_weights_flat: torch.Tensor,
+    workspace: torch.Tensor,
+    active_m: int,
+    size_n: int,
+    max_m_blocks: int,
+    element_dtype: str,
+    sms: int,
+    stream: cuda.CUstream,
+) -> None:
+    """Launch one precompiled staged W4A16 GEMM without host allocations."""
+
+    cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    n_tiles = _covering_count(int(size_n), int(launch.kernel.tile_n))
+    grid_x = min(
+        int(sms) * int(launch.kernel.blocks_per_sm),
+        max(int(max_m_blocks) * n_tiles, 1),
+    )
+    dummy_lut = workspace[:1]
+    launch.kernel.compiled(
+        make_ptr(
+            cutlass_dtype,
+            a.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass_dtype,
+            a.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        b_arg,
+        make_ptr(
+            cutlass_dtype,
+            destination.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        scales_i32,
+        global_scale,
+        packed_route_indices,
+        block_expert_ids,
+        packed_route_count,
+        topk_weights_flat,
+        launch.c_tmp,
+        workspace,
+        dummy_lut,
+        int(active_m),
+        grid_x,
+        stream,
+    )
+
+
+def _run_w4a16_static_lora_staged(
+    *,
+    a_input: torch.Tensor,
+    prepared,
+    adapter: W4A16StaticExpertLoRA,
+    lora_rank_scratch: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    fast_math: bool,
+    swiglu_limit: float | None,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    intermediate_cache13: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    output: torch.Tensor,
+    fc1_c_tmp: torch.Tensor | None,
+    fc2_c_tmp: torch.Tensor | None,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    packed_route_count: torch.Tensor,
+    block_size_m: int,
+    required_m_blocks: int,
+    route_slots_for_scratch: int,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    element_dtype: str,
+    sms: int,
+    max_shared_mem: int,
+    stream: cuda.CUstream,
+) -> torch.Tensor:
+    """Correctness-first staged W4A16 + static routed-expert LoRA path."""
+
+    m, hidden_size = (int(v) for v in a_input.shape)
+    topk = int(topk_ids.shape[1])
+    routed_rows = m * topk
+    intermediate_size = int(prepared.intermediate_size)
+    fc1_cols = 2 * intermediate_size
+    num_experts = int(prepared.num_experts)
+
+    cache13 = intermediate_cache13.view(-1)
+    cache2 = intermediate_cache2.view(-1)
+    fc1_out = cache13[: routed_rows * fc1_cols].view(routed_rows, fc1_cols)
+    activated = cache2[: routed_rows * intermediate_size].view(
+        routed_rows, intermediate_size
+    )
+    fc2_out = cache13[: routed_rows * hidden_size].view(routed_rows, hidden_size)
+    rank_scratch = lora_rank_scratch.view(-1)[: routed_rows * 4].view(routed_rows, 4)
+    route_ids = topk_ids.view(-1)
+    route_weights = topk_weights.view(-1)
+
+    if weight_layout == "modelopt":
+        # Native ModelOpt staging indexes byte offsets directly.
+        w13_arg = prepared.w13.view(torch.uint8).view(-1)
+        w2_arg = prepared.w2.view(torch.uint8).view(-1)
+    else:
+        w13_arg = prepared.w13.view(torch.int32).view(-1)
+        w2_arg = prepared.w2.view(torch.int32).view(-1)
+    w13_scale = prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1)
+    w2_scale = prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1)
+
+    fc1_launch = _compile_w4a16_gemm_launch(
+        size_m=m,
+        size_n=fc1_cols,
+        size_k=hidden_size,
+        num_experts=num_experts,
+        top_k=topk,
+        mul_topk_weights=False,
+        moe_block_size=block_size_m,
+        max_m_blocks=required_m_blocks,
+        element_dtype=element_dtype,
+        packed_route_indices=packed_route_indices,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        device=a_input.device,
+        c_tmp=fc1_c_tmp,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        source_n_rotation=(
+            intermediate_size
+            if weight_layout == "modelopt" and w13_layout == "w13"
+            else 0
+        ),
+        route_slots=route_slots_for_scratch,
+    )
+    _launch_w4a16_standalone_gemm(
+        launch=fc1_launch,
+        a=a_input,
+        b_arg=w13_arg,
+        destination=fc1_out,
+        scales_i32=w13_scale,
+        global_scale=prepared.w13_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        topk_weights_flat=route_weights,
+        workspace=prepared.workspace,
+        active_m=m,
+        size_n=fc1_cols,
+        max_m_blocks=required_m_blocks,
+        element_dtype=element_dtype,
+        sms=sms,
+        stream=stream,
+    )
+    run_w4a16_static_lora_projection(
+        a_input,
+        adapter.w13_a,
+        adapter.w13_b,
+        route_ids,
+        fc1_out,
+        rank_scratch,
+        scale=adapter.w13_scale,
+        input_row_divisor=topk,
+    )
+
+    activation_launch = compile_w4a16_activation(
+        rows=routed_rows,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
+    activation_launch.compiled(
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            fc1_out.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            _cutlass_element_dtype(element_dtype),
+            activated.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        int(routed_rows),
+        stream,
+    )
+
+    fc2_launch = _compile_w4a16_gemm_launch(
+        size_m=routed_rows,
+        size_n=hidden_size,
+        size_k=intermediate_size,
+        num_experts=num_experts,
+        top_k=1,
+        mul_topk_weights=True,
+        moe_block_size=block_size_m,
+        max_m_blocks=required_m_blocks,
+        element_dtype=element_dtype,
+        packed_route_indices=packed_route_indices,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        device=a_input.device,
+        c_tmp=fc2_c_tmp,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        # The generic GEMM constructor validates the prepared layout even for
+        # FC2, where no gate/up row rotation is used.
+        w13_layout=w13_layout if weight_layout == "modelopt" else "packed",
+        route_slots=route_slots_for_scratch,
+    )
+    _launch_w4a16_standalone_gemm(
+        launch=fc2_launch,
+        a=activated,
+        b_arg=w2_arg,
+        destination=fc2_out,
+        scales_i32=w2_scale,
+        global_scale=prepared.w2_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        topk_weights_flat=route_weights,
+        workspace=prepared.workspace,
+        active_m=routed_rows,
+        size_n=hidden_size,
+        max_m_blocks=required_m_blocks,
+        element_dtype=element_dtype,
+        sms=sms,
+        stream=stream,
+    )
+    run_w4a16_static_lora_projection(
+        activated,
+        adapter.w2_a,
+        adapter.w2_b,
+        route_ids,
+        fc2_out,
+        rank_scratch,
+        scale=adapter.w2_scale,
+        route_weights=route_weights,
+    )
+    _w4a16_topk_sum_launch_flat(
+        fc2_out,
+        output,
+        m,
+        topk,
+        hidden_size,
+        element_dtype,
+        int(stream),
+    )
+    return output
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -11573,6 +11870,8 @@ def run_w4a16_moe(
     svh_table: torch.Tensor | None = None,
     rotation_a_gate: torch.Tensor | None = None,
     rotation_a_up: torch.Tensor | None = None,
+    static_lora: W4A16StaticExpertLoRA | None = None,
+    lora_rank_scratch: torch.Tensor | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -11780,6 +12079,58 @@ def run_w4a16_moe(
         raise ValueError(
             "output_expert_map cannot be shorter than the local expert count"
         )
+    if static_lora is not None:
+        if not is_gated:
+            raise NotImplementedError(
+                "W4A16 static expert LoRA currently requires a gated activation"
+            )
+        validate_w4a16_static_expert_lora(
+            static_lora,
+            num_experts=int(prepared.num_experts),
+            hidden_size=hidden_size,
+            intermediate_size=int(prepared.intermediate_size),
+            device=a_input.device,
+        )
+        if a_input.dtype != torch.bfloat16:
+            raise TypeError("W4A16 static expert LoRA requires BF16 activations")
+        if topk_ids.dtype != torch.int32 or not topk_ids.is_cuda:
+            raise TypeError(
+                "W4A16 static expert LoRA requires CUDA int32 topk_ids"
+            )
+        if lora_rank_scratch is None:
+            raise ValueError(
+                "W4A16 static expert LoRA requires caller-owned lora_rank_scratch"
+            )
+        if (
+            lora_rank_scratch.dtype != torch.bfloat16
+            or lora_rank_scratch.device != a_input.device
+            or not lora_rank_scratch.is_contiguous()
+            or int(lora_rank_scratch.numel()) < int(m) * topk * 4
+        ):
+            raise ValueError(
+                "lora_rank_scratch must be contiguous BF16 on the input device "
+                f"with at least {int(m) * topk * 4} elements"
+            )
+        unsupported = {
+            "fused_launch": fused_launch is not None,
+            "activation_amax": activation_amax is not None,
+            "expert_map": expert_map is not None,
+            "output_expert_map": output_expert_map is not None,
+            "apply_router_weight_on_input": bool(apply_router_weight_on_input),
+            "intermediate_rotation_scales": intermediate_rotation_scales is not None,
+            "a_input_up": a_input_up is not None,
+            "full_rotation": bool(full_rotation),
+            "x4t_scale_predecode": bool(use_x4t_scale_predecode),
+            "trellis_t256": weight_layout == "trellis_t256",
+        }
+        enabled = [name for name, value in unsupported.items() if value]
+        if enabled:
+            raise NotImplementedError(
+                "staged W4A16 static expert LoRA does not yet support: "
+                + ", ".join(enabled)
+            )
+    elif lora_rank_scratch is not None:
+        raise ValueError("lora_rank_scratch requires static_lora")
     if full_rotation:
         if apply_router_weight_on_input:
             raise ValueError(
@@ -11882,22 +12233,26 @@ def run_w4a16_moe(
 
     current_stream = current_cuda_stream()
     stream = current_stream if stream is None else stream
-    if (not collect_activation_amax) and _small_m_direct_supported(
-        m=m,
-        hidden_size=hidden_size,
-        intermediate_size=int(prepared.intermediate_size),
-        num_experts=int(prepared.num_experts),
-        topk=topk,
-        activation=activation,
-        apply_router_weight_on_input=bool(apply_router_weight_on_input),
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        element_dtype=element_dtype,
-        weight_layout=weight_layout,
-        w13_layout=w13_layout,
-        scale_format=scale_format,
-        expert_map=expert_map,
+    if (
+        static_lora is None
+        and (not collect_activation_amax)
+        and _small_m_direct_supported(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=int(prepared.intermediate_size),
+            num_experts=int(prepared.num_experts),
+            topk=topk,
+            activation=activation,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            element_dtype=element_dtype,
+            weight_layout=weight_layout,
+            w13_layout=w13_layout,
+            scale_format=scale_format,
+            expert_map=expert_map,
+        )
     ):
         if topk_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("W4A16 small-M direct path requires int32/int64 topk_ids")
@@ -11980,7 +12335,8 @@ def run_w4a16_moe(
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
     use_tc_decode = bool(
-        (not collect_activation_amax)
+        static_lora is None
+        and (not collect_activation_amax)
         and (fused_launch is None or preplanned_tc_decode)
         and weight_layout == "packed"
         and is_gated
@@ -12001,7 +12357,8 @@ def run_w4a16_moe(
         mapped_direct and full_rotation and weight_layout == "trellis_t256"
     )
     direct_topk_eligible = (
-        (not collect_activation_amax)
+        static_lora is None
+        and (not collect_activation_amax)
         and (m <= direct_m_cap or use_tc_decode)
         and direct_layout_ok
     )
@@ -12159,6 +12516,47 @@ def run_w4a16_moe(
 
     if int(prepared.workspace.numel()) < sms * 4 + 2:
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
+    if static_lora is not None:
+        assert lora_rank_scratch is not None
+        assert packed_route_indices is not None
+        assert block_expert_ids is not None
+        assert packed_route_count is not None
+        if int(stream) != int(current_stream):
+            raise NotImplementedError(
+                "staged W4A16 static expert LoRA currently requires the current "
+                "Torch CUDA stream"
+            )
+        return _run_w4a16_static_lora_staged(
+            a_input=a_input,
+            prepared=prepared,
+            adapter=static_lora,
+            lora_rank_scratch=lora_rank_scratch,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            fast_math=bool(fast_math),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=float(swiglu_alpha),
+            swiglu_beta=float(swiglu_beta),
+            intermediate_cache13=intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=output,
+            fc1_c_tmp=fc1_c_tmp,
+            fc2_c_tmp=fc2_c_tmp,
+            packed_route_indices=packed_route_indices,
+            block_expert_ids=block_expert_ids,
+            packed_route_count=packed_route_count,
+            block_size_m=block_size_m,
+            required_m_blocks=required_m_blocks,
+            route_slots_for_scratch=route_slots_for_scratch,
+            weight_layout=weight_layout,
+            scale_format=scale_format,
+            w13_layout=w13_layout,
+            element_dtype=element_dtype,
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+            stream=stream,
+        )
     if fused_launch is None:
         fused = compile_w4a16_fused_moe(
             size_m=m,

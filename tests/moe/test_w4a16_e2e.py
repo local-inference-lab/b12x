@@ -27,6 +27,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
     route_pack_capacity,
     select_route_block_size_m,
 )
+from b12x.moe._shared.kernels.w4a16.lora import W4A16StaticExpertLoRA
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     _W4A16_SMALL_M_DIRECT_MAX_M,
@@ -594,6 +595,128 @@ def _assert_matches_oracle(
     metrics = compare_to_reference(actual, expected)
     min_cos = 0.9975 if activation == "silu" else 0.9900
     assert metrics.cos >= min_cos, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("native_modelopt", [False, True])
+def test_w4a16_static_lora_staged_matches_oracle_and_graph(
+    native_modelopt: bool,
+) -> None:
+    torch.manual_seed(20260821 + int(native_modelopt))
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    m, topk, activation = 17, 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.2).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    adapter = W4A16StaticExpertLoRA(
+        w13_a=(
+            torch.randn(experts, 4, hidden_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w13_b=(
+            torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w2_a=(
+            torch.randn(experts, 4, intermediate_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w2_b=(
+            torch.randn(experts, hidden_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w13_scale=0.75,
+        w2_scale=0.5,
+    )
+    if native_modelopt:
+        prepared = prepare_w4a16_modelopt_native_weights(
+            *weights,
+            activation=activation,
+            params_dtype=x.dtype,
+            source_format="modelopt_nvfp4",
+            w13_layout="up_gate",
+        )
+        assert prepared.weight_layout == "modelopt"
+    else:
+        prepared = prepare_w4a16_weights(
+            *weights,
+            activation=activation,
+            params_dtype=x.dtype,
+        )
+        assert prepared.weight_layout == "packed"
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    rank_scratch = torch.empty(m * topk, 4, dtype=torch.bfloat16, device="cuda")
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            static_lora=adapter,
+            lora_rank_scratch=rank_scratch,
+        )
+
+    expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        static_lora=adapter,
+    )
+    eager = run().clone()
+    torch.cuda.synchronize()
+    metrics = compare_to_reference(eager, expected)
+    assert bool(torch.isfinite(eager).all().item())
+    assert metrics.cos > 0.9975, (
+        metrics,
+        float(eager.abs().max().item()),
+        float(expected.abs().max().item()),
+        float(eager.float().norm().item()),
+        float(expected.float().norm().item()),
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    buffers.intermediate_cache13.fill_(float("nan"))
+    buffers.intermediate_cache2.fill_(float("nan"))
+    buffers.output.fill_(float("nan"))
+    graph.replay()
+    graph_output = buffers.output.clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("scale_format", ["e4m3_k16", "e8m0_k32"])
