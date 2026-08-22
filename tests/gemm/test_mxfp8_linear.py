@@ -13,7 +13,9 @@ import torch
 
 from b12x.gemm import block_fp8_linear as bfl
 from b12x.gemm import mxfp8_linear
+from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
 from b12x.gemm._shared.wo_mxfp8 import (
+    MXFP8Rows,
     dequantize_mxfp8_rows_torch,
 )
 
@@ -207,7 +209,7 @@ def test_incremental_quantized_input_matches_one_shot_linear() -> None:
         device=source.device,
         dtype=torch.bfloat16,
     )
-    actual = mxfp8_linear.mm_quantized(
+    actual = mxfp8_linear.mm_quantized_into(
         quantized,
         packed,
         tokens=tokens,
@@ -218,6 +220,57 @@ def test_incremental_quantized_input_matches_one_shot_linear() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", ((256, 63), (256, 65), (256,), (128, 64)))
+def test_incremental_quantized_input_rejects_invalid_output_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+) -> None:
+    """Malformed caller-owned output storage must not launch the GEMM."""
+    quantized = MXFP8Rows(
+        values=torch.empty((512, 256), dtype=torch.float8_e4m3fn),
+        scale_rows=torch.empty((1, 512, 8), dtype=torch.float8_e8m0fnu),
+        scale_mma=torch.empty(0),
+    )
+    weight_rows = MXFP8Rows(
+        values=torch.empty((64, 256), dtype=torch.float8_e4m3fn),
+        scale_rows=torch.empty((1, 64, 8), dtype=torch.float8_e8m0fnu),
+        scale_mma=torch.empty(0),
+    )
+    packed = mxfp8_kernel.MXFP8LinearWeight(
+        weight=weight_rows,
+        in_features=256,
+        padded_in_features=256,
+        out_features=64,
+    )
+    output = torch.empty(shape, dtype=torch.bfloat16)
+
+    def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("invalid output storage reached the native GEMM dispatch")
+
+    monkeypatch.setattr(mxfp8_kernel, "_check_gpu_tensor", lambda *args: None)
+    monkeypatch.setattr(
+        torch.ops.b12x,
+        "mxfp8_linear_quantized",
+        unexpected_dispatch,
+    )
+    monkeypatch.setattr(
+        torch.ops.b12x,
+        "mxfp8_linear_quantized_out",
+        unexpected_dispatch,
+    )
+    for operation in (
+        mxfp8_kernel.mxfp8_linear_quantized,
+        mxfp8_kernel.mxfp8_linear_quantized_into,
+    ):
+        with pytest.raises(ValueError, match="out must have shape"):
+            operation(
+                quantized,
+                packed,
+                tokens=257,
+                out=output,
+            )
 
 
 def test_incremental_quantized_input_replays_in_cuda_graph() -> None:
@@ -242,7 +295,7 @@ def test_incremental_quantized_input_replays_in_cuda_graph() -> None:
         mxfp8_linear.quantize_input_slice(
             source[:, 128:].contiguous(), quantized, destination_column=128
         )
-        return mxfp8_linear.mm_quantized(quantized, packed, out=output)
+        return mxfp8_linear.mm_quantized_into(quantized, packed, out=output)
 
     run()
     torch.cuda.synchronize()

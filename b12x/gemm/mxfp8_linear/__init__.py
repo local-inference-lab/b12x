@@ -28,6 +28,7 @@ META = OpMeta(
         "is_supported",
         "mm",
         "mm_quantized",
+        "mm_quantized_into",
         "pack_weight",
         "quantize_input_slice",
     ),
@@ -50,6 +51,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         is_supported,
         mm,
         mm_quantized,
+        mm_quantized_into,
         pack_weight,
         quantize_input_slice,
     )

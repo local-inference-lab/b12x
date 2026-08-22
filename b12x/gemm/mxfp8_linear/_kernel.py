@@ -390,19 +390,84 @@ def _mxfp8_linear_quantized_fake(
     )
 
 
-def mxfp8_linear_quantized(
+@torch.library.custom_op(
+    "b12x::mxfp8_linear_quantized_out",
+    mutates_args=("out",),
+)
+def _mxfp8_linear_quantized_out_op(
+    input_values: torch.Tensor,
+    input_scale_mma: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+    stream_int: int | None,
+) -> None:
+    """Run the retained-input GEMM directly into caller-owned storage."""
+    m_tiles = (tokens + 127) // 128
+    output_live = out[:tokens]
+    dense_gemm(
+        (
+            input_values[:tokens].reshape(tokens, in_features, 1),
+            input_scale_mma[:, :, :m_tiles],
+        ),
+        (
+            weight_values.reshape(out_features, in_features, 1),
+            weight_scale_mma,
+        ),
+        out=output_live.reshape(tokens, out_features, 1),
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype=_c_dtype_name(out.dtype),
+        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
+        expected_m=expected_m,
+        stream=stream_int,
+    )
+    if bias is not None:
+        output_live.add_(bias)
+
+
+@_mxfp8_linear_quantized_out_op.register_fake
+def _mxfp8_linear_quantized_out_fake(
+    input_values: torch.Tensor,
+    input_scale_mma: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+    stream_int: int | None,
+) -> None:
+    del (
+        input_values,
+        input_scale_mma,
+        weight_values,
+        weight_scale_mma,
+        out,
+        bias,
+        tokens,
+        in_features,
+        out_features,
+        expected_m,
+        stream_int,
+    )
+
+
+def _validate_quantized_linear(
     source: MXFP8Rows,
     packed_weight: MXFP8LinearWeight,
     *,
     tokens: int | None = None,
     out: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
-    expected_m: int | None = None,
-    stream: object = None,
-) -> torch.Tensor:
-    """Run a packed linear from a caller-owned, already-quantized input."""
-
+) -> tuple[int, int, int, torch.dtype]:
     if not isinstance(source, MXFP8Rows):
         raise TypeError("source must be MXFP8Rows")
     if not isinstance(packed_weight, MXFP8LinearWeight):
@@ -423,9 +488,39 @@ def mxfp8_linear_quantized(
         )
     if out is not None:
         _check_gpu_tensor("out", out)
+        out_features = int(packed_weight.out_features)
+        if out.ndim != 2 or out.shape[0] < live_tokens or out.shape[1] != out_features:
+            raise ValueError(
+                "out must have shape [capacity,N] with sufficient row capacity, "
+                f"got {tuple(out.shape)}, required rows={live_tokens}, "
+                f"N={out_features}"
+            )
         output_dtype = out.dtype
-    output_dtype_name = _c_dtype_name(output_dtype)
+    _c_dtype_name(output_dtype)
     out_features = int(packed_weight.out_features)
+    return live_tokens, in_features, out_features, output_dtype
+
+
+def mxfp8_linear_quantized(
+    source: MXFP8Rows,
+    packed_weight: MXFP8LinearWeight,
+    *,
+    tokens: int | None = None,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+    expected_m: int | None = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Run a compile-safe packed linear from an already-quantized input."""
+
+    live_tokens, in_features, out_features, output_dtype = _validate_quantized_linear(
+        source,
+        packed_weight,
+        tokens=tokens,
+        out=out,
+        output_dtype=output_dtype,
+    )
     result = torch.ops.b12x.mxfp8_linear_quantized(
         source.values,
         source.scale_mma,
@@ -435,21 +530,55 @@ def mxfp8_linear_quantized(
         in_features,
         out_features,
         int(expected_m) if expected_m is not None else live_tokens,
-        output_dtype_name,
+        _c_dtype_name(output_dtype),
         cuda_stream_to_int(stream),
     )
     if bias is not None:
         result = result + bias
     if out is None:
         return result
-    if out.ndim != 2 or out.shape[0] < live_tokens or out.shape[1] != out_features:
-        raise ValueError(
-            "out must have shape [capacity,N] with sufficient row capacity, "
-            f"got {tuple(out.shape)}, required rows={live_tokens}, N={out_features}"
-        )
     output_live = out[:live_tokens]
     output_live.copy_(result)
     return output_live
+
+
+def mxfp8_linear_quantized_into(
+    source: MXFP8Rows,
+    packed_weight: MXFP8LinearWeight,
+    *,
+    out: torch.Tensor,
+    tokens: int | None = None,
+    bias: torch.Tensor | None = None,
+    expected_m: int | None = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Run a packed linear directly into caller-owned eager output storage.
+
+    The mutating operation avoids an intermediate dense output. Use
+    :func:`mxfp8_linear_quantized` inside ``torch.compile`` because PyTorch
+    cannot currently functionalize a closed-over caller-owned output reliably.
+    """
+
+    live_tokens, in_features, out_features, _ = _validate_quantized_linear(
+        source,
+        packed_weight,
+        tokens=tokens,
+        out=out,
+    )
+    torch.ops.b12x.mxfp8_linear_quantized_out(
+        source.values,
+        source.scale_mma,
+        packed_weight.weight.values,
+        packed_weight.weight.scale_mma,
+        out,
+        bias,
+        live_tokens,
+        in_features,
+        out_features,
+        int(expected_m) if expected_m is not None else live_tokens,
+        cuda_stream_to_int(stream),
+    )
+    return out[:live_tokens]
 
 
 __all__ = [
@@ -458,6 +587,7 @@ __all__ = [
     "is_mxfp8_linear_supported",
     "mxfp8_linear",
     "mxfp8_linear_quantized",
+    "mxfp8_linear_quantized_into",
     "pack_mxfp8_linear_weight",
     "quantize_mxfp8_linear_input_slice",
 ]

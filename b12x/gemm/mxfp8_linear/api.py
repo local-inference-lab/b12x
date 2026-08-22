@@ -19,6 +19,9 @@ from ._kernel import (
     mxfp8_linear_quantized as mm_quantized,
 )
 from ._kernel import (
+    mxfp8_linear_quantized_into as mm_quantized_into,
+)
+from ._kernel import (
     pack_mxfp8_linear_weight as pack_weight,
 )
 from ._kernel import (
@@ -41,6 +44,7 @@ __all__ = [
     "is_supported",
     "mm",
     "mm_quantized",
+    "mm_quantized_into",
     "pack_weight",
     "quantize_input_slice",
 ]
