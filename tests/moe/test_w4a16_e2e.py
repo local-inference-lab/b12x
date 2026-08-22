@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -841,6 +843,25 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph(
     assert binding.lora_rank_scratch is not None
     assert binding.lora_rank_scratch.numel() >= m * topk * 4
     assert binding.fused_launch is None
+
+    # Validation precedes the prewarm-cache lookup. A malformed adapter must
+    # fail at bind even after the valid specialization has populated the cache.
+    short_mapping_adapter = replace(
+        adapter,
+        token_lora_mapping=token_lora_mapping[: m - 1],
+    )
+    with pytest.raises(ValueError, match="must contain at least"):
+        fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=True,
+            static_lora=short_mapping_adapter,
+        )
 
     expected = moe_reference_w4a16_f32(
         x,
