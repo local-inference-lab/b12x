@@ -185,3 +185,103 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+
+def test_incremental_quantized_input_matches_one_shot_linear() -> None:
+    """Aligned feature slices preserve one-shot MXFP8 quantization and GEMM."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260823)
+
+    tokens = 257
+    source, _, packed = _make_inputs(tokens, 256, 64)
+    quantized = mxfp8_linear.empty_input(512, 256, device=source.device)
+    mxfp8_linear.quantize_input_slice(
+        source[:, :128].contiguous(), quantized, destination_column=0
+    )
+    mxfp8_linear.quantize_input_slice(
+        source[:, 128:].contiguous(), quantized, destination_column=128
+    )
+    output_storage = torch.empty(
+        (512, packed.out_features),
+        device=source.device,
+        dtype=torch.bfloat16,
+    )
+    actual = mxfp8_linear.mm_quantized(
+        quantized,
+        packed,
+        tokens=tokens,
+        out=output_storage,
+        expected_m=tokens,
+    ).clone()
+    expected = mxfp8_linear.mm(source, packed, expected_m=tokens)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_incremental_quantized_input_replays_in_cuda_graph() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260824)
+
+    tokens = 8
+    source, _, packed = _make_inputs(tokens, 256, 64)
+    replacement = torch.randn_like(source).div_(4)
+    quantized = mxfp8_linear.empty_input(tokens, 256, device=source.device)
+    output = torch.empty(
+        (tokens, packed.out_features),
+        device=source.device,
+        dtype=torch.bfloat16,
+    )
+
+    def run() -> torch.Tensor:
+        mxfp8_linear.quantize_input_slice(
+            source[:, :128].contiguous(), quantized, destination_column=0
+        )
+        mxfp8_linear.quantize_input_slice(
+            source[:, 128:].contiguous(), quantized, destination_column=128
+        )
+        return mxfp8_linear.mm_quantized(quantized, packed, out=output)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    source.copy_(replacement)
+    expected = mxfp8_linear.mm(source, packed)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_incremental_quantized_input_runs_under_torch_compile() -> None:
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260825)
+
+    tokens = 8
+    source, _, packed = _make_inputs(tokens, 256, 64)
+    quantized = mxfp8_linear.empty_input(tokens, 256, device=source.device)
+    output = torch.empty(
+        (tokens, packed.out_features),
+        device=source.device,
+        dtype=torch.bfloat16,
+    )
+
+    @torch.compile(fullgraph=True)
+    def compiled(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        mxfp8_linear.quantize_input_slice(first, quantized, destination_column=0)
+        mxfp8_linear.quantize_input_slice(second, quantized, destination_column=128)
+        return mxfp8_linear.mm_quantized(quantized, packed, out=output)
+
+    actual = compiled(
+        source[:, :128].contiguous(),
+        source[:, 128:].contiguous(),
+    )
+    expected = mxfp8_linear.mm(source, packed)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

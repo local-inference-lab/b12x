@@ -22,7 +22,15 @@ META = OpMeta(
     name="mxfp8_linear",
     group="gemm",
     api_style="oneshot",
-    entry_points=("Weight", "mm", "pack_weight", "is_supported"),
+    entry_points=(
+        "Weight",
+        "empty_input",
+        "is_supported",
+        "mm",
+        "mm_quantized",
+        "pack_weight",
+        "quantize_input_slice",
+    ),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
     requires=("triton",),
@@ -36,6 +44,14 @@ META = OpMeta(
 )
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
-    from .api import Weight, is_supported, mm, pack_weight  # noqa: F401
+    from .api import (  # noqa: F401
+        Weight,
+        empty_input,
+        is_supported,
+        mm,
+        mm_quantized,
+        pack_weight,
+        quantize_input_slice,
+    )
 
 install_lazy_api(globals(), META)

@@ -14,6 +14,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
     _check_gpu_tensor,
+    empty_mxfp8_rows_for_dense_gemm,
     pack_mxfp8_scales_for_dense_gemm,
 )
 
@@ -259,9 +260,204 @@ def mxfp8_linear(
     return output.view(*source.shape[:-1], out_features)
 
 
+def empty_mxfp8_linear_input(
+    max_tokens: int,
+    in_features: int,
+    *,
+    device: torch.device | str,
+) -> MXFP8Rows:
+    """Allocate retained MXFP8 input storage for a dense linear."""
+
+    return empty_mxfp8_rows_for_dense_gemm(
+        int(max_tokens),
+        int(in_features),
+        num_groups=1,
+        device=device,
+    )
+
+
+def quantize_mxfp8_linear_input_slice(
+    source: torch.Tensor,
+    destination: MXFP8Rows,
+    *,
+    destination_column: int,
+) -> None:
+    """Quantize one aligned feature slice into retained MXFP8 input storage.
+
+    The temporary quantized slice is bounded by the source feature width. Its
+    values and both scale layouts are copied into the corresponding 128-column
+    interval of ``destination``. Standard tensor copies keep the operation
+    compatible with torch functionalization while allowing the BF16 source to
+    be released before the final matrix multiplication.
+    """
+
+    source_2d = _source_2d(source)
+    tokens, width = map(int, source_2d.shape)
+    if destination.values.ndim != 2:
+        raise ValueError(
+            "destination.values must have shape [capacity,K], got "
+            f"{tuple(destination.values.shape)}"
+        )
+    capacity, destination_width = map(int, destination.values.shape)
+    if capacity < tokens:
+        raise ValueError(
+            "destination has insufficient row capacity: "
+            f"capacity={capacity}, tokens={tokens}"
+        )
+    destination_column = int(destination_column)
+    if (
+        destination_column < 0
+        or destination_column % 128 != 0
+        or width % 128 != 0
+        or destination_column + width > destination_width
+    ):
+        raise ValueError(
+            "source width and destination column must describe a 128-column-"
+            f"aligned slice within K={destination_width}, got "
+            f"offset={destination_column}, width={width}"
+        )
+
+    quantized = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    destination.values[:tokens, destination_column : destination_column + width].copy_(
+        quantized.values
+    )
+    scale_column = destination_column // MXFP8_SCALE_VEC_SIZE
+    scale_width = width // MXFP8_SCALE_VEC_SIZE
+    destination.scale_rows[:, :tokens, scale_column : scale_column + scale_width].copy_(
+        quantized.scale_rows
+    )
+    m_tiles = (tokens + 127) // 128
+    tile_column = destination_column // 128
+    tile_width = width // 128
+    destination.scale_mma[
+        :, :, :m_tiles, :, tile_column : tile_column + tile_width, :
+    ].copy_(quantized.scale_mma)
+
+
+@torch.library.custom_op(
+    "b12x::mxfp8_linear_quantized",
+    mutates_args=(),
+)
+def _mxfp8_linear_quantized_op(
+    input_values: torch.Tensor,
+    input_scale_mma: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+    output_dtype: str,
+    stream_int: int | None,
+) -> torch.Tensor:
+    m_tiles = (tokens + 127) // 128
+    return dense_gemm(
+        (
+            input_values[:tokens].reshape(tokens, in_features, 1),
+            input_scale_mma[:, :, :m_tiles],
+        ),
+        (
+            weight_values.reshape(out_features, in_features, 1),
+            weight_scale_mma,
+        ),
+        ab_dtype="float8_e4m3fn",
+        sf_dtype="float8_e8m0fnu",
+        c_dtype=output_dtype,
+        sf_vec_size=MXFP8_SCALE_VEC_SIZE,
+        expected_m=expected_m,
+        stream=stream_int,
+    )[:, :, 0]
+
+
+@_mxfp8_linear_quantized_op.register_fake
+def _mxfp8_linear_quantized_fake(
+    input_values: torch.Tensor,
+    input_scale_mma: torch.Tensor,
+    weight_values: torch.Tensor,
+    weight_scale_mma: torch.Tensor,
+    tokens: int,
+    in_features: int,
+    out_features: int,
+    expected_m: int,
+    output_dtype: str,
+    stream_int: int | None,
+) -> torch.Tensor:
+    dtype = torch.bfloat16 if output_dtype == "bfloat16" else torch.float16
+    return torch.empty(
+        (tokens, out_features),
+        dtype=dtype,
+        device=input_values.device,
+    )
+
+
+def mxfp8_linear_quantized(
+    source: MXFP8Rows,
+    packed_weight: MXFP8LinearWeight,
+    *,
+    tokens: int | None = None,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+    expected_m: int | None = None,
+    stream: object = None,
+) -> torch.Tensor:
+    """Run a packed linear from a caller-owned, already-quantized input."""
+
+    if not isinstance(source, MXFP8Rows):
+        raise TypeError("source must be MXFP8Rows")
+    if not isinstance(packed_weight, MXFP8LinearWeight):
+        raise TypeError("packed_weight must be an MXFP8LinearWeight")
+    if source.values.ndim != 2:
+        raise ValueError(
+            "source.values must have shape [capacity,K], got "
+            f"{tuple(source.values.shape)}"
+        )
+    capacity, in_features = map(int, source.values.shape)
+    live_tokens = capacity if tokens is None else int(tokens)
+    if live_tokens <= 0 or live_tokens > capacity:
+        raise ValueError(f"tokens must be in [1,{capacity}], got {live_tokens}")
+    if in_features != int(packed_weight.padded_in_features):
+        raise ValueError(
+            "quantized input width does not match packed weight: "
+            f"input={in_features}, weight={packed_weight.padded_in_features}"
+        )
+    if out is not None:
+        _check_gpu_tensor("out", out)
+        output_dtype = out.dtype
+    output_dtype_name = _c_dtype_name(output_dtype)
+    out_features = int(packed_weight.out_features)
+    result = torch.ops.b12x.mxfp8_linear_quantized(
+        source.values,
+        source.scale_mma,
+        packed_weight.weight.values,
+        packed_weight.weight.scale_mma,
+        live_tokens,
+        in_features,
+        out_features,
+        int(expected_m) if expected_m is not None else live_tokens,
+        output_dtype_name,
+        cuda_stream_to_int(stream),
+    )
+    if bias is not None:
+        result = result + bias
+    if out is None:
+        return result
+    if out.ndim != 2 or out.shape[0] < live_tokens or out.shape[1] != out_features:
+        raise ValueError(
+            "out must have shape [capacity,N] with sufficient row capacity, "
+            f"got {tuple(out.shape)}, required rows={live_tokens}, N={out_features}"
+        )
+    output_live = out[:live_tokens]
+    output_live.copy_(result)
+    return output_live
+
+
 __all__ = [
     "MXFP8LinearWeight",
+    "empty_mxfp8_linear_input",
     "is_mxfp8_linear_supported",
     "mxfp8_linear",
+    "mxfp8_linear_quantized",
     "pack_mxfp8_linear_weight",
+    "quantize_mxfp8_linear_input_slice",
 ]
