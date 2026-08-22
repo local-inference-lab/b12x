@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -27,6 +29,7 @@ from b12x.moe._shared.kernels.w4a16.host import (
     route_pack_capacity,
     select_route_block_size_m,
 )
+from b12x.moe._shared.kernels.w4a16.lora import W4A16StaticExpertLoRA
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _DEFAULT_MAX_SHARED_MEM,
     _W4A16_SMALL_M_DIRECT_MAX_M,
@@ -594,6 +597,326 @@ def _assert_matches_oracle(
     metrics = compare_to_reference(actual, expected)
     min_cos = 0.9975 if activation == "silu" else 0.9900
     assert metrics.cos >= min_cos, metrics
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("native_modelopt", [False, True])
+@pytest.mark.parametrize("split_w13_b", [False, True])
+@pytest.mark.parametrize("m", [1, 17])
+@pytest.mark.parametrize("mapping_dtype", [torch.int32, torch.int64])
+def test_w4a16_static_lora_matches_oracle_and_graph(
+    native_modelopt: bool,
+    split_w13_b: bool,
+    m: int,
+    mapping_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(20260821 + int(native_modelopt))
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.2).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    packed_w13_b = (
+        torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
+    ).to(torch.bfloat16)
+    adapter = W4A16StaticExpertLoRA(
+        w13_a=(
+            torch.randn(experts, 4, hidden_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w13_b=(
+            packed_w13_b[:, :intermediate_size].contiguous()
+            if split_w13_b
+            else packed_w13_b
+        ),
+        w2_a=(
+            torch.randn(experts, 4, intermediate_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w2_b=(
+            torch.randn(experts, hidden_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w13_b_up=(
+            packed_w13_b[:, intermediate_size:].contiguous()
+            if split_w13_b
+            else None
+        ),
+        w13_scale=0.75,
+        w2_scale=0.5,
+        token_lora_mapping=torch.zeros(m, dtype=mapping_dtype, device="cuda"),
+        adapter_slot=0,
+    )
+    if native_modelopt:
+        prepared = prepare_w4a16_modelopt_native_weights(
+            *weights,
+            activation=activation,
+            params_dtype=x.dtype,
+            source_format="modelopt_nvfp4",
+            w13_layout="up_gate",
+        )
+        assert prepared.weight_layout == "modelopt"
+    else:
+        prepared = prepare_w4a16_weights(
+            *weights,
+            activation=activation,
+            params_dtype=x.dtype,
+        )
+        assert prepared.weight_layout == "packed"
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    rank_scratch = torch.empty(m * topk, 4, dtype=torch.bfloat16, device="cuda")
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            fast_math=True,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            static_lora=adapter,
+            lora_rank_scratch=rank_scratch,
+        )
+
+    expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        static_lora=adapter,
+    )
+    eager = run().clone()
+    torch.cuda.synchronize()
+    metrics = compare_to_reference(eager, expected)
+    assert bool(torch.isfinite(eager).all().item())
+    assert metrics.cos > 0.9975, (
+        metrics,
+        float(eager.abs().max().item()),
+        float(expected.abs().max().item()),
+        float(eager.float().norm().item()),
+        float(expected.float().norm().item()),
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    buffers.intermediate_cache13.fill_(float("nan"))
+    buffers.intermediate_cache2.fill_(float("nan"))
+    buffers.output.fill_(float("nan"))
+    graph.replay()
+    graph_output = buffers.output.clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("m", "mapping_dtype"),
+    [(1, torch.int64), (7, torch.int32)],
+)
+def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph(
+    m: int,
+    mapping_dtype: torch.dtype,
+) -> None:
+    """Exercise the public plan -> bind -> run serving boundary with LoRA."""
+
+    import b12x
+    from b12x.moe import fused_moe
+
+    torch.manual_seed(20260822)
+    experts, hidden_size, intermediate_size = 8, 128, 128
+    topk, activation = 2, "silu"
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+    x = (torch.randn(m, hidden_size, device="cuda") * 0.2).to(torch.bfloat16)
+    topk_ids = torch.randint(
+        0,
+        experts,
+        (m, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
+    token_lora_mapping = torch.tensor(
+        [0 if token % 2 == 0 else -1 for token in range(m)],
+        dtype=mapping_dtype,
+        device="cuda",
+    )
+    a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_tp_moe_fp4_experts(
+        a=x,
+        a1_gscale=a_gscale,
+        w1_fp4=weights[0],
+        w1_blockscale=weights[1],
+        w1_alphas=weights[2],
+        a2_gscale=a_gscale,
+        w2_fp4=weights[3],
+        w2_blockscale=weights[4],
+        w2_alphas=weights[5],
+        activation=activation,
+        quant_mode="w4a16",
+    )
+    adapter = fused_moe.StaticExpertLoRA(
+        w13_a=(
+            torch.randn(experts, 4, hidden_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w13_b=(
+            torch.randn(experts, 2 * intermediate_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w2_a=(
+            torch.randn(experts, 4, intermediate_size, device="cuda") * 0.025
+        ).to(torch.bfloat16),
+        w2_b=(
+            torch.randn(experts, hidden_size, 4, device="cuda") * 0.04
+        ).to(torch.bfloat16),
+        w13_scale=0.75,
+        w2_scale=0.5,
+        token_lora_mapping=token_lora_mapping,
+        adapter_slot=0,
+    )
+    plan = fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=m,
+            num_topk=topk,
+            route_num_experts=0,
+            device=x.device,
+            weight_plan=prepared.plan,
+            quant_mode="w4a16",
+            core_token_counts=(m,),
+            frozen=True,
+        )
+    )
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.empty(
+        scratch_spec.shape,
+        dtype=scratch_spec.dtype,
+        device=scratch_spec.device,
+    )
+    output = torch.empty_like(x)
+    binding = fused_moe.bind(
+        plan,
+        scratch=scratch,
+        a=x,
+        experts=prepared,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        input_scales_static=True,
+        static_lora=adapter,
+    )
+    assert binding.static_lora is adapter
+    assert binding.static_lora_prevalidated
+    assert binding.lora_rank_scratch is not None
+    assert binding.lora_rank_scratch.numel() >= m * topk * 4
+    assert binding.fused_launch is None
+
+    # Validation precedes the prewarm-cache lookup. A malformed adapter must
+    # fail at bind even after the valid specialization has populated the cache.
+    short_mapping_adapter = replace(
+        adapter,
+        token_lora_mapping=token_lora_mapping[: m - 1],
+    )
+    with pytest.raises(ValueError, match="must contain at least"):
+        fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=True,
+            static_lora=short_mapping_adapter,
+        )
+
+    expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        static_lora=adapter,
+    )
+    # Binding must resolve the complete replacement CuTe launch set. A first
+    # execution after the serving freeze may not discover or compile kernels.
+    b12x.freeze_kernel_resolution("static-LoRA binding prewarm regression")
+    try:
+        eager = fused_moe.run(binding=binding).clone()
+    finally:
+        b12x.unfreeze_kernel_resolution()
+    torch.cuda.synchronize()
+    metrics = compare_to_reference(eager, expected)
+    assert bool(torch.isfinite(eager).all().item())
+    assert metrics.cos > 0.9975, metrics
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_moe.run(binding=binding)
+    output.fill_(float("nan"))
+    graph.replay()
+    graph_output = output.clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager, rtol=0.0, atol=0.0)
+
+    # The graph reads vLLM-style adapter selection from live device metadata.
+    # Replaying it as a base-only batch must suppress every LoRA delta without
+    # recapturing or replacing the adapter object.
+    token_lora_mapping.fill_(-1)
+    output.fill_(float("nan"))
+    graph.replay()
+    base_graph_output = output.clone()
+    torch.cuda.synchronize()
+    base_expected = moe_reference_w4a16_f32(
+        x,
+        *weights[:3],
+        *weights[3:],
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+    )
+    base_metrics = compare_to_reference(base_graph_output, base_expected)
+    assert base_metrics.cos > 0.9975, base_metrics
 
 
 @pytest.mark.parametrize("scale_format", ["e4m3_k16", "e8m0_k32"])
