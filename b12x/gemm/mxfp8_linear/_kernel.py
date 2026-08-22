@@ -555,8 +555,9 @@ def mxfp8_linear_quantized_into(
     """Run a packed linear directly into caller-owned eager output storage.
 
     The mutating operation avoids an intermediate dense output. Use
-    :func:`mxfp8_linear_quantized` inside ``torch.compile`` because PyTorch
-    cannot currently functionalize a closed-over caller-owned output reliably.
+    :func:`mxfp8_linear_quantized` inside ``torch.compile``. The
+    :func:`mxfp8_linear_quantized_into` operation is supported in eager
+    execution and CUDA Graph replay, not under ``torch.compile``.
     """
 
     live_tokens, in_features, out_features, _ = _validate_quantized_linear(
