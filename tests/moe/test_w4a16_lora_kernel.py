@@ -338,6 +338,16 @@ def test_w4a16_static_lora_split_w13_matches_packed_oracle_and_graph() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
+
+    # First prove that the captured positive path remains numerically correct.
+    destination.copy_(base)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(rank_scratch, expected_rank, rtol=0.0, atol=0.0078125)
+    torch.testing.assert_close(destination, expected, rtol=0.0, atol=0.0078125)
+
+    # Then prove replay reads live mapping storage rather than retaining the
+    # capture-time adapter decision.
     token_mapping.fill_(-1)
     destination.copy_(base)
     graph.replay()

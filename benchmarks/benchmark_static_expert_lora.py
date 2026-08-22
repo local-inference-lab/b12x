@@ -84,6 +84,33 @@ def _gpu_snapshot() -> dict[str, object]:
     )
 
 
+def _selected_gpu_identity() -> dict[str, object]:
+    """Record the physical GPU UUID backing visible CUDA device zero."""
+
+    apps = _command_metadata(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    selected_rows: list[str] = []
+    stdout = apps.get("stdout")
+    if isinstance(stdout, str):
+        current_pid = str(os.getpid())
+        for row in stdout.splitlines():
+            fields = [field.strip() for field in row.split(",")]
+            if len(fields) >= 2 and fields[1] == current_pid:
+                selected_rows.append(row)
+    return {
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "visible_cuda_index": 0,
+        "current_pid": os.getpid(),
+        "physical_compute_process_rows": selected_rows,
+        "all_compute_processes": apps,
+    }
+
+
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -218,20 +245,38 @@ def _capture(run: Callable[[], torch.Tensor]) -> torch.cuda.CUDAGraph:
     return graph
 
 
-def _time_graph(
-    graph: torch.cuda.CUDAGraph, *, iterations: int, repeats: int
-) -> list[float]:
-    samples: list[float] = []
-    for _ in range(repeats):
-        start = torch.cuda.Event(enable_timing=True)
-        stop = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iterations):
-            graph.replay()
-        stop.record()
-        stop.synchronize()
-        samples.append(float(start.elapsed_time(stop)) * 1000.0 / iterations)
-    return samples
+def _time_graph_once(graph: torch.cuda.CUDAGraph, *, iterations: int) -> float:
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        graph.replay()
+    stop.record()
+    stop.synchronize()
+    return float(start.elapsed_time(stop)) * 1000.0 / iterations
+
+
+def _time_graphs_interleaved(
+    base_graph: torch.cuda.CUDAGraph,
+    lora_graph: torch.cuda.CUDAGraph,
+    *,
+    iterations: int,
+    repeats: int,
+) -> tuple[list[float], list[float]]:
+    """Alternate variant order so monotonic clock or thermal drift is balanced."""
+
+    base_samples: list[float] = []
+    lora_samples: list[float] = []
+    for repeat in range(repeats):
+        ordered = (
+            (("base", base_graph), ("lora", lora_graph))
+            if repeat % 2 == 0
+            else (("lora", lora_graph), ("base", base_graph))
+        )
+        for label, graph in ordered:
+            sample = _time_graph_once(graph, iterations=iterations)
+            (base_samples if label == "base" else lora_samples).append(sample)
+    return base_samples, lora_samples
 
 
 def main() -> None:
@@ -286,6 +331,7 @@ def main() -> None:
             ["git", "status", "--short", "--branch"], cwd=repo_root
         ),
         "gpu_before": _gpu_snapshot(),
+        "selected_gpu": _selected_gpu_identity(),
     }
 
     results: dict[str, object] = {
@@ -369,7 +415,15 @@ def main() -> None:
             m * TOPK, RANK, dtype=torch.bfloat16, device="cuda"
         )
 
-        def run(buffers, *, static_lora=None):
+        def run(
+            buffers,
+            *,
+            static_lora=None,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            rank_scratch=rank_scratch,
+        ):
             return run_w4a16_moe(
                 x,
                 prepared,
@@ -394,18 +448,26 @@ def main() -> None:
                 ),
             )
 
-        base_graph = _capture(lambda: run(base_buffers))
+        base_graph = _capture(lambda buffers=base_buffers: run(buffers))
         base_output = base_buffers.output.clone()
-        lora_graph = _capture(lambda: run(lora_buffers, static_lora=adapter))
+        lora_graph = _capture(
+            lambda buffers=lora_buffers, static_lora=adapter: run(
+                buffers,
+                static_lora=static_lora,
+            )
+        )
         lora_output = lora_buffers.output.clone()
         torch.cuda.synchronize()
 
-        base_us = _time_graph(
-            base_graph, iterations=args.iterations, repeats=args.repeats
+        allocated_before_replay = torch.cuda.memory_allocated()
+        base_us, lora_us = _time_graphs_interleaved(
+            base_graph,
+            lora_graph,
+            iterations=args.iterations,
+            repeats=args.repeats,
         )
-        lora_us = _time_graph(
-            lora_graph, iterations=args.iterations, repeats=args.repeats
-        )
+        torch.cuda.synchronize()
+        allocated_after_replay = torch.cuda.memory_allocated()
         if args.profile:
             from torch.profiler import ProfilerActivity, profile
 
@@ -426,9 +488,29 @@ def main() -> None:
         lora_median = statistics.median(lora_us)
         delta = (lora_output.float() - base_output.float()).norm()
         base_norm = base_output.float().norm().clamp_min(1e-30)
+        small_m_direct_baseline = _small_m_direct_supported(
+            m=m,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=intermediate_size,
+            num_experts=EXPERTS,
+            topk=TOPK,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            swiglu_limit=10.0,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            element_dtype="bf16",
+            weight_layout=prepared.weight_layout,
+            w13_layout=prepared.w13_layout,
+            scale_format=prepared.scale_format,
+        )
         measurement = {
             "tokens": m,
-            "lora_path": "direct_augmented" if m == 1 else "staged",
+            "lora_path": (
+                "direct_augmented"
+                if m == 1 and small_m_direct_baseline
+                else "staged"
+            ),
             "base_us": base_us,
             "lora_us": lora_us,
             "base_median_us": base_median,
@@ -439,21 +521,9 @@ def main() -> None:
             "base_finite": bool(torch.isfinite(base_output).all().item()),
             "lora_finite": bool(torch.isfinite(lora_output).all().item()),
             "lora_nonzero_delta": bool(delta.item() > 0.0),
-            "small_m_direct_baseline": _small_m_direct_supported(
-                m=m,
-                hidden_size=HIDDEN_SIZE,
-                intermediate_size=intermediate_size,
-                num_experts=EXPERTS,
-                topk=TOPK,
-                activation="silu",
-                apply_router_weight_on_input=False,
-                swiglu_limit=10.0,
-                swiglu_alpha=None,
-                swiglu_beta=None,
-                element_dtype="bf16",
-                weight_layout=prepared.weight_layout,
-                w13_layout=prepared.w13_layout,
-                scale_format=prepared.scale_format,
+            "small_m_direct_baseline": small_m_direct_baseline,
+            "replay_allocated_delta_bytes": (
+                allocated_after_replay - allocated_before_replay
             ),
         }
         results["measurements"].append(measurement)

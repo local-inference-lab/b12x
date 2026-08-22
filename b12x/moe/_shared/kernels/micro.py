@@ -5884,13 +5884,13 @@ class MoEMicroKernelBackend:
         m_val: Int32,
         grid_x: Int32,
         stream,
+        trellis_lut_ptr: cute.Pointer | None = None,
+        trellis_rot_ptr: cute.Pointer | None = None,
         lora_w13_b_ptr: cute.Pointer | None = None,
         lora_w13_b_up_ptr: cute.Pointer | None = None,
         lora_rank_ptr: cute.Pointer | None = None,
         token_lora_mapping_ptr: cute.Pointer | None = None,
         lora_activated_ptr: cute.Pointer | None = None,
-        trellis_lut_ptr: cute.Pointer | None = None,
-        trellis_rot_ptr: cute.Pointer | None = None,
     ):
         cfg = self._cfg
         a_input = cute.make_tensor(x_ptr, cute.make_layout(Int32(m_val * cfg.k_dim)))

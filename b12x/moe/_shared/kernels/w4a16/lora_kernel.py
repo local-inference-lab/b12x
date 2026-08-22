@@ -26,7 +26,6 @@ def _w4a16_static_lora_shrink_kernel(
     expert_ids,
     token_lora_mapping,
     rank_scratch,
-    NUM_ROUTES: tl.constexpr,
     WIDTH: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     INPUT_ROW_DIVISOR: tl.constexpr,
@@ -68,11 +67,7 @@ def _w4a16_static_lora_shrink_kernel(
         ).to(tl.float32)
         accumulator += tl.sum(x_values * a_values, axis=0)
 
-    tl.store(
-        rank_scratch + route * RANK + rank,
-        accumulator,
-        mask=route < NUM_ROUTES,
-    )
+    tl.store(rank_scratch + route * RANK + rank, accumulator)
 
 
 @triton.jit
@@ -83,7 +78,6 @@ def _w4a16_static_lora_expand_add_kernel(
     route_weights,
     destination,
     SCALE: tl.constexpr,
-    NUM_ROUTES: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     HAS_ROUTE_WEIGHTS: tl.constexpr,
@@ -132,7 +126,6 @@ def _w4a16_static_lora_expand_pair_add_kernel(
     expert_ids,
     destination,
     SCALE: tl.constexpr,
-    NUM_ROUTES: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     RANK: tl.constexpr,
@@ -361,7 +354,6 @@ def run_w4a16_static_lora_shrink(
         expert_ids,
         token_lora_mapping if token_lora_mapping is not None else expert_ids,
         rank_scratch,
-        NUM_ROUTES=num_routes,
         WIDTH=width,
         NUM_EXPERTS=num_experts,
         INPUT_ROW_DIVISOR=divisor,
@@ -618,7 +610,6 @@ def run_w4a16_static_lora_projection(
         expert_ids,
         token_lora_mapping if token_lora_mapping is not None else expert_ids,
         rank_scratch,
-        NUM_ROUTES=num_routes,
         WIDTH=width,
         NUM_EXPERTS=num_experts,
         INPUT_ROW_DIVISOR=divisor,
@@ -638,7 +629,6 @@ def run_w4a16_static_lora_projection(
         route_weights if route_weights is not None else destination,
         destination,
         SCALE=scale,
-        NUM_ROUTES=num_routes,
         OUTPUT_WIDTH=output_width,
         NUM_EXPERTS=num_experts,
         HAS_ROUTE_WEIGHTS=route_weights is not None,
@@ -729,7 +719,6 @@ def run_w4a16_static_lora_split_w13_projection(
         expert_ids,
         destination,
         SCALE=scale,
-        NUM_ROUTES=num_routes,
         OUTPUT_WIDTH=output_width,
         NUM_EXPERTS=num_experts,
         RANK=_RANK,

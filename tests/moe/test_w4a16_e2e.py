@@ -741,6 +741,7 @@ def test_w4a16_static_lora_matches_oracle_and_graph(
 def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> None:
     """Exercise the public plan -> bind -> run serving boundary with LoRA."""
 
+    import b12x
     from b12x.moe import fused_moe
 
     torch.manual_seed(20260822)
@@ -845,7 +846,13 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
         activation=activation,
         static_lora=adapter,
     )
-    eager = fused_moe.run(binding=binding).clone()
+    # Binding must resolve the complete replacement CuTe launch set. A first
+    # execution after the serving freeze may not discover or compile kernels.
+    b12x.freeze_kernel_resolution("static-LoRA binding prewarm regression")
+    try:
+        eager = fused_moe.run(binding=binding).clone()
+    finally:
+        b12x.unfreeze_kernel_resolution()
     torch.cuda.synchronize()
     metrics = compare_to_reference(eager, expected)
     assert bool(torch.isfinite(eager).all().item())

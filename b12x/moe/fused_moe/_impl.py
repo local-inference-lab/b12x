@@ -292,6 +292,7 @@ class TPW4A16Workspace:
     # TC-decode fused-sum launches, keyed by exact token count (only the small-M
     # decode sizes in TC-decode's supported set, packed layout only).
     planned_tc_decode_launches: dict[int, object] = field(default_factory=dict)
+    planned_static_lora_launches: dict[object, str] = field(default_factory=dict)
     route_workspace: "_TPRouteWorkspace | None" = None
     volatile_launch_state: bool = False
 
@@ -875,6 +876,9 @@ class TPMoEScratchPlan:
     _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
         default=(), repr=False
     )
+    _prewarmed_static_lora_launches: dict[object, str] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @property
     def full_rotation(self) -> bool:
@@ -944,6 +948,24 @@ class TPMoEScratchPlan:
         )
         if fast_math is None and self.caps.quant_mode == "w4a16":
             fast_math = self.caps.w4a16_fast_math
+        if static_lora is not None:
+            _prewarm_w4a16_static_lora_binding(
+                cache=self._prewarmed_static_lora_launches,
+                a=a,
+                experts=experts,
+                topk_ids=topk_ids,
+                fast_math=fast_math,
+                swiglu_limit=self.caps.swiglu_limit,
+                swiglu_alpha=self.caps.swiglu_alpha,
+                swiglu_beta=self.caps.swiglu_beta,
+                static_lora=static_lora,
+                fc1_c_tmp=tensors["fc1_c_tmp"],
+                fc2_c_tmp=tensors["fc2_c_tmp"],
+                packed_route_indices=tensors["packed_route_indices"],
+                block_expert_ids=tensors["block_expert_ids"],
+                route_E=self._core_workspace_plan.route_E,
+                route_block_size_m=self._core_workspace_plan.route_block_size_m,
+            )
         return _build_tp_moe_fp4_binding_from_views(
             plan=self._core_workspace_plan,
             tensors=tensors,
@@ -2217,6 +2239,119 @@ def _finalize_workspace_views(workspace: TPMoEWorkspace) -> None:
     workspace.scale_flat = views.scale_flat
     workspace.sfa_ptr = views.sfa_ptr
     workspace.packed_a_storage_ptr = views.packed_a_storage_ptr
+
+
+def _prewarm_w4a16_static_lora_binding(
+    *,
+    cache: dict[object, str],
+    a: torch.Tensor,
+    experts: B12XFP4ExpertWeights,
+    topk_ids: torch.Tensor,
+    fast_math: bool | None,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+    static_lora: W4A16StaticExpertLoRA,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_expert_ids: torch.Tensor,
+    route_E: int,
+    route_block_size_m: int | None,
+) -> str:
+    """Resolve one static-LoRA launch family once, before serving freeze."""
+
+    source_format = experts.source_format
+    activation = experts.activation
+    m, hidden_size = (int(value) for value in a.shape)
+    topk = int(topk_ids.shape[1])
+    prepared = _prepared_payload_for_runtime(
+        experts,
+        quant_mode="w4a16",
+        source_format=source_format,
+        activation=activation,
+        w13_layout=experts.w13_layout,
+        dtype=a.dtype,
+        hidden_size=hidden_size,
+    )
+    if prepared is None:
+        raise RuntimeError("static_lora requires materialized W4A16 prepared weights")
+    weight_layout = getattr(prepared, "weight_layout", "packed")
+    scale_format = _normalize_w4a16_scale_format(
+        getattr(
+            prepared,
+            "scale_format",
+            _w4a16_scale_format_for_source(source_format),
+        )
+    )
+    w13_layout = getattr(prepared, "w13_layout", experts.w13_layout)
+    resolved_fast_math = _FAST_MATH_DEFAULT if fast_math is None else bool(fast_math)
+    cache_key = (
+        m,
+        str(topk_ids.dtype),
+        resolved_fast_math,
+        weight_layout,
+        scale_format,
+        w13_layout,
+        static_lora.w13_b_up is not None,
+        static_lora.token_lora_mapping is not None,
+        int(static_lora.adapter_slot),
+        float(static_lora.w13_scale),
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        _DEFAULT_MAX_SHARED_MEM,
+        prewarm_w4a16_static_lora_launches,
+    )
+
+    block_size_m = route_block_size_m or select_route_block_size_m(
+        m,
+        topk,
+        int(route_E),
+    )
+    props = torch.cuda.get_device_properties(a.device)
+    path = prewarm_w4a16_static_lora_launches(
+        m=m,
+        hidden_size=hidden_size,
+        intermediate_size=int(prepared.intermediate_size),
+        num_experts=int(prepared.num_experts),
+        topk=topk,
+        activation=activation,
+        fast_math=resolved_fast_math,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        topk_ids_dtype=topk_ids.dtype,
+        fc1_c_tmp=fc1_c_tmp,
+        fc2_c_tmp=fc2_c_tmp,
+        packed_route_indices=packed_route_indices,
+        block_size_m=block_size_m,
+        required_m_blocks=int(block_expert_ids.numel()),
+        route_slots_for_scratch=int(packed_route_indices.numel()),
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        element_dtype=_w4a16_element_dtype(a.dtype),
+        split_w13_b=static_lora.w13_b_up is not None,
+        has_token_lora_mapping=static_lora.token_lora_mapping is not None,
+        adapter_slot=int(static_lora.adapter_slot),
+        w13_scale=float(static_lora.w13_scale),
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(
+            getattr(
+                props,
+                "shared_memory_per_block_optin",
+                _DEFAULT_MAX_SHARED_MEM,
+            )
+        ),
+        device=a.device,
+    )
+    cache[cache_key] = path
+    return path
 
 
 def _build_tp_moe_fp4_binding_from_views(
@@ -7755,9 +7890,26 @@ def build_tp_moe_fp4_binding(
                 raise NotImplementedError(
                     "static_lora is not supported by the full-rotation Trellis path"
                 )
-            # The first correctness path composes LoRA around the standalone
-            # W4A16 FC1/FC2 launches. It deliberately does not pass the ordinary
-            # fused-MoE launch into run_w4a16_moe.
+            _prewarm_w4a16_static_lora_binding(
+                cache=workspace.planned_static_lora_launches,
+                a=a,
+                experts=experts,
+                topk_ids=topk_ids,
+                fast_math=fast_math,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                static_lora=static_lora,
+                fc1_c_tmp=workspace.fc1_c_tmp,
+                fc2_c_tmp=workspace.fc2_c_tmp,
+                packed_route_indices=workspace.packed_route_indices,
+                block_expert_ids=workspace.block_expert_ids,
+                route_E=workspace.route_E,
+                route_block_size_m=workspace.route_block_size_m,
+            )
+            # Static LoRA composes around standalone W4A16 FC1/FC2 launches;
+            # the ordinary fused-MoE launch is therefore not used. The exact
+            # replacement launch set was resolved above, before graph freeze.
             fused_launch = None
             topk_sum_launch = None
         return TPMoEFP4Binding(

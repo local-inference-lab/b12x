@@ -8539,6 +8539,8 @@ def _compile_w4a16_small_m_direct(
         current_cuda_stream(),
         *(
             (
+                dummy(cutlass.Uint8),
+                dummy(cutlass.Float16),
                 dummy(cutlass.BFloat16),
                 dummy(cutlass.BFloat16),
                 dummy(cutlass.BFloat16),
@@ -10063,6 +10065,11 @@ def _w4a16_small_m_direct_lora_launch_flat(
         Int32(m),
         Int32(direct_launch.grid_x),
         cuda.CUstream(stream_int),
+        # The shared micro-kernel ABI places optional Trellis pointers before
+        # static-LoRA pointers. This packed ModelOpt path does not read them,
+        # so use valid, aligned adapter storage as non-owning dummy pointers.
+        ptr(cutlass.Uint8, lora_w13_b),
+        ptr(cutlass.Float16, lora_w13_b),
         ptr(cutlass.BFloat16, lora_w13_b),
         ptr(cutlass.BFloat16, lora_w13_b_up),
         ptr(cutlass.BFloat16, lora_rank_scratch),
@@ -11173,6 +11180,10 @@ def _get_c_tmp(
             raise ValueError("W4A16 c_tmp scratch buffers must be contiguous")
         if int(scratch.numel()) >= int(elements):
             return scratch[: int(elements)]
+        raise ValueError(
+            "caller-owned W4A16 c_tmp scratch is too small: "
+            f"have={int(scratch.numel())}, need={int(elements)}"
+        )
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "W4A16 GEMM scratch is not initialized for CUDA graph capture; "
@@ -11893,6 +11904,154 @@ def _launch_w4a16_standalone_gemm(
     )
 
 
+def prewarm_w4a16_static_lora_launches(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    activation: str,
+    fast_math: bool,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+    topk_ids_dtype: torch.dtype,
+    fc1_c_tmp: torch.Tensor,
+    fc2_c_tmp: torch.Tensor,
+    packed_route_indices: torch.Tensor,
+    block_size_m: int,
+    required_m_blocks: int,
+    route_slots_for_scratch: int,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    element_dtype: str,
+    split_w13_b: bool,
+    has_token_lora_mapping: bool,
+    adapter_slot: int,
+    w13_scale: float,
+    sms: int,
+    max_shared_mem: int,
+    device: torch.device,
+) -> str:
+    """Resolve every CuTe launch used by one static-LoRA serving shape.
+
+    Binding calls this before serving freezes kernel resolution. The supplied
+    GEMM scratch is caller-owned; undersized storage therefore fails here
+    instead of allocating an untracked fallback during graph capture.
+    """
+
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
+    use_direct = bool(
+        int(m) == 1
+        and _small_m_direct_supported(
+            m=int(m),
+            hidden_size=int(hidden_size),
+            intermediate_size=int(intermediate_size),
+            num_experts=int(num_experts),
+            topk=int(topk),
+            activation=activation,
+            apply_router_weight_on_input=False,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            element_dtype=element_dtype,
+            weight_layout=weight_layout,
+            w13_layout=w13_layout,
+            scale_format=scale_format,
+            expert_map=None,
+        )
+    )
+    if use_direct:
+        _compile_w4a16_small_m_direct(
+            m=int(m),
+            hidden_size=int(hidden_size),
+            intermediate_size=int(intermediate_size),
+            num_experts=int(num_experts),
+            topk=int(topk),
+            activation=activation,
+            fast_math=bool(fast_math),
+            topk_ids_dtype=topk_ids_dtype,
+            device=device,
+            scale_format=scale_format,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            w13_layout=w13_layout,
+            static_expert_lora=True,
+            lora_split_w13_b=bool(split_w13_b),
+            lora_has_token_mapping=bool(has_token_lora_mapping),
+            lora_adapter_slot=int(adapter_slot),
+            lora_w13_scale=float(w13_scale),
+        )
+        return "direct_augmented"
+
+    routed_rows = int(m) * int(topk)
+    fc1_cols = 2 * int(intermediate_size)
+    common = dict(
+        num_experts=int(num_experts),
+        moe_block_size=int(block_size_m),
+        max_m_blocks=int(required_m_blocks),
+        element_dtype=element_dtype,
+        packed_route_indices=packed_route_indices,
+        sms=int(sms),
+        max_shared_mem=int(max_shared_mem),
+        device=device,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        route_slots=int(route_slots_for_scratch),
+    )
+    _compile_w4a16_gemm_launch(
+        size_m=int(m),
+        size_n=fc1_cols,
+        size_k=int(hidden_size),
+        top_k=int(topk),
+        mul_topk_weights=False,
+        c_tmp=fc1_c_tmp,
+        w13_layout=w13_layout,
+        source_n_rotation=(
+            int(intermediate_size)
+            if weight_layout == "modelopt" and w13_layout == "w13"
+            else 0
+        ),
+        **common,
+    )
+    compile_w4a16_activation(
+        rows=routed_rows,
+        intermediate_size=int(intermediate_size),
+        activation=activation,
+        element_dtype=element_dtype,
+        fast_math=bool(fast_math),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
+    _compile_w4a16_gemm_launch(
+        size_m=routed_rows,
+        size_n=int(hidden_size),
+        size_k=int(intermediate_size),
+        top_k=1,
+        mul_topk_weights=True,
+        c_tmp=fc2_c_tmp,
+        w13_layout=w13_layout if weight_layout == "modelopt" else "packed",
+        **common,
+    )
+    compile_w4a16_topk_sum(
+        m=int(m),
+        topk=int(topk),
+        hidden_size=int(hidden_size),
+        element_dtype=element_dtype,
+    )
+    return "staged"
+
+
 def _run_w4a16_static_lora_staged(
     *,
     a_input: torch.Tensor,
@@ -12531,9 +12690,8 @@ def run_w4a16_moe(
     stream = current_stream if stream is None else stream
     use_direct_static_lora = bool(
         static_lora is not None
-        # The exact DS4F TP4 rank-4 gate shows that preserving the fused
-        # direct kernel wins for single-token decode. At m>=2 the staged
-        # tensor-core path amortizes its route-pack/launch costs better.
+        # The fused direct kernel wins for single-token decode. At m>=2 the
+        # staged tensor-core path amortizes route-pack and launch costs better.
         and int(m) == 1
         and (not collect_activation_amax)
         and _small_m_direct_supported(
@@ -13585,6 +13743,7 @@ __all__ = [
     "compile_w4a16_gemm",
     "compile_w4a16_topk_sum",
     "pack_topk_routes_by_expert",
+    "prewarm_w4a16_static_lora_launches",
     "run_trellis256_dense",
     "run_w4a16_moe",
 ]
