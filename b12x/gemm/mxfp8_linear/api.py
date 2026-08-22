@@ -7,13 +7,25 @@ from ._kernel import (
     MXFP8LinearWeight as Weight,
 )
 from ._kernel import (
+    empty_mxfp8_linear_input as empty_input,
+)
+from ._kernel import (
     is_mxfp8_linear_supported as _kernel_is_supported,
 )
 from ._kernel import (
     mxfp8_linear as mm,
 )
 from ._kernel import (
+    mxfp8_linear_quantized as mm_quantized,
+)
+from ._kernel import (
+    mxfp8_linear_quantized_into as mm_quantized_into,
+)
+from ._kernel import (
     pack_mxfp8_linear_weight as pack_weight,
+)
+from ._kernel import (
+    quantize_mxfp8_linear_input_slice as quantize_input_slice,
 )
 from . import META
 
@@ -26,4 +38,13 @@ def is_supported(device=None) -> bool:
     )
 
 
-__all__ = ["Weight", "mm", "pack_weight", "is_supported"]
+__all__ = [
+    "Weight",
+    "empty_input",
+    "is_supported",
+    "mm",
+    "mm_quantized",
+    "mm_quantized_into",
+    "pack_weight",
+    "quantize_input_slice",
+]
