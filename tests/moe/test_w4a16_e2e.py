@@ -738,7 +738,14 @@ def test_w4a16_static_lora_matches_oracle_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> None:
+@pytest.mark.parametrize(
+    ("m", "mapping_dtype"),
+    [(1, torch.int64), (7, torch.int32)],
+)
+def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph(
+    m: int,
+    mapping_dtype: torch.dtype,
+) -> None:
     """Exercise the public plan -> bind -> run serving boundary with LoRA."""
 
     import b12x
@@ -746,7 +753,7 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
 
     torch.manual_seed(20260822)
     experts, hidden_size, intermediate_size = 8, 128, 128
-    m, topk, activation = 7, 2, "silu"
+    topk, activation = 2, "silu"
     weights = _make_weights(
         experts=experts,
         hidden_size=hidden_size,
@@ -764,7 +771,7 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
     topk_weights = torch.softmax(torch.randn(m, topk, device="cuda"), dim=-1)
     token_lora_mapping = torch.tensor(
         [0 if token % 2 == 0 else -1 for token in range(m)],
-        dtype=torch.int32,
+        dtype=mapping_dtype,
         device="cuda",
     )
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
@@ -830,6 +837,7 @@ def test_w4a16_static_lora_scratch_plan_binding_matches_oracle_and_graph() -> No
         static_lora=adapter,
     )
     assert binding.static_lora is adapter
+    assert binding.static_lora_prevalidated
     assert binding.lora_rank_scratch is not None
     assert binding.lora_rank_scratch.numel() >= m * topk * 4
     assert binding.fused_launch is None

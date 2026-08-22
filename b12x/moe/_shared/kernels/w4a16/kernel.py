@@ -114,6 +114,7 @@ from b12x.moe._shared.kernels.w4a16.lora import (
     validate_w4a16_static_expert_lora,
 )
 from b12x.moe._shared.kernels.w4a16.lora_kernel import (
+    prewarm_w4a16_static_lora_triton_kernels,
     run_w4a16_static_lora_output_sum,
     run_w4a16_static_lora_projection,
     run_w4a16_static_lora_shrink,
@@ -8441,11 +8442,17 @@ def _compile_w4a16_small_m_direct(
     static_expert_lora: bool = False,
     lora_split_w13_b: bool = False,
     lora_has_token_mapping: bool = False,
+    lora_token_mapping_dtype: torch.dtype = torch.int32,
     lora_adapter_slot: int = 0,
     lora_w13_scale: float = 1.0,
 ) -> _W4A16SmallMDirectLaunch:
     if topk_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
+    if lora_token_mapping_dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "small-M W4A16 direct LoRA path requires an int32/int64 "
+            "token mapping dtype"
+        )
     activation = normalize_moe_activation(activation)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_activation_swiglu_params(
         activation,
@@ -8472,6 +8479,7 @@ def _compile_w4a16_small_m_direct(
         bool(static_expert_lora),
         bool(lora_split_w13_b),
         bool(lora_has_token_mapping),
+        lora_token_mapping_dtype,
         int(lora_adapter_slot),
         float(lora_w13_scale),
     )
@@ -8509,6 +8517,11 @@ def _compile_w4a16_small_m_direct(
         return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
 
     ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    lora_mapping_dtype = (
+        cutlass.Int64
+        if lora_token_mapping_dtype == torch.int64
+        else cutlass.Int32
+    )
     barrier_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (1,),
@@ -8544,7 +8557,7 @@ def _compile_w4a16_small_m_direct(
                 dummy(cutlass.BFloat16),
                 dummy(cutlass.BFloat16),
                 dummy(cutlass.BFloat16),
-                dummy(cutlass.Int32),
+                dummy(lora_mapping_dtype),
                 dummy(cutlass.BFloat16),
             )
             if static_expert_lora
@@ -8552,7 +8565,7 @@ def _compile_w4a16_small_m_direct(
         ),
         compile_spec=KernelCompileSpec.from_facts(
             "moe.w4a16.small_m_direct",
-            3,
+            4,
             ("device_index", None if device is None else int(device.index or 0)),
             ("m", int(m)),
             ("hidden_size", int(hidden_size)),
@@ -8570,6 +8583,7 @@ def _compile_w4a16_small_m_direct(
             ("static_expert_lora", bool(static_expert_lora)),
             ("lora_split_w13_b", bool(lora_split_w13_b)),
             ("lora_has_token_mapping", bool(lora_has_token_mapping)),
+            ("lora_token_mapping_dtype", str(lora_token_mapping_dtype)),
             ("lora_adapter_slot", int(lora_adapter_slot)),
             ("lora_w13_scale", float(lora_w13_scale)),
             ("grid_x", int(kernel.grid_x)),
@@ -10037,6 +10051,7 @@ def _w4a16_small_m_direct_lora_launch_flat(
         static_expert_lora=True,
         lora_split_w13_b=bool(lora_split_w13_b),
         lora_has_token_mapping=bool(has_token_lora_mapping),
+        lora_token_mapping_dtype=token_lora_mapping.dtype,
         lora_adapter_slot=int(adapter_slot),
         lora_w13_scale=float(lora_w13_scale),
         device=a_input.device,
@@ -11929,8 +11944,10 @@ def prewarm_w4a16_static_lora_launches(
     element_dtype: str,
     split_w13_b: bool,
     has_token_lora_mapping: bool,
+    token_lora_mapping_dtype: torch.dtype,
     adapter_slot: int,
     w13_scale: float,
+    w2_scale: float,
     sms: int,
     max_shared_mem: int,
     device: torch.device,
@@ -11988,8 +12005,24 @@ def prewarm_w4a16_static_lora_launches(
             static_expert_lora=True,
             lora_split_w13_b=bool(split_w13_b),
             lora_has_token_mapping=bool(has_token_lora_mapping),
+            lora_token_mapping_dtype=token_lora_mapping_dtype,
             lora_adapter_slot=int(adapter_slot),
             lora_w13_scale=float(w13_scale),
+        )
+        prewarm_w4a16_static_lora_triton_kernels(
+            m=int(m),
+            hidden_size=int(hidden_size),
+            intermediate_size=int(intermediate_size),
+            num_experts=int(num_experts),
+            topk=int(topk),
+            split_w13_b=bool(split_w13_b),
+            has_token_lora_mapping=bool(has_token_lora_mapping),
+            token_lora_mapping_dtype=token_lora_mapping_dtype,
+            adapter_slot=int(adapter_slot),
+            w13_scale=float(w13_scale),
+            w2_scale=float(w2_scale),
+            direct=True,
+            device=device,
         )
         return "direct_augmented"
 
@@ -12048,6 +12081,21 @@ def prewarm_w4a16_static_lora_launches(
         topk=int(topk),
         hidden_size=int(hidden_size),
         element_dtype=element_dtype,
+    )
+    prewarm_w4a16_static_lora_triton_kernels(
+        m=int(m),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(num_experts),
+        topk=int(topk),
+        split_w13_b=bool(split_w13_b),
+        has_token_lora_mapping=bool(has_token_lora_mapping),
+        token_lora_mapping_dtype=token_lora_mapping_dtype,
+        adapter_slot=int(adapter_slot),
+        w13_scale=float(w13_scale),
+        w2_scale=float(w2_scale),
+        direct=False,
+        device=device,
     )
     return "staged"
 
@@ -12317,6 +12365,7 @@ def run_w4a16_moe(
     rotation_a_gate: torch.Tensor | None = None,
     rotation_a_up: torch.Tensor | None = None,
     static_lora: W4A16StaticExpertLoRA | None = None,
+    _static_lora_prevalidated: bool = False,
     lora_rank_scratch: torch.Tensor | None = None,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
@@ -12530,13 +12579,14 @@ def run_w4a16_moe(
             raise NotImplementedError(
                 "W4A16 static expert LoRA currently requires a gated activation"
             )
-        validate_w4a16_static_expert_lora(
-            static_lora,
-            num_experts=int(prepared.num_experts),
-            hidden_size=hidden_size,
-            intermediate_size=int(prepared.intermediate_size),
-            device=a_input.device,
-        )
+        if not _static_lora_prevalidated:
+            validate_w4a16_static_expert_lora(
+                static_lora,
+                num_experts=int(prepared.num_experts),
+                hidden_size=hidden_size,
+                intermediate_size=int(prepared.intermediate_size),
+                device=a_input.device,
+            )
         if a_input.dtype != torch.bfloat16:
             raise TypeError("W4A16 static expert LoRA requires BF16 activations")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_cuda:

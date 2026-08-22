@@ -61,7 +61,10 @@ from b12x.moe._shared.kernels.activations import (
     normalize_swiglu_beta_for_activation,
     normalize_swiglu_limit_for_activation,
 )
-from b12x.moe._shared.kernels.w4a16.lora import W4A16StaticExpertLoRA
+from b12x.moe._shared.kernels.w4a16.lora import (
+    W4A16StaticExpertLoRA,
+    validate_w4a16_static_expert_lora,
+)
 from b12x.moe._shared.kernels.micro import (
     _BLOCK_DIM as _DIRECT_MICRO_BLOCK_DIM,
     MoEMicroKernelBackend,
@@ -1067,6 +1070,7 @@ class TPMoEFP4Binding:
     expert_offsets: torch.Tensor | None = None
     expert_counts: torch.Tensor | None = None
     static_lora: W4A16StaticExpertLoRA | None = None
+    static_lora_prevalidated: bool = False
     lora_rank_scratch: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
@@ -2263,6 +2267,12 @@ def _prewarm_w4a16_static_lora_binding(
 
     source_format = experts.source_format
     activation = experts.activation
+    swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
+        activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
+    )
     m, hidden_size = (int(value) for value in a.shape)
     topk = int(topk_ids.shape[1])
     prepared = _prepared_payload_for_runtime(
@@ -2276,6 +2286,27 @@ def _prewarm_w4a16_static_lora_binding(
     )
     if prepared is None:
         raise RuntimeError("static_lora requires materialized W4A16 prepared weights")
+    validate_w4a16_static_expert_lora(
+        static_lora,
+        num_experts=int(prepared.num_experts),
+        hidden_size=hidden_size,
+        intermediate_size=int(prepared.intermediate_size),
+        device=a.device,
+    )
+    if a.dtype != torch.bfloat16:
+        raise TypeError("W4A16 static expert LoRA requires BF16 activations")
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_cuda:
+        raise TypeError("W4A16 static expert LoRA requires CUDA int32 topk_ids")
+    if not topk_ids.is_contiguous():
+        raise ValueError("W4A16 static expert LoRA requires contiguous topk_ids")
+    if (
+        static_lora.token_lora_mapping is not None
+        and int(static_lora.token_lora_mapping.numel()) < m
+    ):
+        raise ValueError(
+            "W4A16 static expert LoRA token_lora_mapping must contain at least "
+            f"{m} entries, got {int(static_lora.token_lora_mapping.numel())}"
+        )
     weight_layout = getattr(prepared, "weight_layout", "packed")
     scale_format = _normalize_w4a16_scale_format(
         getattr(
@@ -2293,10 +2324,19 @@ def _prewarm_w4a16_static_lora_binding(
         weight_layout,
         scale_format,
         w13_layout,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
         static_lora.w13_b_up is not None,
         static_lora.token_lora_mapping is not None,
+        str(
+            static_lora.token_lora_mapping.dtype
+            if static_lora.token_lora_mapping is not None
+            else topk_ids.dtype
+        ),
         int(static_lora.adapter_slot),
         float(static_lora.w13_scale),
+        float(static_lora.w2_scale),
     )
     cached = cache.get(cache_key)
     if cached is not None:
@@ -2338,8 +2378,14 @@ def _prewarm_w4a16_static_lora_binding(
         element_dtype=_w4a16_element_dtype(a.dtype),
         split_w13_b=static_lora.w13_b_up is not None,
         has_token_lora_mapping=static_lora.token_lora_mapping is not None,
+        token_lora_mapping_dtype=(
+            static_lora.token_lora_mapping.dtype
+            if static_lora.token_lora_mapping is not None
+            else topk_ids.dtype
+        ),
         adapter_slot=int(static_lora.adapter_slot),
         w13_scale=float(static_lora.w13_scale),
+        w2_scale=float(static_lora.w2_scale),
         sms=int(props.multi_processor_count),
         max_shared_mem=int(
             getattr(
@@ -2555,6 +2601,7 @@ def _build_tp_moe_fp4_binding_from_views(
         activation_amax=activation_amax,
         layer_idx=layer_idx,
         static_lora=static_lora,
+        static_lora_prevalidated=static_lora is not None,
     )
     if plan.implementation == "w4a16":
         return TPMoEFP4Binding(
@@ -7811,6 +7858,7 @@ def build_tp_moe_fp4_binding(
         route_expert_map=route_expert_map,
         output_expert_map=output_expert_map,
         static_lora=static_lora,
+        static_lora_prevalidated=static_lora is not None,
     )
     if isinstance(workspace, TPW4A16Workspace):
         if quant_mode != "w4a16":
@@ -10936,6 +10984,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             expert_offsets=expert_offsets,
             expert_counts=_require_binding_field(binding, "expert_counts"),
             static_lora=static_lora,
+            _static_lora_prevalidated=binding.static_lora_prevalidated,
             lora_rank_scratch=(
                 _require_binding_field(binding, "lora_rank_scratch")
                 if static_lora is not None

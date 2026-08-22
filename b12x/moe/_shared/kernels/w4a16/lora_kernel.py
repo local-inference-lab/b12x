@@ -19,6 +19,147 @@ _SHRINK_BLOCK_K = 1024
 _EXPAND_BLOCK_N = 256
 
 
+def prewarm_w4a16_static_lora_triton_kernels(
+    *,
+    m: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    split_w13_b: bool,
+    has_token_lora_mapping: bool,
+    token_lora_mapping_dtype: torch.dtype,
+    adapter_slot: int,
+    w13_scale: float,
+    w2_scale: float,
+    direct: bool,
+    device: torch.device,
+) -> None:
+    """Compile every Triton specialization used by one bound LoRA shape.
+
+    ``JITFunction.warmup`` compiles from dtypes and constexpr metadata without
+    dereferencing or mutating the caller's tensors.  Keeping this at binding
+    time makes the subsequent first serving invocation safe to capture.
+    """
+
+    if token_lora_mapping_dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "token_lora_mapping_dtype must be torch.int32 or torch.int64, "
+            f"got {token_lora_mapping_dtype}"
+        )
+    m = int(m)
+    hidden_size = int(hidden_size)
+    intermediate_size = int(intermediate_size)
+    num_experts = int(num_experts)
+    topk = int(topk)
+    routes = m * topk
+    mapping_dtype = (
+        token_lora_mapping_dtype if has_token_lora_mapping else torch.int32
+    )
+
+    def warm_shrink(
+        *, width: int, input_row_divisor: int, token_row_divisor: int
+    ) -> None:
+        _w4a16_static_lora_shrink_kernel.warmup(
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.int32,
+            mapping_dtype,
+            torch.bfloat16,
+            WIDTH=int(width),
+            NUM_EXPERTS=num_experts,
+            INPUT_ROW_DIVISOR=int(input_row_divisor),
+            TOKEN_ROW_DIVISOR=int(token_row_divisor),
+            ADAPTER_SLOT=int(adapter_slot),
+            HAS_TOKEN_LORA_MAPPING=bool(has_token_lora_mapping),
+            RANK=_RANK,
+            BLOCK_K=_SHRINK_BLOCK_K,
+            num_warps=4,
+            grid=(routes, _RANK),
+        )
+
+    with torch.cuda.device(device):
+        warm_shrink(
+            width=hidden_size,
+            input_row_divisor=topk,
+            token_row_divisor=topk,
+        )
+        if not direct:
+            if split_w13_b:
+                _w4a16_static_lora_expand_pair_add_kernel.warmup(
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.int32,
+                    torch.bfloat16,
+                    SCALE=float(w13_scale),
+                    OUTPUT_WIDTH=intermediate_size,
+                    NUM_EXPERTS=num_experts,
+                    RANK=_RANK,
+                    BLOCK_N=_EXPAND_BLOCK_N,
+                    num_warps=4,
+                    grid=(routes, triton.cdiv(intermediate_size, _EXPAND_BLOCK_N)),
+                )
+            else:
+                _w4a16_static_lora_expand_add_kernel.warmup(
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.int32,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    SCALE=float(w13_scale),
+                    OUTPUT_WIDTH=2 * intermediate_size,
+                    NUM_EXPERTS=num_experts,
+                    HAS_ROUTE_WEIGHTS=False,
+                    RANK=_RANK,
+                    BLOCK_N=_EXPAND_BLOCK_N,
+                    num_warps=4,
+                    grid=(
+                        routes,
+                        triton.cdiv(2 * intermediate_size, _EXPAND_BLOCK_N),
+                    ),
+                )
+
+        warm_shrink(
+            width=intermediate_size,
+            input_row_divisor=1,
+            token_row_divisor=topk,
+        )
+        if direct:
+            _w4a16_static_lora_expand_token_sum_kernel.warmup(
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.int32,
+                torch.float32,
+                torch.bfloat16,
+                SCALE=float(w2_scale),
+                NUM_TOKENS=m,
+                TOPK=topk,
+                OUTPUT_WIDTH=hidden_size,
+                NUM_EXPERTS=num_experts,
+                RANK=_RANK,
+                BLOCK_N=_EXPAND_BLOCK_N,
+                num_warps=4,
+                grid=(m, triton.cdiv(hidden_size, _EXPAND_BLOCK_N)),
+            )
+        else:
+            _w4a16_static_lora_expand_add_kernel.warmup(
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.int32,
+                torch.float32,
+                torch.bfloat16,
+                SCALE=float(w2_scale),
+                OUTPUT_WIDTH=hidden_size,
+                NUM_EXPERTS=num_experts,
+                HAS_ROUTE_WEIGHTS=True,
+                RANK=_RANK,
+                BLOCK_N=_EXPAND_BLOCK_N,
+                num_warps=4,
+                grid=(routes, triton.cdiv(hidden_size, _EXPAND_BLOCK_N)),
+            )
+
+
 @triton.jit
 def _w4a16_static_lora_shrink_kernel(
     x,
@@ -729,6 +870,7 @@ def run_w4a16_static_lora_split_w13_projection(
 
 
 __all__ = [
+    "prewarm_w4a16_static_lora_triton_kernels",
     "run_w4a16_static_lora_output_sum",
     "run_w4a16_static_lora_projection",
     "run_w4a16_static_lora_shrink",

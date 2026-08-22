@@ -16,12 +16,14 @@ the real adapter and TP-sliced for the selected rank.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
 import statistics
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
@@ -38,6 +40,10 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
     make_w4a16_packed_buffers,
     prepare_w4a16_modelopt_native_weights,
 )
+from b12x.moe._shared.kernels.reference import (
+    compare_to_reference,
+    moe_reference_w4a16_f32,
+)
 
 
 EXPERTS = 256
@@ -45,6 +51,7 @@ HIDDEN_SIZE = 4096
 INTERMEDIATE_FULL = 2048
 TOPK = 6
 RANK = 4
+ORACLE_MIN_COS = 0.9975
 
 
 def _command_metadata(
@@ -116,6 +123,72 @@ def _package_version(name: str) -> str | None:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compiler_artifacts() -> dict[str, object]:
+    """Inventory CuTe and Triton artifacts produced by this benchmark cache."""
+
+    compile_root_value = os.environ.get("B12X_COMPILE_CACHE_DIR")
+    triton_root_value = os.environ.get("TRITON_CACHE_DIR")
+    manifests: list[dict[str, object]] = []
+    if compile_root_value:
+        compile_root = Path(compile_root_value)
+        for manifest_path in sorted(compile_root.rglob("*.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            kernel_id = manifest.get("kernel_id")
+            if not isinstance(kernel_id, str) or not kernel_id.startswith(
+                "moe.w4a16"
+            ):
+                continue
+            manifests.append(
+                {
+                    "manifest": str(manifest_path.relative_to(compile_root)),
+                    "kernel_id": kernel_id,
+                    "cache_key": manifest.get("cache_key"),
+                    "compile_spec_hash": manifest.get("compile_spec_hash"),
+                    "compile_spec_json": manifest.get("compile_spec_json"),
+                    "object_sha256": manifest.get("object_sha256"),
+                    "artifact_evidence_sha256": manifest.get(
+                        "artifact_evidence_sha256"
+                    ),
+                    "target": manifest.get("target"),
+                }
+            )
+
+    triton_artifacts: list[dict[str, object]] = []
+    if triton_root_value:
+        triton_root = Path(triton_root_value)
+        for artifact_path in sorted(triton_root.rglob("*")):
+            if (
+                not artifact_path.is_file()
+                or artifact_path.suffix not in {".cubin", ".ptx"}
+                or "_w4a16_static_lora_" not in artifact_path.name
+            ):
+                continue
+            triton_artifacts.append(
+                {
+                    "artifact": str(artifact_path.relative_to(triton_root)),
+                    "sha256": _sha256(artifact_path),
+                    "bytes": artifact_path.stat().st_size,
+                }
+            )
+    return {
+        "b12x_compile_cache_dir": compile_root_value,
+        "triton_cache_dir": triton_root_value,
+        "cute_manifests": manifests,
+        "triton_artifacts": triton_artifacts,
+    }
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
@@ -323,12 +396,25 @@ def main() -> None:
     gpu_props = torch.cuda.get_device_properties(0)
     evidence: dict[str, object] = {
         "command": [sys.executable, *sys.argv],
+        "worktree_path": str(repo_root),
         "container_image": os.environ.get("B12X_BENCH_CONTAINER_IMAGE"),
         "git_commit": _command_metadata(
             ["git", "rev-parse", "HEAD"], cwd=repo_root
         ),
         "git_status": _command_metadata(
             ["git", "status", "--short", "--branch"], cwd=repo_root
+        ),
+        "git_source_tree": _command_metadata(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=repo_root
+        ),
+        "comparison_revision": _command_metadata(
+            ["git", "merge-base", "HEAD", "origin/master"], cwd=repo_root
+        ),
+        "ptxas": _command_metadata(
+            [
+                os.environ.get("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas"),
+                "--version",
+            ]
         ),
         "gpu_before": _gpu_snapshot(),
         "selected_gpu": _selected_gpu_identity(),
@@ -459,6 +545,46 @@ def main() -> None:
         lora_output = lora_buffers.output.clone()
         torch.cuda.synchronize()
 
+        base_reference = moe_reference_w4a16_f32(
+            x,
+            *raw_weights[:3],
+            *raw_weights[3:],
+            topk_ids,
+            topk_weights,
+            EXPERTS,
+            HIDDEN_SIZE,
+            intermediate_size,
+            activation="silu",
+            swiglu_limit=10.0,
+        )
+        lora_reference = moe_reference_w4a16_f32(
+            x,
+            *raw_weights[:3],
+            *raw_weights[3:],
+            topk_ids,
+            topk_weights,
+            EXPERTS,
+            HIDDEN_SIZE,
+            intermediate_size,
+            activation="silu",
+            swiglu_limit=10.0,
+            static_lora=adapter,
+        )
+        base_oracle = compare_to_reference(base_output, base_reference)
+        lora_oracle = compare_to_reference(lora_output, lora_reference)
+        for label, output_value, metrics in (
+            ("base", base_output, base_oracle),
+            ("lora", lora_output, lora_oracle),
+        ):
+            if not torch.isfinite(output_value).all().item():
+                raise RuntimeError(f"{label} output is non-finite before timing")
+            if metrics.cos < ORACLE_MIN_COS:
+                raise RuntimeError(
+                    f"{label} output failed FP32 oracle: "
+                    f"cos={metrics.cos:.8f} < {ORACLE_MIN_COS:.8f}; "
+                    f"metrics={metrics}"
+                )
+
         allocated_before_replay = torch.cuda.memory_allocated()
         base_us, lora_us = _time_graphs_interleaved(
             base_graph,
@@ -518,6 +644,11 @@ def main() -> None:
             "slowdown_x": lora_median / base_median,
             "overhead_percent": (lora_median / base_median - 1.0) * 100.0,
             "relative_output_delta": float((delta / base_norm).item()),
+            "oracle_min_cos": ORACLE_MIN_COS,
+            "base_oracle": asdict(base_oracle),
+            "lora_oracle": asdict(lora_oracle),
+            "base_oracle_passed": base_oracle.cos >= ORACLE_MIN_COS,
+            "lora_oracle_passed": lora_oracle.cos >= ORACLE_MIN_COS,
             "base_finite": bool(torch.isfinite(base_output).all().item()),
             "lora_finite": bool(torch.isfinite(lora_output).all().item()),
             "lora_nonzero_delta": bool(delta.item() > 0.0),
@@ -541,6 +672,7 @@ def main() -> None:
         "max_reserved_bytes": torch.cuda.max_memory_reserved(),
     }
     evidence["gpu_after"] = _gpu_snapshot()
+    evidence["compiler_artifacts"] = _compiler_artifacts()
     rendered = json.dumps(results, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.write_text(rendered + "\n")
