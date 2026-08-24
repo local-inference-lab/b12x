@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 import contextlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -921,6 +921,11 @@ def _time_graphs(
     device: torch.device,
 ) -> dict[str, Any]:
     orders = _balanced_orders()
+    if iterations % len(orders):
+        raise ValueError(
+            f"iterations must be a multiple of {len(orders)} to keep route "
+            "ordering balanced"
+        )
     for iteration in range(warmups):
         order = orders[iteration % len(orders)]
         for name in order:
@@ -1004,7 +1009,9 @@ def _make_routes(
         raise ValueError(f"source must be fp16 or bf16, got {element_dtype}")
     sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     fused_output = torch.empty((rows, size_n), dtype=element_dtype, device=device)
-    fused_rotated = torch.empty((rows, size_k), dtype=element_dtype, device=device)
+    fused_rotated_compute = torch.empty(
+        (rows, size_k), dtype=element_dtype, device=device
+    )
     fused_c_tmp = torch.empty(
         trellis_linear.k6_mcg_small_m_scratch_elements(size_k, size_n),
         dtype=torch.float32,
@@ -1053,7 +1060,7 @@ def _make_routes(
             source,
             fused_weight,
             output=fused_output,
-            rotated_f16=fused_rotated,
+            rotated_compute=fused_rotated_compute,
             c_tmp=fused_c_tmp,
         )
         if result.data_ptr() != fused_output.data_ptr():
@@ -1118,13 +1125,13 @@ def _make_routes(
             output=fused_output,
             poison_tensors={
                 "output": fused_output,
-                "rotated_f16": fused_rotated,
+                "rotated_compute": fused_rotated_compute,
                 "c_tmp": fused_c_tmp,
             },
             stable_tensors={
                 **shared,
                 "output": fused_output,
-                "rotated_f16": fused_rotated,
+                "rotated_compute": fused_rotated_compute,
                 "c_tmp": fused_c_tmp,
                 "workspace": fused_weight.workspace,
             },
@@ -1470,11 +1477,57 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+@contextlib.contextmanager
+def _temporary_k6_mcg_grid_override(
+    *,
+    size_k: int,
+    size_n: int,
+    requested_grid_x: int | None,
+) -> Iterator[dict[str, Any] | None]:
+    """Apply one benchmark-only planner override and always restore it."""
+    if requested_grid_x is None:
+        yield None
+        return
+    requested_grid_x = int(requested_grid_x)
+    if requested_grid_x <= 0:
+        raise ValueError("--experimental-grid-x must be positive")
+
+    from b12x.gemm.trellis_linear import _k6_mcg_cute
+
+    table = _k6_mcg_cute._MEASURED_GRID_CTA
+    shape = (int(size_k), int(size_n))
+    had_previous = shape in table
+    previous = table.get(shape)
+    table[shape] = requested_grid_x
+    try:
+        yield {
+            "experimental": True,
+            "method": (
+                "temporary benchmark-only mutation of b12x planner shape table "
+                "during public prepare"
+            ),
+            "shape": list(shape),
+            "previous_requested_grid_x": previous,
+            "requested_grid_x": requested_grid_x,
+        }
+    finally:
+        if had_previous:
+            table[shape] = previous
+        else:
+            table.pop(shape, None)
+
+
 def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
     if args.compile_warmups < 1:
         raise ValueError("--compile-warmups must be at least one")
     if min(args.cold_replays, args.warmups, args.iterations, args.replay_checks) < 1:
         raise ValueError("replay and timing counts must all be positive")
+    order_count = len(_balanced_orders())
+    if args.iterations % order_count:
+        raise ValueError(
+            f"--iterations must be a multiple of {order_count} to keep route "
+            "ordering balanced"
+        )
     if not torch.cuda.is_available():
         raise QualificationError("CUDA is required")
     device = torch.device(args.device)
@@ -1513,31 +1566,19 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
     source_hashes_before = {
         name: _sha256_tensor(tensor) for name, tensor in payload_gpu.items()
     }
-    planner_override = None
-    if args.experimental_grid_x is not None:
-        requested_grid_x = int(args.experimental_grid_x)
-        if requested_grid_x <= 0:
-            raise ValueError("--experimental-grid-x must be positive")
-        from b12x.gemm.trellis_linear import _k6_mcg_cute
-
-        shape = (int(payload_gpu["suh"].numel()), int(payload_gpu["svh"].numel()))
-        previous = _k6_mcg_cute._MEASURED_GRID_CTA.get(shape)
-        _k6_mcg_cute._MEASURED_GRID_CTA[shape] = requested_grid_x
-        planner_override = {
-            "experimental": True,
-            "method": "benchmark-only mutation of b12x planner shape table before public prepare",
-            "shape": list(shape),
-            "previous_requested_grid_x": previous,
-            "requested_grid_x": requested_grid_x,
-        }
-    prepare_start_ns = time.perf_counter_ns()
-    fused_weight = trellis_linear.prepare_weight(
-        payload_gpu["trellis"],
-        payload_gpu["suh"],
-        payload_gpu["svh"],
-        mcg=payload_gpu["mcg"],
-        params_dtype=args.params_dtype,
-    )
+    with _temporary_k6_mcg_grid_override(
+        size_k=int(payload_gpu["suh"].numel()),
+        size_n=int(payload_gpu["svh"].numel()),
+        requested_grid_x=args.experimental_grid_x,
+    ) as planner_override:
+        prepare_start_ns = time.perf_counter_ns()
+        fused_weight = trellis_linear.prepare_weight(
+            payload_gpu["trellis"],
+            payload_gpu["suh"],
+            payload_gpu["svh"],
+            mcg=payload_gpu["mcg"],
+            params_dtype=args.params_dtype,
+        )
     torch.cuda.synchronize(device)
     prepare_wall_ms = (time.perf_counter_ns() - prepare_start_ns) / 1.0e6
     launch = fused_weight.k6_mcg_small_m_launch

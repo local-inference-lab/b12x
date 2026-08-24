@@ -29,6 +29,7 @@ def _write_receipt(
     cooperative: int = 1,
     runtime_route: str = "b12x_k6_mcg_small_m",
     include_inactive_fp16_plan: bool = False,
+    malformed_runtime_launch: bool = False,
 ) -> Path:
     receipt = tmp_path / "receipt"
     graphs = receipt / "graphs"
@@ -88,7 +89,9 @@ def _write_receipt(
                 "m": 4,
                 "cuda_graph_capture": True,
                 "selected_route": runtime_route,
-                "launch": {"launch_grid_x": grid_x},
+                "launch": (
+                    {} if malformed_runtime_launch else {"launch_grid_x": grid_x}
+                ),
             }
         )
     log_lines = [
@@ -138,3 +141,19 @@ def test_analyze_receipt_fails_closed_for_noncooperative_k6_node(
     assert report["status"] == "fail"
     assert not report["summary"]["all_k6_mcg_nodes_cooperative"]
     assert report["graphs"][0]["k6_mcg_noncooperative_nodes"]
+
+
+def test_analyze_receipt_fails_closed_for_malformed_runtime_launch(
+    tmp_path: Path,
+) -> None:
+    report = analyze_receipt(
+        _write_receipt(tmp_path, malformed_runtime_launch=True)
+    )
+
+    assert report["status"] == "fail"
+    graph = report["graphs"][0]
+    assert graph["status"] == "fail"
+    assert not graph["checks"]["launch_grid_multiset_matches_runtime"]
+    assert any(
+        "invalid launch.launch_grid_x" in error for error in graph["errors"]
+    )

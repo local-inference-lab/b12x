@@ -11348,12 +11348,19 @@ def _run_trellis256_dense_current_device(
             run_k6_mcg_small_m,
         )
 
-        if small_m_launch.accepts_input(x):
-            rotated_f16 = _trellis_dense_buffer(
-                "rotated_f16",
-                rotated_f16,
+        fused_scratch_elements = k6_mcg_small_m_scratch_elements(size_k, size_n)
+        fused_c_tmp_compatible = c_tmp is None or (
+            c_tmp.dtype == torch.float32
+            and c_tmp.device == x.device
+            and c_tmp.is_contiguous()
+            and int(c_tmp.numel()) >= fused_scratch_elements
+        )
+        if small_m_launch.accepts_input(x) and fused_c_tmp_compatible:
+            rotated_compute = _trellis_dense_buffer(
+                "rotated_compute",
+                rotated_compute,
                 shape=(m, size_k),
-                dtype=x.dtype,
+                dtype=compute_dtype,
                 device=x.device,
             )
             if c_tmp is None:
@@ -11363,7 +11370,7 @@ def _run_trellis256_dense_current_device(
                         "capture; provide caller-owned storage"
                     )
                 c_tmp = torch.empty(
-                    (k6_mcg_small_m_scratch_elements(size_k, size_n),),
+                    (fused_scratch_elements,),
                     dtype=torch.float32,
                     device=x.device,
                 )
@@ -11371,7 +11378,7 @@ def _run_trellis256_dense_current_device(
                 x,
                 prepared_dense,
                 output=output,
-                rotated=rotated_f16,
+                rotated=rotated_compute,
                 c_tmp=c_tmp,
             )
 

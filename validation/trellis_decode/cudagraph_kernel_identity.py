@@ -425,11 +425,25 @@ def analyze_receipt(
             if role is not None and m is not None
             else []
         )
-        expected_grids = Counter(
-            int(row["launch"]["launch_grid_x"])
-            for row in expected_rows
-            if isinstance(row.get("launch"), dict)
-        )
+        expected_grids: Counter[int] = Counter()
+        for row in expected_rows:
+            launch = row.get("launch")
+            grid_x = (
+                launch.get("launch_grid_x")
+                if isinstance(launch, dict)
+                else None
+            )
+            if (
+                not isinstance(grid_x, int)
+                or isinstance(grid_x, bool)
+                or grid_x <= 0
+            ):
+                graph_errors.append(
+                    "runtime record has invalid launch.launch_grid_x: "
+                    f"projection={row.get('projection')!r}, value={grid_x!r}"
+                )
+                continue
+            expected_grids[grid_x] += 1
         observed_grids = Counter(node.grid_x for node in k6_nodes)
         expected_runtime_count = len(expected_rows)
         expected_plan_count = plan_bound_counts.get(role, 0) if role else 0

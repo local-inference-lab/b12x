@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,8 @@ from benchmarks.benchmark_trellis_k6_mcg_checkpoint import (
     _parse_rows,
     _resolve_checkpoint_binding,
     _sample_statistics,
+    _run,
+    _temporary_k6_mcg_grid_override,
     _tensor_metrics,
     _metrics_pass,
     parse_cuda_graph_dot,
@@ -127,6 +130,49 @@ def test_sample_statistics_retains_dispersion() -> None:
     assert report["mad_ms"] == 1.0
     assert report["p10_ms"] == pytest.approx(1.3)
     assert report["p90_ms"] == pytest.approx(3.7)
+
+
+def test_run_rejects_unbalanced_route_iterations_before_cuda() -> None:
+    args = SimpleNamespace(
+        compile_warmups=1,
+        cold_replays=1,
+        warmups=1,
+        iterations=5,
+        replay_checks=1,
+    )
+
+    with pytest.raises(ValueError, match="multiple of 6"):
+        _run(args, {})
+
+
+def test_temporary_grid_override_restores_planner_state() -> None:
+    from b12x.gemm.trellis_linear import _k6_mcg_cute
+
+    table = _k6_mcg_cute._MEASURED_GRID_CTA
+    existing_shape = (2048, 4096)
+    previous = table[existing_shape]
+    with (
+        pytest.raises(RuntimeError, match="prepare failed"),
+        _temporary_k6_mcg_grid_override(
+            size_k=existing_shape[0],
+            size_n=existing_shape[1],
+            requested_grid_x=previous + 1,
+        ) as report,
+    ):
+        assert table[existing_shape] == previous + 1
+        assert report is not None
+        raise RuntimeError("prepare failed")
+    assert table[existing_shape] == previous
+
+    absent_shape = (123, 456)
+    assert absent_shape not in table
+    with _temporary_k6_mcg_grid_override(
+        size_k=absent_shape[0],
+        size_n=absent_shape[1],
+        requested_grid_x=7,
+    ):
+        assert table[absent_shape] == 7
+    assert absent_shape not in table
 
 
 def test_topk_gate_allows_only_numerically_ambiguous_boundary_swap() -> None:

@@ -10,6 +10,7 @@ import torch
 from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.gemm import trellis_linear
 from b12x.gemm.trellis_linear import _k6_mcg_cute
+from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
 
 
 def _weight_descriptor(**overrides):
@@ -158,9 +159,12 @@ def _buffers(
 ) -> dict[str, torch.Tensor]:
     return {
         "output": torch.empty((rows, size_n), dtype=dtype, device=device),
-        # ``rotated_f16`` is the legacy public parameter name. The fused path
-        # requires this caller-owned scratch to match the activation dtype.
-        "rotated_f16": torch.empty((rows, size_k), dtype=dtype, device=device),
+        "rotated_f16": torch.empty(
+            (rows, size_k), dtype=torch.float16, device=device
+        ),
+        "rotated_compute": torch.empty(
+            (rows, size_k), dtype=dtype, device=device
+        ),
         "c_tmp": torch.empty(
             (trellis_linear.k6_mcg_small_m_scratch_elements(size_k, size_n),),
             dtype=torch.float32,
@@ -262,12 +266,6 @@ def test_fused_k6_mcg_matches_separate_rotation_pipeline(
     assert not _k6_mcg_cute.is_k6_mcg_small_m_eligible(noncontiguous, weight)
 
     reference_buffers = _buffers(rows, size_k, size_n, device, dtype)
-    if dtype == torch.bfloat16:
-        # The generic comparator preserves its legacy FP16 rotation boundary;
-        # the fused candidate keeps the selected BF16 activation boundary.
-        reference_buffers["rotated_f16"] = torch.empty(
-            (rows, size_k), dtype=torch.float16, device=device
-        )
     reference = trellis_linear.run(
         source,
         weight,
@@ -352,7 +350,7 @@ def test_fused_k6_mcg_cuda_graph_replay_is_stable(
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("missing", ["output", "rotated_f16", "c_tmp"])
+@pytest.mark.parametrize("missing", ["output", "rotated_compute", "c_tmp"])
 def test_fused_k6_mcg_capture_requires_caller_owned_buffers(
     missing: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -378,3 +376,56 @@ def test_fused_k6_mcg_capture_requires_caller_owned_buffers(
 
     with pytest.raises(RuntimeError, match="CUDA graph capture"):
         trellis_linear.run(source, weight, **buffers)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_fused_k6_mcg_declines_generic_sized_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = 8
+    size_k = size_n = 128
+    trellis = torch.zeros(
+        (size_k // 16, size_n // 16, 96), dtype=torch.int16, device=device
+    )
+    signs = torch.ones(size_k, dtype=torch.float16, device=device)
+    weight = trellis_linear.prepare_weight(
+        trellis,
+        signs,
+        signs.clone(),
+        codebook="mcg",
+        params_dtype=torch.bfloat16,
+    )
+    source = torch.zeros((rows, size_k), dtype=torch.bfloat16, device=device)
+    buffers = {
+        "output": torch.empty_like(source),
+        "gemm_output": torch.empty_like(source),
+        "c_tmp": torch.empty((size_n * 64,), dtype=torch.float32, device=device),
+        "input_f16": torch.empty_like(source, dtype=torch.float16),
+        "rotated_f16": torch.empty_like(source, dtype=torch.float16),
+        "rotated_compute": torch.empty_like(source),
+        "gemm_output_f16": torch.empty_like(source, dtype=torch.float16),
+        "output_f16": torch.empty_like(source, dtype=torch.float16),
+    }
+
+    monkeypatch.setattr(
+        _k6_mcg_cute,
+        "k6_mcg_small_m_scratch_elements",
+        lambda _size_k, _size_n: int(buffers["c_tmp"].numel()) + 1,
+    )
+
+    def fail_fused(*_args, **_kwargs):
+        pytest.fail("undersized fused scratch must decline the fused route")
+
+    monkeypatch.setattr(_k6_mcg_cute, "run_k6_mcg_small_m", fail_fused)
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_resolve_exl3_hadamard_128",
+        lambda _callback: _hadamard_128_reference,
+    )
+
+    actual = trellis_linear.run(source, weight, **buffers)
+    torch.cuda.synchronize(device)
+
+    assert actual is buffers["output"]
+    assert torch.isfinite(actual).all()
