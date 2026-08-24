@@ -145,6 +145,19 @@ def test_run_rejects_unbalanced_route_iterations_before_cuda() -> None:
         _run(args, {})
 
 
+def test_run_rejects_unbalanced_cold_replays_before_cuda() -> None:
+    args = SimpleNamespace(
+        compile_warmups=1,
+        cold_replays=5,
+        warmups=1,
+        iterations=6,
+        replay_checks=1,
+    )
+
+    with pytest.raises(ValueError, match="--cold-replays must be a multiple of 6"):
+        _run(args, {})
+
+
 def test_temporary_grid_override_restores_planner_state() -> None:
     from b12x.gemm.trellis_linear import _k6_mcg_cute
 

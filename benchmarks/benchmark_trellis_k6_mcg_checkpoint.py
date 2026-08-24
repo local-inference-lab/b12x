@@ -1400,6 +1400,11 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
             f"--iterations must be a multiple of {order_count} to keep route "
             "ordering balanced"
         )
+    if args.cold_replays % order_count:
+        raise ValueError(
+            f"--cold-replays must be a multiple of {order_count} to keep "
+            "route ordering balanced"
+        )
     if not torch.cuda.is_available():
         raise QualificationError("CUDA is required")
     device = torch.device(args.device)

@@ -988,7 +988,7 @@ def _compile_k6_mcg_small_m_current_device(
         ),
         dsl_compile_options=OptLevel(2),
     )
-    # Resolve and retain this ABI tensor at the model-load planning boundary.
+    # Resolve and retain the trellis LUT at the model-load planning boundary.
     # MCG does not read the table, but the shared launch signature requires a
     # stable device pointer and CUDA graph capture must never populate its
     # process-global cache.

@@ -181,6 +181,68 @@ def test_planning_rejects_invalid_static_workspace_before_serving() -> None:
     with pytest.raises(ValueError, match="workspace"):
         _k6_mcg_cute.plan_k6_mcg_small_m(invalid)
 
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_bound_fused_dispatch_skips_generic_static_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = 1
+    size_k = size_n = 128
+    scratch_elements = trellis_linear.k6_mcg_small_m_scratch_elements(
+        size_k, size_n
+    )
+    launch = _k6_mcg_cute.K6McgSmallMCompileResult(
+        compiled=None,
+        device_index=int(device.index),
+        size_k=size_k,
+        size_n=size_n,
+        params_dtype=torch.float16,
+        grid_x=1,
+        cta_threads=256,
+        resident_ctas=1,
+        blocks_per_sm=1,
+        shared_memory_bytes=0,
+        required_scratch_elements=scratch_elements,
+        required_workspace_elements=1,
+        trellis_lut=torch.empty(1, dtype=torch.uint8, device=device),
+    )
+    # A bound launch is the immutable serving contract. Deliberately omit every
+    # generic static weight attribute so any per-call revalidation fails here.
+    prepared = SimpleNamespace(k6_mcg_small_m_launch=launch)
+    source = torch.zeros((rows, size_k), dtype=torch.float16, device=device)
+    output = torch.empty((rows, size_n), dtype=torch.float16, device=device)
+    rotated = torch.empty_like(source)
+    c_tmp = torch.empty(scratch_elements, dtype=torch.float32, device=device)
+    calls: list[tuple[torch.Tensor, object]] = []
+
+    def fake_run(
+        actual_source,
+        actual_prepared,
+        *,
+        output,
+        rotated,
+        c_tmp,
+    ):
+        calls.append((actual_source, actual_prepared))
+        return output
+
+    monkeypatch.setattr(_k6_mcg_cute, "run_k6_mcg_small_m", fake_run)
+
+    actual = w4a16_kernel._run_trellis256_dense_current_device(
+        source,
+        prepared,
+        output=output,
+        rotated_compute=rotated,
+        c_tmp=c_tmp,
+    )
+
+    assert actual is output
+    assert len(calls) == 1
+    assert calls[0][0] is source
+    assert calls[0][1] is prepared
+
+
 def _buffers(
     rows: int,
     size_k: int,
