@@ -11328,13 +11328,9 @@ def _run_trellis256_dense_current_device(
     # FP16/BF16 K6/MCG payload. Runtime admission checks dynamic input and call
     # controls without resolving a kernel or duplicating weight policy.
     small_m_launch = getattr(prepared_dense, "k6_mcg_small_m_launch", None)
-    if small_m_launch is not None and (
-        getattr(small_m_launch, "params_dtype", None) != compute_dtype
-        or x.dtype != compute_dtype
-    ):
+    if small_m_launch is not None and x.dtype != compute_dtype:
         raise TypeError(
-            "bound K6/MCG launch, prepared weight, and input must use one dtype: "
-            f"launch={getattr(small_m_launch, 'params_dtype', None)}, "
+            "bound K6/MCG weight and input must use one dtype: "
             f"prepared={compute_dtype}, input={x.dtype}"
         )
     if (
@@ -11344,11 +11340,10 @@ def _run_trellis256_dense_current_device(
         and _force_tile_config is None
     ):
         from b12x.gemm.trellis_linear._k6_mcg_cute import (
-            k6_mcg_small_m_scratch_elements,
             run_k6_mcg_small_m,
         )
 
-        fused_scratch_elements = k6_mcg_small_m_scratch_elements(size_k, size_n)
+        fused_scratch_elements = int(small_m_launch.required_scratch_elements)
         fused_c_tmp_compatible = c_tmp is None or (
             c_tmp.dtype == torch.float32
             and c_tmp.device == x.device

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -108,6 +109,9 @@ def test_rotation_grid_and_gemm_grid_have_independent_capacity() -> None:
         resident_ctas=376,
         blocks_per_sm=2,
         shared_memory_bytes=0,
+        required_scratch_elements=65536,
+        required_workspace_elements=1,
+        trellis_lut=torch.empty(1, dtype=torch.uint8),
     )
 
     assert launch.launch_grid_x(1) == 32
@@ -128,6 +132,9 @@ def test_bound_launch_rejects_non_cuda_runtime_inputs() -> None:
         resident_ctas=1,
         blocks_per_sm=1,
         shared_memory_bytes=0,
+        required_scratch_elements=2048,
+        required_workspace_elements=1,
+        trellis_lut=torch.empty(1, dtype=torch.uint8),
     )
 
     assert not launch.accepts_input(torch.empty((1, 128), dtype=torch.float16))
@@ -149,6 +156,30 @@ def _sm12x_available() -> bool:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return int(props.major) == 12
 
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_planning_rejects_invalid_static_workspace_before_serving() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    size_k = size_n = 128
+    trellis = torch.zeros(
+        (size_k // 16, size_n // 16, 96), dtype=torch.int16, device=device
+    )
+    signs = torch.ones(size_k, dtype=torch.float16, device=device)
+    weight = trellis_linear.prepare_weight(
+        trellis,
+        signs,
+        signs.clone(),
+        codebook="mcg",
+        params_dtype=torch.float16,
+    )
+    invalid = replace(
+        weight,
+        workspace=torch.empty(1, dtype=torch.int32, device=device),
+        k6_mcg_small_m_launch=None,
+    )
+
+    with pytest.raises(ValueError, match="workspace"):
+        _k6_mcg_cute.plan_k6_mcg_small_m(invalid)
 
 def _buffers(
     rows: int,
@@ -306,6 +337,7 @@ def test_fused_k6_mcg_cuda_graph_replay_is_stable(
     size_k: int,
     size_n: int,
     dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(0x4B364752)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -328,6 +360,14 @@ def test_fused_k6_mcg_cuda_graph_replay_is_stable(
     assert isinstance(
         weight.k6_mcg_small_m_launch, _k6_mcg_cute.K6McgSmallMCompileResult
     )
+    launch = weight.k6_mcg_small_m_launch
+    assert launch.trellis_lut.device == device
+    assert launch.trellis_lut.dtype == torch.uint8
+    assert launch.required_workspace_elements <= int(weight.workspace.numel())
+    assert (
+        launch.required_scratch_elements
+        == trellis_linear.k6_mcg_small_m_scratch_elements(size_k, size_n)
+    )
     source = (torch.randn((rows, size_k), device=device) * 0.05).to(dtype)
     buffers = _buffers(rows, size_k, size_n, device, dtype)
     _k6_mcg_cute.clear_k6_mcg_small_m_cache()
@@ -336,6 +376,14 @@ def test_fused_k6_mcg_cuda_graph_replay_is_stable(
         expected = trellis_linear.run(source, weight, **buffers).clone()
         torch.cuda.synchronize(device)
 
+        def fail_late_lut_resolution(*_args, **_kwargs):
+            pytest.fail("runtime launch must reuse the LUT bound during preparation")
+
+        monkeypatch.setattr(
+            _k6_mcg_cute,
+            "sqg_xor_cheb_t12_lut",
+            fail_late_lut_resolution,
+        )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = trellis_linear.run(source, weight, **buffers)
@@ -408,10 +456,12 @@ def test_fused_k6_mcg_declines_generic_sized_scratch(
         "output_f16": torch.empty_like(source, dtype=torch.float16),
     }
 
-    monkeypatch.setattr(
-        _k6_mcg_cute,
-        "k6_mcg_small_m_scratch_elements",
-        lambda _size_k, _size_n: int(buffers["c_tmp"].numel()) + 1,
+    weight = replace(
+        weight,
+        k6_mcg_small_m_launch=replace(
+            weight.k6_mcg_small_m_launch,
+            required_scratch_elements=int(buffers["c_tmp"].numel()) + 1,
+        ),
     )
 
     def fail_fused(*_args, **_kwargs):

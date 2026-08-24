@@ -16,7 +16,7 @@ explicit pair metadata and must use the generic dense Trellis scheduler.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -94,6 +94,9 @@ class K6McgSmallMCompileResult:
     resident_ctas: int
     blocks_per_sm: int
     shared_memory_bytes: int
+    required_scratch_elements: int
+    required_workspace_elements: int
+    trellis_lut: torch.Tensor = field(repr=False, compare=False)
 
     def accepts_input(self, x: torch.Tensor) -> bool:
         """Return whether a runtime input matches this bound launch."""
@@ -956,6 +959,7 @@ def _compile_k6_mcg_small_m_current_device(
 
     trellis_elements = (int(size_k) // 16) * (int(size_n) // 16) * 48
     scratch_elements = k6_mcg_small_m_scratch_elements(size_k, size_n)
+    workspace_elements = 4 * int(kernel.sms) + _BARRIER_WORDS
     compile_args = (
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         tensor(cutlass.Int32, trellis_elements),
@@ -984,6 +988,11 @@ def _compile_k6_mcg_small_m_current_device(
         ),
         dsl_compile_options=OptLevel(2),
     )
+    # Resolve and retain this ABI tensor at the model-load planning boundary.
+    # MCG does not read the table, but the shared launch signature requires a
+    # stable device pointer and CUDA graph capture must never populate its
+    # process-global cache.
+    trellis_lut = sqg_xor_cheb_t12_lut(device)
     result = K6McgSmallMCompileResult(
         compiled=compiled,
         device_index=device_index,
@@ -995,9 +1004,57 @@ def _compile_k6_mcg_small_m_current_device(
         resident_ctas=int(resident_ctas),
         blocks_per_sm=int(kernel.blocks_per_sm),
         shared_memory_bytes=int(kernel.shared_words * 4),
+        required_scratch_elements=int(scratch_elements),
+        required_workspace_elements=int(workspace_elements),
+        trellis_lut=trellis_lut,
     )
     _CACHE[cache_key] = result
     return result
+
+
+def _validate_k6_mcg_small_m_prepared_contract(
+    prepared,
+    launch: K6McgSmallMCompileResult,
+) -> None:
+    """Validate immutable weight, launch, workspace, and LUT bindings once."""
+    device = prepared.trellis.device
+    device_index = int(device.index if device.index is not None else 0)
+    if (
+        launch.device_index != device_index
+        or launch.size_k != int(prepared.in_features)
+        or launch.size_n != int(prepared.out_features)
+        or launch.params_dtype != prepared.params_dtype
+    ):
+        raise RuntimeError(
+            "compiled K6/MCG launch does not match its prepared weight contract"
+        )
+
+    workspace = prepared.workspace
+    if (
+        workspace.dtype != torch.int32
+        or int(workspace.numel()) < launch.required_workspace_elements
+        or workspace.device != device
+        or not workspace.is_contiguous()
+        or int(workspace.data_ptr()) % 16 != 0
+    ):
+        raise ValueError(
+            "prepared K6/MCG workspace must be contiguous, 16-byte-aligned "
+            f"int32 on {device} with at least "
+            f"{launch.required_workspace_elements} elements"
+        )
+
+    trellis_lut = launch.trellis_lut
+    if (
+        trellis_lut.dtype != torch.uint8
+        or trellis_lut.device != device
+        or not trellis_lut.is_contiguous()
+        or int(trellis_lut.numel()) < 1
+        or int(trellis_lut.data_ptr()) % 16 != 0
+    ):
+        raise RuntimeError(
+            "bound K6/MCG LUT must be non-empty, contiguous, 16-byte-aligned "
+            f"uint8 on {device}"
+        )
 
 
 def plan_k6_mcg_small_m(prepared) -> K6McgSmallMCompileResult | None:
@@ -1009,12 +1066,14 @@ def plan_k6_mcg_small_m(prepared) -> K6McgSmallMCompileResult | None:
     """
     if _STANDALONE_K6_DISABLED or not _is_unpaired_k6_mcg_weight(prepared):
         return None
-    return compile_k6_mcg_small_m(
+    launch = compile_k6_mcg_small_m(
         size_k=int(prepared.in_features),
         size_n=int(prepared.out_features),
         params_dtype=prepared.params_dtype,
         device=prepared.trellis.device,
     )
+    _validate_k6_mcg_small_m_prepared_contract(prepared, launch)
+    return launch
 
 
 def run_k6_mcg_small_m(
@@ -1032,21 +1091,10 @@ def run_k6_mcg_small_m(
             "prepared K6/MCG weight has no bound small-row launch; prepare the "
             "weight through b12x.gemm.trellis_linear.prepare_weight"
         )
-    prepared_dtype = getattr(prepared, "params_dtype", None)
-    if launch.params_dtype != prepared_dtype:
-        raise RuntimeError(
-            "bound K6/MCG launch dtype does not match its prepared weight: "
-            f"launch={launch.params_dtype}, prepared={prepared_dtype}"
-        )
-    if x.dtype != prepared_dtype:
-        raise TypeError(
-            "K6/MCG input dtype must match the prepared activation dtype: "
-            f"input={x.dtype}, prepared={prepared_dtype}"
-        )
     if not launch.accepts_input(x):
         raise ValueError("input does not satisfy the bound K6/MCG small-row ABI")
     m, size_k = (int(v) for v in x.shape)
-    size_n = int(prepared.out_features)
+    size_n = launch.size_n
     for name, tensor, shape, dtype in (
         ("output", output, (m, size_n), x.dtype),
         ("rotated", rotated, (m, size_k), x.dtype),
@@ -1070,34 +1118,12 @@ def run_k6_mcg_small_m(
         raise ValueError(
             "c_tmp must be contiguous, aligned float32 on the input device"
         )
-    required_workspace = (
-        4 * int(torch.cuda.get_device_properties(x.device).multi_processor_count)
-        + _BARRIER_WORDS
-    )
-    if (
-        prepared.workspace.dtype != torch.int32
-        or int(prepared.workspace.numel()) < required_workspace
-        or prepared.workspace.device != x.device
-        or not prepared.workspace.is_contiguous()
-    ):
-        raise ValueError(
-            "prepared K6/MCG workspace must provide four lock words per SM and "
-            "one cooperative barrier word"
-        )
-    if launch.size_n != size_n:
-        raise ValueError(
-            "prepared K6/MCG launch does not match the projection output size: "
-            f"launch={launch.size_n}, prepared={size_n}"
-        )
     launch_grid_x = launch.launch_grid_x(m)
-    required_scratch = max(
-        k6_mcg_small_m_scratch_elements(size_k, size_n),
-        launch.grid_x * _ROUTE_BLOCK * _TILE_N,
-    )
-    if int(c_tmp.numel()) < required_scratch:
+    if int(c_tmp.numel()) < launch.required_scratch_elements:
         raise ValueError(
             "K6/MCG split-K scratch is too small: "
-            f"required={required_scratch}, got={int(c_tmp.numel())}"
+            f"required={launch.required_scratch_elements}, "
+            f"got={int(c_tmp.numel())}"
         )
     cutlass_dtype = (
         cutlass.Float16 if x.dtype == torch.float16 else cutlass.BFloat16
@@ -1138,9 +1164,7 @@ def run_k6_mcg_small_m(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        # MCG does not consume the LUT ABI slot, but the shared W4A16 launch
-        # signature still requires a stable device tensor there.
-        sqg_xor_cheb_t12_lut(x.device),
+        launch.trellis_lut,
         m,
         launch_grid_x,
         launch.grid_x,
