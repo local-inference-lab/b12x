@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,16 @@ from b12x.moe.fused_moe._impl import (
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.w4a8.weights import repack_w4a8_weights
+from b12x.moe.fused_moe.config import PackedConfig
+
+
+def _attach_test_config(plan):
+    # Private recipe tests can construct states that are intentionally outside
+    # the public checkpoint planner. Caps still receives an immutable config.
+    return replace(
+        plan,
+        checkpoint_config=PackedConfig(source_format="fp4_e8m0_k32"),
+    )
 
 
 def _weight_plan(
@@ -32,7 +43,7 @@ def _weight_plan(
     activation: str = "silu",
     w4a16_layout: PreparedWeightLayout | None = None,
 ):
-    return plan_b12x_fp4_moe_weights(
+    return _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes=quant_mode,
         source_format=source_format,
         activation=activation,
@@ -41,7 +52,7 @@ def _weight_plan(
         hidden_size=k,
         intermediate_size=n,
         w4a16_layout=w4a16_layout,
-    )
+    ))
 
 
 def _caps(**overrides) -> TPMoEScratchCaps:
@@ -50,8 +61,8 @@ def _caps(**overrides) -> TPMoEScratchCaps:
         device="cpu",
         max_tokens=4,
         num_topk=2,
+        config=weight_plan.checkpoint_config,
         weight_plan=weight_plan,
-        quant_mode=next(iter(weight_plan.quant_modes)),
     )
     values.update(overrides)
     return TPMoEScratchCaps(**values)
@@ -207,7 +218,7 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
         w2_scale_original.clamp(max=247).contiguous(),
     )
 
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="fp4_e8m0_k32",
         activation="silu",
@@ -216,7 +227,7 @@ def test_explicit_w4a8_mx_prepares_native_e8m0_source_in_place() -> None:
         hidden_size=k,
         intermediate_size=n,
         w13_layout="w31",
-    )
+    ))
     prepared = prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w1_source,
@@ -498,10 +509,10 @@ def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     )
     base_caps = dict(
         device="cpu",
+        config=weight_plan.checkpoint_config,
         weight_plan=weight_plan,
         num_topk=8,
         route_num_experts=0,
-        quant_mode="w4a16",
     )
     plan_4080 = plan_tp_moe_scratch(
         TPMoEScratchCaps(max_tokens=4080, core_token_counts=(4080,), **base_caps)
@@ -530,7 +541,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
 ) -> None:
     """Trellis must not pay the generic W4A16 compile-bucket memory cost."""
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         trellis_codebook="mcg",
@@ -541,7 +552,7 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
         intermediate_size=512,
         trellis_bits=3,
         trellis_tile_config=(64, 256, 64, 256),
-    )
+    ))
     plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=3072,
@@ -549,8 +560,8 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
             num_topk=8,
             route_num_experts=0,
             device="cpu",
+            config=weight_plan.checkpoint_config,
             weight_plan=weight_plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=64,
         )
     )
@@ -580,7 +591,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         "_plan_full_rotation_w4a16_launches",
         lambda **_kwargs: ((), ()),
     )
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         trellis_codebook="mcg",
@@ -591,15 +602,15 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         intermediate_size=512,
         trellis_bits=3,
         trellis_tile_config=(64, 256, 64, 256),
-    )
+    ))
     caps = TPMoEScratchCaps(
         max_tokens=3072,
         core_token_counts=(3072,),
         num_topk=8,
         route_num_experts=0,
         device="cpu",
+        config=weight_plan.checkpoint_config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
     )
 
     plan = plan_tp_moe_scratch(caps)
@@ -612,7 +623,7 @@ def test_trellis_scratch_plan_resolves_default_route_block(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
     """The real planner must cover every fixed decode and route-pack variant."""
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         trellis_codebook="mcg",
@@ -623,7 +634,7 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
         intermediate_size=128,
         trellis_bits=3,
         trellis_tile_config=(64, 128, 64, 128),
-    )
+    ))
     plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=4,
@@ -631,8 +642,8 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
             num_topk=2,
             route_num_experts=8,
             device="cuda",
+            config=weight_plan.checkpoint_config,
             weight_plan=weight_plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=8,
         )
     )
@@ -669,7 +680,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         "_plan_full_rotation_w4a16_launches",
         lambda **_kwargs: (fused_launches, sums),
     )
-    weight_plan = plan_b12x_fp4_moe_weights(
+    weight_plan = _attach_test_config(plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         trellis_codebook="mcg",
@@ -680,7 +691,7 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         intermediate_size=128,
         trellis_bits=3,
         trellis_tile_config=(64, 128, 64, 128),
-    )
+    ))
     plan = plan_tp_moe_scratch(
         TPMoEScratchCaps(
             max_tokens=4,
@@ -688,8 +699,8 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
             num_topk=2,
             route_num_experts=0,
             device="cpu",
+            config=weight_plan.checkpoint_config,
             weight_plan=weight_plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=8,
         )
     )

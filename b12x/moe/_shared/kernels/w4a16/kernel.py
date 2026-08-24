@@ -3811,7 +3811,10 @@ class W4A16GemmKernel:
             for jj in cutlass.range_constexpr(4):
                 local_n16 = Int32(4) * w_n + Int32(jj)
                 tile_base = Int32(0)
-                if cutlass.const_expr(int(low_bits) == int(high_bits)):
+                # CuTe must specialize the payload width before evaluating the
+                # device-side row predicate, so these equal bodies cannot be
+                # combined into one Python boolean expression.
+                if cutlass.const_expr(int(low_bits) == int(high_bits)):  # noqa: SIM114
                     tile_base = kt_base_u32 + local_n16 * Int32(8 * low_bits)
                     wa[jj], wb[jj] = self._load_trellis256_pair_tile_windows(
                         b_region, tile_base, lane, low_bits

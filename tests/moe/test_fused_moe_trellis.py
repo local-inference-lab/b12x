@@ -23,6 +23,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     _PreparedWeightRepresentation,
+    plan_b12x_fp4_moe_weights,
 )
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_xor_cheb_t12_direct_lut_cpu,
@@ -53,7 +54,9 @@ def _weight_plan(
     codebook: str = "mcg",
     coupled_hadamard: bool | None = None,
 ) -> fused_moe.WeightsPlan:
-    return fused_moe.plan_weights(
+    # These tests deliberately exercise private historical kernel recipes that
+    # are not representable by the canonical checkpoint schema.
+    plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         activation=activation,
@@ -66,6 +69,12 @@ def _weight_plan(
         trellis_codebook=codebook,
         trellis_tile_config=tile_config,
         coupled_hadamard=coupled_hadamard,
+    )
+    return replace(
+        plan,
+        checkpoint_config=fused_moe.PackedConfig(
+            source_format="fp4_e8m0_k32"
+        ),
     )
 
 
@@ -89,8 +98,8 @@ def _caps(**overrides) -> fused_moe.Caps:
         input_dtype=values.pop("input_dtype"),
     )
     return fused_moe.Caps(
+        config=weight_plan.checkpoint_config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
         **values,
     )
 
@@ -218,12 +227,12 @@ def _plan(
 ) -> fused_moe.Plan:
     return fused_moe.plan(
         fused_moe.Caps(
+            config=weights.plan.checkpoint_config,
             max_tokens=max_tokens,
             num_topk=num_topk,
             route_num_experts=route_num_experts,
             device=device,
             weight_plan=weights.plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=block_size_m,
         )
     )
@@ -1185,7 +1194,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
     )
     route_map = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=device)
     output_map = torch.tensor([-1, 0, -1, 1], dtype=torch.int32, device=device)
-    external_output = torch.empty((2, hidden), dtype=torch.float32, device=device)
+    external_output = torch.empty((2, hidden), dtype=input_dtype, device=device)
 
     mapped = fused_moe.bind(
         plan,
@@ -1214,7 +1223,12 @@ def test_planned_full_rotation_matches_reference_and_captures(
     identity_output = identity.run()
     torch.cuda.synchronize(device)
     assert identity_output.dtype == torch.float32
-    assert torch.allclose(identity_output, mapped_eager, rtol=2.0e-3, atol=2.0e-3)
+    torch.testing.assert_close(
+        mapped_eager,
+        identity_output.to(input_dtype),
+        rtol=0,
+        atol=0,
+    )
 
     reference = _reference_full_rotation(
         x,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Tuple
 
 import pytest
@@ -89,11 +90,19 @@ def prepare_tp_moe_fp4_experts(
 ):
     """Prepare one explicit expert owner from source tensors for a test."""
     from b12x.moe import fused_moe
+    from b12x.moe.fused_moe._impl import (
+        plan_b12x_fp4_moe_weights,
+        prepare_b12x_fp4_moe_weights,
+    )
 
     normalized_mode = quant_mode.lower()
     weight_E = int(w1_fp4.shape[0])
     n = int(w2_fp4.shape[2]) * 2
-    weight_plan = fused_moe.plan_weights(
+    config = fused_moe.PackedConfig(
+        source_format=source_format,
+        w13_layout=w13_layout,
+    )
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes=normalized_mode,
         source_format=source_format,
         activation=activation,
@@ -103,12 +112,13 @@ def prepare_tp_moe_fp4_experts(
         intermediate_size=n,
         w13_layout=w13_layout,
     )
+    weight_plan = replace(weight_plan, checkpoint_config=config)
     w1_global_scale = w1_alphas
     w2_global_scale = w2_alphas
     if normalized_mode in {"nvfp4", "w4a8_nvfp4"}:
         w1_global_scale = (w1_alphas.float() * a1_gscale.float()).contiguous()
         w2_global_scale = (w2_alphas.float() * a2_gscale.float()).contiguous()
-    return fused_moe.prepare_weights(
+    return prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         w1_fp4=w1_fp4,
         w1_blockscale=w1_blockscale,
@@ -133,7 +143,6 @@ def make_tp_moe_fp4_binding(
     input_scales_static: bool = False,
     fast_math: bool | None = None,
     quant_mode: str | None = None,
-    unit_scale_contract: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -141,21 +150,25 @@ def make_tp_moe_fp4_binding(
     from b12x.moe import fused_moe
 
     modes = experts.plan.quant_modes
-    if quant_mode is None:
-        if len(modes) != 1:
-            raise ValueError("quant_mode is required for a multi-recipe expert plan")
-        normalized_mode = next(iter(modes))
-    else:
-        normalized_mode = quant_mode.lower()
+    if len(modes) != 1:
+        raise ValueError("test helper requires a single private recipe")
+    planned_mode = next(iter(modes))
+    if quant_mode is not None and quant_mode.lower() != planned_mode:
+        raise ValueError(
+            f"requested test recipe {quant_mode!r} does not match {planned_mode!r}"
+        )
+    config = experts.plan.checkpoint_config
+    if config is None:
+        raise ValueError("prepared test experts have no checkpoint config")
     plan = fused_moe.plan(
         fused_moe.Caps(
             max_tokens=int(a.shape[0]),
             num_topk=int(topk_ids.shape[1]),
             device=a.device,
+            config=config,
             weight_plan=experts.plan,
             core_token_counts=(int(a.shape[0]),),
             route_num_experts=0,
-            quant_mode=normalized_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
@@ -176,7 +189,6 @@ def make_tp_moe_fp4_binding(
         output=output,
         input_scales_static=input_scales_static,
         fast_math=fast_math,
-        unit_scale_contract=unit_scale_contract,
     )
 
 

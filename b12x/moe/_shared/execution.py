@@ -31,6 +31,7 @@ from enum import Enum
 
 from .trellis_codebooks import (
     CODEBOOKS as _TRELLIS_CODEBOOKS,
+    MCG as _TRELLIS_MCG,
     SQG_E4M3 as _TRELLIS_SQG_E4M3,
     validate_codebook_bits as _validate_trellis_codebook_bits,
 )
@@ -160,9 +161,10 @@ _SOURCE_FORMATS = {
     "fp4_e8m0_k32",
     "compressed_tensors",
     "mxfp6_e2m3",
+    "b12x_trellis",
     "btx",
 }
-_TRELLIS_SOURCE_FORMATS = frozenset({"btx"})
+_TRELLIS_SOURCE_FORMATS = frozenset({"b12x_trellis", "btx"})
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
@@ -173,6 +175,7 @@ _SOURCES_BY_QUANT_MODE = {
             "modelopt_nvfp4",
             "fp4_e8m0_k32",
             "compressed_tensors",
+            "b12x_trellis",
             "btx",
         }
     ),
@@ -276,13 +279,15 @@ class MoEWeightPreparationPlan:
     weight_layouts: frozenset[PreparedWeightLayout]
     scale_layouts: frozenset[PreparedScaleLayout]
     storage_policy: WeightStoragePolicy
+    # Public checkpoint configuration captured by the normal plan/prepare
+    # lifecycle. Runtime policy remains in the private MoE specs above.
+    checkpoint_config: object | None = None
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
     coupled_hadamard: bool = False
-    # BTX declarations: the manifest-declared codebook, rate structure,
-    # pair-kind summary, and coupled-Hadamard block widths.
+    # Trellis declarations used by preparation and private kernel planning.
     trellis_codebook: str | None = None
-    trellis_rate_structure: str | None = None
+    trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
     coupled_hadamard_blocks: tuple[int, int] | None = None
 
@@ -322,13 +327,13 @@ class MoEWeightPreparationPlan:
             )
             if codebook not in _TRELLIS_CODEBOOKS:
                 raise ValueError(
-                    "btx weights require trellis_codebook in "
+                    "Trellis weights require trellis_codebook in "
                     f"{sorted(_TRELLIS_CODEBOOKS)}; got "
                     f"{self.trellis_codebook!r}"
                 )
             _validate_trellis_codebook_bits(codebook, bits)
             if codebook == "mcg" and bits == 2:
-                raise ValueError("mcg btx weights require trellis_bits>=3")
+                raise ValueError("MCG Trellis weights require trellis_bits>=3")
             object.__setattr__(self, "trellis_codebook", codebook)
             tile_config = self.trellis_tile_config or (64, 256, 64, 256)
             tile_config = tuple(int(value) for value in tile_config)
@@ -340,10 +345,10 @@ class MoEWeightPreparationPlan:
                 )
             object.__setattr__(self, "trellis_bits", bits)
             object.__setattr__(self, "trellis_tile_config", tile_config)
-            structure = (
+            granularity = (
                 "uniform"
-                if self.trellis_rate_structure is None
-                else str(self.trellis_rate_structure).lower()
+                if self.trellis_rate_granularity is None
+                else str(self.trellis_rate_granularity).lower()
             )
             pair_kinds = (
                 None
@@ -352,30 +357,30 @@ class MoEWeightPreparationPlan:
                     str(kind).upper() for kind in self.trellis_pair_kinds
                 )
             )
-            if structure == "uniform":
+            if granularity in {"uniform", "per_layer", "per_expert"}:
                 if pair_kinds is not None:
                     raise ValueError(
-                        "uniform btx rates declare no trellis_pair_kinds"
+                        f"{granularity} trellis rates declare no pair kinds"
                     )
-            elif structure == "per_expert_pair":
+            elif granularity == "per_expert_pair":
                 if self.coupled_hadamard:
                     raise ValueError(
-                        "coupled-Hadamard btx execution is qualified "
-                        "only for uniform rate structures"
+                        "coupled-Hadamard Trellis execution is qualified "
+                        "only for uniform rate granularity"
                     )
                 if bits != 3:
                     raise ValueError(
-                        "per-expert-pair btx rates require the "
+                        "per-expert-pair Trellis rates require the "
                         "trellis_bits=3 base specialization"
                     )
                 if pair_kinds is None:
                     raise ValueError(
-                        "per-expert-pair btx rates declare "
+                        "per-expert-pair Trellis rates declare "
                         "trellis_pair_kinds"
                     )
                 if "P44" in pair_kinds:
                     raise ValueError(
-                        "btx pair-kind sets containing P44 (whole-expert"
+                        "Trellis pair-kind sets containing P44 (whole-expert"
                         " K4 tiers) have no fused execution arm; use"
                         " mixed-tier or multi-launch execution"
                     )
@@ -385,13 +390,28 @@ class MoEWeightPreparationPlan:
                     frozenset({"P33", "P43"}),
                 ):
                     raise ValueError(
-                        "btx pair-kind sets must be {P33}, {P33,P24}, "
+                        "Trellis pair-kind sets must be {P33}, {P33,P24}, "
                         f"or {{P33,P43}}; got {sorted(pair_kinds)}"
+                    )
+            elif granularity == "per_expert_projection":
+                if self.coupled_hadamard:
+                    raise ValueError(
+                        "coupled-Hadamard trellis execution requires uniform rates"
+                    )
+                if self.trellis_codebook != _TRELLIS_MCG:
+                    raise ValueError(
+                        "per-expert-projection trellis rates require the mcg codebook"
+                    )
+                if pair_kinds is not None:
+                    raise ValueError(
+                        "per-expert-projection rates do not declare pair kinds"
                     )
             else:
                 raise ValueError(
-                    "trellis_rate_structure must be 'uniform' or "
-                    f"'per_expert_pair'; got {structure!r}"
+                    "trellis rate granularity must be 'uniform', 'per_layer', "
+                    "'per_expert', 'per_expert_pair', or "
+                    "'per_expert_projection'; "
+                    f"got {granularity!r}"
                 )
             blocks = (
                 None
@@ -403,21 +423,23 @@ class MoEWeightPreparationPlan:
             if self.coupled_hadamard:
                 if self.trellis_codebook != _TRELLIS_SQG_E4M3:
                     raise ValueError(
-                        "coupled-Hadamard btx execution is qualified only"
+                        "coupled-Hadamard Trellis execution is qualified only"
                         " for the sqg_e4m3 codebook"
                     )
                 if blocks is None:
                     blocks = (512, 128)
                 if blocks != (512, 128):
                     raise ValueError(
-                        "coupled-Hadamard btx execution implements "
+                        "coupled-Hadamard Trellis execution implements "
                         f"blocks (512, 128); got {blocks}"
                     )
             elif blocks is not None:
                 raise ValueError(
                     "coupled_hadamard_blocks require coupled_hadamard"
                 )
-            object.__setattr__(self, "trellis_rate_structure", structure)
+            object.__setattr__(
+                self, "trellis_rate_granularity", granularity
+            )
             object.__setattr__(self, "trellis_pair_kinds", pair_kinds)
             object.__setattr__(self, "coupled_hadamard_blocks", blocks)
         elif (
@@ -425,7 +447,7 @@ class MoEWeightPreparationPlan:
             or self.trellis_tile_config is not None
             or self.coupled_hadamard
             or self.trellis_codebook is not None
-            or self.trellis_rate_structure is not None
+            or self.trellis_rate_granularity is not None
             or self.trellis_pair_kinds is not None
             or self.coupled_hadamard_blocks is not None
         ):
@@ -726,7 +748,7 @@ def plan_moe_weight_preparation(
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     coupled_hadamard: bool | None = None,
     trellis_codebook: str | None = None,
-    trellis_rate_structure: str | None = None,
+    trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Iterable[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
@@ -811,11 +833,11 @@ def plan_moe_weight_preparation(
                     and str(trellis_codebook).lower() != "sqg_e4m3"
                 ):
                     raise ValueError(
-                        "W4A8-MX btx execution requires the sqg_e4m3 codebook"
+                        "W4A8-MX Trellis execution requires the sqg_e4m3 codebook"
                     )
                 if (
-                    trellis_rate_structure is not None
-                    and str(trellis_rate_structure).lower() != "uniform"
+                    trellis_rate_granularity is not None
+                    and str(trellis_rate_granularity).lower() != "uniform"
                 ):
                     # The W4A8 kernels decode one compile-time rate for the
                     # whole payload; the mixed-rate pair machinery is
@@ -873,14 +895,14 @@ def plan_moe_weight_preparation(
             if source_format in _TRELLIS_SOURCE_FORMATS:
                 if spec.activation not in {"silu", "situ"}:
                     raise ValueError(
-                        "EXL3 Trellis W4A16 currently requires silu or situ"
+                        "Trellis W4A16 currently requires silu or situ"
                     )
                 if requested_w4a16_layout not in {
                     None,
                     PreparedWeightLayout.TRELLIS_NATIVE,
                 }:
                     raise ValueError(
-                        "EXL3 Trellis W4A16 requires trellis_native layout"
+                        "Trellis W4A16 requires trellis_native layout"
                     )
                 transforms.add(WeightPreparationTransform.W4A16_TRELLIS)
                 weight_layouts.add(PreparedWeightLayout.TRELLIS_NATIVE)
@@ -970,7 +992,7 @@ def plan_moe_weight_preparation(
         trellis_tile_config=trellis_tile_config,
         coupled_hadamard=coupled_hadamard,
         trellis_codebook=trellis_codebook,
-        trellis_rate_structure=trellis_rate_structure,
+        trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=(
             None
             if trellis_pair_kinds is None

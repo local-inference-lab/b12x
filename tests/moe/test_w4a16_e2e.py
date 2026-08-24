@@ -2208,27 +2208,30 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
     )
     w1_global = torch.ones(local_experts, dtype=torch.float32, device=device)
     w2_global = torch.ones(local_experts, dtype=torch.float32, device=device)
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
+    config = fused_moe.PackedConfig(
         source_format="fp4_e8m0_k32",
+        w13_layout="w13",
+    )
+    weight_plan = fused_moe.plan_weights(
+        config=config,
         activation=activation,
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        w13_layout="w13",
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
-        params_dtype=torch.bfloat16,
-        w1_fp4=w1,
-        w1_blockscale=w1_scale,
-        w1_global_scale=w1_global,
-        a1_gscale=torch.ones_like(w1_global),
-        w2_fp4=w2,
-        w2_blockscale=w2_scale,
-        w2_global_scale=w2_global,
-        a2_gscale=torch.ones_like(w2_global),
+        weights=fused_moe.PackedWeights(
+            w13=w1,
+            w2=w2,
+            w13_block_scales=w1_scale,
+            w2_block_scales=w2_scale,
+            w13_global_scales=w1_global,
+            w2_global_scales=w2_global,
+            input_scale=torch.ones_like(w1_global),
+            intermediate_scale=torch.ones_like(w2_global),
+        ),
     )
     plan = fused_moe.plan(
         fused_moe.Caps(
@@ -2236,8 +2239,8 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
             num_topk=topk,
             route_num_experts=global_experts,
             device=device,
+            config=config,
             weight_plan=prepared.plan,
-            quant_mode="w4a16",
             core_token_counts=(1, 8),
             frozen=True,
         )
@@ -2262,7 +2265,6 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         topk_ids=topk_ids,
         output=output,
         input_scales_static=True,
-        unit_scale_contract=True,
         route_expert_map=expert_map,
     )
     legacy_ids = torch.zeros_like(topk_ids)
@@ -2277,7 +2279,6 @@ def test_w4a16_scratch_plan_mapped_decode_is_graph_safe(
         topk_ids=legacy_ids,
         output=legacy_output,
         input_scales_static=True,
-        unit_scale_contract=True,
     )
 
     def route_pack_must_not_run(*args, **kwargs):

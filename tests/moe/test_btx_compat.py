@@ -17,6 +17,7 @@ from b12x.moe._shared.kernels.w4a16.btx import prepare_btx_moe_weights
 from b12x.moe._shared.kernels.w4a16.btx_compat import (
     lift_qsrt_atoms_v1_extent,
     lift_qsrt_atoms_v2_extent,
+    lift_qsrt_atoms_v3_extent,
 )
 from b12x.moe._shared.kernels.w4a16.btx_synth import (
     BtxSynthConfig,
@@ -146,7 +147,21 @@ def test_v1_lift_matches_synth_btx(tmp_path) -> None:
 
 
 @requires_cuda
-def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("bits", "profile", "seed", "per_expert_input_rotations"),
+    (
+        (2, "k2_coupled_h512_h128", 21, False),
+        (3, "k3_coupled_h512_h128", 22, False),
+        (3, "k3_coupled_h512_h128", 23, True),
+    ),
+)
+def test_v2_pure_uniform_lift_matches_synth_btx(
+    tmp_path,
+    bits: int,
+    profile: str,
+    seed: int,
+    per_expert_input_rotations: bool,
+) -> None:
     from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
     from b12x.moe._shared.kernels.w4a16.btx_synth import write_btx_checkpoint
 
@@ -157,13 +172,14 @@ def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
         hidden_size=hidden,
         intermediate_size=global_i,
         moe_layer_indices=(1,),
-        bits=2,
+        bits=bits,
         coupled=True,
         pre_block=512,
         post_block=128,
+        per_expert_input_rotations=per_expert_input_rotations,
         extent_alignment_slots=4,
         extent_barriers=(8,),
-        seed=21,
+        seed=seed,
     )
     manifest = write_btx_checkpoint(tmp_path, config)
     btx_layer = read_btx_layer(
@@ -178,7 +194,7 @@ def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
     )
 
     payloads = synth_layer_payloads(config, 1)
-    section = matrix_atom_bytes(hidden, 2, 2)
+    section = matrix_atom_bytes(hidden, bits, bits)
     bundle = 3 * section + 3 * 64
     payload = torch.zeros((slots, experts * bundle), dtype=torch.uint8)
     for slot in range(slots):
@@ -200,7 +216,7 @@ def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
 
     lifted_layer = lift_qsrt_atoms_v2_extent(
         payload,
-        profile="k2_coupled_h512_h128",
+        profile=profile,
         first_atom_slot=0,
         layer_index=1,
         hidden_size=hidden,
@@ -210,6 +226,10 @@ def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
         up_suh=payloads.up_suh,
         down_svh=payloads.down_svh,
         rotation_draws=payloads.rotation_draws,
+    )
+    assert (
+        lifted_layer.manifest.hadamard.per_expert_input_rotations
+        is per_expert_input_rotations
     )
     lifted = prepare_btx_moe_weights(
         lifted_layer,
@@ -225,6 +245,189 @@ def test_v2_pure_k2_lift_matches_synth_btx(tmp_path) -> None:
     )
     assert torch.equal(lifted.gate_suh, from_synth.gate_suh)
     assert lifted.coupled_hadamard and from_synth.coupled_hadamard
+
+
+@pytest.mark.parametrize("first_slot", (4, 12))
+def test_v3_compact_scales_expand_only_the_local_extent(first_slot: int) -> None:
+    hidden, global_i, experts = 512, 512, 2
+    slots = 4
+    section = matrix_atom_bytes(hidden, 3, 3)
+    payload = torch.zeros(
+        (slots, experts * 3 * section), dtype=torch.uint8
+    )
+
+    def signs(length: int, offset: int) -> torch.Tensor:
+        values = torch.ones(length, dtype=torch.float16)
+        values[offset::2] = -1
+        return values
+
+    hidden_signs = [signs(hidden, offset) for offset in (0, 1, 0)]
+    intermediate_signs = [signs(global_i, offset) for offset in (0, 1, 0)]
+    layer_magnitudes = torch.tensor([2.0, 3.0, 4.0], dtype=torch.float16)
+    expert_magnitudes = torch.tensor(
+        [[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]], dtype=torch.float16
+    )
+    lifted = lift_qsrt_atoms_v3_extent(
+        payload,
+        first_atom_slot=first_slot,
+        layer_index=44,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        num_experts=experts,
+        gate_suh_signs=hidden_signs[0],
+        up_suh_signs=hidden_signs[1],
+        down_svh_signs=hidden_signs[2],
+        gate_svh_signs=intermediate_signs[0],
+        up_svh_signs=intermediate_signs[1],
+        down_suh_signs=intermediate_signs[2],
+        layer_scale_magnitudes=layer_magnitudes,
+        expert_scale_magnitudes=expert_magnitudes,
+        rotation_draws=torch.zeros(experts, dtype=torch.uint8),
+    )
+
+    def scale_atoms(values: torch.Tensor) -> torch.Tensor:
+        physical_to_logical = torch.tensor([0, 3, 1, 2])
+        logical_to_physical = torch.argsort(physical_to_logical)
+        return (
+            values.reshape(4, 128)
+            .index_select(0, logical_to_physical)
+            .reshape(16, 32)
+        )
+
+    gate_atoms, up_atoms, down_atoms = [
+        scale_atoms(values) for values in intermediate_signs
+    ]
+    upstream = torch.cat((gate_atoms, up_atoms), dim=0)
+    indices = torch.arange(first_slot, first_slot + slots)
+    expected_signs = torch.stack(
+        (upstream[2 * indices], upstream[2 * indices + 1], down_atoms[indices]),
+        dim=1,
+    )
+    upstream_magnitude = expert_magnitudes[0 if first_slot < 8 else 1]
+    expected_magnitudes = torch.stack(
+        (upstream_magnitude, upstream_magnitude, expert_magnitudes[2]), dim=1
+    )
+    expected = expected_magnitudes[None, :, :, None] * expected_signs[:, None]
+    assert torch.equal(lifted.rotations, expected)
+    assert torch.equal(lifted.gate_suh, hidden_signs[0] * 2)
+    assert torch.equal(lifted.up_suh, hidden_signs[1] * 3)
+    assert torch.equal(lifted.down_svh, hidden_signs[2] * 4)
+    assert lifted.atoms.shape == payload.shape
+    assert lifted.first_slot == first_slot
+    assert lifted.slot_count == slots
+    assert lifted.manifest.rates.bits == 3
+    assert not lifted.manifest.hadamard.per_expert_input_rotations
+
+
+@requires_cuda
+def test_v3_compact_lift_prepares_identically_to_embedded_v2() -> None:
+    hidden, global_i, experts, slots = 512, 512, 2, 8
+    generator = torch.Generator().manual_seed(71)
+    section = matrix_atom_bytes(hidden, 3, 3)
+    words = torch.randint(
+        0,
+        256,
+        (slots, experts, 3 * section),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+
+    def signs(length: int, offset: int) -> torch.Tensor:
+        values = torch.ones(length, dtype=torch.float16)
+        values[offset::2] = -1
+        return values
+
+    hidden_signs = [signs(hidden, offset) for offset in (0, 1, 0)]
+    intermediate_signs = [signs(global_i, offset) for offset in (0, 1, 0)]
+    layer_magnitudes = torch.tensor([0.5, 0.75, 1.25], dtype=torch.float16)
+    expert_magnitudes = torch.tensor(
+        [[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]], dtype=torch.float16
+    )
+    side_tables = [
+        hidden_signs[index] * layer_magnitudes[index] for index in range(3)
+    ]
+    local_channels = slots * 32
+    def scale_atoms(values: torch.Tensor) -> torch.Tensor:
+        physical_to_logical = torch.tensor([0, 3, 1, 2])
+        logical_to_physical = torch.argsort(physical_to_logical)
+        return (
+            values.reshape(4, 128)
+            .index_select(0, logical_to_physical)
+            .reshape(16, 32)
+        )
+
+    gate_atoms, up_atoms, down_atoms = [
+        scale_atoms(values) for values in intermediate_signs
+    ]
+    upstream = torch.cat((gate_atoms, up_atoms), dim=0)
+    indices = torch.arange(slots)
+    rotation_signs = torch.stack(
+        (upstream[2 * indices], upstream[2 * indices + 1], down_atoms[indices]),
+        dim=1,
+    )
+    rotation_magnitudes = torch.stack(
+        (expert_magnitudes[0], expert_magnitudes[0], expert_magnitudes[2]),
+        dim=1,
+    )
+    rotations = (
+        rotation_magnitudes[None, :, :, None] * rotation_signs[:, None]
+    ).contiguous()
+    embedded = torch.cat(
+        (words, rotations.view(torch.uint8).reshape(slots, experts, 3 * 64)),
+        dim=2,
+    ).reshape(slots, -1)
+    draws = torch.zeros(experts, dtype=torch.uint8)
+
+    v2 = lift_qsrt_atoms_v2_extent(
+        embedded,
+        profile="k3_coupled_h512_h128",
+        first_atom_slot=0,
+        layer_index=44,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        num_experts=experts,
+        gate_suh=side_tables[0],
+        up_suh=side_tables[1],
+        down_svh=side_tables[2],
+        rotation_draws=draws,
+    )
+    v3 = lift_qsrt_atoms_v3_extent(
+        words.reshape(slots, -1),
+        first_atom_slot=0,
+        layer_index=44,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        num_experts=experts,
+        gate_suh_signs=hidden_signs[0],
+        up_suh_signs=hidden_signs[1],
+        down_svh_signs=hidden_signs[2],
+        gate_svh_signs=intermediate_signs[0],
+        up_svh_signs=intermediate_signs[1],
+        down_suh_signs=intermediate_signs[2],
+        layer_scale_magnitudes=layer_magnitudes,
+        expert_scale_magnitudes=expert_magnitudes,
+        rotation_draws=draws,
+    )
+    from_v2 = prepare_btx_moe_weights(
+        v2,
+        activation="situ",
+        device=_device(),
+        tile_config=(128, 128, 128, 128),
+    )
+    from_v3 = prepare_btx_moe_weights(
+        v3,
+        activation="situ",
+        device=_device(),
+        tile_config=(128, 128, 128, 128),
+    )
+    assert torch.equal(from_v3.w13, from_v2.w13)
+    assert torch.equal(from_v3.w2, from_v2.w2)
+    assert torch.equal(from_v3.gate_suh, from_v2.gate_suh)
+    assert torch.equal(from_v3.up_suh, from_v2.up_suh)
+    assert torch.equal(from_v3.down_svh, from_v2.down_svh)
+    assert torch.equal(
+        from_v3.intermediate_rotations, from_v2.intermediate_rotations
+    )
 
 
 @requires_cuda

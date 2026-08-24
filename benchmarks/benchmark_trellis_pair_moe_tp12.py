@@ -23,7 +23,7 @@ Example:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -44,6 +44,10 @@ except ModuleNotFoundError:  # Direct ``python benchmarks/...py`` execution.
 from b12x.moe import fused_moe
 from b12x.moe._shared.kernels.w4a16.btx_compat import (
     lift_qsrt_atoms_v1_extent,
+)
+from b12x.moe.fused_moe._impl import (
+    plan_b12x_fp4_moe_weights,
+    prepare_b12x_fp4_moe_weights,
 )
 
 
@@ -509,7 +513,7 @@ def _prepare_weights(
     pair_kinds = {"P33"}
     if bool(fc1_modes.any()) or bool(fc2_modes.any()):
         pair_kinds.add("P24")
-    weight_plan = fused_moe.plan_weights(
+    weight_plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16",
         source_format="btx",
         activation="situ",
@@ -520,9 +524,15 @@ def _prepare_weights(
         w13_layout="w13",
         trellis_bits=3,
         trellis_codebook=codebook,
-        trellis_rate_structure="per_expert_pair",
+        trellis_rate_granularity="per_expert_pair",
         trellis_pair_kinds=sorted(pair_kinds),
         trellis_tile_config=_TILES,
+    )
+    weight_plan = replace(
+        weight_plan,
+        checkpoint_config=fused_moe.PackedConfig(
+            source_format="fp4_e8m0_k32"
+        ),
     )
     btx_layer = lift_qsrt_atoms_v1_extent(
         atom_payload,
@@ -536,7 +546,7 @@ def _prepare_weights(
         up_suh=hidden_rotation,
         down_svh=hidden_rotation,
     )
-    return fused_moe.prepare_weights(
+    return prepare_b12x_fp4_moe_weights(
         plan=weight_plan,
         params_dtype=torch.bfloat16,
         btx_layer=btx_layer,
@@ -597,12 +607,12 @@ def _capture_case(
     ).to(torch.bfloat16)
     plan = fused_moe.plan(
         fused_moe.Caps(
+            config=weights.plan.checkpoint_config,
             max_tokens=tokens,
             num_topk=_TOPK,
             route_num_experts=_ROUTE_EXPERTS,
             device=device,
             weight_plan=weights.plan,
-            quant_mode="w4a16",
             w4a16_block_size_m=8,
         )
     )

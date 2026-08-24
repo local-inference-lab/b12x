@@ -4,7 +4,7 @@
 Loads a ``layer_{L}.moe_fp6.safetensors`` produced by
 ``scripts/quantize_model_fp6.py`` (or ``scripts/quantize_moe_fp6.py``), checks
 its tensors match the kernel's input contract, then actually runs it through
-``b12x.moe.fused_moe`` (quant_mode ``w6a8_mx``) on random tokens at
+``b12x.moe.fused_moe`` using the ``mxfp6_e2m3`` packed encoding on random tokens at
 several token counts and asserts the output is the right shape, finite, and
 non-zero.
 
@@ -154,34 +154,41 @@ def _unswizzle_grid(swizzled: torch.Tensor, rows: int, num_blocks: int) -> torch
 
 
 def _run(x, weights, topk_ids, topk_weights):
-    """Run the artifact through b12x.moe.fused_moe (quant_mode w6a8_mx)."""
+    """Run the artifact through b12x.moe.fused_moe."""
     from b12x.moe import fused_moe
 
     device = x.device
     m, k = x.shape
     e, n, tk = weights.num_experts, weights.n, topk_ids.shape[1]
 
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w6a8_mx",
+    config = fused_moe.PackedConfig(
         source_format="mxfp6_e2m3",
+        w13_layout="w13",
+    )
+    weight_plan = fused_moe.plan_weights(
+        config=config,
         activation=weights.activation,
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=e,
         hidden_size=k,
         intermediate_size=n,
-        w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
     )
     prepared = fused_moe.prepare_weights(
         plan=weight_plan,
-        w1_fp4=weights.w1_fp6,  # packed FP6 code bytes ride the fp4-named args
-        w1_blockscale=_unswizzle_grid(weights.w1_blockscale, 2 * n, k // 32),
-        w1_global_scale=weights.w1_alphas,
-        a1_gscale=weights.a1_gscale,
-        w2_fp4=weights.w2_fp6,
-        w2_blockscale=_unswizzle_grid(weights.w2_blockscale, k, n // 32),
-        w2_global_scale=weights.w2_alphas,
-        a2_gscale=weights.a2_gscale,
-        params_dtype=torch.bfloat16,
+        weights=fused_moe.PackedWeights(
+            w13=weights.w1_fp6,
+            w2=weights.w2_fp6,
+            w13_block_scales=_unswizzle_grid(
+                weights.w1_blockscale, 2 * n, k // 32
+            ),
+            w2_block_scales=_unswizzle_grid(
+                weights.w2_blockscale, k, n // 32
+            ),
+            w13_global_scales=weights.w1_alphas,
+            w2_global_scales=weights.w2_alphas,
+            input_scale=weights.a1_gscale,
+            intermediate_scale=weights.a2_gscale,
+        ),
     )
     fused_moe.clear_caches()
     plan = fused_moe.plan(
@@ -189,10 +196,10 @@ def _run(x, weights, topk_ids, topk_weights):
             max_tokens=m,
             num_topk=tk,
             device=device,
+            config=config,
             weight_plan=weight_plan,
             core_token_counts=(m,),
             route_num_experts=0,
-            quant_mode="w6a8_mx",
         )
     )
     scratch = tuple(

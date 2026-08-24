@@ -1,122 +1,138 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from b12x.moe import fused_moe
 import b12x.moe.fused_moe._impl as fused_moe_impl
+from b12x.moe import fused_moe
 
 
 def _weight_plan() -> fused_moe.WeightsPlan:
+    config = fused_moe.PackedConfig(
+        source_format="fp4_e8m0_k32",
+        w13_layout="w13",
+    )
     return fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format="modelopt_nvfp4",
+        config=config,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=160,
         hidden_size=6144,
         intermediate_size=512,
-        w13_layout="w13",
     )
 
 
 def _caps(*, block_size_m: int | None) -> fused_moe.Caps:
+    weight_plan = _weight_plan()
     return fused_moe.Caps(
         max_tokens=64,
         num_topk=8,
         route_num_experts=160,
         device="cpu",
-        weight_plan=_weight_plan(),
-        quant_mode="w4a16",
+        config=weight_plan.checkpoint_config,
+        weight_plan=weight_plan,
         w4a16_block_size_m=block_size_m,
     )
 
 
 def _trellis_caps() -> fused_moe.Caps:
+    config = fused_moe.TrellisConfig.from_dict(
+        {
+            "version": 2,
+            "codebook": "mcg",
+            "rate": {"granularity": "per_expert_projection"},
+            "scale": {
+                "input_scales": {"vectors": "per_layer", "gains": "none"},
+                "intermediate_scales": {
+                    "vectors": "per_expert",
+                    "gains": "none",
+                },
+                "output_scales": {"vectors": "per_layer", "gains": "none"},
+            },
+            "transform": {
+                "projection": {"kind": "scaled_hadamard", "block_size": 128},
+                "expert": {"kind": "none"},
+            },
+        }
+    )
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format="btx",
+        config=config,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=160,
         hidden_size=6144,
         intermediate_size=512,
-        w13_layout="w13",
-        trellis_bits=3,
-        trellis_codebook="mcg",
-        trellis_tile_config=(64, 256, 64, 256),
     )
     return fused_moe.Caps(
         max_tokens=3072,
         num_topk=8,
         route_num_experts=160,
         device="cpu",
+        config=config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
         w4a16_block_size_m=64,
     )
 
 
 def _small_packed_caps() -> fused_moe.Caps:
+    config = fused_moe.PackedConfig(source_format="compressed_tensors")
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format="compressed_tensors",
+        config=config,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=16,
         hidden_size=128,
         intermediate_size=128,
-        w13_layout="w13",
     )
     return fused_moe.Caps(
         max_tokens=4,
         num_topk=8,
         route_num_experts=16,
         device="cpu",
+        config=config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
     )
 
 
 def _subset_router_caps() -> fused_moe.Caps:
+    config = fused_moe.PackedConfig(source_format="compressed_tensors")
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format="compressed_tensors",
+        config=config,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=160,
         hidden_size=128,
         intermediate_size=128,
-        w13_layout="w13",
     )
     return fused_moe.Caps(
         max_tokens=8,
         num_topk=8,
         route_num_experts=16,
         device="cpu",
+        config=config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
     )
 
 
 def _mapped_packed_caps() -> fused_moe.Caps:
+    config = fused_moe.PackedConfig(source_format="compressed_tensors")
     weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
-        source_format="compressed_tensors",
+        config=config,
         activation="silu",
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=8,
         hidden_size=128,
         intermediate_size=128,
-        w13_layout="w13",
     )
     return fused_moe.Caps(
         max_tokens=8,
         num_topk=2,
         route_num_experts=12,
         device="cpu",
+        config=config,
         weight_plan=weight_plan,
-        quant_mode="w4a16",
     )
 
 
@@ -137,7 +153,7 @@ def test_required_nbytes_avoids_launch_prewarm(
 
     required = fused_moe.required_nbytes(caps)
 
-    assert required > 1024 * 1024 * 1024
+    assert required > 800 * 1024 * 1024
     assert "required_nbytes" in fused_moe.META.entry_points
     with pytest.raises(TypeError, match="TPMoEScratchCaps"):
         fused_moe.required_nbytes(object())
@@ -207,144 +223,161 @@ def test_unpinned_small_capacity_matches_reachable_block_8(
     assert oversized - automatic > 64 * 1024 * 1024
 
 
-def _btx_plan(**overrides) -> fused_moe.WeightsPlan:
-    kwargs = dict(
-        quant_modes="w4a16",
-        source_format="btx",
+def _k3_config() -> fused_moe.TrellisConfig:
+    return fused_moe.TrellisConfig.from_dict(
+        {
+            "version": 2,
+            "codebook": "sqg_e4m3",
+            "rate": {"granularity": "uniform"},
+            "scale": {
+                "input_scales": {
+                    "vectors": "per_layer",
+                    "gains": "per_layer",
+                },
+                "intermediate_scales": {
+                    "vectors": "per_layer",
+                    "gains": "per_expert",
+                },
+                "output_scales": {
+                    "vectors": "per_layer",
+                    "gains": "per_layer",
+                },
+            },
+            "transform": {
+                "projection": {"kind": "scaled_hadamard", "block_size": 128},
+                "expert": {
+                    "kind": "coupled_hadamard",
+                    "pre_block_size": 512,
+                    "post_block_size": 128,
+                    "draw_granularity": "per_expert",
+                },
+            },
+        }
+    )
+
+
+def test_trellis_plan_derives_private_recipe_from_config() -> None:
+    config = _k3_config()
+    plan = fused_moe.plan_weights(
+        config=config,
         activation="situ",
-        params_dtype=torch.float16,
+        dtype=torch.float16,
         num_experts=8,
         hidden_size=256,
         intermediate_size=256,
-        trellis_bits=2,
-        trellis_codebook="sqg_e4m3",
-        coupled_hadamard=True,
-        trellis_tile_config=(128, 128, 128, 128),
     )
-    kwargs.update(overrides)
-    return fused_moe.plan_weights(**kwargs)
 
-
-def test_btx_plan_round_trips_declarations() -> None:
-    plan = _btx_plan()
-    assert plan.source_format == "btx"
+    assert plan.checkpoint_config is config
+    assert plan.source_format == "b12x_trellis"
+    assert plan.quant_modes == frozenset({"w4a16"})
     assert plan.trellis_codebook == "sqg_e4m3"
-    assert plan.trellis_rate_structure == "uniform"
-    assert plan.trellis_pair_kinds is None
+    assert plan.trellis_rate_granularity == "uniform"
     assert plan.coupled_hadamard
     assert plan.coupled_hadamard_blocks == (512, 128)
 
-    pair_plan = _btx_plan(
-        trellis_bits=3,
-        coupled_hadamard=False,
-        trellis_tile_config=(64, 256, 64, 256),
-        trellis_rate_structure="per_expert_pair",
-        trellis_pair_kinds=("P33", "P43"),
-    )
-    assert pair_plan.trellis_pair_kinds == frozenset({"P33", "P43"})
-    assert pair_plan.coupled_hadamard_blocks is None
 
+def test_runtime_rejects_unimplemented_orthogonal_trellis_combination() -> None:
+    value = _k3_config().to_dict()
+    value["codebook"] = "mcg"
+    config = fused_moe.TrellisConfig.from_dict(value)
 
-def test_btx_plan_supports_w4a8_mx_uniform() -> None:
-    plan = _btx_plan(quant_modes="w4a8_mx")
-    assert plan.quant_modes == frozenset({"w4a8_mx"})
-    with pytest.raises(ValueError, match="uniform-rate"):
-        _btx_plan(
-            quant_modes="w4a8_mx",
-            trellis_bits=3,
-            coupled_hadamard=False,
-            trellis_tile_config=(64, 256, 64, 256),
-            trellis_rate_structure="per_expert_pair",
-            trellis_pair_kinds=("P33", "P43"),
-        )
-
-
-@pytest.mark.parametrize(
-    "overrides, match",
-    [
-        ({"trellis_codebook": None}, "trellis_codebook"),
-        ({"trellis_codebook": "sqg_xor_cheb_t12"}, "trellis_codebook"),
-        ({"trellis_codebook": "sqg_fp16", "trellis_bits": 3}, "sqg_fp16"),
-        (
-            {"trellis_codebook": "mcg", "coupled_hadamard": True},
-            "qualified only",
-        ),
-        (
-            {"coupled_hadamard_blocks": (256, 128)},
-            r"blocks \(512, 128\)",
-        ),
-        (
-            {
-                "trellis_bits": 3,
-                "coupled_hadamard": False,
-                "trellis_tile_config": (64, 256, 64, 256),
-                "trellis_rate_structure": "per_expert_pair",
-                "trellis_pair_kinds": ("P33", "P44"),
-            },
-            "no fused execution arm",
-        ),
-        (
-            {
-                "trellis_bits": 3,
-                "coupled_hadamard": False,
-                "trellis_tile_config": (64, 256, 64, 256),
-                "trellis_rate_structure": "per_expert_pair",
-                "trellis_pair_kinds": ("P24", "P43"),
-            },
-            "pair-kind sets must be",
-        ),
-        (
-            {
-                "trellis_bits": 2,
-                "coupled_hadamard": False,
-                "trellis_rate_structure": "per_expert_pair",
-                "trellis_pair_kinds": ("P33", "P43"),
-            },
-            "trellis_bits=3",
-        ),
-        (
-            {
-                "trellis_bits": 3,
-                "trellis_rate_structure": "per_expert_pair",
-                "trellis_pair_kinds": ("P33", "P43"),
-            },
-            "only for uniform rate structures",
-        ),
-        (
-            {"trellis_pair_kinds": ("P33", "P43")},
-            "uniform btx rates declare no trellis_pair_kinds",
-        ),
-    ],
-)
-def test_btx_plan_fails_closed(overrides, match) -> None:
-    if overrides.get("trellis_codebook") == "mcg":
-        overrides.setdefault("trellis_bits", 3)
-    with pytest.raises(ValueError, match=match):
-        _btx_plan(**overrides)
-
-
-def test_btx_declarations_require_btx_source() -> None:
-    with pytest.raises(ValueError, match="trellis source format"):
+    with pytest.raises(NotImplementedError, match="sqg_e4m3.*uniform"):
         fused_moe.plan_weights(
-            quant_modes="w4a16",
-            source_format="modelopt_nvfp4",
-            activation="silu",
-            params_dtype=torch.bfloat16,
+            config=config,
+            activation="situ",
+            dtype=torch.float16,
             num_experts=8,
             hidden_size=256,
             intermediate_size=256,
-            trellis_codebook="sqg_e4m3",
         )
 
 
-def test_btx_pair_kind_derivation_from_plan() -> None:
-    derive = fused_moe_impl._fc_trellis_pair_kind
+def test_runtime_rejects_schema_only_sqg_fp16_codebook() -> None:
+    value = _k3_config().to_dict()
+    value["codebook"] = "sqg_fp16"
+    value["transform"]["expert"] = {"kind": "none"}
+    config = fused_moe.TrellisConfig.from_dict(value)
 
-    class _Stub:
-        def __init__(self, kinds):
-            self.trellis_pair_kinds = kinds
+    with pytest.raises(NotImplementedError, match="sqg_fp16"):
+        fused_moe.plan_weights(
+            config=config,
+            activation="silu",
+            dtype=torch.float16,
+            num_experts=8,
+            hidden_size=256,
+            intermediate_size=256,
+        )
 
-    assert derive(_Stub(frozenset({"P33", "P43"}))) == "P33_P43"
-    assert derive(_Stub(frozenset({"P33", "P24"}))) == "PDYNAMIC"
-    assert derive(_Stub(frozenset({"P33"}))) == "PDYNAMIC"
-    assert derive(_Stub(None)) is None
+
+def test_trellis_output_finalization_casts_into_caller_buffer() -> None:
+    accumulated = torch.tensor([[1.25, -2.5]], dtype=torch.float32)
+    target = torch.empty_like(accumulated, dtype=torch.bfloat16)
+
+    result = fused_moe_impl._finalize_trellis_output(
+        SimpleNamespace(output_cast_target=target),
+        accumulated,
+    )
+
+    assert result.data_ptr() == target.data_ptr()
+    torch.testing.assert_close(result, accumulated.to(torch.bfloat16))
+
+
+def test_projection_mixed_config_selects_fixed_mixed_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    caps = _trellis_caps()
+    plan = fused_moe.plan(caps)
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    assert plan._core_workspace_plan.implementation == "trellis_mixed3"
+    assert plan._core_workspace_plan.projection_mixed_trellis
+    assert specs["intermediate_cache13"].shape == (3072 * 8 * 1024,)
+    assert specs["intermediate_cache2"].shape == (3072 * 8 * 512,)
+    assert specs["rotation_a_gate"].shape == (3072 * 8, 6144)
+    assert specs["rotation_a_up"].shape == (3072 * 8, 6144)
+    assert specs["full_rotation_output"].shape == (3072, 6144)
+
+
+def test_public_planning_api_has_no_quant_mode() -> None:
+    config = fused_moe.PackedConfig(source_format="modelopt_nvfp4")
+    with pytest.raises(TypeError, match="quant_modes"):
+        fused_moe.plan_weights(
+            config=config,
+            quant_modes="w4a16",
+            activation="silu",
+            dtype=torch.bfloat16,
+            num_experts=8,
+            hidden_size=256,
+            intermediate_size=256,
+        )
+
+    weight_plan = fused_moe.plan_weights(
+        config=config,
+        activation="silu",
+        dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=256,
+    )
+    with pytest.raises(TypeError, match="quant_mode"):
+        fused_moe.Caps(
+            config=config,
+            weight_plan=weight_plan,
+            quant_mode="w4a16",
+            max_tokens=1,
+            num_topk=1,
+            device="cpu",
+        )
+
+
+def test_caps_rejects_a_different_checkpoint_config() -> None:
+    weight_plan = _weight_plan()
+    with pytest.raises(ValueError, match="does not match"):
+        fused_moe.Caps(
+            config=fused_moe.PackedConfig(source_format="modelopt_nvfp4"),
+            weight_plan=weight_plan,
+            max_tokens=1,
+            num_topk=1,
+            device="cpu",
+        )

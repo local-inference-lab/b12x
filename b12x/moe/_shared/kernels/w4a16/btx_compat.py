@@ -12,6 +12,11 @@ knowledge (the ``(5*expert + layer) % 12`` pair rotation, the embedded
 64-byte span offsets, and the rate-class row grouping). Remove it when the
 checkpoints it serves have been re-exported as `btx-atoms-v1` and the
 re-exports validate.
+
+The unshipped ``qsrt_atoms_v3`` container stores uniform-K3 trellis words
+separately from compact sign-and-magnitude reconstruction tables. Its lift
+expands only the owner-local intermediate-coordinate extent into the same
+``BtxLayer`` boundary tables consumed by the fused kernels.
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ from b12x.moe._shared.trellis_codebooks import SQG_E4M3
 # with this multiplier; the lift materializes the result as tables.
 _PAIR_ROTATION_MULTIPLIER = 5
 _SPAN_BYTES = 64
+_UNIFORM_RECORD_CHANNELS = 128
+_ROTATION_SPAN_CHANNELS = 32
 
 
 def _lift_manifest(
@@ -43,10 +50,11 @@ def _lift_manifest(
     layer_index: int,
     rates: dict,
     coupled: bool,
+    per_expert_input_rotations: bool = False,
 ) -> BtxManifest:
     hadamard: dict = {
         "coupled": coupled,
-        "per_expert_input_rotations": False,
+        "per_expert_input_rotations": per_expert_input_rotations,
     }
     if coupled:
         hadamard["pre_block"] = 512
@@ -104,7 +112,61 @@ def _strip_spans(
 
 
 def _side_table(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.reshape(-1).contiguous()
+    return tensor.contiguous()
+
+
+def _uniform_k3_scale_atoms(signs: torch.Tensor) -> torch.Tensor:
+    """Map candidate-order scale signs to coupled logical atom order."""
+
+    if signs.dim() != 1 or signs.numel() % _UNIFORM_RECORD_CHANNELS:
+        raise ValueError(
+            "uniform-K3 intermediate signs must contain complete 128-channel records"
+        )
+    record_count = signs.numel() // _UNIFORM_RECORD_CHANNELS
+    physical_to_logical: list[int] = []
+    for low in range((record_count + 1) // 2):
+        high = record_count - 1 - low
+        physical_to_logical.append(low)
+        if high != low:
+            physical_to_logical.append(high)
+    logical_to_physical = torch.argsort(
+        torch.tensor(
+            physical_to_logical,
+            dtype=torch.long,
+            device=signs.device,
+        )
+    )
+    return (
+        signs.reshape(record_count, _UNIFORM_RECORD_CHANNELS)
+        .index_select(0, logical_to_physical)
+        .reshape(-1, _ROTATION_SPAN_CHANNELS)
+        .contiguous()
+    )
+
+
+def _per_expert_side_tables(
+    *,
+    num_experts: int,
+    hidden_size: int,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+) -> bool:
+    shapes = {
+        tuple(gate_suh.shape),
+        tuple(up_suh.shape),
+        tuple(down_svh.shape),
+    }
+    shared = (hidden_size,)
+    per_expert = (num_experts, hidden_size)
+    if shapes == {shared}:
+        return False
+    if shapes == {per_expert}:
+        return True
+    raise ValueError(
+        "gate_suh, up_suh, and down_svh must all be shared [hidden_size] "
+        "or expert-private [num_experts, hidden_size] tables"
+    )
 
 
 def lift_qsrt_atoms_v1_extent(
@@ -212,32 +274,40 @@ def lift_qsrt_atoms_v2_extent(
 ) -> BtxLayer:
     """Lift one atoms-v2 rank extent for a supported profile.
 
-    ``atom_payload`` is ``[atom_count, row_bytes]`` uint8. The pure-K2
-    coupled profile lifts to a uniform coupled extent of any legal length;
+    ``atom_payload`` is ``[atom_count, row_bytes]`` uint8. Uniform K2/K3
+    coupled profiles lift to a coupled extent of any legal length;
     the fixed high-rate profile (``k3x22_k4x2``) lifts one pair with its
     rate-class row grouping restored to expert-major order. The coupled
     high-rate profile has no lift: its pair-kind mixes have no qualified
     BTX execution path, so serving it requires a re-export decision.
     """
 
-    if profile == "k2_coupled_h512_h128":
+    if profile in {"k2_coupled_h512_h128", "k3_coupled_h512_h128"}:
         if rotation_draws is None:
-            raise ValueError("the coupled pure-K2 profile carries draws")
+            raise ValueError("coupled uniform profiles carry draws")
         atom_count = int(atom_payload.shape[0])
-        matrix_bytes = matrix_atom_bytes(hidden_size, 2, 2)
+        bits = 2 if profile == "k2_coupled_h512_h128" else 3
+        matrix_bytes = matrix_atom_bytes(hidden_size, bits, bits)
         bundle = 3 * matrix_bytes + 3 * _SPAN_BYTES
         payload = num_experts * bundle
         if int(atom_payload.shape[1]) < payload:
-            raise ValueError("pure-K2 rows are shorter than their bundles")
+            raise ValueError("uniform rows are shorter than their bundles")
         if bool(torch.any(atom_payload[:, payload:] != 0)):
-            raise ValueError("pure-K2 row padding must be zero")
+            raise ValueError("uniform row padding must be zero")
         manifest = _lift_manifest(
             num_experts=num_experts,
             hidden_size=hidden_size,
             global_intermediate_size=global_intermediate_size,
             layer_index=layer_index,
-            rates={"structure": "uniform", "bits": 2},
+            rates={"structure": "uniform", "bits": bits},
             coupled=True,
+            per_expert_input_rotations=_per_expert_side_tables(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                gate_suh=gate_suh,
+                up_suh=up_suh,
+                down_svh=down_svh,
+            ),
         )
         manifest.validate_extent(first_atom_slot, atom_count)
         bundles = atom_payload[:, :payload].reshape(
@@ -343,4 +413,158 @@ def lift_qsrt_atoms_v2_extent(
         f"QSRT atoms-v2 profile {profile!r} has no BTX lift; the coupled "
         "high-rate profile's pair-kind mixes have no qualified fused "
         "execution path"
+    )
+
+
+def lift_qsrt_atoms_v3_extent(
+    atom_payload: torch.Tensor,
+    *,
+    first_atom_slot: int,
+    layer_index: int,
+    hidden_size: int,
+    global_intermediate_size: int,
+    num_experts: int,
+    gate_suh_signs: torch.Tensor,
+    up_suh_signs: torch.Tensor,
+    down_svh_signs: torch.Tensor,
+    gate_svh_signs: torch.Tensor,
+    up_svh_signs: torch.Tensor,
+    down_suh_signs: torch.Tensor,
+    layer_scale_magnitudes: torch.Tensor,
+    expert_scale_magnitudes: torch.Tensor,
+    rotation_draws: torch.Tensor,
+) -> BtxLayer:
+    """Lift one compact sign-and-scalar uniform-K3 atoms-v3 extent.
+
+    ``atom_payload`` contains trellis words only. The six sign tables and
+    magnitudes reconstruct the three side tables and three owner-local
+    intermediate tables without allocating a model-global expert table.
+    """
+
+    if atom_payload.dim() != 2 or atom_payload.dtype != torch.uint8:
+        raise ValueError("atoms-v3 payload must be uint8[atom_count, row_bytes]")
+    atom_count = int(atom_payload.shape[0])
+    matrix_bytes = matrix_atom_bytes(hidden_size, 3, 3)
+    bundle = 3 * matrix_bytes
+    payload = num_experts * bundle
+    if int(atom_payload.shape[1]) < payload:
+        raise ValueError("atoms-v3 rows are shorter than their trellis bundles")
+    if bool(torch.any(atom_payload[:, payload:] != 0)):
+        raise ValueError("atoms-v3 row padding must be zero")
+
+    hidden_signs = {
+        "gate_suh": gate_suh_signs,
+        "up_suh": up_suh_signs,
+        "down_svh": down_svh_signs,
+    }
+    for name, signs in hidden_signs.items():
+        if signs.dtype != torch.float16 or tuple(signs.shape) != (hidden_size,):
+            raise ValueError(f"atoms-v3 {name} signs must be fp16[hidden_size]")
+        if not bool(torch.all(torch.abs(signs) == 1)):
+            raise ValueError(f"atoms-v3 {name} signs must be exactly +/-1")
+
+    intermediate_signs = {
+        "gate_svh": gate_svh_signs,
+        "up_svh": up_svh_signs,
+        "down_suh": down_suh_signs,
+    }
+    for name, signs in intermediate_signs.items():
+        if signs.dtype != torch.float16 or tuple(signs.shape) != (
+            global_intermediate_size,
+        ):
+            raise ValueError(
+                f"atoms-v3 {name} signs must be fp16[global_intermediate_size]"
+            )
+        if not bool(torch.all(torch.abs(signs) == 1)):
+            raise ValueError(f"atoms-v3 {name} signs must be exactly +/-1")
+
+    if (
+        layer_scale_magnitudes.dtype != torch.float16
+        or tuple(layer_scale_magnitudes.shape) != (3,)
+        or not bool(torch.all(torch.isfinite(layer_scale_magnitudes)))
+        or bool(torch.any(layer_scale_magnitudes <= 0))
+    ):
+        raise ValueError("atoms-v3 layer magnitudes must be positive finite fp16[3]")
+    if (
+        expert_scale_magnitudes.dtype != torch.float16
+        or tuple(expert_scale_magnitudes.shape) != (3, num_experts)
+        or not bool(torch.all(torch.isfinite(expert_scale_magnitudes)))
+        or bool(torch.any(expert_scale_magnitudes <= 0))
+    ):
+        raise ValueError(
+            "atoms-v3 expert magnitudes must be positive finite "
+            "fp16[3, num_experts]"
+        )
+    if (
+        rotation_draws.dtype != torch.uint8
+        or tuple(rotation_draws.shape) != (num_experts,)
+        or bool(torch.any(rotation_draws != 0))
+    ):
+        raise ValueError("production atoms-v3 requires uint8 zero draws")
+
+    manifest = _lift_manifest(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        global_intermediate_size=global_intermediate_size,
+        layer_index=layer_index,
+        rates={"structure": "uniform", "bits": 3},
+        coupled=True,
+    )
+    manifest.validate_extent(first_atom_slot, atom_count)
+
+    last_atom_slot = first_atom_slot + atom_count
+    if last_atom_slot * manifest.geometry.atom_channels > global_intermediate_size:
+        raise ValueError("atoms-v3 intermediate extent exceeds model geometry")
+
+    side_tables = [
+        hidden_signs["gate_suh"] * layer_scale_magnitudes[0],
+        hidden_signs["up_suh"] * layer_scale_magnitudes[1],
+        hidden_signs["down_svh"] * layer_scale_magnitudes[2],
+    ]
+    gate_atoms = _uniform_k3_scale_atoms(intermediate_signs["gate_svh"])
+    up_atoms = _uniform_k3_scale_atoms(intermediate_signs["up_svh"])
+    down_atoms = _uniform_k3_scale_atoms(intermediate_signs["down_suh"])
+    upstream_atoms = torch.cat((gate_atoms, up_atoms), dim=0)
+    atom_indices = torch.arange(
+        first_atom_slot,
+        last_atom_slot,
+        dtype=torch.long,
+        device=atom_payload.device,
+    )
+    rotation_signs = torch.stack(
+        (
+            upstream_atoms.index_select(0, 2 * atom_indices),
+            upstream_atoms.index_select(0, 2 * atom_indices + 1),
+            down_atoms.index_select(0, atom_indices),
+        ),
+        dim=1,
+    )
+    upstream_magnitude_indices = (
+        atom_indices >= manifest.geometry.atom_slots // 2
+    ).to(torch.long)
+    upstream_magnitudes = expert_scale_magnitudes.index_select(
+        0, upstream_magnitude_indices
+    )
+    down_magnitudes = expert_scale_magnitudes[2].expand(atom_count, -1)
+    rotation_magnitudes = torch.stack(
+        (upstream_magnitudes, upstream_magnitudes, down_magnitudes),
+        dim=2,
+    )
+    rotations = (
+        rotation_magnitudes[..., None] * rotation_signs[:, None, :, :]
+    ).contiguous()
+    bundles = atom_payload[:, :payload].reshape(atom_count, num_experts, bundle)
+    return BtxLayer(
+        manifest=manifest,
+        layer_index=layer_index,
+        first_slot=first_atom_slot,
+        slot_count=atom_count,
+        atoms=bundles.reshape(atom_count, -1),
+        rotations=rotations,
+        gate_suh=_side_table(side_tables[0]),
+        up_suh=_side_table(side_tables[1]),
+        down_svh=_side_table(side_tables[2]),
+        rates_fc1=None,
+        rates_fc2=None,
+        rotation_draws=rotation_draws.contiguous(),
     )

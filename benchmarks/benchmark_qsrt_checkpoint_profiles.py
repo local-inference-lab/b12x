@@ -55,7 +55,12 @@ _DEFAULT_H308_ROOT = Path("/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-3p08-v2")
 
 _COMPLETION = "qsrt-completion.json"
 _COMPLETION_KIND = "kquant_kimi_k3_qsrt_completion"
-_STORAGE_SCHEMA = "kquant_kimi_k3_qsrt_atoms_v2"
+_STORAGE_SCHEMAS = frozenset(
+    {
+        "kquant_kimi_k3_qsrt_atoms_v2",
+        "qsrt_kimi_k3_qsrt_atoms_v2",
+    }
+)
 _ENCODING = "qsrt_sqg_e4m3"
 _CODEBOOK = "sqg_xor_cheb_t12"
 _VERSION = 2
@@ -237,7 +242,6 @@ def _validate_completion(
     expected = {
         "kind": _COMPLETION_KIND,
         "schema_version": _VERSION,
-        "storage_schema": _STORAGE_SCHEMA,
         "profile": contract.profile,
         "complete": True,
         "layer_count": 92,
@@ -248,6 +252,12 @@ def _validate_completion(
                 f"QSRT completion {name!r} mismatch: "
                 f"{completion.get(name)!r} != {value!r}"
             )
+    if completion.get("storage_schema") not in _STORAGE_SCHEMAS:
+        raise ValueError(
+            "QSRT completion 'storage_schema' must be one of "
+            f"{sorted(_STORAGE_SCHEMAS)!r}, got "
+            f"{completion.get('storage_schema')!r}"
+        )
     candidate_hash = completion.get("candidate_pool_content_sha256")
     if (
         not isinstance(candidate_hash, str)
@@ -292,7 +302,6 @@ def _read_layer_source(
             raise ValueError("QSRT layer tensor inventory is noncanonical")
         expected_metadata: dict[str, str] = {
             "format": "pt",
-            "schema": _STORAGE_SCHEMA,
             "version": str(_VERSION),
             "encoding": _ENCODING,
             "codebook": _CODEBOOK,
@@ -310,6 +319,11 @@ def _read_layer_source(
         expected_metadata.update(
             {name: str(value) for name, value in contract.atom_bundle_metadata}
         )
+        if metadata.get("schema") not in _STORAGE_SCHEMAS:
+            raise ValueError(
+                "QSRT layer metadata 'schema' must be one of "
+                f"{sorted(_STORAGE_SCHEMAS)!r}, got {metadata.get('schema')!r}"
+            )
         if contract.coupled_hadamard:
             expected_metadata.update(
                 {

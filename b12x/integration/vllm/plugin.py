@@ -502,15 +502,16 @@ def register_b12x_fp6() -> None:
             )
             prepared = fused_moe.prepare_weights(
                 plan=weight_plan,
-                w1_fp4=w1_fp6,
-                w1_blockscale=w1_scale,
-                w1_global_scale=ones_e,
-                a1_gscale=ones_1,
-                w2_fp4=w2_fp6,
-                w2_blockscale=w2_scale,
-                w2_global_scale=ones_e.clone(),
-                a2_gscale=ones_1.clone(),
-                params_dtype=torch.bfloat16,
+                weights=fused_moe.PackedWeights(
+                    w13=w1_fp6,
+                    w2=w2_fp6,
+                    w13_block_scales=w1_scale,
+                    w2_block_scales=w2_scale,
+                    w13_global_scales=ones_e,
+                    w2_global_scales=ones_e.clone(),
+                    input_scale=ones_1,
+                    intermediate_scale=ones_1.clone(),
+                ),
             )
 
             for name in (

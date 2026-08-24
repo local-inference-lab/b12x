@@ -1,13 +1,13 @@
-"""End-to-end w4a8_mx serving of trellis-native QSRT weights.
+"""End-to-end w4a8_mx serving of a private trellis kernel recipe.
 
-Drives the public fused-MoE surface (plan_weights -> expert weights ->
-Caps/plan/bind/run) with a synthetic trellis-native prepared representation
-and checks the decode band routes to the direct micro trellis arm and
-matches the torch reference. Activation quantization is not emulated by the
-oracle, so acceptance uses cosine and relative-L2 bounds.
+The canonical b12x_trellis checkpoint contract does not expose this K2/W4A8
+combination. This test keeps low-level kernel coverage without presenting a
+second public checkpoint format.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     _PreparedWeightRepresentation,
+    plan_b12x_fp4_moe_weights,
 )
 from tests._reference.helpers import require_b12x
 from tests._reference.trellis_moe import (
@@ -58,7 +59,7 @@ def _make_expert_weights(
     # profile; the ordinary boundary stays covered by the kernel-level
     # parity suites.
     assert coupled
-    plan = fused_moe.plan_weights(
+    plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a8_mx",
         source_format="btx",
         activation="situ",
@@ -70,6 +71,12 @@ def _make_expert_weights(
         trellis_codebook="sqg_e4m3",
         trellis_tile_config=(128, 128, 128, 128),
         coupled_hadamard=True,
+    )
+    plan = replace(
+        plan,
+        checkpoint_config=fused_moe.PackedConfig(
+            source_format="fp4_e8m0_k32"
+        ),
     )
     dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
     ones_e = torch.ones(E, dtype=torch.float32, device=device)
@@ -135,12 +142,12 @@ def test_w4a8_trellis_micro_serving_matches_reference(m: int) -> None:
 
     plan = fused_moe.plan(
         fused_moe.Caps(
+            config=experts.plan.checkpoint_config,
             max_tokens=m,
             num_topk=topk,
             route_num_experts=E,
             device=device,
             weight_plan=experts.plan,
-            quant_mode="w4a8_mx",
         )
     )
     spec = plan.scratch_specs()[0]

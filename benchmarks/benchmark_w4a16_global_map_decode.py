@@ -152,27 +152,30 @@ def main() -> None:
         device=device,
     ).view(e8m0_dtype)
     unit_scales = torch.ones(local_experts, dtype=torch.float32, device=device)
-    weight_plan = fused_moe.plan_weights(
-        quant_modes="w4a16",
+    config = fused_moe.PackedConfig(
         source_format="fp4_e8m0_k32",
+        w13_layout="w13",
+    )
+    weight_plan = fused_moe.plan_weights(
+        config=config,
         activation=activation,
-        params_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_experts=local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        w13_layout="w13",
     )
     experts = fused_moe.prepare_weights(
         plan=weight_plan,
-        params_dtype=torch.bfloat16,
-        w1_fp4=w1,
-        w1_blockscale=w1_scale,
-        w1_global_scale=unit_scales,
-        a1_gscale=unit_scales,
-        w2_fp4=w2,
-        w2_blockscale=w2_scale,
-        w2_global_scale=unit_scales,
-        a2_gscale=unit_scales,
+        weights=fused_moe.PackedWeights(
+            w13=w1,
+            w2=w2,
+            w13_block_scales=w1_scale,
+            w2_block_scales=w2_scale,
+            w13_global_scales=unit_scales,
+            w2_global_scales=unit_scales,
+            input_scale=unit_scales,
+            intermediate_scale=unit_scales,
+        ),
     )
 
     plan = fused_moe.plan(
@@ -181,8 +184,8 @@ def main() -> None:
             num_topk=topk,
             route_num_experts=global_experts,
             device=device,
+            config=config,
             weight_plan=experts.plan,
-            quant_mode="w4a16",
             core_token_counts=(1, 8),
             frozen=True,
         )
@@ -217,7 +220,6 @@ def main() -> None:
         topk_ids=topk_ids,
         output=mapped_output,
         input_scales_static=True,
-        unit_scale_contract=True,
         route_expert_map=expert_map,
     )
 
@@ -234,7 +236,6 @@ def main() -> None:
         topk_ids=local_ids,
         output=legacy_kernel_output,
         input_scales_static=True,
-        unit_scale_contract=True,
     )
     legacy_total_output = torch.empty_like(x)
 
@@ -257,7 +258,6 @@ def main() -> None:
             topk_ids=kept_ids,
             output=legacy_total_output,
             input_scales_static=True,
-            unit_scale_contract=True,
         )
         return fused_moe.run(binding=binding)
 

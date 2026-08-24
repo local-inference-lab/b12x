@@ -23,9 +23,9 @@ scales are UE8M0 (``float8_e8m0fnu`` bytes) at ``sf_vec_size=32``:
 * ``hidden_states``  ``(M, K)``      bfloat16 activations (quantized to FP6 in-kernel)
 * ``topk_weights``   ``(M, topk)``   float32 router weights
 * ``topk_ids``       ``(M, topk)``   int32 expert ids
-* prepared experts from :func:`b12x.moe.fused_moe.prepare_weights` with
-  ``quant_mode="w6a8_mx"`` / ``source_format="mxfp6_e2m3"`` and FC1 rows in
-  ``[up; gate]`` (``w13_layout="w13"``)
+* prepared experts from :func:`b12x.moe.fused_moe.prepare_weights` with a
+  ``PackedConfig(source_format="mxfp6_e2m3", w13_layout="w13")`` and FC1 rows
+  in ``[up; gate]``
 * output ``(M, K)`` bfloat16.
 
 Routing is the framework's responsibility.  :class:`B12XFP6MoEMethod.apply`
@@ -91,15 +91,17 @@ def get_fp6_moe_weight_plan(
     )
     plan = _WEIGHT_PLAN_CACHE.get(key)
     if plan is None:
-        plan = fused_moe.plan_weights(
-            quant_modes="w6a8_mx",
+        config = fused_moe.PackedConfig(
             source_format=source_format,
+            w13_layout="w13",  # [up; gate] FC1 rows.
+        )
+        plan = fused_moe.plan_weights(
+            config=config,
             activation=activation,
-            params_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            w13_layout="w13",  # [up; gate] FC1 rows (the only w6a8_mx layout)
         )
         _WEIGHT_PLAN_CACHE[key] = plan
     return plan
@@ -197,10 +199,10 @@ class B12XFP6MoEMethod:
                     max_tokens=m,
                     num_topk=topk,
                     device=device,
+                    config=self.weight_plan.checkpoint_config,
                     weight_plan=self.weight_plan,
                     core_token_counts=(m,),
                     route_num_experts=0,
-                    quant_mode="w6a8_mx",
                     apply_router_weight_on_input=self.apply_router_weight_on_input,
                 )
             )
@@ -321,19 +323,20 @@ def load_b12x_fp6_moe_methods(
 
         prepared = fused_moe.prepare_weights(
             plan=weight_plan,
-            w1_fp4=weights.w1_fp6,
-            w1_blockscale=_unswizzle_grid(
-                weights.w1_blockscale, 2 * weights.n, weights.k // 32
+            weights=fused_moe.PackedWeights(
+                w13=weights.w1_fp6,
+                w2=weights.w2_fp6,
+                w13_block_scales=_unswizzle_grid(
+                    weights.w1_blockscale, 2 * weights.n, weights.k // 32
+                ),
+                w2_block_scales=_unswizzle_grid(
+                    weights.w2_blockscale, weights.k, weights.n // 32
+                ),
+                w13_global_scales=weights.w1_alphas,
+                w2_global_scales=weights.w2_alphas,
+                input_scale=weights.a1_gscale,
+                intermediate_scale=weights.a2_gscale,
             ),
-            w1_global_scale=weights.w1_alphas,
-            a1_gscale=weights.a1_gscale,
-            w2_fp4=weights.w2_fp6,
-            w2_blockscale=_unswizzle_grid(
-                weights.w2_blockscale, weights.k, weights.n // 32
-            ),
-            w2_global_scale=weights.w2_alphas,
-            a2_gscale=weights.a2_gscale,
-            params_dtype=torch.bfloat16,
         )
         out[layer_idx] = B12XFP6MoEMethod(prepared, weight_plan)
     return out

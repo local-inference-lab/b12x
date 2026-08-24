@@ -15,6 +15,7 @@ geometry used by layers containing hundreds of EXL3 experts.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import gc
 import statistics
 
@@ -28,6 +29,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     _PreparedWeightRepresentation,
+    plan_b12x_fp4_moe_weights,
 )
 
 
@@ -147,7 +149,7 @@ def main() -> None:
     print("tiles                         median_us    min_us    rel_error    cosine")
 
     for tile_config in tile_configs:
-        weight_plan = fused_moe.plan_weights(
+        weight_plan = plan_b12x_fp4_moe_weights(
             quant_modes="w4a16",
             source_format="btx",
             activation="situ",
@@ -159,6 +161,12 @@ def main() -> None:
             trellis_bits=3,
             trellis_codebook="mcg",
             trellis_tile_config=tile_config,
+        )
+        weight_plan = replace(
+            weight_plan,
+            checkpoint_config=fused_moe.PackedConfig(
+                source_format="fp4_e8m0_k32"
+            ),
         )
         value = prepare_trellis256_moe_weights(
             w13,
@@ -198,12 +206,12 @@ def main() -> None:
         )
         plan = fused_moe.plan(
             fused_moe.Caps(
+                config=weight_plan.checkpoint_config,
                 max_tokens=1,
                 num_topk=topk,
                 route_num_experts=route_experts,
                 device=device,
                 weight_plan=weights.plan,
-                quant_mode="w4a16",
                 w4a16_block_size_m=8,
             )
         )
