@@ -285,7 +285,186 @@ def _smem_byte(base_addr: Int32, byte_off) -> Int32:
     """Flat smem byte address (base u32 + byte offset); no XOR swizzle."""
     return base_addr + Int32(byte_off)
 
+@cute.jit
+def kvarn_hadamard_bf16_smem(
+    base_addr: Int32,
+    tid: Int32,
+    *,
+    hpb: cutlass.Constexpr,
+    row_stride: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr = 0,
+):
+    """Normalized 512-D Sylvester Hadamard with FP32 register butterflies.
 
+    One warp owns two heads. Each lane holds the sixteen dimensions sharing its
+    low-five-bit coordinate, so stages 0..4 use warp shuffles and stages 5..8
+    exchange registers. BF16 is rounded only at the final store, matching the
+    external Hadacore clone/copy contract much more closely than shared-memory
+    rounding after every stage.
+    """
+    warp = tid >> Int32(5)
+    lane = tid & Int32(31)
+    inv_sqrt512 = Float32(0.04419417382415922)
+    for head_in_warp in cutlass.range_constexpr(2):
+        head = warp * Int32(2) + Int32(head_in_warp)
+        values = [Float32(0.0) for _ in range(16)]
+        row = base_addr + head * Int32(row_stride * 2)
+        for segment in cutlass.range_constexpr(16):
+            dim = lane + Int32(segment * 32)
+            values[segment] = _u32_to_f32(
+                _ld_u16_zext(row, dim * Int32(2)) << Uint32(16)
+            )
+        for stage in cutlass.range_constexpr(5):
+            mask = Int32(1 << stage)
+            for segment in cutlass.range_constexpr(16):
+                value = values[segment]
+                partner = cute.arch.shuffle_sync_bfly(value, offset=(1 << stage))
+                if (lane & mask) == Int32(0):
+                    values[segment] = value + partner
+                else:
+                    values[segment] = partner - value
+        for stage in cutlass.range_constexpr(4):
+            half = 1 << stage
+            span = half * 2
+            for block in cutlass.range_constexpr(16 // span):
+                for offset in cutlass.range_constexpr(half):
+                    lo = block * span + offset
+                    hi = lo + half
+                    a = values[lo]
+                    b = values[hi]
+                    values[lo] = a + b
+                    values[hi] = a - b
+        for segment in cutlass.range_constexpr(16):
+            dim = lane + Int32(segment * 32)
+            st_shared_bf16_from_f32(
+                row + dim * Int32(2), values[segment] * inv_sqrt512
+            )
+    cute.arch.barrier(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
+
+
+@cute.jit
+def kvarn_quantize_hadamard_q_fp8(
+    q_bf16_addr: Int32,
+    q_fp8_addr: Int32,
+    q_sc_addr: Int32,
+    group: Int32,
+    tid_flat: Int32,
+    tid_group: Int32,
+    lane: Int32,
+    *,
+    groups: cutlass.Constexpr,
+    hpb_per_group: cutlass.Constexpr,
+    q_stride: cutlass.Constexpr,
+    num_group_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr,
+):
+    """Quantize grouped BF16 Hadamard rows without overlapping their source."""
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=barrier_threads)
+    for turn in cutlass.range_constexpr(groups):
+        selected = group == Int32(turn)
+        values = [Float32(0.0) for _ in range(hpb_per_group * 2)]
+        if selected:
+            for h in cutlass.range_constexpr(hpb_per_group):
+                src_head = Int32(turn * hpb_per_group + h)
+                row = q_bf16_addr + src_head * Int32(q_stride * 2)
+                values[h * 2] = _u32_to_f32(
+                    _ld_u16_zext(row, tid_group * Int32(2)) << Uint32(16)
+                )
+                values[h * 2 + 1] = _u32_to_f32(
+                    _ld_u16_zext(row, (tid_group + Int32(256)) * Int32(2))
+                    << Uint32(16)
+                )
+            if tid_group < Int32(hpb_per_group * 4):
+                st_shared_f32(
+                    q_sc_addr
+                    + Int32(turn * hpb_per_group * 4 * 4)
+                    + tid_group * Int32(4),
+                    Float32(0.0),
+                )
+        cute.arch.barrier(**bar_kw)
+
+        if selected:
+            scale_pair = tid_group >> Int32(7)
+            for h in cutlass.range_constexpr(hpb_per_group):
+                m0 = fabs_f32(values[h * 2])
+                m1 = fabs_f32(values[h * 2 + 1])
+                for offset in (16, 8, 4, 2, 1):
+                    m0 = fmax_f32(m0, cute.arch.shuffle_sync_bfly(m0, offset=offset))
+                    m1 = fmax_f32(m1, cute.arch.shuffle_sync_bfly(m1, offset=offset))
+                if lane == Int32(0):
+                    sc_base = q_sc_addr + Int32((turn * hpb_per_group + h) * 4 * 4)
+                    atomic_max_shared_f32(sc_base + scale_pair * Int32(4), m0)
+                    atomic_max_shared_f32(sc_base + (scale_pair + Int32(2)) * Int32(4), m1)
+        cute.arch.barrier(**bar_kw)
+
+        if selected and tid_group < Int32(hpb_per_group * 4):
+            sc_addr = (
+                q_sc_addr
+                + Int32(turn * hpb_per_group * 4 * 4)
+                + tid_group * Int32(4)
+            )
+            raw = fmax_f32(ld_shared_f32(sc_addr), Float32(1e-4)) * Float32(1.0 / _FP8_MAX)
+            rounded, _ = pow2_ceil_ue8m0(raw)
+            st_shared_f32(sc_addr, rounded)
+        cute.arch.barrier(**bar_kw)
+
+        if selected:
+            for h in cutlass.range_constexpr(hpb_per_group):
+                dst_head = Int32(turn * hpb_per_group + h)
+                sc_base = q_sc_addr + dst_head * Int32(4 * 4)
+                sc0 = ld_shared_f32(sc_base + (tid_group >> Int32(7)) * Int32(4))
+                sc1 = ld_shared_f32(
+                    sc_base + ((tid_group >> Int32(7)) + Int32(2)) * Int32(4)
+                )
+                dst = q_fp8_addr + dst_head * Int32(q_stride)
+                st_shared_u8(dst + tid_group, _quant_e4m3_byte(values[h * 2] / sc0))
+                st_shared_u8(
+                    dst + tid_group + Int32(256),
+                    _quant_e4m3_byte(values[h * 2 + 1] / sc1),
+                )
+        cute.arch.barrier(**bar_kw)
+
+
+
+@cute.jit
+def kvarn_hadamard_output_bf16(
+    shared_addr: Int32,
+    out_o: cute.Tensor,
+    tid: Int32,
+    *,
+    hpb: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    barrier_threads: cutlass.Constexpr = 0,
+):
+    """Inverse normalized Hadamard in shared memory, then write final BF16."""
+    kvarn_hadamard_bf16_smem(
+        shared_addr,
+        tid,
+        hpb=hpb,
+        row_stride=512,
+        num_threads=num_threads,
+        barrier_id=barrier_id,
+        barrier_threads=barrier_threads,
+    )
+    i = tid
+    while i < Int32(hpb * 512):
+        head = i // Int32(512)
+        dim = i - head * Int32(512)
+        value = _u32_to_f32(
+            _ld_u16_zext(
+                shared_addr + head * Int32(512 * 2), dim * Int32(2)
+            )
+            << Uint32(16)
+        )
+        out_o[head, dim] = value.to(out_o.element_type)
+        i += Int32(num_threads)
 # =============================================================================
 # S0 -- Q quantization to smem (BF16 -> E4M3 + pow2 UE8M0 scale)
 # Port of fp8_quant.cuh::quantize_q_to_smem. Outputs q_fp8 / q_sc / q_rope.
@@ -623,6 +802,12 @@ def s1_qk_nope_block_scaled(
             latent_scale_per_token=latent_scale_per_token,
             kv_sc_base_addr=kv_sc_base_addr,
         )
+    if cutlass.const_expr(scale_format in (3, 5)):
+        return s1_qk_nope_kvarn_bf16(
+            qk, q_fp8_base_addr, kv_fp8_base_addr, warp_first_cand, lane,
+            num_scales=num_scales, quant_tile=quant_tile,
+            q_nope_bf16_stride=q_nope_stride, kv_smem_stride=kv_smem_stride,
+        )
 
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
@@ -802,6 +987,29 @@ def s1_qk_nope_nvfp4_bf16(
             )
     return qk
 
+
+@cute.jit
+def s1_qk_nope_kvarn_bf16(
+    qk, q_base: Int32, kv_base: Int32, warp_first_cand: Int32, lane: Int32,
+    *, num_scales: cutlass.Constexpr, quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr, kv_smem_stride: cutlass.Constexpr,
+):
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    row = kv_base + (warp_first_cand + gid) * Int32(kv_smem_stride)
+    for blk in cutlass.range_constexpr(num_scales):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk * quant_tile + ks * 16)
+            bc = ko + tid * Int32(2)
+            b0 = _ld_u16_zext(row, bc * Int32(2)) | (_ld_u16_zext(row, (bc + Int32(1)) * Int32(2)) << Uint32(16))
+            bc1 = bc + Int32(8)
+            b1 = _ld_u16_zext(row, bc1 * Int32(2)) | (_ld_u16_zext(row, (bc1 + Int32(1)) * Int32(2)) << Uint32(16))
+            ab = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(_smem_byte(q_base, ab))
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1)
+    return qk
 
 @cute.jit
 def s1_qk_nope_block_scaled_glm_h8_swap_ab(
@@ -1431,6 +1639,7 @@ def s4_online_softmax(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,  # math-only named-barrier slot
     n_acc_tiles: cutlass.Constexpr = None,  # len(acc_nope); defaults to n_v_chunks
+    barrier_threads: cutlass.Constexpr = 0,
 ):
     """S4: per-warp + cross-warp max/sum, exp2(qk-max), cross-chunk rescale.
 
@@ -1440,7 +1649,10 @@ def s4_online_softmax(
     probabilities); the caller multiplies by ``warp_rescale`` before storing
     sm_p_full (kills all-invalid-warp spurious 1s). Exactly decode_dsv4
     :456-587."""
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    bar_kw = dict(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     # alpha "has-prev-max" guard threshold == decode_dsv4 :520 (> -1e29f).
@@ -1761,6 +1973,7 @@ def s6_xv_nope(
     sm_p_full_addr: Int32 = None,  # NVFP4 BF16 PV only
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    barrier_threads: cutlass.Constexpr = 0,
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -1817,8 +2030,19 @@ def s6_xv_nope(
             latent_scale_per_token=latent_scale_per_token,
             kv_sc_base_addr=kv_sc_base_addr,
         )
+    if cutlass.const_expr(scale_format in (3, 5)):
+        return s6_xv_nope_kvarn_bf16(
+            acc_nope, sm_p_full_addr, kv_fp8_base_addr, warp_id, lane,
+            n_v_chunks=n_v_chunks, v_chunk=v_chunk, bi=bi,
+            kv_smem_stride=kv_smem_stride, n_warps=n_warps,
+            nt_per_warp_xv=nt_per_warp_xv,
+            sm_p_stride=(sm_p_stride if sm_p_stride else bi),
+        )
 
-    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    bar_kw = dict(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
     warp_first_cand = warp_id * Int32(8)
@@ -2202,6 +2426,44 @@ def s6_xv_nope_nvfp4_bf16(
             acc_nope[at][3] = acc_nope[at][3] + xv3
     return acc_nope
 
+
+@cute.jit
+def s6_xv_nope_kvarn_bf16(
+    acc_nope, sm_p_addr: Int32, kv_base: Int32, warp_id: Int32, lane: Int32,
+    *, n_v_chunks: cutlass.Constexpr, v_chunk: cutlass.Constexpr,
+    bi: cutlass.Constexpr, kv_smem_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr, nt_per_warp_xv: cutlass.Constexpr,
+    sm_p_stride: cutlass.Constexpr,
+):
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            col = Int32(vc * v_chunk) + (Int32(nt * n_warps) + warp_id) * Int32(8) + gid
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for ks in cutlass.range_constexpr(bi // 16):
+                kb = Int32(ks * 16)
+                ab = (a_row * Int32(sm_p_stride) + kb + a_col) * Int32(2)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_addr + ab)
+                e = kb + tid * Int32(2)
+                r0 = kv_base + e * Int32(kv_smem_stride)
+                r1 = r0 + Int32(kv_smem_stride)
+                r8 = r0 + Int32(8 * kv_smem_stride)
+                r9 = r0 + Int32(9 * kv_smem_stride)
+                b0 = _ld_u16_zext(r0, col * Int32(2)) | (_ld_u16_zext(r1, col * Int32(2)) << Uint32(16))
+                b1 = _ld_u16_zext(r8, col * Int32(2)) | (_ld_u16_zext(r9, col * Int32(2)) << Uint32(16))
+                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(xv0, xv1, xv2, xv3, a0, a1, a2, a3, b0, b1)
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] += xv0
+            acc_nope[at][1] += xv1
+            acc_nope[at][2] += xv2
+            acc_nope[at][3] += xv3
+    return acc_nope
 
 @cute.jit
 def s6_xv_nope_glm_h8_swap_ab(
@@ -2744,6 +3006,7 @@ def s7_epilogue(
     num_threads: cutlass.Constexpr = 0,
     barrier_id: cutlass.Constexpr = 0,
     coalesced_output: cutlass.Constexpr = False,
+    natural_lse: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -2936,6 +3199,9 @@ def s7_epilogue(
                     )
                 else:
                     lse1 = sink1
+        if cutlass.const_expr(natural_lse):
+            lse0 = lse0 * Float32(1.0 / LOG2_E)
+            lse1 = lse1 * Float32(1.0 / LOG2_E)
         out_lse[gid] = lse0
         if cutlass.const_expr(valid_hpb > 8):
             out_lse[gid + Int32(8)] = lse1

@@ -6,8 +6,9 @@
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
 - ``compressed_mla``: MLA decode directly from compressed KV pages (DSV4).
+- ``kvarn_mla``: KVarN packed-latent (K2/K4/K5 G64) staging and native
+  sparse-MLA decode without a global row stage.
 - ``nsa_indexer``: the NSA index stage — quantize -> score -> select.
-- ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ _OP_MODULES = (
     "dense_mla",
     "sparse_mla",
     "compressed_mla",
+    "kvarn_mla",
     "nsa_indexer",
     "varlen",
 )
