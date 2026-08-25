@@ -222,6 +222,21 @@ def test_export_cross_checks_sidecar_bit_maps(tmp_path) -> None:
     assert report["checks"]["sidecar_bit_map_layers"] == 1
 
 
+def test_export_rejects_duplicate_shared_vectors(tmp_path) -> None:
+    source, output = tmp_path / "src", tmp_path / "out"
+    _write_source(source, layout="shared")
+    save_file(
+        {
+            "model.layers.1.mlp.experts.other_shared.gate_up_suh": (
+                torch.ones((_HIDDEN,), dtype=torch.float16)
+            )
+        },
+        str(source / "zz-extra-shared.safetensors"),
+    )
+    with pytest.raises(SystemExit, match="resolves to two tensors"):
+        _run(source, output)
+
+
 def test_export_rejects_partial_checkpoints(tmp_path) -> None:
     source, output = tmp_path / "src", tmp_path / "out"
     _write_source(source, layout="per_expert")

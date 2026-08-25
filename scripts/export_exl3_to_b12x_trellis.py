@@ -136,10 +136,15 @@ class _Source:
                 "whole-matrix tensors first"
             )
         if shared:
-            self.shared.setdefault(layer, {})[shared.group("vec")] = (
-                filename,
-                name,
-            )
+            vec = shared.group("vec")
+            slot = self.shared.setdefault(layer, {})
+            previous = slot.setdefault(vec, (filename, name))
+            if previous != (filename, name):
+                raise _fail(
+                    f"layer {layer} {vec} resolves to two tensors: "
+                    f"{previous[1]!r} in {previous[0]!r} and {name!r} in "
+                    f"{filename!r}"
+                )
             return
         key = (int(whole.group("expert")), whole.group("proj"))
         slot = self.whole.setdefault(layer, {}).setdefault(key, {})
