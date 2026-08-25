@@ -1,5 +1,6 @@
-"""Cooperative SM120 dense K6/MCG execution for small row counts.
+"""Cooperative SM120 dense K2-K6/MCG execution for small row counts.
 
+``elem(x * suh) -> H128 -> K{2,3,4,5,6}/MCG GEMM -> H128 -> elem(* svh)``.
 The kernel executes the complete native Trellis dense-linear transform in one resident
 grid for either FP16 or BF16 activations:
 
@@ -42,6 +43,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _SCALAR_ACC_FRAGMENT_WIDTH,
+    _TRELLIS256_BITS,
     W4A16GemmKernel,
 )
 
@@ -77,6 +79,8 @@ _QWEN38_GRID_CTA = {
     # Linear-attention output and MLP down projections.
     (6144, 5120): 120,
     (17408, 5120): 160,
+    # MLP gate/up projections (K5 in Qwen3.8-27B K5K6 checkpoint).
+    (5120, 17408): 128,
 }
 
 _MEASURED_GRID_CTA = {**_GLM_GRID_CTA, **_QWEN38_GRID_CTA}
@@ -205,14 +209,13 @@ def _grid_barrier_wait_flip(
         ip=ip,
     )
 
-
 def _is_unpaired_k6_mcg_weight(prepared) -> bool:
-    """Return whether a prepared weight has the unpaired K6/MCG contract."""
+    """Return whether a prepared weight has the unpaired K2-K6/MCG contract."""
     return bool(
         getattr(prepared, "params_dtype", None) in (torch.float16, torch.bfloat16)
         and getattr(prepared, "weight_layout", None) == "trellis_t256"
         and int(getattr(prepared, "num_experts", 0)) == 1
-        and int(getattr(prepared, "trellis_bits", 0)) == 6
+        and int(getattr(prepared, "trellis_bits", 0)) in _TRELLIS256_BITS
         and str(getattr(prepared, "trellis_codebook", "")).lower() == "mcg"
         and getattr(prepared, "trellis_pair_kind", None) is None
         and getattr(prepared, "trellis_rate_axis", None) is None
@@ -222,7 +225,7 @@ def _is_unpaired_k6_mcg_weight(prepared) -> bool:
 
 
 def is_k6_mcg_small_m_eligible(x: torch.Tensor, prepared) -> bool:
-    """Return whether input and weight satisfy the fused K6/MCG contract."""
+    """Return whether input and weight satisfy the fused K2-K6/MCG contract."""
     return bool(
         isinstance(x, torch.Tensor)
         and x.is_cuda
@@ -251,9 +254,9 @@ def _grid_x(size_k: int, size_n: int, resident_ctas: int) -> int:
 
 
 def k6_mcg_small_m_scratch_elements(size_k: int, size_n: int) -> int:
-    """Return the FP32 split-K scratch required by an unpaired K6 weight."""
+    """Return the FP32 split-K scratch required by an unpaired K2-K6 weight."""
     if min(int(size_k), int(size_n)) <= 0 or size_k % 128 or size_n % 128:
-        raise ValueError("K6/MCG K and N must be positive multiples of 128")
+        raise ValueError("K2-K6/MCG K and N must be positive multiples of 128")
     return max(
         int(size_n) * _ROUTE_BLOCK,
         _requested_grid_x(size_k, size_n) * _ROUTE_BLOCK * _TILE_N,
@@ -261,17 +264,16 @@ def k6_mcg_small_m_scratch_elements(size_k: int, size_n: int) -> int:
 
 
 class K6McgSmallMKernel:
-    """One cooperative grid for H128, split-K MCG GEMM, and H128 output."""
-
-    ABI_VERSION = 4
-
-    def __init__(self, *, size_k: int, size_n: int, element_dtype: str):
+    def __init__(self, *, size_k: int, size_n: int, element_dtype: str, trellis_bits: int = 6):
         """Build a compile-time specialization for one K-by-N projection."""
         if element_dtype not in ("fp16", "bf16"):
             raise ValueError(f"unsupported K6/MCG element dtype {element_dtype!r}")
+        if trellis_bits not in _TRELLIS256_BITS:
+            raise ValueError(f"unsupported trellis_bits {trellis_bits}, must be in {_TRELLIS256_BITS}")
         self.size_k = int(size_k)
         self.size_n = int(size_n)
         self.element_dtype = element_dtype
+        self.trellis_bits = int(trellis_bits)
         self.gemm = W4A16GemmKernel(
             size_m=_MAX_ROWS,
             size_n=self.size_n,
@@ -287,7 +289,7 @@ class K6McgSmallMKernel:
             weight_layout="trellis_t256",
             scale_format="e4m3_k32",
             w13_layout="packed",
-            trellis_bits=6,
+            trellis_bits=self.trellis_bits,
             trellis_codebook="mcg",
             dense_route_fast_path=True,
             schedule_whole_tiles=False,
@@ -307,6 +309,7 @@ class K6McgSmallMKernel:
             self.size_k,
             self.size_n,
             self.element_dtype,
+            self.trellis_bits,
             self.gemm.__cache_key__,
             self.cta_threads,
             self.blocks_per_sm,
@@ -906,6 +909,7 @@ def compile_k6_mcg_small_m(
     size_n: int,
     params_dtype: torch.dtype,
     device: torch.device,
+    trellis_bits: int = 6,
 ) -> K6McgSmallMCompileResult:
     """Compile the cooperative specialization on the weight's CUDA device."""
     device = torch.device(device)
@@ -917,6 +921,7 @@ def compile_k6_mcg_small_m(
             size_n=size_n,
             params_dtype=params_dtype,
             device=device,
+            trellis_bits=trellis_bits,
         )
 
 
@@ -926,6 +931,7 @@ def _compile_k6_mcg_small_m_current_device(
     size_n: int,
     params_dtype: torch.dtype,
     device: torch.device,
+    trellis_bits: int = 6,
 ) -> K6McgSmallMCompileResult:
     """Compile after the public planner has selected the weight's device."""
     if params_dtype == torch.float16:
@@ -942,6 +948,7 @@ def _compile_k6_mcg_small_m_current_device(
         size_k=size_k,
         size_n=size_n,
         element_dtype=element_dtype,
+        trellis_bits=trellis_bits,
     )
     resident_ctas = int(kernel.sms * kernel.blocks_per_sm)
     grid_x = _grid_x(size_k, size_n, resident_ctas)
@@ -957,7 +964,7 @@ def _compile_k6_mcg_small_m_current_device(
             dtype, (max(int(elements), 1),), assumed_align=align
         )
 
-    trellis_elements = (int(size_k) // 16) * (int(size_n) // 16) * 48
+    trellis_elements = (int(size_k) // 16) * (int(size_n) // 16) * (trellis_bits * 8)
     scratch_elements = k6_mcg_small_m_scratch_elements(size_k, size_n)
     workspace_elements = 4 * int(kernel.sms) + _BARRIER_WORDS
     compile_args = (
@@ -1058,7 +1065,7 @@ def _validate_k6_mcg_small_m_prepared_contract(
 
 
 def plan_k6_mcg_small_m(prepared) -> K6McgSmallMCompileResult | None:
-    """Bind the cooperative launch for an eligible prepared K6/MCG weight.
+    """Bind the cooperative launch for an eligible prepared K2-K6/MCG weight.
 
     This function is a model-load planning boundary. It resolves the compiled
     launch before serving and returns ``None`` when the weight must retain the
@@ -1066,11 +1073,13 @@ def plan_k6_mcg_small_m(prepared) -> K6McgSmallMCompileResult | None:
     """
     if _STANDALONE_K6_DISABLED or not _is_unpaired_k6_mcg_weight(prepared):
         return None
+    trellis_bits = int(getattr(prepared, "trellis_bits", 6))
     launch = compile_k6_mcg_small_m(
         size_k=int(prepared.in_features),
         size_n=int(prepared.out_features),
         params_dtype=prepared.params_dtype,
         device=prepared.trellis.device,
+        trellis_bits=trellis_bits,
     )
     _validate_k6_mcg_small_m_prepared_contract(prepared, launch)
     return launch
