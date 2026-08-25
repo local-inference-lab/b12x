@@ -169,7 +169,9 @@ def test_export_rejects_divergent_gate_up_input_vectors(tmp_path) -> None:
     _write_source(source, layout="per_expert")
     shard = source / "experts-layer-001.safetensors"
     with safe_open(str(shard), framework="pt") as handle:
-        tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+        # Clone: get_tensor returns file-backed views and the shard is
+        # rewritten in place below.
+        tensors = {name: handle.get_tensor(name).clone() for name in handle.keys()}
     name = "model.layers.1.mlp.experts.0.up_proj.suh"
     tensors[name] = tensors[name] + 1.0
     save_file(tensors, str(shard))
@@ -197,7 +199,9 @@ def test_export_rejects_foreign_mcg_multiplier(tmp_path) -> None:
     _write_source(source, layout="per_expert")
     shard = source / "experts-layer-001.safetensors"
     with safe_open(str(shard), framework="pt") as handle:
-        tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+        # Clone: get_tensor returns file-backed views and the shard is
+        # rewritten in place below.
+        tensors = {name: handle.get_tensor(name).clone() for name in handle.keys()}
     tensors["model.layers.1.mlp.experts.0.gate_proj.mcg"] = torch.tensor(
         1234567, dtype=torch.int32
     )
@@ -235,6 +239,63 @@ def test_export_rejects_duplicate_shared_vectors(tmp_path) -> None:
     )
     with pytest.raises(SystemExit, match="resolves to two tensors"):
         _run(source, output)
+
+
+def test_export_rejects_conflicting_multi_shard_sidecars(tmp_path) -> None:
+    source, output = tmp_path / "src", tmp_path / "out"
+    _write_source(source, layout="per_expert")
+    # Move one expert's tensors for layer 1 into a second shard with its
+    # own sidecar whose bit map conflicts with the first shard's.
+    shard = source / "experts-layer-001.safetensors"
+    with safe_open(str(shard), framework="pt") as handle:
+        # Clone: get_tensor returns file-backed views and the shard is
+        # rewritten in place below.
+        tensors = {name: handle.get_tensor(name).clone() for name in handle.keys()}
+    # Clone: get_tensor returns file-backed views, and the shard is
+    # rewritten below while `moved` is still needed.
+    moved = {
+        name: tensors.pop(name).clone()
+        for name in list(tensors)
+        if ".experts.2." in name
+    }
+    save_file(tensors, str(shard))
+    save_file(moved, str(source / "experts-layer-001-extra.safetensors"))
+    key = "model.layers.1.mlp.experts.0.gate_proj"
+    (source / "experts-layer-001.json").write_text(json.dumps({"bit_map": {key: 3}}))
+    (source / "experts-layer-001-extra.json").write_text(
+        json.dumps({"bit_map": {key: 5}})
+    )
+    with pytest.raises(SystemExit, match="conflicting sidecar bit maps"):
+        _run(source, output)
+
+    # Consistent maps across both shards merge and pass.
+    (source / "experts-layer-001-extra.json").write_text(
+        json.dumps({"bit_map": {key: 3}})
+    )
+    report = _run(source, output)
+    assert report["checks"]["sidecar_bit_map_layers"] == 1
+
+
+def test_export_rejects_lossy_scale_dtypes(tmp_path) -> None:
+    source, output = tmp_path / "src", tmp_path / "out"
+    _write_source(source, layout="per_expert")
+    shard = source / "experts-layer-001.safetensors"
+    with safe_open(str(shard), framework="pt") as handle:
+        # Clone: get_tensor returns file-backed views and the shard is
+        # rewritten in place below.
+        tensors = {name: handle.get_tensor(name).clone() for name in handle.keys()}
+    name = "model.layers.1.mlp.experts.0.gate_proj.svh"
+    lossy = torch.full((_INTERMEDIATE,), 1.0 / 3.0, dtype=torch.float32)
+    tensors[name] = lossy
+    save_file(tensors, str(shard))
+    with pytest.raises(SystemExit, match="not exactly representable"):
+        _run(source, output)
+
+    # Exactly representable wider dtypes convert without loss.
+    tensors[name] = torch.full((_INTERMEDIATE,), 1.5, dtype=torch.float32)
+    save_file(tensors, str(shard))
+    report = _run(source, output)
+    assert report["verification"]["result"] == "element-identical"
 
 
 def test_export_rejects_partial_checkpoints(tmp_path) -> None:

@@ -182,17 +182,47 @@ def _check_mcg(value: torch.Tensor, name: str) -> None:
 
 
 def _sidecar_bit_map(source: _Source, layer: int) -> dict | None:
-    for filename in {
-        entry[0]
-        for slots in source.whole.get(layer, {}).values()
-        for entry in slots.values()
-    }:
+    """Merge every matching sidecar bit map, rejecting conflicts."""
+
+    merged: dict | None = None
+    for filename in sorted(
+        {
+            entry[0]
+            for slots in source.whole.get(layer, {}).values()
+            for entry in slots.values()
+        }
+    ):
         sidecar = (source.root / filename).with_suffix(".json")
-        if sidecar.exists():
-            data = json.loads(sidecar.read_text())
-            if isinstance(data.get("bit_map"), dict):
-                return data["bit_map"]
-    return None
+        if not sidecar.exists():
+            continue
+        data = json.loads(sidecar.read_text())
+        bit_map = data.get("bit_map")
+        if not isinstance(bit_map, dict):
+            continue
+        if merged is None:
+            merged = {}
+        for key, declared in bit_map.items():
+            previous = merged.setdefault(key, declared)
+            if int(previous) != int(declared):
+                raise _fail(
+                    f"conflicting sidecar bit maps for {key!r}: "
+                    f"{previous} and {declared}"
+                )
+    return merged
+
+
+def _to_fp16_exact(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    """Narrow to fp16 only when every value is exactly representable."""
+
+    if tensor.dtype == torch.float16:
+        return tensor
+    narrowed = tensor.to(torch.float16)
+    if not torch.equal(narrowed.to(tensor.dtype), tensor):
+        raise _fail(
+            f"{name} is {tensor.dtype} with values not exactly "
+            "representable in fp16; refusing a lossy scale conversion"
+        )
+    return narrowed
 
 
 def export(args: argparse.Namespace) -> dict:
@@ -298,14 +328,14 @@ def export(args: argparse.Namespace) -> dict:
                     raise _fail(
                         f"{ivec[1]} shape {tuple(vector.shape)} != [{intermediate}]"
                     )
-                inter_rows[row, expert, pi] = vector.to(torch.float16)
+                inter_rows[row, expert, pi] = _to_fp16_exact(vector, ivec[1])
                 hvec_entry = slot.get("suh" if fc1 else "svh")
                 if hvec_entry is not None:
-                    hvec = _tensor(source, hvec_entry).to(torch.float16)
+                    hvec = _to_fp16_exact(_tensor(source, hvec_entry), hvec_entry[1])
                 elif fc1 and shared_in is not None:
-                    hvec = shared_in.to(torch.float16)
+                    hvec = _to_fp16_exact(shared_in, "gate_up_suh")
                 elif not fc1 and shared_out is not None:
-                    hvec = shared_out.to(torch.float16)
+                    hvec = _to_fp16_exact(shared_out, "down_svh")
                 else:
                     raise _fail(
                         f"layer {layer} expert {expert} {proj} has no "
