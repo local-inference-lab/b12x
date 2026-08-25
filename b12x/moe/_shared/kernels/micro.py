@@ -426,22 +426,22 @@ class MoEMicroKernelBackend:
         swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
         if w13_layout not in {"w13", "w31"}:
             raise ValueError(f"unsupported micro w13_layout {w13_layout!r}")
-        if weight_layout not in {"modelopt", "trellis_t256"}:
+        if weight_layout not in {"modelopt", "trellis3_t256"}:
             raise ValueError(f"unsupported micro weight_layout {weight_layout!r}")
-        if weight_layout == "trellis_t256":
+        if weight_layout == "trellis3_t256":
             if trellis_bits not in (2, 3, 4):
                 raise ValueError(
-                    "trellis_t256 micro weights require trellis_bits in "
+                    "trellis3_t256 micro weights require trellis_bits in "
                     f"{{2, 3, 4}}, got {trellis_bits!r}"
                 )
             if not is_gated_moe_activation(activation):
                 raise ValueError(
-                    "trellis_t256 micro weights require a gated activation"
+                    "trellis3_t256 micro weights require a gated activation"
                 )
         elif trellis_bits is not None or trellis_coupled:
             raise ValueError(
                 "trellis_bits/trellis_coupled require weight_layout "
-                "'trellis_t256'"
+                "'trellis3_t256'"
             )
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
@@ -471,7 +471,7 @@ class MoEMicroKernelBackend:
         # w4a8 prefill recipe. Same f16 dot-product math and weights.
         self.a8_mx_mode = a8_mx_mode
         self.weight_layout = weight_layout
-        self.weight_layout_trellis256 = weight_layout == "trellis_t256"
+        self.weight_layout_trellis256 = weight_layout == "trellis3_t256"
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
         self.trellis_coupled = bool(trellis_coupled)
         self.stage_inactive_routes = bool(stage_inactive_routes)
@@ -851,7 +851,7 @@ class MoEMicroKernelBackend:
             trellis_chunks = max(1, n // 128)
             if n % 128:
                 raise ValueError(
-                    "trellis_t256 micro weights require intermediate % 128 == 0"
+                    "trellis3_t256 micro weights require intermediate % 128 == 0"
                 )
             num_fc1_chunks = trellis_chunks
         elif self.a8_mx_mode:

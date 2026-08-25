@@ -86,6 +86,12 @@ def _pad_source_2d_k(source_2d: torch.Tensor, padded_k: int) -> torch.Tensor:
     return padded.contiguous()
 
 
+def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
+    if int(out_features) < 64:
+        return {"mma_tiler_mn": (64, 32), "swap_ab": True}
+    return {}
+
+
 def is_mxfp8_linear_supported() -> tuple[bool, str | None]:
     if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
         return False, "CUTLASS DSL does not expose cute.nvgpu.warp.MmaMXF8Op"
@@ -191,6 +197,7 @@ def _mxfp8_linear_fused_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
+        **_dense_gemm_kwargs_for_n(out_features),
     )[:, :, 0]
 
 

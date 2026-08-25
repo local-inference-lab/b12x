@@ -29,12 +29,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 
-from .trellis_codebooks import (
-    CODEBOOKS as _TRELLIS_CODEBOOKS,
-    SQG_E4M3 as _TRELLIS_SQG_E4M3,
-    validate_codebook_bits as _validate_trellis_codebook_bits,
-)
-
 
 class _StringEnum(str, Enum):
     def __str__(self) -> str:
@@ -160,20 +154,30 @@ _SOURCE_FORMATS = {
     "fp4_e8m0_k32",
     "compressed_tensors",
     "mxfp6_e2m3",
-    "btx",
+    "exl3_trellis_mcg",
+    "qsrt_sqg_e4m3",
+    "sqg_fp16_d3l",
 }
-_TRELLIS_SOURCE_FORMATS = frozenset({"btx"})
+_TRELLIS_SOURCE_FORMATS = frozenset(
+    {"exl3_trellis_mcg", "qsrt_sqg_e4m3", "sqg_fp16_d3l"}
+)
+_QSRT_ATOMS_V2_PROFILE_H308 = "k3x22_k4x2"
+_QSRT_ATOMS_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
+_QSRT_ATOMS_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
 _SOURCES_BY_QUANT_MODE = {
     "nvfp4": frozenset({"modelopt_nvfp4"}),
     "w4a8_nvfp4": frozenset({"modelopt_nvfp4"}),
-    "w4a8_mx": frozenset({"fp4_e8m0_k32", "btx"}),
-    # The packed MX-FP6 source is exclusive to the w6a8_mx recipe.
+    "w4a8_mx": frozenset({"fp4_e8m0_k32", "qsrt_sqg_e4m3"}),
+    # W4A16 deliberately keeps its historical FP4 source trio; the packed
+    # MX-FP6 source is exclusive to the w6a8_mx recipe.
     "w4a16": frozenset(
         {
             "modelopt_nvfp4",
             "fp4_e8m0_k32",
             "compressed_tensors",
-            "btx",
+            "exl3_trellis_mcg",
+            "qsrt_sqg_e4m3",
+            "sqg_fp16_d3l",
         }
     ),
     "w6a8_mx": frozenset({"mxfp6_e2m3"}),
@@ -278,13 +282,9 @@ class MoEWeightPreparationPlan:
     storage_policy: WeightStoragePolicy
     trellis_bits: int | None = None
     trellis_tile_config: tuple[int, int, int, int] | None = None
+    qsrt_storage_format: str | None = None
+    qsrt_profile: str | None = None
     coupled_hadamard: bool = False
-    # BTX declarations: the manifest-declared codebook, rate structure,
-    # pair-kind summary, and coupled-Hadamard block widths.
-    trellis_codebook: str | None = None
-    trellis_rate_structure: str | None = None
-    trellis_pair_kinds: frozenset[str] | None = None
-    coupled_hadamard_blocks: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -315,21 +315,17 @@ class MoEWeightPreparationPlan:
         object.__setattr__(self, "coupled_hadamard", bool(self.coupled_hadamard))
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
-            codebook = (
-                None
-                if self.trellis_codebook is None
-                else str(self.trellis_codebook).lower()
+            valid_bits = (
+                (2, 3, 4)
+                if self.source_format == "qsrt_sqg_e4m3"
+                else (5, 6)
+                if self.source_format == "sqg_fp16_d3l"
+                else (3, 4, 5, 6)
             )
-            if codebook not in _TRELLIS_CODEBOOKS:
+            if bits not in valid_bits:
                 raise ValueError(
-                    "btx weights require trellis_codebook in "
-                    f"{sorted(_TRELLIS_CODEBOOKS)}; got "
-                    f"{self.trellis_codebook!r}"
+                    f"trellis_bits must be one of {valid_bits}; got {bits}"
                 )
-            _validate_trellis_codebook_bits(codebook, bits)
-            if codebook == "mcg" and bits == 2:
-                raise ValueError("mcg btx weights require trellis_bits>=3")
-            object.__setattr__(self, "trellis_codebook", codebook)
             tile_config = self.trellis_tile_config or (64, 256, 64, 256)
             tile_config = tuple(int(value) for value in tile_config)
             if len(tile_config) != 4 or any(
@@ -340,97 +336,93 @@ class MoEWeightPreparationPlan:
                 )
             object.__setattr__(self, "trellis_bits", bits)
             object.__setattr__(self, "trellis_tile_config", tile_config)
-            structure = (
-                "uniform"
-                if self.trellis_rate_structure is None
-                else str(self.trellis_rate_structure).lower()
-            )
-            pair_kinds = (
+            storage_format = (
                 None
-                if self.trellis_pair_kinds is None
-                else frozenset(
-                    str(kind).upper() for kind in self.trellis_pair_kinds
-                )
+                if self.qsrt_storage_format is None
+                else str(self.qsrt_storage_format).lower()
             )
-            if structure == "uniform":
-                if pair_kinds is not None:
+            if self.source_format == "qsrt_sqg_e4m3":
+                if storage_format not in {
+                    "qsrt_atoms_v1",
+                    "qsrt_atoms_v2",
+                }:
                     raise ValueError(
-                        "uniform btx rates declare no trellis_pair_kinds"
+                        "QSRT MoE weights require "
+                        "qsrt_storage_format='qsrt_atoms_v1', "
+                        "or 'qsrt_atoms_v2'"
                     )
-            elif structure == "per_expert_pair":
-                if self.coupled_hadamard:
+                profile = self.qsrt_profile
+                if storage_format == "qsrt_atoms_v2":
+                    profile = profile or _QSRT_ATOMS_V2_PROFILE_H308
+                    if profile not in {
+                        _QSRT_ATOMS_V2_PROFILE_H308,
+                        _QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+                        _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
+                    }:
+                        raise ValueError(
+                            f"unsupported QSRT atoms-v2 profile {profile!r}"
+                        )
+                elif profile is not None:
                     raise ValueError(
-                        "coupled-Hadamard btx execution is qualified "
-                        "only for uniform rate structures"
+                        "qsrt_profile is valid only for qsrt_atoms_v2 storage"
                     )
-                if bits != 3:
-                    raise ValueError(
-                        "per-expert-pair btx rates require the "
-                        "trellis_bits=3 base specialization"
-                    )
-                if pair_kinds is None:
-                    raise ValueError(
-                        "per-expert-pair btx rates declare "
-                        "trellis_pair_kinds"
-                    )
-                if "P44" in pair_kinds:
-                    raise ValueError(
-                        "btx pair-kind sets containing P44 (whole-expert"
-                        " K4 tiers) have no fused execution arm; use"
-                        " mixed-tier or multi-launch execution"
-                    )
-                if pair_kinds not in (
-                    frozenset({"P33"}),
-                    frozenset({"P33", "P24"}),
-                    frozenset({"P33", "P43"}),
-                ):
-                    raise ValueError(
-                        "btx pair-kind sets must be {P33}, {P33,P24}, "
-                        f"or {{P33,P43}}; got {sorted(pair_kinds)}"
-                    )
-            else:
+                if profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2:
+                    if bits != 2:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires trellis_bits=2"
+                        )
+                    if self.intermediate_size % 128:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires a local intermediate "
+                            "size divisible by 128"
+                        )
+                    if tile_config != (128, 128, 128, 128):
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires tile_config="
+                            "(128, 128, 128, 128)"
+                        )
+                    if not self.coupled_hadamard:
+                        raise ValueError(
+                            "the coupled pure-K2 profile requires "
+                            "coupled_hadamard=True"
+                        )
+                else:
+                    if bits != 3:
+                        raise ValueError(
+                            "the fixed high-rate QSRT profile requires trellis_bits=3"
+                        )
+                    if self.intermediate_size != 256:
+                        raise ValueError(
+                            "the fixed high-rate QSRT pair kernel requires "
+                            "intermediate_size=256"
+                        )
+                    if tile_config[1] != 256:
+                        raise ValueError(
+                            "the fixed high-rate QSRT pair kernel requires "
+                            "FC1 tile_n=256"
+                        )
+                    if (
+                        profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_H308
+                    ) != self.coupled_hadamard:
+                        raise ValueError(
+                            "the fixed high-rate coupled profile and "
+                            "coupled_hadamard flag must agree"
+                        )
+                object.__setattr__(self, "qsrt_profile", profile)
+            elif storage_format is not None:
                 raise ValueError(
-                    "trellis_rate_structure must be 'uniform' or "
-                    f"'per_expert_pair'; got {structure!r}"
+                    "qsrt_storage_format is valid only for qsrt_sqg_e4m3"
                 )
-            blocks = (
-                None
-                if self.coupled_hadamard_blocks is None
-                else tuple(
-                    int(value) for value in self.coupled_hadamard_blocks
-                )
-            )
-            if self.coupled_hadamard:
-                if self.trellis_codebook != _TRELLIS_SQG_E4M3:
-                    raise ValueError(
-                        "coupled-Hadamard btx execution is qualified only"
-                        " for the sqg_e4m3 codebook"
-                    )
-                if blocks is None:
-                    blocks = (512, 128)
-                if blocks != (512, 128):
-                    raise ValueError(
-                        "coupled-Hadamard btx execution implements "
-                        f"blocks (512, 128); got {blocks}"
-                    )
-            elif blocks is not None:
-                raise ValueError(
-                    "coupled_hadamard_blocks require coupled_hadamard"
-                )
-            object.__setattr__(self, "trellis_rate_structure", structure)
-            object.__setattr__(self, "trellis_pair_kinds", pair_kinds)
-            object.__setattr__(self, "coupled_hadamard_blocks", blocks)
+            object.__setattr__(self, "qsrt_storage_format", storage_format)
         elif (
             self.trellis_bits is not None
             or self.trellis_tile_config is not None
+            or self.qsrt_storage_format is not None
+            or self.qsrt_profile is not None
             or self.coupled_hadamard
-            or self.trellis_codebook is not None
-            or self.trellis_rate_structure is not None
-            or self.trellis_pair_kinds is not None
-            or self.coupled_hadamard_blocks is not None
         ):
             raise ValueError(
-                "trellis storage settings require a trellis source format"
+                "QSRT storage settings require a QSRT source format"
             )
         for name in ("num_experts", "hidden_size", "intermediate_size"):
             if getattr(self, name) <= 0:
@@ -503,7 +495,7 @@ class MoEWeightPreparationPlan:
     @property
     def w4a16_weight_layout(self) -> str | None:
         if WeightPreparationTransform.W4A16_TRELLIS in self.transforms:
-            return "trellis_t256"
+            return "trellis3_t256"
         if WeightPreparationTransform.W4A16_NATIVE in self.transforms:
             return "modelopt"
         if WeightPreparationTransform.W4A16_PACKED in self.transforms:
@@ -515,7 +507,7 @@ class MoEWeightPreparationPlan:
         """Kernel weight-layout string for the w4a8_mx recipe, if planned."""
 
         if WeightPreparationTransform.W4A8_TRELLIS in self.transforms:
-            return "trellis_t256"
+            return "trellis3_t256"
         if WeightPreparationTransform.W4A8_QMMA in self.transforms:
             return "qmma_repacked"
         return None
@@ -724,11 +716,9 @@ def plan_moe_weight_preparation(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    qsrt_storage_format: str | None = None,
+    qsrt_profile: str | None = None,
     coupled_hadamard: bool | None = None,
-    trellis_codebook: str | None = None,
-    trellis_rate_structure: str | None = None,
-    trellis_pair_kinds: Iterable[str] | None = None,
-    coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -775,7 +765,7 @@ def plan_moe_weight_preparation(
         and source_format not in _TRELLIS_SOURCE_FORMATS
     ):
         raise ValueError(
-            "trellis_native layout requires a trellis source format"
+            "trellis_native layout requires an EXL3 trellis source format"
         )
 
     transforms: set[WeightPreparationTransform] = set()
@@ -806,17 +796,15 @@ def plan_moe_weight_preparation(
                 # after in-kernel decode; identity weight block scales).
                 # The w4a8 trellis kernels window K and I in 16s and run
                 # the 128-wide activation boundary per intermediate chunk.
-                if (
-                    trellis_codebook is not None
-                    and str(trellis_codebook).lower() != "sqg_e4m3"
-                ):
+                if source_format != "qsrt_sqg_e4m3":
                     raise ValueError(
-                        "W4A8-MX btx execution requires the sqg_e4m3 codebook"
+                        "W4A8-MX trellis execution requires the "
+                        "qsrt_sqg_e4m3 source format"
                     )
-                if (
-                    trellis_rate_structure is not None
-                    and str(trellis_rate_structure).lower() != "uniform"
-                ):
+                if qsrt_profile in {
+                    _QSRT_ATOMS_V2_PROFILE_H308,
+                    _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
+                }:
                     # The W4A8 kernels decode one compile-time rate for the
                     # whole payload; the mixed-rate pair machinery is
                     # W4A16-only.
@@ -956,7 +944,10 @@ def plan_moe_weight_preparation(
         storage_policy = WeightStoragePolicy.KEEP_SOURCE
 
     if coupled_hadamard is None:
-        coupled_hadamard = False
+        coupled_hadamard = qsrt_profile in {
+            _QSRT_ATOMS_V2_PROFILE_COUPLED_K2,
+            _QSRT_ATOMS_V2_PROFILE_COUPLED_H308,
+        }
     return MoEWeightPreparationPlan(
         specs=normalized_specs,
         num_experts=num_experts,
@@ -968,15 +959,9 @@ def plan_moe_weight_preparation(
         storage_policy=storage_policy,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
+        qsrt_storage_format=qsrt_storage_format,
+        qsrt_profile=qsrt_profile,
         coupled_hadamard=coupled_hadamard,
-        trellis_codebook=trellis_codebook,
-        trellis_rate_structure=trellis_rate_structure,
-        trellis_pair_kinds=(
-            None
-            if trellis_pair_kinds is None
-            else frozenset(str(kind) for kind in trellis_pair_kinds)
-        ),
-        coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
 
 

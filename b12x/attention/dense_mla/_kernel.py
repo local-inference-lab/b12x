@@ -21,7 +21,6 @@ from b12x._lib.compiler import (
     tensor_key,
 )
 
-from .._shared import static_fp8_quant
 from ._forward import DenseMlaForwardKernel
 from ._layout import make_smem_layout
 from ._merge import DenseMlaMergeKernel
@@ -83,10 +82,6 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.query_tile,
         scratch.num_splits,
         scratch.chunks_per_split,
-        scratch.physical_record_width,
-        scratch.head_dim,
-        scratch.v_head_dim,
-        scratch.window_size,
         tuple(int(value) for value in binding.q.stride()),
         tuple(int(value) for value in binding.kv_cache.stride()),
         tuple(int(value) for value in binding.output.stride()),
@@ -118,7 +113,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     layout = make_smem_layout(
         query_tile=scratch.query_tile,
         fp8=fp8,
-        qk_dim=scratch.head_dim,
     )
     entry = DenseMlaForwardKernel(
         layout=layout,
@@ -128,9 +122,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         chunks_per_split=scratch.chunks_per_split,
         query_tile=scratch.query_tile,
         fp8=fp8,
-        qk_dim=scratch.head_dim,
-        value_dim=scratch.v_head_dim,
-        window_size=scratch.window_size,
     )
 
     q_bytes = _byte_base_pointer(binding.q)
@@ -194,7 +185,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         Int64(int(binding.q.stride(0)) * binding.q.element_size()),
         Int64(int(binding.q.stride(1)) * binding.q.element_size()),
         Int64(int(binding.kv_cache.stride(0)) * binding.kv_cache.element_size()),
-        Int64(int(binding.kv_cache.stride(1)) * binding.kv_cache.element_size()),
         Int64(int(binding.page_table.stride(0))),
         Int32(int(binding.q.shape[0])),
         Int32(int(binding.cache_seqlens.shape[0])),
@@ -203,7 +193,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        4,
+        3,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
@@ -212,10 +202,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         key_field("query_tile", scratch.query_tile),
         key_field("num_splits", scratch.num_splits),
         key_field("chunks_per_split", scratch.chunks_per_split),
-        key_field("physical_record_width", scratch.physical_record_width),
-        key_field("head_dim", scratch.head_dim),
-        key_field("v_head_dim", scratch.v_head_dim),
-        key_field("window_size", scratch.window_size),
         key_field("record_stride_bytes", layout.record_stride_bytes),
         tensor_key(
             "q",
@@ -223,7 +209,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.head_dim),
+                DimKey.exact(576),
             ),
         ),
         tensor_key(
@@ -232,7 +218,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.page_size),
-                DimKey.exact(scratch.physical_record_width),
+                DimKey.exact(576),
             ),
         ),
         tensor_key(
@@ -241,7 +227,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
     )
@@ -254,7 +240,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         return None
     assert scratch.partial_output is not None
     assert scratch.partial_lse is not None
-    entry = DenseMlaMergeKernel(scratch.num_splits, scratch.v_head_dim)
+    entry = DenseMlaMergeKernel(scratch.num_splits)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (
         _to_cute(
@@ -278,7 +264,6 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         4,
         key_field("num_splits", scratch.num_splits),
         key_field("heads", scratch.num_q_heads),
-        key_field("v_head_dim", scratch.v_head_dim),
         tensor_key(
             "partial_output",
             scratch.partial_output,
@@ -286,7 +271,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
                 DimKey.capacity(scratch.max_total_q),
                 DimKey.exact(scratch.num_q_heads),
                 DimKey.exact(scratch.num_splits),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
         tensor_key(
@@ -295,7 +280,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
     )
@@ -333,8 +318,6 @@ def compile_dense_mla(*, binding: Binding) -> None:
     """Compile the exact native forward/merge entries without launching."""
     if not binding.q.is_cuda:
         raise ValueError("dense MLA native compilation requires CUDA tensors")
-    if binding.query_quant is not None:
-        static_fp8_quant.compile(binding=binding.query_quant)
     _compile_entries(binding)
 
 
@@ -345,8 +328,6 @@ def run_dense_mla(
     """Launch only previously planned storage; no device allocation occurs."""
     if not binding.q.is_cuda:
         raise ValueError("dense MLA native execution requires CUDA tensors")
-    if binding.query_quant is not None:
-        static_fp8_quant.run(binding=binding.query_quant)
     signature = _signature(binding)
     with _LOCK:
         compiled_forward = _FORWARD_CACHE.get(signature)
@@ -374,7 +355,6 @@ def run_dense_mla(
 
 
 def clear_dense_mla_kernel_caches() -> None:
-    static_fp8_quant.clear_caches()
     with _LOCK:
         _FORWARD_CACHE.clear()
         _MERGE_CACHE.clear()

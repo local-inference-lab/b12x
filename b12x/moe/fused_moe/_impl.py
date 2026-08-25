@@ -80,11 +80,6 @@ from b12x.moe._shared.execution import (
     make_moe_spec,
     plan_moe_weight_preparation,
 )
-from b12x.moe._shared.execution import (
-    _SOURCE_FORMATS as _EXECUTION_SOURCE_FORMATS,
-    _TRELLIS_SOURCE_FORMATS as _EXECUTION_TRELLIS_SOURCE_FORMATS,
-)
-from b12x.moe._shared.trellis_codebooks import SQG_E4M3
 from b12x.moe._shared.tuning import lookup_max_active_clusters
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -97,8 +92,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -128,10 +122,25 @@ _DYNAMIC_W4A8_SHARE_INPUT_ENV = "B12X_DYNAMIC_W4A8_SHARE_INPUT"
 _DYNAMIC_W4A8_MATERIALIZED_ENV = "B12X_DYNAMIC_W4A8_MATERIALIZED"
 _W4A8_CONVERT_SCRATCH_MB_ENV = "B12X_W4A8_CONVERT_SCRATCH_MB"
 _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
-# The source-format vocabulary is owned by b12x.moe._shared.execution;
-# these views keep the historical local names.
-_FP4_SOURCE_FORMATS = {name: name for name in _EXECUTION_SOURCE_FORMATS}
-_TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
+_FP4_SOURCE_FORMATS = {
+    "modelopt_nvfp4": "modelopt_nvfp4",
+    "fp4_e8m0_k32": "fp4_e8m0_k32",
+    "compressed_tensors": "compressed_tensors",
+    # Packed MX-FP6 E2M3 codes with UE8M0 K/32 grids; exclusive to the
+    # w6a8_mx recipe (see _validate_fp4_source_format_for_quant_mode).
+    "mxfp6_e2m3": "mxfp6_e2m3",
+    # Native fixed-payload QSRT with finite E4M3 reconstruction.
+    "qsrt_sqg_e4m3": "qsrt_sqg_e4m3",
+    # Existing general EXL3 full-rotation MCG source contract.
+    "exl3_trellis_mcg": "exl3_trellis_mcg",
+    # Uniform K5/K6 SQG with the frozen 416-byte FP16-D3L scalar law.
+    "sqg_fp16_d3l": "sqg_fp16_d3l",
+}
+_TRELLIS_SOURCE_FORMATS = {
+    "exl3_trellis_mcg",
+    "qsrt_sqg_e4m3",
+    "sqg_fp16_d3l",
+}
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
@@ -144,7 +153,7 @@ _W13_LAYOUTS = {
     # in-place W13 row rotation ("w13"), "gate_up" is already kernel-native.
     "up_gate": "w13",
     "gate_up": "w31",
-    "trellis_t256_proj": "trellis_t256_proj",
+    "trellis3_t256_proj": "trellis3_t256_proj",
 }
 
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
@@ -271,8 +280,7 @@ class TPW4A16Workspace:
     full_rotation: bool = False
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
-    trellis_pair_kinds: frozenset[str] | None = None
-    trellis_codebook: str | None = None
+    qsrt_storage_format: str | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     planned_token_counts: frozenset[int] = field(default_factory=frozenset)
@@ -694,8 +702,7 @@ class _TPCoreWorkspacePlan:
     full_rotation: bool = False
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
-    trellis_pair_kinds: frozenset[str] | None = None
-    trellis_codebook: str | None = None
+    qsrt_storage_format: str | None = None
     coupled_hadamard: bool = False
     route_block_size_m: int | None = None
     prefill_fused_sum_fp32: bool = False
@@ -1323,8 +1330,10 @@ def _normalize_fp4_source_format(source_format: str) -> str:
         return _FP4_SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of "
-            f"{sorted(_FP4_SOURCE_FORMATS)}, got {source_format!r}"
+            "source_format must be one of 'modelopt_nvfp4', "
+            "'fp4_e8m0_k32', 'compressed_tensors', 'mxfp6_e2m3', or "
+            "'exl3_trellis_mcg', 'qsrt_sqg_e4m3', or 'sqg_fp16_d3l', "
+            f"got {source_format!r}"
         ) from exc
 
 
@@ -1371,10 +1380,10 @@ def _w4a16_weight_layout_for_source(source_format: str) -> str:
     just not auto-routed here.)
     """
     source_format = _normalize_fp4_source_format(source_format)
-    return "trellis_t256" if source_format in _TRELLIS_SOURCE_FORMATS else "packed"
+    return "trellis3_t256" if source_format in _TRELLIS_SOURCE_FORMATS else "packed"
 
 
-_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis_t256"}
+_W4A16_WEIGHT_LAYOUTS = {"packed", "modelopt", "trellis3_t256"}
 
 
 def _normalize_w4a16_weight_layout(weight_layout: str) -> str:
@@ -1419,28 +1428,6 @@ def _normalize_swiglu_params(
     )
 
 
-def _derive_trellis_codebook(
-    source_format: str, trellis_codebook: str | None
-) -> str | None:
-    """Kernel decode codebook, declared by the btx plan."""
-
-    del source_format
-    return trellis_codebook
-
-
-def _fc_trellis_pair_kind(workspace) -> str | None:
-    """Compile-time pair kind from the plan's declared rate summary.
-
-    Compact P33/P43 descriptors serve {P33, P43}; PDYNAMIC mode tables
-    serve {P33} and {P33, P24}.
-    """
-
-    kinds = workspace.trellis_pair_kinds
-    if kinds:
-        return "P33_P43" if "P43" in kinds else "PDYNAMIC"
-    return None
-
-
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
@@ -1464,7 +1451,7 @@ def _validate_fp4_source_format_for_quant_mode(
         return
     if source_format == "fp4_e8m0_k32" and quant_mode == "w4a8_mx":
         return
-    if source_format == "btx" and quant_mode == "w4a8_mx":
+    if source_format == "qsrt_sqg_e4m3" and quant_mode == "w4a8_mx":
         return
     raise ValueError(
         f"source_format={source_format!r} with quant_mode={quant_mode!r} is "
@@ -2551,8 +2538,7 @@ def _plan_core_workspace(
     w4a16_block_size_m: int | None = None,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
-    trellis_pair_kinds: frozenset[str] | None = None,
-    trellis_codebook: str | None = None,
+    qsrt_storage_format: str | None = None,
     coupled_hadamard: bool = False,
     apply_router_weight_on_input: bool = False,
     collect_activation_amax: bool = False,
@@ -2597,14 +2583,12 @@ def _plan_core_workspace(
             else _w4a16_weight_layout_for_source(source_format)
         )
         requested_route_E = int(route_num_experts or weight_E)
-        full_rotation = weight_layout == "trellis_t256"
-        # Route metadata must address every physical weight and every global
-        # router ID accepted through route_expert_map.
-        route_E = max(int(weight_E), requested_route_E)
+        full_rotation = weight_layout == "trellis3_t256"
+        route_E = requested_route_E if full_rotation else int(weight_E)
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
-                    "trellis_t256 workspace requires a trellis source format"
+                    "trellis3_t256 workspace requires an EXL3 trellis source format"
                 )
             if int(k) % 128 != 0 or int(n) % 128 != 0:
                 raise ValueError(
@@ -2614,13 +2598,33 @@ def _plan_core_workspace(
             if int(trellis_bits) not in (2, 3, 4, 5, 6):
                 raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
             trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
-            if trellis_pair_kinds and (
+            if qsrt_storage_format not in {
+                None,
+                "qsrt_atoms_v1",
+                "qsrt_atoms_v2",
+            }:
+                raise ValueError(
+                    "qsrt_storage_format must be None, 'qsrt_atoms_v1', "
+                    "or 'qsrt_atoms_v2'"
+                )
+            if qsrt_storage_format == "qsrt_atoms_v1" and (
                 int(trellis_bits) != 3 or int(n) != 256
             ):
-                raise ValueError(
-                    "per-expert-pair btx extents require n=256 and "
-                    "trellis_bits=3"
-                )
+                raise ValueError("QSRT atoms-v1 requires n=256 and trellis_bits=3")
+            if qsrt_storage_format == "qsrt_atoms_v2":
+                if int(trellis_bits) == 3 and int(n) != 256:
+                    raise ValueError(
+                        "the fixed high-rate atoms-v2 profile requires n=256"
+                    )
+                if int(trellis_bits) == 2 and int(n) % 128:
+                    raise ValueError(
+                        "the coupled pure-K2 atoms-v2 profile requires n divisible "
+                        "by 128"
+                    )
+                if int(trellis_bits) not in (2, 3):
+                    raise ValueError("QSRT atoms-v2 supports only K2 or K3 bases")
+        elif qsrt_storage_format is not None:
+            raise ValueError("qsrt_storage_format requires QSRT full rotation")
         routed_capacity = max(int(routed_rows), 1)
         fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
@@ -2851,11 +2855,10 @@ def _plan_core_workspace(
             full_rotation=full_rotation,
             trellis_bits=int(trellis_bits),
             trellis_tile_config=trellis_tile_config,
-            trellis_pair_kinds=trellis_pair_kinds,
-            trellis_codebook=trellis_codebook,
+            qsrt_storage_format=qsrt_storage_format,
             coupled_hadamard=bool(coupled_hadamard),
             route_block_size_m=w4a16_block_size_m,
-            prefill_fused_sum_fp32=use_prefill_fused_sum,
+            prefill_fused_sum_fp32=bool(use_prefill_fused_sum),
             tensor_specs=tuple(tensor_specs),
         )
 
@@ -3292,8 +3295,7 @@ def _materialize_workspace_from_core_arena(
             full_rotation=plan.full_rotation,
             trellis_bits=plan.trellis_bits,
             trellis_tile_config=plan.trellis_tile_config,
-            trellis_pair_kinds=plan.trellis_pair_kinds,
-            trellis_codebook=plan.trellis_codebook,
+            qsrt_storage_format=plan.qsrt_storage_format,
             coupled_hadamard=plan.coupled_hadamard,
             route_block_size_m=plan.route_block_size_m,
             planned_prefill_fused_sum_fp32=plan.prefill_fused_sum_fp32,
@@ -4741,7 +4743,7 @@ def _w4a8_prepared_dict(prepared: object) -> dict[str, torch.Tensor]:
 
     if isinstance(prepared, dict):
         values = prepared
-    elif getattr(prepared, "weight_layout", None) == "trellis_t256":
+    elif getattr(prepared, "weight_layout", None) == "trellis3_t256":
         # Trellis-native representation: the rp slots carry the
         # projection-major payloads and the sfb slots carry the fp16
         # boundary rotations. The dynamic launch keys trellis mode off
@@ -5032,11 +5034,9 @@ def plan_b12x_fp4_moe_weights(
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
+    qsrt_storage_format: str | None = None,
+    qsrt_profile: str | None = None,
     coupled_hadamard: bool | None = None,
-    trellis_codebook: str | None = None,
-    trellis_rate_structure: str | None = None,
-    trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
-    coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -5064,11 +5064,9 @@ def plan_b12x_fp4_moe_weights(
         w4a16_layout=w4a16_layout,
         trellis_bits=trellis_bits,
         trellis_tile_config=trellis_tile_config,
+        qsrt_storage_format=qsrt_storage_format,
+        qsrt_profile=qsrt_profile,
         coupled_hadamard=coupled_hadamard,
-        trellis_codebook=trellis_codebook,
-        trellis_rate_structure=trellis_rate_structure,
-        trellis_pair_kinds=trellis_pair_kinds,
-        coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
 
 
@@ -5084,8 +5082,17 @@ def prepare_b12x_fp4_moe_weights(
     w2_blockscale: torch.Tensor | None = None,
     a1_gscale: torch.Tensor | None = None,
     a2_gscale: torch.Tensor | None = None,
-    btx_layer: object | None = None,
-    btx_device: torch.device | str | None = None,
+    gate_suh: torch.Tensor | None = None,
+    up_suh: torch.Tensor | None = None,
+    intermediate_rotations: torch.Tensor | None = None,
+    down_svh: torch.Tensor | None = None,
+    trellis_mcg: torch.Tensor | int | None = None,
+    qsrt_atom_payload: torch.Tensor | None = None,
+    qsrt_first_atom_slot: int | None = None,
+    qsrt_layer_index: int | None = None,
+    qsrt_expert_ids: torch.Tensor | None = None,
+    qsrt_format_codes: torch.Tensor | None = None,
+    qsrt_rotation_draws: torch.Tensor | None = None,
     dummy_scale: torch.Tensor | None = None,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner."""
@@ -5097,91 +5104,169 @@ def prepare_b12x_fp4_moe_weights(
         raise ValueError(
             f"params_dtype={actual_dtype!r} does not match plan dtype={plan.io_dtype!r}"
         )
-    if plan.source_format == "btx":
-        from b12x.moe._shared.kernels.w4a16.btx import (
-            BtxLayer,
-            prepare_btx_moe_weights,
-        )
-
-        if not isinstance(btx_layer, BtxLayer):
-            raise ValueError(
-                "btx preparation requires btx_layer, a BtxLayer extent from "
-                "read_btx_layer"
-            )
-        if btx_device is None:
-            raise ValueError(
-                "btx preparation requires btx_device, the CUDA device that "
-                "owns the prepared weights"
-            )
+    if plan.source_format == "qsrt_sqg_e4m3":
         if len(plan.quant_modes) != 1 or not plan.quant_modes <= frozenset(
             {"w4a16", "w4a8_mx"}
         ):
             raise ValueError(
-                "btx weights support exactly one of quant_mode='w4a16' or "
+                "QSRT weights support exactly one of quant_mode='w4a16' or "
                 "quant_mode='w4a8_mx'"
             )
-        manifest = btx_layer.manifest
-        if manifest.codebook != plan.trellis_codebook:
+        qsrt_quant_mode = next(iter(plan.quant_modes))
+        if plan.qsrt_storage_format not in {"qsrt_atoms_v1", "qsrt_atoms_v2"}:
             raise ValueError(
-                f"btx manifest codebook {manifest.codebook!r} does not match "
-                f"the plan's trellis_codebook {plan.trellis_codebook!r}"
+                "QSRT preparation requires qsrt_atoms_v1 or qsrt_atoms_v2 storage"
             )
-        if (
-            manifest.rates.bits is not None
-            and manifest.rates.bits != plan.trellis_bits
+        if plan.qsrt_storage_format == "qsrt_atoms_v2":
+            if not all(
+                value is not None
+                for value in (
+                    qsrt_atom_payload,
+                    qsrt_first_atom_slot,
+                    qsrt_layer_index,
+                    gate_suh,
+                    up_suh,
+                    down_svh,
+                )
+            ):
+                raise ValueError(
+                    "QSRT atoms-v2 preparation requires the atom extent, its "
+                    "physical identity, and all shared rotations"
+                )
+            assert qsrt_atom_payload is not None
+            assert qsrt_first_atom_slot is not None
+            assert qsrt_layer_index is not None
+            assert gate_suh is not None and up_suh is not None
+            assert down_svh is not None
+            from b12x.moe._shared.kernels.w4a16.prepare import (
+                prepare_qsrt_atom_v2_moe_weights,
+            )
+
+            value = prepare_qsrt_atom_v2_moe_weights(
+                qsrt_atom_payload,
+                first_atom_slot=qsrt_first_atom_slot,
+                layer_index=qsrt_layer_index,
+                profile=plan.qsrt_profile or "k3x22_k4x2",
+                rotation_draws=qsrt_rotation_draws,
+                hidden_size=plan.hidden_size,
+                intermediate_size=plan.intermediate_size,
+                num_experts=plan.num_experts,
+                activation=plan.activation,
+                gate_suh=gate_suh,
+                up_suh=up_suh,
+                down_svh=down_svh,
+                params_dtype=torch.float16,
+                codebook="sqg_xor_cheb_t12",
+                tile_config=plan.trellis_tile_config or (64, 256, 64, 256),
+                dummy_scale=dummy_scale,
+            )
+            representation = _PreparedWeightRepresentation(
+                quant_mode=qsrt_quant_mode,
+                layout=PreparedWeightLayout.TRELLIS_NATIVE,
+                value=value,
+            )
+            # Atom-v2 may be streamed from a host-backed canonical extent, but
+            # the returned expert package is a CUDA runtime object.  Keep even
+            # the unit activation-scale placeholders colocated with the
+            # prepared weights so later binding and validation never inherit
+            # the source extent's device.
+            input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
+            return B12XFP4ExpertWeights(
+                plan=plan,
+                a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
+                w1_fp4=value.w13,
+                w1_blockscale=value.w13_scale,
+                w1_alphas=value.w13_global_scale,
+                a2_gscale=a2_gscale if a2_gscale is not None else input_scale,
+                w2_fp4=value.w2,
+                w2_blockscale=value.w2_scale,
+                w2_alphas=value.w2_global_scale,
+                representation=representation,
+            )
+        if not all(
+            value is not None
+            for value in (
+                qsrt_atom_payload,
+                qsrt_first_atom_slot,
+                qsrt_layer_index,
+                qsrt_expert_ids,
+                qsrt_format_codes,
+                gate_suh,
+                up_suh,
+                down_svh,
+            )
         ):
             raise ValueError(
-                f"btx manifest declares bits={manifest.rates.bits}; the plan "
-                f"declares trellis_bits={plan.trellis_bits}"
+                "QSRT preparation requires the atom extent, its physical-slot "
+                "metadata, expert IDs, format codes, and shared rotations"
             )
-        if manifest.rates.structure != (
-            plan.trellis_rate_structure or "uniform"
+        assert qsrt_atom_payload is not None
+        assert qsrt_first_atom_slot is not None
+        assert qsrt_layer_index is not None
+        assert qsrt_expert_ids is not None and qsrt_format_codes is not None
+        assert gate_suh is not None and up_suh is not None
+        assert down_svh is not None
+        h_side_shapes = (
+            (plan.num_experts, plan.hidden_size),
+            (1, plan.hidden_size),
+        )
+        for name, tensor, shapes in (
+            ("gate_suh", gate_suh, h_side_shapes),
+            ("up_suh", up_suh, h_side_shapes),
+            ("down_svh", down_svh, h_side_shapes),
         ):
+            if tensor.dtype != torch.float16:
+                raise TypeError(f"{name} must be torch.float16, got {tensor.dtype}")
+            if tuple(tensor.shape) not in shapes:
+                raise ValueError(
+                    f"{name} must have shape {shapes}, got {tuple(tensor.shape)}"
+                )
+            if tensor.device != qsrt_atom_payload.device:
+                raise ValueError(
+                    f"{name} must be on {qsrt_atom_payload.device}, got {tensor.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
             raise ValueError(
-                "btx manifest rate structure "
-                f"{manifest.rates.structure!r} does not match the plan's "
-                f"{plan.trellis_rate_structure!r}"
+                "gate_suh and up_suh must both be per-expert or both broadcast"
             )
-        if (manifest.rates.pair_kinds or None) != plan.trellis_pair_kinds:
-            raise ValueError(
-                "btx manifest pair kinds do not match the plan's "
-                "trellis_pair_kinds"
-            )
-        if manifest.hadamard.coupled != plan.coupled_hadamard:
-            raise ValueError(
-                "btx manifest coupled-Hadamard declaration does not match "
-                "the plan"
-            )
-        if (
-            manifest.geometry.num_experts != plan.num_experts
-            or manifest.geometry.hidden_size != plan.hidden_size
-        ):
-            raise ValueError(
-                "btx manifest geometry does not match the plan's expert "
-                "count or hidden size"
-            )
-        if btx_layer.local_intermediate_size != plan.intermediate_size:
-            raise ValueError(
-                f"btx extent covers {btx_layer.local_intermediate_size} "
-                "intermediate channels; the plan declares "
-                f"{plan.intermediate_size}"
-            )
-        value = prepare_btx_moe_weights(
-            btx_layer,
+        tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
+        # The atom extent may retain an aligned row stride from a sliced
+        # safetensors tensor.  Take the placeholder from one contiguous inner
+        # byte span instead of requiring the complete extent to be viewable.
+        workspace_placeholder = (
+            qsrt_atom_payload[0, 0, :4].view(torch.int32).reshape(-1)
+        )
+        from b12x.moe._shared.kernels.w4a16.prepare import (
+            prepare_qsrt_atom_moe_weights,
+        )
+
+        value = prepare_qsrt_atom_moe_weights(
+            qsrt_atom_payload,
+            first_atom_slot=qsrt_first_atom_slot,
+            layer_index=qsrt_layer_index,
+            expert_ids=qsrt_expert_ids,
+            format_codes=qsrt_format_codes,
+            hidden_size=plan.hidden_size,
+            intermediate_size=plan.intermediate_size,
+            num_experts=plan.num_experts,
             activation=plan.activation,
-            device=btx_device,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=down_svh,
             params_dtype=torch.float16,
-            tile_config=plan.trellis_tile_config,
+            codebook="sqg_xor_cheb_t12",
+            tile_config=tile_config,
             dummy_scale=dummy_scale,
+            workspace=workspace_placeholder,
         )
         representation = _PreparedWeightRepresentation(
-            quant_mode=next(iter(plan.quant_modes)),
+            quant_mode=qsrt_quant_mode,
             layout=PreparedWeightLayout.TRELLIS_NATIVE,
             value=value,
         )
-        input_scale = torch.ones(
-            (), dtype=torch.float32, device=value.w13.device
-        )
+        input_scale = torch.ones((), dtype=torch.float32, device=value.w13.device)
         return B12XFP4ExpertWeights(
             plan=plan,
             a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
@@ -5194,6 +5279,116 @@ def prepare_b12x_fp4_moe_weights(
             w2_alphas=value.w2_global_scale,
             representation=representation,
         )
+
+    if plan.source_format in {"exl3_trellis_mcg", "sqg_fp16_d3l"}:
+        is_d3l = plan.source_format == "sqg_fp16_d3l"
+        if plan.quant_modes != frozenset({"w4a16"}):
+            raise ValueError("Trellis weights support only quant_mode='w4a16'")
+        if w1_fp4 is None or w2_fp4 is None:
+            raise ValueError("Trellis preparation requires both weight payloads")
+        if not is_d3l and trellis_mcg is None:
+            raise ValueError(
+                "EXL3 Trellis preparation requires the checkpoint's trellis_mcg "
+                "marker; the runtime decoder is MCG-only and must fail closed"
+            )
+        if not is_d3l:
+            assert trellis_mcg is not None
+            marker = (
+                int(trellis_mcg.item())
+                if isinstance(trellis_mcg, torch.Tensor)
+                else int(trellis_mcg)
+            ) & 0xFFFFFFFF
+            if marker != 0xCBAC1FED:
+                raise ValueError(
+                    f"unexpected EXL3 MCG marker {marker:#010x}; expected 0xcbac1fed"
+                )
+        elif trellis_mcg is not None:
+            raise ValueError("sqg_fp16_d3l must not carry an MCG marker")
+        if not all(
+            value is not None
+            for value in (gate_suh, up_suh, intermediate_rotations, down_svh)
+        ):
+            raise ValueError(
+                "EXL3 Trellis preparation requires gate_suh, up_suh, "
+                "intermediate_rotations, and down_svh"
+            )
+        assert gate_suh is not None and up_suh is not None
+        assert intermediate_rotations is not None and down_svh is not None
+        h_side_shapes = (
+            (plan.num_experts, plan.hidden_size),
+            (1, plan.hidden_size),
+        )
+        for name, tensor, shapes in (
+            ("gate_suh", gate_suh, h_side_shapes),
+            ("up_suh", up_suh, h_side_shapes),
+            (
+                "intermediate_rotations",
+                intermediate_rotations,
+                ((plan.num_experts, 3 * plan.intermediate_size),),
+            ),
+            ("down_svh", down_svh, h_side_shapes),
+        ):
+            if tensor.dtype != torch.float16:
+                raise TypeError(f"{name} must be torch.float16, got {tensor.dtype}")
+            if tuple(tensor.shape) not in shapes:
+                raise ValueError(
+                    f"{name} must have shape {shapes}, got {tuple(tensor.shape)}"
+                )
+            if tensor.device != w1_fp4.device:
+                raise ValueError(
+                    f"{name} must be on {w1_fp4.device}, got {tensor.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+            raise ValueError(
+                "gate_suh and up_suh must both be per-expert or both broadcast"
+            )
+        from b12x.moe._shared.kernels.w4a16.prepare import (
+            prepare_trellis256_moe_weights,
+        )
+
+        tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
+        value = prepare_trellis256_moe_weights(
+            w1_fp4,
+            w2_fp4,
+            hidden_size=plan.hidden_size,
+            intermediate_size=plan.intermediate_size,
+            num_experts=plan.num_experts,
+            activation=plan.activation,
+            params_dtype=torch.float16,
+            fc1_tile_n=tile_config[1],
+            fc2_tile_n=tile_config[3],
+            w13_layout="trellis3_t256_proj",
+            trellis_bits=plan.trellis_bits,
+            dummy_scale=dummy_scale,
+            codebook="sqg_fp16_d3l" if is_d3l else "mcg",
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate_rotations=intermediate_rotations,
+            down_svh=down_svh,
+            tile_config=tile_config,
+            workspace=w1_fp4.view(torch.int32).reshape(-1)[:1],
+        )
+        representation = _PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.TRELLIS_NATIVE,
+            value=value,
+        )
+        input_scale = torch.ones((), dtype=torch.float32, device=w1_fp4.device)
+        return B12XFP4ExpertWeights(
+            plan=plan,
+            a1_gscale=a1_gscale if a1_gscale is not None else input_scale,
+            w1_fp4=value.w13,
+            w1_blockscale=value.w13_scale,
+            w1_alphas=value.w13_global_scale,
+            a2_gscale=a2_gscale if a2_gscale is not None else input_scale,
+            w2_fp4=value.w2,
+            w2_blockscale=value.w2_scale,
+            w2_alphas=value.w2_global_scale,
+            representation=representation,
+        )
+
     if w1_fp4 is None or w2_fp4 is None:
         raise ValueError("weight preparation requires both w1_fp4 and w2_fp4")
 
@@ -5578,7 +5773,7 @@ def _resolve_workspace_layout(
         # W4A8-MX sizes so compacted checkpoints never require a second
         # source-native copy merely to enter the tiny-decode band.
         if normalized_quant_mode == "w4a8_mx":
-            if weight_layout == "trellis_t256":
+            if weight_layout == "trellis3_t256":
                 # Trellis-native serving: the direct micro trellis arm owns
                 # the decode band; the dynamic kernel's w4a8_trellis recipe
                 # serves every larger batch. The QMMA tiny-decode kernel
@@ -6527,10 +6722,7 @@ def plan_tp_moe_arena_layout(
             w4a16_block_size_m=w4a16_block_size_m,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
-            trellis_pair_kinds=weight_plan.trellis_pair_kinds,
-            trellis_codebook=_derive_trellis_codebook(
-                weight_plan.source_format, weight_plan.trellis_codebook
-            ),
+            qsrt_storage_format=weight_plan.qsrt_storage_format,
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
@@ -6585,7 +6777,10 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+    from b12x.moe._shared.kernels.w4a16.host import (
+        route_pack_capacity,
+        route_pack_warmup_token_counts,
+    )
     from b12x.moe._shared.kernels.w4a16.kernel import (
         _DEFAULT_MAX_SHARED_MEM,
         compile_w4a16_fused_moe,
@@ -6605,13 +6800,13 @@ def _plan_full_rotation_w4a16_launches(
     scale_format = _normalize_w4a16_scale_format(
         caps.w4a16_scale_format or _w4a16_scale_format_for_source(caps.source_format)
     )
-    if weight_layout != "trellis_t256" or scale_format != "e4m3_k32":
+    if weight_layout != "trellis3_t256" or scale_format != "e4m3_k32":
         raise RuntimeError(
             "full-rotation Trellis launch planning requires "
-            "weight_layout='trellis_t256' and scale_format='e4m3_k32'; "
+            "weight_layout='trellis3_t256' and scale_format='e4m3_k32'; "
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
-    w13_layout = "trellis_t256_proj"
+    w13_layout = "trellis3_t256_proj"
     _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
@@ -6666,7 +6861,6 @@ def _plan_full_rotation_w4a16_launches(
                 scale_format=scale_format,
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
-                trellis_codebook=core_plan.trellis_codebook or SQG_E4M3,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -6698,68 +6892,80 @@ def _plan_full_rotation_w4a16_launches(
             for ids_dtype in (torch.int32, torch.int64)
             for mapped in (False, True)
         )
-        for mapped in (False, True):
-            route_pack_key = (
-                core_plan.device.type,
-                int(torch.cuda.current_device()),
-                capacity_tokens * core_plan.num_topk,
-                int(block_size_m),
-                int(core_plan.route_E),
-                mapped,
-            )
-            if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
-                continue
+        packed_route_indices = torch.empty(
+            capacity_route_slots,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        block_expert_ids = torch.empty(
+            capacity_m_blocks,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        packed_route_count = torch.empty(
+            1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_offsets = torch.empty(
+            core_plan.route_E + 1,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        expert_counts = torch.empty(
+            core_plan.route_E,
+            dtype=torch.int32,
+            device=core_plan.device,
+        )
+        pending_route_pack_keys: list[tuple[object, ...]] = []
+        for route_ids_dtype in (torch.int32, torch.int64):
             dummy_topk_ids = torch.zeros(
                 capacity_tokens,
                 core_plan.num_topk,
-                dtype=torch.int32,
+                dtype=route_ids_dtype,
                 device=core_plan.device,
             )
-            packed_route_indices = torch.empty(
-                capacity_route_slots,
-                dtype=torch.int32,
-                device=core_plan.device,
+            for mapped in (False, True):
+                expert_map = None
+                if mapped:
+                    expert_map = torch.arange(
+                        core_plan.route_E,
+                        dtype=torch.int32,
+                        device=core_plan.device,
+                    )
+                for token_count in route_pack_warmup_token_counts(capacity_tokens):
+                    route_pack_key = (
+                        core_plan.device.type,
+                        int(torch.cuda.current_device()),
+                        str(route_ids_dtype),
+                        token_count * core_plan.num_topk,
+                        int(block_size_m),
+                        int(core_plan.route_E),
+                        mapped,
+                    )
+                    if route_pack_key in _W4A16_ROUTE_PACK_PREWARMED:
+                        continue
+                    pack_topk_routes_by_expert(
+                        dummy_topk_ids[:token_count],
+                        block_size_m,
+                        core_plan.route_E,
+                        expert_map=expert_map,
+                        packed_route_indices=packed_route_indices,
+                        block_expert_ids=block_expert_ids,
+                        packed_route_count=packed_route_count,
+                        expert_offsets=expert_offsets,
+                        expert_counts=expert_counts,
+                    )
+                    pending_route_pack_keys.append(route_pack_key)
+        torch.cuda.current_stream(core_plan.device).synchronize()
+        _W4A16_ROUTE_PACK_PREWARMED.update(pending_route_pack_keys)
+        if pending_route_pack_keys:
+            logger.info(
+                "Prewarmed %d full-rotation W4A16 route-pack variant(s) "
+                "for token capacity %d.",
+                len(pending_route_pack_keys),
+                capacity_tokens,
             )
-            block_expert_ids = torch.empty(
-                capacity_m_blocks,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            packed_route_count = torch.empty(
-                1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_offsets = torch.empty(
-                core_plan.route_E + 1,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_counts = torch.empty(
-                core_plan.route_E,
-                dtype=torch.int32,
-                device=core_plan.device,
-            )
-            expert_map = None
-            if mapped:
-                expert_map = torch.arange(
-                    core_plan.route_E,
-                    dtype=torch.int32,
-                    device=core_plan.device,
-                )
-            pack_topk_routes_by_expert(
-                dummy_topk_ids,
-                block_size_m,
-                core_plan.route_E,
-                expert_map=expert_map,
-                packed_route_indices=packed_route_indices,
-                block_expert_ids=block_expert_ids,
-                packed_route_count=packed_route_count,
-                expert_offsets=expert_offsets,
-                expert_counts=expert_counts,
-            )
-            torch.cuda.current_stream(core_plan.device).synchronize()
-            _W4A16_ROUTE_PACK_PREWARMED.add(route_pack_key)
     return fused_launches, topk_sum_launches
 
 
@@ -6866,10 +7072,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         w4a16_block_size_m=resolved_block_size_m,
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
-        trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
-        trellis_codebook=_derive_trellis_codebook(
-            caps.weight_plan.source_format, caps.weight_plan.trellis_codebook
-        ),
+        qsrt_storage_format=caps.weight_plan.qsrt_storage_format,
         coupled_hadamard=caps.weight_plan.coupled_hadamard,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         collect_activation_amax=caps.collect_activation_amax,
@@ -6939,7 +7142,7 @@ def _prewarm_w4a16_planned_launches(
     weight_layout = _normalize_w4a16_weight_layout(weight_layout)
     full_rotation = bool(workspace.full_rotation)
     if full_rotation:
-        w13_layout = "trellis_t256_proj"
+        w13_layout = "trellis3_t256_proj"
     else:
         w13_layout = _normalize_w13_layout(w13_layout)
     collect_activation_amax = bool(collect_activation_amax)
@@ -7042,12 +7245,25 @@ def _prewarm_w4a16_planned_launches(
                     weight_layout=weight_layout,
                     scale_format=scale_format,
                     w13_layout=w13_layout,
-                    prefill_fused_sum_fp32=build_prefill_fused_sum,
                     collect_activation_amax=collect_activation_amax,
+                    prefill_fused_sum=bool(build_prefill_fused_sum),
                     trellis_bits=workspace.trellis_bits,
-                    trellis_codebook=workspace.trellis_codebook or SQG_E4M3,
-                    fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
+                    fc1_trellis_pair_kind=(
+                        "P33_P43"
+                        if workspace.qsrt_storage_format == "qsrt_atoms_v2"
+                        and workspace.trellis_bits == 3
+                        else "PDYNAMIC"
+                        if workspace.qsrt_storage_format == "qsrt_atoms_v1"
+                        else None
+                    ),
+                    fc2_trellis_pair_kind=(
+                        "P33_P43"
+                        if workspace.qsrt_storage_format == "qsrt_atoms_v2"
+                        and workspace.trellis_bits == 3
+                        else "PDYNAMIC"
+                        if workspace.qsrt_storage_format == "qsrt_atoms_v1"
+                        else None
+                    ),
                     force_tile_config=workspace.trellis_tile_config,
                     intermediate_rotation=full_rotation,
                     full_rotation=full_rotation,
@@ -7111,6 +7327,7 @@ def _prewarm_w4a16_planned_launches(
             route_pack_key = (
                 workspace.device.type,
                 int(torch.cuda.current_device()),
+                str(torch.int32),
                 int(token_count) * int(workspace.num_topk),
                 int(block_size_m),
                 int(workspace.route_E),
@@ -7209,11 +7426,21 @@ def _prewarm_w4a16_planned_launches(
                         w13_layout=w13_layout,
                         collect_activation_amax=False,
                         trellis_bits=workspace.trellis_bits,
-                        fc1_trellis_pair_kind=_fc_trellis_pair_kind(
-                            workspace
+                        fc1_trellis_pair_kind=(
+                            "P33_P43"
+                            if workspace.qsrt_storage_format == "qsrt_atoms_v2"
+                            and workspace.trellis_bits == 3
+                            else "PDYNAMIC"
+                            if workspace.qsrt_storage_format == "qsrt_atoms_v1"
+                            else None
                         ),
-                        fc2_trellis_pair_kind=_fc_trellis_pair_kind(
-                            workspace
+                        fc2_trellis_pair_kind=(
+                            "P33_P43"
+                            if workspace.qsrt_storage_format == "qsrt_atoms_v2"
+                            and workspace.trellis_bits == 3
+                            else "PDYNAMIC"
+                            if workspace.qsrt_storage_format == "qsrt_atoms_v1"
+                            else None
                         ),
                         force_tile_config=workspace.trellis_tile_config,
                         direct_topk_routes=True,
@@ -7379,10 +7606,7 @@ def materialize_tp_moe_arena_workspaces(
             w4a16_block_size_m=resolved_block_size_m,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
-            trellis_pair_kinds=weight_plan.trellis_pair_kinds,
-            trellis_codebook=_derive_trellis_codebook(
-                weight_plan.source_format, weight_plan.trellis_codebook
-            ),
+            qsrt_storage_format=weight_plan.qsrt_storage_format,
             coupled_hadamard=weight_plan.coupled_hadamard,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
@@ -8138,7 +8362,7 @@ def _get_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
-    micro_trellis = weight_layout == "trellis_t256"
+    micro_trellis = weight_layout == "trellis3_t256"
     if micro_trellis:
         micro_kwargs["weight_layout"] = weight_layout
         micro_kwargs["trellis_bits"] = int(trellis_bits)
@@ -8619,21 +8843,15 @@ class _DynamicMoEW4A8Launch:
             # [E][K16(I)][N16(K)]. SFB tensors are compile-time dead
             # (identity UE8M0 word).
             _tr_bits = int(self._kernel.trellis_bits)
-            _tr_w13_u32 = (
-                2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
-            )
+            _tr_w13_u32 = 2 * (self._k // 16) * ((self._w1_n // 2) // 16) * 8 * _tr_bits
             _tr_down_u32 = (self._n // 16) * (self._k // 16) * 8 * _tr_bits
             w13_rp = cute.make_tensor(
                 w13_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_w13_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_w13_u32,), stride=(1,)),
             )
             down_rp = cute.make_tensor(
                 down_rp_ptr,
-                layout=cute.make_layout(
-                    (num_experts * _tr_down_u32,), stride=(1,)
-                ),
+                layout=cute.make_layout((num_experts * _tr_down_u32,), stride=(1,)),
             )
             _tr_sentinel = cute.make_layout((1,), stride=(1,))
             w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
@@ -8767,9 +8985,7 @@ class _DynamicMoEW4A8Launch:
                             row_counts.shape[0]
                             * (
                                 6
-                                if getattr(
-                                    self._kernel, "trellis_coupled", False
-                                )
+                                if getattr(self._kernel, "trellis_coupled", False)
                                 else 3
                             )
                             * self._n,
@@ -9284,9 +9500,7 @@ def _launch_dynamic_flat(
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
-    w4a8_trellis = (
-        _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
-    )
+    w4a8_trellis = _is_w4a8_quant_mode(quant_mode) and w13_sfb_rp.dtype == torch.float16
     trellis_bits = 0
     trellis_coupled = False
     trellis_lut_tensor = None
@@ -9295,14 +9509,11 @@ def _launch_dynamic_flat(
             _trellis256_execution_lut,
         )
 
-        trellis_lut_tensor = _trellis256_execution_lut(a.device, SQG_E4M3)
+        trellis_lut_tensor = _trellis256_execution_lut(a.device, "sqg_xor_cheb_t12")
         payload_u32 = w13_rp.numel() * w13_rp.element_size() // 4
         window_words = 2 * E * (k // 16) * (n // 16) * 8
         trellis_bits = payload_u32 // window_words
-        if (
-            trellis_bits not in (2, 3, 4)
-            or trellis_bits * window_words != payload_u32
-        ):
+        if trellis_bits not in (2, 3, 4) or trellis_bits * window_words != payload_u32:
             raise RuntimeError(
                 "w4a8 trellis payload extent does not match the launch "
                 f"shape (E={E}, k={k}, n={n}, payload_u32={payload_u32})"
@@ -9963,7 +10174,7 @@ def _launch_compact_micro_flat(
             _trellis256_execution_lut,
         )
 
-        trellis_lut = _trellis256_execution_lut(a.device, SQG_E4M3)
+        trellis_lut = _trellis256_execution_lut(a.device, "sqg_xor_cheb_t12")
         trellis_rotations = w1_scale_storage
     use_native_nvfp4_split = (
         quant_mode == "w4a8_nvfp4"
@@ -10042,7 +10253,7 @@ def _launch_compact_micro_flat(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
-        weight_layout="trellis_t256" if w4a8_trellis else None,
+        weight_layout="trellis3_t256" if w4a8_trellis else None,
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
     )
@@ -10444,9 +10655,7 @@ def _launch_micro(
     # activation wrappers such as SiTU keep is_supported False to hold the
     # nvfp4-family compact path closed while serving the trellis arm.
     shape_supported = (
-        MoEMicroKernelBackend.is_supported
-        if w4a8_trellis
-        else micro_cls.is_supported
+        MoEMicroKernelBackend.is_supported if w4a8_trellis else micro_cls.is_supported
     )
     use_micro_direct = (
         quant_mode == "nvfp4" or _is_w4a8_quant_mode(quant_mode)
@@ -10720,7 +10929,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"
             )
-        full_rotation = getattr(prepared, "weight_layout", "") == "trellis_t256"
+        full_rotation = getattr(prepared, "weight_layout", "") == "trellis3_t256"
         output_dtype = torch.float32 if full_rotation else a.dtype
         if output is None:
             if torch.cuda.is_current_stream_capturing():
@@ -10871,8 +11080,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
         micro_w4a8_trellis = (
             quant_mode == "w4a8_mx"
-            and getattr(prepared_payload, "weight_layout", None)
-            == "trellis_t256"
+            and getattr(prepared_payload, "weight_layout", None) == "trellis3_t256"
         )
         if micro_w4a8_trellis:
             wv = _w4a8_trellis_weight_views(
@@ -11062,8 +11270,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -11422,9 +11629,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

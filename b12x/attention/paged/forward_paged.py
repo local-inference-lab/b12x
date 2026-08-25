@@ -8227,7 +8227,15 @@ class PagedFp8DecodeRawForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
+            grid=(
+                (
+                    self.analytic_verify_max_chunks,
+                    mKCache.shape[2],
+                    self.analytic_verify_batch,
+                )
+                if self.use_q64_laguna_verifier
+                else (mBlockValidMask.shape[0], mKCache.shape[2], 1)
+            ),
             block=[32, 1, 4],
             # 67,584 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
@@ -8998,7 +9006,7 @@ class PagedBf16ExtendRawForwardKernel:
             tma_atom_K,
             tma_atom_V,
         ).launch(
-            grid=(mBlockValidMask.shape[0], mKCache.shape[2], 1),
+            grid=launch_grid,
             block=[32, 4, 1],
             # 99,328 B including barriers/alignment on SM120: one CTA/SM.
             min_blocks_per_mp=1,
