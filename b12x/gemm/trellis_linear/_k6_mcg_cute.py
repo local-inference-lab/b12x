@@ -264,6 +264,10 @@ def k6_mcg_small_m_scratch_elements(size_k: int, size_n: int) -> int:
 
 
 class K6McgSmallMKernel:
+    """One cooperative grid for H128, split-K MCG GEMM, and H128 output."""
+
+    ABI_VERSION = 4
+
     def __init__(self, *, size_k: int, size_n: int, element_dtype: str, trellis_bits: int = 6):
         """Build a compile-time specialization for one K-by-N projection."""
         if element_dtype not in ("fp16", "bf16"):
