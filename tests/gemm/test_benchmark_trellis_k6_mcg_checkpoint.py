@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from benchmarks.benchmark_trellis_k6_mcg_checkpoint import (
+    _bound_fused_scratch_elements,
     _dot_report,
     _independent_oracle,
     _parse_params_dtype,
@@ -186,6 +187,27 @@ def test_temporary_grid_override_restores_planner_state() -> None:
     ):
         assert table[absent_shape] == 7
     assert absent_shape not in table
+
+
+def test_bound_scratch_uses_immutable_launch_contract() -> None:
+    weight = SimpleNamespace(
+        k6_mcg_small_m_launch=SimpleNamespace(required_scratch_elements=385_024)
+    )
+
+    assert _bound_fused_scratch_elements(weight) == 385_024
+
+
+@pytest.mark.parametrize("required", (None, 0, -1))
+def test_bound_scratch_rejects_missing_or_nonpositive_contract(required) -> None:
+    launch = (
+        None
+        if required is None
+        else SimpleNamespace(required_scratch_elements=required)
+    )
+    weight = SimpleNamespace(k6_mcg_small_m_launch=launch)
+
+    with pytest.raises(RuntimeError, match="no positive bound"):
+        _bound_fused_scratch_elements(weight)
 
 
 def test_topk_gate_allows_only_numerically_ambiguous_boundary_swap() -> None:

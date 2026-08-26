@@ -67,6 +67,8 @@ _ALLOCATOR_COUNTERS = (
     "num_alloc_retries",
     "num_ooms",
 )
+
+
 class QualificationError(RuntimeError):
     """Raised when a mandatory pre-timing qualification gate fails."""
 
@@ -862,6 +864,18 @@ def _time_graphs(
     }
 
 
+def _bound_fused_scratch_elements(fused_weight: Any) -> int:
+    """Return the immutable scratch capacity selected during public planning."""
+
+    small_m_launch = getattr(fused_weight, "k6_mcg_small_m_launch", None)
+    required = int(getattr(small_m_launch, "required_scratch_elements", 0))
+    if required <= 0:
+        raise QualificationError(
+            "fused weight has no positive bound K6/MCG scratch contract"
+        )
+    return required
+
+
 def _make_routes(
     *,
     rows: int,
@@ -879,13 +893,14 @@ def _make_routes(
     element_dtype = source.dtype
     if element_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"source must be fp16 or bf16, got {element_dtype}")
+    fused_scratch_elements = _bound_fused_scratch_elements(fused_weight)
     sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     fused_output = torch.empty((rows, size_n), dtype=element_dtype, device=device)
     fused_rotated_compute = torch.empty(
         (rows, size_k), dtype=element_dtype, device=device
     )
     fused_c_tmp = torch.empty(
-        trellis_linear.k6_mcg_small_m_scratch_elements(size_k, size_n),
+        fused_scratch_elements,
         dtype=torch.float32,
         device=device,
     )
@@ -1493,9 +1508,7 @@ def _run(args: argparse.Namespace, report: dict[str, Any]) -> None:
         "launch_grid_by_rows": {
             str(rows): int(launch.launch_grid_x(rows)) for rows in args.rows
         },
-        "fused_scratch_elements": trellis_linear.k6_mcg_small_m_scratch_elements(
-            fused_weight.in_features, fused_weight.out_features
-        ),
+        "fused_scratch_elements": int(launch.required_scratch_elements),
         "generic_forcing": "dataclasses.replace(weight, k6_mcg_small_m_launch=None)",
         "planner_override": planner_override,
     }

@@ -62,6 +62,8 @@ def test_unpaired_weight_gate_excludes_qsrt_pairs(
     ("size_k", "size_n", "expected"),
     [
         (2048, 4096, 131072),
+        # GLM-5.2 TP4 o_proj uses the measured 144-CTA grid.
+        (4096, 6144, 294912),
         (6144, 1024, 65536),
         (512, 6144, 98304),
         # Qwen3.8-27B K6 down projection uses the measured 160-CTA grid.
@@ -86,6 +88,21 @@ def test_scratch_contract_covers_split_k_owners(
     ],
 )
 def test_qwen38_grid_policy_is_shape_specific(
+    size_k: int, size_n: int, expected_grid_x: int
+) -> None:
+    assert _k6_mcg_cute._requested_grid_x(size_k, size_n) == expected_grid_x
+
+
+@pytest.mark.parametrize(
+    ("size_k", "size_n", "expected_grid_x"),
+    [
+        (2048, 4096, 64),
+        (4096, 6144, 144),
+        (6144, 1024, 32),
+        (512, 6144, 48),
+    ],
+)
+def test_glm_grid_policy_is_shape_specific(
     size_k: int, size_n: int, expected_grid_x: int
 ) -> None:
     assert _k6_mcg_cute._requested_grid_x(size_k, size_n) == expected_grid_x
