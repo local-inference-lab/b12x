@@ -208,6 +208,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--grid-x", type=int, required=True)
     result.add_argument("--rows", default="1,4,8,16")
     result.add_argument("--max-regression-percent", type=float, default=1.0)
+    result.add_argument(
+        "--max-sm-clock-spread-mhz",
+        type=int,
+        default=30,
+        help="maximum allowed per-row SM-clock spread across panel arms",
+    )
     result.add_argument("--prior-exact-result", type=Path)
     result.add_argument("--output", type=Path, required=True)
     return result
@@ -215,6 +221,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.max_sm_clock_spread_mhz < 0:
+        raise ValueError("--max-sm-clock-spread-mhz must be nonnegative")
     rows = tuple(int(item) for item in args.rows.split(","))
     arms = {
         "base_before": read_arm(args.base_before),
@@ -280,6 +288,23 @@ def main() -> int:
                 f"M={row}: {regression_percent:.6f}% regression exceeds "
                 f"{args.max_regression_percent:.6f}%"
             )
+    for row in rows:
+        sm_clocks = {
+            label: int(per_row[row]["telemetry"]["sm_clock_mhz"])
+            for label, per_row in timings.items()
+        }
+        sm_clock_spread = max(sm_clocks.values()) - min(sm_clocks.values())
+        comparisons[str(row)]["sm_clock_mhz_by_arm"] = sm_clocks
+        comparisons[str(row)]["sm_clock_spread_mhz"] = sm_clock_spread
+        comparisons[str(row)]["sm_clock_spread_pass"] = (
+            sm_clock_spread <= args.max_sm_clock_spread_mhz
+        )
+        if sm_clock_spread > args.max_sm_clock_spread_mhz:
+            failures.append(
+                f"M={row}: SM-clock spread {sm_clock_spread} MHz exceeds "
+                f"{args.max_sm_clock_spread_mhz} MHz: {sm_clocks}"
+            )
+
     for label, per_row in timings.items():
         for row, values in per_row.items():
             telemetry = values["telemetry"]
@@ -319,6 +344,7 @@ def main() -> int:
         "grid_x": args.grid_x,
         "rows": list(rows),
         "max_regression_percent": args.max_regression_percent,
+        "max_sm_clock_spread_mhz": args.max_sm_clock_spread_mhz,
         "arms": compact_arms,
         "checkpoint_tensors": checkpoint_tensors[0],
         "timings": timings,

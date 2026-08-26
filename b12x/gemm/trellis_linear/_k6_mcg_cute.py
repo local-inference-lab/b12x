@@ -53,11 +53,9 @@ _TILE_N = 128
 _BARRIER_WORDS = 1
 _STANDALONE_K6_DISABLED = os.environ.get("B12X_DISABLE_STANDALONE_K6", "0") == "1"
 
-# The K-by-N projection shapes below dominate GLM-5.2 dense online-K6 decode.
-# The resident CTA counts minimize full-chain latency on a 188-SM SM120 device
-# while retaining capacity for concurrent model streams.  The 4096x6144 TP4
-# o_proj uses 144 CTAs: exact-checkpoint graph replay is faster than the served
-# ExLlamaV3 route at M=1/4 and reaches parity at M=8/12/16.
+# These shape-specific resident CTA counts are b12x-owned fixed-capacity planner
+# policy for GLM-5.2 dense online-K6 decode. The 4096x6144 qualification is
+# recorded under validation/trellis_decode/glm52_o4096x6144_optimization/.
 _GLM_GRID_CTA = {
     (2048, 4096): 64,
     (4096, 6144): 144,
@@ -66,7 +64,7 @@ _GLM_GRID_CTA = {
 }
 
 # Exact checkpoint-native Qwen3.8-27B graph-replay sweeps on the 188-SM RTX
-# PRO 6000 Blackwell selected these resident GEMM grids.  The prior generic
+# PRO 6000 Blackwell selected these resident GEMM grids.  The generic
 # 64-CTA fallback left the 40-N-tile projections substantially underfilled;
 # the shape-specific grids preserve one cooperative launch while distributing
 # split-K work across enough resident CTAs.  These are b12x planner decisions,

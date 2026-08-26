@@ -23,10 +23,7 @@ import urllib.request
 MODEL_DIR = Path("/data/models/brandonmusic/GLM-5.2-EXL3-TR3v4-3.5bpw-MTP78")
 SERVED_MODEL = "GLM-5.2-EXL3-TR3v4-3.5bpw"
 GPU_INDICES = "0,1,2,3"
-QUALIFICATION_TOOL_ROOT = Path(
-    "/home/jon/git/local-inference-lab/b12x-glm52-pr243-qualification/"
-    "validation/trellis_decode/glm52_pr243_qualification"
-)
+DEFAULT_QUALIFICATION_TOOL_ROOT = Path(__file__).resolve().parent
 WORKLOADS = (
     ("short_c1_p128_o256", 128, 256, 1, 1, 5),
     ("short_c4_p128_o256", 128, 256, 4, 1, 5),
@@ -248,6 +245,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--panel", required=True)
     result.add_argument("--nonce-base", required=True)
     result.add_argument("--output-dir", type=Path, required=True)
+    result.add_argument(
+        "--qualification-tool-root",
+        type=Path,
+        default=DEFAULT_QUALIFICATION_TOOL_ROOT,
+        help="directory containing the service benchmark and capture tools",
+    )
     result.add_argument("--port", type=int, default=18080)
     result.add_argument("--kill-switch", action="store_true")
     result.add_argument("--idle-timeout", type=int, default=120)
@@ -258,14 +261,18 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     args.output_dir = args.output_dir.resolve()
+    args.qualification_tool_root = args.qualification_tool_root.resolve()
     if args.output_dir.exists():
         raise FileExistsError(f"arm evidence already exists: {args.output_dir}")
     if not MODEL_DIR.is_dir():
         raise FileNotFoundError(MODEL_DIR)
-    benchmark_tool = QUALIFICATION_TOOL_ROOT / "benchmark_openai_stream.py"
-    capture_tool = QUALIFICATION_TOOL_ROOT / "capture_service_evidence.py"
+    benchmark_tool = args.qualification_tool_root / "benchmark_openai_stream.py"
+    capture_tool = args.qualification_tool_root / "capture_service_evidence.py"
     if not benchmark_tool.is_file() or not capture_tool.is_file():
-        raise FileNotFoundError("prior qualification service tools are missing")
+        raise FileNotFoundError(
+            "qualification service tools are missing from "
+            f"{args.qualification_tool_root}"
+        )
     existing = capture(["docker", "container", "inspect", args.container])
     if existing["returncode"] == 0:
         raise RuntimeError(f"container already exists: {args.container}")
@@ -298,6 +305,7 @@ def main() -> int:
         "kill_switch": args.kill_switch,
         "port": args.port,
         "model_dir": str(MODEL_DIR),
+        "qualification_tool_root": str(args.qualification_tool_root),
         "serving_fused_sha256": sha256_file(MODEL_DIR / "SERVING_FUSED.md"),
         "docker_compose_sha256": sha256_file(MODEL_DIR / "docker-compose.yaml"),
         "tools": {

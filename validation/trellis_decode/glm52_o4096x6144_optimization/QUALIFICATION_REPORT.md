@@ -67,8 +67,8 @@ changed. In particular:
 - The Qwen `(5120, 6144)` grid remains 120, and unrelated compiled objects are
   unchanged.
 
-PR #221 was reviewed as a reference implementation, not merged. It and PR
-#243 cover the same M≤16 kernel class; the evidence supported a planner-only
+PR #221 was reviewed as a reference implementation, not merged. It and
+PR #243 cover the same M≤16 kernel class; the evidence supported a planner-only
 parallelism correction rather than combining branches or creating an
 M=17–128 path.
 
@@ -77,9 +77,11 @@ M=17–128 path.
 | Item | Identity |
 |---|---|
 | Optimization worktree | `/home/jon/git/local-inference-lab/b12x-glm52-pr243-o-opt` |
-| b12x/PR #243 HEAD | `706ad0eb54014ed9156dc82a7e0acff691662a89` |
-| b12x/PR #243 tree | `5e4c5566062306b76a6860d6a40c0f743aac0c89` |
+| Qualified PR #243 base revision | `706ad0eb54014ed9156dc82a7e0acff691662a89` |
+| Qualified PR #243 base tree | `5e4c5566062306b76a6860d6a40c0f743aac0c89` |
 | Qualified source diff SHA-256 | `a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4` |
+| Qualified implementation revision | `e7465a425bfa04c816901ee30a5f9c4f6a092a43` |
+| Qualified/published K6/MCG runtime AST SHA-256 | `3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc` |
 | Fetched `origin/master` | `3a437ab5168060e4d625f05e1625c04089f1ba37` |
 | Fetched PR #221 | `413f96e889dad1ae0752fd1f4be9d37f56849600` |
 | master/#221 merge base | `6714ff09bc5be749c6f674ac8e2ba6a3b6a40ab4` |
@@ -99,9 +101,10 @@ semantic integration of the b12x policy into the v39 ABI, not a claim that the
 image file is byte-identical to the qualified b12x-namespaced source file.
 The image receipt's `b12x_source_sha256` value
 `99318df5...c186872` identifies the reviewed source snapshot used to authorize
-the port. The b12x file with SHA-256 `2b933615...fbc67c` differs from that
-snapshot only in comments and formatting; its executable 4096×6144 policy is
-equivalent.
+the port. The published b12x file with SHA-256 `26aaed0f...dc988` differs from
+that snapshot only in comments and formatting. Its runtime AST SHA-256 is
+identical to qualified implementation revision `e7465a4`, so the executable
+4096×6144 policy is unchanged.
 See [`image-verification.json`](evidence/optimized_image_v1/image-verification.json).
 
 Qualification did not deploy or promote an image and did not alter production
@@ -128,7 +131,7 @@ The checkpoint does not ship an independent shard checksum list. The shard
 hash above is an exact recorded identity, while the checkpoint-owned source
 manifest hash was independently verified. Those two facts are kept distinct.
 
-Projection tuning and final focused qualification ran on host `epyc`, physical
+Projection tuning and focused qualification ran on host `epyc`, physical
 GPU 6:
 
 | Property | Value |
@@ -153,8 +156,15 @@ Each grid used a fresh isolated compile/cache directory, exact checkpoint
 tensors, FP16 correctness gates, CUDA-graph capture/replay, balanced route
 ordering, 6,000 warmups, 240 timed iterations, and 12 cold replays. All eleven
 grids passed correctness, route identity, graph safety, stable-address,
-mutation, overwrite, and replay-allocation gates before their timings were
-accepted.
+mutation, overwrite, and replay-allocation gates before their raw timings were
+recorded. The sweep locates the CTA plateau; grid selection uses the
+clock-comparable repeat samples described below.
+
+Each retained sweep manifest contains a Docker inspect payload whose image ID
+matches the declared
+`sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795`.
+`run_grid_sweep.py` resolves that ID and rejects a mismatch before creating run
+output; its containers use `--pull=never`, `--network=none`, and `--ipc=none`.
 
 The table reports fused median latency in microseconds; lower is better.
 
@@ -182,18 +192,29 @@ The leaders were repeated in both orders, with 600 iterations per arm:
 | Repeat order | 144 CTAs M=1 / M=4 | 160 CTAs M=1 / M=4 |
 |---|---:|---:|
 | 160 → 144 | 20.032 / 20.064 | 20.032 / 20.064 |
-| 144 → 160 | 20.032 / 20.064 | 20.064 / 20.064 |
+| 144 → 160 | 20.032 / 20.064 | excluded / 20.064 |
 
-Grid 144 was selected because the repeat panels could not distinguish it from
-160, while 144 uses 10% less FP32 scratch and launches fewer CTAs. The selected
-samples remained P1 with throttle mask `0x0`. Some non-leading 176/188 samples
-observed `0x4`; they were not used to support the speed claim.
+The fully valid 160→144 repeat measured both M=1 arms at 2,272 MHz and found
+identical 20.032 µs medians. In the reverse repeat, the grid-160 M=1
+post-timing snapshot had already fallen to 832 MHz while grid 144 remained at
+2,280 MHz, so that one comparison is excluded. The reverse-repeat M=4 clocks
+were 2,257 and 2,265 MHz and both medians were 20.064 µs. The exploratory sweep
+also captured post-timing M=1 downclocks and is not used to distinguish grids
+144 and 160 at that row.
+
+Grid 144 was selected from the fully valid repeat tie and the valid M=4
+reverse-order tie because it uses 10% less FP32 scratch and launches fewer
+CTAs. The independent normal-planner run below then qualified the selected
+policy against ExLlamaV3 with balanced within-run route ordering. Some
+non-leading 176/188 samples observed throttle mask `0x4`; they were not used to
+support the speed claim.
 
 Raw evidence:
 
 - [`sweep_manifest.json`](evidence/grid_sweep_fp16_v1_20260826/sweep_manifest.json)
 - [`leader repeat 160→144`](evidence/leader_repeat_1_160_144/sweep_manifest.json)
 - [`leader repeat 144→160`](evidence/leader_repeat_2_144_160/sweep_manifest.json)
+- [`reverse-repeat telemetry disposition`](evidence/leader_repeat_2_144_160/telemetry_disposition.json)
 
 ## Normal-planner performance
 
@@ -273,7 +294,8 @@ The base-candidate-base panel kept grid 64 and 131,072 scratch elements. Every
 arm produced cubin SHA-256
 `5748a801e29e76804c8dc7df9e3a52882d2efa4667808992368543bce1761c5d`.
 The worst positive candidate delta was +0.1003%, below the 1% budget. All
-correctness, graph, telemetry, and route-identity checks passed.
+correctness, graph, telemetry, and route-identity checks passed. Per-row
+SM-clock spreads were 8–15 MHz, below the declared 30 MHz limit.
 
 ### Qwen down projection, BF16, 17408×5120
 
@@ -289,7 +311,8 @@ The deterministic panel kept grid 160. Every arm produced cubin SHA-256
 candidate deltas ranged from -0.0685% to +0.0717%. This proves that the
 shape-specific GLM entry does not change Qwen dispatch, compiled code, or
 representative replay latency. The fixture is not used as checkpoint
-correctness evidence.
+correctness evidence. Per-row SM-clock spreads were 0–7 MHz, below the declared
+30 MHz limit.
 
 Evidence:
 
@@ -452,6 +475,7 @@ python validation/trellis_decode/glm52_o4096x6144_optimization/run_service_arm.p
   --image-id sha256:c728d06ab95ee208bacecbf4b5948c735b5c0057cfffd179ef8b53b390c777d1 \
   --arm B1 --panel upstream_aba \
   --nonce-base glm52-o144-aba-v1-20260826 \
+  --qualification-tool-root validation/trellis_decode/glm52_o4096x6144_optimization \
   --output-dir validation/trellis_decode/glm52_o4096x6144_optimization/evidence/service_mtp3_panel_v1_20260826/b1 \
   --port 18080
 ```
@@ -460,23 +484,28 @@ The complete generated `docker run` command and every workload command are in
 [`B1 arm receipt`](evidence/service_mtp3_panel_v1_20260826/b1/arm_runner_receipt.json);
 the other arm directories contain equivalent receipts.
 
-## Final verification and repository state
+## Verification and repository state
 
-Focused tests passed twice. The retained evidence run was:
+The required focused test command passed against the published source:
 
 ```text
-71 passed in 19.22s
+71 passed in 20.82s
 ```
 
-The final post-documentation rerun also passed all 71 tests in 20.67 seconds.
-
-Ruff, explicit Python source compilation, and `git diff --check` also passed.
+Ruff passed for all 17 changed Python files. Explicit Python source
+compilation, the qualification-tool smoke gates, JSON parsing, evidence hash
+verification, relative-link verification, and `git diff --check` also passed.
 The focused test log is
 [`focused_pytest.log`](evidence/final_verification_20260826/focused_pytest.log).
 
 The qualified executable source is bound to PR #243 revision
 `706ad0eb54014ed9156dc82a7e0acff691662a89` plus tracked diff SHA-256
 `a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4`.
+That implementation is revision `e7465a425bfa04c816901ee30a5f9c4f6a092a43`.
+The published planner-table comment preserves runtime AST SHA-256
+`3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc`;
+qualification-tooling and evidence-interpretation changes do not affect the
+serving executable.
 The vLLM integration worktree with diff SHA-256
 `329ccd993a5fad0c15fe75b3d2483e73da7e3b72c3779f43d84faa05ee33007e`
 was read but not modified. Qualification containers and generated per-arm

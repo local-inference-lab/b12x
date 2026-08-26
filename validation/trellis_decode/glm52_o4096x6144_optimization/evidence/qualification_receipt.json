@@ -1,9 +1,11 @@
 {
   "schema": "b12x.glm52_o4096x6144_optimization_qualification.v1",
-  "generated_at": "2026-08-26T11:46:04Z",
+  "generated_at": "2026-08-26T13:34:27Z",
   "publication": {
     "target": "https://github.com/local-inference-lab/b12x/pull/243",
     "qualified_source_binding": "PR #243 revision 706ad0eb54014ed9156dc82a7e0acff691662a89 plus tracked diff SHA-256 a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4",
+    "qualified_implementation_revision": "e7465a425bfa04c816901ee30a5f9c4f6a092a43",
+    "runtime_semantic_identity": "The published K6/MCG runtime source has AST SHA-256 3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc, identical to qualified implementation revision e7465a425bfa04c816901ee30a5f9c4f6a092a43. Planner-table comments, qualification tooling, and evidence interpretation do not alter that executable AST.",
     "evidence_policy": "Commit the compact files listed in evidence/README.md. Full raw samples, caches, generated fixtures, logs, and extracted binaries remain host-local and are bound by the hashes in this receipt."
   },
   "verdict": {
@@ -35,6 +37,8 @@
     "b12x_head": "706ad0eb54014ed9156dc82a7e0acff691662a89",
     "b12x_head_tree": "5e4c5566062306b76a6860d6a40c0f743aac0c89",
     "tracked_diff_sha256": "a33e6f38db7b3ac594183b312fb234fa4fdadd1bb01c12ee27f9bead05b355a4",
+    "qualified_implementation_revision": "e7465a425bfa04c816901ee30a5f9c4f6a092a43",
+    "qualified_and_published_kernel_ast_sha256": "3b070bc70075e8db6f0014faf83de9d02162d405b67672f88ce2931ce4a8c7dc",
     "origin_master": {
       "head": "3a437ab5168060e4d625f05e1625c04089f1ba37",
       "tree": "f5778d984546d08b1ed0e05f07029425aa999202"
@@ -54,13 +58,22 @@
       "head": "8e7be4d5c97fb86d983bd5f83c825153452efaec",
       "tree": "b930c0f215e4c18f105b4480022eca59299d6072",
       "uncommitted_diff_sha256": "329ccd993a5fad0c15fe75b3d2483e73da7e3b72c3779f43d84faa05ee33007e",
-      "modified_by_this_work": false
+      "modified_during_glm_o_proj_qualification": false
     },
     "changed_file_sha256": {
-      "b12x/gemm/trellis_linear/_k6_mcg_cute.py": "2b9336159e6abc01e67ccf8cc32a2e24717bb2249fc473c9850f319920fbc67c",
+      "b12x/gemm/trellis_linear/_k6_mcg_cute.py": "d9c85d74f12d8e859727a9686e12798430d50d71985f263004ecd5ce80542c1c",
       "benchmarks/benchmark_trellis_k6_mcg_checkpoint.py": "6b7d06f5c64d487ab2e63010e5fa69e2337802721261487b3e13ca316c1a4198",
       "tests/gemm/test_benchmark_trellis_k6_mcg_checkpoint.py": "e2a3feaeb584733810b0fe3fff155b15bfb3ed9fcbba50418da50c98711951e7",
       "tests/gemm/test_trellis_k6_mcg_cute.py": "697cdb6e359f07bef29a8b3100a1dec21e775f537e22824701d47aa65c9e3156"
+    },
+    "reproduction_tool_sha256": {
+      "validation/trellis_decode/glm52_o4096x6144_optimization/analyze_regression_panel.py": "fd4a7bb009d14f5bd3ddaa123993b5b5682040ec1f11ac2be0e9265cf794ff38",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/audit_grid_artifacts.py": "6bfc460e9960c4a14a2a20988a90efbd480bca3689063149247161962212bf21",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/benchmark_openai_stream.py": "5d3924204b3a3abd71166c052e858957d0c1d22c43bd63b82d9b054e3dfc3439",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/capture_service_evidence.py": "acfb066ac45148473c050939c689dffc216256ec6ae781ad442234dcebd030f8",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/compile_v39_grid_artifact.py": "ad52d0b95cd63c83e3eda2d52484189761d68381f10855a64fadb62663beb0c3",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/run_grid_sweep.py": "0c72e6c9ec3bb09e93f0eca08cbb564e00c6791d64d5150dfd669bdff4ac26f0",
+      "validation/trellis_decode/glm52_o4096x6144_optimization/run_service_arm.py": "16da813c17be2d3ebc3faac362642c40b71e28fd1f551267a46f05c9569e698d"
     }
   },
   "implementation": {
@@ -131,9 +144,9 @@
       "internal_policy_source_before_sha256": "70edc835c03a0054ef29d56f869996fc4cf22df5b1cc4636734b9ea812a77f94",
       "internal_policy_source_after_sha256": "4fde57ae373a161ea59ce091f8029e8cb8b1346f2689810ebdba2508ffca672f",
       "reviewed_b12x_policy_snapshot_sha256": "99318df5db87635e845bcd1ba93d6714e17b1cebdad51150ac892b227c186872",
-      "current_b12x_policy_file_sha256_after_comment_format_cleanup": "2b9336159e6abc01e67ccf8cc32a2e24717bb2249fc473c9850f319920fbc67c",
+      "published_b12x_policy_file_sha256_after_comment_cleanup": "d9c85d74f12d8e859727a9686e12798430d50d71985f263004ecd5ce80542c1c",
       "verification_pass": true,
-      "namespace_note": "The pinned v39 serving image exposes the reviewed integration through the sparkinfer namespace. The image is a strict policy-only semantic port of the b12x decision, not a byte-for-byte copy of the current b12x source file. The later local source change was comment/format-only; the executable 4096x6144 policy is unchanged."
+      "namespace_note": "The pinned v39 serving image exposes the reviewed integration through the sparkinfer namespace. The image is a strict policy-only semantic port of the b12x decision, not a byte-for-byte copy of the published b12x source file. The source difference is comment-only; the executable 4096x6144 policy and kernel AST are unchanged."
     }
   },
   "grid_sweep": {
@@ -154,6 +167,13 @@
     ],
     "ratio_direction": "exllamav3_over_fused_latency > 1 favors fused",
     "route_order": "all six permutations cycled equally",
+    "image_identity": {
+      "declared_id": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "recorded_docker_inspect_id": "sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+      "retained_manifest_match": true,
+      "published_runner_resolves_and_rejects_mismatch": true,
+      "published_runner_isolation": ["--pull=never", "--network=none", "--ipc=none"]
+    },
     "all_correctness_and_graph_gates_passed": true,
     "results_us": [
       {"grid_x": 48, "scratch_elements": 98304, "m1": 32.256, "m4": 32.320, "m8": 32.352, "m12": 32.352, "m16": 32.352},
@@ -170,10 +190,18 @@
     ],
     "selection": {
       "grid_x": 144,
-      "reason": "It tied grid 160 in both balanced repeat orders while using 10% less FP32 scratch and fewer CTAs; its formal leader samples stayed P1 with throttle mask 0x0.",
+      "reason": "The fully valid 160-to-144 repeat measured both M=1 arms at 2272 MHz with identical 20.032 microsecond medians. The reverse-order M=4 arms were clock-comparable and tied at 20.064 microseconds. Grid 144 uses 10% less FP32 scratch and fewer CTAs than grid 160.",
       "repeat_1_order": [160, 144],
       "repeat_2_order": [144, 160],
-      "repeat_iterations": 600
+      "repeat_iterations": 600,
+      "excluded_comparison": {
+        "grid_x": 160,
+        "m": 1,
+        "repeat_order": [144, 160],
+        "observed_sm_clock_mhz": 832,
+        "reason": "The post-timing snapshot was not clock-comparable with the grid-144 arm and is excluded from the selection claim.",
+        "disposition_path": "evidence/leader_repeat_2_144_160/telemetry_disposition.json"
+      }
     }
   },
   "normal_planner_qualification": {
@@ -242,7 +270,9 @@
       "balanced_order": ["base_before", "candidate", "base_after"],
       "identical_cubin_sha256": "5748a801e29e76804c8dc7df9e3a52882d2efa4667808992368543bce1761c5d",
       "worst_candidate_regression_percent": 0.10030166396841622,
-      "budget_percent": 1.0
+      "budget_percent": 1.0,
+      "max_sm_clock_spread_mhz": 30,
+      "observed_max_sm_clock_spread_mhz": 15
     },
     "qwen_down_bf16": {
       "valid": true,
@@ -252,8 +282,10 @@
       "identical_cubin_sha256": "615fcb7d1c6d8e79ad74a141c56f7ed03d2d9dd97f2953aea516299fe63959e0",
       "candidate_regression_range_percent": [-0.06854061550111146, 0.07173655664027834],
       "budget_percent": 1.0,
-      "current_input_kind": "deterministic shape-only BF16 fixture",
-      "exact_checkpoint_available_for_current_rerun": false,
+      "max_sm_clock_spread_mhz": 30,
+      "observed_max_sm_clock_spread_mhz": 7,
+      "input_kind": "deterministic shape-only BF16 fixture",
+      "exact_checkpoint_available_for_rerun": false,
       "retained_exact_checkpoint_evidence": {
         "path": "validation/trellis_decode/evidence/qwen38_down_bf16_8159533/result.json",
         "sha256": "74372b9860ebf1854e17130aa923037063c45e3386ed38158288f90f78b4f1ff",
@@ -329,13 +361,15 @@
     "prior_historical_range": [0.06398, 0.07462],
     "documented_reference": 0.069527,
     "broken_fc2_reference": 2.36,
-    "interpretation": "The new mean is inside the historical qualified range and is 1.81% above the prior qualified mean. One run is 0.00012 above the prior observed maximum; this is disclosed rather than hidden and remains far from the broken-FC2 signature."
+    "interpretation": "The optimized-image mean is inside the historical qualified range and is 1.81% above the prior qualified mean. One run is 0.00012 above the prior observed maximum; this is disclosed rather than hidden and remains far from the broken-FC2 signature."
   },
   "verification": {
-    "focused_pytest_recorded_evidence": "71 passed in 19.22s",
-    "focused_pytest_final_rerun": "71 passed in 20.67s",
-    "ruff": "pass",
+    "focused_pytest": "71 passed in 20.82s",
+    "ruff": "pass for all 17 changed Python files",
     "python_syntax": "pass",
+    "regression_panel_clock_gate": "pass; the 30 MHz gate accepts both retained panels and a 7 MHz negative test rejects the GLM q_b panel",
+    "sweep_image_identity_gate": "pass against sha256:d4cdc039cc3b7ef7be8e64ae51a70768cc7977994cd0547c01c3411a61339795",
+    "qualification_tool_smoke": "pass for nested receipt creation, nonzero CUDA status rejection, and repository-local service tool discovery",
     "git_diff_check": "pass"
   },
   "evidence": {
@@ -344,20 +378,22 @@
     "resource_audit": {"path": "evidence/grid_sweep_fp16_v1_20260826/resource_audit_v1/report.json", "sha256": "644988cfeece05c0a18c84b8a67a18c50ce60b5ab6ecd0f88b17f22112c8c7d5"},
     "leader_repeat_1": {"path": "evidence/leader_repeat_1_160_144/sweep_manifest.json", "sha256": "9388cafaa9ef2f78c3c51c03cbf318df3a19aa2d1754e406478b99395299e030"},
     "leader_repeat_2": {"path": "evidence/leader_repeat_2_144_160/sweep_manifest.json", "sha256": "d1e206c7b6052a11ee4a599207aeb738afbd98fb48833c43c4f320b6e024b3fe"},
+    "leader_repeat_2_telemetry_disposition": {"path": "evidence/leader_repeat_2_144_160/telemetry_disposition.json", "sha256": "5eb07bdd58398a6a72ed5be9f796c7daf214f611c940c38ca7b9f4a7a27de8ee"},
     "normal_planner": {"path": "evidence/normal_planner_o_fp16_v1_20260826/qualification_receipt.json", "sha256": "ab3d964239593920f82126ae4455631c164a2d0a96d4f0a4b35c7ec1db641307"},
-    "glm_q_b_regression": {"path": "evidence/regression_qb_fp16_panel_20260826.json", "sha256": "5ef4913e23e23e00d92a766af97e92a22d4c93df21f19fc52791c03963da7d1c"},
-    "qwen_shape_regression": {"path": "evidence/regression_qwen_shape_bf16_panel_20260826.json", "sha256": "d2fc3090c011c7a2d8c3c3a2a058e0556b3e3e852e9040966678e0e3449953da"},
-    "service_upstream_aba": {"path": "evidence/service_mtp3_panel_v1_20260826/e2e_upstream_aba.json", "sha256": "939a0338cceb80adecf70ff1d5aa3d7e132dee21bd91727d160a05e3a3bdb3aa"},
+    "glm_q_b_regression": {"path": "evidence/regression_qb_fp16_panel_20260826.json", "sha256": "9eda1ed089d224eb264fda0c5b5873b9e381f202b4e46cfa3bdddfe9a80253fc"},
+    "qwen_shape_regression": {"path": "evidence/regression_qwen_shape_bf16_panel_20260826.json", "sha256": "248dbb37f26665cf0c6f31ff81b2703a6c6afc123e633d1a273ea15b386abb2a"},
+    "service_upstream_aba": {"path": "evidence/service_mtp3_panel_v1_20260826/e2e_upstream_aba.json", "sha256": "a20e32c0818a0d0d4de3a6f8e08d4bf7e6bd2b95fe84888534ebdfed19b39aa4"},
     "service_kill_switch_cbc": {"path": "evidence/service_mtp3_panel_v1_20260826/e2e_kill_switch_cbc.json", "sha256": "05f8e2028384bdc22c2df5013007db2aacf8fdf24fcb9212f50c68bea1c4fdf7"},
     "service_cache_inventory": {"path": "evidence/service_mtp3_panel_v1_20260826/cache_inventory_before_cleanup.json", "sha256": "4baaa8606b06b1b63490858c2de624eb0aca036b790a055f72f39ce61ab362b5"},
     "kld_summary": {"path": "evidence/kld_optimized_v1_20260826/summary.json", "sha256": "308c516f68407ecef17978552310eb253da9aa53d9226f5a5c2eab70686d75bc"},
     "image_verification": {"path": "evidence/optimized_image_v1/image-verification.json", "sha256": "7fdcc30dce9cb798363d5cdfe4283932b8e260f36202f133bfed38ea7854aae9"},
-    "focused_pytest": {"path": "evidence/final_verification_20260826/focused_pytest.log", "sha256": "b089532c1759c110f9b7722c04f0355d7914ec6c5915ab1fcd552f8f9e815223"}
+    "focused_pytest": {"path": "evidence/final_verification_20260826/focused_pytest.log", "sha256": "817d65f6ac1c216c8ae2bbbd9041b39f4b8491edfa1fe2b7bdfa996d00b7c09b"}
   },
   "limitations": [
     "The service evidence supports a workload-scoped E2E improvement, not a universal decode or E2E speedup.",
+    "The reverse-order grid-160 M=1 leader sample had an 832 MHz post-timing SM-clock snapshot and is excluded from the grid-selection claim. The fully valid 160-to-144 repeat tied at M=1, and the clock-comparable reverse-order M=4 arms also tied.",
     "MTP acceptance variation makes the short-concurrency-4 service comparison especially noisy.",
-    "The original exact Qwen checkpoint is no longer present locally. Current no-regression evidence combines a deterministic shape-only BF16 A-B-A panel with retained exact-checkpoint evidence; it is not a new exact-checkpoint rerun.",
+    "The exact Qwen checkpoint is absent from its recorded local path. Qwen no-regression evidence combines a deterministic shape-only BF16 base-candidate-base panel with retained exact-checkpoint evidence; this qualification generated no exact-checkpoint Qwen result.",
     "The checkpoint provides no independent shard checksum list, so the exact shard hash is recorded but cannot be independently verified against a checkpoint-owned digest.",
     "The resource audit recompiled retained PTX with ptxas 13.3.27; runtime compilation and timing used CUDA/ptxas 13.2.78.",
     "An unrelated Triton draft-routing kernel JIT appeared during the service workload warmup. Timed samples followed the warmup, and K6 capture/replay qualification separately proved no K6 JIT or replay allocation."

@@ -5,6 +5,15 @@
     "A2"
   ],
   "panel": "upstream_aba",
+  "qualification_disposition": {
+    "decode_result_range_percent": [
+      -0.8226460092011667,
+      0.22015429869688408
+    ],
+    "supported_service_claim": "The short-concurrency-1 p128/o256 workload improved end-to-end latency by 0.346% against 0.025% outer-arm drift.",
+    "universal_decode_speedup_supported": false,
+    "workload_scope": "Other decode and end-to-end results are mixed or within outer-arm drift. This panel does not support a universal service-level speedup."
+  },
   "schema": "b12x.glm52_pr243.balanced_e2e_panel.v1",
   "services": [
     {

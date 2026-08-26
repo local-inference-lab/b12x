@@ -71,6 +71,21 @@ def run_capture(command: list[str], *, cwd: Path | None = None) -> dict[str, Any
     }
 
 
+def resolve_image_id(image: str) -> tuple[str, dict[str, Any]]:
+    inspection = run_capture(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image]
+    )
+    resolved = inspection["stdout"].strip()
+    if inspection["returncode"] != 0 or not resolved:
+        raise RuntimeError(
+            f"cannot resolve local image identity for {image}: "
+            f"{inspection['stderr'].strip()}"
+        )
+    if "\n" in resolved:
+        raise RuntimeError(f"image reference resolves to multiple IDs: {image}")
+    return resolved, inspection
+
+
 def gpu_snapshot(gpu: int) -> dict[str, Any]:
     return run_capture(
         [
@@ -184,6 +199,12 @@ def main() -> int:
         raise FileExistsError(
             f"output root already exists; choose a fresh path: {args.output_root}"
         )
+    resolved_image_id, image_id_inspect = resolve_image_id(args.image)
+    if resolved_image_id != args.image_id:
+        raise RuntimeError(
+            "image identity mismatch: "
+            f"declared={args.image_id}, resolved={resolved_image_id}"
+        )
     args.output_root.mkdir(parents=True, exist_ok=True)
 
     adapter = args.source_tree / (
@@ -207,7 +228,8 @@ def main() -> int:
         "model_dir": str(args.model_dir),
         "output_root": str(args.output_root),
         "image": args.image,
-        "image_id": args.image_id,
+        "image_id": resolved_image_id,
+        "image_id_inspect": image_id_inspect,
         "source_revision": args.source_revision,
         "integration_tree": args.integration_tree,
         "physical_gpu_index": args.gpu,
@@ -257,6 +279,9 @@ def main() -> int:
             "docker",
             "run",
             "--rm",
+            "--pull=never",
+            "--network=none",
+            "--ipc=none",
             "--name",
             container_name,
             "--gpus",
@@ -323,7 +348,7 @@ def main() -> int:
             "--image",
             args.image,
             "--image-id",
-            args.image_id,
+            resolved_image_id,
         ]
         run_record: dict[str, Any] = {
             "grid_x": grid,

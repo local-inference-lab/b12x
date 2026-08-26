@@ -12,7 +12,8 @@ the qualification conclusion.
 The repository retains:
 
 - the complete CTA sweep summary and the selected grid-144 result;
-- both balanced grid-144/grid-160 repeat summaries;
+- both balanced grid-144/grid-160 repeat summaries and the explicit disposition
+  for one reverse-order M=1 post-timing clock anomaly;
 - the normal-planner exact-checkpoint qualification receipt;
 - the selected launch's resource audit;
 - GLM `q_b_proj` and Qwen shape-regression summaries;

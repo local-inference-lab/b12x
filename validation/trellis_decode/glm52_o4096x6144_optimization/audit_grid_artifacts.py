@@ -264,10 +264,13 @@ class OccupancyAudit:
                 cuda.cuModuleGetFunction(module, kernel.encode()),
                 "cuModuleGetFunction",
             )
-            cuda.cuFuncSetAttribute(
-                function,
-                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                dynamic_smem,
+            self._check(
+                cuda.cuFuncSetAttribute(
+                    function,
+                    cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    dynamic_smem,
+                ),
+                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
             )
             attributes = {
                 "registers": cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
