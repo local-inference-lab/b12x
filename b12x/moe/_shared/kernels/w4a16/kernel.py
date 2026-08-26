@@ -5918,10 +5918,9 @@ class W4A16FusedMoeKernel:
                 raise ValueError(
                     "intermediate_rotation is only supported for trellis_t256"
                 )
-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
+            if not is_gated or self.activation_is_swigluoai:
                 raise ValueError(
-                    "intermediate_rotation requires unclamped gated silu or situ "
-                    "(no swiglu limit/oai)"
+                    "intermediate_rotation requires gated silu or situ (not oai)"
                 )
             if int(intermediate_size) % 128 != 0:
                 raise ValueError(
@@ -7234,6 +7233,10 @@ class W4A16FusedMoeKernel:
                 b0, b1, b2, b3 = self._load_coupled_pre_quad(
                     fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
                 )
+                a0, a1 = self._clamp_swiglu_inputs(a0, a1)
+                a2, a3 = self._clamp_swiglu_inputs(a2, a3)
+                b0, b1 = self._clamp_swiglu_inputs(b0, b1)
+                b2, b3 = self._clamp_swiglu_inputs(b2, b3)
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -7394,6 +7397,10 @@ class W4A16FusedMoeKernel:
                 iu1 = uh1 * svu1
                 iu2 = uh2 * svu2
                 iu3 = uh3 * svu3
+                ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
+                ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
+                ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
+                ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
                 down = isz + isz
                 sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
                 sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
@@ -7717,6 +7724,13 @@ class W4A16FusedMoeKernel:
                 iu2_1 = uh1 * svu1
                 iu2_2 = uh2 * svu2
                 iu2_3 = uh3 * svu3
+                # Clamp the logical gate/up values after undoing the EXL3 FC1
+                # output rotations. This is the same point used by the plain
+                # activation arm and preserves DeepSeek's clamped SwiGLU.
+                ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
+                ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
+                ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
+                ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
                 # silu(gate) * up, then pre-scale suh_down
                 d2 = isz + isz
                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)
