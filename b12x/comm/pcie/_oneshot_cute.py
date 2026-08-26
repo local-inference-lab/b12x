@@ -372,7 +372,12 @@ class _OneshotLaunch(_PackedMath):
             local_poll_base = local_scratch_base + plain_region_packs * Int64(16)
             # Generation zero is the initialized scratch value. Starting at
             # two and retaining published records gives every alternating slot
-            # a different expected value, including across uint32 wraparound.
+            # a different expected value. For generation g, the immediately
+            # preceding record in the same slot is g while this invocation
+            # expects g + 2, including modulo-uint32 wraparound. Collective
+            # lockstep prevents a record from an entire 2^32-generation cycle
+            # remaining in a slot: a missed publication blocks that generation
+            # before either rank can advance its graph-local epoch.
             expected_generation = generation + Uint32(2)
 
             if cutlass.const_expr(self._transport == "tp2_remote_push"):

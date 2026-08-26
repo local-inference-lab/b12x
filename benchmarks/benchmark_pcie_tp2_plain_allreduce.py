@@ -39,6 +39,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--samples", type=int, default=60)
     parser.add_argument("--base-revision", required=True)
+    parser.add_argument(
+        "--topology-description",
+        required=True,
+        help=(
+            "Semantic description of the physical path between the selected "
+            "GPUs, for example 'separate CPU root ports without a PCIe switch'"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -73,7 +81,10 @@ def _nvidia_smi_inventory() -> str:
     return _run_text(
         [
             "nvidia-smi",
-            "--query-gpu=index,uuid,pci.bus_id,name,driver_version",
+            (
+                "--query-gpu=index,uuid,pci.bus_id,name,driver_version,"
+                "persistence_mode,compute_mode,clocks.sm,clocks.max.sm,power.limit"
+            ),
             "--format=csv,noheader",
         ]
     )
@@ -150,6 +161,24 @@ def _capture_b12x(
     return graph
 
 
+def _b12x_graph_plan(pool: object, inp: torch.Tensor) -> dict[str, object]:
+    """Return the launch plan selected by the same backend used for capture."""
+
+    channel = pool.for_stream()
+    backend = channel._ext
+    state = backend._state(channel._ptr)
+    transport, threads, blocks = backend._plain_launch_config(
+        state,
+        inp,
+        graph_channel=True,
+    )
+    return {
+        "transport": transport,
+        "threads_per_cta": threads,
+        "ctas": blocks,
+    }
+
+
 def _capture_nccl(inp: torch.Tensor) -> torch.cuda.CUDAGraph:
     stream = torch.cuda.Stream(device=inp.device)
     stream.wait_stream(torch.cuda.current_stream(inp.device))
@@ -173,6 +202,7 @@ def _benchmark_b12x(
     value = float(rank + 1)
     inp = torch.full((rows, hidden_size), value, dtype=dtype, device=device)
     out = torch.empty_like(inp)
+    launch_plan = _b12x_graph_plan(pool, inp)
     graph = _capture_b12x(pool, inp, out)
     samples = _measure_graph(
         graph,
@@ -185,6 +215,7 @@ def _benchmark_b12x(
     torch.cuda.synchronize(device)
     return {
         "backend": "b12x",
+        "launch_plan": launch_plan,
         "correct": _correct(out, 3.0, device),
         "samples_slowest_rank_us": samples,
         **_distribution(samples),
@@ -292,12 +323,17 @@ def main() -> None:
             "base_revision": args.base_revision,
             "source": _source_identity(),
             "host": socket.gethostname(),
+            "topology_description": args.topology_description,
             "command": [sys.executable, *sys.argv],
             "python_version": platform.python_version(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "collective_environment": {
                 name: os.environ.get(name)
                 for name in (
+                    "B12X_PCIE_ONESHOT_BLOCK_LIMIT",
+                    "B12X_PCIE_ONESHOT_THREADS",
+                    "B12X_PCIE_TP2_PLAIN_REMOTE_PUSH",
+                    "B12X_PCIE_TP2_REMOTE_PUSH",
                     "NCCL_ALLOC_P2P_NET_LL_BUFFERS",
                     "NCCL_BUFFSIZE",
                     "NCCL_DMABUF_ENABLE",

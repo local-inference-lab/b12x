@@ -14,6 +14,10 @@ from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReducePool,
     _tp2_plain_remote_push_enabled,
 )
+from b12x.comm.pcie._oneshot_cute import (
+    _GRAPH_ARRIVED_OFFSET,
+    _GRAPH_EPOCH_OFFSET,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -63,6 +67,29 @@ def _local_eager_words(
         )
     stream.synchronize()
     return words[0].value, words[1].value
+
+
+def _copy_host_to_device(
+    channel, destination: int, source: ctypes.Array, stream: torch.cuda.Stream
+) -> None:
+    channel._ipc.cudaMemcpyAsync(
+        destination,
+        ctypes.addressof(source),
+        ctypes.sizeof(source),
+        int(stream.cuda_stream),
+    )
+
+
+def _read_local_u32(channel, source: int, stream: torch.cuda.Stream) -> int:
+    value = ctypes.c_uint32()
+    channel._ipc.cudaMemcpyAsync(
+        ctypes.addressof(value),
+        source,
+        ctypes.sizeof(value),
+        int(stream.cuda_stream),
+    )
+    stream.synchronize()
+    return value.value
 
 
 def _run_eager(
@@ -290,7 +317,7 @@ def _run_tp2_payload_patterns(
         expected = patterns[0] + patterns[1]
         pool.all_reduce(inp, out=output, channel_id="eager:default")
         torch.cuda.synchronize(device)
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
 
 def _run_tp2_graph_payload_patterns(
@@ -363,6 +390,91 @@ def _run_tp2_graph_payload_patterns(
             assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
 
+def _run_tp2_graph_generation_wrap(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Replay the peer-push kernel across uint32 generation wraparound."""
+
+    if not _tp2_plain_remote_push_active(world_size):
+        return
+    source = torch.empty((4, 4096), device=device, dtype=torch.bfloat16)
+    scratch = torch.empty_like(source)
+    output = torch.empty_like(source)
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+
+    with pool.capture(stream, channel_id="graph:wrap") as graph_channel:
+        with torch.cuda.stream(stream):
+            graph_channel.prepare_graph_all_reduce(scratch)
+        with torch.cuda.graph(graph, stream=stream):
+            scratch.copy_(source)
+            graph_channel.all_reduce(scratch, out=output)
+    stream.synchronize()
+
+    backend_state = graph_channel._ext._state(graph_channel._ptr)
+    start_generation = 0xFFFFFFFE
+    selected_slot = (start_generation + backend_state.slot_bias) & 1
+    size_packs = source.numel() * source.element_size() // 16
+    record_words = size_packs * 8
+    record_offset = backend_state.plain_remote_push_region_packs * 16
+
+    for slot in range(2):
+        # A slot is reused every two generations. Before generation g, its
+        # retained marker is g; the other slot most recently published g + 1.
+        retained_generation = (
+            start_generation if slot == selected_slot else start_generation + 1
+        ) & 0xFFFFFFFF
+        records = (ctypes.c_uint32 * record_words)()
+        for record in range(size_packs):
+            base = record * 8
+            for lane in (1, 3, 5, 7):
+                records[base + lane] = retained_generation
+        _copy_host_to_device(
+            graph_channel,
+            graph_channel._eager_ptrs[slot][rank] + record_offset,
+            records,
+            stream,
+        )
+
+    control = (ctypes.c_uint32 * 2)(start_generation, 0)
+    assert _GRAPH_ARRIVED_OFFSET == _GRAPH_EPOCH_OFFSET + 4
+    _copy_host_to_device(
+        graph_channel,
+        graph_channel.signal_ptrs[rank] + _GRAPH_EPOCH_OFFSET,
+        control,
+        stream,
+    )
+    stream.synchronize()
+    dist.barrier()
+
+    lane = torch.arange(source.numel(), device=device, dtype=torch.float32)
+    for iteration in range(4):
+        patterns = []
+        for source_rank in range(world_size):
+            pattern = (((lane + 3 * source_rank + 5 * iteration) % 127) - 63) / 8
+            pattern[0] = 0.0
+            pattern[1] = -0.0
+            patterns.append(pattern.to(source.dtype).view_as(source))
+        source.copy_(patterns[rank])
+        expected = patterns[0] + patterns[1]
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+
+    assert (
+        _read_local_u32(
+            graph_channel,
+            graph_channel.signal_ptrs[rank] + _GRAPH_EPOCH_OFFSET,
+            stream,
+        )
+        == 2
+    )
+
+
 def _graph_payload_worker(rank: int, world_size: int, port: int) -> None:
     os.environ["B12X_PCIE_TP2_PLAIN_REMOTE_PUSH"] = "1"
     torch.cuda.set_device(rank)
@@ -377,11 +489,13 @@ def _graph_payload_worker(rank: int, world_size: int, port: int) -> None:
         process_group=dist.group.WORLD,
         device=device,
         max_input_bytes=TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
-        max_concurrent_channels=1,
+        max_concurrent_channels=2,
     )
     try:
-        pool.prepare_channels(("graph:payload",))
+        pool.prepare_channels(("graph:payload", "graph:wrap"))
         _run_tp2_graph_payload_patterns(pool, device, rank, world_size)
+        dist.barrier()
+        _run_tp2_graph_generation_wrap(pool, device, rank, world_size)
         torch.cuda.synchronize(device)
     finally:
         pool.close()
