@@ -10,6 +10,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
+    TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
     _abort_collective_ipc_setup,
     _broadcast_gather_object,
     _compute_crossover_size,
@@ -23,12 +24,14 @@ from b12x.comm.pcie.pcie_oneshot import (
     _RETAINED_FAILED_IPC_EXPORTS,
     _CuTeOneshotBackend,
     _CuTeOneshotState,
+    _eager_storage_shards,
     _enable_device_slot_selection,
+    _tp2_plain_remote_push_enabled,
     _transport_policy_contract,
     _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
-from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch
+from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch, _OneshotLaunch
 
 
 @pytest.fixture(autouse=True)
@@ -257,7 +260,39 @@ def test_graph_slot_bias_preserves_the_next_host_slot() -> None:
     assert state.slot_bias == 1
 
 
-def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotState:
+def test_plain_tp2_remote_push_rejects_unstaged_input() -> None:
+    with pytest.raises(ValueError, match="requires a graph-owned staged"):
+        _OneshotLaunch(
+            "bfloat16",
+            world_size=2,
+            rank=0,
+            stage_input=False,
+            device_slot_selection=False,
+            slot_bias=0,
+            transport="tp2_remote_push",
+            threads=128,
+        )
+
+
+def test_plain_tp2_graph_remote_push_accepts_full_launch_geometry() -> None:
+    _OneshotLaunch(
+        "bfloat16",
+        world_size=2,
+        rank=0,
+        stage_input=True,
+        device_slot_selection=True,
+        slot_bias=0,
+        transport="tp2_remote_push",
+        threads=512,
+    )
+
+
+def _make_cute_state(
+    world_size: int,
+    *,
+    eager: bool = True,
+    eager_buffer_bytes: int = TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
+) -> _CuTeOneshotState:
     transport_policy = _transport_policy_contract()
     return _CuTeOneshotState(
         rank=0,
@@ -268,13 +303,105 @@ def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotStat
         next_table_offset=128,
         registered_tables={},
         eager_tables=(300, 400) if eager else None,
-        eager_buffer_bytes=128 * 1024 if eager else None,
+        eager_buffer_bytes=eager_buffer_bytes if eager else None,
         transport_policy=transport_policy,
         sharded_eager_storage=_uses_sharded_eager_storage(
             world_size,
             transport_policy,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    (
+        (1, ("tp2_remote_push", 64, 36)),
+        (2, ("tp2_remote_push_stream", 128, 36)),
+        (4, ("tp2_remote_push_stream", 256, 36)),
+        (6, ("tp2_remote_push", 64, 16)),
+        (8, ("tp2_remote_push", 256, 32)),
+        (16, ("tp2_remote_push_stream", 64, 36)),
+        (24, ("tp2_remote_push_stream", 128, 32)),
+        (32, ("tp2_remote_push", 128, 16)),
+        (128, ("tp2_remote_push", 128, 16)),
+        (256, ("tp2_remote_push", 128, 16)),
+        (512, ("tp2_remote_push", 128, 16)),
+    ),
+)
+def test_plain_tp2_remote_push_uses_qualified_geometry(
+    monkeypatch,
+    rows: int,
+    expected: tuple[str, int, int],
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    state = _make_cute_state(2)
+
+    assert (
+        _CuTeOneshotBackend._plain_launch_config(
+            state,
+            torch.empty((rows, 4096), dtype=torch.bfloat16),
+            graph_channel=True,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "shape", "dtype", "eager"),
+    (
+        (2, (513, 4096), torch.bfloat16, True),
+        (2, (4, 6144), torch.bfloat16, True),
+        (2, (4, 4096), torch.float32, True),
+        (2, (4, 4096), torch.bfloat16, False),
+        (4, (1, 4096), torch.bfloat16, True),
+        (8, (1, 4096), torch.bfloat16, True),
+        (16, (1, 4096), torch.bfloat16, True),
+    ),
+)
+def test_plain_tp2_remote_push_preserves_generic_fallbacks(
+    monkeypatch,
+    world_size: int,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    eager: bool,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    transport, _, _ = _CuTeOneshotBackend._plain_launch_config(
+        _make_cute_state(world_size, eager=eager),
+        torch.empty(shape, dtype=dtype),
+        graph_channel=True,
+    )
+
+    assert transport == "pull"
+
+
+def test_plain_tp2_transport_policy_is_frozen_at_channel_setup(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    state = _make_cute_state(2)
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
+
+    transport, _, _ = _CuTeOneshotBackend._plain_launch_config(
+        state,
+        torch.empty((1, 4096), dtype=torch.bfloat16),
+        graph_channel=True,
+    )
+
+    assert transport == "tp2_remote_push"
+
+
+def test_plain_tp2_remote_push_is_not_selected_for_eager_execution(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    transport, _, _ = _CuTeOneshotBackend._plain_launch_config(
+        _make_cute_state(2),
+        torch.empty((6, 4096), dtype=torch.bfloat16),
+    )
+
+    assert transport == "pull"
 
 
 def test_tp8_owner_launcher_rejects_float32() -> None:
@@ -329,22 +456,47 @@ def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("world_size", "env_name", "shape", "expected_when_enabled"),
     (
-        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 4096), "stage_remote_push"),
-        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (32, 6144), "stage_remote_push"),
+        "world_size",
+        "env_name",
+        "shape",
+        "expected_by_default",
+        "expected_when_enabled",
+    ),
+    (
+        (
+            2,
+            "B12X_PCIE_TP2_REMOTE_PUSH",
+            (4, 4096),
+            "stage_pull",
+            "stage_remote_push",
+        ),
+        (
+            4,
+            "B12X_PCIE_TP4_REMOTE_PUSH",
+            (32, 6144),
+            "stage_pull",
+            "stage_remote_push",
+        ),
     ),
 )
-def test_tp2_tp4_remote_push_is_opt_in(
+def test_tp2_tp4_remote_push_defaults_and_overrides(
     monkeypatch,
     world_size: int,
     env_name: str,
     shape: tuple[int, int],
+    expected_by_default: str,
     expected_when_enabled: str,
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     inp = torch.empty(shape, dtype=torch.bfloat16)
+    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(world_size), inp
+    )
+    assert mode == expected_by_default
+
+    monkeypatch.setenv(env_name, "0")
     mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
         _make_cute_state(world_size), inp
     )
@@ -412,6 +564,7 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
     for name in (
         "B12X_PCIE_ONESHOT_PUSH",
         "B12X_PCIE_TP2_REMOTE_PUSH",
+        "B12X_PCIE_TP2_PLAIN_REMOTE_PUSH",
         "B12X_PCIE_TP4_REMOTE_PUSH",
         "B12X_PCIE_TP8_OWNER_REDUCE",
     ):
@@ -420,13 +573,34 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
     assert not _uses_sharded_eager_storage(2)
     assert not _uses_sharded_eager_storage(4)
     assert _uses_sharded_eager_storage(8)
-    assert _transport_policy_contract() == (False, False, False, True)
+    assert _eager_storage_shards(2) == 3
+    assert _eager_storage_shards(4) == 1
+    assert _eager_storage_shards(8) == 8
+    assert _transport_policy_contract() == (False, False, True, False, True)
 
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
     assert _uses_sharded_eager_storage(4)
     assert not _uses_sharded_eager_storage(8)
-    assert _transport_policy_contract() == (False, False, True, False)
+    assert _eager_storage_shards(4) == 4
+    assert _transport_policy_contract() == (False, False, False, True, False)
+
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    assert _eager_storage_shards(2) == 4
+
+
+def test_plain_tp2_remote_push_override_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "0")
+    assert not _tp2_plain_remote_push_enabled()
+
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    assert _tp2_plain_remote_push_enabled()
 
 
 def test_register_buffer_is_idempotent_for_same_mapping():
@@ -625,6 +799,68 @@ def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
     assert (
         runtime.should_allreduce(torch.arange(16, dtype=torch.bfloat16)[::2]) is False
     )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "shape", "generic_max_bytes", "graph_capture", "expected"),
+    (
+        (2, (64, 4096), 84 * 1024, True, True),
+        (2, (65, 4096), 84 * 1024, True, False),
+        (2, (512, 4096), 84 * 1024, True, False),
+        (2, (1, 4096), 84 * 1024, False, True),
+        (2, (16, 4096), 84 * 1024, False, False),
+        (2, (1, 6144), 84 * 1024, True, True),
+        (2, (8, 6144), 84 * 1024, True, False),
+        (4, (8, 4096), 84 * 1024, True, True),
+        (4, (32, 4096), 84 * 1024, True, False),
+        (8, (40, 4096), 84 * 1024, True, False),
+    ),
+)
+def test_plain_allreduce_route_uses_qualified_tp_bands(
+    monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    shape: tuple[int, int],
+    generic_max_bytes: int,
+    graph_capture: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_TP2_REMOTE_PUSH", raising=False)
+    runtime = _make_runtime(world_size=world_size, eager=True)
+
+    assert (
+        runtime.should_route_plain_allreduce(
+            torch.empty(shape, dtype=torch.bfloat16),
+            generic_max_bytes=generic_max_bytes,
+            graph_capture=graph_capture,
+        )
+        is expected
+    )
+
+
+def test_plain_allreduce_route_honors_tp2_remote_push_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
+    runtime = _make_runtime(world_size=2, eager=True)
+    inp = torch.empty((32, 4096), dtype=torch.bfloat16)
+
+    assert not runtime.should_route_plain_allreduce(
+        inp,
+        generic_max_bytes=84 * 1024,
+        graph_capture=True,
+    )
+
+
+def test_plain_allreduce_route_rejects_negative_generic_band() -> None:
+    runtime = _make_runtime(world_size=2, eager=True)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        runtime.should_route_plain_allreduce(
+            torch.empty((1, 4096), dtype=torch.bfloat16),
+            generic_max_bytes=-1,
+        )
 
 
 def test_eager_runtime_rejects_threshold_above_buffer_capacity():
@@ -1397,7 +1633,7 @@ def test_eager_channel_buffers_use_single_ipc_slab(monkeypatch):
         exchange_group,
         signal_bytes=signal_bytes,
         eager_buffer_bytes=eager_bytes,
-        sharded_eager_storage=False,
+        eager_storage_shards=1,
         ipc=ipc,
     )
 
@@ -1510,7 +1746,7 @@ def test_eager_channel_buffers_cleanup_when_slab_zero_fails(monkeypatch):
             object(),
             signal_bytes=300,
             eager_buffer_bytes=128,
-            sharded_eager_storage=False,
+            eager_storage_shards=1,
             ipc=ipc,
         )
 
@@ -1551,9 +1787,7 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 
 def test_object_broadcast_uses_cpu_for_gloo(monkeypatch):
     group = object()
-    monkeypatch.setattr(
-        "torch.distributed.get_backend", lambda group=None: "gloo"
-    )
+    monkeypatch.setattr("torch.distributed.get_backend", lambda group=None: "gloo")
 
     assert _object_broadcast_device(group) == torch.device("cpu")
 

@@ -25,6 +25,19 @@ SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 DEFAULT_RANK_DATA_BYTES = 8 * 1024 * 1024
+TP2_PLAIN_REMOTE_PUSH_MAX_ROWS = 512
+TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS = 64
+TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE = 4096
+TP2_PLAIN_REMOTE_PUSH_MAX_BYTES = (
+    TP2_PLAIN_REMOTE_PUSH_MAX_ROWS
+    * TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
+    * torch.bfloat16.itemsize
+)
+TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES = (
+    TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS
+    * TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
+    * torch.bfloat16.itemsize
+)
 AUTOTUNE_CEILING = 1 * 1024 * 1024
 AUTOTUNE_FINE_STEP = 8 * 1024
 IPC_SLAB_ALIGNMENT = 256
@@ -120,6 +133,20 @@ def _tp2_remote_push_enabled() -> bool:
     return os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "0") not in ("", "0")
 
 
+def _tp2_plain_remote_push_enabled() -> bool:
+    """Enable the qualified plain TP2 peer-push transport by default.
+
+    ``B12X_PCIE_TP2_REMOTE_PUSH`` remains a compatible global TP2 override
+    when the plain-specific variable is absent. This preserves explicit
+    deployment controls without changing the fused transport's default.
+    """
+
+    configured = os.getenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH")
+    if configured is None:
+        configured = os.getenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    return configured not in ("", "0")
+
+
 def _tp4_remote_push_enabled() -> bool:
     """Enable the qualified fused TP4 remote-write transport."""
 
@@ -134,11 +161,11 @@ def _tp8_owner_reduce_enabled() -> bool:
 
 def _uses_sharded_eager_storage(
     world_size: int,
-    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+    transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
 ) -> bool:
     """Return whether staged fused transport needs one shard per source."""
 
-    push, tp2_remote, tp4_remote, tp8_owner = (
+    push, tp2_remote, _, tp4_remote, tp8_owner = (
         _transport_policy_contract() if transport_policy is None else transport_policy
     )
     return push or (
@@ -148,15 +175,55 @@ def _uses_sharded_eager_storage(
     )
 
 
-def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
+def _eager_storage_shards(
+    world_size: int,
+    transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
+) -> int:
+    """Return fixed-size shards required by each eager staging slot.
+
+    Topology transports reserve one source shard per rank. TP2 plain
+    peer-push also reserves one isolated incoming shard so its unpublished
+    markers cannot alias payloads retained by fused or pull collectives.
+    """
+
+    policy = (
+        _transport_policy_contract() if transport_policy is None else transport_policy
+    )
+    base_shards = world_size if _uses_sharded_eager_storage(world_size, policy) else 1
+    # Graph peer-push uses a data-and-epoch layout. Every 16 bytes of input
+    # occupy 32 bytes of incoming scratch so readiness is carried in the same
+    # PCIe transactions as the payload instead of a separate peer atomic.
+    # Eager channels use only the first incoming shard.
+    plain_tp2_incoming = 2 if world_size == 2 and policy[2] else 0
+    return base_shards + plain_tp2_incoming
+
+
+def _transport_policy_contract() -> tuple[bool, bool, bool, bool, bool]:
     """Values that must agree across ranks before IPC storage is allocated."""
 
     return (
         _push_mode_enabled(),
         _tp2_remote_push_enabled(),
+        _tp2_plain_remote_push_enabled(),
         _tp4_remote_push_enabled(),
         _tp8_owner_reduce_enabled(),
     )
+
+
+def _tp2_plain_remote_push_rows(inp: torch.Tensor) -> Optional[int]:
+    """Return the row count for the qualified TP2 peer-push tensor contract."""
+
+    if (
+        inp.dtype not in (torch.float16, torch.bfloat16)
+        or inp.ndim == 0
+        or int(inp.shape[-1]) != TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
+        or inp.numel() % TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE != 0
+    ):
+        return None
+    rows = inp.numel() // TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
+    if rows < 1 or rows > TP2_PLAIN_REMOTE_PUSH_MAX_ROWS:
+        return None
+    return rows
 
 
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
@@ -1253,8 +1320,15 @@ class _CuTeOneshotState:
     eager_tables: Optional[tuple[int, int]] = None
     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
     eager_buffer_bytes: Optional[int] = None
-    transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
+    transport_policy: tuple[bool, bool, bool, bool, bool] = (
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
     sharded_eager_storage: bool = False
+    plain_remote_push_region_packs: int = 0
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
@@ -1367,7 +1441,7 @@ class _CuTeOneshotBackend:
         pointers0: Sequence[int],
         pointers1: Sequence[int],
         eager_buffer_bytes: Optional[int] = None,
-        transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+        transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
     ) -> None:
         state = self._state(handle)
         ptrs0 = tuple(int(pointer) for pointer in pointers0)
@@ -1388,6 +1462,13 @@ class _CuTeOneshotBackend:
             state.world_size,
             state.transport_policy,
         )
+        if state.world_size == 2 and state.transport_policy[2]:
+            base_shards = state.world_size if state.sharded_eager_storage else 1
+            state.plain_remote_push_region_packs = (
+                base_shards * int(state.eager_buffer_bytes or 0) // 16
+            )
+        else:
+            state.plain_remote_push_region_packs = 0
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
         state.eager_slot = 0
@@ -1403,6 +1484,74 @@ class _CuTeOneshotBackend:
             )
         blocks = max(1, min(block_limit, (size_packs + threads - 1) // threads))
         return threads, blocks
+
+    @staticmethod
+    def _tp2_plain_remote_push_geometry(
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+        *,
+        graph_channel: bool,
+    ) -> Optional[tuple[int, int, bool]]:
+        """Return TP2 peer-push geometry for a graph-owned plain all-reduce.
+
+        The protocol requires device-selected alternating slots, which are
+        owned by a prepared CUDA graph channel. Eager calls use the existing
+        pull transport. The 512-row bound is functional capacity; callers use
+        ``TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS`` as the automatic latency policy.
+        """
+
+        if (
+            state.eager_tables is None
+            or state.eager_buffer_bytes is None
+            or state.world_size != 2
+            or not state.transport_policy[2]
+            or not graph_channel
+        ):
+            return None
+        rows = _tp2_plain_remote_push_rows(inp)
+        if rows is None or inp.numel() * inp.element_size() > state.eager_buffer_bytes:
+            return None
+        if rows == 1:
+            return 64, 36, False
+        if rows == 2:
+            return 128, 36, True
+        if rows <= 4:
+            return 256, 36, True
+        if rows <= 6:
+            return 64, 16, False
+        if rows <= 8:
+            return 256, 32, False
+        if rows <= 14:
+            return 64, 16, False
+        if rows <= 16:
+            return 64, 36, True
+        if rows <= 22:
+            return 128, 16, False
+        if rows <= 24:
+            return 128, 32, True
+        return 128, 16, False
+
+    @classmethod
+    def _plain_launch_config(
+        cls,
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+        *,
+        graph_channel: bool = False,
+    ) -> tuple[str, int, int]:
+        """Select a plain all-reduce transport and its launch geometry."""
+
+        remote_push = cls._tp2_plain_remote_push_geometry(
+            state,
+            inp,
+            graph_channel=graph_channel,
+        )
+        if remote_push is not None:
+            threads, blocks, stream_mode = remote_push
+            transport = "tp2_remote_push_stream" if stream_mode else "tp2_remote_push"
+            return transport, threads, blocks
+        threads, blocks = cls._launch_geometry(inp.numel() * inp.element_size() // 16)
+        return "pull", threads, blocks
 
     @staticmethod
     def _fused_threads() -> int:
@@ -1427,7 +1576,7 @@ class _CuTeOneshotBackend:
         if hidden <= 0 or inp.numel() % hidden != 0:
             return None
         rows = inp.numel() // hidden
-        _, tp2_remote, tp4_remote, tp8_owner = state.transport_policy
+        _, tp2_remote, _, tp4_remote, tp8_owner = state.transport_policy
         if (
             state.world_size == 8
             and tp8_owner
@@ -1490,7 +1639,11 @@ class _CuTeOneshotBackend:
         stage_input = state.eager_tables is not None
         if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
             raise RuntimeError("input buffer is not registered")
-        threads, _ = self._launch_geometry(inp.numel() * inp.element_size() // 16)
+        transport, threads, _ = self._plain_launch_config(
+            state,
+            inp,
+            graph_channel=True,
+        )
         from ._oneshot_cute import get_oneshot_launcher
 
         device_index = self._device_index(inp.device)
@@ -1503,6 +1656,7 @@ class _CuTeOneshotBackend:
                 stage_input,
                 device_slot_selection,
                 slot_bias,
+                transport,
                 threads,
                 device_index,
             )
@@ -1569,7 +1723,19 @@ class _CuTeOneshotBackend:
         state = self._state(handle)
         capturing = _is_current_stream_capturing(inp.device)
         size_packs = inp.numel() * inp.element_size() // 16
-        threads, blocks = self._launch_geometry(size_packs)
+        graph_channel = state.device_slot_selection or (
+            capturing and state.eager_tables is not None
+        )
+        transport, threads, blocks = self._plain_launch_config(
+            state,
+            inp,
+            graph_channel=graph_channel,
+        )
+        graph_transport, graph_threads, _ = self._plain_launch_config(
+            state,
+            inp,
+            graph_channel=True,
+        )
         device_index = self._device_index(inp.device)
         prospective_device_selection = state.device_slot_selection or (
             capturing and state.eager_tables is not None
@@ -1587,6 +1753,7 @@ class _CuTeOneshotBackend:
                 state.eager_tables is not None,
                 prospective_device_selection,
                 prospective_slot_bias,
+                transport,
                 threads,
                 device_index,
             ):
@@ -1606,6 +1773,18 @@ class _CuTeOneshotBackend:
         table_address, stage_input = self._select_table(state, inp.data_ptr())
         from ._oneshot_cute import get_oneshot_launcher
 
+        plain_slot_ptrs = (0, 0, 0, 0)
+        if transport.startswith("tp2_remote_push"):
+            if state.eager_ptrs is None:
+                raise RuntimeError("TP2 peer-push requires eager staging pointers")
+            peer_rank = state.rank ^ 1
+            plain_slot_ptrs = (
+                state.eager_ptrs[0][state.rank],
+                state.eager_ptrs[0][peer_rank],
+                state.eager_ptrs[1][state.rank],
+                state.eager_ptrs[1][peer_rank],
+            )
+
         with torch.cuda.device(inp.device):
             launcher = get_oneshot_launcher(
                 _dtype_name(inp.dtype),
@@ -1614,6 +1793,7 @@ class _CuTeOneshotBackend:
                 stage_input,
                 state.device_slot_selection,
                 state.slot_bias,
+                transport,
                 threads,
                 device_index,
             )
@@ -1628,7 +1808,8 @@ class _CuTeOneshotBackend:
                         stage_input,
                         True,
                         slot_bias,
-                        threads,
+                        graph_transport,
+                        graph_threads,
                         device_index,
                     )
             launcher(
@@ -1637,6 +1818,8 @@ class _CuTeOneshotBackend:
                 inp.data_ptr(),
                 out.data_ptr(),
                 size_packs,
+                state.plain_remote_push_region_packs,
+                *plain_slot_ptrs,
                 blocks,
             )
 
@@ -2042,7 +2225,7 @@ class PCIeOneshotAllReduce:
         eager_buffer_ptrs0: Optional[Sequence[int]],
         eager_buffer_ptrs1: Optional[Sequence[int]],
         eager_buffer_bytes: Optional[int],
-        transport_policy: tuple[bool, bool, bool, bool],
+        transport_policy: tuple[bool, bool, bool, bool, bool],
         exchange_group: Optional[ProcessGroup],
         ipc: Optional[CudaRTLibrary],
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
@@ -2255,7 +2438,7 @@ class PCIeOneshotAllReduce:
             exchange_group,
             signal_bytes=signal_bytes,
             eager_buffer_bytes=eager_buffer_bytes,
-            sharded_eager_storage=_uses_sharded_eager_storage(
+            eager_storage_shards=_eager_storage_shards(
                 world_size,
                 transport_policy,
             ),
@@ -2544,7 +2727,7 @@ class PCIeOneshotAllReduce:
         *,
         signal_bytes: int,
         eager_buffer_bytes: int,
-        sharded_eager_storage: bool,
+        eager_storage_shards: int,
         ipc: CudaRTLibrary,
     ) -> _ChannelSharedBuffers:
         signal_bytes = int(signal_bytes)
@@ -2553,8 +2736,10 @@ class PCIeOneshotAllReduce:
             raise ValueError("signal_bytes must be positive")
         if eager_buffer_bytes <= 0:
             raise ValueError("eager_buffer_bytes must be positive")
-        if sharded_eager_storage:
-            eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
+        eager_storage_shards = int(eager_storage_shards)
+        if eager_storage_shards <= 0:
+            raise ValueError("eager_storage_shards must be positive")
+        eager_buffer_bytes *= eager_storage_shards
 
         signal_offset = 0
         eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
@@ -2618,6 +2803,39 @@ class PCIeOneshotAllReduce:
         if inp_bytes % 16 != 0:
             return False
         return _is_weak_contiguous(inp)
+
+    def should_route_plain_allreduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        generic_max_bytes: int,
+        graph_capture: bool = False,
+    ) -> bool:
+        """Return whether plain all-reduce should use B12X instead of NCCL.
+
+        ``should_allreduce`` defines functional support. This method adds the
+        latency policy used by callers with an NCCL fallback. Prepared TP2 CUDA
+        graph channels extend the caller's generic band through 64 contiguous
+        FP16/BF16 rows of width 4096. Every other shape and execution mode uses
+        the caller-supplied size policy.
+        """
+
+        if not self.should_allreduce(inp):
+            return False
+        generic_max_bytes = int(generic_max_bytes)
+        if generic_max_bytes < 0:
+            raise ValueError("generic_max_bytes must be non-negative")
+        inp_bytes = inp.numel() * inp.element_size()
+        if self.world_size == 2:
+            remote_push = (
+                graph_capture
+                and self._eager_ptrs is not None
+                and self._transport_policy[2]
+                and (rows := _tp2_plain_remote_push_rows(inp)) is not None
+                and rows <= TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_ROWS
+            )
+            return remote_push or inp_bytes <= generic_max_bytes
+        return inp_bytes <= generic_max_bytes
 
     def register_buffer(self, peer_input_ptrs: Sequence[int]) -> None:
         if self._closed:
@@ -3251,6 +3469,10 @@ class PCIeOneshotAllReducePool:
             self.world_size,
             self._transport_policy,
         )
+        self._eager_storage_shards = _eager_storage_shards(
+            self.world_size,
+            self._transport_policy,
+        )
         self.exchange_group = resolved_group
         self.process_group = self.exchange_group
         self._channel_factory = channel_factory
@@ -3378,7 +3600,7 @@ class PCIeOneshotAllReducePool:
             self.exchange_group,
             signal_bytes=self._signal_bytes,
             eager_buffer_bytes=self.eager_buffer_bytes,
-            sharded_eager_storage=self._sharded_eager_storage,
+            eager_storage_shards=self._eager_storage_shards,
             ipc=self._ipc,
         )
         owned_buffers = [channel_buffers.owned_buffer]
