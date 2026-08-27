@@ -227,8 +227,24 @@ def _tp2_plain_remote_push_rows(inp: torch.Tensor) -> Optional[int]:
 
 
 def _is_weak_contiguous(inp: torch.Tensor) -> bool:
+    """Return whether raw-pointer traversal visits every logical element once."""
+
     if inp.is_contiguous():
         return True
+    expected_stride = 1
+    dimensions = []
+    for size, stride in zip(inp.shape, inp.stride(), strict=True):
+        size = int(size)
+        stride = int(stride)
+        if size <= 1:
+            continue
+        if stride < 0:
+            return False
+        dimensions.append((stride, size))
+    for stride, size in sorted(dimensions):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
     storage = inp.untyped_storage()
     return (
         storage.nbytes() - inp.storage_offset() * inp.element_size()

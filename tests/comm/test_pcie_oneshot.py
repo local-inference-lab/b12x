@@ -874,6 +874,31 @@ def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
     )
 
 
+def test_plain_allreduce_route_rejects_overlapping_storage_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_TP2_REMOTE_PUSH", raising=False)
+    runtime = _make_runtime(world_size=2, eager=True)
+    transposed = torch.empty((4096, 4), dtype=torch.bfloat16).transpose(0, 1)
+    overlapping = torch.empty((4, 4096), dtype=torch.bfloat16).as_strided(
+        (4, 4096), (0, 1)
+    )
+
+    assert runtime.should_allreduce(transposed)
+    assert runtime.should_route_plain_allreduce(
+        transposed,
+        generic_max_bytes=0,
+        graph_capture=True,
+    )
+    assert not runtime.should_allreduce(overlapping)
+    assert not runtime.should_route_plain_allreduce(
+        overlapping,
+        generic_max_bytes=0,
+        graph_capture=True,
+    )
+
+
 @pytest.mark.parametrize(
     ("world_size", "shape", "generic_max_bytes", "graph_capture", "expected"),
     (
