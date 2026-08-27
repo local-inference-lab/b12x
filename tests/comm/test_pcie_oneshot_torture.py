@@ -389,6 +389,48 @@ def _run_tp2_graph_payload_patterns(
             assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
 
+def _run_tp2_graph_weak_contiguous_storage(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Validate graph peer-push over a dense, non-contiguous logical view."""
+
+    source = torch.empty((4096, 4), device=device, dtype=torch.bfloat16).transpose(0, 1)
+    scratch = torch.empty_like(source)
+    output = torch.empty_like(source)
+    assert not source.is_contiguous()
+    assert source.untyped_storage().nbytes() == source.numel() * source.element_size()
+
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with pool.capture(stream, channel_id="graph:weak-contiguous") as graph_channel:
+        with torch.cuda.stream(stream):
+            graph_channel.prepare_graph_all_reduce(scratch)
+        with torch.cuda.graph(graph, stream=stream):
+            scratch.copy_(source)
+            graph_channel.all_reduce(scratch, out=output)
+    stream.synchronize()
+
+    lane = torch.arange(source.numel(), device=device, dtype=torch.float32).view_as(
+        source
+    )
+    for iteration in range(4):
+        patterns = tuple(
+            (((lane + 7 * source_rank + 3 * iteration) % 127) - 63)
+            .div(8)
+            .to(source.dtype)
+            for source_rank in range(world_size)
+        )
+        source.copy_(patterns[rank])
+        expected = patterns[0] + patterns[1]
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        assert torch.equal(output, expected)
+
+
 def _run_tp2_graph_generation_wrap(
     pool: PCIeOneshotAllReducePool,
     device: torch.device,
@@ -491,8 +533,10 @@ def _graph_payload_worker(rank: int, world_size: int, port: int) -> None:
         max_concurrent_channels=2,
     )
     try:
-        pool.prepare_channels(("graph:payload", "graph:wrap"))
+        pool.prepare_channels(("graph:payload", "graph:weak-contiguous", "graph:wrap"))
         _run_tp2_graph_payload_patterns(pool, device, rank, world_size)
+        dist.barrier()
+        _run_tp2_graph_weak_contiguous_storage(pool, device, rank, world_size)
         dist.barrier()
         _run_tp2_graph_generation_wrap(pool, device, rank, world_size)
         torch.cuda.synchronize(device)

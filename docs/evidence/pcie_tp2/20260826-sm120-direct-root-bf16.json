@@ -10,7 +10,7 @@
   },
   "host": "684b034a3e15",
   "topology_description": "two RTX PRO 6000 Blackwell GPUs attached to separate CPU root ports without a PCIe switch on their direct peer path",
-  "command": [
+  "worker_command": [
     "/opt/venv/bin/python3",
     "benchmarks/benchmark_pcie_tp2_plain_allreduce.py",
     "--warmup",
@@ -24,6 +24,11 @@
     "--output",
     "/results/20260826-sm120-direct-root-bf16.json"
   ],
+  "distributed_environment": {
+    "RANK": "0",
+    "LOCAL_RANK": "0",
+    "WORLD_SIZE": "2"
+  },
   "python_version": "3.12.3",
   "cuda_visible_devices": "0,1",
   "collective_environment": {

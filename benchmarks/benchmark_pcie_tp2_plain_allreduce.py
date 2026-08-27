@@ -320,7 +320,11 @@ def main() -> None:
             "source": _source_identity(),
             "host": socket.gethostname(),
             "topology_description": args.topology_description,
-            "command": [sys.executable, *sys.argv],
+            "worker_command": [sys.executable, *sys.argv],
+            "distributed_environment": {
+                name: os.environ.get(name)
+                for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")
+            },
             "python_version": platform.python_version(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "collective_environment": {
