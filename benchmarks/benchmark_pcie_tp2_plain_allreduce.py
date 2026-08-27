@@ -148,34 +148,30 @@ def _capture_b12x(
     inp: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.cuda.CUDAGraph:
-    # The eager call prepares the graph-only peer-push specialization.
-    pool.all_reduce(inp, out=out)
-    torch.cuda.synchronize(inp.device)
     stream = torch.cuda.Stream(device=inp.device)
     stream.wait_stream(torch.cuda.current_stream(inp.device))
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(stream), torch.cuda.graph(graph, stream=stream):
-        pool.all_reduce(inp, out=out)
+    with pool.capture(stream) as channel:
+        with torch.cuda.stream(stream):
+            channel.prepare_graph_all_reduce(inp)
+        with torch.cuda.graph(graph, stream=stream):
+            channel.all_reduce(inp, out=out)
     torch.cuda.current_stream(inp.device).wait_stream(stream)
     torch.cuda.synchronize(inp.device)
     return graph
 
 
 def _b12x_graph_plan(pool: object, inp: torch.Tensor) -> dict[str, object]:
-    """Return the launch plan selected by the same backend used for capture."""
+    """Return the immutable launch plan retained during graph preparation."""
 
     channel = pool.for_stream()
     backend = channel._ext
     state = backend._state(channel._ptr)
-    transport, threads, blocks = backend._plain_launch_config(
-        state,
-        inp,
-        graph_channel=True,
-    )
+    plan = state.plain_graph_plans[backend._plain_graph_plan_key(inp)]
     return {
-        "transport": transport,
-        "threads_per_cta": threads,
-        "ctas": blocks,
+        "transport": plan.transport,
+        "threads_per_cta": plan.threads,
+        "ctas": plan.blocks,
     }
 
 
@@ -202,8 +198,8 @@ def _benchmark_b12x(
     value = float(rank + 1)
     inp = torch.full((rows, hidden_size), value, dtype=dtype, device=device)
     out = torch.empty_like(inp)
-    launch_plan = _b12x_graph_plan(pool, inp)
     graph = _capture_b12x(pool, inp, out)
+    launch_plan = _b12x_graph_plan(pool, inp)
     samples = _measure_graph(
         graph,
         lambda: inp.fill_(value),

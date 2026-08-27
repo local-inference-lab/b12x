@@ -294,6 +294,23 @@ def _make_cute_state(
     eager_buffer_bytes: int = TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
 ) -> _CuTeOneshotState:
     transport_policy = _transport_policy_contract()
+    sharded_eager_storage = _uses_sharded_eager_storage(
+        world_size,
+        transport_policy,
+    )
+    eager_ptrs = (
+        (
+            tuple(range(1_000, 1_000 + world_size)),
+            tuple(range(2_000, 2_000 + world_size)),
+        )
+        if eager
+        else None
+    )
+    plain_remote_push_region_packs = (
+        (world_size if sharded_eager_storage else 1) * eager_buffer_bytes // 16
+        if eager and world_size == 2 and transport_policy[2]
+        else 0
+    )
     return _CuTeOneshotState(
         rank=0,
         world_size=world_size,
@@ -303,12 +320,11 @@ def _make_cute_state(
         next_table_offset=128,
         registered_tables={},
         eager_tables=(300, 400) if eager else None,
+        eager_ptrs=eager_ptrs,
         eager_buffer_bytes=eager_buffer_bytes if eager else None,
         transport_policy=transport_policy,
-        sharded_eager_storage=_uses_sharded_eager_storage(
-            world_size,
-            transport_policy,
-        ),
+        sharded_eager_storage=sharded_eager_storage,
+        plain_remote_push_region_packs=plain_remote_push_region_packs,
     )
 
 
@@ -390,6 +406,63 @@ def test_plain_tp2_transport_policy_is_frozen_at_channel_setup(monkeypatch) -> N
     )
 
     assert transport == "tp2_remote_push"
+
+
+def test_plain_graph_plan_freezes_prepared_channel_contract(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    monkeypatch.setattr(
+        _CuTeOneshotBackend,
+        "_device_index",
+        staticmethod(lambda _device: 0),
+    )
+    state = _make_cute_state(2)
+    inp = torch.empty((6, 4096), dtype=torch.bfloat16)
+
+    plan = _CuTeOneshotBackend._plain_graph_plan(state, inp)
+    state.transport_policy = (False, False, False, False, False)
+    state.eager_buffer_bytes = 0
+    state.plain_remote_push_region_packs = 0
+
+    assert plan.transport == "tp2_remote_push"
+    assert (plan.threads, plan.blocks) == (64, 16)
+    assert plan.eager_buffer_bytes == TP2_PLAIN_REMOTE_PUSH_MAX_BYTES
+    assert plan.transport_policy[2] is True
+    assert plan.remote_push_region_packs > 0
+    assert plan.remote_push_slot_ptrs == (1_000, 1_001, 2_000, 2_001)
+
+
+def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    monkeypatch.setattr(
+        _CuTeOneshotBackend,
+        "_device_index",
+        staticmethod(lambda _device: 0),
+    )
+    launchers = []
+
+    def fake_get_oneshot_launcher(*args):
+        launchers.append(args)
+        return object()
+
+    monkeypatch.setattr(
+        "b12x.comm.pcie._oneshot_cute.get_oneshot_launcher",
+        fake_get_oneshot_launcher,
+    )
+    backend = _CuTeOneshotBackend()
+    state = _make_cute_state(2)
+    backend._states[7] = state
+    inp = torch.empty((6, 4096), dtype=torch.bfloat16)
+
+    backend.prepare_all_reduce(7, inp)
+
+    key = backend._plain_graph_plan_key(inp)
+    plan = state.plain_graph_plans[key]
+    assert plan.transport == "tp2_remote_push"
+    assert (plan.threads, plan.blocks) == (64, 16)
+    assert [args[4:8] for args in launchers] == [
+        (True, 0, "tp2_remote_push", 64),
+        (True, 1, "tp2_remote_push", 64),
+    ]
 
 
 def test_plain_tp2_remote_push_is_not_selected_for_eager_execution(

@@ -1277,6 +1277,22 @@ class _BenchmarkResult:
     winner: str
 
 
+@dataclass(frozen=True)
+class _PlainGraphLaunchPlan:
+    """Immutable dispatch contract for one prepared plain graph shape."""
+
+    transport: str
+    threads: int
+    blocks: int
+    size_packs: int
+    stage_input: bool
+    device_index: int
+    eager_buffer_bytes: Optional[int]
+    transport_policy: tuple[bool, bool, bool, bool, bool]
+    remote_push_region_packs: int
+    remote_push_slot_ptrs: tuple[int, int, int, int]
+
+
 @lru_cache(maxsize=1)
 def _load_extension():
     """Return the pure-Python CuTe backend used by the compatibility runtime."""
@@ -1332,6 +1348,9 @@ class _CuTeOneshotState:
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
+    plain_graph_plans: dict[tuple[object, ...], _PlainGraphLaunchPlan] = field(
+        default_factory=dict
+    )
 
 
 def _enable_device_slot_selection(
@@ -1472,6 +1491,7 @@ class _CuTeOneshotBackend:
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
         state.eager_slot = 0
+        state.plain_graph_plans.clear()
 
     @staticmethod
     def _launch_geometry(size_packs: int) -> tuple[int, int]:
@@ -1552,6 +1572,57 @@ class _CuTeOneshotBackend:
             return transport, threads, blocks
         threads, blocks = cls._launch_geometry(inp.numel() * inp.element_size() // 16)
         return "pull", threads, blocks
+
+    @classmethod
+    def _plain_graph_plan(
+        cls,
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+    ) -> _PlainGraphLaunchPlan:
+        """Create the immutable launch contract admitted before graph capture."""
+
+        transport, threads, blocks = cls._plain_launch_config(
+            state,
+            inp,
+            graph_channel=True,
+        )
+        slot_ptrs = (0, 0, 0, 0)
+        if transport.startswith("tp2_remote_push"):
+            if state.eager_ptrs is None:
+                raise RuntimeError("TP2 peer-push requires eager staging pointers")
+            peer_rank = state.rank ^ 1
+            slot_ptrs = (
+                state.eager_ptrs[0][state.rank],
+                state.eager_ptrs[0][peer_rank],
+                state.eager_ptrs[1][state.rank],
+                state.eager_ptrs[1][peer_rank],
+            )
+        return _PlainGraphLaunchPlan(
+            transport=transport,
+            threads=threads,
+            blocks=blocks,
+            size_packs=inp.numel() * inp.element_size() // 16,
+            stage_input=state.eager_tables is not None,
+            device_index=cls._device_index(inp.device),
+            eager_buffer_bytes=state.eager_buffer_bytes,
+            transport_policy=state.transport_policy,
+            remote_push_region_packs=state.plain_remote_push_region_packs,
+            remote_push_slot_ptrs=slot_ptrs,
+        )
+
+    @classmethod
+    def _plain_graph_plan_key(
+        cls,
+        inp: torch.Tensor,
+    ) -> tuple[object, ...]:
+        """Return the tensor contract that identifies a prepared graph plan."""
+
+        return (
+            _dtype_name(inp.dtype),
+            tuple(inp.shape),
+            tuple(inp.stride()),
+            cls._device_index(inp.device),
+        )
 
     @staticmethod
     def _fused_threads() -> int:
@@ -1639,14 +1710,9 @@ class _CuTeOneshotBackend:
         stage_input = state.eager_tables is not None
         if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
             raise RuntimeError("input buffer is not registered")
-        transport, threads, _ = self._plain_launch_config(
-            state,
-            inp,
-            graph_channel=True,
-        )
+        plan = self._plain_graph_plan(state, inp)
         from ._oneshot_cute import get_oneshot_launcher
 
-        device_index = self._device_index(inp.device)
         variants = ((True, 0), (True, 1)) if stage_input else ((False, 0),)
         for device_slot_selection, slot_bias in variants:
             get_oneshot_launcher(
@@ -1656,10 +1722,11 @@ class _CuTeOneshotBackend:
                 stage_input,
                 device_slot_selection,
                 slot_bias,
-                transport,
-                threads,
-                device_index,
+                plan.transport,
+                plan.threads,
+                plan.device_index,
             )
+        state.plain_graph_plans[self._plain_graph_plan_key(inp)] = plan
 
     def prepare_fused_all_reduce(self, handle: int, inp: torch.Tensor) -> None:
         """Compile/load fused graph variants without launching a kernel."""
@@ -1723,20 +1790,34 @@ class _CuTeOneshotBackend:
         state = self._state(handle)
         capturing = _is_current_stream_capturing(inp.device)
         size_packs = inp.numel() * inp.element_size() // 16
-        graph_channel = state.device_slot_selection or (
-            capturing and state.eager_tables is not None
+        graph_channel = state.device_slot_selection or capturing
+        plan = (
+            state.plain_graph_plans.get(self._plain_graph_plan_key(inp))
+            if graph_channel
+            else None
         )
-        transport, threads, blocks = self._plain_launch_config(
-            state,
-            inp,
-            graph_channel=graph_channel,
-        )
-        graph_transport, graph_threads, _ = self._plain_launch_config(
-            state,
-            inp,
-            graph_channel=True,
-        )
-        device_index = self._device_index(inp.device)
+        if graph_channel and plan is None:
+            raise RuntimeError(
+                "plain PCIe oneshot graph shape is not prepared; call "
+                "prepare_graph_all_reduce() before capture"
+            )
+        if plan is None:
+            transport, threads, blocks = self._plain_launch_config(
+                state,
+                inp,
+                graph_channel=False,
+            )
+            device_index = self._device_index(inp.device)
+            plain_region_packs = 0
+            plain_slot_ptrs = (0, 0, 0, 0)
+        else:
+            transport = plan.transport
+            threads = plan.threads
+            blocks = plan.blocks
+            size_packs = plan.size_packs
+            device_index = plan.device_index
+            plain_region_packs = plan.remote_push_region_packs
+            plain_slot_ptrs = plan.remote_push_slot_ptrs
         prospective_device_selection = state.device_slot_selection or (
             capturing and state.eager_tables is not None
         )
@@ -1773,18 +1854,6 @@ class _CuTeOneshotBackend:
         table_address, stage_input = self._select_table(state, inp.data_ptr())
         from ._oneshot_cute import get_oneshot_launcher
 
-        plain_slot_ptrs = (0, 0, 0, 0)
-        if transport.startswith("tp2_remote_push"):
-            if state.eager_ptrs is None:
-                raise RuntimeError("TP2 peer-push requires eager staging pointers")
-            peer_rank = state.rank ^ 1
-            plain_slot_ptrs = (
-                state.eager_ptrs[0][state.rank],
-                state.eager_ptrs[0][peer_rank],
-                state.eager_ptrs[1][state.rank],
-                state.eager_ptrs[1][peer_rank],
-            )
-
         with torch.cuda.device(inp.device):
             launcher = get_oneshot_launcher(
                 _dtype_name(inp.dtype),
@@ -1797,28 +1866,13 @@ class _CuTeOneshotBackend:
                 threads,
                 device_index,
             )
-            if not state.device_slot_selection and stage_input:
-                # Warm the graph specialization outside capture so replay
-                # never triggers compiler work or allocation.
-                for slot_bias in (0, 1):
-                    get_oneshot_launcher(
-                        _dtype_name(inp.dtype),
-                        state.world_size,
-                        state.rank,
-                        stage_input,
-                        True,
-                        slot_bias,
-                        graph_transport,
-                        graph_threads,
-                        device_index,
-                    )
             launcher(
                 table_address,
                 state.signal_table_address,
                 inp.data_ptr(),
                 out.data_ptr(),
                 size_packs,
-                state.plain_remote_push_region_packs,
+                plain_region_packs,
                 *plain_slot_ptrs,
                 blocks,
             )

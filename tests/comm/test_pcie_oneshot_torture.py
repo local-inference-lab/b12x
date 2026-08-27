@@ -147,13 +147,13 @@ def _run_graph_scratch_reuse(
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
-    with (
-        pool.capture(stream, channel_id="graph:torture") as graph_channel,
-        torch.cuda.graph(graph, stream=stream),
-    ):
-        for layer in range(layers):
-            scratch.copy_(sources[layer])
-            graph_channel.all_reduce(scratch, out=outs[layer])
+    with pool.capture(stream, channel_id="graph:torture") as graph_channel:
+        with torch.cuda.stream(stream):
+            graph_channel.prepare_graph_all_reduce(scratch)
+        with torch.cuda.graph(graph, stream=stream):
+            for layer in range(layers):
+                scratch.copy_(sources[layer])
+                graph_channel.all_reduce(scratch, out=outs[layer])
     stream.synchronize()
 
     for iteration in range(TORTURE_GRAPH_REPLAYS):
@@ -166,9 +166,8 @@ def _run_graph_scratch_reuse(
             _assert_constant(out, world_size * base + rank_sum)
 
     if _tp2_plain_remote_push_active(world_size):
-        # Six rows exercise concurrent target and speculative verifier rows.
-        # The checks above cover repeated generation publication and alternating
-        # graph-slot reuse for that shape.
+        # The six-row input validates repeated generation publication and
+        # alternating graph-slot reuse across multiple collectives per replay.
         return
 
     # A graph with an odd number of collectives must swap which slot receives
