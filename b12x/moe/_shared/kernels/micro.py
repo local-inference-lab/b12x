@@ -924,6 +924,9 @@ class MoEMicroKernelBackend:
     def _resolve_route_expert(self, route_eid: Int32) -> Tuple[Int32, Int32]:
         """Return an in-range expert id and an integer active-route predicate."""
 
+        if cutlass.const_expr(self.single_token):
+            return route_eid, Int32(1)
+
         cfg = self._cfg
         eid = Int32(0)
         route_active = Int32(0)
