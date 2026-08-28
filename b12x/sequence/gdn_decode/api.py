@@ -15,6 +15,7 @@ from ._impl import (
     plan,
     run,
     run_kda,
+    run_kda_single_token,
 )
 
 
@@ -34,6 +35,7 @@ __all__ = [
     "bind_kda",
     "run",
     "run_kda",
+    "run_kda_single_token",
     "reference",
     "is_supported",
 ]

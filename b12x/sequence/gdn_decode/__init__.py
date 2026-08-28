@@ -57,6 +57,7 @@ META = OpMeta(
         "bind_kda",
         "run",
         "run_kda",
+        "run_kda_single_token",
         "reference",
         "is_supported",
     ),
@@ -96,6 +97,7 @@ if TYPE_CHECKING:
         reference,
         run,
         run_kda,
+        run_kda_single_token,
     )
 
 install_lazy_api(globals(), META)

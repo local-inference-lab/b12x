@@ -172,7 +172,6 @@ def test_reference_applies_per_key_lower_bounded_decay() -> None:
 
 
 def test_reference_keeps_kda_rmsnorm_in_fp32_until_final_store() -> None:
-    device = torch.device("cpu")
     core = torch.linspace(-1.3, 1.7, 128, dtype=torch.float32).to(torch.bfloat16)
     q = torch.zeros(128, dtype=torch.bfloat16)
     q[0] = 1
@@ -315,6 +314,7 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
         SIGMOID_GATE=True,
         NORM_WEIGHT_FP32=False,
         KDA_NORM_FP32=True,
+        TRUSTED_LIVE_TOKENS=False,
         num_warps=4,
         num_stages=1,
     )
@@ -354,6 +354,109 @@ def test_packed_kda_matches_reference(state_dtype: torch.dtype) -> None:
         atol=8e-3 if state_dtype == torch.bfloat16 else 2e-5,
     )
     assert torch.count_nonzero(actual[4:]) == 0
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_single_token_kda_matches_reference_with_strided_beta(
+    state_dtype: torch.dtype,
+) -> None:
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        query_lengths=(1, 1),
+        columns=1,
+        max_tokens=2,
+        state_dtype=state_dtype,
+    )
+    binding.num_accepted_tokens.fill_(1)
+    raw_beta_storage = _randn((2, 4), device=device)
+    raw_beta = raw_beta_storage[:, ::2]
+    assert raw_beta.shape == binding.raw_beta.shape
+    assert not raw_beta.is_contiguous()
+    state_reference = binding.recurrent_state.clone()
+    expected = gdn.reference.decode_kda(
+        binding.mixed_qkv,
+        binding.raw_g,
+        raw_beta,
+        binding.z,
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        state_reference,
+        binding.query_start_loc,
+        binding.num_accepted_tokens,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        heads=binding.plan.caps.value_heads,
+        qk_l2norm=binding.plan.caps.qk_l2norm,
+    )
+
+    actual = gdn.run_kda_single_token(
+        binding,
+        mixed_qkv=binding.mixed_qkv,
+        raw_g=binding.raw_g,
+        raw_beta=raw_beta,
+        z=binding.z,
+        state_indices=binding.state_indices,
+        output=binding.output,
+    )
+    torch.cuda.synchronize(device)
+
+    assert actual.data_ptr() == binding.output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state,
+        state_reference,
+        rtol=1e-2 if state_dtype == torch.bfloat16 else 1e-5,
+        atol=8e-3 if state_dtype == torch.bfloat16 else 2e-5,
+    )
+
+
+def test_single_token_kda_cuda_graph_replay_preserves_addresses() -> None:
+    device = require_sm120()
+    binding = _make_case(
+        device=device,
+        query_lengths=(1, 1),
+        columns=1,
+        max_tokens=2,
+    )
+    binding.num_accepted_tokens.fill_(1)
+
+    def launch() -> torch.Tensor:
+        return gdn.run_kda_single_token(
+            binding,
+            mixed_qkv=binding.mixed_qkv,
+            raw_g=binding.raw_g,
+            raw_beta=binding.raw_beta,
+            z=binding.z,
+            state_indices=binding.state_indices,
+            output=binding.output,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = launch()
+
+    binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
+    binding.raw_g.copy_(torch.randn_like(binding.raw_g).mul_(0.2))
+    binding.raw_beta.copy_(torch.randn_like(binding.raw_beta).mul_(0.2))
+    binding.z.copy_(torch.randn_like(binding.z).mul_(0.2))
+    state_reference = binding.recurrent_state.clone()
+    expected = _reference(binding, state_reference)
+    output_ptr = captured_output.data_ptr()
+    state_ptr = binding.recurrent_state.data_ptr()
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert captured_output.data_ptr() == output_ptr
+    assert binding.recurrent_state.data_ptr() == state_ptr
+    torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
 
 
 def test_glm53_tp8_head_geometry_matches_reference() -> None:

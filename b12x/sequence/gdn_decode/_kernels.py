@@ -179,6 +179,7 @@ def _packed_sequential_kda_decode_kernel(
     QK_L2NORM: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
+    TRUSTED_SINGLE_TOKEN: tl.constexpr,
 ):
     value_tile = tl.program_id(0)
     request_value_head = tl.program_id(1)
@@ -186,17 +187,22 @@ def _packed_sequential_kda_decode_kernel(
     value_head = request_value_head % VALUE_HEADS
     key_head = value_head
 
-    live_seqs = tl.load(num_seqs).to(tl.int32)
-    if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
-        tl.load(error_code).to(tl.int32) != 0
-    ):
-        return
+    if TRUSTED_SINGLE_TOKEN:
+        start = request
+        end = request + 1
+        accepted_column = 0
+    else:
+        live_seqs = tl.load(num_seqs).to(tl.int32)
+        if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
+            tl.load(error_code).to(tl.int32) != 0
+        ):
+            return
 
-    start = tl.load(query_start_loc + request).to(tl.int32)
-    end = tl.load(query_start_loc + request + 1).to(tl.int32)
-    if end <= start:
-        return
-    accepted_column = tl.load(num_accepted_tokens + request).to(tl.int32) - 1
+        start = tl.load(query_start_loc + request).to(tl.int32)
+        end = tl.load(query_start_loc + request + 1).to(tl.int32)
+        if end <= start:
+            return
+        accepted_column = tl.load(num_accepted_tokens + request).to(tl.int32) - 1
     source_idx = tl.load(
         state_indices
         + request.to(tl.int64) * stride_indices_request
@@ -335,6 +341,7 @@ def _gated_rmsnorm_kernel(
     SIGMOID_GATE: tl.constexpr,
     NORM_WEIGHT_FP32: tl.constexpr,
     KDA_NORM_FP32: tl.constexpr,
+    TRUSTED_LIVE_TOKENS: tl.constexpr,
 ):
     token_value_head = tl.program_id(0)
     token = token_value_head // VALUE_HEADS
@@ -347,14 +354,15 @@ def _gated_rmsnorm_kernel(
         + value_head.to(tl.int64) * stride_output_head
         + cols.to(tl.int64)
     )
-    error = tl.load(error_code).to(tl.int32)
-    if error != 0:
-        tl.store(output + output_offsets, float("nan"), mask=mask)
-        return
-    live_tokens = tl.load(num_tokens).to(tl.int32)
-    if token >= tl.maximum(0, tl.minimum(live_tokens, MAX_TOKENS)):
-        tl.store(output + output_offsets, 0.0, mask=mask)
-        return
+    if not TRUSTED_LIVE_TOKENS:
+        error = tl.load(error_code).to(tl.int32)
+        if error != 0:
+            tl.store(output + output_offsets, float("nan"), mask=mask)
+            return
+        live_tokens = tl.load(num_tokens).to(tl.int32)
+        if token >= tl.maximum(0, tl.minimum(live_tokens, MAX_TOKENS)):
+            tl.store(output + output_offsets, 0.0, mask=mask)
+            return
 
     z_offsets = (
         token_i64 * stride_z_token
@@ -622,6 +630,7 @@ def _launch_gdn_decode(
             QK_L2NORM=bool(qk_l2norm),
             HAS_NULL_STATE_INDEX=bool(has_null_state_index),
             NULL_STATE_INDEX=int(null_state_index),
+            TRUSTED_SINGLE_TOKEN=False,
             num_warps=int(recurrent_num_warps),
             num_stages=3,
         )
@@ -642,9 +651,196 @@ def _launch_gdn_decode(
         SIGMOID_GATE=bool(sigmoid_gate),
         NORM_WEIGHT_FP32=norm_weight.dtype == torch.float32,
         KDA_NORM_FP32=bool(lower_bounded_kda),
+        TRUSTED_LIVE_TOKENS=False,
         num_warps=int(norm_num_warps),
         num_stages=1,
     )
+
+
+def _launch_kda_single_token(
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    qk_l2norm: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
+    block_v: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    """Launch trusted ordinary KDA decode directly on caller-owned tensors."""
+
+    num_tokens = int(mixed_qkv.shape[0])
+    value_tiles = triton.cdiv(value_head_dim, block_v)
+    # The metadata pointers are compile-time dead in the trusted specialization.
+    # Reuse state_indices so the hot op has no staging tensors or scalar fills.
+    metadata_placeholder = state_indices
+    _packed_sequential_kda_decode_kernel[(value_tiles, num_tokens * value_heads)](
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        A_log,
+        dt_bias,
+        recurrent_state,
+        metadata_placeholder,
+        metadata_placeholder,
+        state_indices,
+        metadata_placeholder,
+        output,
+        metadata_placeholder,
+        float(scale),
+        float(lower_bound),
+        stride_mixed_token=int(mixed_qkv.stride(0)),
+        stride_a_token=int(raw_g.stride(0)),
+        stride_a_head=int(raw_g.stride(1)),
+        stride_b_token=int(raw_beta.stride(0)),
+        stride_b_head=int(raw_beta.stride(1)),
+        stride_dt_bias_head=int(dt_bias.stride(0)),
+        stride_state_slot=int(recurrent_state.stride(0)),
+        stride_state_head=int(recurrent_state.stride(1)),
+        stride_state_v=int(recurrent_state.stride(2)),
+        stride_indices_request=int(state_indices.stride(0)),
+        stride_indices_column=int(state_indices.stride(1)),
+        stride_output_token=int(output.stride(0)),
+        stride_output_head=int(output.stride(1)),
+        MAX_SEQS=num_tokens,
+        KEY_HEADS=int(key_heads),
+        VALUE_HEADS=int(value_heads),
+        KEY_HEAD_DIM=int(key_head_dim),
+        VALUE_HEAD_DIM=int(value_head_dim),
+        STATE_INDEX_COLUMNS=1,
+        BLOCK_V=int(block_v),
+        QK_L2NORM=bool(qk_l2norm),
+        HAS_NULL_STATE_INDEX=bool(has_null_state_index),
+        NULL_STATE_INDEX=int(null_state_index),
+        TRUSTED_SINGLE_TOKEN=True,
+        num_warps=int(recurrent_num_warps),
+        num_stages=3,
+    )
+    _gated_rmsnorm_kernel[(num_tokens * value_heads,)](
+        output,
+        z,
+        norm_weight,
+        metadata_placeholder,
+        metadata_placeholder,
+        float(eps),
+        stride_output_token=int(output.stride(0)),
+        stride_output_head=int(output.stride(1)),
+        stride_z_token=int(z.stride(0)),
+        stride_z_head=int(z.stride(1)),
+        MAX_TOKENS=num_tokens,
+        VALUE_HEADS=int(value_heads),
+        VALUE_HEAD_DIM=int(value_head_dim),
+        SIGMOID_GATE=True,
+        NORM_WEIGHT_FP32=norm_weight.dtype == torch.float32,
+        KDA_NORM_FP32=True,
+        TRUSTED_LIVE_TOKENS=True,
+        num_warps=int(norm_num_warps),
+        num_stages=1,
+    )
+
+
+@torch.library.custom_op(
+    "b12x::kda_decode_single_token",
+    mutates_args=("recurrent_state", "output"),
+)
+def _kda_decode_single_token_op(
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    qk_l2norm: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
+    block_v: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    _launch_kda_single_token(
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        recurrent_state,
+        state_indices,
+        output,
+        eps,
+        scale,
+        lower_bound,
+        key_heads,
+        value_heads,
+        key_head_dim,
+        value_head_dim,
+        qk_l2norm,
+        has_null_state_index,
+        null_state_index,
+        block_v,
+        recurrent_num_warps,
+        norm_num_warps,
+    )
+
+
+@_kda_decode_single_token_op.register_fake
+def _kda_decode_single_token_fake(
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    qk_l2norm: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
+    block_v: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    del mixed_qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight
+    del recurrent_state, state_indices, output, eps, scale, lower_bound
+    del key_heads, value_heads, key_head_dim, value_head_dim
+    del qk_l2norm, has_null_state_index, null_state_index, block_v
+    del recurrent_num_warps, norm_num_warps
 
 
 @torch.library.custom_op(
@@ -862,4 +1058,56 @@ def run_gdn_decode(
     )
 
 
-__all__ = ["run_gdn_decode"]
+def run_kda_single_token(
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    qk_l2norm: bool,
+    null_state_index: int | None,
+    block_v: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+) -> None:
+    torch.ops.b12x.kda_decode_single_token(
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        z,
+        A_log,
+        dt_bias,
+        norm_weight,
+        recurrent_state,
+        state_indices,
+        output,
+        float(eps),
+        float(scale),
+        float(lower_bound),
+        int(key_heads),
+        int(value_heads),
+        int(key_head_dim),
+        int(value_head_dim),
+        bool(qk_l2norm),
+        null_state_index is not None,
+        0 if null_state_index is None else int(null_state_index),
+        int(block_v),
+        int(recurrent_num_warps),
+        int(norm_num_warps),
+    )
+
+
+__all__ = ["run_gdn_decode", "run_kda_single_token"]

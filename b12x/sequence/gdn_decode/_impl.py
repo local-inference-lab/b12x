@@ -851,6 +851,126 @@ def run_kda(
     return binding.output
 
 
+def run_kda_single_token(
+    binding: KdaBinding,
+    *,
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    lower_bound: float = -5.0,
+    eps: float = 1e-6,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Run trusted ordinary KDA decode directly on caller-owned tensors.
+
+    Every input row is one live request and ``state_indices[:, 0]`` contains
+    unique, in-range scheduler-owned state slots. Callers that cannot provide
+    that contract must use :func:`run_kda`, which validates packed metadata on
+    the device before mutating recurrent state.
+    """
+    if not isinstance(binding, KdaBinding):
+        raise TypeError(f"binding must be KdaBinding, got {type(binding)!r}")
+    caps = binding.plan.caps
+    num_tokens = int(mixed_qkv.shape[0])
+    if num_tokens <= 0 or num_tokens > caps.max_tokens:
+        raise ValueError(
+            f"single-token KDA rows={num_tokens} exceed capacity {caps.max_tokens}"
+        )
+    model = (caps.model_dtype,)
+    _require_tensor(
+        "mixed_qkv",
+        mixed_qkv,
+        shape=(num_tokens, caps.packed_qkv_width),
+        device=caps.device,
+        dtypes=model,
+    )
+    _require_tensor(
+        "raw_g",
+        raw_g,
+        shape=(num_tokens, caps.value_heads, caps.key_head_dim),
+        device=caps.device,
+        dtypes=model,
+    )
+    if tuple(raw_beta.shape) != (num_tokens, caps.value_heads):
+        raise ValueError(
+            "raw_beta shape must be "
+            f"{(num_tokens, caps.value_heads)}, got {tuple(raw_beta.shape)}"
+        )
+    if raw_beta.device != caps.device or raw_beta.dtype not in model:
+        raise ValueError(
+            "raw_beta must match the planned model device/dtype, got "
+            f"{raw_beta.device}/{raw_beta.dtype}"
+        )
+    for name, tensor in (("z", z), ("output", output)):
+        _require_tensor(
+            name,
+            tensor,
+            shape=(num_tokens, caps.value_heads, caps.value_head_dim),
+            device=caps.device,
+            dtypes=model,
+        )
+    _require_tensor(
+        "state_indices",
+        state_indices,
+        shape=(num_tokens, 1),
+        device=caps.device,
+        dtypes=(torch.int32, torch.int64),
+    )
+    for name, tensor in (
+        ("mixed_qkv", mixed_qkv),
+        ("raw_g", raw_g),
+        ("raw_beta", raw_beta),
+        ("z", z),
+        ("state_indices", state_indices),
+    ):
+        if _overlaps(output, tensor):
+            raise ValueError(f"output must not overlap read-only tensor {name}")
+
+    lower_bound_value = float(lower_bound)
+    if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
+        raise ValueError(
+            "lower_bound must be finite and negative, got "
+            f"{lower_bound_value}"
+        )
+    eps_value = float(eps)
+    if not math.isfinite(eps_value) or eps_value <= 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps_value}")
+    scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
+    if not math.isfinite(scale_value) or scale_value <= 0.0:
+        raise ValueError(f"scale must be finite and positive, got {scale_value}")
+
+    from ._kernels import run_kda_single_token as launch_kda_single_token
+
+    launch_kda_single_token(
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        z,
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        binding.recurrent_state,
+        state_indices,
+        output,
+        eps=eps_value,
+        scale=scale_value,
+        lower_bound=lower_bound_value,
+        key_heads=caps.key_heads,
+        value_heads=caps.value_heads,
+        key_head_dim=caps.key_head_dim,
+        value_head_dim=caps.value_head_dim,
+        qk_l2norm=caps.qk_l2norm,
+        null_state_index=caps.null_state_index,
+        block_v=binding.plan.recurrent_block_v,
+        recurrent_num_warps=binding.plan.recurrent_num_warps,
+        norm_num_warps=binding.plan.norm_num_warps,
+    )
+    return output
+
+
 __all__ = [
     "Caps",
     "Plan",
@@ -861,4 +981,5 @@ __all__ = [
     "bind_kda",
     "run",
     "run_kda",
+    "run_kda_single_token",
 ]
