@@ -2168,6 +2168,38 @@ def select_tp_moe_backend(
     return "dynamic"
 
 
+def _nvfp4_glm53_m4_dynamic_candidate(
+    *,
+    num_tokens: int,
+    num_topk: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    activation: str,
+    quant_mode: str,
+) -> bool:
+    """Select the measured GLM-5.3 TP4 M4 dynamic tactic.
+
+    This is deliberately keyed on the complete static kernel geometry rather
+    than lowering the process-wide micro/dynamic cutover. The latter also
+    changes unrelated CUDA-graph buckets and model shapes. Actual-weight graph
+    replay on SM120 places this one crossover at M4: dynamic is about 20
+    percent faster than direct micro while preserving the same NVFP4 numeric
+    contract.
+    """
+
+    return bool(
+        _current_compute_capability() == (12, 0)
+        and _normalize_quant_mode(quant_mode) == "nvfp4"
+        and normalize_moe_activation(activation) == "silu"
+        and int(num_tokens) == 4
+        and int(num_topk) == 8
+        and int(weight_E) == 288
+        and int(k) == 4096
+        and int(n) == 512
+    )
+
+
 def _dynamic_task_geometry(
     E: int,
     n: int,
@@ -5844,6 +5876,16 @@ def _resolve_workspace_layout(
         num_topk=num_topk,
         quant_mode=quant_mode,
     )
+    if implementation == "micro" and _nvfp4_glm53_m4_dynamic_candidate(
+        num_tokens=num_tokens,
+        num_topk=num_topk,
+        weight_E=weight_E,
+        k=k,
+        n=n,
+        activation=activation,
+        quant_mode=quant_mode,
+    ):
+        implementation = "dynamic"
     if implementation == "micro" and not _band_runs_direct_micro(
         num_tokens=num_tokens,
         k=k,
