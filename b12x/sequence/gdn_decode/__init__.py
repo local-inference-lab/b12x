@@ -9,10 +9,11 @@ outside this package.
 ``bind`` / ``run`` implements scalar per-head Qwen GDN decay. ``bind_kda`` /
 ``run_kda`` implements GLM/Kimi lower-bounded KDA decay from a per-key-coordinate
 raw gate while preserving the same state, transaction, and serving lifecycle.
-Trusted serving runtimes may use ``bind_kda_metadata`` and ``run_kda_live``
-to consume live layer tensors without staging or device-side metadata
-validation. That interface requires the runtime to preserve packed-request
-geometry, unique active state ownership, and in-range state indices.
+KDA bindings accept live tensor capacities within the plan, so serving runtimes
+can bind projection, metadata, and output tensors directly without staging.
+``Caps.kda_metadata_validation="trusted"`` disables device-side validation when
+the runtime already guarantees packed-request geometry, unique active state
+ownership, and in-range state indices.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
@@ -57,17 +58,14 @@ META = OpMeta(
         "GdnConfig",
         "GdnQuery",
         "KdaBinding",
-        "KdaMetadataBinding",
         "Plan",
         "bind",
         "bind_kda",
-        "bind_kda_metadata",
         "is_supported",
         "plan",
         "reference",
         "run",
         "run_kda",
-        "run_kda_live",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("silu", "sigmoid", "lower_bounded_kda"),
@@ -99,17 +97,14 @@ if TYPE_CHECKING:
         GdnConfig,
         GdnQuery,
         KdaBinding,
-        KdaMetadataBinding,
         Plan,
         bind,
         bind_kda,
-        bind_kda_metadata,
         is_supported,
         plan,
         reference,
         run,
         run_kda,
-        run_kda_live,
     )
 
 install_lazy_api(globals(), META)

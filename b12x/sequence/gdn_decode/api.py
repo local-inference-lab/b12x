@@ -9,15 +9,12 @@ from ._impl import (
     Binding,
     Caps,
     KdaBinding,
-    KdaMetadataBinding,
     Plan,
     bind,
     bind_kda,
-    bind_kda_metadata,
     plan,
     run,
     run_kda,
-    run_kda_live,
 )
 from ._policy import GdnConfig, GdnQuery
 
@@ -34,15 +31,12 @@ __all__ = [
     "GdnConfig",
     "GdnQuery",
     "KdaBinding",
-    "KdaMetadataBinding",
     "Plan",
     "bind",
     "bind_kda",
-    "bind_kda_metadata",
     "is_supported",
     "plan",
     "reference",
     "run",
     "run_kda",
-    "run_kda_live",
 ]

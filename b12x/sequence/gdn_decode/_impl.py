@@ -25,6 +25,7 @@ from ._policy import GDN_POLICY, GdnQuery
 
 
 GateActivation = Literal["silu", "sigmoid"]
+KdaMetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -63,6 +64,7 @@ class Caps:
     gate_activation: GateActivation = "silu"
     qk_l2norm: bool = True
     null_state_index: int | None = None
+    kda_metadata_validation: KdaMetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -106,6 +108,11 @@ class Caps:
             raise ValueError(
                 "gate_activation must be 'silu' or 'sigmoid', got "
                 f"{self.gate_activation!r}"
+            )
+        if self.kda_metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "kda_metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.kda_metadata_validation!r}"
             )
         null_state_index = self.null_state_index
         if null_state_index is not None:
@@ -197,7 +204,7 @@ class Binding:
 
 @dataclass(frozen=True)
 class KdaBinding:
-    """Caller-owned inputs for lower-bounded KDA decode.
+    """Complete caller-owned invocation for lower-bounded KDA decode.
 
     ``raw_g`` is the unactivated per-key-coordinate forget gate and
     ``raw_beta`` is the unactivated scalar update gate for each head.
@@ -221,27 +228,6 @@ class KdaBinding:
     num_seqs: torch.Tensor
     num_tokens: torch.Tensor
     output: torch.Tensor
-
-
-@dataclass(frozen=True)
-class KdaMetadataBinding:
-    """Statically checked packed KDA metadata owned by a trusted runtime.
-
-    Tensor layouts and capacities are checked when this object is created.
-    Runtime values are not checked on the device; callers must preserve the
-    packed-request and recurrent-state ownership contract documented by this
-    package.
-    """
-
-    plan: Plan
-    query_start_loc: torch.Tensor
-    num_accepted_tokens: torch.Tensor
-    state_indices: torch.Tensor
-    num_seqs: torch.Tensor
-    num_tokens: torch.Tensor
-    max_tokens: int
-    max_seqs: int
-    state_index_columns: int
 
 
 def _materialize_plan(
@@ -342,6 +328,40 @@ def _require_paged_recurrent_state(
         raise ValueError(
             "recurrent_state slots must not overlap; expected outer stride at "
             f"least {slot_elements}, got {tensor.stride(0)}"
+        )
+
+
+def _require_row_contiguous(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    device: torch.device,
+    dtypes: tuple[torch.dtype, ...],
+) -> None:
+    _require_tensor(
+        name,
+        tensor,
+        shape=shape,
+        device=device,
+        dtypes=dtypes,
+        contiguous=False,
+    )
+    expected_inner_strides = []
+    stride = 1
+    for size in reversed(shape[1:]):
+        expected_inner_strides.append(stride)
+        stride *= size
+    expected_inner = tuple(reversed(expected_inner_strides))
+    if tuple(tensor.stride()[1:]) != expected_inner:
+        raise ValueError(
+            f"{name} must be contiguous within each token row; expected inner "
+            f"strides {expected_inner}, got {tuple(tensor.stride()[1:])}"
+        )
+    if tensor.stride(0) < stride:
+        raise ValueError(
+            f"{name} token rows must not overlap; expected outer stride at "
+            f"least {stride}, got {tensor.stride(0)}"
         )
 
 
@@ -573,10 +593,10 @@ def bind_kda(
 ) -> KdaBinding:
     """Bind lower-bounded KDA tensors to a GDN decode plan.
 
-    KDA uses one Q/K/V head per recurrent state head. ``raw_g`` has shape
-    ``[max_tokens, heads, key_head_dim]`` and ``raw_beta`` has shape
-    ``[max_tokens, heads]``. The recurrent-state and packed-request contracts
-    are identical to :func:`bind`.
+    KDA uses one Q/K/V head per recurrent state head. Projection, metadata,
+    and output tensors may use any positive leading capacity within the plan.
+    All live tensors for one invocation must be bound together before
+    :func:`run_kda`; binding neither copies nor stages their contents.
     """
     if not isinstance(plan, Plan):
         raise TypeError(f"plan must be Plan, got {type(plan)!r}")
@@ -607,31 +627,68 @@ def bind_kda(
     )
     model = (caps.model_dtype,)
     parameter = (torch.bfloat16, torch.float32)
-    _require_tensor(
+    if mixed_qkv.ndim != 2:
+        raise ValueError(
+            f"mixed_qkv must have two dimensions, got shape {tuple(mixed_qkv.shape)}"
+        )
+    token_capacity = _positive("mixed_qkv token capacity", mixed_qkv.shape[0])
+    if token_capacity > caps.max_tokens:
+        raise ValueError(
+            f"mixed_qkv token capacity {token_capacity} exceeds planned "
+            f"capacity {caps.max_tokens}"
+        )
+    if state_indices.ndim != 2:
+        raise ValueError(
+            "state_indices must have two dimensions, got "
+            f"shape {tuple(state_indices.shape)}"
+        )
+    sequence_capacity = _positive(
+        "state_indices sequence capacity", state_indices.shape[0]
+    )
+    state_index_columns = _positive(
+        "state_indices column capacity", state_indices.shape[1]
+    )
+    if sequence_capacity > caps.max_seqs:
+        raise ValueError(
+            f"state_indices sequence capacity {sequence_capacity} exceeds "
+            f"planned capacity {caps.max_seqs}"
+        )
+    if state_index_columns > caps.state_index_columns:
+        raise ValueError(
+            f"state_indices column capacity {state_index_columns} exceeds "
+            f"planned capacity {caps.state_index_columns}"
+        )
+    if token_capacity > sequence_capacity * state_index_columns:
+        raise ValueError(
+            "token capacity must fit the bound packed metadata geometry, got "
+            f"{token_capacity} > {sequence_capacity} * {state_index_columns}"
+        )
+    _require_row_contiguous(
         "mixed_qkv",
         mixed_qkv,
-        shape=(caps.max_tokens, caps.packed_qkv_width),
+        shape=(token_capacity, caps.packed_qkv_width),
         device=caps.device,
         dtypes=model,
     )
-    _require_tensor(
+    _require_row_contiguous(
         "raw_g",
         raw_g,
-        shape=(caps.max_tokens, caps.value_heads, caps.key_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.key_head_dim),
         device=caps.device,
         dtypes=model,
     )
     _require_tensor(
         "raw_beta",
         raw_beta,
-        shape=(caps.max_tokens, caps.value_heads),
+        shape=(token_capacity, caps.value_heads),
         device=caps.device,
         dtypes=model,
+        contiguous=False,
     )
-    _require_tensor(
+    _require_row_contiguous(
         "z",
         z,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -670,23 +727,24 @@ def bind_kda(
     _require_tensor(
         "query_start_loc",
         query_start_loc,
-        shape=(caps.max_seqs + 1,),
+        shape=(sequence_capacity + 1,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "num_accepted_tokens",
         num_accepted_tokens,
-        shape=(caps.max_seqs,),
+        shape=(sequence_capacity,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "state_indices",
         state_indices,
-        shape=(caps.max_seqs, caps.state_index_columns),
+        shape=(sequence_capacity, state_index_columns),
         device=caps.device,
         dtypes=(torch.int32, torch.int64),
+        contiguous=False,
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         _require_tensor(
@@ -696,10 +754,10 @@ def bind_kda(
             device=caps.device,
             dtypes=(torch.int32,),
         )
-    _require_tensor(
+    _require_row_contiguous(
         "output",
         output,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(token_capacity, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -753,96 +811,6 @@ def bind_kda(
         num_seqs=num_seqs,
         num_tokens=num_tokens,
         output=output,
-    )
-
-
-def bind_kda_metadata(
-    plan: Plan,
-    *,
-    query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    state_indices: torch.Tensor,
-    num_seqs: torch.Tensor,
-    num_tokens: torch.Tensor,
-    max_tokens: int,
-    max_seqs: int,
-) -> KdaMetadataBinding:
-    """Bind trusted runtime metadata after checking its static tensor contract.
-
-    This function checks capacity, shape, dtype, device, and layout. It does
-    not inspect device-resident values. The caller must ensure that packed
-    ranges, accepted-token columns, and state slots satisfy the operation
-    contract for every launch.
-    """
-    if not isinstance(plan, Plan):
-        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
-    caps = plan.caps
-    live_tokens = _positive("max_tokens", max_tokens)
-    live_seqs = _positive("max_seqs", max_seqs)
-    if live_tokens > caps.max_tokens:
-        raise ValueError(
-            f"max_tokens={live_tokens} exceeds planned capacity {caps.max_tokens}"
-        )
-    if live_seqs > caps.max_seqs:
-        raise ValueError(
-            f"max_seqs={live_seqs} exceeds planned capacity {caps.max_seqs}"
-        )
-    if state_indices.ndim != 2:
-        raise ValueError(
-            "state_indices must have two dimensions, got "
-            f"shape {tuple(state_indices.shape)}"
-        )
-    live_columns = int(state_indices.shape[1])
-    if live_columns < 1 or live_columns > caps.state_index_columns:
-        raise ValueError(
-            "state-index columns must be within planned capacity, got "
-            f"{live_columns}/{caps.state_index_columns}"
-        )
-    if live_tokens > live_seqs * live_columns:
-        raise ValueError(
-            "max_tokens must fit the packed metadata geometry, got "
-            f"{live_tokens} > {live_seqs} * {live_columns}"
-        )
-
-    _require_tensor(
-        "query_start_loc",
-        query_start_loc,
-        shape=(live_seqs + 1,),
-        device=caps.device,
-        dtypes=(torch.int32,),
-    )
-    _require_tensor(
-        "num_accepted_tokens",
-        num_accepted_tokens,
-        shape=(live_seqs,),
-        device=caps.device,
-        dtypes=(torch.int32,),
-    )
-    _require_tensor(
-        "state_indices",
-        state_indices,
-        shape=(live_seqs, live_columns),
-        device=caps.device,
-        dtypes=(torch.int32, torch.int64),
-    )
-    for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
-        _require_tensor(
-            name,
-            tensor,
-            shape=(1,),
-            device=caps.device,
-            dtypes=(torch.int32,),
-        )
-    return KdaMetadataBinding(
-        plan=plan,
-        query_start_loc=query_start_loc,
-        num_accepted_tokens=num_accepted_tokens,
-        state_indices=state_indices,
-        num_seqs=num_seqs,
-        num_tokens=num_tokens,
-        max_tokens=live_tokens,
-        max_seqs=live_seqs,
-        state_index_columns=live_columns,
     )
 
 
@@ -915,6 +883,7 @@ def run(
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
         norm_num_warps=binding.plan.norm_num_warps,
+        validate_metadata=True,
     )
     return binding.output
 
@@ -979,100 +948,19 @@ def run_kda(
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
         norm_num_warps=binding.plan.norm_num_warps,
+        validate_metadata=caps.kda_metadata_validation == "transactional",
     )
     return binding.output
-
-
-def run_kda_live(
-    binding: KdaBinding,
-    metadata: KdaMetadataBinding,
-    *,
-    mixed_qkv: torch.Tensor,
-    raw_g: torch.Tensor,
-    raw_beta: torch.Tensor,
-    z: torch.Tensor,
-    output: torch.Tensor,
-    lower_bound: float = -5.0,
-    eps: float = 1e-6,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """Run KDA on live tensors with trusted, statically bound metadata.
-
-    This entry point performs no device-side metadata validation and does not
-    stage the live projection or output tensors. The caller must pass tensors
-    matching ``binding`` and metadata admitted by :func:`bind_kda_metadata`.
-    Use :func:`run_kda` when device-side transactional validation is required.
-    """
-    if not isinstance(binding, KdaBinding):
-        raise TypeError(f"binding must be KdaBinding, got {type(binding)!r}")
-    if not isinstance(metadata, KdaMetadataBinding):
-        raise TypeError(f"metadata must be KdaMetadataBinding, got {type(metadata)!r}")
-    lower_bound_value = float(lower_bound)
-    if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
-        raise ValueError(
-            f"lower_bound must be finite and negative, got {lower_bound_value}"
-        )
-    eps_value = float(eps)
-    if not math.isfinite(eps_value) or eps_value <= 0.0:
-        raise ValueError(f"eps must be finite and positive, got {eps_value}")
-    caps = binding.plan.caps
-    scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
-    if not math.isfinite(scale_value) or scale_value <= 0.0:
-        raise ValueError(f"scale must be finite and positive, got {scale_value}")
-    from ._kernels import run_gdn_decode
-
-    run_gdn_decode(
-        mixed_qkv,
-        raw_g,
-        raw_beta,
-        z,
-        binding.A_log,
-        binding.dt_bias,
-        binding.norm_weight,
-        binding.recurrent_state,
-        metadata.query_start_loc,
-        metadata.num_accepted_tokens,
-        metadata.state_indices,
-        metadata.num_seqs,
-        metadata.num_tokens,
-        output,
-        binding.duplicate_slots,
-        binding.error_code,
-        eps=eps_value,
-        scale=scale_value,
-        max_tokens=metadata.max_tokens,
-        max_seqs=metadata.max_seqs,
-        state_index_columns=metadata.state_index_columns,
-        max_state_slots=caps.max_state_slots,
-        key_heads=caps.key_heads,
-        value_heads=caps.value_heads,
-        key_head_dim=caps.key_head_dim,
-        value_head_dim=caps.value_head_dim,
-        gate_activation="sigmoid",
-        decay_recipe="kda",
-        lower_bound=lower_bound_value,
-        qk_l2norm=caps.qk_l2norm,
-        null_state_index=caps.null_state_index,
-        block_v=binding.plan.recurrent_block_v,
-        duplicate_table_size=binding.plan.duplicate_table_size,
-        recurrent_num_warps=binding.plan.recurrent_num_warps,
-        norm_num_warps=binding.plan.norm_num_warps,
-        validate_metadata=False,
-    )
-    return output
 
 
 __all__ = [
     "Binding",
     "Caps",
     "KdaBinding",
-    "KdaMetadataBinding",
     "Plan",
     "bind",
     "bind_kda",
-    "bind_kda_metadata",
     "plan",
     "run",
     "run_kda",
-    "run_kda_live",
 ]
