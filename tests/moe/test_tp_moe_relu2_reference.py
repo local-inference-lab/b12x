@@ -324,6 +324,58 @@ def test_single_token_multi_expert_situ_avoids_micro_and_matches_reference() -> 
     assert metrics.cos > 0.9999, f"situ: {metrics}"
 
 
+def test_glm53_m4_nvfp4_uses_measured_dynamic_crossover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tp_moe, "_current_compute_capability", lambda: (12, 0))
+
+    implementation, _, _ = tp_moe._resolve_workspace_layout(
+        num_tokens=4,
+        weight_E=288,
+        num_topk=8,
+        k=4096,
+        n=512,
+        activation="silu",
+        quant_mode="nvfp4",
+    )
+
+    assert implementation == "dynamic"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_tokens", 3),
+        ("weight_E", 256),
+        ("num_topk", 6),
+        ("k", 3072),
+        ("n", 640),
+        ("activation", "relu2"),
+        ("quant_mode", "w4a8_nvfp4"),
+    ],
+)
+def test_glm53_m4_nvfp4_crossover_rejects_nearby_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: int | str,
+) -> None:
+    monkeypatch.setattr(tp_moe, "_current_compute_capability", lambda: (12, 0))
+    kwargs: dict[str, int | str] = {
+        "num_tokens": 4,
+        "weight_E": 288,
+        "num_topk": 8,
+        "k": 4096,
+        "n": 512,
+        "activation": "silu",
+        "quant_mode": "nvfp4",
+    }
+    kwargs[field] = value
+
+    implementation, _, _ = tp_moe._resolve_workspace_layout(**kwargs)
+
+    assert implementation == "micro"
+
+
 @pytest.mark.parametrize("m", [1, 2, 4])
 def test_silu_tiny_dynamic_direct_matches_reference(m: int) -> None:
     output, reference = _run_activation_case(
