@@ -356,6 +356,104 @@ def test_packed_kda_matches_reference(state_dtype: torch.dtype) -> None:
     assert torch.count_nonzero(actual[4:]) == 0
 
 
+def test_prevalidated_kda_runs_directly_on_live_tensor_views() -> None:
+    device = require_sm120()
+    binding = _make_case(device=device)
+    live_tokens = int(binding.num_tokens.item())
+    metadata_binding = gdn.bind_kda_metadata(
+        binding.plan,
+        scratch=binding.scratch,
+        query_start_loc=binding.query_start_loc,
+        num_accepted_tokens=binding.num_accepted_tokens,
+        state_indices=binding.state_indices,
+        num_seqs=binding.num_seqs,
+        num_tokens=binding.num_tokens,
+        max_tokens=live_tokens,
+        max_seqs=binding.plan.caps.max_seqs,
+    )
+    validated = gdn.validate_kda_metadata(metadata_binding)
+    state_reference = binding.recurrent_state.clone()
+    beta_storage = torch.empty(
+        (live_tokens, binding.plan.caps.value_heads + 3),
+        dtype=binding.raw_beta.dtype,
+        device=device,
+    )
+    raw_beta = beta_storage[:, : binding.plan.caps.value_heads]
+    raw_beta.copy_(binding.raw_beta[:live_tokens])
+    assert not raw_beta.is_contiguous()
+    expected = gdn.reference.decode_kda(
+        binding.mixed_qkv[:live_tokens],
+        binding.raw_g[:live_tokens],
+        raw_beta,
+        binding.z[:live_tokens],
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        state_reference,
+        binding.query_start_loc,
+        binding.num_accepted_tokens,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        heads=binding.plan.caps.value_heads,
+    )
+    output = torch.empty_like(binding.output[:live_tokens])
+
+    actual = gdn.run_kda_prevalidated(
+        binding,
+        validated,
+        mixed_qkv=binding.mixed_qkv[:live_tokens],
+        raw_g=binding.raw_g[:live_tokens],
+        raw_beta=raw_beta,
+        z=binding.z[:live_tokens],
+        output=output,
+    )
+    torch.cuda.synchronize(device)
+
+    assert actual.data_ptr() == output.data_ptr()
+    assert actual.data_ptr() != binding.output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_prevalidated_kda_preserves_transactional_failure() -> None:
+    device = require_sm120()
+    binding = _make_case(device=device)
+    binding.state_indices[0, :3].fill_(1)
+    live_tokens = int(binding.num_tokens.item())
+    metadata_binding = gdn.bind_kda_metadata(
+        binding.plan,
+        scratch=binding.scratch,
+        query_start_loc=binding.query_start_loc,
+        num_accepted_tokens=binding.num_accepted_tokens,
+        state_indices=binding.state_indices,
+        num_seqs=binding.num_seqs,
+        num_tokens=binding.num_tokens,
+        max_tokens=live_tokens,
+        max_seqs=binding.plan.caps.max_seqs,
+    )
+    validated = gdn.validate_kda_metadata(metadata_binding)
+    before = binding.recurrent_state.clone()
+    output = torch.empty_like(binding.output[:live_tokens])
+
+    actual = gdn.run_kda_prevalidated(
+        binding,
+        validated,
+        mixed_qkv=binding.mixed_qkv[:live_tokens],
+        raw_g=binding.raw_g[:live_tokens],
+        raw_beta=binding.raw_beta[:live_tokens],
+        z=binding.z[:live_tokens],
+        output=output,
+    )
+    torch.cuda.synchronize(device)
+
+    assert metadata_binding.error_code.item() & 1
+    assert torch.isnan(actual).all()
+    torch.testing.assert_close(binding.recurrent_state, before, rtol=0, atol=0)
+
+
 def test_glm53_tp8_head_geometry_matches_reference() -> None:
     device = require_sm120()
     binding = _make_case(device=device, heads=8)

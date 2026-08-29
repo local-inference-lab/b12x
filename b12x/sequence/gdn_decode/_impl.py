@@ -223,6 +223,35 @@ class KdaBinding:
     output: torch.Tensor
 
 
+@dataclass(frozen=True)
+class KdaMetadataBinding:
+    """Packed KDA metadata and validation scratch for one live batch shape."""
+
+    plan: Plan
+    scratch: torch.Tensor
+    duplicate_slots: torch.Tensor
+    error_code: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+    state_indices: torch.Tensor
+    num_seqs: torch.Tensor
+    num_tokens: torch.Tensor
+    max_tokens: int
+    max_seqs: int
+
+
+@dataclass(frozen=True)
+class ValidatedKdaMetadata:
+    """Device-validated KDA metadata reusable by compatible layer launches.
+
+    Validation and consumer launches must remain ordered on the same CUDA
+    stream. The device error word is read by every consumer, so malformed
+    metadata still prevents recurrent-state mutation and poisons output.
+    """
+
+    binding: KdaMetadataBinding
+
+
 def _materialize_plan(
     caps: Caps,
     *,
@@ -735,6 +764,316 @@ def bind_kda(
     )
 
 
+def bind_kda_metadata(
+    plan: Plan,
+    *,
+    scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    max_tokens: int,
+    max_seqs: int,
+) -> KdaMetadataBinding:
+    """Bind one live packed metadata shape to reusable validation scratch.
+
+    The live token and sequence capacities may be smaller than ``plan.caps``.
+    This lets CUDA graphs validate their exact capture shape without requiring
+    projection tensors to be copied into server-wide capacity buffers.
+    """
+    if not isinstance(plan, Plan):
+        raise TypeError(f"plan must be Plan, got {type(plan)!r}")
+    caps = plan.caps
+    live_tokens = _positive("max_tokens", max_tokens)
+    live_seqs = _positive("max_seqs", max_seqs)
+    if live_tokens > caps.max_tokens:
+        raise ValueError(
+            f"max_tokens={live_tokens} exceeds planned capacity {caps.max_tokens}"
+        )
+    if live_seqs > caps.max_seqs:
+        raise ValueError(
+            f"max_seqs={live_seqs} exceeds planned capacity {caps.max_seqs}"
+        )
+    if live_tokens > live_seqs * caps.state_index_columns:
+        raise ValueError(
+            "max_tokens must fit the live packed metadata geometry, got "
+            f"{live_tokens} > {live_seqs} * {caps.state_index_columns}"
+        )
+
+    scratch_storage = scratch_tensor(
+        scratch, plan.scratch_specs(), owner="KDA metadata validation"
+    )
+    error_code, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=plan.error_code_offset_bytes,
+        shape=(1,),
+        dtype=torch.int32,
+    )
+    duplicate_slots, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=plan.duplicate_table_offset_bytes,
+        shape=(plan.duplicate_table_size,),
+        dtype=torch.int64,
+    )
+    _require_tensor(
+        "query_start_loc",
+        query_start_loc,
+        shape=(live_seqs + 1,),
+        device=caps.device,
+        dtypes=(torch.int32,),
+    )
+    _require_tensor(
+        "num_accepted_tokens",
+        num_accepted_tokens,
+        shape=(live_seqs,),
+        device=caps.device,
+        dtypes=(torch.int32,),
+    )
+    _require_tensor(
+        "state_indices",
+        state_indices,
+        shape=(live_seqs, caps.state_index_columns),
+        device=caps.device,
+        dtypes=(torch.int32, torch.int64),
+    )
+    for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
+        _require_tensor(
+            name,
+            tensor,
+            shape=(1,),
+            device=caps.device,
+            dtypes=(torch.int32,),
+        )
+    for name, tensor in (
+        ("query_start_loc", query_start_loc),
+        ("num_accepted_tokens", num_accepted_tokens),
+        ("state_indices", state_indices),
+        ("num_seqs", num_seqs),
+        ("num_tokens", num_tokens),
+    ):
+        if _overlaps(scratch_storage, tensor):
+            raise ValueError(
+                f"validation scratch must not overlap metadata tensor {name}"
+            )
+    return KdaMetadataBinding(
+        plan=plan,
+        scratch=scratch_storage,
+        duplicate_slots=duplicate_slots,
+        error_code=error_code,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        state_indices=state_indices,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        max_tokens=live_tokens,
+        max_seqs=live_seqs,
+    )
+
+
+def validate_kda_metadata(binding: KdaMetadataBinding) -> ValidatedKdaMetadata:
+    """Validate packed KDA metadata once for compatible layer consumers."""
+    if not isinstance(binding, KdaMetadataBinding):
+        raise TypeError(f"binding must be KdaMetadataBinding, got {type(binding)!r}")
+    caps = binding.plan.caps
+    from ._kernels import validate_gdn_metadata
+
+    validate_gdn_metadata(
+        binding.query_start_loc,
+        binding.num_accepted_tokens,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        binding.duplicate_slots,
+        binding.error_code,
+        max_tokens=binding.max_tokens,
+        max_seqs=binding.max_seqs,
+        max_state_slots=caps.max_state_slots,
+        state_index_columns=caps.state_index_columns,
+        duplicate_table_size=binding.plan.duplicate_table_size,
+        null_state_index=caps.null_state_index,
+    )
+    return ValidatedKdaMetadata(binding=binding)
+
+
+def run_kda_prevalidated(
+    binding: KdaBinding,
+    metadata: ValidatedKdaMetadata,
+    *,
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    z: torch.Tensor,
+    output: torch.Tensor,
+    lower_bound: float = -5.0,
+    eps: float = 1e-6,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Run KDA directly on live tensors after one shared metadata validation."""
+    if not isinstance(binding, KdaBinding):
+        raise TypeError(f"binding must be KdaBinding, got {type(binding)!r}")
+    if not isinstance(metadata, ValidatedKdaMetadata):
+        raise TypeError(
+            f"metadata must be ValidatedKdaMetadata, got {type(metadata)!r}"
+        )
+    metadata_binding = metadata.binding
+    caps = binding.plan.caps
+    metadata_caps = metadata_binding.plan.caps
+    compatibility_fields = (
+        "device",
+        "max_state_slots",
+        "key_heads",
+        "value_heads",
+        "key_head_dim",
+        "value_head_dim",
+        "state_index_columns",
+        "state_dtype",
+        "null_state_index",
+    )
+    incompatible = [
+        name
+        for name in compatibility_fields
+        if getattr(caps, name) != getattr(metadata_caps, name)
+    ]
+    if incompatible:
+        raise ValueError(
+            "validated KDA metadata is incompatible with the layer plan: "
+            + ", ".join(incompatible)
+        )
+
+    live_tokens = metadata_binding.max_tokens
+    model = (caps.model_dtype,)
+    _require_tensor(
+        "mixed_qkv",
+        mixed_qkv,
+        shape=(live_tokens, caps.packed_qkv_width),
+        device=caps.device,
+        dtypes=model,
+        contiguous=False,
+    )
+    _require_tensor(
+        "raw_g",
+        raw_g,
+        shape=(live_tokens, caps.value_heads, caps.key_head_dim),
+        device=caps.device,
+        dtypes=model,
+        contiguous=False,
+    )
+    _require_tensor(
+        "raw_beta",
+        raw_beta,
+        shape=(live_tokens, caps.value_heads),
+        device=caps.device,
+        dtypes=model,
+        contiguous=False,
+    )
+    for name, tensor in (("z", z), ("output", output)):
+        _require_tensor(
+            name,
+            tensor,
+            shape=(live_tokens, caps.value_heads, caps.value_head_dim),
+            device=caps.device,
+            dtypes=model,
+            contiguous=False,
+        )
+    for name, tensor in (
+        ("mixed_qkv", mixed_qkv),
+        ("raw_g", raw_g),
+        ("z", z),
+        ("output", output),
+    ):
+        if tensor.stride(-1) != 1:
+            raise ValueError(
+                f"{name} must be contiguous in its vector dimension; "
+                f"got strides {tuple(tensor.stride())}"
+            )
+
+    mutable = (
+        ("recurrent_state", binding.recurrent_state),
+        ("output", output),
+    )
+    read_only = (
+        ("mixed_qkv", mixed_qkv),
+        ("raw_g", raw_g),
+        ("raw_beta", raw_beta),
+        ("z", z),
+        ("A_log", binding.A_log),
+        ("dt_bias", binding.dt_bias),
+        ("norm_weight", binding.norm_weight),
+        ("query_start_loc", metadata_binding.query_start_loc),
+        ("num_accepted_tokens", metadata_binding.num_accepted_tokens),
+        ("state_indices", metadata_binding.state_indices),
+        ("num_seqs", metadata_binding.num_seqs),
+        ("num_tokens", metadata_binding.num_tokens),
+        ("validation_scratch", metadata_binding.scratch),
+    )
+    for index, (left_name, left) in enumerate(mutable):
+        for right_name, right in mutable[index + 1 :]:
+            if _overlaps(left, right):
+                raise ValueError(
+                    f"mutable buffers {left_name} and {right_name} must not overlap"
+                )
+        for right_name, right in read_only:
+            if _overlaps(left, right):
+                raise ValueError(
+                    f"mutable buffer {left_name} must not overlap read-only "
+                    f"tensor {right_name}"
+                )
+
+    lower_bound_value = float(lower_bound)
+    if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
+        raise ValueError(
+            f"lower_bound must be finite and negative, got {lower_bound_value}"
+        )
+    eps_value = float(eps)
+    if not math.isfinite(eps_value) or eps_value <= 0.0:
+        raise ValueError(f"eps must be finite and positive, got {eps_value}")
+    scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
+    if not math.isfinite(scale_value) or scale_value <= 0.0:
+        raise ValueError(f"scale must be finite and positive, got {scale_value}")
+    from ._kernels import run_gdn_decode
+
+    run_gdn_decode(
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        z,
+        binding.A_log,
+        binding.dt_bias,
+        binding.norm_weight,
+        binding.recurrent_state,
+        metadata_binding.query_start_loc,
+        metadata_binding.num_accepted_tokens,
+        metadata_binding.state_indices,
+        metadata_binding.num_seqs,
+        metadata_binding.num_tokens,
+        output,
+        metadata_binding.duplicate_slots,
+        metadata_binding.error_code,
+        eps=eps_value,
+        scale=scale_value,
+        max_tokens=metadata_binding.max_tokens,
+        max_seqs=metadata_binding.max_seqs,
+        state_index_columns=caps.state_index_columns,
+        max_state_slots=caps.max_state_slots,
+        key_heads=caps.key_heads,
+        value_heads=caps.value_heads,
+        key_head_dim=caps.key_head_dim,
+        value_head_dim=caps.value_head_dim,
+        gate_activation="sigmoid",
+        decay_recipe="kda",
+        lower_bound=lower_bound_value,
+        qk_l2norm=caps.qk_l2norm,
+        null_state_index=caps.null_state_index,
+        block_v=binding.plan.recurrent_block_v,
+        duplicate_table_size=metadata_binding.plan.duplicate_table_size,
+        recurrent_num_warps=binding.plan.recurrent_num_warps,
+        norm_num_warps=binding.plan.norm_num_warps,
+        validate_metadata=False,
+    )
+    return output
+
+
 def run(
     binding: Binding,
     *,
@@ -821,8 +1160,7 @@ def run_kda(
     lower_bound_value = float(lower_bound)
     if not math.isfinite(lower_bound_value) or lower_bound_value >= 0.0:
         raise ValueError(
-            "lower_bound must be finite and negative, got "
-            f"{lower_bound_value}"
+            f"lower_bound must be finite and negative, got {lower_bound_value}"
         )
     eps_value = float(eps)
     if not math.isfinite(eps_value) or eps_value <= 0.0:
@@ -878,9 +1216,14 @@ __all__ = [
     "Plan",
     "Binding",
     "KdaBinding",
+    "KdaMetadataBinding",
+    "ValidatedKdaMetadata",
     "plan",
     "bind",
     "bind_kda",
+    "bind_kda_metadata",
     "run",
     "run_kda",
+    "run_kda_prevalidated",
+    "validate_kda_metadata",
 ]

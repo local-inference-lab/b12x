@@ -259,9 +259,7 @@ def _packed_sequential_kda_decode_kernel(
             q *= scale
 
             b_value = tl.load(
-                b
-                + token_i64 * stride_b_token
-                + value_head.to(tl.int64) * stride_b_head
+                b + token_i64 * stride_b_token + value_head.to(tl.int64) * stride_b_head
             ).to(tl.float32)
             A_log_value = tl.load(A_log + value_head).to(tl.float32)
             raw_gate = tl.load(
@@ -456,56 +454,24 @@ def _make_qwen_binding(
     )
 
 
-def _launch_gdn_decode(
-    mixed_qkv: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    z: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    norm_weight: torch.Tensor,
-    recurrent_state: torch.Tensor,
+def _launch_gdn_validation(
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_indices: torch.Tensor,
     num_seqs: torch.Tensor,
     num_tokens: torch.Tensor,
-    output: torch.Tensor,
     duplicate_slots: torch.Tensor,
     error_code: torch.Tensor,
-    eps: float,
-    scale: float,
-    lower_bound: float,
+    *,
     max_tokens: int,
     max_seqs: int,
     max_state_slots: int,
     state_index_columns: int,
-    key_heads: int,
-    value_heads: int,
-    key_head_dim: int,
-    value_head_dim: int,
-    sigmoid_gate: bool,
-    qk_l2norm: bool,
-    lower_bounded_kda: bool,
+    duplicate_table_size: int,
     has_null_state_index: bool,
     null_state_index: int,
-    block_v: int,
-    duplicate_table_size: int,
-    recurrent_num_warps: int,
-    norm_num_warps: int,
 ) -> None:
-    if lower_bounded_kda:
-        if key_heads != value_heads or not sigmoid_gate:
-            raise RuntimeError(
-                "GLM/KDA decode requires equal Q/K/V head counts and a "
-                "sigmoid output gate"
-            )
-    elif value_heads != 3 * key_heads:
-        raise RuntimeError(
-            "Qwen GDN decode requires three value heads per key head, got "
-            f"key_heads={key_heads}, value_heads={value_heads}"
-        )
-
+    """Validate one packed metadata set for all compatible GDN layers."""
     _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
         duplicate_slots,
         error_code,
@@ -544,6 +510,76 @@ def _launch_gdn_decode(
         num_warps=1,
         num_stages=1,
     )
+
+
+def _launch_gdn_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    z: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    output: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    eps: float,
+    scale: float,
+    lower_bound: float,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    key_heads: int,
+    value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    sigmoid_gate: bool,
+    qk_l2norm: bool,
+    lower_bounded_kda: bool,
+    has_null_state_index: bool,
+    null_state_index: int,
+    block_v: int,
+    duplicate_table_size: int,
+    recurrent_num_warps: int,
+    norm_num_warps: int,
+    validate_metadata: bool,
+) -> None:
+    if lower_bounded_kda:
+        if key_heads != value_heads or not sigmoid_gate:
+            raise RuntimeError(
+                "GLM/KDA decode requires equal Q/K/V head counts and a "
+                "sigmoid output gate"
+            )
+    elif value_heads != 3 * key_heads:
+        raise RuntimeError(
+            "Qwen GDN decode requires three value heads per key head, got "
+            f"key_heads={key_heads}, value_heads={value_heads}"
+        )
+
+    if validate_metadata:
+        _launch_gdn_validation(
+            query_start_loc,
+            num_accepted_tokens,
+            state_indices,
+            num_seqs,
+            num_tokens,
+            duplicate_slots,
+            error_code,
+            max_tokens=max_tokens,
+            max_seqs=max_seqs,
+            max_state_slots=max_state_slots,
+            state_index_columns=state_index_columns,
+            duplicate_table_size=duplicate_table_size,
+            has_null_state_index=has_null_state_index,
+            null_state_index=null_state_index,
+        )
     if not lower_bounded_kda:
         binding = _make_qwen_binding(
             mixed_qkv,
@@ -572,9 +608,7 @@ def _launch_gdn_decode(
             value_head_dim=value_head_dim,
             sigmoid_gate=sigmoid_gate,
             qk_l2norm=qk_l2norm,
-            null_state_index=(
-                null_state_index if has_null_state_index else None
-            ),
+            null_state_index=(null_state_index if has_null_state_index else None),
             duplicate_table_size=duplicate_table_size,
         )
         from ._cute_kernels import run_packed_recurrent_qwen
@@ -582,9 +616,7 @@ def _launch_gdn_decode(
         run_packed_recurrent_qwen(binding, scale=scale)
     else:
         value_tiles = triton.cdiv(value_head_dim, block_v)
-        _packed_sequential_kda_decode_kernel[
-            (value_tiles, max_seqs * value_heads)
-        ](
+        _packed_sequential_kda_decode_kernel[(value_tiles, max_seqs * value_heads)](
             mixed_qkv,
             a,
             b,
@@ -648,6 +680,102 @@ def _launch_gdn_decode(
 
 
 @torch.library.custom_op(
+    "b12x::gdn_validate_metadata",
+    mutates_args=("duplicate_slots", "error_code"),
+)
+def _gdn_validate_metadata_op(
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    duplicate_table_size: int,
+    has_null_state_index: bool,
+    null_state_index: int,
+) -> None:
+    _launch_gdn_validation(
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        num_tokens,
+        duplicate_slots,
+        error_code,
+        max_tokens=max_tokens,
+        max_seqs=max_seqs,
+        max_state_slots=max_state_slots,
+        state_index_columns=state_index_columns,
+        duplicate_table_size=duplicate_table_size,
+        has_null_state_index=has_null_state_index,
+        null_state_index=null_state_index,
+    )
+
+
+@_gdn_validate_metadata_op.register_fake
+def _gdn_validate_metadata_fake(
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    duplicate_table_size: int,
+    has_null_state_index: bool,
+    null_state_index: int,
+) -> None:
+    del query_start_loc, num_accepted_tokens, state_indices, num_seqs, num_tokens
+    del duplicate_slots, error_code, max_tokens, max_seqs, max_state_slots
+    del state_index_columns, duplicate_table_size, has_null_state_index
+    del null_state_index
+
+
+def validate_gdn_metadata(
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_seqs: torch.Tensor,
+    num_tokens: torch.Tensor,
+    duplicate_slots: torch.Tensor,
+    error_code: torch.Tensor,
+    *,
+    max_tokens: int,
+    max_seqs: int,
+    max_state_slots: int,
+    state_index_columns: int,
+    duplicate_table_size: int,
+    null_state_index: int | None,
+) -> None:
+    """Launch transactional validation for reusable packed GDN metadata."""
+    torch.ops.b12x.gdn_validate_metadata(
+        query_start_loc,
+        num_accepted_tokens,
+        state_indices,
+        num_seqs,
+        num_tokens,
+        duplicate_slots,
+        error_code,
+        int(max_tokens),
+        int(max_seqs),
+        int(max_state_slots),
+        int(state_index_columns),
+        int(duplicate_table_size),
+        null_state_index is not None,
+        0 if null_state_index is None else int(null_state_index),
+    )
+
+
+@torch.library.custom_op(
     "b12x::gdn_decode",
     mutates_args=(
         "recurrent_state",
@@ -693,6 +821,7 @@ def _gdn_decode_op(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool,
 ) -> None:
     _launch_gdn_decode(
         mixed_qkv,
@@ -731,6 +860,7 @@ def _gdn_decode_op(
         duplicate_table_size,
         recurrent_num_warps,
         norm_num_warps,
+        validate_metadata,
     )
 
 
@@ -772,6 +902,7 @@ def _gdn_decode_fake(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool,
 ) -> None:
     del mixed_qkv, a, b, z, A_log, dt_bias, norm_weight
     del recurrent_state, query_start_loc, num_accepted_tokens, state_indices
@@ -781,7 +912,7 @@ def _gdn_decode_fake(
     del key_heads, value_heads, key_head_dim, value_head_dim, sigmoid_gate
     del qk_l2norm, lower_bounded_kda, has_null_state_index, null_state_index
     del block_v, duplicate_table_size
-    del recurrent_num_warps, norm_num_warps
+    del recurrent_num_warps, norm_num_warps, validate_metadata
 
 
 def run_gdn_decode(
@@ -821,6 +952,7 @@ def run_gdn_decode(
     duplicate_table_size: int,
     recurrent_num_warps: int,
     norm_num_warps: int,
+    validate_metadata: bool = True,
 ) -> None:
     torch.ops.b12x.gdn_decode(
         mixed_qkv,
@@ -859,7 +991,8 @@ def run_gdn_decode(
         int(duplicate_table_size),
         int(recurrent_num_warps),
         int(norm_num_warps),
+        bool(validate_metadata),
     )
 
 
-__all__ = ["run_gdn_decode"]
+__all__ = ["run_gdn_decode", "validate_gdn_metadata"]

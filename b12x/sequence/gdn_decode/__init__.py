@@ -9,6 +9,10 @@ outside this package.
 ``bind`` / ``run`` implements scalar per-head Qwen GDN decay. ``bind_kda`` /
 ``run_kda`` implements GLM/Kimi lower-bounded KDA decay from a per-key-coordinate
 raw gate while preserving the same state, transaction, and serving lifecycle.
+Servers with many compatible KDA layers may bind and validate packed metadata
+once, then use ``run_kda_prevalidated`` with each layer's live tensors. The
+validation result remains transactional and is reusable only by same-stream
+launches with matching state geometry.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
@@ -52,13 +56,18 @@ META = OpMeta(
         "Plan",
         "Binding",
         "KdaBinding",
+        "KdaMetadataBinding",
+        "ValidatedKdaMetadata",
         "GdnConfig",
         "GdnQuery",
         "plan",
         "bind",
         "bind_kda",
+        "bind_kda_metadata",
         "run",
         "run_kda",
+        "run_kda_prevalidated",
+        "validate_kda_metadata",
         "reference",
         "is_supported",
     ),
@@ -90,16 +99,21 @@ if TYPE_CHECKING:
         Binding,
         Caps,
         KdaBinding,
+        KdaMetadataBinding,
         GdnConfig,
         GdnQuery,
         Plan,
+        ValidatedKdaMetadata,
         bind,
         bind_kda,
+        bind_kda_metadata,
         is_supported,
         plan,
         reference,
         run,
         run_kda,
+        run_kda_prevalidated,
+        validate_kda_metadata,
     )
 
 install_lazy_api(globals(), META)
