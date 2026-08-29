@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import replace
 
 import pytest
 import torch
 
+import b12x
 from b12x.sequence import gdn_decode as gdn
 
 from ..conftest import require_b12x as require_sm120
@@ -34,6 +36,7 @@ def _make_case(
     max_tokens: int = 5,
     state_dtype: torch.dtype = torch.float32,
     null_state_index: int | None = None,
+    raw_beta_stride: int = 1,
 ) -> gdn.KdaBinding:
     max_seqs = len(query_lengths)
     live_tokens = sum(query_lengths)
@@ -60,6 +63,10 @@ def _make_case(
     state_indices = torch.arange(
         max_seqs * columns, dtype=torch.int64, device=device
     ).view(max_seqs, columns)
+    raw_beta_storage = _randn(
+        (max_tokens, heads * raw_beta_stride), device=device
+    )
+    raw_beta = raw_beta_storage[:, ::raw_beta_stride]
     return gdn.bind_kda(
         plan,
         scratch=torch.empty(
@@ -67,7 +74,7 @@ def _make_case(
         ),
         mixed_qkv=_randn((max_tokens, caps.packed_qkv_width), device=device),
         raw_g=_randn((max_tokens, heads, 128), device=device),
-        raw_beta=_randn((max_tokens, heads), device=device),
+        raw_beta=raw_beta,
         z=_randn((max_tokens, heads, 128), device=device),
         A_log=_randn((heads,), device=device, dtype=torch.float32, scale=0.1),
         dt_bias=_randn(
@@ -85,7 +92,9 @@ def _make_case(
         ),
         query_start_loc=query_start_loc,
         num_accepted_tokens=torch.tensor(
-            [2, 1], dtype=torch.int32, device=device
+            [min(length, 2) for length in query_lengths],
+            dtype=torch.int32,
+            device=device,
         ),
         state_indices=state_indices,
         num_seqs=torch.tensor([max_seqs], dtype=torch.int32, device=device),
@@ -373,6 +382,176 @@ def test_glm53_tp8_head_geometry_matches_reference() -> None:
     )
 
 
+def test_kda_subcapacity_matches_reference_and_replays_cuda_graph() -> None:
+    device = require_sm120()
+    source = _make_case(
+        device=device,
+        query_lengths=(2, 1, 1),
+        max_tokens=6,
+        raw_beta_stride=2,
+    )
+    plan = gdn.plan(replace(source.plan.caps, max_tokens=8, max_seqs=4))
+    (scratch_spec,) = plan.scratch_specs()
+    scratch = torch.empty(
+        scratch_spec.shape, dtype=scratch_spec.dtype, device=device
+    )
+    first = gdn.bind_kda(
+        plan,
+        scratch=scratch,
+        mixed_qkv=source.mixed_qkv[:5],
+        raw_g=source.raw_g[:5],
+        raw_beta=source.raw_beta[:5],
+        z=source.z[:5],
+        A_log=source.A_log,
+        dt_bias=source.dt_bias,
+        norm_weight=source.norm_weight,
+        recurrent_state=source.recurrent_state,
+        query_start_loc=source.query_start_loc[:3],
+        num_accepted_tokens=source.num_accepted_tokens[:2],
+        state_indices=source.state_indices[:2],
+        num_seqs=torch.tensor([2], dtype=torch.int32, device=device),
+        num_tokens=torch.tensor([3], dtype=torch.int32, device=device),
+        output=source.output[:5],
+    )
+    state_reference = first.recurrent_state.clone()
+    expected = _reference(first, state_reference)
+
+    actual = gdn.run_kda(first)
+    torch.cuda.synchronize(device)
+
+    assert first.plan.caps.max_tokens == 8
+    assert first.mixed_qkv.shape[0] == 5
+    assert first.num_accepted_tokens.shape[0] == 2
+    assert not first.raw_beta.is_contiguous()
+    assert actual.data_ptr() == source.output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        first.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+    from b12x.sequence.gdn_decode import _kernels
+
+    triton_kernels = (
+        _kernels._reset_validation_kernel,
+        _kernels._validate_packed_metadata_kernel,
+        _kernels._validate_active_state_slots_kernel,
+        _kernels._packed_sequential_kda_decode_kernel,
+        _kernels._gated_rmsnorm_kernel,
+    )
+    device_index = torch.cuda.current_device()
+
+    def cache_sizes() -> tuple[int, ...]:
+        return tuple(
+            len(kernel.device_caches[device_index][0]) for kernel in triton_kernels
+        )
+
+    first_cache_sizes = cache_sizes()
+    second = gdn.bind_kda(
+        plan,
+        scratch=scratch,
+        mixed_qkv=source.mixed_qkv,
+        raw_g=source.raw_g,
+        raw_beta=source.raw_beta,
+        z=source.z,
+        A_log=source.A_log,
+        dt_bias=source.dt_bias,
+        norm_weight=source.norm_weight,
+        recurrent_state=source.recurrent_state,
+        query_start_loc=source.query_start_loc,
+        num_accepted_tokens=source.num_accepted_tokens,
+        state_indices=source.state_indices,
+        num_seqs=source.num_seqs,
+        num_tokens=source.num_tokens,
+        output=source.output,
+    )
+    state_reference = second.recurrent_state.clone()
+    expected = _reference(second, state_reference)
+
+    b12x.freeze_kernel_resolution("reduced-capacity KDA regression")
+    try:
+        actual = gdn.run_kda(second)
+        torch.cuda.synchronize(device)
+    finally:
+        b12x.unfreeze_kernel_resolution()
+
+    assert second.mixed_qkv.shape[0] == 6
+    assert second.num_accepted_tokens.shape[0] == 3
+    assert cache_sizes() == first_cache_sizes
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        second.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = gdn.run_kda(second)
+
+    second.mixed_qkv.copy_(torch.randn_like(second.mixed_qkv).mul_(0.2))
+    second.raw_g.copy_(torch.randn_like(second.raw_g).mul_(0.2))
+    second.raw_beta.copy_(torch.randn_like(second.raw_beta).mul_(0.2))
+    second.z.copy_(torch.randn_like(second.z).mul_(0.2))
+    second.recurrent_state.copy_(
+        torch.randn_like(second.recurrent_state).mul_(0.1)
+    )
+    state_reference = second.recurrent_state.clone()
+    expected = _reference(second, state_reference)
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        second.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_kda_subcapacity_metadata_errors_are_transactional() -> None:
+    device = require_sm120()
+    source = _make_case(device=device)
+    plan = gdn.plan(replace(source.plan.caps, max_tokens=6, max_seqs=4))
+    (scratch_spec,) = plan.scratch_specs()
+    binding = gdn.bind_kda(
+        plan,
+        scratch=torch.empty(
+            scratch_spec.shape, dtype=scratch_spec.dtype, device=device
+        ),
+        mixed_qkv=source.mixed_qkv,
+        raw_g=source.raw_g,
+        raw_beta=source.raw_beta,
+        z=source.z,
+        A_log=source.A_log,
+        dt_bias=source.dt_bias,
+        norm_weight=source.norm_weight,
+        recurrent_state=source.recurrent_state,
+        query_start_loc=source.query_start_loc,
+        num_accepted_tokens=source.num_accepted_tokens,
+        state_indices=source.state_indices,
+        num_seqs=source.num_seqs,
+        num_tokens=source.num_tokens,
+        output=source.output,
+    )
+    before = binding.recurrent_state.clone()
+
+    def assert_rejected() -> None:
+        actual = gdn.run_kda(binding)
+        torch.cuda.synchronize(device)
+
+        assert binding.error_code.item() & 2
+        assert torch.isnan(actual).all()
+        torch.testing.assert_close(
+            binding.recurrent_state, before, rtol=0, atol=0
+        )
+
+    binding.num_seqs.fill_(1)
+    assert_rejected()
+
+    binding.num_seqs.fill_(2)
+    binding.query_start_loc.copy_(
+        torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
+    )
+    assert_rejected()
+
+
 def test_kda_rejected_draft_restarts_from_accepted_checkpoint() -> None:
     device = require_sm120()
     binding = _make_case(device=device)
@@ -468,6 +647,39 @@ def test_kda_cuda_graph_replay_preserves_addresses() -> None:
 
     assert captured_output.data_ptr() == output_ptr
     assert binding.recurrent_state.data_ptr() == state_ptr
+    torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_kda_cuda_graph_replay_accepts_multiple_live_counts() -> None:
+    device = require_sm120()
+    binding = _make_case(device=device)
+    gdn.run_kda(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = gdn.run_kda(binding)
+
+    binding.query_start_loc.copy_(
+        torch.tensor([0, 2, 2], dtype=torch.int32, device=device)
+    )
+    binding.num_accepted_tokens.fill_(1)
+    binding.num_seqs.fill_(1)
+    binding.num_tokens.fill_(2)
+    binding.mixed_qkv.copy_(torch.randn_like(binding.mixed_qkv).mul_(0.2))
+    binding.raw_g.copy_(torch.randn_like(binding.raw_g).mul_(0.2))
+    binding.raw_beta.copy_(torch.randn_like(binding.raw_beta).mul_(0.2))
+    binding.z.copy_(torch.randn_like(binding.z).mul_(0.2))
+    binding.recurrent_state.copy_(
+        torch.randn_like(binding.recurrent_state).mul_(0.1)
+    )
+    state_reference = binding.recurrent_state.clone()
+    expected = _reference(binding, state_reference)
+
+    graph.replay()
+    torch.cuda.synchronize(device)
+
     torch.testing.assert_close(captured_output, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state, state_reference, rtol=1e-5, atol=2e-5
