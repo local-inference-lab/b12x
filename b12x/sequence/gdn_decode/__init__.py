@@ -9,10 +9,10 @@ outside this package.
 ``bind`` / ``run`` implements scalar per-head Qwen GDN decay. ``bind_kda`` /
 ``run_kda`` implements GLM/Kimi lower-bounded KDA decay from a per-key-coordinate
 raw gate while preserving the same state, transaction, and serving lifecycle.
-Servers with many compatible KDA layers may bind and validate packed metadata
-once, then use ``run_kda_prevalidated`` with each layer's live tensors. The
-validation result remains transactional and is reusable only by same-stream
-launches with matching state geometry.
+Trusted serving runtimes may use ``bind_kda_metadata`` and ``run_kda_live``
+to consume live layer tensors without staging or device-side metadata
+validation. That interface requires the runtime to preserve packed-request
+geometry, unique active state ownership, and in-range state indices.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the
@@ -52,24 +52,22 @@ META = OpMeta(
     group="sequence",
     api_style="planned",
     entry_points=(
-        "Caps",
-        "Plan",
         "Binding",
-        "KdaBinding",
-        "KdaMetadataBinding",
-        "ValidatedKdaMetadata",
+        "Caps",
         "GdnConfig",
         "GdnQuery",
-        "plan",
+        "KdaBinding",
+        "KdaMetadataBinding",
+        "Plan",
         "bind",
         "bind_kda",
         "bind_kda_metadata",
+        "is_supported",
+        "plan",
+        "reference",
         "run",
         "run_kda",
-        "run_kda_prevalidated",
-        "validate_kda_metadata",
-        "reference",
-        "is_supported",
+        "run_kda_live",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("silu", "sigmoid", "lower_bounded_kda"),
@@ -98,12 +96,11 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
-        KdaBinding,
-        KdaMetadataBinding,
         GdnConfig,
         GdnQuery,
+        KdaBinding,
+        KdaMetadataBinding,
         Plan,
-        ValidatedKdaMetadata,
         bind,
         bind_kda,
         bind_kda_metadata,
@@ -112,8 +109,7 @@ if TYPE_CHECKING:
         reference,
         run,
         run_kda,
-        run_kda_prevalidated,
-        validate_kda_metadata,
+        run_kda_live,
     )
 
 install_lazy_api(globals(), META)

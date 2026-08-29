@@ -11,15 +11,13 @@ from ._impl import (
     KdaBinding,
     KdaMetadataBinding,
     Plan,
-    ValidatedKdaMetadata,
     bind,
     bind_kda,
     bind_kda_metadata,
     plan,
     run,
     run_kda,
-    run_kda_prevalidated,
-    validate_kda_metadata,
+    run_kda_live,
 )
 from ._policy import GdnConfig, GdnQuery
 
@@ -31,22 +29,20 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
-    "Caps",
-    "Plan",
     "Binding",
-    "KdaBinding",
-    "KdaMetadataBinding",
-    "ValidatedKdaMetadata",
+    "Caps",
     "GdnConfig",
     "GdnQuery",
-    "plan",
+    "KdaBinding",
+    "KdaMetadataBinding",
+    "Plan",
     "bind",
     "bind_kda",
     "bind_kda_metadata",
+    "is_supported",
+    "plan",
+    "reference",
     "run",
     "run_kda",
-    "run_kda_prevalidated",
-    "validate_kda_metadata",
-    "reference",
-    "is_supported",
+    "run_kda_live",
 ]
