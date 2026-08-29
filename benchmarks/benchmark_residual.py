@@ -22,6 +22,7 @@ from benchmarks.common import (
     require_sm120,
 )
 from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post_pre
+from b12x.norm.mhc._kernels import _mhc_prefill_tf32_chunk_min_tokens
 
 
 def _mhc_pre_reference(
@@ -313,8 +314,8 @@ def main() -> None:
             os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
         )
     )
-    prefill_tf32_tma_chunk_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
+    prefill_tf32_tma_chunk_min_tokens = _mhc_prefill_tf32_chunk_min_tokens(
+        args.hidden_size
     )
     prefill_tf32_tma_chunk_geometry = (
         args.tokens >= prefill_tf32_tma_chunk_min_tokens

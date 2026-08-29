@@ -120,8 +120,20 @@ _PREFILL_TF32_TMA_STAGES = int(
         os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "1"),
     )
 )
+_RAW_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = os.getenv(
+    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS"
+)
 _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
+    _RAW_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS or "4096"
+)
+# The GLM-5.3 vLLM integration presents 4080 live-token tiles at its 4096-token
+# scheduler limit. The hidden-4096 chunk kernel retains its measured geometry
+# across that 16-token boundary. Other hidden sizes retain the generic limit.
+_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS = int(
+    os.getenv(
+        "B12X_MHC_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS",
+        _RAW_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS or "4080",
+    )
 )
 _PREFILL_TF32_TMA_LONG_MIN_TOKENS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
@@ -129,7 +141,7 @@ _PREFILL_TF32_TMA_LONG_MIN_TOKENS = int(
 # At hidden=4096, one CTA owns all 24 mix columns so A is loaded once instead
 # of once per 8-column N tile. M192/K64 gives the best 4096-token balance of B
 # reuse and SM coverage; K splitting supplies enough CTAs for all SMs.
-# Keep the previous geometry for hidden=7168, where wide-N regresses.
+# Hidden size 7168 retains narrow-N geometry because wide-N regresses there.
 _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
 )
@@ -255,6 +267,13 @@ def _source_tiles_for_hidden(hidden_size: int) -> int:
             f"{_SOURCE_TILE_H}"
         )
     return hidden_size // _SOURCE_TILE_H
+
+
+def _mhc_prefill_tf32_chunk_min_tokens(hidden_size: int) -> int:
+    """Return the live-token threshold for TF32 chunk geometry."""
+    if int(hidden_size) == _HIDDEN:
+        return _PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS
+    return _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
 
 
 def _split_k_for_hidden(hidden_size: int) -> int:
@@ -5018,7 +5037,8 @@ def _run_mhc_prefill_tf32_project_launch(
     if not fn.is_contiguous():
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
-    chunk_geometry = tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+    chunk_min_tokens = _mhc_prefill_tf32_chunk_min_tokens(hidden_size)
+    chunk_geometry = tokens >= chunk_min_tokens
     long_geometry = (
         hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
     )
@@ -5070,7 +5090,7 @@ def _run_mhc_prefill_tf32_project_launch(
         ("hidden_size", hidden_size),
         ("split_k", split_k),
         ("chunk_geometry", chunk_geometry),
-        ("chunk_min_tokens", _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS),
+        ("chunk_min_tokens", chunk_min_tokens),
         ("long_geometry", long_geometry),
         ("long_min_tokens", _PREFILL_TF32_TMA_LONG_MIN_TOKENS),
         ("tile_m", kernel.tile_m),
@@ -5099,7 +5119,7 @@ def _run_mhc_prefill_tf32_project_launch(
 
 def mhc_prefill_tf32_project_splits(*, tokens: int, hidden_size: int) -> int:
     """Return the projection split count selected by the TF32 prefill kernel."""
-    chunk_geometry = int(tokens) >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+    chunk_geometry = int(tokens) >= _mhc_prefill_tf32_chunk_min_tokens(hidden_size)
     long_geometry = (
         int(hidden_size) == _HIDDEN and int(tokens) >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
     )

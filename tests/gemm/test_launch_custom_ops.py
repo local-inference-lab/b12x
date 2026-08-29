@@ -57,6 +57,19 @@ def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
     assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 0
 
 
+def test_mhc_prefill_chunk_geometry_covers_hidden4096_scheduler_payload() -> None:
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    assert residual_kernels._mhc_prefill_tf32_chunk_min_tokens(4096) == 4080
+    assert residual_kernels._mhc_prefill_tf32_chunk_min_tokens(7168) == 4096
+    assert residual_kernels.mhc_prefill_tf32_project_splits(
+        tokens=4079, hidden_size=4096
+    ) == 1
+    assert residual_kernels.mhc_prefill_tf32_project_splits(
+        tokens=4080, hidden_size=4096
+    ) == 8
+
+
 def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:
     import b12x.norm.mhc._kernels as residual_kernels
 
