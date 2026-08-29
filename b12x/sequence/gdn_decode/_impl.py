@@ -531,9 +531,12 @@ def bind_kda(
     """Bind lower-bounded KDA tensors to a GDN decode plan.
 
     KDA uses one Q/K/V head per recurrent state head. ``raw_g`` has shape
-    ``[max_tokens, heads, key_head_dim]`` and ``raw_beta`` has shape
-    ``[max_tokens, heads]``. The recurrent-state and packed-request contracts
-    are identical to :func:`bind`.
+    ``[tokens, heads, key_head_dim]`` and ``raw_beta`` has shape
+    ``[tokens, heads]``. Token and request tensor capacities may be smaller
+    than the plan while state columns remain fixed. When request capacity is
+    smaller than the plan, every bound request row is live and ``num_seqs``
+    must match it. ``query_start_loc[-1]`` must match the independent,
+    device-side ``num_tokens`` live-count scalar.
     """
     if not isinstance(plan, Plan):
         raise TypeError(f"plan must be Plan, got {type(plan)!r}")
@@ -547,6 +550,43 @@ def bind_kda(
         raise ValueError(
             "KDA decode requires gate_activation='sigmoid', got "
             f"{caps.gate_activation!r}"
+        )
+
+    if mixed_qkv.ndim != 2:
+        raise ValueError(
+            f"mixed_qkv must be rank 2, got shape={tuple(mixed_qkv.shape)}"
+        )
+    if num_accepted_tokens.ndim != 1:
+        raise ValueError(
+            "num_accepted_tokens must be rank 1, got "
+            f"shape={tuple(num_accepted_tokens.shape)}"
+        )
+    if state_indices.ndim != 2:
+        raise ValueError(
+            f"state_indices must be rank 2, got shape={tuple(state_indices.shape)}"
+        )
+    bound_tokens = int(mixed_qkv.shape[0])
+    bound_seqs = int(num_accepted_tokens.shape[0])
+    bound_columns = int(state_indices.shape[1])
+    if not 0 < bound_tokens <= caps.max_tokens:
+        raise ValueError(
+            "KDA token capacity must fit the plan, got "
+            f"{bound_tokens}/{caps.max_tokens}"
+        )
+    if not 0 < bound_seqs <= caps.max_seqs:
+        raise ValueError(
+            "KDA request capacity must fit the plan, got "
+            f"{bound_seqs}/{caps.max_seqs}"
+        )
+    if bound_columns != caps.state_index_columns:
+        raise ValueError(
+            "KDA bindings require the planned state-index columns, got "
+            f"{bound_columns}/{caps.state_index_columns}"
+        )
+    if bound_tokens > bound_seqs * bound_columns:
+        raise ValueError(
+            "KDA token capacity must fit request columns, got "
+            f"{bound_tokens} > {bound_seqs} * {bound_columns}"
         )
 
     scratch_storage = scratch_tensor(scratch, plan.scratch_specs(), owner="KDA decode")
@@ -567,28 +607,29 @@ def bind_kda(
     _require_tensor(
         "mixed_qkv",
         mixed_qkv,
-        shape=(caps.max_tokens, caps.packed_qkv_width),
+        shape=(bound_tokens, caps.packed_qkv_width),
         device=caps.device,
         dtypes=model,
     )
     _require_tensor(
         "raw_g",
         raw_g,
-        shape=(caps.max_tokens, caps.value_heads, caps.key_head_dim),
+        shape=(bound_tokens, caps.value_heads, caps.key_head_dim),
         device=caps.device,
         dtypes=model,
     )
     _require_tensor(
         "raw_beta",
         raw_beta,
-        shape=(caps.max_tokens, caps.value_heads),
+        shape=(bound_tokens, caps.value_heads),
         device=caps.device,
         dtypes=model,
+        contiguous=False,
     )
     _require_tensor(
         "z",
         z,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(bound_tokens, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )
@@ -627,21 +668,21 @@ def bind_kda(
     _require_tensor(
         "query_start_loc",
         query_start_loc,
-        shape=(caps.max_seqs + 1,),
+        shape=(bound_seqs + 1,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "num_accepted_tokens",
         num_accepted_tokens,
-        shape=(caps.max_seqs,),
+        shape=(bound_seqs,),
         device=caps.device,
         dtypes=(torch.int32,),
     )
     _require_tensor(
         "state_indices",
         state_indices,
-        shape=(caps.max_seqs, caps.state_index_columns),
+        shape=(bound_seqs, bound_columns),
         device=caps.device,
         dtypes=(torch.int32, torch.int64),
     )
@@ -656,7 +697,7 @@ def bind_kda(
     _require_tensor(
         "output",
         output,
-        shape=(caps.max_tokens, caps.value_heads, caps.value_head_dim),
+        shape=(bound_tokens, caps.value_heads, caps.value_head_dim),
         device=caps.device,
         dtypes=model,
     )

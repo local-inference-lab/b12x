@@ -23,35 +23,56 @@ def _reset_validation_kernel(
         tl.store(error_code, 0)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bound_seqs", "bound_tokens"])
 def _validate_packed_metadata_kernel(
     query_start_loc,
     num_accepted_tokens,
     num_seqs,
     num_tokens,
+    bound_seqs,
+    bound_tokens,
     error_code,
     MAX_SEQS: tl.constexpr,
     MAX_TOKENS: tl.constexpr,
     STATE_INDEX_COLUMNS: tl.constexpr,
+    EXACT_SEQS: tl.constexpr,
 ):
     request = tl.program_id(0)
-    live_seqs = tl.load(num_seqs).to(tl.int32)
+    declared_seqs = tl.load(num_seqs).to(tl.int32)
+    if EXACT_SEQS:
+        live_seqs = bound_seqs
+    else:
+        live_seqs = declared_seqs
     live_tokens = tl.load(num_tokens).to(tl.int32)
 
     if request == 0:
         counts_invalid = (
-            (live_seqs < 0)
-            | (live_seqs > MAX_SEQS)
+            (bound_seqs < 0)
+            | (bound_seqs > MAX_SEQS)
+            | (bound_tokens < 0)
+            | (bound_tokens > MAX_TOKENS)
+            | (live_seqs < 0)
+            | (live_seqs > bound_seqs)
             | (live_tokens < 0)
-            | (live_tokens > MAX_TOKENS)
+            | (live_tokens > bound_tokens)
         )
         first = tl.load(query_start_loc).to(tl.int32)
-        safe_last = tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))
-        last = tl.load(query_start_loc + safe_last).to(tl.int32)
-        if counts_invalid | (first != 0) | (last != live_tokens):
-            tl.atomic_or(error_code, 2)
+        if EXACT_SEQS:
+            last = tl.load(query_start_loc + bound_seqs).to(tl.int32)
+            if (
+                counts_invalid
+                | (declared_seqs != bound_seqs)
+                | (first != 0)
+                | (last != live_tokens)
+            ):
+                tl.atomic_or(error_code, 2)
+        else:
+            safe_last = tl.maximum(0, tl.minimum(live_seqs, bound_seqs))
+            last = tl.load(query_start_loc + safe_last).to(tl.int32)
+            if counts_invalid | (first != 0) | (last != live_tokens):
+                tl.atomic_or(error_code, 2)
 
-    if request < tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+    if request < tl.maximum(0, tl.minimum(live_seqs, bound_seqs)):
         start = tl.load(query_start_loc + request).to(tl.int32)
         end = tl.load(query_start_loc + request + 1).to(tl.int32)
         accepted = tl.load(num_accepted_tokens + request).to(tl.int32)
@@ -68,12 +89,13 @@ def _validate_packed_metadata_kernel(
             tl.atomic_or(error_code, 2)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bound_seqs"])
 def _validate_active_state_slots_kernel(
     query_start_loc,
     num_accepted_tokens,
     state_indices,
     num_seqs,
+    bound_seqs,
     duplicate_slots,
     error_code,
     stride_indices_request: tl.constexpr,
@@ -84,12 +106,16 @@ def _validate_active_state_slots_kernel(
     TABLE_SIZE: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
+    EXACT_SEQS: tl.constexpr,
 ):
     cell = tl.program_id(0)
     request = cell // STATE_INDEX_COLUMNS
     column = cell % STATE_INDEX_COLUMNS
-    live_seqs = tl.load(num_seqs).to(tl.int32)
-    if request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS)):
+    if EXACT_SEQS:
+        live_seqs = bound_seqs
+    else:
+        live_seqs = tl.load(num_seqs).to(tl.int32)
+    if request >= tl.maximum(0, tl.minimum(live_seqs, bound_seqs)):
         return
 
     start = tl.load(query_start_loc + request).to(tl.int32)
@@ -140,7 +166,7 @@ def _validate_active_state_slots_kernel(
         tl.atomic_or(error_code, 1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bound_seqs"])
 def _packed_sequential_kda_decode_kernel(
     mixed_qkv,
     a,
@@ -152,6 +178,7 @@ def _packed_sequential_kda_decode_kernel(
     num_accepted_tokens,
     state_indices,
     num_seqs,
+    bound_seqs,
     output,
     error_code,
     scale,
@@ -179,6 +206,7 @@ def _packed_sequential_kda_decode_kernel(
     QK_L2NORM: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
+    EXACT_SEQS: tl.constexpr,
 ):
     value_tile = tl.program_id(0)
     request_value_head = tl.program_id(1)
@@ -186,8 +214,11 @@ def _packed_sequential_kda_decode_kernel(
     value_head = request_value_head % VALUE_HEADS
     key_head = value_head
 
-    live_seqs = tl.load(num_seqs).to(tl.int32)
-    if (request >= tl.maximum(0, tl.minimum(live_seqs, MAX_SEQS))) | (
+    if EXACT_SEQS:
+        live_seqs = bound_seqs
+    else:
+        live_seqs = tl.load(num_seqs).to(tl.int32)
+    if (request >= tl.maximum(0, tl.minimum(live_seqs, bound_seqs))) | (
         tl.load(error_code).to(tl.int32) != 0
     ):
         return
@@ -505,6 +536,11 @@ def _launch_gdn_decode(
             "Qwen GDN decode requires three value heads per key head, got "
             f"key_heads={key_heads}, value_heads={value_heads}"
         )
+    bound_tokens = int(mixed_qkv.shape[0]) if lower_bounded_kda else max_tokens
+    bound_seqs = (
+        int(num_accepted_tokens.shape[0]) if lower_bounded_kda else max_seqs
+    )
+    exact_request_capacity = lower_bounded_kda and bound_seqs < max_seqs
 
     _reset_validation_kernel[(triton.cdiv(duplicate_table_size, _VALIDATION_BLOCK),)](
         duplicate_slots,
@@ -514,23 +550,27 @@ def _launch_gdn_decode(
         num_warps=1,
         num_stages=1,
     )
-    _validate_packed_metadata_kernel[(max_seqs,)](
+    _validate_packed_metadata_kernel[(bound_seqs,)](
         query_start_loc,
         num_accepted_tokens,
         num_seqs,
         num_tokens,
+        bound_seqs,
+        bound_tokens,
         error_code,
         MAX_SEQS=int(max_seqs),
         MAX_TOKENS=int(max_tokens),
         STATE_INDEX_COLUMNS=int(state_index_columns),
+        EXACT_SEQS=bool(exact_request_capacity),
         num_warps=1,
         num_stages=1,
     )
-    _validate_active_state_slots_kernel[(max_seqs * state_index_columns,)](
+    _validate_active_state_slots_kernel[(bound_seqs * state_index_columns,)](
         query_start_loc,
         num_accepted_tokens,
         state_indices,
         num_seqs,
+        bound_seqs,
         duplicate_slots,
         error_code,
         stride_indices_request=int(state_indices.stride(0)),
@@ -541,6 +581,7 @@ def _launch_gdn_decode(
         TABLE_SIZE=int(duplicate_table_size),
         HAS_NULL_STATE_INDEX=bool(has_null_state_index),
         NULL_STATE_INDEX=int(null_state_index),
+        EXACT_SEQS=bool(exact_request_capacity),
         num_warps=1,
         num_stages=1,
     )
@@ -583,7 +624,7 @@ def _launch_gdn_decode(
     else:
         value_tiles = triton.cdiv(value_head_dim, block_v)
         _packed_sequential_kda_decode_kernel[
-            (value_tiles, max_seqs * value_heads)
+            (value_tiles, bound_seqs * value_heads)
         ](
             mixed_qkv,
             a,
@@ -595,6 +636,7 @@ def _launch_gdn_decode(
             num_accepted_tokens,
             state_indices,
             num_seqs,
+            bound_seqs,
             output,
             error_code,
             float(scale),
@@ -622,10 +664,11 @@ def _launch_gdn_decode(
             QK_L2NORM=bool(qk_l2norm),
             HAS_NULL_STATE_INDEX=bool(has_null_state_index),
             NULL_STATE_INDEX=int(null_state_index),
+            EXACT_SEQS=bool(exact_request_capacity),
             num_warps=int(recurrent_num_warps),
             num_stages=3,
         )
-    _gated_rmsnorm_kernel[(max_tokens * value_heads,)](
+    _gated_rmsnorm_kernel[(bound_tokens * value_heads,)](
         output,
         z,
         norm_weight,
