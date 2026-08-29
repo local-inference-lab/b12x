@@ -126,9 +126,9 @@ _RAW_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = os.getenv(
 _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
     _RAW_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS or "4096"
 )
-# The GLM-5.3 vLLM integration presents 4080 live-token tiles at its 4096-token
-# scheduler limit. The hidden-4096 chunk kernel retains its measured geometry
-# across that 16-token boundary. Other hidden sizes retain the generic limit.
+# A 4096-row scheduler batch can reserve 16 rows for bookkeeping and pass 4080
+# live rows to the projection. Hidden size 4096 retains the measured chunk
+# geometry across that boundary. Other hidden sizes retain the generic limit.
 _PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS = int(
     os.getenv(
         "B12X_MHC_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS",

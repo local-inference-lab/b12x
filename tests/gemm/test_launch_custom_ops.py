@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
@@ -68,6 +70,86 @@ def test_mhc_prefill_chunk_geometry_covers_hidden4096_scheduler_payload() -> Non
     assert residual_kernels.mhc_prefill_tf32_project_splits(
         tokens=4080, hidden_size=4096
     ) == 8
+
+
+@pytest.mark.parametrize("tokens", [4079, 4080])
+def test_mhc_prefill_chunk_boundary_matches_reference_under_graph_replay(
+    tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise both sides of the 4080-row dispatch boundary on SM120."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("the hidden-4096 projection geometry is qualified on SM120")
+
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", raising=False)
+    device = torch.device("cuda")
+    hidden_size = 4096
+    split_k = 64
+    generator = torch.Generator(device=device)
+    generator.manual_seed(40_790 + tokens)
+    residual = (
+        torch.randn(
+            (tokens, 4, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.02
+    ).contiguous()
+    projection = (
+        torch.randn(
+            (24, 4 * hidden_size),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.02
+    ).contiguous()
+    partials = torch.empty((tokens, split_k, 25), device=device, dtype=torch.float32)
+    active_splits = residual_kernels.mhc_prefill_tf32_project_splits(
+        tokens=tokens,
+        hidden_size=hidden_size,
+    )
+
+    def launch() -> None:
+        residual_kernels.run_mhc_prefill_tf32_project(
+            out=residual,
+            fn=projection,
+            partials=partials,
+        )
+
+    launch()
+    torch.cuda.synchronize(device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    residual.copy_(
+        torch.randn(
+            residual.shape,
+            device=device,
+            dtype=residual.dtype,
+            generator=generator,
+        )
+        * 0.02
+    )
+    partials.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    actual = partials[:, 0, 1:25].clone()
+    if active_splits > 1:
+        actual += partials[:, 2 : active_splits + 1, 1:25].sum(dim=1)
+    reference = F.linear(residual.flatten(1).float(), projection)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual).item() > 0
+    torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.0625)
 
 
 def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:

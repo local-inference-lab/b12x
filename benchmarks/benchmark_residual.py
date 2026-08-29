@@ -22,7 +22,15 @@ from benchmarks.common import (
     require_sm120,
 )
 from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post_pre
-from b12x.norm.mhc._kernels import _mhc_prefill_tf32_chunk_min_tokens
+from b12x.norm.mhc import _kernels as mhc_kernels
+
+
+def _resolved_mhc_prefill_tf32_chunk_min_tokens(hidden_size: int) -> int:
+    """Resolve the runtime threshold across both compared B12X revisions."""
+    resolver = getattr(mhc_kernels, "_mhc_prefill_tf32_chunk_min_tokens", None)
+    if resolver is not None:
+        return int(resolver(hidden_size))
+    return int(os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096"))
 
 
 def _mhc_pre_reference(
@@ -132,14 +140,18 @@ def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, f
     return float(diff.abs().max().item()), float(torch.sqrt(torch.mean(diff * diff)).item())
 
 
-def _bench_graph(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float]:
+def _bench_graph(
+    fn, *, warmup: int, iters: int, l2_flush
+) -> tuple[float, float, list[float]]:
     graph = capture_cuda_graph(fn, warmup=warmup)
     stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
     samples = stats["replay_us"]
-    return statistics.median(samples), min(samples)
+    return statistics.median(samples), min(samples), samples
 
 
-def _bench_eager(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float]:
+def _bench_eager(
+    fn, *, warmup: int, iters: int, l2_flush
+) -> tuple[float, float, list[float]]:
     samples = []
     for _ in range(warmup):
         if l2_flush is not None:
@@ -148,7 +160,7 @@ def _bench_eager(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float
     torch.cuda.synchronize()
     for _ in range(iters):
         samples.append(bench_gpu_ms(fn, warmup=0, iters=1, l2_flush=l2_flush) * 1000.0)
-    return statistics.median(samples), min(samples)
+    return statistics.median(samples), min(samples), samples
 
 
 def _register_vllm_mhc_tilelang(vllm_path: pathlib.Path) -> None:
@@ -191,6 +203,11 @@ def main() -> None:
     parser.add_argument("--hc-eps", type=float, default=1e-6)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--print-samples",
+        action="store_true",
+        help="Append every measured timing sample to the result line.",
+    )
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--l2-flush", action="store_true")
@@ -314,7 +331,7 @@ def main() -> None:
             os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
         )
     )
-    prefill_tf32_tma_chunk_min_tokens = _mhc_prefill_tf32_chunk_min_tokens(
+    prefill_tf32_tma_chunk_min_tokens = _resolved_mhc_prefill_tf32_chunk_min_tokens(
         args.hidden_size
     )
     prefill_tf32_tma_chunk_geometry = (
@@ -576,15 +593,16 @@ def main() -> None:
 
     l2_flush = make_l2_flush_fn(args.l2_flush, args.l2_flush_bytes)
     bench = _bench_eager if args.eager else _bench_graph
-    fused_median, fused_min = bench(
+    fused_median, fused_min, fused_samples = bench(
         run_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
     )
     if args.compare_vllm:
-        vllm_median, vllm_min = bench(
+        vllm_median, vllm_min, vllm_samples = bench(
             run_vllm_fused, warmup=args.warmup, iters=args.iters, l2_flush=l2_flush
         )
     else:
         vllm_median = vllm_min = float("nan")
+        vllm_samples = []
     mode = "eager" if args.eager else "graph"
 
     line = (
@@ -599,6 +617,7 @@ def main() -> None:
         f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
         f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
         f"prefill_tf32_chunk_geometry={prefill_tf32_tma_chunk_geometry} "
+        f"prefill_tf32_chunk_min_tokens={prefill_tf32_tma_chunk_min_tokens} "
         f"prefill_tf32_long_geometry={prefill_tf32_tma_long_geometry} "
         f"prefill_tf32_k_splits={prefill_tf32_tma_k_splits} "
         f"prefill_gram_threads={prefill_gram_threads} "
@@ -619,6 +638,10 @@ def main() -> None:
             f"bf16ref_post_max={bf16ref_post_max:.3g} "
             f"bf16ref_comb_max={bf16ref_comb_max:.3g}"
         )
+    if args.print_samples:
+        line += " post_pre_samples_us=" + ",".join(
+            f"{sample:.2f}" for sample in fused_samples
+        )
     if args.compare_vllm:
         line += (
             " vllm_deep_gemm=True"
@@ -628,6 +651,10 @@ def main() -> None:
             f"vllm_post_max={vllm_post_max:.3g} vllm_comb_max={vllm_comb_max:.3g} "
             f"vllm_out_max={vllm_out_max:.3g} vllm_out_rmse={vllm_out_rmse:.3g}"
         )
+        if args.print_samples:
+            line += " vllm_post_pre_samples_us=" + ",".join(
+                f"{sample:.2f}" for sample in vllm_samples
+            )
     print(line)
 
 
