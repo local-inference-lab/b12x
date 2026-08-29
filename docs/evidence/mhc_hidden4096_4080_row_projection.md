@@ -1,8 +1,9 @@
-# Hidden-size-4096 mHC projection at 4080 live rows
+# Hidden-size-4096 multi-head connection projection at 4080 live rows
 
 Status: **qualified** for CUDA graph replay on SM120 with the software and
-hardware conditions recorded below. The result qualifies the mHC projection
-operation; it does not by itself predict end-to-end serving throughput.
+hardware conditions recorded below. The result qualifies the multi-head
+connection (mHC) projection operation; it does not by itself predict
+end-to-end serving throughput.
 
 ## Operation and revisions
 
@@ -112,9 +113,9 @@ The qualified arm reported output RMSE `4.76e-06`, projection maximum error
 | Comparison B | `m16n8k256s1wm1wn1`, one K split | 381.60 us | 378.53 us |
 
 The pooled comparison median is 381.60 us and the pooled qualified median is
-296.61 us. The qualified geometry reduces latency by 22.27%. Expressed in the
-opposite direction, fixed-work throughput is 1.2865 times the comparison arm,
-or 28.65% higher.
+296.58 us. The qualified geometry reduces latency by 22.28%. Expressed in the
+opposite direction, fixed-work throughput is 1.2867 times the comparison arm,
+or 28.67% higher.
 
 ### Raw replay samples in microseconds
 

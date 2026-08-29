@@ -26,7 +26,11 @@ from b12x.norm.mhc import _kernels as mhc_kernels
 
 
 def _resolved_mhc_prefill_tf32_chunk_min_tokens(hidden_size: int) -> int:
-    """Resolve the runtime threshold across both compared B12X revisions."""
+    """Return the effective runtime threshold for the requested hidden size.
+
+    B12X revisions with hidden-size-specific selection expose a resolver.
+    Revisions with only the global policy expose the threshold constant.
+    """
     resolver = getattr(mhc_kernels, "_mhc_prefill_tf32_chunk_min_tokens", None)
     if resolver is not None:
         return int(resolver(hidden_size))
