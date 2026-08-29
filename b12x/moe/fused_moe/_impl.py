@@ -157,6 +157,66 @@ _W13_LAYOUTS = {
 }
 
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
+_W4A8_COUPLED_OUTER_TRANSFORM_CACHE: dict[tuple[int, bool], object] = {}
+
+
+@triton.jit
+def _sanitize_w4a8_routing_kernel(
+    ids,
+    weights,
+    output_ids,
+    output_weights,
+    size,
+    num_experts,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < size
+    expert = tl.load(ids + offsets, mask=mask, other=-1)
+    weight = tl.load(weights + offsets, mask=mask, other=0.0)
+    valid = (expert >= 0) & (expert < num_experts)
+    tl.store(output_ids + offsets, tl.where(valid, expert, 0), mask=mask)
+    tl.store(output_weights + offsets, tl.where(valid, weight, 0.0), mask=mask)
+
+
+def sanitize_w4a8_routing(
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    output_ids: torch.Tensor,
+    output_weights: torch.Tensor,
+    *,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map inactive route sentinels to zero-id, zero-weight entries."""
+
+    if ids.dtype != torch.int32 or output_ids.dtype != torch.int32:
+        raise TypeError("W4A8 routing sanitizer requires int32 ids")
+    if weights.dtype != torch.float32 or output_weights.dtype != torch.float32:
+        raise TypeError("W4A8 routing sanitizer requires float32 weights")
+    if ids.shape != weights.shape or output_ids.shape != ids.shape:
+        raise ValueError("W4A8 routing sanitizer tensors must have equal shapes")
+    if output_weights.shape != ids.shape:
+        raise ValueError("W4A8 routing sanitizer output weights have wrong shape")
+    tensors = (ids, weights, output_ids, output_weights)
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("W4A8 routing sanitizer tensors must be contiguous")
+    if any(tensor.device != ids.device for tensor in tensors[1:]):
+        raise ValueError("W4A8 routing sanitizer tensors must share a device")
+    if int(num_experts) <= 0:
+        raise ValueError("W4A8 routing sanitizer requires num_experts > 0")
+    size = ids.numel()
+    block = 256
+    _sanitize_w4a8_routing_kernel[(triton.cdiv(size, block),)](
+        ids,
+        weights,
+        output_ids,
+        output_weights,
+        size,
+        int(num_experts),
+        BLOCK=block,
+        num_warps=4,
+    )
+    return output_ids, output_weights
 
 
 def _current_compute_capability() -> tuple[int, int] | None:
@@ -170,6 +230,275 @@ def _current_compute_capability() -> tuple[int, int] | None:
         capability = tuple(torch.cuda.get_device_capability(device_index))
         _DEVICE_CAPABILITY_CACHE[device_index] = capability
     return capability
+
+
+class _W4A8CoupledOuterTransform:
+    """Token-major coupled H512/H128 boundary transform for QSRT W4A8."""
+
+    def __init__(self, *, width: int, output_transform: bool):
+        if width <= 0 or width % 512:
+            raise ValueError("coupled outer transform width must be divisible by 512")
+        self.width = int(width)
+        self.output_transform = bool(output_transform)
+        self.cta_threads = 128
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return (self.width, self.output_transform, self.cta_threads)
+
+    @cute.jit
+    def __call__(
+        self,
+        input_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        scale_ptr: cute.Pointer,
+        active_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        elements = active_m * Int32(self.width)
+        input_flat = cute.make_tensor(
+            input_ptr, layout=cute.make_layout((elements,), stride=(1,))
+        )
+        output_flat = cute.make_tensor(
+            output_ptr, layout=cute.make_layout((elements,), stride=(1,))
+        )
+        scale_flat = cute.make_tensor(
+            scale_ptr,
+            layout=cute.make_layout((Int32(self.width),), stride=(1,)),
+        )
+        grid = (active_m * Int32(self.width // 512), 1, 1)
+        self.kernel(input_flat, output_flat, scale_flat).launch(
+            grid=grid,
+            block=[self.cta_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        input_flat: cute.Tensor,
+        output_flat: cute.Tensor,
+        scale_flat: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        unit = Int32(bidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        blocks_per_row = Int32(self.width // 512)
+        row = unit // blocks_per_row
+        block = unit - row * blocks_per_row
+        col0 = block * Int32(512) + warp * Int32(128) + lane * Int32(4)
+        base = row * Int32(self.width) + col0
+
+        v0 = cutlass.Float16(
+            input_flat[base + Int32(0)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v1 = cutlass.Float16(
+            input_flat[base + Int32(1)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v2 = cutlass.Float16(
+            input_flat[base + Int32(2)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v3 = cutlass.Float16(
+            input_flat[base + Int32(3)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+
+        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+        if cutlass.const_expr(self.output_transform):
+            h0 *= scale_flat[col0 + Int32(0)].to(cutlass.Float32)
+            h1 *= scale_flat[col0 + Int32(1)].to(cutlass.Float32)
+            h2 *= scale_flat[col0 + Int32(2)].to(cutlass.Float32)
+            h3 *= scale_flat[col0 + Int32(3)].to(cutlass.Float32)
+            h0, h1, h2, h3 = self._had128_quad(h0, h1, h2, h3, lane)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            values: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 512],
+                16,
+            ]
+
+        storage = smem.allocate(Storage)
+        shared = cute.make_tensor(
+            storage.values.data_ptr(), cute.make_layout((512,), stride=(1,))
+        )
+        shared_base = warp * Int32(128) + lane * Int32(4)
+        shared[shared_base + Int32(0)] = h0
+        shared[shared_base + Int32(1)] = h1
+        shared[shared_base + Int32(2)] = h2
+        shared[shared_base + Int32(3)] = h3
+        cute.arch.sync_threads()
+
+        c0 = self._cross_h4(shared, lane * Int32(4), warp)
+        c1 = self._cross_h4(shared, lane * Int32(4) + Int32(1), warp)
+        c2 = self._cross_h4(shared, lane * Int32(4) + Int32(2), warp)
+        c3 = self._cross_h4(shared, lane * Int32(4) + Int32(3), warp)
+
+        if cutlass.const_expr(not self.output_transform):
+            c0 = cutlass.Float16(
+                c0 * scale_flat[col0 + Int32(0)].to(cutlass.Float32)
+            ).to(cutlass.Float32)
+            c1 = cutlass.Float16(
+                c1 * scale_flat[col0 + Int32(1)].to(cutlass.Float32)
+            ).to(cutlass.Float32)
+            c2 = cutlass.Float16(
+                c2 * scale_flat[col0 + Int32(2)].to(cutlass.Float32)
+            ).to(cutlass.Float32)
+            c3 = cutlass.Float16(
+                c3 * scale_flat[col0 + Int32(3)].to(cutlass.Float32)
+            ).to(cutlass.Float32)
+            c0, c1, c2, c3 = self._had128_quad(c0, c1, c2, c3, lane)
+
+        output_flat[base + Int32(0)] = cutlass.BFloat16(c0)
+        output_flat[base + Int32(1)] = cutlass.BFloat16(c1)
+        output_flat[base + Int32(2)] = cutlass.BFloat16(c2)
+        output_flat[base + Int32(3)] = cutlass.BFloat16(c3)
+
+    @cute.jit
+    def _cross_h4(
+        self,
+        values: cute.Tensor,
+        offset: Int32,
+        warp: Int32,
+    ) -> cutlass.Float32:
+        a = values[offset + Int32(0)]
+        b = values[offset + Int32(128)]
+        c = values[offset + Int32(256)]
+        d = values[offset + Int32(384)]
+        result = a + b + c + d
+        if warp == Int32(1):
+            result = a - b + c - d
+        elif warp == Int32(2):
+            result = a + b - c - d
+        elif warp == Int32(3):
+            result = a - b - c + d
+        return result * cutlass.Float32(0.5)
+
+    @cute.jit
+    def _had128_quad(
+        self,
+        v0: cutlass.Float32,
+        v1: cutlass.Float32,
+        v2: cutlass.Float32,
+        v3: cutlass.Float32,
+        lane: Int32,
+    ):
+        s0 = v0 + v1
+        d0 = v0 - v1
+        s1 = v2 + v3
+        d1 = v2 - v3
+        h0 = s0 + s1
+        h1 = d0 + d1
+        h2 = s0 - s1
+        h3 = d0 - d1
+        for i in cutlass.range_constexpr(5):
+            step = 1 << i
+            p0 = cute.arch.shuffle_sync_bfly(h0, offset=step)
+            p1 = cute.arch.shuffle_sync_bfly(h1, offset=step)
+            p2 = cute.arch.shuffle_sync_bfly(h2, offset=step)
+            p3 = cute.arch.shuffle_sync_bfly(h3, offset=step)
+            if (lane & Int32(step)) != Int32(0):
+                h0 = p0 - h0
+                h1 = p1 - h1
+                h2 = p2 - h2
+                h3 = p3 - h3
+            else:
+                h0 = p0 + h0
+                h1 = p1 + h1
+                h2 = p2 + h2
+                h3 = p3 + h3
+        scale = cutlass.Float32(0.088388347648)
+        return h0 * scale, h1 * scale, h2 * scale, h3 * scale
+
+
+def run_w4a8_coupled_outer_transform(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    output_transform: bool,
+) -> torch.Tensor:
+    """Apply the shared pure-K2 QSRT boundary transform without allocation."""
+
+    if x.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+        raise TypeError("W4A8 coupled outer transform requires BF16 tensors")
+    if x.ndim != 2 or output.shape != x.shape:
+        raise ValueError("W4A8 coupled outer transform requires equal rank-2 tensors")
+    if (
+        not x.is_contiguous()
+        or not output.is_contiguous()
+        or output.device != x.device
+    ):
+        raise ValueError("W4A8 coupled outer transform requires contiguous tensors")
+    width = int(x.shape[1])
+    if width % 512:
+        raise ValueError("W4A8 coupled outer transform width must divide 512")
+    if (
+        scale.dtype != torch.float16
+        or scale.device != x.device
+        or not scale.is_contiguous()
+        or scale.numel() != width
+    ):
+        raise ValueError(
+            "W4A8 coupled outer scale must be contiguous FP16 with width elements"
+        )
+    key = (width, bool(output_transform))
+    compiled = _W4A8_COUPLED_OUTER_TRANSFORM_CACHE.get(key)
+    if compiled is None:
+        kernel = _W4A8CoupledOuterTransform(
+            width=width,
+            output_transform=bool(output_transform),
+        )
+        bf16_ptr = make_ptr(
+            cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        fp16_ptr = make_ptr(
+            cutlass.Float16, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        raise_if_kernel_resolution_frozen(
+            "cute.compile", target=kernel, cache_key=key
+        )
+        compiled = b12x_compile(
+            kernel,
+            bf16_ptr,
+            bf16_ptr,
+            fp16_ptr,
+            Int32(1),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "integration.tp_moe.w4a8_coupled_outer",
+                1,
+                key,
+            ),
+        )
+        _W4A8_COUPLED_OUTER_TRANSFORM_CACHE[key] = compiled
+    compiled(
+        make_ptr(
+            cutlass.BFloat16,
+            x.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.BFloat16,
+            output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float16,
+            scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        int(x.shape[0]),
+        current_cuda_stream(),
+    )
+    return output
 
 
 @dataclass(kw_only=True)
@@ -1521,6 +1850,7 @@ def _select_dynamic_tile_mn(
     num_experts: int,
     activation: str = "silu",
     compute_capability: tuple[int, int] | None = None,
+    trellis: bool = False,
 ) -> Tuple[int, int]:
     """Tile planner for the dynamic kernel.
 
@@ -1586,7 +1916,10 @@ def _select_dynamic_tile_mn(
         if routed_rows >= 36 * num_experts:
             return (64, _LEVEL_TILE_N)
         if routed_rows > 16 * num_experts:
-            return (32, _LEVEL_TILE_N)
+            # Trellis materialization only has M64/M128 phase kernels, while
+            # its M32 monolithic fallback can exceed the cooperative launch
+            # residency limit. Keep the whole mid-band on the valid M64 path.
+            return (64 if trellis else 32, _LEVEL_TILE_N)
         return (16, _LEVEL_TILE_N)
     activation = _get_activation_kernel_spec(
         activation, quant_mode=quant_mode
@@ -1773,6 +2106,7 @@ def _w4a8_dynamic_materialized_enabled(
     w4a8_repacked: bool,
     share_input_across_experts: bool,
     deterministic_output: bool,
+    trellis_bits: int = 0,
 ) -> bool:
     """Resolve the complete unified-W4A8 specialization as one decision."""
 
@@ -1802,6 +2136,19 @@ def _w4a8_dynamic_materialized_enabled(
         )
     )
     candidate = dense_candidate or m1_candidate
+    if candidate and trellis_bits > 0:
+        # The trellis-native materialized phase kernels compile only for the
+        # M64/M128 tilers; mid-band (32, 128) shapes must stay monolithic.
+        tile = _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=num_experts,
+            activation=activation,
+            trellis=True,
+        )
+        if tile not in {(64, 128), (128, 128)}:
+            candidate = False
     return bool(
         candidate
         and w4a8_repacked
@@ -2141,6 +2488,63 @@ def _dynamic_task_geometry(
     )
     max_tasks = max_m_tiles * slice_groups
     return max_m_tiles, gate_tile_cnt, max_tasks
+
+
+def _dynamic_capacity_geometry(
+    *,
+    max_tokens: int,
+    num_topk: int,
+    num_experts: int,
+    n: int,
+    quant_mode: str,
+    activation: str,
+    deterministic_output: bool,
+    trellis: bool,
+) -> tuple[int, int]:
+    """Size one dynamic workspace for every token count in its capacity.
+
+    Dynamic tile selection is not monotonic in storage: a smaller request can
+    select M16 and require more physical tiles than a max-capacity request
+    planned with M64. Frozen serving workspaces must therefore reserve the
+    envelope across all reachable token counts, not just the endpoint.
+    """
+    max_physical_tiles = 1
+    max_tasks = 1
+    for token_count in range(1, max(int(max_tokens), 1) + 1):
+        routed_rows = token_count * int(num_topk)
+        tile_m, tile_n = _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=num_experts,
+            activation=activation,
+            trellis=trellis,
+        )
+        physical_tiles, gate_tile_cnt, task_capacity = _dynamic_task_geometry(
+            num_experts,
+            n,
+            routed_rows,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        )
+        if _dynamic_direct_routing_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=num_experts,
+            n=n,
+            deterministic_output=deterministic_output,
+        ):
+            direct_groups = max(
+                1,
+                (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1)
+                // _DYNAMIC_SLICE_CHUNK,
+            )
+            physical_tiles = max(physical_tiles, routed_rows)
+            task_capacity = max(task_capacity, routed_rows * direct_groups)
+        max_physical_tiles = max(max_physical_tiles, physical_tiles)
+        max_tasks = max(max_tasks, task_capacity)
+    return max_physical_tiles, max_tasks
 
 
 def _refresh_dynamic_workspace_scales(
@@ -2978,34 +3382,23 @@ def _plan_core_workspace(
         quant_mode,
         num_experts=state_E,
         activation=activation_spec.activation,
+        trellis=(
+            quant_mode == "w4a8_mx" and source_format in _TRELLIS_SOURCE_FORMATS
+        ),
     )
     if dynamic_physical_tiles is None or dynamic_task_capacity is None:
-        dynamic_tiles, _, dynamic_max_tasks = _dynamic_task_geometry(
-            state_E,
-            dynamic_kernel_n,
-            routed_rows,
-            tile_m=dynamic_tile_m,
-            tile_n=dynamic_tile_n,
-        )
-        if _dynamic_direct_routing_candidate(
-            quant_mode=quant_mode,
-            activation=activation_spec.activation,
-            routed_rows=routed_rows,
+        dynamic_tiles, dynamic_max_tasks = _dynamic_capacity_geometry(
+            max_tokens=(routed_rows + num_topk - 1) // num_topk,
+            num_topk=num_topk,
             num_experts=state_E,
             n=dynamic_kernel_n,
+            quant_mode=quant_mode,
+            activation=activation_spec.activation,
             deterministic_output=False,
-        ):
-            direct_groups = max(
-                1,
-                (
-                    (dynamic_kernel_n + dynamic_tile_n - 1) // dynamic_tile_n
-                    + _DYNAMIC_SLICE_CHUNK
-                    - 1
-                )
-                // _DYNAMIC_SLICE_CHUNK,
-            )
-            dynamic_tiles = max(dynamic_tiles, routed_rows)
-            dynamic_max_tasks = max(dynamic_max_tasks, routed_rows * direct_groups)
+            trellis=(
+                quant_mode == "w4a8_mx" and source_format in _TRELLIS_SOURCE_FORMATS
+            ),
+        )
     else:
         dynamic_tiles = dynamic_physical_tiles
         dynamic_max_tasks = dynamic_task_capacity
@@ -5733,7 +6126,6 @@ def _band_runs_direct_micro(
         m=num_tokens, k=k, n=n, num_topk=num_topk, weight_E=weight_E
     )
 
-
 def _resolve_workspace_layout(
     *,
     num_tokens: int,
@@ -5796,6 +6188,7 @@ def _resolve_workspace_layout(
                     quant_mode,
                     num_experts=weight_E,
                     activation=activation,
+                    trellis=True,
                 )
                 return "dynamic", weight_E, align_up(routed_rows, tile_m)
             if _tiny_decode_enabled() and _tiny_decode_supports(
@@ -5950,32 +6343,26 @@ def plan_tp_moe_execution(
             quant_mode,
             num_experts=state_E,
             activation=activation,
+            trellis=(
+                quant_mode == "w4a8_mx"
+                and weight_plan.w4a8_weight_layout == "trellis3_t256"
+            ),
         )
-        dynamic_physical_tiles, gate_tile_cnt, dynamic_task_capacity = (
-            _dynamic_task_geometry(
-                state_E,
-                dynamic_kernel_n,
-                routed_rows,
-                tile_m=dynamic_tile_m,
-                tile_n=dynamic_tile_n,
+        dynamic_physical_tiles, dynamic_task_capacity = (
+            _dynamic_capacity_geometry(
+                max_tokens=num_tokens,
+                num_topk=num_topk,
+                num_experts=state_E,
+                n=dynamic_kernel_n,
+                quant_mode=quant_mode,
+                activation=activation,
+                deterministic_output=False,
+                trellis=(
+                    quant_mode == "w4a8_mx"
+                    and weight_plan.w4a8_weight_layout == "trellis3_t256"
+                ),
             )
         )
-        if _dynamic_direct_routing_candidate(
-            quant_mode=quant_mode,
-            activation=activation,
-            routed_rows=routed_rows,
-            num_experts=state_E,
-            n=dynamic_kernel_n,
-            deterministic_output=False,
-        ):
-            direct_groups = max(
-                1,
-                (gate_tile_cnt + _DYNAMIC_SLICE_CHUNK - 1) // _DYNAMIC_SLICE_CHUNK,
-            )
-            dynamic_physical_tiles = max(dynamic_physical_tiles, routed_rows)
-            dynamic_task_capacity = max(
-                dynamic_task_capacity, routed_rows * direct_groups
-            )
         max_tokens_per_launch = _dynamic_token_chunk_limit(
             weight_E,
             k,
@@ -9057,6 +9444,7 @@ def _get_dynamic_kernel(
         quant_mode,
         num_experts=E,
         activation=activation_spec.activation,
+        trellis=int(trellis_bits) > 0,
     )
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
@@ -9069,6 +9457,7 @@ def _get_dynamic_kernel(
         w4a8_repacked=w4a8_repacked,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
+        trellis_bits=int(trellis_bits),
     )
     # Gated FC1 swap_ab: a non-128 (but 32-aligned) per-shard intermediate needs
     # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
@@ -9565,6 +9954,7 @@ def _launch_dynamic_flat(
         quant_mode,
         num_experts=E,
         activation=activation,
+        trellis=int(trellis_bits) > 0,
     )[0]
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
@@ -9577,6 +9967,7 @@ def _launch_dynamic_flat(
         w4a8_repacked=w4a8_repacked,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
+        trellis_bits=int(trellis_bits),
     )
     if materialize_intermediate:
         required_intermediate_bytes = (
@@ -9730,6 +10121,7 @@ def _launch_dynamic_flat(
             quant_mode,
             num_experts=E,
             activation=activation,
+            trellis=int(trellis_bits) > 0,
         )[0],
         task_capacity,
         physical_tiles_capacity,
