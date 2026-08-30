@@ -59,11 +59,27 @@ _SUPERTILE_K_ENV = "B12X_DSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
 
 
-def _resolve_smem_candidate_capacity(*, topk: int, device: torch.device) -> int:
-    capability = torch.cuda.get_device_capability(device)
+@lru_cache(maxsize=32)
+def _resolve_smem_candidate_capacity_for_device(
+    topk: int,
+    device_index: int,
+) -> int:
+    """Resolve immutable selector geometry once per device and top-k."""
+    capability = torch.cuda.get_device_capability(device_index)
     if capability == (12, 0) and int(topk) == 512:
         return _SM120_TOPK512_SMEM_CANDIDATES
     return _DEFAULT_SMEM_CANDIDATES
+
+
+def _resolve_smem_candidate_capacity(*, topk: int, device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError(
+            f"top-k candidate capacity requires a CUDA device, got {device}"
+        )
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _resolve_smem_candidate_capacity_for_device(int(topk), int(device_index))
 
 
 @dsl_user_op
@@ -1319,6 +1335,7 @@ def _build_row_topk_kernel(
 def clear_tiled_topk_kernel_cache() -> None:
     _build_tiled_topk_kernel.cache_clear()
     _build_row_topk_kernel.cache_clear()
+    _resolve_smem_candidate_capacity_for_device.cache_clear()
 
 
 def _validate_supported_topk(topk: int, *, caller: str) -> int:
