@@ -347,6 +347,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--indices-only",
+        action="store_true",
+        help="omit final top-k score output, matching sparse-attention serving",
+    )
+    parser.add_argument(
         "--nsys-capture",
         action="store_true",
         help="bracket one warmed graph replay with cudaProfilerStart/Stop",
@@ -358,6 +363,9 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=91_100)
     args = parser.parse_args()
+
+    if args.check and args.indices_only:
+        raise ValueError("--check requires score output and cannot use --indices-only")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -662,7 +670,7 @@ def main() -> None:
                 num_heads=num_heads,
                 topk=topk,
                 out_indices=out_indices,
-                out_values=out_scores,
+                out_values=None if args.indices_only else out_scores,
                 ctas_per_group=fused_ctas,
                 merge_threshold=(
                     None
@@ -683,7 +691,7 @@ def main() -> None:
             topk=topk,
             expected_num_q_heads=num_heads,
             out_indices=out_indices,
-            out_scores=out_scores,
+            out_scores=None if args.indices_only else out_scores,
             supertile_k=supertile_k,
         )
 
@@ -889,6 +897,7 @@ def main() -> None:
         f"requested_supertile_k={requested_supertile_k} "
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
         f"input_pattern={'analytic' if args.check else args.input_pattern} "
+        f"indices_only={bool(args.indices_only)} "
         f"scratch_mib={plan.layout.nbytes / (1024 * 1024):.2f} "
         f"output_shape={tuple(out.shape)} correctness={oracle_state} "
         f"median_us={median_us:.2f} min_us={min_us:.2f}"

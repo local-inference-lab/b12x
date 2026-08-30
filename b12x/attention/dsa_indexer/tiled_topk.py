@@ -538,6 +538,7 @@ class DSATiledTopkKernel:
         output_physical_slots: bool = False,
         extent_splits: int = 1,
         smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
+        write_values: bool = True,
     ):
         self.extent_splits = int(extent_splits)
         self.is_tiled = is_tiled
@@ -553,6 +554,7 @@ class DSATiledTopkKernel:
         self.is_first = bool(is_first)
         self.output_physical_slots = bool(output_physical_slots)
         self.smem_candidate_capacity = int(smem_candidate_capacity)
+        self.write_values = bool(write_values)
         if self.smem_candidate_capacity < self.topk:
             raise ValueError(
                 "shared candidate capacity must cover top-k output capacity, got "
@@ -769,23 +771,24 @@ class DSATiledTopkKernel:
             i = Int32(tx)
             while i < topk_static:
                 is_valid = i < total_len
-                values[out_base + i] = (
-                    _load_value_virtual(
-                        input_tensor,
-                        carry_values,
-                        row_base,
-                        row_start,
-                        out_base,
-                        length,
-                        i,
-                        self.block_q,
-                        self.block_k,
-                        self.is_tiled,
-                        self.is_first,
+                if cutlass.const_expr(self.write_values):
+                    values[out_base + i] = (
+                        _load_value_virtual(
+                            input_tensor,
+                            carry_values,
+                            row_base,
+                            row_start,
+                            out_base,
+                            length,
+                            i,
+                            self.block_q,
+                            self.block_k,
+                            self.is_tiled,
+                            self.is_first,
+                        )
+                        if is_valid
+                        else Float32(float("-inf"))
                     )
-                    if is_valid
-                    else Float32(float("-inf"))
-                )
                 indices[out_base + i] = (
                     _emit_global_index_virtual(
                         carry_indices,
@@ -1196,19 +1199,20 @@ class DSATiledTopkKernel:
             idx0 = Int32(tx)
             if idx0 < topk_static:
                 selected0 = Int32(s_out[idx0])
-                values[out_base + idx0] = _load_value_virtual(
-                    input_tensor,
-                    carry_values,
-                    row_base,
-                    row_start,
-                    out_base,
-                    length,
-                    selected0,
-                    self.block_q,
-                    self.block_k,
-                    self.is_tiled,
-                    self.is_first,
-                )
+                if cutlass.const_expr(self.write_values):
+                    values[out_base + idx0] = _load_value_virtual(
+                        input_tensor,
+                        carry_values,
+                        row_base,
+                        row_start,
+                        out_base,
+                        length,
+                        selected0,
+                        self.block_q,
+                        self.block_k,
+                        self.is_tiled,
+                        self.is_first,
+                    )
                 indices[out_base + idx0] = _emit_global_index_virtual(
                     carry_indices,
                     output_page_table,
@@ -1226,19 +1230,20 @@ class DSATiledTopkKernel:
             idx1 = idx0 + Int32(_THREADS_PER_CTA)
             if idx1 < topk_static:
                 selected1 = Int32(s_out[idx1])
-                values[out_base + idx1] = _load_value_virtual(
-                    input_tensor,
-                    carry_values,
-                    row_base,
-                    row_start,
-                    out_base,
-                    length,
-                    selected1,
-                    self.block_q,
-                    self.block_k,
-                    self.is_tiled,
-                    self.is_first,
-                )
+                if cutlass.const_expr(self.write_values):
+                    values[out_base + idx1] = _load_value_virtual(
+                        input_tensor,
+                        carry_values,
+                        row_base,
+                        row_start,
+                        out_base,
+                        length,
+                        selected1,
+                        self.block_q,
+                        self.block_k,
+                        self.is_tiled,
+                        self.is_first,
+                    )
                 indices[out_base + idx1] = _emit_global_index_virtual(
                     carry_indices,
                     output_page_table,
@@ -1265,6 +1270,7 @@ def _build_tiled_topk_kernel(
     output_physical_slots: bool = False,
     extent_splits: int = 1,
     smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
+    write_values: bool = True,
 ):
     return DSATiledTopkKernel(
         is_tiled=True,
@@ -1276,6 +1282,7 @@ def _build_tiled_topk_kernel(
         output_physical_slots=output_physical_slots,
         extent_splits=extent_splits,
         smem_candidate_capacity=smem_candidate_capacity,
+        write_values=write_values,
     )
 
 
@@ -1284,6 +1291,7 @@ def _build_row_topk_kernel(
     topk: int,
     output_physical_slots: bool = False,
     smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
+    write_values: bool = True,
 ):
     return DSATiledTopkKernel(
         is_tiled=False,
@@ -1293,6 +1301,7 @@ def _build_row_topk_kernel(
         zero_row_start=True,
         output_physical_slots=output_physical_slots,
         smem_candidate_capacity=smem_candidate_capacity,
+        write_values=write_values,
     )
 
 
@@ -1335,7 +1344,14 @@ def run_tiled_topk(
     extent_splits: int = 1,
     output_row_stride: int | None = None,
     output_row_base: int = 0,
+    write_values: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select tiled row top-k indices and optionally materialize their scores.
+
+    ``write_values=False`` leaves ``output_values`` untouched. It is valid when
+    the caller consumes only indices; carry-producing launches must keep value
+    writes enabled because later folds read the selected scores.
+    """
     topk = _validate_supported_topk(topk, caller="run_tiled_topk")
     extent_splits = int(extent_splits)
     if extent_splits > 1:
@@ -1530,6 +1546,7 @@ def run_tiled_topk(
         bool(output_physical_slots),
         extent_splits,
         smem_candidate_capacity,
+        bool(write_values),
     )
     input_key_tensor = tile_logits
     lengths_key_tensor = lengths
@@ -1583,7 +1600,7 @@ def run_tiled_topk(
             "output_page_table", output_page_table_key_tensor, dynamic=True
         ),
         (
-            "tiled_topk_v28_smem_candidate_policy",
+            "tiled_topk_v29_optional_value_output",
             topk,
             block_q,
             block_k,
@@ -1592,6 +1609,7 @@ def run_tiled_topk(
             bool(output_physical_slots),
             extent_splits,
             smem_candidate_capacity,
+            bool(write_values),
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
@@ -1628,13 +1646,15 @@ def run_row_topk(
     output_indices: torch.Tensor | None = None,
     output_index_offset: int = 0,
     output_gather_table: torch.Tensor | None = None,
+    write_values: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact row-wise topk over a dense row-major logits tile.
 
-    output_gather_table: optional int32 (rows, width) table; selected logical
-    positions are remapped through it (out = table[row, pos]), turning the
-    pass into a fold over (value, index) candidate pairs. Padded candidates
-    (-inf value, -1 index) propagate -1 naturally.
+    ``output_gather_table`` is an optional int32 ``(rows, width)`` table. Selected
+    logical positions are remapped through it, turning the pass into a fold over
+    value-index candidate pairs. Padded candidates propagate ``-1`` naturally.
+    ``write_values=False`` leaves ``output_values`` untouched for indices-only
+    consumers.
     """
     topk = _validate_supported_topk(topk, caller="run_row_topk")
     if row_logits.ndim != 2:
@@ -1722,6 +1742,7 @@ def run_row_topk(
         topk,
         output_gather_table is not None,
         smem_candidate_capacity,
+        bool(write_values),
     )
     input_key_tensor = row_logits
     lengths_key_tensor = lengths
@@ -1771,10 +1792,11 @@ def run_row_topk(
             "output_gather_table", output_gather_table_for_kernel, dynamic=True
         ),
         (
-            "row_topk_v8_smem_candidate_policy",
+            "row_topk_v9_optional_value_output",
             topk,
             output_gather_table is not None,
             smem_candidate_capacity,
+            bool(write_values),
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
