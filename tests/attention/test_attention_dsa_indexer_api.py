@@ -1601,9 +1601,11 @@ def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
         (rows, width), generator=generator, dtype=torch.float32
     ).to(device)
     row_logits.masked_fill_(~live_mask, float("-inf"))
-    gather_table = torch.arange(width, dtype=torch.int32, device=device).expand(
-        rows, -1
-    ).contiguous()
+    gather_table = (
+        torch.arange(width, dtype=torch.int32, device=device)
+        .expand(rows, -1)
+        .contiguous()
+    )
     gather_table.masked_fill_(~live_mask, -1)
     lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
     output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)

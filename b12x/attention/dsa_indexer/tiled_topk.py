@@ -1147,7 +1147,9 @@ class DSATiledTopkKernel:
                                                 if cutlass.const_expr(r_idx_next_is_0)
                                                 else _smem_xadd(ni1, Int32(0), Int32(1))
                                             )
-                                            if cand_pos < Int32(smem_candidate_capacity):
+                                            if cand_pos < Int32(
+                                                smem_candidate_capacity
+                                            ):
                                                 if cutlass.const_expr(r_idx_next_is_0):
                                                     s_cand0[cand_pos] = c_idx
                                                 else:

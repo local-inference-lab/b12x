@@ -473,9 +473,9 @@ def main() -> None:
         )
         if args.input_pattern == "random":
             k_source = (
-                torch.randn(
-                    (cache_tokens, 128), generator=gen, dtype=torch.float32
-                ).to(device)
+                torch.randn((cache_tokens, 128), generator=gen, dtype=torch.float32).to(
+                    device
+                )
                 / 3
             )
         else:
