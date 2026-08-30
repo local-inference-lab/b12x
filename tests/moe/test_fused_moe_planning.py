@@ -120,6 +120,104 @@ def _mapped_packed_caps() -> fused_moe.Caps:
     )
 
 
+def _w4a8_prequantized_caps() -> fused_moe.Caps:
+    weight_plan = fused_moe.plan_weights(
+        quant_modes="w4a8_mx",
+        source_format="qsrt_sqg_e4m3",
+        activation="situ",
+        params_dtype=torch.bfloat16,
+        num_experts=896,
+        hidden_size=3584,
+        intermediate_size=384,
+        trellis_bits=2,
+        trellis_tile_config=(128, 128, 128, 128),
+        qsrt_storage_format="qsrt_atoms_v2",
+        qsrt_profile="k2_coupled_h512_h128",
+        coupled_hadamard=True,
+    )
+    return fused_moe.Caps(
+        max_tokens=3080,
+        num_topk=16,
+        route_num_experts=896,
+        device="cpu",
+        weight_plan=weight_plan,
+        quant_mode="w4a8_mx",
+        prequantized_input=True,
+    )
+
+
+def test_prequantized_w4a8_plan_uses_external_input_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+
+    plan = fused_moe.plan(_w4a8_prequantized_caps())
+    specs = {spec.name: spec for spec in plan._core_workspace_plan.tensor_specs}
+
+    assert plan.caps.prequantized_input
+    assert plan._core_workspace_plan.prequantized_input
+    assert torch.Size(specs["packed_input"].shape).numel() == 1
+    assert torch.Size(specs["packed_input_scale"].shape).numel() == 1
+    assert not plan.supports_prequantized_input(896)
+    assert plan.supports_prequantized_input(897)
+    assert plan.supports_prequantized_input(3080)
+
+
+def test_prequantized_input_rejects_w4a16() -> None:
+    with pytest.raises(ValueError, match="requires quant_mode='w4a8_mx'"):
+        fused_moe.Caps(
+            max_tokens=64,
+            num_topk=8,
+            route_num_experts=160,
+            device="cpu",
+            weight_plan=_weight_plan(),
+            quant_mode="w4a16",
+            prequantized_input=True,
+        )
+
+
+def test_prequantized_plan_requires_external_values_and_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    plan = fused_moe.plan(_w4a8_prequantized_caps())
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.zeros(scratch_spec.shape, dtype=scratch_spec.dtype)
+
+    with pytest.raises(ValueError, match="requires external MXFP8 values and scales"):
+        plan.bind(
+            scratch=scratch,
+            a=torch.zeros((8, 1024), dtype=torch.bfloat16),
+            experts=object(),
+            topk_weights=torch.zeros((8, 4), dtype=torch.float32),
+            topk_ids=torch.zeros((8, 4), dtype=torch.int32),
+            a_prequant=None,
+            a_prequant_scale=None,
+        )
+
+
+def test_prequantized_plan_rejects_nonmatrix_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 188)
+    plan = fused_moe.plan(_w4a8_prequantized_caps())
+    scratch_spec = plan.scratch_specs()[0]
+    scratch = torch.zeros(scratch_spec.shape, dtype=scratch_spec.dtype)
+
+    with pytest.raises(ValueError, match="rank-2 input"):
+        plan.bind(
+            scratch=scratch,
+            a=torch.zeros((1024,), dtype=torch.bfloat16),
+            experts=object(),
+            topk_weights=torch.zeros((1, 4), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 4), dtype=torch.int32),
+            a_prequant=torch.zeros((1024,), dtype=torch.float8_e4m3fn),
+            a_prequant_scale=torch.zeros(
+                (1, 32), dtype=torch.float8_e8m0fnu
+            ),
+        )
+
+
 def test_required_nbytes_avoids_launch_prewarm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

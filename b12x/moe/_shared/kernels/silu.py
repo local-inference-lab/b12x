@@ -88,6 +88,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
+        prequantized_input: bool = False,
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
@@ -111,6 +112,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
+            prequantized_input=prequantized_input,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
@@ -190,6 +192,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
         direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
+        prequantized_input: bool = False,
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
@@ -210,6 +213,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
             direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
+            prequantized_input=prequantized_input,
             swiglu_limit=normalize_swiglu_limit_for_activation(
                 activation, swiglu_limit
             ),

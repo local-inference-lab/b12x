@@ -26,6 +26,8 @@ from b12x._lib.compiler import (
 from b12x._lib.intrinsics import (
     align_up,
     as_grouped_scale_view,
+    max_abs_32,
+    quantize_block_fp8_mx,
 )
 from b12x._lib.utils import (
     current_cuda_stream,
@@ -50,6 +52,9 @@ from b12x.moe._shared.kernels.silu import (
 from b12x.moe._shared.kernels.situ import (
     MoEDynamicKernelSitu,
     MoEMicroKernelSitu,
+)
+from b12x.moe._shared.kernels.w4a8_trellis_decode import (
+    _w4a8_trellis_permute_k32,
 )
 from b12x.moe._shared.kernels.activations import (
     SITU,
@@ -158,6 +163,7 @@ _W13_LAYOUTS = {
 
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
 _W4A8_COUPLED_OUTER_TRANSFORM_CACHE: dict[tuple[int, bool], object] = {}
+_W4A8_COUPLED_OUTER_MXFP8_CACHE: dict[int, object] = {}
 
 
 @triton.jit
@@ -499,6 +505,269 @@ def run_w4a8_coupled_outer_transform(
         current_cuda_stream(),
     )
     return output
+
+
+class _W4A8CoupledOuterTransformMXFP8:
+    """Coupled input transform with a token-major MXFP8 epilogue."""
+
+    _cross_h4 = _W4A8CoupledOuterTransform._cross_h4
+    _had128_quad = _W4A8CoupledOuterTransform._had128_quad
+
+    def __init__(self, *, width: int):
+        self.width = int(width)
+        if self.width <= 0 or self.width % 512 != 0:
+            raise ValueError("W4A8 coupled outer transform width must be 512-aligned")
+        self.blocks_per_row = self.width // 512
+        self.cta_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        input_ptr: cute.Pointer,
+        values_ptr: cute.Pointer,
+        scale_rows_ptr: cute.Pointer,
+        scale_ptr: cute.Pointer,
+        active_m: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        elements = active_m * Int32(self.width)
+        input_flat = cute.make_tensor(
+            input_ptr, layout=cute.make_layout((elements,), stride=(1,))
+        )
+        values_u32 = cute.make_tensor(
+            values_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.width // 4),), stride=(1,)
+            ),
+        )
+        scale_rows = cute.make_tensor(
+            scale_rows_ptr,
+            layout=cute.make_layout(
+                (active_m * Int32(self.width // 32),), stride=(1,)
+            ),
+        )
+        scale_flat = cute.make_tensor(
+            scale_ptr,
+            layout=cute.make_layout((Int32(self.width),), stride=(1,)),
+        )
+        grid = (active_m * Int32(self.width // 512), 1, 1)
+        self.kernel(input_flat, values_u32, scale_rows, scale_flat).launch(
+            grid=grid,
+            block=[self.cta_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        input_flat: cute.Tensor,
+        values_u32: cute.Tensor,
+        scale_rows: cute.Tensor,
+        scale_flat: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        unit = Int32(bidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        blocks_per_row = Int32(self.width // 512)
+        row = unit // blocks_per_row
+        block = unit - row * blocks_per_row
+        col0 = block * Int32(512) + warp * Int32(128) + lane * Int32(4)
+        base = row * Int32(self.width) + col0
+
+        v0 = cutlass.Float16(
+            input_flat[base + Int32(0)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v1 = cutlass.Float16(
+            input_flat[base + Int32(1)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v2 = cutlass.Float16(
+            input_flat[base + Int32(2)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        v3 = cutlass.Float16(
+            input_flat[base + Int32(3)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            values: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 512],
+                16,
+            ]
+
+        storage = smem.allocate(Storage)
+        shared = cute.make_tensor(
+            storage.values.data_ptr(), cute.make_layout((512,), stride=(1,))
+        )
+        shared_base = warp * Int32(128) + lane * Int32(4)
+        shared[shared_base + Int32(0)] = h0
+        shared[shared_base + Int32(1)] = h1
+        shared[shared_base + Int32(2)] = h2
+        shared[shared_base + Int32(3)] = h3
+        cute.arch.sync_threads()
+
+        c0 = self._cross_h4(shared, lane * Int32(4), warp)
+        c1 = self._cross_h4(shared, lane * Int32(4) + Int32(1), warp)
+        c2 = self._cross_h4(shared, lane * Int32(4) + Int32(2), warp)
+        c3 = self._cross_h4(shared, lane * Int32(4) + Int32(3), warp)
+        c0 = cutlass.Float16(
+            c0 * scale_flat[col0 + Int32(0)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        c1 = cutlass.Float16(
+            c1 * scale_flat[col0 + Int32(1)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        c2 = cutlass.Float16(
+            c2 * scale_flat[col0 + Int32(2)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        c3 = cutlass.Float16(
+            c3 * scale_flat[col0 + Int32(3)].to(cutlass.Float32)
+        ).to(cutlass.Float32)
+        c0, c1, c2, c3 = self._had128_quad(c0, c1, c2, c3, lane)
+
+        # Match the two-stage path's BF16 materialization before MXFP8 packing.
+        cute.arch.sync_threads()
+        shared[shared_base + Int32(0)] = cutlass.BFloat16(c0).to(
+            cutlass.Float32
+        )
+        shared[shared_base + Int32(1)] = cutlass.BFloat16(c1).to(
+            cutlass.Float32
+        )
+        shared[shared_base + Int32(2)] = cutlass.BFloat16(c2).to(
+            cutlass.Float32
+        )
+        shared[shared_base + Int32(3)] = cutlass.BFloat16(c3).to(
+            cutlass.Float32
+        )
+        cute.arch.sync_threads()
+
+        subgroup = lane >> Int32(3)
+        lane8 = lane & Int32(7)
+        if lane8 == Int32(0):
+            group_base = warp * Int32(128) + subgroup * Int32(32)
+            group_values = cute.make_rmem_tensor((32,), cutlass.Float32)
+            for elem in cutlass.range_constexpr(32):
+                group_values[elem] = shared[group_base + Int32(elem)]
+            block_max = max_abs_32(group_values)
+            payload, scale_byte = quantize_block_fp8_mx(
+                _w4a8_trellis_permute_k32(group_values), block_max
+            )
+            group = block * Int32(16) + warp * Int32(4) + subgroup
+            word_base = row * Int32(self.width // 4) + group * Int32(8)
+            for word in cutlass.range_constexpr(8):
+                values_u32[word_base + Int32(word)] = payload[word]
+            scale_rows[row * Int32(self.width // 32) + group] = cutlass.Uint8(
+                scale_byte
+            )
+
+
+def run_w4a8_coupled_outer_transform_mxfp8(
+    x: torch.Tensor,
+    values: torch.Tensor,
+    scale_rows: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transform BF16 QSRT rows directly into token-major MXFP8 storage."""
+
+    if x.dtype != torch.bfloat16:
+        raise TypeError("W4A8 coupled MXFP8 transform requires BF16 input")
+    if values.dtype != torch.float8_e4m3fn:
+        raise TypeError("W4A8 coupled MXFP8 transform requires E4M3 values")
+    if scale_rows.dtype != torch.float8_e8m0fnu:
+        raise TypeError("W4A8 coupled MXFP8 transform requires E8M0 row scales")
+    if x.ndim != 2 or values.shape != x.shape:
+        raise ValueError("W4A8 coupled MXFP8 values must match input [M,K]")
+    width = int(x.shape[1])
+    if width % 512:
+        raise ValueError("coupled MXFP8 transform width must be divisible by 512")
+    if scale_rows.shape != (int(x.shape[0]), width // 32):
+        raise ValueError(
+            "W4A8 coupled MXFP8 row scales must have shape [M,K/32]"
+        )
+    tensors = (x, values, scale_rows, scale)
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("W4A8 coupled MXFP8 tensors must be contiguous")
+    if any(tensor.device != x.device for tensor in tensors[1:]):
+        raise ValueError("W4A8 coupled MXFP8 tensors must share a device")
+    if scale.dtype != torch.float16 or scale.numel() != width:
+        raise ValueError(
+            "W4A8 coupled MXFP8 transform requires FP16 width scale"
+        )
+
+    compiled = _W4A8_COUPLED_OUTER_MXFP8_CACHE.get(width)
+    if compiled is None:
+        kernel = _W4A8CoupledOuterTransformMXFP8(width=width)
+        raise_if_kernel_resolution_frozen(
+            "cute.compile", target=kernel, cache_key=(width,)
+        )
+        compiled = b12x_compile(
+            kernel,
+            make_ptr(
+                cutlass.BFloat16,
+                16,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint32,
+                16,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint8,
+                16,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Float16,
+                16,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            Int32(1),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "integration.tp_moe.w4a8_coupled_outer_mxfp8",
+                1,
+                (width,),
+            ),
+        )
+        _W4A8_COUPLED_OUTER_MXFP8_CACHE[width] = compiled
+    compiled(
+        make_ptr(
+            cutlass.BFloat16,
+            x.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint32,
+            values.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8,
+            scale_rows.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Float16,
+            scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        int(x.shape[0]),
+        current_cuda_stream(),
+    )
+    return values, scale_rows
 
 
 @dataclass(kw_only=True)
@@ -1026,6 +1295,7 @@ class _TPCoreWorkspacePlan:
     device: torch.device
     dtype: torch.dtype
     deterministic_output: bool = False
+    prequantized_input: bool = False
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
     full_rotation: bool = False
@@ -1099,6 +1369,7 @@ class TPMoEScratchCaps:
     swiglu_beta: float | None = None
     collect_activation_amax: bool = False
     deterministic_output: bool | None = None
+    prequantized_input: bool = False
     w4a16_block_size_m: int | None = None
     w4a16_fast_math: bool = True
     frozen: bool = True
@@ -1118,6 +1389,10 @@ class TPMoEScratchCaps:
                 f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
+        prequantized_input = bool(self.prequantized_input)
+        if prequantized_input and quant_mode != "w4a8_mx":
+            raise ValueError("prequantized input requires quant_mode='w4a8_mx'")
+        object.__setattr__(self, "prequantized_input", prequantized_input)
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -1221,6 +1496,27 @@ class TPMoEScratchPlan:
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
+    def supports_prequantized_input(self, num_tokens: int) -> bool:
+        """Whether this exact token count can consume token-major MXFP8."""
+        num_tokens = int(num_tokens)
+        if not self.caps.prequantized_input:
+            return False
+        if num_tokens <= 0 or num_tokens > self.caps.max_tokens:
+            return False
+        return _w4a8_dynamic_materialized_enabled(
+            quant_mode=self.caps.quant_mode,
+            activation=self.caps.activation,
+            num_tokens=num_tokens,
+            routed_rows=num_tokens * self.caps.num_topk,
+            num_experts=self.caps.weight_E,
+            k=self.caps.k,
+            n=self.caps.n,
+            w4a8_repacked=True,
+            share_input_across_experts=True,
+            deterministic_output=bool(self.caps.deterministic_output),
+            trellis_bits=int(self.caps.weight_plan.trellis_bits or 0),
+        )
+
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
@@ -1229,6 +1525,8 @@ class TPMoEScratchPlan:
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
         a: torch.Tensor,
+        a_prequant: torch.Tensor | None = None,
+        a_prequant_scale: torch.Tensor | None = None,
         experts: B12XFP4ExpertWeights,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -1241,6 +1539,31 @@ class TPMoEScratchPlan:
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
     ) -> "TPMoEFP4Binding":
+        has_prequant = a_prequant is not None or a_prequant_scale is not None
+        if self.caps.prequantized_input:
+            if a.ndim != 2:
+                raise ValueError("prequantized input requires rank-2 input")
+            if a_prequant is None or a_prequant_scale is None:
+                raise ValueError(
+                    "prequantized input requires external MXFP8 values and scales"
+                )
+            if a_prequant.dtype != torch.float8_e4m3fn:
+                raise TypeError("prequantized input values must be E4M3")
+            if a_prequant_scale.dtype != torch.float8_e8m0fnu:
+                raise TypeError("prequantized input scales must be E8M0")
+            expected_scale_shape = (int(a.shape[0]), int(a.shape[1]) // 32)
+            if a_prequant.shape != a.shape:
+                raise ValueError("prequantized input values must match input [M,K]")
+            if a_prequant_scale.shape != expected_scale_shape:
+                raise ValueError(
+                    "prequantized input scales must have shape [M,K/32]"
+                )
+            if not a_prequant.is_contiguous() or not a_prequant_scale.is_contiguous():
+                raise ValueError("prequantized input tensors must be contiguous")
+            if a_prequant.device != a.device or a_prequant_scale.device != a.device:
+                raise ValueError("prequantized input tensors must share input device")
+        elif has_prequant:
+            raise ValueError("plan does not accept prequantized input")
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
         if experts.plan != self.caps.weight_plan:
@@ -1284,6 +1607,8 @@ class TPMoEScratchPlan:
             plan=self._core_workspace_plan,
             tensors=tensors,
             a=a,
+            a_prequant=a_prequant,
+            a_prequant_scale=a_prequant_scale,
             experts=experts,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
@@ -1326,6 +1651,7 @@ class TPMoEFP4Binding:
     fast_math: bool | None = None
     quant_mode: str | None = None
     deterministic_output: bool = False
+    prequantized_input: bool = False
     unit_scale_contract: bool = False
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
@@ -2613,6 +2939,8 @@ def _build_tp_moe_fp4_binding_from_views(
     plan: _TPCoreWorkspacePlan,
     tensors: Dict[str, torch.Tensor],
     a: torch.Tensor,
+    a_prequant: torch.Tensor | None = None,
+    a_prequant_scale: torch.Tensor | None = None,
     experts: B12XFP4ExpertWeights,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2794,6 +3122,7 @@ def _build_tp_moe_fp4_binding_from_views(
         fast_math=fast_math,
         quant_mode=quant_mode,
         deterministic_output=plan.deterministic_output,
+        prequantized_input=plan.prequantized_input,
         unit_scale_contract=unit_scale_contract,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
@@ -2861,17 +3190,24 @@ def _build_tp_moe_fp4_binding_from_views(
             raise RuntimeError("dynamic TP MoE binding plan is missing capacities")
         tensors["input_gs"].copy_(experts.a1_gscale.expand(plan.weight_E))
         tensors["down_input_scale"].copy_(experts.a2_gscale.expand(plan.weight_E))
+        packed_input = tensors["packed_input"]
+        packed_input_scale = tensors["packed_input_scale"]
+        if plan.prequantized_input:
+            if a_prequant is None or a_prequant_scale is None:
+                raise ValueError("prequantized binding is missing external input")
+            packed_input = a_prequant.view(torch.uint8).unsqueeze(0)
+            packed_input_scale = a_prequant_scale.view(torch.uint8)
         view_kwargs = _packed_input_binding_views(
-            packed_input=tensors["packed_input"],
-            packed_input_scale=tensors["packed_input_scale"],
+            packed_input=packed_input,
+            packed_input_scale=packed_input_scale,
         )
         return TPMoEFP4Binding(
             **common_kwargs,
             row_counts=tensors["row_counts"],
             token_map=tensors["token_map"],
             token_weights=tensors["token_weights"],
-            packed_input=tensors["packed_input"],
-            packed_input_scale=tensors["packed_input_scale"],
+            packed_input=packed_input,
+            packed_input_scale=packed_input_scale,
             barrier_count=tensors["barrier_count"],
             barrier_epoch=tensors["barrier_epoch"],
             routed_rows_capacity=plan.routed_rows,
@@ -2947,6 +3283,7 @@ def _plan_core_workspace(
     apply_router_weight_on_input: bool = False,
     collect_activation_amax: bool = False,
     deterministic_output: bool = False,
+    prequantized_input: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -2955,6 +3292,7 @@ def _plan_core_workspace(
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
     deterministic_output = bool(deterministic_output and implementation == "dynamic")
+    prequantized_input = bool(prequantized_input)
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -3415,7 +3753,11 @@ def _plan_core_workspace(
         if (_is_w4a8_quant_mode(quant_mode) or quant_mode in _W6A8_QUANT_MODES)
         else k // 2
     )
-    packed_input_shape = (1, dynamic_rows_padded, packed_input_cols)
+    packed_input_shape = (
+        (1, 1, 1)
+        if prequantized_input
+        else (1, dynamic_rows_padded, packed_input_cols)
+    )
     packed_input_dtype = torch.uint8
     # Atomic scatter writes directly into the caller-owned [M, K] output and
     # never addresses route_output.  Reserve only one ABI-compatible row for
@@ -3456,6 +3798,7 @@ def _plan_core_workspace(
         device=device,
         dtype=dtype,
         deterministic_output=deterministic_output,
+        prequantized_input=prequantized_input,
         dynamic_physical_tiles=dynamic_tiles,
         dynamic_task_capacity=dynamic_max_tasks,
         tensor_specs=common_specs
@@ -3474,7 +3817,9 @@ def _plan_core_workspace(
             ),
             _TensorAllocSpec("packed_input", packed_input_shape, packed_input_dtype),
             _TensorAllocSpec(
-                "packed_input_scale", (dynamic_scale_rows, cols_pad_k), torch.uint8
+                "packed_input_scale",
+                (1, 1) if prequantized_input else (dynamic_scale_rows, cols_pad_k),
+                torch.uint8,
             ),
             _TensorAllocSpec(
                 "expert_write_rows", (state_E,), torch.int32, init="zeros"
@@ -7014,6 +7359,7 @@ def plan_tp_moe_arena_layout(
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
     deterministic_output: bool | None = None,
+    prequantized_input: bool = False,
     w4a16_block_size_m: int | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -7114,6 +7460,7 @@ def plan_tp_moe_arena_layout(
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
+            prequantized_input=prequantized_input,
             swiglu_limit=plan.swiglu_limit,
             swiglu_alpha=plan.swiglu_alpha,
             swiglu_beta=plan.swiglu_beta,
@@ -7407,6 +7754,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         swiglu_beta=caps.swiglu_beta,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=deterministic_output,
+        prequantized_input=caps.prequantized_input,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
     )
 
@@ -7464,6 +7812,7 @@ def plan_tp_moe_scratch(caps: TPMoEScratchCaps) -> TPMoEScratchPlan:
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
+        prequantized_input=caps.prequantized_input,
         swiglu_limit=launch_plan.swiglu_limit,
         swiglu_alpha=launch_plan.swiglu_alpha,
         swiglu_beta=launch_plan.swiglu_beta,
@@ -9403,6 +9752,7 @@ def _get_dynamic_kernel(
     direct_routing: bool = False,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
+    prequantized_input: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -9459,6 +9809,9 @@ def _get_dynamic_kernel(
         deterministic_output=deterministic_output,
         trellis_bits=int(trellis_bits),
     )
+    prequantized_input = bool(prequantized_input)
+    if prequantized_input and not materialize_intermediate:
+        raise ValueError("prequantized input requires materialized W4A8")
     # Gated FC1 swap_ab: a non-128 (but 32-aligned) per-shard intermediate needs
     # the 32-col-tile/swapped FC1 so the gate-half base lands on a tile boundary
     # inside one SF atom (env override for dev: B12X_DYNAMIC_SWAP_AB=0/1).
@@ -9494,6 +9847,7 @@ def _get_dynamic_kernel(
         share_input_across_experts,
         swap_ab,
         bool(deterministic_output),
+        prequantized_input,
         work_source,
         bool(w4a8_repacked),
         bool(direct_routing),
@@ -9543,6 +9897,7 @@ def _get_dynamic_kernel(
     kernel_kwargs["swap_ab"] = swap_ab
     kernel_kwargs["work_source"] = work_source
     kernel_kwargs["materialize_intermediate"] = materialize_intermediate
+    kernel_kwargs["prequantized_input"] = prequantized_input
     kernel_kwargs["swiglu_limit"] = swiglu_limit
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
@@ -9880,6 +10235,7 @@ def _launch_dynamic_flat(
     w4a8_repacked: bool,
     share_input_across_experts: bool,
     deterministic_output: bool,
+    prequantized_input: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -10037,6 +10393,7 @@ def _launch_dynamic_flat(
         direct_routing=direct_routing,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
+        prequantized_input=prequantized_input,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -10208,6 +10565,11 @@ def _tp_moe_dynamic_launch_op(
     swiglu_beta: float,
     volatile_launch_state: bool,
 ) -> None:
+    # Torch custom ops cap positional schemas at 64 arguments. Preserve the
+    # established ABI and carry this compile-time-only flag in max_rows' sign;
+    # the launch geometry always consumes the restored positive value below.
+    prequantized_input = max_rows < 0
+    max_rows = abs(max_rows)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -10269,6 +10631,7 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
+        prequantized_input=prequantized_input,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -10369,6 +10732,7 @@ def _launch_dynamic(
     w4a8_prepared: dict | None = None,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
+    prequantized_input: bool = False,
     swiglu_limit: float | None = None,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
@@ -10443,7 +10807,7 @@ def _launch_dynamic(
         n,
         num_topk,
         routed_rows,
-        max_rows,
+        -max_rows if prequantized_input else max_rows,
         scatter_rows,
         workspace.physical_tiles_capacity,
         workspace.task_capacity,
@@ -11616,6 +11980,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             quant_mode=quant_mode,
             w4a8_prepared=dynamic_w4a8_prepared,
             deterministic_output=deterministic_output,
+            prequantized_input=binding.prequantized_input,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,

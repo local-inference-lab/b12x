@@ -697,6 +697,7 @@ class MoEDynamicKernelBackend:
         w4a8_repacked: bool = False,
         direct_routing: bool = False,
         materialize_intermediate: bool = False,
+        prequantized_input: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
@@ -957,6 +958,15 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
+        self.prequantized_input = bool(prequantized_input)
+        if self.prequantized_input and not (
+            self.is_w4a8
+            and self.share_input_across_experts
+            and self.materialize_intermediate
+        ):
+            raise ValueError(
+                "prequantized input requires materialized shared-input W4A8"
+            )
         # Small repacked W4A8 has six route warps.  Split them into three
         # two-warp token groups: this matches the pair-owned producer's useful
         # warp/CTA concurrency while every K/32 block is quantized once.
@@ -2945,6 +2955,8 @@ class MoEDynamicKernelBackend:
             # Fold it into phase 0 so the existing resident barrier publishes
             # both the cleared output and the prepared input in one step.
             m1_blk_idx = flat_tid
+            if cutlass.const_expr(self.prequantized_input):
+                m1_blk_idx = mx_blocks_per_row
             while m1_blk_idx < mx_blocks_per_row:
                 m1_block_start = m1_blk_idx * Int32(32)
                 m1_values, m1_block_max = _load_bf16x32_to_f32(
@@ -3138,7 +3150,9 @@ class MoEDynamicKernelBackend:
                         else:
                             cute.arch.sync_warp()
 
-                        if cutlass.const_expr(self.is_w4a8):
+                        if cutlass.const_expr(
+                            self.is_w4a8 and not self.prequantized_input
+                        ):
                             # A token's BF16 row is identical for every routed
                             # expert. The materialized specialization stores one
                             # quantized row per token and gathers it in FC1; the
@@ -3318,7 +3332,7 @@ class MoEDynamicKernelBackend:
                                             ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                             topk_slot += Int32(1)
                                     blk_idx += Int32(self.input_warps_per_token * 32)
-                        else:
+                        elif cutlass.const_expr(not self.is_w4a8):
                             gs_value = shared_input_gs_value
                             if num_topk == Int32(8):
                                 for cache_slot in cutlass.range_constexpr(8):

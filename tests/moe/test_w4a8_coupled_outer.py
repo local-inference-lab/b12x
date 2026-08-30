@@ -142,3 +142,139 @@ def test_coupled_outer_transform_matches_torch(m: int) -> None:
         output_transform=True,
     )
     _assert_close(actual_output, expected_output)
+
+
+def test_coupled_outer_mxfp8_requires_e4m3_values() -> None:
+    from b12x.moe.fused_moe._impl import (
+        run_w4a8_coupled_outer_transform_mxfp8,
+    )
+
+    x = torch.empty((1, 512), dtype=torch.bfloat16)
+    values = torch.empty((1, 512), dtype=torch.uint8)
+    scale_rows = torch.empty((1, 16), dtype=torch.float8_e8m0fnu)
+    scale = torch.empty((512,), dtype=torch.float16)
+
+    with pytest.raises(TypeError, match="E4M3 values"):
+        run_w4a8_coupled_outer_transform_mxfp8(
+            x,
+            values,
+            scale_rows,
+            scale,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", [1, 16, 257])
+def test_coupled_outer_mxfp8_matches_two_stage_reference(m: int) -> None:
+    from b12x.gemm import block_fp8_linear as bfl
+    from b12x.moe.fused_moe._impl import (
+        run_w4a8_coupled_outer_transform,
+        run_w4a8_coupled_outer_transform_mxfp8,
+    )
+    from b12x.quantization import mxfp8
+
+    device = torch.device("cuda")
+    width = 3584
+    torch.manual_seed(20260831 + m)
+    x = torch.randn(m, width, dtype=torch.bfloat16, device=device)
+    scale = (torch.randn(width, device=device).sign() * 0.02).to(torch.float16)
+
+    transformed = torch.empty_like(x)
+    run_w4a8_coupled_outer_transform(
+        x,
+        transformed,
+        scale,
+        output_transform=False,
+    )
+    reference = bfl.quantize_input(transformed)
+    reference_scale_mma = torch.full_like(
+        reference.scale_mma.view(torch.uint8), 127
+    ).view(torch.float8_e8m0fnu)
+    mxfp8.quantize_rows(
+        transformed,
+        reference.values,
+        reference.scale_rows,
+        reference_scale_mma,
+        value_order="trellis_native_mma",
+    )
+
+    values = torch.empty(
+        (m, width), dtype=torch.float8_e4m3fn, device=device
+    )
+    scale_rows = torch.empty(
+        (m, width // 32), dtype=torch.float8_e8m0fnu, device=device
+    )
+    run_w4a8_coupled_outer_transform_mxfp8(
+        x,
+        values,
+        scale_rows,
+        scale,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        values.view(torch.uint8), reference.values.view(torch.uint8).reshape(m, width)
+    )
+    assert torch.equal(
+        scale_rows.view(torch.uint8),
+        reference.scale_rows.view(torch.uint8).reshape(m, width // 32),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_coupled_outer_mxfp8_graph_replay_tracks_input() -> None:
+    from b12x.gemm import block_fp8_linear as bfl
+    from b12x.moe.fused_moe._impl import (
+        run_w4a8_coupled_outer_transform,
+        run_w4a8_coupled_outer_transform_mxfp8,
+    )
+    from b12x.quantization import mxfp8
+
+    device = torch.device("cuda")
+    m, width = 16, 3584
+    torch.manual_seed(20260901)
+    x = torch.randn(m, width, dtype=torch.bfloat16, device=device)
+    next_x = torch.randn_like(x)
+    scale = (torch.randn(width, device=device).sign() * 0.02).to(torch.float16)
+    values = torch.empty(
+        (m, width), dtype=torch.float8_e4m3fn, device=device
+    )
+    scale_rows = torch.empty(
+        (m, width // 32), dtype=torch.float8_e8m0fnu, device=device
+    )
+
+    run_w4a8_coupled_outer_transform_mxfp8(x, values, scale_rows, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_w4a8_coupled_outer_transform_mxfp8(x, values, scale_rows, scale)
+    x.copy_(next_x)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    transformed = torch.empty_like(x)
+    run_w4a8_coupled_outer_transform(
+        x,
+        transformed,
+        scale,
+        output_transform=False,
+    )
+    reference = bfl.quantize_input(transformed)
+    reference_scale_mma = torch.full_like(
+        reference.scale_mma.view(torch.uint8), 127
+    ).view(torch.float8_e8m0fnu)
+    mxfp8.quantize_rows(
+        transformed,
+        reference.values,
+        reference.scale_rows,
+        reference_scale_mma,
+        value_order="trellis_native_mma",
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        values.view(torch.uint8), reference.values.view(torch.uint8).reshape(m, width)
+    )
+    assert torch.equal(
+        scale_rows.view(torch.uint8),
+        reference.scale_rows.view(torch.uint8).reshape(m, width // 32),
+    )

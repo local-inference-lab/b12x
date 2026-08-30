@@ -664,6 +664,75 @@ def test_w4a8_mx_materialized_dense_override_matches_oracle(
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
+def test_w4a8_mx_prequantized_input_bypasses_bf16_prologue() -> None:
+    _skip_if_unavailable()
+    from b12x.gemm import block_fp8_linear as bfl
+    from b12x.moe import fused_moe
+
+    weights = _weights(n=256, seed=93)
+    prepared = _prepare(weights, n=256)
+    m = 1024
+    x, topk_ids, topk_weights = _routed_inputs(m, 94)
+
+    def run(
+        a: torch.Tensor,
+        *,
+        prequantized_input: bool,
+        values: torch.Tensor | None = None,
+        scale_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        plan = fused_moe.plan(
+            fused_moe.Caps(
+                max_tokens=m,
+                num_topk=_TOPK,
+                route_num_experts=_E,
+                device=a.device,
+                weight_plan=prepared.plan,
+                quant_mode="w4a8_mx",
+                deterministic_output=True,
+                prequantized_input=prequantized_input,
+            )
+        )
+        spec = plan.scratch_specs()[0]
+        scratch = torch.zeros(spec.shape, dtype=spec.dtype, device=spec.device)
+        output = torch.zeros_like(x)
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=a,
+            a_prequant=values,
+            a_prequant_scale=scale_rows,
+            experts=prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            output=output,
+            input_scales_static=True,
+        )
+        fused_moe.run(binding=binding)
+        torch.cuda.synchronize()
+        return output
+
+    baseline = run(x, prequantized_input=False)
+    external = bfl.quantize_input(x)
+    values = external.values.reshape(m, _K).contiguous()
+    scale_rows = external.scale_rows.reshape(m, _K // 32).contiguous()
+    values_before = values.view(torch.uint8).clone()
+    scales_before = scale_rows.view(torch.uint8).clone()
+    poison = torch.full_like(x, float("nan"))
+
+    actual = run(
+        poison,
+        prequantized_input=True,
+        values=values,
+        scale_rows=scale_rows,
+    )
+
+    assert torch.equal(values.view(torch.uint8), values_before)
+    assert torch.equal(scale_rows.view(torch.uint8), scales_before)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+
+
 def test_w4a8_mx_prepared_dynamic_runs_with_compacted_sources() -> None:
     """The serving representation must not retain logical checkpoint weights."""
 

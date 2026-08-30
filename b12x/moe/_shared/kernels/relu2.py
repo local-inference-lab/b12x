@@ -72,6 +72,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         direct_routing: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
+        prequantized_input: bool = False,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
     ):
@@ -90,6 +91,7 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             direct_routing=direct_routing,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
+            prequantized_input=prequantized_input,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
         )
