@@ -1550,6 +1550,41 @@ def test_contiguous_tiled_topk_live_rows_do_not_resolve_new_kernel(
     not torch.cuda.is_available(),
     reason="CUDA required for indexer compile-cache coverage",
 )
+def test_row_topk_indices_only_preserves_value_buffer() -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(73_621)
+    rows, width, topk = 17, 1024, 512
+    row_logits = torch.randn(
+        (rows, width), generator=generator, dtype=torch.float32
+    ).to(device)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+    output_values = torch.full(
+        (rows, topk), 12345.0, dtype=torch.float32, device=device
+    )
+    output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    run_row_topk(
+        row_logits=row_logits,
+        lengths=lengths,
+        topk=topk,
+        output_values=output_values,
+        output_indices=output_indices,
+        write_values=False,
+    )
+    torch.cuda.synchronize(device)
+
+    expected = torch.topk(row_logits, k=topk, dim=1, largest=True, sorted=False)
+    assert bool((output_values == 12345.0).all())
+    assert torch.equal(
+        torch.sort(output_indices, dim=1).values.to(torch.long),
+        torch.sort(expected.indices, dim=1).values,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for indexer compile-cache coverage",
+)
 def test_row_topk_graph_replay_tracks_live_logits_and_lengths() -> None:
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
