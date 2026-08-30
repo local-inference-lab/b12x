@@ -21,14 +21,29 @@ winner.
 - Comparison revision: `fc1d4b68f7a5b0cfdb88bf06abccd869f5c589d5`,
   tree `7fcb6afb69b04b6981060012e943e125e58168b4`.
 - Qualified implementation revision:
-  `5a24588f1a6846a03fb4ca65debc868a5efee7d8`, tree
-  `b7ef58e13e4057810bdd6b64170e7c93e711a300`.
-- Runtime image:
-  `local/vllm:glm53-flash-nvfp4-dcp4-dflash2-flashkda-bt4096-20260830-r3`.
+  `ee611d20258b00a976123d4fead0a218de04a709`, tree
+  `20f47518383665eeab46bfca5a6ceda7d117063d`.
+- Comparison worktree:
+  `/root/vllm/worktrees/b12x-master-fc1d4b68-20260830`.
+- Qualified worktree: `/root/vllm/tmp/b12x-pr-paged-topk-20260830`.
+- Runtime foundation image:
+  `local/vllm:glm53-flash-nvfp4-dcp4-dflash2-flashkda-bt4096-20260830-r4`,
+  image ID
+  `sha256:0029fb596153966c997e1f09737e3ea7a547bf1c7a251f356e01c681c9f917d6`.
 - Physical GPU 1: `GPU-3747d42a-c416-459c-cf88-bc2e84f471b1`, NVIDIA RTX PRO
   6000 Blackwell Workstation Edition, driver 610.57.04, PCIe Gen5 x16.
-- Performance measurements used CUDA graph replay with L2 flushing, 10
-  warmups, and 30 timed iterations.
+- GPU-mode snapshots before and after collection were P1, persistence enabled,
+  default compute mode, 2,692 MHz SM clock, 13,365 MHz memory clock, active
+  throttle mask `0x0`, 38 C, and 77.88/78.84 W against a 600 W limit.
+- Toolchain map: `nvidia-cutlass-dsl==4.6.2` from
+  `/opt/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl`, PyTorch 2.13.0,
+  and `/usr/local/cuda/bin/ptxas` build
+  `cuda_13.3.r13.3/compiler.38244171_0`; `CUTE_DSL_ARCH=sm_120a`.
+- Source-specific compile-cache manifests were fixed for every timed process.
+  The comparison cache contained four files with aggregate manifest SHA-256
+  `ad17d606754fdf21f11bc4e32be598ea49eb0bcde8b8964e8ee0b228b1716a3d`;
+  the qualified cache contained six files with aggregate manifest SHA-256
+  `dab33ecfbeb248a2b90b2b6768ddb969acc089a842165bf792dabd267afc8abd`.
 
 ## Correctness
 
@@ -42,12 +57,15 @@ CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ARCH=sm_120a \
   -k "row_topk or paged_prefill_topk"
 ```
 
-Result: `15 passed, 29 deselected`.
+Result: `15 passed, 30 deselected`. The capacity-cache unit selection produced
+`7 passed, 29 deselected` and verifies one capability query for each immutable
+device/top-k pair.
 
 A production-geometry analytic run used 4,080 query rows, 64 replicated
 indexer heads, an 8,192-token visible cache, top-k 512, and a shared paged
-table. Every selected index matched the exact FP32 top-k membership and the
-maximum valid-score error was 0.000488.
+table. It reported `analytic_pass(max_abs=0.000488)`. The indices-only contract
+is covered by the GPU suite above because analytic score comparison requires
+score materialization.
 
 ## Performance
 
@@ -56,7 +74,8 @@ revision used the serving contract in which sparse attention consumes only
 selected indices:
 
 ```bash
-/opt/venv/bin/python -B benchmarks/benchmark_paged_indexer.py \
+CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ARCH=sm_120a \
+  /opt/venv/bin/python -B benchmarks/benchmark_paged_indexer.py \
   --rows 4080 \
   --global-heads 64 \
   --tp-size 4 \
@@ -71,34 +90,44 @@ selected indices:
 ```
 
 The comparison command omitted `--indices-only` because that revision does not
-implement the indices-only contract.
+implement the indices-only contract. Each arm first ran one zero-warmup replay
+and one 10-warmup preconditioning process. Five process-level medians per arm
+were then collected in the balanced order comparison, qualified, qualified,
+comparison, comparison, qualified, qualified, comparison, comparison,
+qualified. Every timed process loaded its arm's fixed cache objects before
+graph capture.
 
-| Revision | Median | Minimum |
-| --- | ---: | ---: |
-| Comparison | 1,074.18 us | 1,072.13 us |
-| Qualified | 1,053.70 us | 1,052.22 us |
+| Revision | Process medians, microseconds | Median |
+| --- | --- | ---: |
+| Comparison | 1,074.18, 1,074.18, 1,073.15, 1,073.20, 1,073.86 | 1,073.86 us |
+| Qualified | 1,052.50, 1,052.67, 1,052.67, 1,053.57, 1,052.67 | 1,052.67 us |
 
-The fixed-work latency reduction is 1.91%. The equivalent throughput ratio is
-`1074.18 / 1053.70 = 1.019436`, or 1.94% higher selector throughput.
+The zero-warmup replay was 1,073.15 us for the comparison and 1,050.62 us for
+the qualified implementation. The preconditioning process medians were
+1,074.18 us and 1,052.67 us, respectively.
+
+The fixed-work latency reduction is 1.97%. The ratio direction is comparison
+latency divided by qualified latency: `1073.86 / 1052.67 = 1.020130`, or 2.01%
+higher selector throughput.
 
 Comparison raw samples, microseconds:
 
 ```text
-1073.15, 1073.73, 1075.78, 1074.75, 1075.17, 1073.73, 1074.94,
-1073.15, 1074.72, 1073.79, 1073.70, 1074.85, 1077.79, 1074.18,
-1077.15, 1075.84, 1074.18, 1073.15, 1076.22, 1073.15, 1074.18,
-1074.18, 1075.20, 1074.18, 1075.20, 1072.13, 1074.18, 1075.20,
-1074.18, 1075.20
+1074.66, 1072.77, 1071.68, 1072.70, 1073.73, 1073.73, 1072.10,
+1073.15, 1072.00, 1071.10, 1075.10, 1074.82, 1073.09, 1074.18,
+1077.09, 1074.43, 1074.18, 1071.10, 1074.18, 1073.15, 1072.13,
+1074.18, 1075.20, 1074.18, 1075.20, 1074.18, 1074.18, 1075.20,
+1074.18, 1073.15
 ```
 
 Qualified raw samples, microseconds:
 
 ```text
-1052.67, 1052.22, 1052.70, 1054.40, 1052.74, 1054.30, 1053.79,
-1055.52, 1053.60, 1055.36, 1053.60, 1054.37, 1056.70, 1053.70,
-1054.69, 1054.50, 1052.67, 1052.67, 1053.70, 1054.72, 1053.70,
-1052.67, 1053.70, 1053.70, 1054.72, 1053.70, 1052.67, 1053.70,
-1052.67, 1052.67
+1050.62, 1050.46, 1050.53, 1050.21, 1050.69, 1052.22, 1051.81,
+1052.67, 1051.55, 1051.26, 1051.36, 1050.24, 1050.56, 1051.65,
+1052.42, 1054.34, 1052.67, 1054.72, 1053.70, 1052.67, 1053.70,
+1052.67, 1053.70, 1053.70, 1052.67, 1053.70, 1052.67, 1053.70,
+1054.72, 1052.67
 ```
 
 The operation result does not by itself establish an end-to-end serving gain.
