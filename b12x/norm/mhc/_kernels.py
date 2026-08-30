@@ -71,19 +71,11 @@ _PREFILL_MMA_THREADS = 32
 _PREFILL_MMA_TILE_M = 16
 _PREFILL_MMA_TILE_N = 8
 _PREFILL_MMA_TILE_K = 16
-_PREFILL_TMA_COMPUTE_WARPS = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "8")
-)
+_PREFILL_TMA_COMPUTE_WARPS = int(os.getenv("B12X_MHC_PREFILL_TMA_WARPS", "8"))
 _PREFILL_TMA_THREADS = (_PREFILL_TMA_COMPUTE_WARPS + 1) * 32
-_PREFILL_TMA_TILE_M = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128")
-)
-_PREFILL_TMA_TILE_N = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16")
-)
-_PREFILL_TMA_TILE_K = int(
-    os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64")
-)
+_PREFILL_TMA_TILE_M = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "128"))
+_PREFILL_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_N", "16"))
+_PREFILL_TMA_TILE_K = int(os.getenv("B12X_MHC_PREFILL_TMA_TILE_K", "64"))
 _PREFILL_TMA_STAGES = int(os.getenv("B12X_MHC_PREFILL_TMA_STAGES", "3"))
 _PREFILL_TF32_TMA_M_WARPS = int(
     os.getenv(
@@ -94,9 +86,7 @@ _PREFILL_TF32_TMA_M_WARPS = int(
         ),
     )
 )
-_PREFILL_TF32_TMA_N_WARPS = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
-)
+_PREFILL_TF32_TMA_N_WARPS = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"))
 _PREFILL_TF32_TMA_COMPUTE_WARPS = _PREFILL_TF32_TMA_M_WARPS * _PREFILL_TF32_TMA_N_WARPS
 _PREFILL_TF32_TMA_THREADS = (_PREFILL_TF32_TMA_COMPUTE_WARPS + 1) * 32
 _PREFILL_TF32_TMA_TILE_M = int(
@@ -105,9 +95,7 @@ _PREFILL_TF32_TMA_TILE_M = int(
         os.getenv("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
     )
 )
-_PREFILL_TF32_TMA_TILE_N = int(
-    os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
-)
+_PREFILL_TF32_TMA_TILE_N = int(os.getenv("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"))
 _PREFILL_TF32_TMA_TILE_K = int(
     os.getenv(
         "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
@@ -241,9 +229,7 @@ _PREFILL_TF32_TMA_LONG_4096_STAGES = int(
 _PREFILL_TF32_TMA_LONG_4096_K_SPLITS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
 )
-_PREFILL_FINALIZE_THREADS = int(
-    os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
-)
+_PREFILL_FINALIZE_THREADS = int(os.getenv("B12X_MHC_PREFILL_FINALIZE_THREADS", "256"))
 _POST_PRE_CHUNK = 12
 
 # --- Gram-trick split finalize (multi-CTA fuse_norm, no per-h norm reduction) -
@@ -501,9 +487,7 @@ def _selected_post_pre_decode_split_n(
             f"no larger than {_SOURCE_TILES}, got {splits}"
         )
     if tile_n <= 0 or _MIXES % tile_n != 0:
-        raise ValueError(
-            f"B12X_MHC_DECODE_TILE_N must divide {_MIXES}, got {tile_n}"
-        )
+        raise ValueError(f"B12X_MHC_DECODE_TILE_N must divide {_MIXES}, got {tile_n}")
     return splits, tile_n
 
 
@@ -563,9 +547,7 @@ def _selected_post_pre_partials_per_cta(
         try:
             return _validate_post_pre_partials_per_cta(int(raw))
         except ValueError as exc:
-            raise ValueError(
-                f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}"
-            ) from exc
+            raise ValueError(f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}") from exc
 
     if compute_capability is None and torch.cuda.is_available():
         compute_capability = tuple(torch.cuda.get_device_capability())
@@ -5694,9 +5676,7 @@ def _run_mhc_finalize_gram_launch(
         )
     )
     single_cta = single_cta_threads > 0
-    raw_single_cta_groups = os.environ.get(
-        "B12X_MHC_DECODE_FINALIZE_CTAS"
-    )
+    raw_single_cta_groups = os.environ.get("B12X_MHC_DECODE_FINALIZE_CTAS")
     single_cta_groups = 1
     if single_cta:
         single_cta_groups = (

@@ -96,9 +96,9 @@ def _post_pre_reference(
     )
     if norm_weight is not None:
         rms = torch.rsqrt(y_raw_fp32.square().mean(dim=-1, keepdim=True) + norm_eps)
-        y = (
-            y_raw_fp32.to(torch.bfloat16).float() * rms * norm_weight.float()
-        ).to(torch.bfloat16)
+        y = (y_raw_fp32.to(torch.bfloat16).float() * rms * norm_weight.float()).to(
+            torch.bfloat16
+        )
     else:
         y = y_raw_fp32.to(torch.bfloat16)
     return residual_out, y, post, comb
@@ -114,22 +114,39 @@ def _make_inputs(
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
     residual = (
-        torch.randn((tokens, 4, hidden_size), generator=gen, dtype=torch.float32).to(device)
+        torch.randn((tokens, 4, hidden_size), generator=gen, dtype=torch.float32).to(
+            device
+        )
         / 3
     ).to(torch.bfloat16)
     x = (
-        torch.randn((tokens, hidden_size), generator=gen, dtype=torch.float32).to(device)
+        torch.randn((tokens, hidden_size), generator=gen, dtype=torch.float32).to(
+            device
+        )
         / 4
     ).to(torch.bfloat16)
-    fn = torch.randn((24, 4 * hidden_size), generator=gen, dtype=torch.float32).to(device) / 64
+    fn = (
+        torch.randn((24, 4 * hidden_size), generator=gen, dtype=torch.float32).to(
+            device
+        )
+        / 64
+    )
     scale = torch.randn((3,), generator=gen, dtype=torch.float32).to(device) / 3
     bias = torch.randn((24,), generator=gen, dtype=torch.float32).to(device) / 5
-    return residual.contiguous(), x.contiguous(), fn.contiguous(), scale.contiguous(), bias.contiguous()
+    return (
+        residual.contiguous(),
+        x.contiguous(),
+        fn.contiguous(),
+        scale.contiguous(),
+        bias.contiguous(),
+    )
 
 
 def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
     diff = actual.float() - expected.float()
-    return float(diff.abs().max().item()), float(torch.sqrt(torch.mean(diff * diff)).item())
+    return float(diff.abs().max().item()), float(
+        torch.sqrt(torch.mean(diff * diff)).item()
+    )
 
 
 def _bench_graph(fn, *, warmup: int, iters: int, l2_flush) -> tuple[float, float]:
@@ -168,7 +185,9 @@ def _register_vllm_mhc_tilelang(vllm_path: pathlib.Path) -> None:
         ) from exc
 
     if not hasattr(torch.ops.vllm, "mhc_fused_post_pre_tilelang"):
-        raise RuntimeError("vLLM mhc_fused_post_pre_tilelang custom op was not registered")
+        raise RuntimeError(
+            "vLLM mhc_fused_post_pre_tilelang custom op was not registered"
+        )
 
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
@@ -323,10 +342,14 @@ def main() -> None:
         torch.empty(shape, dtype=dtype, device=device)
         for shape, dtype in fused_plan.shapes_and_dtypes()
     )
-    fused_y = torch.empty((args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
+    fused_y = torch.empty(
+        (args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device
+    )
     fused_post = torch.empty((args.tokens, 4), dtype=torch.float32, device=device)
     fused_comb = torch.empty((args.tokens, 4, 4), dtype=torch.float32, device=device)
-    fused_out = torch.empty((args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device)
+    fused_out = torch.empty(
+        (args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device
+    )
     fused_binding = fused_plan.bind(
         scratch=fused_scratch,
         tokens=args.tokens,
@@ -383,23 +406,25 @@ def main() -> None:
 
     def run_vllm_fused() -> None:
         nonlocal vllm_out, vllm_post, vllm_comb, vllm_y
-        vllm_out, vllm_post, vllm_comb, vllm_y = torch.ops.vllm.mhc_fused_post_pre_tilelang(
-            x,
-            residual,
-            prev_post,
-            prev_comb,
-            fn,
-            scale,
-            bias,
-            args.rms_eps,
-            args.hc_eps,
-            args.hc_eps,
-            2.0,
-            args.sinkhorn_iters,
-            1,
-            1,
-            norm_weight,
-            args.norm_eps if norm_weight is not None else 0.0,
+        vllm_out, vllm_post, vllm_comb, vllm_y = (
+            torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                prev_post,
+                prev_comb,
+                fn,
+                scale,
+                bias,
+                args.rms_eps,
+                args.hc_eps,
+                args.hc_eps,
+                2.0,
+                args.sinkhorn_iters,
+                1,
+                1,
+                norm_weight,
+                args.norm_eps if norm_weight is not None else 0.0,
+            )
         )
 
     run_fused()
