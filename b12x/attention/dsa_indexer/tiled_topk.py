@@ -1168,6 +1168,15 @@ class DSATiledTopkKernel:
                 # winners when more candidates than the buffer shared the coarse
                 # threshold bucket. Redo the selection exactly by re-scanning.
                 if bin_count > Int32(smem_candidate_capacity):
+                    # The buffered arm may already have populated a prefix of
+                    # s_out. Initialize every slot to a distinct in-range tail
+                    # candidate so an unselected padding tie cannot retain a
+                    # duplicate winner from that discarded prefix.
+                    reset_idx = Int32(tx)
+                    while reset_idx < topk_static:
+                        s_out[reset_idx] = total_len - topk_static + reset_idx
+                        reset_idx = reset_idx + Int32(_THREADS_PER_CTA)
+                    cute.arch.sync_threads()
                     _exact_overflow_fallback(
                         tx,
                         total_len,
@@ -1600,7 +1609,7 @@ def run_tiled_topk(
             "output_page_table", output_page_table_key_tensor, dynamic=True
         ),
         (
-            "tiled_topk_v29_optional_value_output",
+            "tiled_topk_v30_initialized_overflow_output",
             topk,
             block_q,
             block_k,
@@ -1792,7 +1801,7 @@ def run_row_topk(
             "output_gather_table", output_gather_table_for_kernel, dynamic=True
         ),
         (
-            "row_topk_v9_optional_value_output",
+            "row_topk_v10_initialized_overflow_output",
             topk,
             output_gather_table is not None,
             smem_candidate_capacity,
