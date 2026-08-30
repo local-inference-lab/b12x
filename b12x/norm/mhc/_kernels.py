@@ -126,10 +126,47 @@ _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS = int(
 _PREFILL_TF32_TMA_LONG_MIN_TOKENS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
 )
-# At hidden=4096, one CTA owns all 24 mix columns so A is loaded once instead
-# of once per 8-column N tile. M192/K64 gives the best 4096-token balance of B
-# reuse and SM coverage; K splitting supplies enough CTAs for all SMs.
-# Keep the previous geometry for hidden=7168, where wide-N regresses.
+# Hidden-size-4096 projection batches from 2304 through 3583 rows use M64 CTAs
+# and eight K splits to occupy SM120. One CTA owns all 24 mix columns, so the
+# input tile is read once instead of once per 8-column N tile. Three pipeline
+# stages hide TMA latency below 3072 rows; two stages reduce pipeline resources
+# from 3072 rows through the end of the M64 range.
+_PREFILL_TF32_TMA_MEDIUM_MIN_TOKENS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_MIN_TOKENS", "2304")
+)
+_PREFILL_TF32_TMA_MEDIUM_HIGH_MIN_TOKENS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_HIGH_MIN_TOKENS", "3072")
+)
+_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS", "3584")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_M_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_M_WARPS", "4")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_N_WARPS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_N_WARPS", "1")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_TILE_M = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_TILE_M", "64")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_TILE_N = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_TILE_N", "24")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_TILE_K = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_TILE_K", "64")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_STAGES = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_STAGES", "3")
+)
+_PREFILL_TF32_TMA_MEDIUM_HIGH_4096_STAGES = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_HIGH_STAGES", "2")
+)
+_PREFILL_TF32_TMA_MEDIUM_4096_K_SPLITS = int(
+    os.getenv("B12X_MHC_PREFILL_TF32_TMA_MEDIUM_K_SPLITS", "8")
+)
+# From 3584 rows at hidden size 4096, M192/K64 balances B reuse and SM coverage;
+# K splitting supplies enough CTAs for all SMs. Hidden size 7168 keeps narrow N
+# tiles because wide-N geometry regresses that shape.
 _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS = int(
     os.getenv("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
 )
@@ -2507,10 +2544,13 @@ class MHCPrefillTf32ProjectTmaKernel:
         *,
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
+        medium_geometry: bool = False,
+        medium_high_geometry: bool = False,
         chunk_geometry: bool = False,
         long_geometry: bool = False,
     ):
         self.hidden_size = int(hidden_size)
+        use_4096_medium_geometry = medium_geometry and self.hidden_size == _HIDDEN
         use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
         use_4096_long_geometry = long_geometry and self.hidden_size == _HIDDEN
         if use_4096_long_geometry:
@@ -2529,6 +2569,18 @@ class MHCPrefillTf32ProjectTmaKernel:
             self.tile_k = _PREFILL_TF32_TMA_CHUNK_4096_TILE_K
             self.num_stages = _PREFILL_TF32_TMA_CHUNK_4096_STAGES
             self.k_splits = _PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS
+        elif use_4096_medium_geometry:
+            self.num_m_warps = _PREFILL_TF32_TMA_MEDIUM_4096_M_WARPS
+            self.num_n_warps = _PREFILL_TF32_TMA_MEDIUM_4096_N_WARPS
+            self.tile_m = _PREFILL_TF32_TMA_MEDIUM_4096_TILE_M
+            self.tile_n = _PREFILL_TF32_TMA_MEDIUM_4096_TILE_N
+            self.tile_k = _PREFILL_TF32_TMA_MEDIUM_4096_TILE_K
+            self.num_stages = (
+                _PREFILL_TF32_TMA_MEDIUM_HIGH_4096_STAGES
+                if medium_high_geometry
+                else _PREFILL_TF32_TMA_MEDIUM_4096_STAGES
+            )
+            self.k_splits = _PREFILL_TF32_TMA_MEDIUM_4096_K_SPLITS
         elif chunk_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS
@@ -3949,12 +4001,16 @@ def _prefill_bf16_project_tma_kernel(
 def _prefill_tf32_project_kernel(
     hidden_size: int,
     split_k: int,
+    medium_geometry: bool = False,
+    medium_high_geometry: bool = False,
     chunk_geometry: bool = False,
     long_geometry: bool = False,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
+        medium_geometry=medium_geometry,
+        medium_high_geometry=medium_high_geometry,
         chunk_geometry=chunk_geometry,
         long_geometry=long_geometry,
     )
@@ -4994,6 +5050,35 @@ def run_mhc_prefill_bf16_project(
     )
 
 
+def _mhc_prefill_tf32_chunk_min_tokens(hidden_size: int) -> int:
+    """Return the wide-CTA projection threshold for a hidden size."""
+    if int(hidden_size) == _HIDDEN:
+        return _PREFILL_TF32_TMA_CHUNK_4096_MIN_TOKENS
+    return _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
+
+
+def _mhc_prefill_tf32_geometry(
+    *, tokens: int, hidden_size: int
+) -> tuple[bool, bool, bool, bool]:
+    """Select medium, high-medium, chunk, and long TF32 geometries."""
+    tokens = int(tokens)
+    hidden_size = int(hidden_size)
+    chunk_min_tokens = _mhc_prefill_tf32_chunk_min_tokens(hidden_size)
+    medium_geometry = (
+        hidden_size == _HIDDEN
+        and tokens >= _PREFILL_TF32_TMA_MEDIUM_MIN_TOKENS
+        and tokens < chunk_min_tokens
+    )
+    medium_high_geometry = (
+        medium_geometry and tokens >= _PREFILL_TF32_TMA_MEDIUM_HIGH_MIN_TOKENS
+    )
+    chunk_geometry = tokens >= chunk_min_tokens
+    long_geometry = (
+        hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+    )
+    return medium_geometry, medium_high_geometry, chunk_geometry, long_geometry
+
+
 def _run_mhc_prefill_tf32_project_launch(
     *,
     out: torch.Tensor,
@@ -5018,13 +5103,20 @@ def _run_mhc_prefill_tf32_project_launch(
     if not fn.is_contiguous():
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
-    chunk_geometry = tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
-    long_geometry = (
-        hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+    (
+        medium_geometry,
+        medium_high_geometry,
+        chunk_geometry,
+        long_geometry,
+    ) = _mhc_prefill_tf32_geometry(
+        tokens=tokens,
+        hidden_size=hidden_size,
     )
     kernel = _prefill_tf32_project_kernel(
         hidden_size,
         split_k,
+        medium_geometry,
+        medium_high_geometry,
         chunk_geometry,
         long_geometry,
     )
@@ -5069,8 +5161,12 @@ def _run_mhc_prefill_tf32_project_launch(
     compile_key = (
         ("hidden_size", hidden_size),
         ("split_k", split_k),
+        ("medium_geometry", medium_geometry),
+        ("medium_min_tokens", _PREFILL_TF32_TMA_MEDIUM_MIN_TOKENS),
+        ("medium_high_geometry", medium_high_geometry),
+        ("medium_high_min_tokens", _PREFILL_TF32_TMA_MEDIUM_HIGH_MIN_TOKENS),
         ("chunk_geometry", chunk_geometry),
-        ("chunk_min_tokens", _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS),
+        ("chunk_min_tokens", _mhc_prefill_tf32_chunk_min_tokens(hidden_size)),
         ("long_geometry", long_geometry),
         ("long_min_tokens", _PREFILL_TF32_TMA_LONG_MIN_TOKENS),
         ("tile_m", kernel.tile_m),
@@ -5099,13 +5195,20 @@ def _run_mhc_prefill_tf32_project_launch(
 
 def mhc_prefill_tf32_project_splits(*, tokens: int, hidden_size: int) -> int:
     """Return the projection split count selected by the TF32 prefill kernel."""
-    chunk_geometry = int(tokens) >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
-    long_geometry = (
-        int(hidden_size) == _HIDDEN and int(tokens) >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+    (
+        medium_geometry,
+        medium_high_geometry,
+        chunk_geometry,
+        long_geometry,
+    ) = _mhc_prefill_tf32_geometry(
+        tokens=int(tokens),
+        hidden_size=int(hidden_size),
     )
     return _prefill_tf32_project_kernel(
         int(hidden_size),
         _split_k_for_hidden(int(hidden_size)),
+        medium_geometry,
+        medium_high_geometry,
         chunk_geometry,
         long_geometry,
     ).k_splits

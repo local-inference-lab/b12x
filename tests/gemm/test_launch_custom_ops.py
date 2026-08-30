@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 
@@ -55,6 +57,146 @@ def test_mhc_sm121_decode_finalize_policy(monkeypatch) -> None:
     assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 1)) == 128
     assert select(num_tokens=16, hidden_size=4096, compute_capability=(12, 0)) == 0
     assert select(num_tokens=16, hidden_size=7168, compute_capability=(12, 1)) == 0
+
+
+def test_mhc_prefill_tf32_projection_geometry_boundaries() -> None:
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    select = residual_kernels._mhc_prefill_tf32_geometry
+    assert select(tokens=2303, hidden_size=4096) == (False, False, False, False)
+    assert select(tokens=2304, hidden_size=4096) == (True, False, False, False)
+    assert select(tokens=3071, hidden_size=4096) == (True, False, False, False)
+    assert select(tokens=3072, hidden_size=4096) == (True, True, False, False)
+    assert select(tokens=3583, hidden_size=4096) == (True, True, False, False)
+    assert select(tokens=3584, hidden_size=4096) == (False, False, True, False)
+    assert select(tokens=8191, hidden_size=4096) == (False, False, True, False)
+    assert select(tokens=8192, hidden_size=4096) == (False, False, True, True)
+    assert select(tokens=3584, hidden_size=7168) == (False, False, False, False)
+    assert select(tokens=4096, hidden_size=7168) == (False, False, True, False)
+
+    medium_kernel = residual_kernels._prefill_tf32_project_kernel(
+        4096,
+        64,
+        True,
+        False,
+        False,
+    )
+    assert (
+        medium_kernel.tile_m,
+        medium_kernel.tile_n,
+        medium_kernel.tile_k,
+        medium_kernel.num_stages,
+        medium_kernel.num_m_warps,
+        medium_kernel.num_n_warps,
+        medium_kernel.num_threads,
+        medium_kernel.k_splits,
+    ) == (64, 24, 64, 3, 4, 1, 160, 8)
+    medium_high_kernel = residual_kernels._prefill_tf32_project_kernel(
+        4096,
+        64,
+        True,
+        True,
+        False,
+        False,
+    )
+    assert medium_high_kernel.num_stages == 2
+
+    assert (
+        residual_kernels.mhc_prefill_tf32_project_splits(tokens=2303, hidden_size=4096)
+        == 1
+    )
+    assert (
+        residual_kernels.mhc_prefill_tf32_project_splits(tokens=2304, hidden_size=4096)
+        == 8
+    )
+    assert (
+        residual_kernels.mhc_prefill_tf32_project_splits(tokens=3583, hidden_size=4096)
+        == 8
+    )
+    assert (
+        residual_kernels.mhc_prefill_tf32_project_splits(tokens=3584, hidden_size=4096)
+        == 8
+    )
+    assert (
+        residual_kernels.mhc_prefill_tf32_project_splits(tokens=8192, hidden_size=4096)
+        == 4
+    )
+
+
+@pytest.mark.parametrize("tokens", [2304, 3072, 3583])
+def test_mhc_prefill_tf32_optimized_geometry_matches_reference_under_graph_replay(
+    tokens: int,
+) -> None:
+    """Validate the tuned medium-row projection geometries on SM120."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("the hidden-size-4096 projection geometry requires SM120")
+
+    import b12x.norm.mhc._kernels as residual_kernels
+
+    device = torch.device("cuda")
+    hidden_size = 4096
+    split_k = 64
+    generator = torch.Generator(device=device)
+    generator.manual_seed(23_040 + tokens)
+    residual = (
+        torch.randn(
+            (tokens, 4, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.02
+    ).contiguous()
+    projection = (
+        torch.randn(
+            (24, 4 * hidden_size),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.02
+    ).contiguous()
+    partials = torch.empty((tokens, split_k, 25), device=device, dtype=torch.float32)
+    active_splits = residual_kernels.mhc_prefill_tf32_project_splits(
+        tokens=tokens,
+        hidden_size=hidden_size,
+    )
+
+    def launch() -> None:
+        residual_kernels.run_mhc_prefill_tf32_project(
+            out=residual,
+            fn=projection,
+            partials=partials,
+        )
+
+    launch()
+    torch.cuda.synchronize(device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    residual.copy_(
+        torch.randn(
+            residual.shape,
+            device=device,
+            dtype=residual.dtype,
+            generator=generator,
+        )
+        * 0.02
+    )
+    partials.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    actual = partials[:, 0, 1:25].clone()
+    actual += partials[:, 2 : active_splits + 1, 1:25].sum(dim=1)
+    reference = F.linear(residual.flatten(1).float(), projection)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual).item() > 0
+    torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.0625)
 
 
 def test_mhc_sm121_decode_partial_group_policy(monkeypatch) -> None:

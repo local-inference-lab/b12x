@@ -21,6 +21,7 @@ from benchmarks.common import (
     make_l2_flush_fn,
     require_sm120,
 )
+from b12x.norm.mhc import _kernels as mhc_kernels
 from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post_pre
 
 
@@ -280,131 +281,23 @@ def main() -> None:
     prefill_finalize_threads = int(
         os.environ.get("B12X_MHC_PREFILL_FINALIZE_THREADS", "256")
     )
-    prefill_tf32_tma_m_warps = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_M_WARPS",
-            os.environ.get(
-                "B12X_MHC_PREFILL_TF32_TMA_WARPS",
-                os.environ.get("B12X_MHC_PREFILL_TMA_WARPS", "1"),
-            ),
-        )
+    (
+        prefill_tf32_tma_medium_geometry,
+        prefill_tf32_tma_medium_high_geometry,
+        prefill_tf32_tma_chunk_geometry,
+        prefill_tf32_tma_long_geometry,
+    ) = mhc_kernels._mhc_prefill_tf32_geometry(
+        tokens=args.tokens,
+        hidden_size=args.hidden_size,
     )
-    prefill_tf32_tma_n_warps = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1")
+    prefill_tf32_kernel = mhc_kernels._prefill_tf32_project_kernel(
+        args.hidden_size,
+        args.split_k,
+        prefill_tf32_tma_medium_geometry,
+        prefill_tf32_tma_medium_high_geometry,
+        prefill_tf32_tma_chunk_geometry,
+        prefill_tf32_tma_long_geometry,
     )
-    prefill_tf32_tma_m = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_M",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_M", "16"),
-        )
-    )
-    prefill_tf32_tma_n = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8")
-    )
-    prefill_tf32_tma_k = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_TILE_K",
-            os.environ.get("B12X_MHC_PREFILL_TMA_TILE_K", "256"),
-        )
-    )
-    prefill_tf32_tma_stages = int(
-        os.environ.get(
-            "B12X_MHC_PREFILL_TF32_TMA_STAGES",
-            os.environ.get("B12X_MHC_PREFILL_TMA_STAGES", "1"),
-        )
-    )
-    prefill_tf32_tma_chunk_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_MIN_TOKENS", "4096")
-    )
-    prefill_tf32_tma_chunk_geometry = (
-        args.tokens >= prefill_tf32_tma_chunk_min_tokens
-    )
-    prefill_tf32_tma_long_min_tokens = int(
-        os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_MIN_TOKENS", "8192")
-    )
-    prefill_tf32_tma_long_geometry = (
-        args.hidden_size == 4096
-        and args.tokens >= prefill_tf32_tma_long_min_tokens
-    )
-    prefill_tf32_tma_k_splits = 1
-    if prefill_tf32_tma_chunk_geometry:
-        if args.hidden_size == 4096:
-            prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "12")
-            )
-            prefill_tf32_tma_n_warps = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
-                )
-            )
-            prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "192")
-            )
-            prefill_tf32_tma_n = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "24"),
-                )
-            )
-            prefill_tf32_tma_k_splits = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_K_SPLITS", "8"
-                )
-            )
-            prefill_tf32_tma_k = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_K",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_K", "64"),
-                )
-            )
-            prefill_tf32_tma_stages = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_STAGES",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_STAGES", "2"),
-                )
-            )
-        else:
-            prefill_tf32_tma_m_warps = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_M_WARPS", "2")
-            )
-            prefill_tf32_tma_n_warps = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_N_WARPS",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_N_WARPS", "1"),
-                )
-            )
-            prefill_tf32_tma_m = int(
-                os.environ.get("B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_M", "32")
-            )
-            prefill_tf32_tma_n = int(
-                os.environ.get(
-                    "B12X_MHC_PREFILL_TF32_TMA_CHUNK_TILE_N",
-                    os.environ.get("B12X_MHC_PREFILL_TF32_TMA_TILE_N", "8"),
-                )
-            )
-    if prefill_tf32_tma_long_geometry:
-        prefill_tf32_tma_m_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_M_WARPS", "8")
-        )
-        prefill_tf32_tma_n_warps = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_N_WARPS", "1")
-        )
-        prefill_tf32_tma_m = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_M", "128")
-        )
-        prefill_tf32_tma_n = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_N", "24")
-        )
-        prefill_tf32_tma_k = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_TILE_K", "64")
-        )
-        prefill_tf32_tma_stages = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_STAGES", "2")
-        )
-        prefill_tf32_tma_k_splits = int(
-            os.environ.get("B12X_MHC_PREFILL_TF32_TMA_LONG_K_SPLITS", "4")
-        )
 
     device = require_sm120()
     if args.compare_vllm:
@@ -594,12 +487,18 @@ def main() -> None:
         f"fused_rmsnorm={args.fuse_rmsnorm} "
         f"prefill_tf32_mma={prefill_tf32_enabled} "
         f"prefill_tf32_selected={prefill_tf32_selected} "
-        f"prefill_tf32_tma=m{prefill_tf32_tma_m}n{prefill_tf32_tma_n}"
-        f"k{prefill_tf32_tma_k}s{prefill_tf32_tma_stages}"
-        f"wm{prefill_tf32_tma_m_warps}wn{prefill_tf32_tma_n_warps} "
+        f"prefill_tf32_tma=m{prefill_tf32_kernel.tile_m}"
+        f"n{prefill_tf32_kernel.tile_n}"
+        f"k{prefill_tf32_kernel.tile_k}"
+        f"s{prefill_tf32_kernel.num_stages}"
+        f"wm{prefill_tf32_kernel.num_m_warps}"
+        f"wn{prefill_tf32_kernel.num_n_warps} "
+        f"prefill_tf32_medium_geometry={prefill_tf32_tma_medium_geometry} "
+        f"prefill_tf32_medium_high_geometry="
+        f"{prefill_tf32_tma_medium_high_geometry} "
         f"prefill_tf32_chunk_geometry={prefill_tf32_tma_chunk_geometry} "
         f"prefill_tf32_long_geometry={prefill_tf32_tma_long_geometry} "
-        f"prefill_tf32_k_splits={prefill_tf32_tma_k_splits} "
+        f"prefill_tf32_k_splits={prefill_tf32_kernel.k_splits} "
         f"prefill_gram_threads={prefill_gram_threads} "
         f"prefill_finalize_threads={prefill_finalize_threads} "
         f"prefill_bf16_mma={prefill_bf16_enabled} "
