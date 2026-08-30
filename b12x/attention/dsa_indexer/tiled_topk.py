@@ -47,15 +47,23 @@ _RADIX = 256
 _COARSE_RADIX_BITS = 10
 _COARSE_RADIX_BINS = 1 << _COARSE_RADIX_BITS
 _HIST_SLOTS = _COARSE_RADIX_BINS + 128
-# A 1024-thread selector CTA is already limited to one resident block per SM on
-# SM120 (1536 threads/SM).  Keeping 8192 candidates therefore avoids the common
-# long-context overflow without reducing occupancy; the complete shared-memory
-# allocation remains below the 99 KiB opt-in block limit.  The exact rescan below
-# still covers wider or degenerate threshold buckets.
-_SMEM_CANDS = 8192
+# Candidate storage is a compile-time kernel policy.  The SM120 top-k-512 path
+# uses a smaller buffer to reduce the selector's shared-memory footprint; its
+# exact overflow rescan preserves selection semantics when a threshold bucket is
+# wider than the buffer.  Larger top-k values retain enough buffered candidates
+# to avoid making that rescan the ordinary path.
+_DEFAULT_SMEM_CANDIDATES = 8192
+_SM120_TOPK512_SMEM_CANDIDATES = 1024
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "B12X_DSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
+
+
+def _resolve_smem_candidate_capacity(*, topk: int, device: torch.device) -> int:
+    capability = torch.cuda.get_device_capability(device)
+    if capability == (12, 0) and int(topk) == 512:
+        return _SM120_TOPK512_SMEM_CANDIDATES
+    return _DEFAULT_SMEM_CANDIDATES
 
 
 @dsl_user_op
@@ -529,6 +537,7 @@ class DSATiledTopkKernel:
         is_first: bool = True,
         output_physical_slots: bool = False,
         extent_splits: int = 1,
+        smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
     ):
         self.extent_splits = int(extent_splits)
         self.is_tiled = is_tiled
@@ -543,6 +552,12 @@ class DSATiledTopkKernel:
         # or the user's final output.
         self.is_first = bool(is_first)
         self.output_physical_slots = bool(output_physical_slots)
+        self.smem_candidate_capacity = int(smem_candidate_capacity)
+        if self.smem_candidate_capacity < self.topk:
+            raise ValueError(
+                "shared candidate capacity must cover top-k output capacity, got "
+                f"{self.smem_candidate_capacity} < {self.topk}"
+            )
 
     @cute.jit
     def __call__(
@@ -692,6 +707,7 @@ class DSATiledTopkKernel:
             )
 
         smem_alloc = cutlass.utils.SmemAllocator()
+        smem_candidate_capacity = self.smem_candidate_capacity
 
         @cute.struct
         class SharedStorage:
@@ -710,10 +726,10 @@ class DSATiledTopkKernel:
             ni1: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             last_rem: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 128]
             cand0: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128
+                cute.struct.MemRange[cutlass.Int32, smem_candidate_capacity], 128
             ]
             cand1: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int32, _SMEM_CANDS], 128
+                cute.struct.MemRange[cutlass.Int32, smem_candidate_capacity], 128
             ]
 
         storage = smem_alloc.allocate(SharedStorage)
@@ -728,10 +744,10 @@ class DSATiledTopkKernel:
             cute.make_layout((topk_capacity,), stride=(1,))
         )
         s_cand0 = storage.cand0.get_tensor(
-            cute.make_layout((_SMEM_CANDS,), stride=(1,))
+            cute.make_layout((smem_candidate_capacity,), stride=(1,))
         )
         s_cand1 = storage.cand1.get_tensor(
-            cute.make_layout((_SMEM_CANDS,), stride=(1,))
+            cute.make_layout((smem_candidate_capacity,), stride=(1,))
         )
 
         h0 = shared_ptr_to_u32(storage.hist0.data_ptr())
@@ -949,7 +965,7 @@ class DSATiledTopkKernel:
                         else:
                             if Int32(coarse_bin) == threshold_bin:
                                 cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
-                                if cand_pos < Int32(_SMEM_CANDS):
+                                if cand_pos < Int32(smem_candidate_capacity):
                                     s_cand0[cand_pos] = idx
                                     key32 = _convert_to_uint32(raw_input)
                                     sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
@@ -976,7 +992,7 @@ class DSATiledTopkKernel:
                     else:
                         if Int32(coarse_bin) == threshold_bin:
                             cand_pos = _smem_xadd(ni0, Int32(0), Int32(1))
-                            if cand_pos < Int32(_SMEM_CANDS):
+                            if cand_pos < Int32(smem_candidate_capacity):
                                 s_cand0[cand_pos] = idx_base
                                 key32 = _convert_to_uint32(raw_input)
                                 sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
@@ -985,7 +1001,7 @@ class DSATiledTopkKernel:
 
                 cute.arch.sync_threads()
                 # ni0 now holds the FULL threshold-bin candidate count: the xadd
-                # ran for every bin-matching key, even past _SMEM_CANDS. Capture it
+                # ran for every bin-matching key, even past the buffer. Capture it
                 # before the round loop clobbers ni0, to detect when the threshold
                 # bucket overflowed the candidate buffer (winners dropped past the cap).
                 bin_count = Int32(_smem_ld(ni0, Int32(0)))
@@ -995,7 +1011,7 @@ class DSATiledTopkKernel:
                 # buffer first: none of those intermediate outputs survive.  This is
                 # a CTA-uniform branch because every thread reads the same shared
                 # counter after the barrier above.
-                if bin_count > Int32(_SMEM_CANDS):
+                if bin_count > Int32(smem_candidate_capacity):
                     topk = Int32(-1)
 
                 # Stage 2: refine with 8-bit radix passes
@@ -1011,8 +1027,8 @@ class DSATiledTopkKernel:
                         )
                         num_input = (
                             raw_num_input
-                            if raw_num_input < Int32(_SMEM_CANDS)
-                            else Int32(_SMEM_CANDS)
+                            if raw_num_input < Int32(smem_candidate_capacity)
+                            else Int32(smem_candidate_capacity)
                         )
 
                         # Prefix sum
@@ -1128,7 +1144,7 @@ class DSATiledTopkKernel:
                                                 if cutlass.const_expr(r_idx_next_is_0)
                                                 else _smem_xadd(ni1, Int32(0), Int32(1))
                                             )
-                                            if cand_pos < Int32(_SMEM_CANDS):
+                                            if cand_pos < Int32(smem_candidate_capacity):
                                                 if cutlass.const_expr(r_idx_next_is_0):
                                                     s_cand0[cand_pos] = c_idx
                                                 else:
@@ -1146,9 +1162,9 @@ class DSATiledTopkKernel:
                             cute.arch.sync_threads()
 
                 # Exact overflow fallback: the buffered refine above dropped
-                # winners when more than _SMEM_CANDS candidates shared the coarse
+                # winners when more candidates than the buffer shared the coarse
                 # threshold bucket. Redo the selection exactly by re-scanning.
-                if bin_count > Int32(_SMEM_CANDS):
+                if bin_count > Int32(smem_candidate_capacity):
                     _exact_overflow_fallback(
                         tx,
                         total_len,
@@ -1248,6 +1264,7 @@ def _build_tiled_topk_kernel(
     is_first: bool = True,
     output_physical_slots: bool = False,
     extent_splits: int = 1,
+    smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
 ):
     return DSATiledTopkKernel(
         is_tiled=True,
@@ -1258,11 +1275,16 @@ def _build_tiled_topk_kernel(
         is_first=is_first,
         output_physical_slots=output_physical_slots,
         extent_splits=extent_splits,
+        smem_candidate_capacity=smem_candidate_capacity,
     )
 
 
-@lru_cache(maxsize=8)
-def _build_row_topk_kernel(topk: int, output_physical_slots: bool = False):
+@lru_cache(maxsize=16)
+def _build_row_topk_kernel(
+    topk: int,
+    output_physical_slots: bool = False,
+    smem_candidate_capacity: int = _DEFAULT_SMEM_CANDIDATES,
+):
     return DSATiledTopkKernel(
         is_tiled=False,
         block_q=1,
@@ -1270,6 +1292,7 @@ def _build_row_topk_kernel(topk: int, output_physical_slots: bool = False):
         topk=topk,
         zero_row_start=True,
         output_physical_slots=output_physical_slots,
+        smem_candidate_capacity=smem_candidate_capacity,
     )
 
 
@@ -1494,6 +1517,10 @@ def run_tiled_topk(
     flat_carry_values = carry_values.reshape(-1).contiguous()
     flat_carry_indices = carry_indices.reshape(-1).contiguous()
 
+    smem_candidate_capacity = _resolve_smem_candidate_capacity(
+        topk=topk,
+        device=tile_logits.device,
+    )
     kernel = _build_tiled_topk_kernel(
         block_q,
         block_k,
@@ -1502,6 +1529,7 @@ def run_tiled_topk(
         bool(is_first),
         bool(output_physical_slots),
         extent_splits,
+        smem_candidate_capacity,
     )
     input_key_tensor = tile_logits
     lengths_key_tensor = lengths
@@ -1555,7 +1583,7 @@ def run_tiled_topk(
             "output_page_table", output_page_table_key_tensor, dynamic=True
         ),
         (
-            "tiled_topk_v27_runtime_page_stride",
+            "tiled_topk_v28_smem_candidate_policy",
             topk,
             block_q,
             block_k,
@@ -1563,6 +1591,7 @@ def run_tiled_topk(
             bool(is_first),
             bool(output_physical_slots),
             extent_splits,
+            smem_candidate_capacity,
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
@@ -1685,7 +1714,15 @@ def run_row_topk(
     carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
-    kernel = _build_row_topk_kernel(topk, output_gather_table is not None)
+    smem_candidate_capacity = _resolve_smem_candidate_capacity(
+        topk=topk,
+        device=row_logits.device,
+    )
+    kernel = _build_row_topk_kernel(
+        topk,
+        output_gather_table is not None,
+        smem_candidate_capacity,
+    )
     input_key_tensor = row_logits
     lengths_key_tensor = lengths
     values_key_tensor = topk_values
@@ -1734,9 +1771,10 @@ def run_row_topk(
             "output_gather_table", output_gather_table_for_kernel, dynamic=True
         ),
         (
-            "row_topk_v7_runtime_page_stride",
+            "row_topk_v8_smem_candidate_policy",
             topk,
             output_gather_table is not None,
+            smem_candidate_capacity,
         ),
     )
     compile_spec = KernelCompileSpec.from_key(
