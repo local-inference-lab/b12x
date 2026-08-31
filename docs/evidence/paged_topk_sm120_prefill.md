@@ -106,10 +106,10 @@ Result: `17 passed, 29 deselected`. The selection covers top-k policy,
 64-bit physical-slot oracle arithmetic, indices-only output, short-row padding,
 exact overflow selection, and CUDA graph replay with changing live inputs.
 
-The benchmark oracle also passed the following graph-replay smoke cases after
-the score sentinel was moved to the terminal workspace slice actually consumed
-by `index_topk_fp8`. These samples are correctness evidence, not performance
-qualification:
+For indices-only `index_topk_fp8` runs, the benchmark initializes the
+binding-owned terminal workspace score slice and verifies that the selector
+leaves it unchanged. The following graph-replay samples provide correctness
+evidence, not performance qualification:
 
 | Rows | Visible tokens | Page-table width | Candidate capacity | Chunks | Oracle state |
 | ---: | ---: | ---: | ---: | ---: | --- |
