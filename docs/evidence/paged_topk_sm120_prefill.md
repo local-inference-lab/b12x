@@ -39,6 +39,17 @@ gated.
   `voipmonitor/vllm:jovian-judgement-community-20260831-r10`, with the B12X
   checkout mounted read-only at `/src`.
 
+The timed selector objects share source revision
+`03ba9855d28717096135f675852a8888fa79c189`, package fingerprint
+`351a2593b55428b9d81840384e4cddcf34a2fc76e3be8b5628366d451655a2e0`,
+CUTLASS DSL 4.6.2, and PTXAS 13.3.73. The PTXAS executable has SHA-256
+`afd8d1e1fa6e310f7faee44f6621e4c1315fb7fd6da7d4d87414358e12a651dc`.
+
+| Candidate capacity | Compile manifest cache key | Compile manifest SHA-256 | Compile specification SHA-256 | Object SHA-256 |
+| ---: | --- | --- | --- | --- |
+| 1,024 | `377868b15c4457c61e769a9534df456d8f2cc067857bb977363aaed549d55f7a` | `153be41d246f0a8f70dc28b7f553766004a778b80027b57600dc461746d6af5c` | `75e920ecbecdc715ccc4061644e1370f66afc778d876909c791663bfe1871806` | `771c9ddf8f831bff42c45846744167faf9e51134cc15c297fc2df48632bf55ce` |
+| 8,192 | `a77894d49ebd74b4d94927aff50f109effb6fc348540cbf855e1542eb707e31f` | `42bf35cb808e4771d005680c4e5c598cb98aa7824e82587ace50a4fd214a92ab` | `4044c4e1510075ae5f8b62e2eba1cc903b677c5713e6e70597a7a0eac0a64b08` | `3302781c9b37e18662de61381d25bdf4db96c1b4366da7ac30ab90772760b5e3` |
+
 Both arms used the same source, analytic inputs, graph-replay path,
 indices-only output contract, and cache state. The benchmark-only
 `--topk-candidate-capacity` argument selected the compile-time capacity:
@@ -85,14 +96,15 @@ docker run --rm --gpus '"device=2"' --ipc=host --shm-size 16g \
   -w /src \
   voipmonitor/vllm:jovian-judgement-community-20260831-r10 \
   -lc '/opt/venv/bin/python -B -m pytest -q \
+    tests/attention/test_benchmark_paged_indexer.py \
     tests/attention/test_attention_dsa_indexer_api.py \
     tests/attention/test_paged_prefill_topk_long_context.py \
-    -k "topk_candidate_capacity or row_topk or paged_prefill_topk"'
+    -k "analytic_topk or topk_candidate_capacity or row_topk or paged_prefill_topk"'
 ```
 
-Result: `16 passed, 29 deselected`. The selection covers top-k policy,
-indices-only output, short-row padding, exact overflow selection, and CUDA graph
-replay with changing live inputs.
+Result: `17 passed, 29 deselected`. The selection covers top-k policy,
+64-bit physical-slot oracle arithmetic, indices-only output, short-row padding,
+exact overflow selection, and CUDA graph replay with changing live inputs.
 
 The benchmark oracle also passed the following graph-replay smoke cases after
 the score sentinel was moved to the terminal workspace slice actually consumed

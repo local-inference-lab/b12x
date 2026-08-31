@@ -62,6 +62,14 @@ def _make_page_table(
     return table.contiguous()
 
 
+def _physical_slots(
+    page_ids: torch.Tensor,
+    page_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Return page-based token slots without 32-bit offset overflow."""
+    return page_ids.to(torch.int64) * 64 + page_offsets.to(torch.int64)
+
+
 def _validate_analytic_topk(
     *,
     indices: torch.Tensor,
@@ -101,7 +109,7 @@ def _validate_analytic_topk(
         torch.int64
     )
     expected_page_ids = torch.gather(real_page_table, 1, safe_page_cols)
-    expected_physical = expected_page_ids * 64 + expected_page_offsets
+    expected_physical = _physical_slots(expected_page_ids, expected_page_offsets)
     expected_indices = expected_physical if output_physical_slots else expected_logical
     expected_indices = torch.where(
         expected_valid, expected_indices, torch.full_like(expected_indices, -1)
@@ -135,7 +143,7 @@ def _validate_analytic_topk(
         actual_page_ids = torch.gather(
             real_page_table, 1, actual_page_cols.to(torch.int64)
         )
-        score_indices = actual_page_ids * 64 + actual_page_offsets
+        score_indices = _physical_slots(actual_page_ids, actual_page_offsets)
     expected_scores = analytic_scores[score_indices.to(torch.int64)]
     actual_valid_scores = scores[valid_mask]
     expected_valid_scores = expected_scores[valid_mask]
