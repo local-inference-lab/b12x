@@ -3,7 +3,7 @@
 ## Status and operation contract
 
 Status: **implemented** as an architecture-neutral top-k policy and
-**qualified** on NVIDIA SM120.
+**qualified** on NVIDIA compute capability 12.0 (SM120).
 
 The top-k-512 selector uses a 1,024-entry shared candidate buffer. Selectors
 with top-k 1,024 or 2,048 use an 8,192-entry buffer. Candidate capacity is an
@@ -31,7 +31,10 @@ gated.
   Gen5 x16, stock clocks, and a 600 W power limit.
 - Toolchain: CUDA Python 13.3.1, PyTorch 2.13.0+cu130, CUTLASS DSL 4.6.2, and
   `CUTE_DSL_ARCH=sm_120a`.
-- Python environment: the worktree `.venv`.
+- Performance environment: the worktree `.venv`.
+- Correctness environment: `/opt/venv` from
+  `voipmonitor/vllm:jovian-judgement-community-20260831-r10`, with the B12X
+  checkout mounted read-only at `/src`.
 
 Both arms used the same source, analytic inputs, graph-replay path,
 indices-only output contract, and cache state. The benchmark-only
@@ -60,24 +63,45 @@ The 8,192-entry arm changed only
 `--topk-candidate-capacity 8192`. One preconditioning process per arm preceded
 five measured processes per arm. Measured processes ran in balanced order, and
 each process first passed the analytic top-k oracle and verified that the
-indices-only launch left a caller-owned score buffer unchanged. Each process
-then reported the median of 30 graph replays.
+indices-only launch left the binding-owned terminal workspace score slice
+unchanged. Each process then reported the median of 30 graph replays.
 
 ## Correctness
 
-The focused selector suite used the production source and 1,024-entry policy:
+The focused selector suite used the production source and 1,024-entry policy.
+The command ran from the B12X repository root and exposed physical GPU 2 as
+CUDA device 0 in the container:
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 CUTE_DSL_ARCH=sm_120a \
-  /opt/venv/bin/python -B -m pytest -q \
-  tests/attention/test_attention_dsa_indexer_api.py \
-  tests/attention/test_paged_prefill_topk_long_context.py \
-  -k "topk_candidate_capacity or row_topk or paged_prefill_topk"
+docker run --rm --gpus '"device=2"' --ipc=host --shm-size 16g \
+  --entrypoint /bin/bash \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -e CUTE_DSL_ARCH=sm_120a \
+  -e PYTHONPATH=/src \
+  -v "$PWD:/src:ro" \
+  -w /src \
+  voipmonitor/vllm:jovian-judgement-community-20260831-r10 \
+  -lc '/opt/venv/bin/python -B -m pytest -q \
+    tests/attention/test_attention_dsa_indexer_api.py \
+    tests/attention/test_paged_prefill_topk_long_context.py \
+    -k "topk_candidate_capacity or row_topk or paged_prefill_topk"'
 ```
 
 Result: `16 passed, 29 deselected`. The selection covers top-k policy,
 indices-only output, short-row padding, exact overflow selection, and CUDA graph
 replay with changing live inputs.
+
+The benchmark oracle also passed the following graph-replay smoke cases after
+the score sentinel was moved to the terminal workspace slice actually consumed
+by `index_topk_fp8`. These samples are correctness evidence, not performance
+qualification:
+
+| Rows | Visible tokens | Page-table width | Candidate capacity | Chunks | Oracle state |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4,080 | 8,192 | 128 | 1,024 | 1 | indices and untouched terminal scores pass |
+| 4,080 | 8,192 | 128 | 8,192 | 1 | indices and untouched terminal scores pass |
+| 1 | 64 | 1 | 1,024 | 1 | short-row padding and untouched terminal scores pass |
+| 32 | 16,384 | 256 | 1,024 | 2 | carry fold, indices, and untouched terminal scores pass |
 
 ## Selector performance
 

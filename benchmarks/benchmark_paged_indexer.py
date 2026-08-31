@@ -94,11 +94,13 @@ def _validate_analytic_topk(
     )
     expected_page_cols = torch.div(expected_logical, 64, rounding_mode="floor")
     expected_page_offsets = torch.remainder(expected_logical, 64)
-    expected_page_ids = torch.gather(
-        real_page_table,
-        1,
-        expected_page_cols.clamp_(min=0).to(torch.int64),
+    page_table_width = int(real_page_table.shape[1])
+    if page_table_width <= 0:
+        raise ValueError("analytic top-k validation requires a non-empty page table")
+    safe_page_cols = expected_page_cols.clamp(min=0, max=page_table_width - 1).to(
+        torch.int64
     )
+    expected_page_ids = torch.gather(real_page_table, 1, safe_page_cols)
     expected_physical = expected_page_ids * 64 + expected_page_offsets
     expected_indices = expected_physical if output_physical_slots else expected_logical
     expected_indices = torch.where(
@@ -382,6 +384,10 @@ def main() -> None:
             "top-k candidate capacity must cover the requested top-k width, got "
             f"{args.topk_candidate_capacity} < {args.topk}"
         )
+    if args.topk_candidate_capacity is not None and args.mode != "supertile-topk":
+        raise ValueError(
+            "--topk-candidate-capacity applies only to --mode supertile-topk"
+        )
     if args.topk_candidate_capacity is not None:
         candidate_capacity = int(args.topk_candidate_capacity)
 
@@ -629,17 +635,22 @@ def main() -> None:
 
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
     out_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
-    untouched_scores = None
-    if args.check and args.indices_only:
-        # The indices-only serving contract must not mutate caller score storage.
-        # A distinct value per element detects partial writes as well as full
-        # materialization without relying on NaN comparison behavior.
-        out_scores.copy_(
+    indices_only_scratch_scores = None
+    untouched_scratch_scores = None
+    if args.check and args.indices_only and bench_mode == "supertile-topk":
+        # index_topk_fp8 receives no output score tensor in indices-only mode.
+        # Its terminal fold instead targets the binding-owned workspace slice,
+        # so validate that exact slice rather than unrelated caller storage.
+        scratch_scores, _ = binding.scratch.get_indexer_contiguous_topk_buffers(
+            row_count=rows
+        )
+        indices_only_scratch_scores = scratch_scores[:, :topk]
+        indices_only_scratch_scores.copy_(
             torch.arange(rows * topk, dtype=torch.float32, device=device).view(
                 rows, topk
             )
         )
-        untouched_scores = out_scores.clone()
+        untouched_scratch_scores = indices_only_scratch_scores.clone()
     fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
     fused_cache = None
     if bench_mode == "fused-topk":
@@ -859,12 +870,18 @@ def main() -> None:
             output_physical_slots=output_physical_slots,
         )
         if args.indices_only:
-            assert untouched_scores is not None
-            if not torch.equal(out_scores, untouched_scores):
-                raise AssertionError(
-                    "indices-only selector must leave the score buffer untouched"
-                )
-            oracle_state = "analytic_indices_pass(scores_untouched)"
+            if indices_only_scratch_scores is not None:
+                assert untouched_scratch_scores is not None
+                if not torch.equal(
+                    indices_only_scratch_scores, untouched_scratch_scores
+                ):
+                    raise AssertionError(
+                        "indices-only selector must leave its terminal workspace "
+                        "score slice untouched"
+                    )
+                oracle_state = "analytic_indices_pass(workspace_scores_untouched)"
+            else:
+                oracle_state = "analytic_indices_pass"
         else:
             assert oracle_max_abs is not None
             oracle_state = f"analytic_pass(max_abs={oracle_max_abs:.3g})"

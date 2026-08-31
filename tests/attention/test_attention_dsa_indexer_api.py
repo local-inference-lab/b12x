@@ -1593,7 +1593,7 @@ def test_row_topk_indices_only_preserves_value_buffer() -> None:
     reason="CUDA required for padded row top-k coverage",
 )
 def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
-    """Qualify a compressed-key fold with fewer than top-k live candidates."""
+    """Validate a gathered row fold with fewer than top-k live candidates."""
     device = torch.device("cuda")
     generator = torch.Generator(device="cpu").manual_seed(73_623)
     rows, width, topk = 2304, 2560, 512
