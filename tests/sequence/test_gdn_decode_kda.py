@@ -258,7 +258,6 @@ def test_reference_applies_per_key_lower_bounded_decay() -> None:
 
 
 def test_reference_keeps_kda_rmsnorm_in_fp32_until_final_store() -> None:
-    device = torch.device("cpu")
     core = torch.linspace(-1.3, 1.7, 128, dtype=torch.float32).to(torch.bfloat16)
     q = torch.zeros(128, dtype=torch.bfloat16)
     q[0] = 1
