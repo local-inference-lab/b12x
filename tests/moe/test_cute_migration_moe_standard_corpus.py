@@ -553,7 +553,7 @@ def test_standard_moe_glm53_m1_rowpair_live_graph_oracle(
 ) -> None:
     """Exercise GLM-5.3's native M1 row-pair FC2 path through dispatch."""
 
-    num_experts = 16
+    num_experts = 288
     hidden_size = 4096
     intermediate_size = 512
     topk = 8
