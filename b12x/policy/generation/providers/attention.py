@@ -124,7 +124,7 @@ class GdnAttentionGenerator(_AttentionGenerator):
             corpus_name="gdn",
             geometry_count=len(GDN_GEOMETRIES),
             benchmark_factory=benchmark_factory or GdnBenchmarkFactory(),
-            config_schema_version=2,
+            config_schema_version=3,
             nearest_range_bounds={
                 "max_seqs": (1, max(COMMON_SEQUENCE_CAPACITIES)),
                 "max_tokens": (
