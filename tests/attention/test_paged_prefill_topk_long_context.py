@@ -214,7 +214,7 @@ def test_paged_prefill_topk_all_equal_scores_tie_fill(monkeypatch) -> None:
 
 
 def test_paged_prefill_topk_512_all_equal_scores_tie_fill(monkeypatch) -> None:
-    """The SM120 top-k-512 buffer policy preserves exact tie-fill semantics."""
+    """The top-k-512 buffer policy preserves exact tie-fill semantics."""
     device = torch.device("cuda")
     scene = _build_scene(device, 8192, "equal", topk=512)
     selected = _run_indexer(
