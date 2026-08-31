@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from benchmarks.common import make_l2_flush_fn
+import b12x.attention.dsa_indexer.tiled_topk as tiled_topk_module
 from b12x.attention.dsa_indexer._impl import uses_paged_mqa_schedule
 from b12x.attention.dsa_indexer.kernel import (
     run_paged_supertile_logits_kernel,
@@ -270,6 +271,15 @@ def main() -> None:
     )
     parser.add_argument("--topk", type=int, default=512)
     parser.add_argument(
+        "--topk-candidate-capacity",
+        type=int,
+        choices=(1024, 8192),
+        help=(
+            "benchmark-only override for the compile-time shared candidate "
+            "capacity"
+        ),
+    )
+    parser.add_argument(
         "--output-index-space",
         choices=("logical", "physical"),
         default="logical",
@@ -366,6 +376,28 @@ def main() -> None:
 
     if args.check and args.indices_only:
         raise ValueError("--check requires score output and cannot use --indices-only")
+    if (
+        args.topk_candidate_capacity is not None
+        and args.topk_candidate_capacity < args.topk
+    ):
+        raise ValueError(
+            "top-k candidate capacity must cover the requested top-k width, got "
+            f"{args.topk_candidate_capacity} < {args.topk}"
+        )
+    if args.topk_candidate_capacity is not None:
+        candidate_capacity = int(args.topk_candidate_capacity)
+
+        def resolve_candidate_capacity(*, topk: int) -> int:
+            if candidate_capacity < int(topk):
+                raise ValueError(
+                    "top-k candidate capacity must cover the requested width, got "
+                    f"{candidate_capacity} < {topk}"
+                )
+            return candidate_capacity
+
+        tiled_topk_module._resolve_smem_candidate_capacity = (
+            resolve_candidate_capacity
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -892,7 +924,9 @@ def main() -> None:
         f"page_stride={page_stride} cache_page_stride_bytes={cache_page_stride_bytes} "
         f"cache_num_pages={cache_num_pages} "
         f"cache_span_mib={((cache_num_pages - 1) * cache_page_stride_bytes + logical_cache_page_bytes) / (1024 * 1024):.2f} "
-        f"topk={topk} supertile_k={supertile_k} "
+        f"topk={topk} "
+        f"topk_candidate_capacity={args.topk_candidate_capacity or 'policy'} "
+        f"supertile_k={supertile_k} "
         f"output_index_space={args.output_index_space} "
         f"requested_supertile_k={requested_supertile_k} "
         f"route={plan.layout.route} prefill_block_k={plan.layout.prefill_block_k} "
