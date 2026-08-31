@@ -346,48 +346,47 @@ def test_gdn_backend_identifies_decay_contract_from_head_geometry() -> None:
     assert GDN_POLICY.heuristic(glm, None).recurrent_block_v == 32
 
 
-def test_gdn_profile_scopes_glm53_sm120_block_v16_to_measured_capacity() -> None:
-    query = GdnQuery(
-        gate_activation="sigmoid",
-        qk_l2norm=True,
-        state_dtype="float32",
-        key_heads=16,
-        value_heads=16,
-        max_seqs=32,
-        max_tokens=128,
-        state_index_columns=4,
-    )
+def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
+    """Require planned tiles for four-way tensor-parallel serving graphs."""
+
     device = DeviceIdentity(
         vendor="NVIDIA",
         compute_capability=(12, 0),
         sm_count=188,
         product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
     )
-
-    resolution = PolicyContext.for_identity(
-        device,
-        mode=PolicyMode.PREPLANNED_ONLY,
-    ).resolve(GDN_POLICY, query)
-
-    assert resolution.source is PolicySource.PREPLANNED
-    assert resolution.config.backend == "triton"
-    assert resolution.config.recurrent_block_v == 16
-
-    mtp0_query = GdnQuery(
-        gate_activation=query.gate_activation,
-        qk_l2norm=query.qk_l2norm,
-        state_dtype=query.state_dtype,
-        key_heads=query.key_heads,
-        value_heads=query.value_heads,
-        max_seqs=query.max_seqs,
-        max_tokens=32,
-        state_index_columns=1,
-    )
     profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
     component = profile.component("attention.gdn")
     assert component is not None
-    mtp0_leaf = component.lookup(mtp0_query.profile_fields())
-    assert mtp0_leaf is None or mtp0_leaf.config["recurrent_block_v"] == 32
+
+    serving_capacities = (
+        (16, 16, 1),  # One target token without speculative decoding.
+        (16, 64, 4),  # Target plus three multi-token-prediction draft tokens.
+        (16, 128, 8),  # One target token plus seven DFlash2 draft tokens.
+    )
+    for max_seqs, max_tokens, state_index_columns in serving_capacities:
+        query = GdnQuery(
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            state_dtype="float32",
+            key_heads=16,
+            value_heads=16,
+            max_seqs=max_seqs,
+            max_tokens=max_tokens,
+            state_index_columns=state_index_columns,
+        )
+        leaf = component.lookup(query.profile_fields())
+        resolution = PolicyContext.for_identity(
+            device,
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).resolve(GDN_POLICY, query)
+
+        assert leaf is not None
+        assert leaf.config["backend"] == "triton"
+        assert leaf.config["recurrent_block_v"] == 16
+        assert resolution.source is PolicySource.PREPLANNED
+        assert resolution.config.backend == "triton"
+        assert resolution.config.recurrent_block_v == 16
 
     other_device = DeviceIdentity(
         vendor="NVIDIA",
