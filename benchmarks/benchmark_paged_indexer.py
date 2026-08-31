@@ -65,13 +65,13 @@ def _make_page_table(
 def _validate_analytic_topk(
     *,
     indices: torch.Tensor,
-    scores: torch.Tensor,
+    scores: torch.Tensor | None,
     seqlens: torch.Tensor,
     topk: int,
     analytic_scores: torch.Tensor,
     real_page_table: torch.Tensor,
     output_physical_slots: bool,
-) -> float:
+) -> float | None:
     """Validate every target-shape row against a cheap analytic top-k oracle."""
     columns = torch.arange(topk, dtype=torch.int32, device=indices.device)
     valid_counts = torch.minimum(seqlens, torch.full_like(seqlens, int(topk)))
@@ -120,6 +120,9 @@ def _validate_analytic_topk(
             f"row={row} missing={missing} extra={extra} "
             f"actual_unique={len(actual_set)} expected_unique={len(expected_set)}"
         )
+
+    if scores is None:
+        return None
 
     safe_indices = indices.clamp(min=0)
     if output_physical_slots:
@@ -371,8 +374,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=91_100)
     args = parser.parse_args()
 
-    if args.check and args.indices_only:
-        raise ValueError("--check requires score output and cannot use --indices-only")
     if (
         args.topk_candidate_capacity is not None
         and args.topk_candidate_capacity < args.topk
@@ -628,6 +629,17 @@ def main() -> None:
 
     out_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
     out_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    untouched_scores = None
+    if args.check and args.indices_only:
+        # The indices-only serving contract must not mutate caller score storage.
+        # A distinct value per element detects partial writes as well as full
+        # materialization without relying on NaN comparison behavior.
+        out_scores.copy_(
+            torch.arange(rows * topk, dtype=torch.float32, device=device).view(
+                rows, topk
+            )
+        )
+        untouched_scores = out_scores.clone()
     fused_ctas = int(args.fused_ctas) if int(args.fused_ctas) > 0 else None
     fused_cache = None
     if bench_mode == "fused-topk":
@@ -834,18 +846,28 @@ def main() -> None:
     # First call compiles the CuTe DSL kernel before timing or capture.
     out = run()
     torch.cuda.synchronize()
-    oracle_max_abs = None
+    oracle_state = "not_run"
     if args.check:
         assert analytic_scores is not None
         oracle_max_abs = _validate_analytic_topk(
             indices=out_indices,
-            scores=out_scores,
+            scores=None if args.indices_only else out_scores,
             seqlens=seqlens,
             topk=topk,
             analytic_scores=analytic_scores,
             real_page_table=metadata.real_page_table,
             output_physical_slots=output_physical_slots,
         )
+        if args.indices_only:
+            assert untouched_scores is not None
+            if not torch.equal(out_scores, untouched_scores):
+                raise AssertionError(
+                    "indices-only selector must leave the score buffer untouched"
+                )
+            oracle_state = "analytic_indices_pass(scores_untouched)"
+        else:
+            assert oracle_max_abs is not None
+            oracle_state = f"analytic_pass(max_abs={oracle_max_abs:.3g})"
     l2_flush = make_l2_flush_fn(not args.no_l2_flush)
     if args.eager:
         samples_us = _event_time_us(
@@ -904,11 +926,6 @@ def main() -> None:
 
     median_us = statistics.median(samples_us)
     min_us = min(samples_us)
-    oracle_state = (
-        f"analytic_pass(max_abs={oracle_max_abs:.3g})"
-        if oracle_max_abs is not None
-        else "not_run"
-    )
     raw_us = ",".join(f"{sample:.2f}" for sample in samples_us)
 
     print(
