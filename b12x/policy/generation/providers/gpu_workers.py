@@ -43,13 +43,15 @@ def _gdn_random_tensor(
 def _build_gdn_buffers(
     case: SweepCase,
     *,
+    candidate: SweepCandidate,
     device: object,
     seed: int,
 ) -> _GdnBuffers:
     import torch
 
-    from b12x.policy import PolicyContext, PolicyMode
+    from b12x.policy import GDN_ATTENTION, PolicyContext, PolicyMode
     from b12x.sequence import gdn_decode as gdn
+    from b12x.sequence.gdn_decode._policy import GdnConfig
 
     raw_lengths = case.metadata["query_lengths"]
     if not isinstance(raw_lengths, tuple):
@@ -99,6 +101,9 @@ def _build_gdn_buffers(
         policy=PolicyContext.for_device(
             device,
             mode=PolicyMode.HEURISTIC_ONLY,
+        ).with_override(
+            GDN_ATTENTION,
+            GdnConfig.from_profile(candidate.config),
         ),
     )
     (scratch_spec,) = planned.scratch_specs()
@@ -355,8 +360,19 @@ def _cuda_event_samples_us(
 
 class _GdnSession(AbstractContextManager["_GdnSession"]):
     _CANDIDATES = {
-        "gdn": (SweepCandidate.create({"backend": "cutedsl"}),),
-        "kda": (SweepCandidate.create({"backend": "triton"}),),
+        "gdn": (
+            SweepCandidate.create(
+                {"backend": "cutedsl", "recurrent_block_v": 32}
+            ),
+        ),
+        "kda": (
+            SweepCandidate.create(
+                {"backend": "triton", "recurrent_block_v": 16}
+            ),
+            SweepCandidate.create(
+                {"backend": "triton", "recurrent_block_v": 32}
+            ),
+        ),
     }
 
     def __init__(self, context: GenerationContext) -> None:
@@ -388,13 +404,21 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
         from b12x.sequence import gdn_decode as gdn
 
         expected_candidates = self.candidates(case)
-        if candidates != expected_candidates:
+        if not candidates or any(
+            candidate not in expected_candidates for candidate in candidates
+        ):
             raise ValueError("GDN worker received an unknown candidate set")
+        if len(candidates) > 1:
+            measurements = []
+            for candidate in candidates:
+                measurements.extend(self.measure(case, (candidate,)))
+            return tuple(measurements)
         settings = self._context.settings
         device = torch.device("cuda", self._context.device_ordinal)
         with torch.cuda.device(self._context.device_ordinal):
             buffers = _build_gdn_buffers(
                 case,
+                candidate=candidates[0],
                 device=device,
                 seed=settings.seed,
             )
