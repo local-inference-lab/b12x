@@ -27,7 +27,7 @@ gated.
   `03ba9855d28717096135f675852a8888fa79c189`, based on `master` revision
   `a45d3f7690e5b2f2e9bdcc0f76d76a48a0c490aa`.
 - Correctness and benchmark-oracle revision:
-  `c2b4b20170477d12b139d7853a3903a43fca07ab`.
+  `a8306ab1d117bb53285b511c71ba4bcb5aad4f18`.
 - Worktree: `/root/vllm/tmp/b12x-pr-paged-topk-20260830`.
 - Physical GPU 2: `GPU-167fbc3f-fd06-7f08-9e06-ee02946d041c`, NVIDIA RTX PRO
   6000 Blackwell Workstation Edition, compute capability 12.0, 188 SMs, PCIe
