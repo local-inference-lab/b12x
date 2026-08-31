@@ -47,39 +47,23 @@ _RADIX = 256
 _COARSE_RADIX_BITS = 10
 _COARSE_RADIX_BINS = 1 << _COARSE_RADIX_BITS
 _HIST_SLOTS = _COARSE_RADIX_BINS + 128
-# Candidate storage is a compile-time kernel policy.  The SM120 top-k-512 path
+# Candidate storage is a compile-time top-k policy. The top-k-512 specialization
 # uses a smaller buffer to reduce the selector's shared-memory footprint; its
 # exact overflow rescan preserves selection semantics when a threshold bucket is
-# wider than the buffer.  Larger top-k values retain enough buffered candidates
+# wider than the buffer. Larger top-k values retain enough buffered candidates
 # to avoid making that rescan the ordinary path.
 _DEFAULT_SMEM_CANDIDATES = 8192
-_SM120_TOPK512_SMEM_CANDIDATES = 1024
+_TOPK512_SMEM_CANDIDATES = 1024
 _SCAN_UNROLL = 4
 _SUPERTILE_K_ENV = "B12X_DSA_TOPK_SUPERTILE_K"
 _SUPERTILE_K_DEFAULT = 32768
 
 
-@lru_cache(maxsize=32)
-def _resolve_smem_candidate_capacity_for_device(
-    topk: int,
-    device_index: int,
-) -> int:
-    """Resolve immutable selector geometry once per device and top-k."""
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability == (12, 0) and int(topk) == 512:
-        return _SM120_TOPK512_SMEM_CANDIDATES
+def _resolve_smem_candidate_capacity(*, topk: int) -> int:
+    """Resolve the immutable candidate capacity for a top-k specialization."""
+    if int(topk) == 512:
+        return _TOPK512_SMEM_CANDIDATES
     return _DEFAULT_SMEM_CANDIDATES
-
-
-def _resolve_smem_candidate_capacity(*, topk: int, device: torch.device) -> int:
-    if device.type != "cuda":
-        raise ValueError(
-            f"top-k candidate capacity requires a CUDA device, got {device}"
-        )
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    return _resolve_smem_candidate_capacity_for_device(int(topk), int(device_index))
 
 
 @dsl_user_op
@@ -564,9 +548,9 @@ class DSATiledTopkKernel:
         self.zero_row_start = bool(zero_row_start)
         # When is_first the carry buffers are unread (the running-topk fold has no
         # predecessor for the first supertile chunk). There is no `is_last`: the
-        # kernel always emits (value, global index) topk into values/indices; the
-        # orchestrator decides whether that tensor is the next chunk's carry buffer
-        # or the user's final output.
+        # kernel always emits top-k indices and emits values when write_values is
+        # true. The orchestrator decides whether those tensors are the next chunk's
+        # carry buffers or the user's final outputs.
         self.is_first = bool(is_first)
         self.output_physical_slots = bool(output_physical_slots)
         self.smem_candidate_capacity = int(smem_candidate_capacity)
@@ -1335,7 +1319,6 @@ def _build_row_topk_kernel(
 def clear_tiled_topk_kernel_cache() -> None:
     _build_tiled_topk_kernel.cache_clear()
     _build_row_topk_kernel.cache_clear()
-    _resolve_smem_candidate_capacity_for_device.cache_clear()
 
 
 def _validate_supported_topk(topk: int, *, caller: str) -> int:
@@ -1561,10 +1544,7 @@ def run_tiled_topk(
     flat_carry_values = carry_values.reshape(-1).contiguous()
     flat_carry_indices = carry_indices.reshape(-1).contiguous()
 
-    smem_candidate_capacity = _resolve_smem_candidate_capacity(
-        topk=topk,
-        device=tile_logits.device,
-    )
+    smem_candidate_capacity = _resolve_smem_candidate_capacity(topk=topk)
     kernel = _build_tiled_topk_kernel(
         block_q,
         block_k,
@@ -1762,10 +1742,7 @@ def run_row_topk(
     carry_indices = topk_indices
     flat_carry_values = carry_values.reshape(-1)
     flat_carry_indices = carry_indices.reshape(-1)
-    smem_candidate_capacity = _resolve_smem_candidate_capacity(
-        topk=topk,
-        device=row_logits.device,
-    )
+    smem_candidate_capacity = _resolve_smem_candidate_capacity(topk=topk)
     kernel = _build_row_topk_kernel(
         topk,
         output_gather_table is not None,
