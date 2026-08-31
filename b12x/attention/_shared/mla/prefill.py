@@ -209,7 +209,7 @@ def run_unified_prefill(
         scale_format = inferred_scale_format
     else:
         scale_format = int(scale_format)
-        if model_type == ModelType.GLM_NSA and scale_format == ScaleFormat.NVFP4_E4M3:
+        if is_glm_model_type(model_type) and scale_format == ScaleFormat.NVFP4_E4M3:
             # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
             # dequant + BF16 MMA); FP8 compute would misread the 432B record.
             compute_mode = ComputeMode.BF16
@@ -238,7 +238,7 @@ def run_unified_prefill(
         traits.kv_gmem_stride
     ):
         raise ValueError(
-            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
+            "GLM_NEXT sparse MLA cache record width does not match its recipe: "
             f"{int(kv_cache.shape[-1])}"
         )
     d_v = int(traits.d_v)
@@ -409,13 +409,16 @@ def run_unified_prefill(
     _mg_nvfp4 = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
-    if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+    nvfp4_topk_supported = topk in (128, 512, 1024, 2048) or (
+        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    )
+    if _mg_nvfp4 and nvfp4_topk_supported:
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.NVFP4_E4M3,
         )
     _mg_base = (

@@ -4168,14 +4168,21 @@ def run_unified_prefill_mg(
         )
     if scale_format == ScaleFormat.NVFP4_E4M3:
         record_bytes = int(kv_cache.shape[-1])
-        if fp8_rope is None:
+        if model_type == ModelType.GLM_NEXT:
+            if fp8_rope not in (None, False):
+                raise ValueError("GLM_NEXT has no RoPE cache payload")
+            fp8_rope = False
+            expected_record_bytes = 304
+        elif fp8_rope is None:
             if record_bytes not in (368, 432):
                 raise ValueError(
                     "NVFP4 sparse MLA MG cache record must be 368 or 432 bytes, "
                     f"got {record_bytes}"
                 )
             fp8_rope = record_bytes == 368
-        expected_record_bytes = 368 if fp8_rope else 432
+            expected_record_bytes = 368 if fp8_rope else 432
+        else:
+            expected_record_bytes = 368 if fp8_rope else 432
         if record_bytes != expected_record_bytes:
             raise ValueError(
                 "NVFP4 sparse MLA MG cache record disagrees with fp8_rope: "
@@ -4189,7 +4196,7 @@ def run_unified_prefill_mg(
                 "SM120 sparse MLA MG prefill latent_scale_per_token requires "
                 f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
             )
-        if not bool(fp8_rope):
+        if model_type != ModelType.GLM_NEXT and not bool(fp8_rope):
             raise ValueError(
                 "SM120 sparse MLA MG prefill latent_scale_per_token requires "
                 "the fp8-rope 368-byte NVFP4 record; got the 432-byte record"
@@ -4205,7 +4212,7 @@ def run_unified_prefill_mg(
         traits.kv_gmem_stride
     ):
         raise ValueError(
-            "GLM_NEXT sparse MLA MG cache record must be 528 bytes, got "
+            "GLM_NEXT sparse MLA MG cache record width does not match its recipe: "
             f"{int(kv_cache.shape[-1])}"
         )
     # heads_per_cta = mg_n_hg * HPB. mg_n_hg==2 covers paired head groups; mg_n_hg==1

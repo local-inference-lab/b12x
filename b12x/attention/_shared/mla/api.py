@@ -28,6 +28,7 @@ _MLA_SM120_BACKEND = "sm120"
 _MLA_UNIFIED_GLM_Q_HEAD_DIM = 576
 _MLA_UNIFIED_GLM_NEXT_Q_HEAD_DIM = 512
 _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES = 528
+_MLA_UNIFIED_GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _MLA_SINGLE_PASS_TARGET_Q_ROWS = 2048
 _MLA_SINGLE_PASS_TARGET_TOPK = 2048
 _LN2 = math.log(2.0)
@@ -660,19 +661,30 @@ def _run_sparse_mla(
                 "GLM_NEXT sparse MLA requires q_head_dim=512, got "
                 f"{int(q_all.shape[-1])}"
             )
-        if int(kv_cache.shape[-1]) != _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES:
-            raise ValueError(
-                "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
-                f"{int(kv_cache.shape[-1])}"
-            )
-        if scale_format_for_call not in (None, 1):
+        if scale_format_for_call in (None, 1):
+            expected_record_bytes = _MLA_UNIFIED_GLM_NEXT_RECORD_BYTES
+            scale_format_for_call = 1
+        elif int(scale_format_for_call) == 2:
+            expected_record_bytes = _MLA_UNIFIED_GLM_NEXT_NVFP4_RECORD_BYTES
+            if not latent_scale_per_token:
+                raise ValueError(
+                    "GLM_NEXT NVFP4 sparse MLA requires an inline per-token "
+                    "latent scale"
+                )
+        else:
             raise ValueError(
                 "GLM_NEXT sparse MLA requires scale_format=1 "
-                f"(ARBITRARY_FP32), got {scale_format_for_call}"
+                "(ARBITRARY_FP32) or 2 (NVFP4_E4M3), got "
+                f"{scale_format_for_call}"
+            )
+        if int(kv_cache.shape[-1]) != expected_record_bytes:
+            raise ValueError(
+                "GLM_NEXT sparse MLA cache record width does not match its "
+                f"recipe: got {int(kv_cache.shape[-1])}, expected "
+                f"{expected_record_bytes}"
             )
         if fp8_rope not in (None, False):
             raise ValueError("GLM_NEXT sparse MLA has no RoPE cache payload")
-        scale_format_for_call = 1
         fp8_rope_for_call = False
     elif model_type_for_call not in (None, ModelType.GLM_NSA):
         raise ValueError(
@@ -697,7 +709,10 @@ def _run_sparse_mla(
         fp8_rope_for_call = record_bytes == 368
     elif model_type_for_call != ModelType.GLM_NEXT:
         fp8_rope_for_call = _resolve_kv_fp8_rope(fp8_rope)
-    if int(scale_format_for_call or -1) == 2:
+    if (
+        model_type_for_call != ModelType.GLM_NEXT
+        and int(scale_format_for_call or -1) == 2
+    ):
         expected_record_bytes = 368 if fp8_rope_for_call else 432
         if int(kv_cache.shape[-1]) != expected_record_bytes:
             raise ValueError(
@@ -717,10 +732,16 @@ def _run_sparse_mla(
                 "sparse MLA latent_scale_per_token requires the NVFP4 cache "
                 f"(scale_format=2); got scale_format={scale_format_for_call!r}"
             )
-        if int(kv_cache.shape[-1]) != 368:
+        expected_scale_record_bytes = (
+            _MLA_UNIFIED_GLM_NEXT_NVFP4_RECORD_BYTES
+            if model_type_for_call == ModelType.GLM_NEXT
+            else 368
+        )
+        if int(kv_cache.shape[-1]) != expected_scale_record_bytes:
             raise ValueError(
-                "sparse MLA latent_scale_per_token requires the fp8-rope "
-                f"368-byte NVFP4 record; got {int(kv_cache.shape[-1])} bytes"
+                "sparse MLA latent_scale_per_token requires its inline-scale "
+                f"NVFP4 record; got {int(kv_cache.shape[-1])} bytes, expected "
+                f"{expected_scale_record_bytes}"
             )
     if attn_sink is not None:
         attn_sink = attn_sink.detach()

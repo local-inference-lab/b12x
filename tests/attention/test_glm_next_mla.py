@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention import sparse_mla
 from b12x.attention._shared.mla.reference import (
+    _sparse_attention_reference,
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
     unpack_mla_kv_cache_reference,
@@ -21,11 +22,13 @@ from b12x.attention._shared.mla.traits import (
     infer_model_type,
     make_unified_traits,
 )
+from tests._reference.helpers import dequantize_nvfp4_mla_nope
 
 from ..conftest import require_b12x as require_sm120
 
 
 _GLM_NEXT_RECORD_BYTES = 528
+_GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _GLM_NEXT_PAGE_SIZE = 64
 _GLM_NEXT_HEAD_DIM = 512
 _GLM_NEXT_SM_SCALE = 256**-0.5
@@ -312,8 +315,21 @@ def test_glm_next_requires_explicit_identity_for_ambiguous_head_width() -> None:
         infer_model_type(576, torch.uint8, model_type=ModelType.GLM_NEXT)
 
 
-def test_glm_next_rejects_rope_and_nvfp4_cache_recipes() -> None:
-    with pytest.raises(ValueError, match="ARBITRARY_FP32"):
+def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
+    nvfp4_traits = make_unified_traits(
+        ModelType.GLM_NEXT,
+        ComputeMode.BF16,
+        ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+        latent_scale_per_token=True,
+    )
+
+    assert nvfp4_traits.kv_gmem_stride == _GLM_NEXT_NVFP4_RECORD_BYTES
+    assert nvfp4_traits.kv_smem_stride == 288
+    assert nvfp4_traits.d_rope == 0
+    assert nvfp4_traits.compute_mode == ComputeMode.BF16
+
+    with pytest.raises(ValueError, match="inline per-token latent scale"):
         make_unified_traits(
             ModelType.GLM_NEXT,
             ComputeMode.BF16,
@@ -322,9 +338,10 @@ def test_glm_next_rejects_rope_and_nvfp4_cache_recipes() -> None:
     with pytest.raises(ValueError, match="no RoPE cache payload"):
         make_unified_traits(
             ModelType.GLM_NEXT,
-            ComputeMode.FP8,
-            ScaleFormat.ARBITRARY_FP32,
+            ComputeMode.BF16,
+            ScaleFormat.NVFP4_E4M3,
             fp8_rope=True,
+            latent_scale_per_token=True,
         )
     with pytest.raises(ValueError, match="ComputeMode.FP8"):
         make_unified_traits(
@@ -425,7 +442,7 @@ def _valid_glm_next_writer_args() -> list[torch.Tensor]:
         ("cache_dtype", TypeError, "kv_cache must be uint8"),
         ("slot_dtype", TypeError, "1-D int32 or int64"),
         ("short_source", ValueError, "must cover slot_mapping"),
-        ("record_stride", ValueError, "packed 528-byte semantic records"),
+        ("record_stride", ValueError, "packed semantic records"),
         ("overlapping_pages", ValueError, "page stride must cover"),
         ("cpu_device", ValueError, "all tensors must be on CUDA"),
         ("cpu_device_int32", ValueError, "all tensors must be on CUDA"),
@@ -534,6 +551,46 @@ def test_glm_next_cache_writer_preserves_padded_tail_and_record_abi(
         torch.ones_like(expected_scales),
     )
     torch.testing.assert_close(actual_scales, expected_scales, rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_glm_next_nvfp4_writer_uses_inline_scale_record(
+    slot_dtype: torch.dtype,
+) -> None:
+    device = require_sm120()
+    torch.manual_seed(20260831)
+    cache = torch.full(
+        (2, 64, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        0xA5,
+        dtype=torch.uint8,
+        device=device,
+    )
+    latent = (torch.randn((4, 512), device=device) / 4).to(torch.bfloat16)
+    slots = torch.tensor([0, -1, 65, 128], dtype=slot_dtype, device=device)
+
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    torch.cuda.synchronize(device)
+
+    assert torch.all(cache[0, 1] == 0xA5)
+    records = torch.stack((cache[0, 0], cache[1, 1])).cpu()
+    dequantized, _ = dequantize_nvfp4_mla_nope(
+        records,
+        nope_bytes=256,
+        group_scales_offset=256,
+        group_scales_end=288,
+        latent_scale_offset=292,
+    )
+    source = latent.index_select(
+        0, torch.tensor([0, 2], dtype=torch.int64, device=device)
+    ).float().cpu()
+    cosine = torch.nn.functional.cosine_similarity(
+        dequantized.flatten(), source.flatten(), dim=0
+    )
+    assert float(cosine) > 0.97
+    assert torch.all(records[:, 288:292] == 0)
+    assert torch.all(records[:, 296:304] == 0)
+    assert torch.all(records[:, 292:296].contiguous().view(torch.float32) > 0)
 
 
 def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
@@ -722,6 +779,138 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
     _assert_glm_next_attention_close(actual, expected)
     assert bool(torch.isfinite(actual_lse).all().item())
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
+
+
+@torch.inference_mode()
+def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
+    device = require_sm120()
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    rows, heads, num_records, width = 2, 8, 3 * _GLM_NEXT_PAGE_SIZE, 129
+    latent = (
+        torch.randn(
+            (num_records, _GLM_NEXT_HEAD_DIM),
+            generator=generator,
+            device=device,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    cache = torch.empty(
+        (
+            num_records // _GLM_NEXT_PAGE_SIZE,
+            _GLM_NEXT_PAGE_SIZE,
+            _GLM_NEXT_NVFP4_RECORD_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    slots = torch.arange(num_records, dtype=torch.int64, device=device)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+
+    q = (
+        torch.randn(
+            (rows, heads, _GLM_NEXT_HEAD_DIM),
+            generator=generator,
+            device=device,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    selected = torch.stack(
+        [
+            torch.randperm(num_records, generator=generator, device=device)[:width]
+            for _ in range(rows)
+        ]
+    ).to(torch.int32)
+    active = torch.tensor([width, 65], dtype=torch.int32, device=device)
+    cache_seqlens = torch.full(
+        (rows,), num_records, dtype=torch.int32, device=device
+    )
+    _, binding = _glm_next_plan_and_binding(
+        device=device,
+        q=q,
+        selected=selected,
+        active=active,
+        cache_seqlens=cache_seqlens,
+    )
+
+    actual, actual_lse = sparse_mla.run_decode(
+        binding=binding,
+        kv_cache=cache,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+        forced_num_splits=2,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+        latent_scale_per_token=True,
+    )
+    dequantized, _ = dequantize_nvfp4_mla_nope(
+        cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    expected, expected_lse = _sparse_attention_reference(
+        q_all=q,
+        k_all=dequantized,
+        v_all=dequantized,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+    )
+    torch.cuda.synchronize(device)
+
+    _assert_glm_next_attention_close(actual, expected)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        captured_output, captured_lse = sparse_mla.run_decode(
+            binding=binding,
+            kv_cache=cache,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            return_lse=True,
+            forced_num_splits=2,
+            model_type=ModelType.GLM_NEXT,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            fp8_rope=False,
+            latent_scale_per_token=True,
+        )
+
+    q.copy_(
+        (torch.randn(q.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
+    )
+    latent.copy_(
+        (torch.randn(latent.shape, generator=generator, device=device) / 4).to(
+            torch.bfloat16
+        )
+    )
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    dequantized, _ = dequantize_nvfp4_mla_nope(
+        cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    replay_expected, replay_expected_lse = _sparse_attention_reference(
+        q_all=q,
+        k_all=dequantized,
+        v_all=dequantized,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+    )
+    allocated_before = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert torch.cuda.memory_reserved(device) == reserved_before
+    _assert_glm_next_attention_close(captured_output, replay_expected)
+    torch.testing.assert_close(
+        captured_lse, replay_expected_lse, rtol=0.0, atol=0.05
+    )
 
 
 @torch.inference_mode()
@@ -990,6 +1179,90 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
 
 
 @torch.inference_mode()
+def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None:
+    device = require_sm120()
+    generator = torch.Generator(device=device).manual_seed(20260831)
+    rows, heads = 1, 8
+    active_width = 2051
+    container_width = 2112
+    num_records = container_width
+    latent = (
+        torch.randn(
+            (num_records, _GLM_NEXT_HEAD_DIM),
+            generator=generator,
+            device=device,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    cache = torch.empty(
+        (
+            num_records // _GLM_NEXT_PAGE_SIZE,
+            _GLM_NEXT_PAGE_SIZE,
+            _GLM_NEXT_NVFP4_RECORD_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    slots = torch.arange(num_records, dtype=torch.int64, device=device)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+
+    q = (
+        torch.randn(
+            (rows, heads, _GLM_NEXT_HEAD_DIM),
+            generator=generator,
+            device=device,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    selected = torch.full(
+        (rows, container_width), -1, dtype=torch.int32, device=device
+    )
+    selected[0, :active_width] = torch.randperm(
+        num_records, generator=generator, device=device
+    )[:active_width].to(torch.int32)
+    active = torch.full((rows,), active_width, dtype=torch.int32, device=device)
+    cache_seqlens = torch.full(
+        (rows,), num_records, dtype=torch.int32, device=device
+    )
+    _, binding = _glm_next_plan_and_binding(
+        device=device,
+        q=q,
+        selected=selected,
+        active=active,
+        cache_seqlens=cache_seqlens,
+        mode="extend",
+    )
+
+    actual, actual_lse = sparse_mla.run_extend(
+        binding=binding,
+        kv_cache=cache,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+        latent_scale_per_token=True,
+    )
+    dequantized, _ = dequantize_nvfp4_mla_nope(
+        cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    expected, expected_lse = _sparse_attention_reference(
+        q_all=q,
+        k_all=dequantized,
+        v_all=dequantized,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+    )
+    torch.cuda.synchronize(device)
+
+    _assert_glm_next_attention_close(actual, expected)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
+
+
+@torch.inference_mode()
 def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     device = require_sm120()
     generator = torch.Generator(device=device).manual_seed(20260830)
@@ -1211,4 +1484,104 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
         block_size=page_size,
         block_stride=page_stride_bytes,
     ) > int32_max
+    _assert_glm_next_attention_close(actual, expected)
+
+
+@torch.inference_mode()
+def test_glm_next_nvfp4_writer_and_reader_use_int64_for_live_high_page() -> None:
+    device = require_sm120()
+    page_size = _GLM_NEXT_PAGE_SIZE
+    index_page_bytes = 64 * 132
+    semantic_page_bytes = page_size * _GLM_NEXT_NVFP4_RECORD_BYTES
+    record_region_bytes = (
+        (semantic_page_bytes + index_page_bytes - 1) // index_page_bytes
+    ) * index_page_bytes
+    pooled_tail_bytes = page_size * 33
+    page_stride_bytes = record_region_bytes + pooled_tail_bytes
+    int32_max = torch.iinfo(torch.int32).max
+    high_page = int32_max // page_stride_bytes + 2
+    num_pages = high_page + 1
+    required_bytes = num_pages * page_stride_bytes
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reserve_bytes = 2 * 1024**3
+    if free_bytes < required_bytes + reserve_bytes:
+        pytest.skip(
+            "live GLM_NEXT NVFP4 high-page test requires "
+            f"{required_bytes + reserve_bytes} bytes free, found {free_bytes}"
+        )
+    try:
+        backing = torch.empty(
+            (num_pages, page_stride_bytes), dtype=torch.uint8, device=device
+        )
+    except torch.OutOfMemoryError:
+        pytest.skip(
+            "CUDA allocator could not reserve the required mostly-uninitialized "
+            f"{required_bytes}-byte GLM_NEXT NVFP4 cache"
+        )
+    cache = torch.as_strided(
+        backing,
+        size=(num_pages, page_size, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        stride=(page_stride_bytes, _GLM_NEXT_NVFP4_RECORD_BYTES, 1),
+    )
+    local_slot = 7
+    high_slot = high_page * page_size + local_slot
+    assert high_page * page_stride_bytes > int32_max
+    assert high_slot < int32_max
+
+    live_latent = (
+        torch.linspace(
+            -0.75,
+            0.75,
+            _GLM_NEXT_HEAD_DIM,
+            dtype=torch.float32,
+            device=device,
+        )
+        .unsqueeze(0)
+        .to(torch.bfloat16)
+    )
+    sources = torch.cat((torch.zeros_like(live_latent), live_latent))
+    slots = torch.tensor([0, high_slot], dtype=torch.int64, device=device)
+    sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots)
+
+    q = torch.randn(
+        (1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    selected = torch.tensor([[high_slot]], dtype=torch.int32, device=device)
+    active = torch.ones((1,), dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor(
+        [high_slot + 1], dtype=torch.int32, device=device
+    )
+    _, binding = _glm_next_plan_and_binding(
+        device=device,
+        q=q,
+        selected=selected,
+        active=active,
+        cache_seqlens=cache_seqlens,
+    )
+    actual = sparse_mla.run_decode(
+        binding=binding,
+        kv_cache=cache,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        forced_num_splits=1,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+        latent_scale_per_token=True,
+    )
+    expected_value, _ = dequantize_nvfp4_mla_nope(
+        cache[high_page, local_slot].reshape(1, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    expected = expected_value[0].view(1, 1, -1).expand_as(actual)
+    torch.cuda.synchronize(device)
+
+    assert (
+        _glm_next_cache_byte_offset(
+            high_slot,
+            block_size=page_size,
+            block_stride=page_stride_bytes,
+            entry_stride=_GLM_NEXT_NVFP4_RECORD_BYTES,
+        )
+        > int32_max
+    )
     _assert_glm_next_attention_close(actual, expected)

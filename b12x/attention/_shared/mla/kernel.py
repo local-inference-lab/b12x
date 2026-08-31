@@ -78,7 +78,6 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
-_GLM_NEXT_KV_GMEM_STRIDE = 528
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -2859,7 +2858,11 @@ def run_unified_decode(
     )
     if scale_format_override is not None:
         scale_format = int(scale_format_override)
-    if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
+    if (
+        model_type != ModelType.GLM_NEXT
+        and scale_format == ScaleFormat.NVFP4_E4M3
+        and fp8_rope_override is None
+    ):
         record_bytes = int(swa_k_cache.shape[-1])
         if record_bytes not in (368, 432):
             raise ValueError(
@@ -2874,7 +2877,7 @@ def run_unified_decode(
                 "SM120 sparse MLA decode latent_scale_per_token requires "
                 f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
             )
-        if not bool(fp8_rope_override):
+        if model_type != ModelType.GLM_NEXT and not bool(fp8_rope_override):
             raise ValueError(
                 "SM120 sparse MLA decode latent_scale_per_token requires the "
                 "fp8-rope 368-byte NVFP4 record; got the 432-byte record"
@@ -2888,9 +2891,9 @@ def run_unified_decode(
     )
     if int(model_type) == int(ModelType.GLM_NEXT) and int(
         swa_k_cache.shape[-1]
-    ) != _GLM_NEXT_KV_GMEM_STRIDE:
+    ) != int(traits.kv_gmem_stride):
         raise ValueError(
-            "GLM_NEXT sparse MLA cache record must be 528 bytes, got "
+            "GLM_NEXT sparse MLA cache record width does not match its recipe: "
             f"{int(swa_k_cache.shape[-1])}"
         )
     if scale_format == ScaleFormat.NVFP4_E4M3 and int(swa_k_cache.shape[-1]) != int(

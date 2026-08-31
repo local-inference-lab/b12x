@@ -1,14 +1,17 @@
 """SM120 quantized MLA cache record writers.
 
 ``concat_and_cache_glm_next_mla`` writes the GLM-5.3-Flash absorbed-MLA
-record consumed by the explicit ``ModelType.GLM_NEXT`` sparse-MLA recipe:
+record consumed by the explicit ``ModelType.GLM_NEXT`` sparse-MLA recipe.
+The cache view selects either the 528-byte FP8 record:
 
     [   0, 512)  512 x E4M3 latent values (four consecutive 128-dim groups)
     [ 512, 528)  4 x fp32 group scales (group amax / 448.0)
 
 The record has no RoPE payload.  The cache may have a padded page stride so a
 selector-only pooled-K tail can share each physical allocation; only the
-528-byte semantic row is written.  Slot-to-page address arithmetic stays in
+semantic row is written. The 304-byte NVFP4 record uses the common packed
+latent layout in bytes [0, 288), zeroes [288, 292), stores its per-token outer
+scale at [292, 296), and zero-pads [296, 304). Slot-to-page arithmetic stays in
 Int64, including the products by page and record stride.
 
 ``concat_and_cache_nvfp4_mla_fp8_rope`` quantizes the MLA compressed latent
@@ -132,6 +135,7 @@ _GLM_NEXT_GROUP_SIZE = 128
 _GLM_NEXT_NUM_GROUPS = _GLM_NEXT_LATENT_DIM // _GLM_NEXT_GROUP_SIZE
 _GLM_NEXT_SCALE_OFFSET = _GLM_NEXT_LATENT_DIM
 _GLM_NEXT_RECORD_BYTES = _GLM_NEXT_LATENT_DIM + _GLM_NEXT_NUM_GROUPS * 4
+_GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _GLM_NEXT_E4M3_MAX_RCP = 1.0 / 448.0
 _GLM_NEXT_WRITER_LOCK = RLock()
 _GLM_NEXT_WRITER_COMPILED: dict[tuple[int, int, torch.dtype], object] = {}
@@ -209,10 +213,17 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
     32 quantizes the RoPE lane to E4M3 with one fp32 per-token scale.
     """
 
-    def __init__(self, block_size: int, is_bf16: bool, per_token_scale: bool = False):
+    def __init__(
+        self,
+        block_size: int,
+        is_bf16: bool,
+        per_token_scale: bool = False,
+        has_rope: bool = True,
+    ):
         self.block_size = int(block_size)
         self.is_bf16 = bool(is_bf16)
         self.per_token_scale = bool(per_token_scale)
+        self.has_rope = bool(has_rope)
 
     @cute.jit
     def __call__(
@@ -365,9 +376,13 @@ class ConcatAndCacheNvfp4MlaFp8RopeKernel:
                         cutlass.Uint8(0),
                     )
 
+            if cutlass.const_expr(not self.has_rope):
+                if tid == Int32(_NUM_GROUPS):
+                    st_global_u32(dst + Int64(_ROPE_SCALE_OFFSET), Uint32(0))
+
             # --- RoPE lane: amax -> fp32 scale at [288, 292) -> satfinite
             # E4M3 bytes at [304, 368).
-            if tid == Int32(_NUM_GROUPS):
+            if cutlass.const_expr(self.has_rope) and tid == Int32(_NUM_GROUPS):
                 rope_vals = cute.make_rmem_tensor((_PE_DIM,), Float32)
                 for i in cutlass.range_constexpr(_PE_DIM // 2):
                     pair = _ld_global_u32(
@@ -535,9 +550,14 @@ class ConcatAndCacheGlmNextMlaKernel:
 
 @lru_cache(maxsize=None)
 def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
-    block_size: int, is_bf16: bool, per_token_scale: bool = False
+    block_size: int,
+    is_bf16: bool,
+    per_token_scale: bool = False,
+    has_rope: bool = True,
 ) -> ConcatAndCacheNvfp4MlaFp8RopeKernel:
-    return ConcatAndCacheNvfp4MlaFp8RopeKernel(block_size, is_bf16, per_token_scale)
+    return ConcatAndCacheNvfp4MlaFp8RopeKernel(
+        block_size, is_bf16, per_token_scale, has_rope
+    )
 
 
 def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
@@ -553,6 +573,7 @@ def _build_concat_and_cache_glm_next_mla_kernel(
 
 def clear_glm_next_mla_kv_cache_kernel_cache() -> None:
     _build_concat_and_cache_glm_next_mla_kernel.cache_clear()
+    _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _GLM_NEXT_WRITER_COMPILED.clear()
 
@@ -728,10 +749,15 @@ def _validate_glm_next_mla_cache_writer_args(
         )
     if kv_c.dtype != torch.bfloat16:
         raise TypeError(f"kv_c must be BF16, got {kv_c.dtype}")
-    if kv_cache.ndim != 3 or int(kv_cache.shape[2]) != _GLM_NEXT_RECORD_BYTES:
+    record_bytes = int(kv_cache.shape[2]) if kv_cache.ndim == 3 else -1
+    if kv_cache.ndim != 3 or record_bytes not in (
+        _GLM_NEXT_RECORD_BYTES,
+        _GLM_NEXT_NVFP4_RECORD_BYTES,
+    ):
         raise ValueError(
             "kv_cache must be (num_pages, page_size, "
-            f"{_GLM_NEXT_RECORD_BYTES}) uint8, got {tuple(kv_cache.shape)}"
+            f"{_GLM_NEXT_RECORD_BYTES}|{_GLM_NEXT_NVFP4_RECORD_BYTES}) uint8, "
+            f"got {tuple(kv_cache.shape)}"
         )
     num_pages = int(kv_cache.shape[0])
     page_size = int(kv_cache.shape[1])
@@ -759,9 +785,9 @@ def _validate_glm_next_mla_cache_writer_args(
         raise ValueError("kv_c rows must be innermost-contiguous")
     if kv_c.stride(0) % 2 != 0 or kv_c.data_ptr() % 4 != 0:
         raise ValueError("kv_c rows must be 4-byte aligned (even row stride)")
-    if kv_cache.stride(2) != 1 or kv_cache.stride(1) != _GLM_NEXT_RECORD_BYTES:
-        raise ValueError("kv_cache must have packed 528-byte semantic records")
-    semantic_page_bytes = page_size * _GLM_NEXT_RECORD_BYTES
+    if kv_cache.stride(2) != 1 or kv_cache.stride(1) != record_bytes:
+        raise ValueError("kv_cache must have packed semantic records")
+    semantic_page_bytes = page_size * record_bytes
     page_stride = int(kv_cache.stride(0))
     if page_stride < semantic_page_bytes:
         raise ValueError(
@@ -778,6 +804,8 @@ def _validate_glm_next_mla_cache_writer_args(
         raise ValueError("slot_mapping token count must fit in int32 launch geometry")
     if slot_capacity >= 2**63:
         raise ValueError("kv_cache slot capacity must fit in int64")
+    if record_bytes == _GLM_NEXT_NVFP4_RECORD_BYTES and slot_capacity >= 2**31:
+        raise ValueError("NVFP4 kv_cache slot capacity must fit in int32")
     if not (kv_c.is_cuda and kv_cache.is_cuda and slot_mapping.is_cuda):
         raise ValueError("all tensors must be on CUDA")
     if len({kv_c.device, kv_cache.device, slot_mapping.device}) != 1:
@@ -796,6 +824,11 @@ def compile_glm_next_mla_cache_writer(
     row stride, and padded page stride remain runtime-dynamic.
     """
     _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    if int(kv_cache.shape[-1]) != _GLM_NEXT_RECORD_BYTES:
+        raise ValueError(
+            "explicit compilation currently applies only to the 528-byte "
+            "GLM_NEXT FP8 writer"
+        )
     if int(slot_mapping.shape[0]) == 0:
         raise ValueError("cache-writer compilation requires at least one token")
     _compile_glm_next_mla_cache_writer(kv_c, kv_cache, slot_mapping)
@@ -808,24 +841,31 @@ def concat_and_cache_glm_next_mla(
 ) -> None:
     """Quantize BF16 absorbed MLA latents into GLM_NEXT cache slots.
 
-    ``kv_cache`` is the semantic ``(num_pages, page_size, 528)`` uint8 view.
-    Its page stride may exceed ``page_size * 528`` so additional page-local
+    ``kv_cache`` is a semantic ``(num_pages, page_size, record_bytes)`` uint8
+    view, where ``record_bytes`` is 528 for FP8 or 304 for NVFP4. Its page
+    stride may exceed ``page_size * record_bytes`` so additional page-local
     storage can follow the MLA records.  The writer never touches that tail.
     Negative and out-of-capacity slot ids are skipped, as required by padded
     CUDA-graph batches.
 
     Warm the exact page-size/slot-dtype specialization once before CUDA graph
-    capture, or call ``compile_glm_next_mla_cache_writer``.  Subsequent calls
-    launch using only caller-owned fixed buffers and are capture safe.
+    capture. The 528-byte FP8 writer may instead be prepared with
+    ``compile_glm_next_mla_cache_writer``. Subsequent calls launch using only
+    caller-owned fixed buffers and are capture safe.
 
     :param kv_c: absorbed latent rows, ``(>= num_tokens, 512)`` BF16.
-    :param kv_cache: strided paged cache view, ``(num_pages, page_size, 528)``
-        uint8, with packed 528-byte rows; mutated in place.
+    :param kv_cache: strided paged cache view with packed 528-byte FP8 or
+        304-byte NVFP4 rows; mutated in place.
     :param slot_mapping: contiguous ``(num_tokens,)`` int32/int64 flat slot ids;
         ids are promoted to Int64 before address arithmetic.
     """
     _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
-    torch.ops.b12x.concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping)
+    if int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES:
+        torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(
+            kv_c, kv_cache, slot_mapping
+        )
+    else:
+        torch.ops.b12x.concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping)
 
 
 def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
@@ -834,6 +874,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     per_token_scale: bool = False,
+    has_rope: bool = True,
 ) -> None:
     num_tokens = int(slot_mapping.shape[0])
     if num_tokens == 0:
@@ -842,14 +883,18 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
     slot_capacity = int(kv_cache.shape[0]) * block_size
     is_bf16 = kv_c.dtype == torch.bfloat16
     kernel = _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
-        block_size, is_bf16, per_token_scale
+        block_size, is_bf16, per_token_scale, has_rope
     )
 
     args = (
         _to_kernel_tensor(kv_c, assumed_align=4, leading_dim=1),
         _to_kernel_tensor(k_pe, assumed_align=4, leading_dim=1),
         _to_kernel_tensor(kv_cache, assumed_align=16, leading_dim=2),
-        _to_kernel_tensor(slot_mapping, assumed_align=8, leading_dim=0),
+        _to_kernel_tensor(
+            slot_mapping,
+            assumed_align=8 if slot_mapping.dtype == torch.int64 else 4,
+            leading_dim=0,
+        ),
         Int32(int(kv_c.stride(0))),
         Int32(int(k_pe.stride(0))),
         Int64(int(kv_cache.stride(0))),
@@ -871,12 +916,17 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
         str(kv_c.dtype),
         block_size,
         bool(per_token_scale),
+        bool(has_rope),
     )
-    # Version 3: per_token_scale joined the record semantics (fp32 second-level
-    # scale at [292, 296)); a v2 cubin must never run against v3 records.
+    op_name = (
+        "attention.mla.nvfp4_fp8_rope_kv_cache"
+        if has_rope
+        else "attention.mla.glm_next_nvfp4_kv_cache"
+    )
+    version = 3 if has_rope else 1
     spec = KernelCompileSpec.from_key(
-        "attention.mla.nvfp4_fp8_rope_kv_cache",
-        3,
+        op_name,
+        version,
         cache_key,
         labels=(
             "kv_c",
@@ -886,6 +936,7 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
             "kv_dtype",
             "block_size",
             "per_token_scale",
+            "has_rope",
         ),
     )
     b12x_launch(
@@ -910,6 +961,34 @@ def _concat_and_cache_nvfp4_mla_fp8_rope_op(
     _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
         kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
     )
+
+
+@torch.library.custom_op(
+    "b12x::concat_and_cache_glm_next_nvfp4_mla",
+    mutates_args=("kv_cache",),
+)
+def _concat_and_cache_glm_next_nvfp4_mla_op(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    _concat_and_cache_nvfp4_mla_fp8_rope_flat_launch(
+        kv_c,
+        kv_c,
+        kv_cache,
+        slot_mapping,
+        per_token_scale=True,
+        has_rope=False,
+    )
+
+
+@_concat_and_cache_glm_next_nvfp4_mla_op.register_fake
+def _concat_and_cache_glm_next_nvfp4_mla_fake(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    return None
 
 
 @_concat_and_cache_nvfp4_mla_fp8_rope_op.register_fake
