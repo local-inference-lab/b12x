@@ -274,10 +274,7 @@ def main() -> None:
         "--topk-candidate-capacity",
         type=int,
         choices=(1024, 8192),
-        help=(
-            "benchmark-only override for the compile-time shared candidate "
-            "capacity"
-        ),
+        help=("benchmark-only override for the compile-time shared candidate capacity"),
     )
     parser.add_argument(
         "--output-index-space",
@@ -395,9 +392,7 @@ def main() -> None:
                 )
             return candidate_capacity
 
-        tiled_topk_module._resolve_smem_candidate_capacity = (
-            resolve_candidate_capacity
-        )
+        tiled_topk_module._resolve_smem_candidate_capacity = resolve_candidate_capacity
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
