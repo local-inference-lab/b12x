@@ -1001,15 +1001,14 @@ class MoEDynamicKernelBackend:
         # element per byte, so the same 128-byte row is sf_vec_size*4 elements.
         tile_k = sf_vec_size * 4 if self.is_w6a8 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
-        # Scale-factor tiles are 128-row atoms in hardware.  The native NVFP4
-        # payload itself does not need to inherit that 128-row capacity: route
-        # compaction already makes every task's tile_m rows contiguous.  Keep
-        # only the live payload rows in sA while retaining the complete SFA
-        # atom below.  At decode M16 this removes 14 KiB from a two-stage CTA
-        # without changing the scale-factor or MMA contracts.
+        # Scale-factor tiles are 128-row atoms in hardware.  Native NVFP4
+        # consumes only the compact route tile in sA while retaining the
+        # complete SFA atom below.  Swapped FC1 addresses multiple row slices
+        # through the established 128-row sA contract and retains that
+        # capacity.
         a_tile_m = (
             mma_tiler_mn[0]
-            if self.quant_recipe == "nvfp4"
+            if self.quant_recipe == "nvfp4" and not self.swap_ab
             else max(128, mma_tiler_mn[0])
         )
         self.sa_tile_shape_mk = (a_tile_m, tile_k)
