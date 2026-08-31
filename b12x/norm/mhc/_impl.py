@@ -1394,6 +1394,11 @@ def _b12x_mhc_post_pre_impl(
                 partials=partials,
                 out=residual_out,
                 compute_gram=norm_weight is not None and pre_mix is None,
+                decode_partials_schedule=(
+                    planned_config.decode_partials_schedule
+                    if planned_config is not None
+                    else "default"
+                ),
             )
         run_mhc_finalize_gram(
             residual=residual_out,
