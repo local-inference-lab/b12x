@@ -10718,6 +10718,18 @@ def _tp_moe_dynamic_launch_op(
     )
 
 
+# kimi-k3-direct-dynamic-launch: begin
+_DIRECT_DYNAMIC_LAUNCH = os.environ.get("B12X_DIRECT_DYNAMIC_LAUNCH", "1") == "1"
+
+
+def _dynamic_launch_entry():
+    """Raw launch function outside compile tracing; the dispatcher op otherwise."""
+    if _DIRECT_DYNAMIC_LAUNCH and not torch.compiler.is_compiling():
+        return _tp_moe_dynamic_launch_op._init_fn
+    return torch.ops.b12x.tp_moe_dynamic_launch
+# kimi-k3-direct-dynamic-launch: end
+
+
 @_tp_moe_dynamic_launch_op.register_fake
 def _tp_moe_dynamic_launch_fake(
     packed_a_view: torch.Tensor,
@@ -10830,7 +10842,7 @@ def _launch_dynamic(
     w13_sfb_rp = w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
     down_rp = w4a8_prepared["w2_rp"] if w4a8_repacked else workspace.row_counts
     down_sfb_rp = w4a8_prepared["w2_sfb"] if w4a8_repacked else workspace.row_counts
-    torch.ops.b12x.tp_moe_dynamic_launch(
+    _dynamic_launch_entry()(  # kimi-k3-direct-dynamic-launch
         workspace.packed_a_view,
         workspace.packed_a_flat,
         workspace.scale_flat,
