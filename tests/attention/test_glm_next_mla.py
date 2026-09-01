@@ -13,6 +13,7 @@ from b12x.attention._shared.mla.reference import (
 from b12x.attention._shared.mla.kv_cache import (
     _glm_next_cache_byte_offset,
     _glm_next_cache_record_address,
+    clear_glm_next_mla_kv_cache_kernel_cache,
     concat_and_cache_glm_next_mla,
 )
 from b12x.attention._shared.mla.traits import (
@@ -569,6 +570,7 @@ def test_glm_next_nvfp4_writer_uses_inline_scale_record(
     latent = (torch.randn((4, 512), device=device) / 4).to(torch.bfloat16)
     slots = torch.tensor([0, -1, 65, 128], dtype=slot_dtype, device=device)
 
+    sparse_mla.compile_glm_next_mla_cache_writer(latent, cache, slots)
     sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
     torch.cuda.synchronize(device)
 
@@ -591,6 +593,25 @@ def test_glm_next_nvfp4_writer_uses_inline_scale_record(
     assert torch.all(records[:, 288:292] == 0)
     assert torch.all(records[:, 296:304] == 0)
     assert torch.all(records[:, 292:296].contiguous().view(torch.float32) > 0)
+
+
+@torch.inference_mode()
+def test_glm_next_nvfp4_writer_rejects_capture_compile_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = require_sm120()
+    cache = torch.empty(
+        (1, 64, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    latent = torch.zeros((1, 512), dtype=torch.bfloat16, device=device)
+    slots = torch.zeros((1,), dtype=torch.int64, device=device)
+    clear_glm_next_mla_kv_cache_kernel_cache()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="compile miss during CUDA graph capture"):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
 
 
 def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:

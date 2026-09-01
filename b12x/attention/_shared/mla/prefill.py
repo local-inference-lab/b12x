@@ -477,6 +477,7 @@ def run_unified_prefill(
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
-        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
+        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}; "
+        "GLM_NEXT NVFP4 additionally topk in {2051, 2112}. "
         "No decode-reuse fallback."
     )
