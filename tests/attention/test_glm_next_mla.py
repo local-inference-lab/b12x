@@ -410,6 +410,62 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
     assert binding.scratch.cache_traits == caps.cache_traits
 
 
+def test_glm_next_pooled_selection_maps_compact_physical_slots_and_replays() -> None:
+    device = require_sm120()
+    pool_ids = torch.full((2, 512), -1, dtype=torch.int32, device=device)
+    pool_ids[0, :2] = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    pool_ids[1, 0] = 0
+    positions = torch.tensor([9, 4], dtype=torch.int64, device=device)
+    request_ids = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    block_table = torch.tensor(
+        [[3, 1, -1], [5, 2, -1]], dtype=torch.int32, device=device
+    )
+    output = torch.empty((2, 2051), dtype=torch.int32, device=device)
+    active = torch.empty((2,), dtype=torch.int32, device=device)
+
+    kwargs = dict(
+        pool_size=4,
+        block_size=8,
+        block_stride_rows=16,
+        num_cache_blocks=8,
+    )
+    sparse_mla.expand_pooled_topk_to_physical_slots(
+        pool_ids,
+        positions,
+        request_ids,
+        block_table,
+        output,
+        active,
+        **kwargs,
+    )
+    torch.cuda.synchronize(device)
+
+    assert active.cpu().tolist() == [10, 5]
+    assert output[0, :10].cpu().tolist() == [52, 53, 54, 55, 48, 49, 50, 51, 16, 17]
+    assert output[1, :5].cpu().tolist() == [80, 81, 82, 83, 84]
+    assert bool(torch.all(output[:, 10:] == -1).item())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla.expand_pooled_topk_to_physical_slots(
+            pool_ids,
+            positions,
+            request_ids,
+            block_table,
+            output,
+            active,
+            **kwargs,
+        )
+    allocated = torch.cuda.memory_allocated(device)
+    output.fill_(7)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_allocated(device) == allocated
+    assert active.cpu().tolist() == [10, 5]
+    assert output[0, :10].cpu().tolist() == [52, 53, 54, 55, 48, 49, 50, 51, 16, 17]
+
+
 def test_glm_next_reference_record_is_528_bytes() -> None:
     torch.manual_seed(20260826)
     latent = torch.randn((7, 512), dtype=torch.bfloat16) / 4
