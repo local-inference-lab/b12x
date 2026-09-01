@@ -876,11 +876,41 @@ def concat_and_cache_glm_next_mla(
     """
     _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
     if int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES:
-        torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(
-            kv_c, kv_cache, slot_mapping
-        )
+        concat_and_cache_glm_next_mla_nvfp4(kv_c, kv_cache, slot_mapping)
     else:
-        torch.ops.b12x.concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping)
+        concat_and_cache_glm_next_mla_fp8(kv_c, kv_cache, slot_mapping)
+
+
+def concat_and_cache_glm_next_mla_fp8(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write the fixed 528-byte GLM_NEXT FP8 cache recipe."""
+    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    if int(kv_cache.shape[-1]) != _GLM_NEXT_RECORD_BYTES:
+        raise ValueError(
+            "GLM_NEXT FP8 writer requires 528-byte records, got "
+            f"{int(kv_cache.shape[-1])}"
+        )
+    torch.ops.b12x.concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping)
+
+
+def concat_and_cache_glm_next_mla_nvfp4(
+    kv_c: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write the fixed 304-byte GLM_NEXT NVFP4 cache recipe."""
+    _validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    if int(kv_cache.shape[-1]) != _GLM_NEXT_NVFP4_RECORD_BYTES:
+        raise ValueError(
+            "GLM_NEXT NVFP4 writer requires 304-byte records, got "
+            f"{int(kv_cache.shape[-1])}"
+        )
+    torch.ops.b12x.concat_and_cache_glm_next_nvfp4_mla(
+        kv_c, kv_cache, slot_mapping
+    )
 
 
 def _nvfp4_mla_writer_signature(

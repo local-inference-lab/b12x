@@ -38,6 +38,7 @@ _GLM_NEXT_SM_SCALE = 256**-0.5
 def _glm_next_plan_and_binding(
     *,
     device: torch.device,
+    kv_cache: torch.Tensor,
     q: torch.Tensor,
     selected: torch.Tensor,
     active: torch.Tensor,
@@ -45,6 +46,7 @@ def _glm_next_plan_and_binding(
     mode: str = "decode",
     page_size: int = _GLM_NEXT_PAGE_SIZE,
 ):
+    is_nvfp4 = int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES
     plan = sparse_mla.plan(
         sparse_mla.Caps(
             device=device,
@@ -58,6 +60,14 @@ def _glm_next_plan_and_binding(
             v_head_dim=_GLM_NEXT_HEAD_DIM,
             page_size=page_size,
             model_type=ModelType.GLM_NEXT,
+            scale_format=(
+                ScaleFormat.NVFP4_E4M3
+                if is_nvfp4
+                else ScaleFormat.ARBITRARY_FP32
+            ),
+            cache_record_bytes=int(kv_cache.shape[-1]),
+            fp8_rope=False,
+            latent_scale_per_token=is_nvfp4,
             mode=mode,
         )
     )
@@ -69,6 +79,7 @@ def _glm_next_plan_and_binding(
         selected_indices=selected,
         cache_seqlens_int32=cache_seqlens,
         nsa_cache_seqlens_int32=active,
+        kv_cache=kv_cache,
     )
     return plan, binding
 
@@ -350,6 +361,53 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
             ComputeMode.BF16,
             ScaleFormat.ARBITRARY_FP32,
         )
+
+
+def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
+    caps = sparse_mla.Caps(
+        device="cpu",
+        num_q_heads=8,
+        max_q_rows=1,
+        max_width=1,
+        kv_dtype=torch.uint8,
+        head_dim=512,
+        v_head_dim=512,
+        page_size=1,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        cache_record_bytes=_GLM_NEXT_NVFP4_RECORD_BYTES,
+        fp8_rope=False,
+        latent_scale_per_token=True,
+    )
+    assert caps.scale_format == ScaleFormat.NVFP4_E4M3
+    assert caps.cache_record_bytes == _GLM_NEXT_NVFP4_RECORD_BYTES
+    assert caps.fp8_rope is False
+    assert caps.latent_scale_per_token is True
+
+    plan = sparse_mla.plan(caps)
+    spec = plan.scratch_specs()[0]
+    bind_kwargs = dict(
+        scratch=torch.empty(spec.shape, dtype=spec.dtype),
+        q=torch.empty((1, 8, 512), dtype=torch.bfloat16),
+        selected_indices=torch.zeros((1, 1), dtype=torch.int32),
+        cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
+        nsa_cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="does not match the sparse MLA plan"):
+        sparse_mla.bind(
+            plan,
+            kv_cache=torch.empty((1, 1, 528), dtype=torch.uint8),
+            **bind_kwargs,
+        )
+    binding = sparse_mla.bind(
+        plan,
+        kv_cache=torch.empty(
+            (1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8
+        ),
+        **bind_kwargs,
+    )
+    assert binding.kv_cache is not None
+    assert binding.scratch.cache_traits == caps.cache_traits
 
 
 def test_glm_next_reference_record_is_528_bytes() -> None:
@@ -773,6 +831,7 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -847,6 +906,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -855,14 +915,9 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
 
     actual, actual_lse = sparse_mla.run_decode(
         binding=binding,
-        kv_cache=cache,
         sm_scale=_GLM_NEXT_SM_SCALE,
         return_lse=True,
         forced_num_splits=2,
-        model_type=ModelType.GLM_NEXT,
-        scale_format=ScaleFormat.NVFP4_E4M3,
-        fp8_rope=False,
-        latent_scale_per_token=True,
     )
     dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
@@ -887,14 +942,9 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
         sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
         captured_output, captured_lse = sparse_mla.run_decode(
             binding=binding,
-            kv_cache=cache,
             sm_scale=_GLM_NEXT_SM_SCALE,
             return_lse=True,
             forced_num_splits=2,
-            model_type=ModelType.GLM_NEXT,
-            scale_format=ScaleFormat.NVFP4_E4M3,
-            fp8_rope=False,
-            latent_scale_per_token=True,
         )
 
     q.copy_(
@@ -984,6 +1034,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1125,6 +1176,7 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1247,6 +1299,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1256,13 +1309,8 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
 
     actual, actual_lse = sparse_mla.run_extend(
         binding=binding,
-        kv_cache=cache,
         sm_scale=_GLM_NEXT_SM_SCALE,
         return_lse=True,
-        model_type=ModelType.GLM_NEXT,
-        scale_format=ScaleFormat.NVFP4_E4M3,
-        fp8_rope=False,
-        latent_scale_per_token=True,
     )
     dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
@@ -1331,6 +1379,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
     cache_seqlens = active.clone()
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1483,6 +1532,7 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1574,6 +1624,7 @@ def test_glm_next_nvfp4_writer_and_reader_use_int64_for_live_high_page() -> None
     )
     _, binding = _glm_next_plan_and_binding(
         device=device,
+        kv_cache=cache,
         q=q,
         selected=selected,
         active=active,
@@ -1581,13 +1632,8 @@ def test_glm_next_nvfp4_writer_and_reader_use_int64_for_live_high_page() -> None
     )
     actual = sparse_mla.run_decode(
         binding=binding,
-        kv_cache=cache,
         sm_scale=_GLM_NEXT_SM_SCALE,
         forced_num_splits=1,
-        model_type=ModelType.GLM_NEXT,
-        scale_format=ScaleFormat.NVFP4_E4M3,
-        fp8_rope=False,
-        latent_scale_per_token=True,
     )
     expected_value, _ = dequantize_nvfp4_mla_nope(
         cache[high_page, local_slot].reshape(1, _GLM_NEXT_NVFP4_RECORD_BYTES),

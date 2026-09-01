@@ -22,6 +22,8 @@ from .._shared.mla.api import (
 from .._shared.mla.kv_cache import (
     compile_glm_next_mla_cache_writer,
     concat_and_cache_glm_next_mla,
+    concat_and_cache_glm_next_mla_fp8,
+    concat_and_cache_glm_next_mla_nvfp4,
 )
 from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
@@ -73,6 +75,8 @@ __all__ = [
     "run_extend",
     "compile_glm_next_mla_cache_writer",
     "concat_and_cache_glm_next_mla",
+    "concat_and_cache_glm_next_mla_fp8",
+    "concat_and_cache_glm_next_mla_nvfp4",
     "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",

@@ -30,9 +30,9 @@ from .traits import (
     ComputeMode,
     ModelType,
     ScaleFormat,
-    infer_model_type,
+    UnifiedMLATraits,
     is_glm_model_type,
-    make_unified_traits,
+    resolve_unplanned_traits,
 )
 
 # DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
@@ -136,6 +136,7 @@ def run_unified_prefill(
     latent_scale: float = 1.0,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    traits_override: UnifiedMLATraits | None = None,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -200,47 +201,24 @@ def run_unified_prefill(
             f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
         )
 
-    model_type, compute_mode, inferred_scale_format = infer_model_type(
-        q_head_dim,
-        kv_cache.dtype,
-        model_type=model_type,
-    )
-    if scale_format is None:
-        scale_format = inferred_scale_format
+    if traits_override is not None:
+        traits = traits_override
+        model_type = int(traits.model_type)
+        compute_mode = int(traits.compute_mode)
+        scale_format = int(traits.scale_format)
     else:
-        scale_format = int(scale_format)
-        if is_glm_model_type(model_type) and scale_format == ScaleFormat.NVFP4_E4M3:
-            # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
-            # dequant + BF16 MMA); FP8 compute would misread the 432B record.
-            compute_mode = ComputeMode.BF16
-        elif scale_format != inferred_scale_format:
-            raise ValueError(
-                "SM120 sparse MLA prefill scale_format does not match q_head_dim: "
-                f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
-                f"override={int(scale_format)}"
-            )
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY (fp8_rope agreement is enforced
-    # by make_unified_traits and the MG record-width validation).
-    if latent_scale_per_token and scale_format != ScaleFormat.NVFP4_E4M3:
-        raise ValueError(
-            "SM120 sparse MLA prefill latent_scale_per_token requires "
-            f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+        traits = resolve_unplanned_traits(
+            q_head_dim,
+            kv_cache.dtype,
+            int(kv_cache.shape[-1]),
+            model_type=model_type,
+            scale_format=scale_format,
+            fp8_rope=fp8_rope,
+            latent_scale_per_token=bool(latent_scale_per_token),
         )
-    traits = make_unified_traits(
-        model_type,
-        compute_mode,
-        scale_format,
-        fp8_rope=fp8_rope,
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
-    if model_type == ModelType.GLM_NEXT and int(kv_cache.shape[-1]) != int(
-        traits.kv_gmem_stride
-    ):
-        raise ValueError(
-            "GLM_NEXT sparse MLA cache record width does not match its recipe: "
-            f"{int(kv_cache.shape[-1])}"
-        )
+        model_type = int(traits.model_type)
+        compute_mode = int(traits.compute_mode)
+        scale_format = int(traits.scale_format)
     d_v = int(traits.d_v)
 
     # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
@@ -338,7 +316,8 @@ def run_unified_prefill(
                 model_type=model_type,
                 scale_format=scale_format,
                 fp8_rope=bool(traits.fp8_rope),
-                latent_scale_per_token=bool(latent_scale_per_token),
+                latent_scale_per_token=bool(traits.latent_scale_per_token),
+                traits_override=traits,
             )
             if extra_kv_cache is not None:
                 kwargs.update(
