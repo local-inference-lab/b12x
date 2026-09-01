@@ -68,6 +68,7 @@ from b12x.moe._shared.kernels.micro import (
     _direct_k_segments_for_k,
     _direct_k_segments_supported,
 )
+from b12x.moe._shared.kernels.m8_route_pack import Nvfp4M8RoutePackKernel
 from b12x.moe._shared.execution import (
     MoEExecutionPlan,
     MoERegime,
@@ -131,12 +132,24 @@ _DYNAMIC_WORK_SOURCE_ENV = "B12X_DYNAMIC_WORK_SOURCE"
 _DYNAMIC_WORK_SOURCE_DEFAULT = "materialized_queue"
 _DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV = "B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN"
 _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS = 256
+_DYNAMIC_SPLIT_ROUTE_COMPUTE_ENV = "B12X_DYNAMIC_SPLIT_ROUTE_COMPUTE"
+_DYNAMIC_SPLIT_PREPARE_MAC_ENV = "B12X_DYNAMIC_SPLIT_PREPARE_MAC"
+_DYNAMIC_SPLIT_COMPUTE_WAVES_ENV = "B12X_DYNAMIC_SPLIT_COMPUTE_WAVES"
+_DYNAMIC_SPLIT_COMPUTE_MAC_ENV = "B12X_DYNAMIC_SPLIT_COMPUTE_MAC"
+_DYNAMIC_SPLIT_LOW_SMEM_ENV = "B12X_DYNAMIC_SPLIT_LOW_SMEM"
+_DYNAMIC_FUSED_LOW_SMEM_ENV = "B12X_DYNAMIC_FUSED_LOW_SMEM"
+_DYNAMIC_SPLIT_FAST_PREPARE_ENV = "B12X_DYNAMIC_SPLIT_FAST_PREPARE"
+_DYNAMIC_DIRECT_EXPERT_SCALES_ENV = "B12X_DYNAMIC_DIRECT_EXPERT_SCALES"
+_DYNAMIC_SKIP_SPLIT_BARRIER_RESET_ENV = (
+    "B12X_DYNAMIC_SKIP_SPLIT_BARRIER_RESET"
+)
 _DYNAMIC_WORK_SOURCES = {
     "persistent_grid",
     "materialized_queue",
     "ready_queue",
 }
 _W4A16_ROUTE_PACK_PREWARMED: set[tuple[object, ...]] = set()
+_M8_ROUTE_PACK_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
 # W4A8's unified dynamic specialization consumes an N256/K128 lane-major
 # weight representation.  Preparation is independent from scheduling: the
 # same representation serves both materialized queue and persistent-grid work.
@@ -1946,7 +1959,8 @@ def _dynamic_external_route_plan_supported(
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
         and dynamic_route_mode == "grouped"
         and not deterministic_output
-        and _dynamic_work_source() == _DYNAMIC_WORK_SOURCE_DEFAULT
+        and _dynamic_work_source()
+        in {_DYNAMIC_WORK_SOURCE_DEFAULT, "persistent_grid"}
     )
 
 
@@ -2687,6 +2701,17 @@ def _refresh_dynamic_workspace_scales(
 ) -> None:
     a1_src_ptr = a1_gscale.data_ptr()
     a2_src_ptr = a2_gscale.data_ptr()
+    # A binding may point the dynamic kernel directly at stable, contiguous
+    # per-expert scale tensors.  In that case a copy would only copy each source
+    # onto itself, and—inside a captured serving forward—would replay twice per
+    # layer because both bind and run materialize the same constants.
+    if (
+        workspace.input_gs.data_ptr() == a1_src_ptr
+        and workspace.down_input_scale.data_ptr() == a2_src_ptr
+    ):
+        workspace.input_gs_src_ptr = a1_src_ptr
+        workspace.down_input_scale_src_ptr = a2_src_ptr
+        return
     if (
         force
         or not input_scales_static
@@ -2995,8 +3020,26 @@ def _build_tp_moe_fp4_binding_from_views(
     if plan.implementation == "dynamic":
         if plan.dynamic_physical_tiles is None or plan.dynamic_task_capacity is None:
             raise RuntimeError("dynamic TP MoE binding plan is missing capacities")
-        tensors["input_gs"].copy_(experts.a1_gscale.expand(plan.weight_E))
-        tensors["down_input_scale"].copy_(experts.a2_gscale.expand(plan.weight_E))
+        direct_expert_scales = bool(
+            _env_flag(_DYNAMIC_DIRECT_EXPERT_SCALES_ENV, default=False)
+            and experts.a1_gscale.dtype == torch.float32
+            and experts.a2_gscale.dtype == torch.float32
+            and experts.a1_gscale.numel() == plan.weight_E
+            and experts.a2_gscale.numel() == plan.weight_E
+            and experts.a1_gscale.is_contiguous()
+            and experts.a2_gscale.is_contiguous()
+        )
+        if direct_expert_scales:
+            # The immutable expert object owns these tensors for at least as
+            # long as the binding.  Their addresses are therefore graph-stable,
+            # and the kernel can consume the canonical FP32 vectors directly.
+            input_gs = experts.a1_gscale.reshape(plan.weight_E)
+            down_input_scale = experts.a2_gscale.reshape(plan.weight_E)
+        else:
+            input_gs = tensors["input_gs"]
+            down_input_scale = tensors["down_input_scale"]
+            input_gs.copy_(experts.a1_gscale.expand(plan.weight_E))
+            down_input_scale.copy_(experts.a2_gscale.expand(plan.weight_E))
         view_kwargs = _packed_input_binding_views(
             packed_input=tensors["packed_input"],
             packed_input_scale=tensors["packed_input_scale"],
@@ -3022,8 +3065,8 @@ def _build_tp_moe_fp4_binding_from_views(
             materialized_intermediate=tensors["materialized_intermediate"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
-            input_gs=tensors["input_gs"],
-            down_input_scale=tensors["down_input_scale"],
+            input_gs=input_gs,
+            down_input_scale=down_input_scale,
             pair_head=tensors["pair_head"],
             producers_done_count=tensors["producers_done_count"],
             all_work_published=tensors["all_work_published"],
@@ -10108,6 +10151,8 @@ def _get_dynamic_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
+    split_phase: str = "fused",
+    low_smem_pipeline: bool = False,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -10190,6 +10235,10 @@ def _get_dynamic_kernel(
     cache_key = (
         quant_mode,
         "dynamic",
+        # The CuTe launch wrapper specializes its grid on this value.  Omitting
+        # it aliases differently sized launches to whichever artifact happened
+        # to compile first, so later MAC overrides are silently ignored.
+        int(mac),
         E,
         k,
         n,
@@ -10214,6 +10263,8 @@ def _get_dynamic_kernel(
         materialize_intermediate,
         int(trellis_bits),
         bool(trellis_coupled),
+        split_phase,
+        bool(low_smem_pipeline),
     )
     last_kkey, last_kval = _LAST_KERNEL
     if last_kkey == cache_key:
@@ -10262,6 +10313,8 @@ def _get_dynamic_kernel(
     kernel_kwargs["swiglu_alpha"] = swiglu_alpha
     kernel_kwargs["swiglu_beta"] = swiglu_beta
     kernel_kwargs["direct_routing"] = bool(direct_routing)
+    kernel_kwargs["split_phase"] = split_phase
+    kernel_kwargs["low_smem_pipeline"] = bool(low_smem_pipeline)
     if external_route_plan:
         kernel_kwargs["external_route_plan"] = True
     if is_w4a8 and int(trellis_bits) > 0:
@@ -10550,6 +10603,90 @@ def _get_dynamic_kernel(
     return compiled, mac
 
 
+def _get_m8_route_pack_kernel(
+    *,
+    topk_ids_dtype: torch.dtype,
+    packed_numel: int,
+    scale_numel: int,
+    token_map_numel: int,
+    task_numel: int,
+):
+    """Compile the exact GLM-5.3 M8 route/activation preparation kernel."""
+
+    cache_key = (
+        topk_ids_dtype,
+        int(packed_numel),
+        int(scale_numel),
+        int(token_map_numel),
+        int(task_numel),
+    )
+    cached = _M8_ROUTE_PACK_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    ids_dtype = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    kernel = Nvfp4M8RoutePackKernel()
+    launch_args = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (8, 4096), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            ids_dtype, (64,), assumed_align=4 if ids_dtype == cutlass.Int32 else 8
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (64,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (packed_numel,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (scale_numel,), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (288,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (289,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (8, 4096), stride_order=(1, 0), assumed_align=16
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (token_map_numel,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (token_map_numel,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (task_numel,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (task_numel,), assumed_align=4
+        ),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4),
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (288,), assumed_align=16
+        ),
+        current_cuda_stream(),
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=kernel, cache_key=cache_key
+    )
+    compiled = b12x_compile(
+        kernel,
+        *launch_args,
+        compile_spec=KernelCompileSpec.from_key(
+            "integration.tp_moe.m8_route_pack",
+            2,
+            cache_key,
+        ),
+    )
+    _M8_ROUTE_PACK_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
 def _launch_dynamic_flat(
     *,
     packed_a_view: torch.Tensor,
@@ -10786,33 +10923,133 @@ def _launch_dynamic_flat(
             effective_mac,
             policy_max_active_clusters,
         )
-    # Do not enlarge this grid beyond the measured resident count: the fused
-    # kernel has a resident-grid barrier, so over-launching would deadlock.
-    compiled, mac = _get_dynamic_kernel(
-        E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
-        fast_math=fast_math,
-        mac_override=effective_mac,
-        activation=activation,
-        quant_mode=quant_mode,
-        w4a8_repacked=w4a8_repacked,
-        direct_routing=direct_routing,
-        external_route_plan=external_route_plan,
-        share_input_across_experts=share_input_across_experts,
-        deterministic_output=deterministic_output,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        trellis_bits=trellis_bits,
-        trellis_coupled=trellis_coupled,
-        planned_tile_m=planned_tile_m,
+    split_route_compute = bool(
+        _env_flag(_DYNAMIC_SPLIT_ROUTE_COMPUTE_ENV, default=False)
+        and quant_mode == "nvfp4"
+        and activation == "silu"
+        and E == 288
+        and m == 8
+        and k == 4096
+        and n == 512
+        and num_topk == 8
+        and selected_tile_m == 16
+        and not direct_routing
+        and external_route_plan
+        and not deterministic_output
+        and _dynamic_work_source() in {"materialized_queue", "persistent_grid"}
     )
-    if volatile_launch_state:
+    fast_split_prepare = bool(
+        split_route_compute
+        and fast_math
+        and _env_flag(_DYNAMIC_SPLIT_FAST_PREPARE_ENV, default=False)
+    )
+    fused_low_smem = bool(
+        not split_route_compute
+        and _env_flag(_DYNAMIC_FUSED_LOW_SMEM_ENV, default=False)
+        and quant_mode == "nvfp4"
+        and activation == "silu"
+        and E == 288
+        and m == 8
+        and k == 4096
+        and n == 512
+        and num_topk == 8
+        and selected_tile_m == 16
+        and not direct_routing
+        and external_route_plan
+        and not deterministic_output
+        and _dynamic_work_source() == "materialized_queue"
+    )
+    # The fused launch must stay within its measured resident count because it
+    # contains software grid barriers.  The split compute phase has no grid
+    # barrier, so it may expose multiple waves to the hardware scheduler.
+    prepare_effective_mac = effective_mac
+    if split_route_compute:
+        prepare_mac_override = os.getenv(_DYNAMIC_SPLIT_PREPARE_MAC_ENV)
+        if prepare_mac_override is not None:
+            prepare_effective_mac = min(
+                task_capacity,
+                max(1, int(prepare_mac_override)),
+            )
+    compiled = None
+    mac = prepare_effective_mac
+    if not fast_split_prepare:
+        compiled, mac = _get_dynamic_kernel(
+            E,
+            m,
+            k,
+            n,
+            num_topk,
+            max_rows,
+            topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
+            fast_math=fast_math,
+            mac_override=prepare_effective_mac,
+            activation=activation,
+            quant_mode=quant_mode,
+            w4a8_repacked=w4a8_repacked,
+            direct_routing=direct_routing,
+            external_route_plan=external_route_plan,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            trellis_bits=trellis_bits,
+            trellis_coupled=trellis_coupled,
+            planned_tile_m=planned_tile_m,
+            split_phase="prepare" if split_route_compute else "fused",
+            low_smem_pipeline=fused_low_smem,
+        )
+    compute_compiled = None
+    compute_mac = mac
+    if split_route_compute:
+        compute_waves = max(
+            1,
+            int(os.getenv(_DYNAMIC_SPLIT_COMPUTE_WAVES_ENV, "2")),
+        )
+        compute_mac = min(
+            task_capacity,
+            get_num_sm(torch.device("cuda")) * compute_waves,
+        )
+        compute_mac_override = os.getenv(_DYNAMIC_SPLIT_COMPUTE_MAC_ENV)
+        if compute_mac_override is not None:
+            compute_mac = min(task_capacity, max(1, int(compute_mac_override)))
+        compute_compiled, _ = _get_dynamic_kernel(
+            E,
+            m,
+            k,
+            n,
+            num_topk,
+            max_rows,
+            topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
+            fast_math=fast_math,
+            mac_override=compute_mac,
+            activation=activation,
+            quant_mode=quant_mode,
+            w4a8_repacked=w4a8_repacked,
+            direct_routing=direct_routing,
+            external_route_plan=external_route_plan,
+            share_input_across_experts=share_input_across_experts,
+            deterministic_output=deterministic_output,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            trellis_bits=trellis_bits,
+            trellis_coupled=trellis_coupled,
+            planned_tile_m=planned_tile_m,
+            split_phase="compute",
+            low_smem_pipeline=_env_flag(
+                _DYNAMIC_SPLIT_LOW_SMEM_ENV,
+                default=False,
+            ),
+        )
+    # Fast M8 preparation and split compute do not execute either resident-grid
+    # barrier.  Re-zeroing those two scalars on every replay is therefore dead
+    # work; retain the reset for every fused/prepare kernel that can read them.
+    skip_split_barrier_reset = bool(
+        fast_split_prepare
+        and _env_flag(_DYNAMIC_SKIP_SPLIT_BARRIER_RESET_ENV, default=False)
+    )
+    if volatile_launch_state and not skip_split_barrier_reset:
         barrier_count.zero_()
         barrier_epoch.zero_()
 
@@ -10843,87 +11080,122 @@ def _launch_dynamic_flat(
     is_w6a8 = quant_mode in _W6A8_QUANT_MODES
     packed_a_cutlass_dtype = cutlass.Float8E4M3FN if is_w6a8 else cutlass.Float4E2M1FN
     sf_cutlass_dtype = cutlass.Float8E8M0FNU if is_w6a8 else cutlass.Float8E4M3FN
-    compiled(
-        _gptr(cutlass.BFloat16, a),
-        _gptr(ids_cutlass_dtype, flat_ids, ids_align),
-        _gptr(cutlass.Float32, flat_weights, 4),
-        _gptr(packed_a_cutlass_dtype, packed_a_view),
-        _gptr(sf_cutlass_dtype, scale_flat),
-        _gptr(cutlass.Uint8, packed_a_flat),
-        _gptr(cutlass.Uint8, scale_flat),
-        _gptr(cutlass.Uint32, materialized_intermediate),
-        barrier_count,
-        barrier_epoch,
-        pair_head,
-        producers_done_count,
-        all_work_published,
-        task_head,
-        task_tail,
-        _gptr(cutlass.Int32, task_ready, 4),
-        _gptr(cutlass.Int32, task_expert, 4),
-        _gptr(cutlass.Int32, task_m_tile, 4),
-        _gptr(cutlass.Int32, task_slice_begin, 4),
-        _gptr(cutlass.Int32, task_slice_count, 4),
-        _gptr(cutlass.Int32, task_valid_rows, 4),
-        _gptr(cutlass.Int32, tile_write_count, 4),
-        w13_fp4,
-        _gptr(sf_cutlass_dtype, w13_sf),
-        *(
-            (_gptr(sf_cutlass_dtype, sfb_w13_mx),)
-            if not _is_w4a8_quant_mode(quant_mode)
-            else ()
-        ),
-        down_fp4,
-        _gptr(sf_cutlass_dtype, down_sf),
-        *(
-            (
-                _gptr(cutlass.Uint8, sfb_w13_mx),
-                _gptr(cutlass.Uint8, sfb_down_mx),
-                _gptr(cutlass.Uint8, w13_residual),
-                _gptr(cutlass.Uint8, down_residual),
-                _gptr(cutlass.Uint32, w13_rp),
-                _gptr(cutlass.Uint32, w13_sfb_rp),
-                _gptr(cutlass.Uint32, down_rp),
-                _gptr(cutlass.Uint32, down_sfb_rp),
+    def _run_compiled(compiled_kernel, launch_mac: int) -> None:
+        compiled_kernel(
+            _gptr(cutlass.BFloat16, a),
+            _gptr(ids_cutlass_dtype, flat_ids, ids_align),
+            _gptr(cutlass.Float32, flat_weights, 4),
+            _gptr(packed_a_cutlass_dtype, packed_a_view),
+            _gptr(sf_cutlass_dtype, scale_flat),
+            _gptr(cutlass.Uint8, packed_a_flat),
+            _gptr(cutlass.Uint8, scale_flat),
+            _gptr(cutlass.Uint32, materialized_intermediate),
+            barrier_count,
+            barrier_epoch,
+            pair_head,
+            producers_done_count,
+            all_work_published,
+            task_head,
+            task_tail,
+            _gptr(cutlass.Int32, task_ready, 4),
+            _gptr(cutlass.Int32, task_expert, 4),
+            _gptr(cutlass.Int32, task_m_tile, 4),
+            _gptr(cutlass.Int32, task_slice_begin, 4),
+            _gptr(cutlass.Int32, task_slice_count, 4),
+            _gptr(cutlass.Int32, task_valid_rows, 4),
+            _gptr(cutlass.Int32, tile_write_count, 4),
+            w13_fp4,
+            _gptr(sf_cutlass_dtype, w13_sf),
+            *(
+                (_gptr(sf_cutlass_dtype, sfb_w13_mx),)
+                if not _is_w4a8_quant_mode(quant_mode)
+                else ()
+            ),
+            down_fp4,
+            _gptr(sf_cutlass_dtype, down_sf),
+            *(
+                (
+                    _gptr(cutlass.Uint8, sfb_w13_mx),
+                    _gptr(cutlass.Uint8, sfb_down_mx),
+                    _gptr(cutlass.Uint8, w13_residual),
+                    _gptr(cutlass.Uint8, down_residual),
+                    _gptr(cutlass.Uint32, w13_rp),
+                    _gptr(cutlass.Uint32, w13_sfb_rp),
+                    _gptr(cutlass.Uint32, down_rp),
+                    _gptr(cutlass.Uint32, down_sfb_rp),
+                )
+                if _is_w4a8_quant_mode(quant_mode)
+                else ()
+            ),
+            row_counts,
+            expert_write_rows,
+            expert_tile_base,
+            input_gs,
+            w1_alpha,
+            w2_alpha,
+            down_input_scale,
+            _gptr(cutlass.BFloat16, scatter_output),
+            _gptr(cutlass.Int32, token_map, 4),
+            _gptr(cutlass.Float32, token_weights, 4),
+            m,
+            max_rows,
+            scatter_rows,
+            physical_tiles_capacity
+            * _select_dynamic_tile_mn(
+                m * num_topk,
+                n,
+                quant_mode,
+                num_experts=E,
+                activation=activation,
+                planned_tile_m=planned_tile_m,
+            )[0],
+            task_capacity,
+            physical_tiles_capacity,
+            launch_mac,
+            current_cuda_stream(),
+            *(
+                (
+                    _gptr(cutlass.Uint8, trellis_lut_tensor),
+                    _gptr(cutlass.Float16, w13_sfb_rp),
+                )
+                if w4a8_trellis
+                else ()
             )
-            if _is_w4a8_quant_mode(quant_mode)
-            else ()
-        ),
-        row_counts,
-        expert_write_rows,
-        expert_tile_base,
-        input_gs,
-        w1_alpha,
-        w2_alpha,
-        down_input_scale,
-        _gptr(cutlass.BFloat16, scatter_output),
-        _gptr(cutlass.Int32, token_map, 4),
-        _gptr(cutlass.Float32, token_weights, 4),
-        m,
-        max_rows,
-        scatter_rows,
-        physical_tiles_capacity
-        * _select_dynamic_tile_mn(
-            m * num_topk,
-            n,
-            quant_mode,
-            num_experts=E,
-            activation=activation,
-            planned_tile_m=planned_tile_m,
-        )[0],
-        task_capacity,
-        physical_tiles_capacity,
-        mac,
-        current_cuda_stream(),
-        *(
-            (
-                _gptr(cutlass.Uint8, trellis_lut_tensor),
-                _gptr(cutlass.Float16, w13_sfb_rp),
-            )
-            if w4a8_trellis
-            else ()
-        ),
-    )
+        )
+
+    if fast_split_prepare:
+        fast_prepare_compiled = _get_m8_route_pack_kernel(
+            topk_ids_dtype=torch.int32 if topk_ids_are_i32 else torch.int64,
+            packed_numel=packed_a_flat.numel(),
+            scale_numel=scale_flat.numel(),
+            token_map_numel=token_map.numel(),
+            task_numel=task_expert.numel(),
+        )
+        fast_prepare_compiled(
+            a,
+            flat_ids,
+            flat_weights,
+            packed_a_flat,
+            scale_flat,
+            row_counts,
+            expert_tile_base,
+            scatter_output,
+            token_map,
+            token_weights,
+            task_expert,
+            task_valid_rows,
+            task_head,
+            task_tail,
+            all_work_published,
+            input_gs,
+            current_cuda_stream(),
+        )
+    else:
+        assert compiled is not None
+        _run_compiled(compiled, mac)
+    if split_route_compute:
+        assert compute_compiled is not None
+        _run_compiled(compute_compiled, compute_mac)
 
 
 _DYNAMIC_TILE_M_POLICY_CODES = {16: 0, 32: 1, 64: 2, 128: 3}
