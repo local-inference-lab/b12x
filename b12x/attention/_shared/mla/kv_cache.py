@@ -207,7 +207,11 @@ def _glm_next_cache_record_address(
 
 
 class ConcatAndCacheNvfp4MlaFp8RopeKernel:
-    """Per-token KV_FP8_ROPE=1 nvfp4_ds_mla record writer.
+    """Per-token packed GLM MLA record writer.
+
+    With ``has_rope=True``, each token uses the 368-byte KV_FP8_ROPE=1
+    nvfp4_ds_mla record. With ``has_rope=False``, each token uses the 304-byte
+    GLM_NEXT record and omits the RoPE lane.
 
     Thread mapping (128 threads/CTA): threads 0-31 quantize one 16-dim
     group each (eight coherent 32-bit loads -> exact f32 promote -> E2M1
