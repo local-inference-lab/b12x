@@ -6,6 +6,9 @@ import os
 import logging
 import time
 from collections.abc import Mapping, Sequence
+import functools  # kimi-k3-moe-plan-cache
+import threading  # kimi-k3-moe-plan-cache
+from collections import OrderedDict  # kimi-k3-moe-plan-cache
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Tuple
@@ -2816,6 +2819,7 @@ def _dynamic_task_geometry(
     return max_m_tiles, gate_tile_cnt, max_tasks
 
 
+@functools.lru_cache(maxsize=8192)  # kimi-k3-moe-plan-cache: pure function of its keyword arguments
 def _dynamic_capacity_geometry(
     *,
     max_tokens: int,
@@ -6607,7 +6611,7 @@ def _resolve_workspace_layout(
     return implementation, weight_E, align_up(routed_rows, tile_m)
 
 
-def plan_tp_moe_execution(
+def _plan_tp_moe_execution_uncached(
     *,
     num_tokens: int,
     num_topk: int,
@@ -6795,6 +6799,81 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
     )
+
+# kimi-k3-moe-plan-cache: begin
+_MOE_PLAN_CACHE_MAX = int(os.environ.get("B12X_MOE_PLAN_CACHE_SIZE", "8192") or 0)
+_MOE_PLAN_CACHE: "OrderedDict[tuple, tuple[object, TPMoEPlan]]" = OrderedDict()
+_MOE_PLAN_CACHE_LOCK = threading.Lock()
+_MOE_PLAN_CACHE_STATS = {"hits": 0, "misses": 0}
+
+
+def _b12x_env_signature() -> tuple:
+    """B12X_* environment values that steer plan lowering (part of the cache key)."""
+    return tuple(sorted(item for item in os.environ.items() if item[0].startswith("B12X_")))
+
+
+def clear_moe_plan_cache() -> None:
+    with _MOE_PLAN_CACHE_LOCK:
+        _MOE_PLAN_CACHE.clear()
+    _dynamic_capacity_geometry.cache_clear()
+
+
+def plan_tp_moe_execution(
+    *,
+    num_tokens: int,
+    num_topk: int,
+    device: torch.device | str,
+    weight_plan: MoEWeightPreparationPlan,
+    quant_mode: str,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+    apply_router_weight_on_input: bool = False,
+    deterministic_output: bool | None = None,
+) -> TPMoEPlan:
+    """Memoized `_plan_tp_moe_execution_uncached`.
+
+    The lowered plan is a frozen dataclass determined by the call arguments,
+    the identity of the immutable weight-preparation plan, and B12X_*
+    environment variables. Entries keep a reference to the weight plan so an
+    `id()` can never be reused by a different live object.
+    """
+    if _MOE_PLAN_CACHE_MAX <= 0:
+        return _plan_tp_moe_execution_uncached(
+            num_tokens=num_tokens, num_topk=num_topk, device=device,
+            weight_plan=weight_plan, quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=deterministic_output,
+        )
+    key = (
+        int(num_tokens), int(num_topk), str(torch.device(device)), id(weight_plan),
+        quant_mode, swiglu_limit, swiglu_alpha, swiglu_beta,
+        bool(apply_router_weight_on_input), deterministic_output,
+        _b12x_env_signature(),
+    )
+    with _MOE_PLAN_CACHE_LOCK:
+        entry = _MOE_PLAN_CACHE.get(key)
+        if entry is not None and entry[0] is weight_plan:
+            _MOE_PLAN_CACHE.move_to_end(key)
+            _MOE_PLAN_CACHE_STATS["hits"] += 1
+            return entry[1]
+    plan = _plan_tp_moe_execution_uncached(
+        num_tokens=num_tokens, num_topk=num_topk, device=device,
+        weight_plan=weight_plan, quant_mode=quant_mode,
+        swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        deterministic_output=deterministic_output,
+    )
+    with _MOE_PLAN_CACHE_LOCK:
+        _MOE_PLAN_CACHE_STATS["misses"] += 1
+        _MOE_PLAN_CACHE[key] = (weight_plan, plan)
+        while len(_MOE_PLAN_CACHE) > _MOE_PLAN_CACHE_MAX:
+            _MOE_PLAN_CACHE.popitem(last=False)
+    return plan
+# kimi-k3-moe-plan-cache: end
 
 
 def _validate_workspace(
