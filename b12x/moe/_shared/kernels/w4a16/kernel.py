@@ -1015,7 +1015,12 @@ class W4A16GemmKernel:
         # Small-M stripe split-K: opt out of the one-tile-per-CTA fast path
         # so decode-heavy small-M phases spread each mn-tile's K range across
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
-        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        # Stripe only decode-sized launches;
+        # large-M prefill keeps the whole-tile wave schedule (stripe
+        # finalize regressed prefill 902->782 tok/s on 2026-08-28).
+        self.small_m_splitk = (
+            _w4a16_small_m_splitk_enabled() and int(size_m) <= 16
+        )
         self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.weight_layout_trellis256_proj = (
             self.weight_layout_trellis256 and w13_layout == "trellis_t256_proj"
@@ -5655,7 +5660,12 @@ class W4A16FusedMoeKernel:
         # Stripe split-K spreads each mn-tile's K range across many CTAs for
         # decode-heavy small-M phases. It is incompatible with whole-tile
         # scheduling and grouped FC2 route subtiles.
-        self.small_m_splitk = _w4a16_small_m_splitk_enabled()
+        # Stripe only decode-sized launches;
+        # large-M prefill keeps the whole-tile wave schedule (stripe
+        # finalize regressed prefill 902->782 tok/s on 2026-08-28).
+        self.small_m_splitk = (
+            _w4a16_small_m_splitk_enabled() and int(size_m) <= 16
+        )
         if self.small_m_splitk:
             schedule_whole_tiles = False
             fc2_schedule_route_block_factor = 1
