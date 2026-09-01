@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from .planner import dynamic_sparse_chunk_indices
+
 K3_ABSORBED_DIM = 576
 K3_VALUE_DIM = 512
 K3_RAW_QK_DIM = 192
@@ -43,6 +45,12 @@ def dense_mla_reference(
     cache_seqlens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     *,
+    query_cache_seqlens: torch.Tensor | None = None,
+    sparse_stride: int = 1,
+    sparse_min_tokens: int = 0,
+    sparse_sink_chunks: int = 0,
+    sparse_recent_chunks: int = 0,
+    sparse_refresh_interval: int = 0,
     kv_scale: torch.Tensor | float | None = None,
     q_scale: torch.Tensor | float | None = None,
     sm_scale: float = K3_SM_SCALE,
@@ -71,8 +79,20 @@ def dense_mla_reference(
         raise ValueError("cache_seqlens shape must match page_table batch")
     if tuple(cu_seqlens_q.shape) != (batch + 1,):
         raise ValueError("cu_seqlens_q shape must be [batch + 1]")
+    if query_cache_seqlens is not None and (
+        query_cache_seqlens.dtype != torch.int32
+        or tuple(query_cache_seqlens.shape) != (int(q.shape[0]),)
+    ):
+        raise TypeError("query_cache_seqlens must be int32 with shape [total_q]")
     if any(
-        t.device != q.device for t in (cache, page_table, cache_seqlens, cu_seqlens_q)
+        t.device != q.device
+        for t in (
+            cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            *(() if query_cache_seqlens is None else (query_cache_seqlens,)),
+        )
     ):
         raise ValueError("dense MLA reference tensors must be on one device")
 
@@ -113,11 +133,38 @@ def dense_mla_reference(
         physical_pages = page_table[request, :pages_needed].to(torch.long)
         records = cache.index_select(0, physical_pages).reshape(-1, K3_ABSORBED_DIM)
         records = records[:kv_len].float() * kv_mul
+        sparse_active = sparse_stride > 1 and kv_len > sparse_min_tokens
+        if sparse_refresh_interval > 0 and kv_len % sparse_refresh_interval < q_len:
+            sparse_active = False
+        if sparse_active:
+            selected_chunks = dynamic_sparse_chunk_indices(
+                (kv_len + 63) // 64,
+                stride=sparse_stride,
+                sink_chunks=sparse_sink_chunks,
+                recent_chunks=sparse_recent_chunks,
+            )
+            selected_positions = torch.cat(
+                [
+                    torch.arange(
+                        chunk * 64,
+                        min((chunk + 1) * 64, kv_len),
+                        device=q.device,
+                    )
+                    for chunk in selected_chunks
+                ]
+            )
+        else:
+            selected_positions = torch.arange(kv_len, device=q.device)
 
         q_rows = q[q_begin:q_end].float() * q_mul
         for local_q in range(q_len):
-            visible = kv_len - q_len + local_q + 1
-            key = records[:visible]
+            visible = (
+                int(query_cache_seqlens[q_begin + local_q])
+                if query_cache_seqlens is not None
+                else kv_len - q_len + local_q + 1
+            )
+            visible_positions = selected_positions[selected_positions < visible]
+            key = records.index_select(0, visible_positions)
             logits = torch.einsum("hd,kd->hk", q_rows[local_q], key)
             logits = logits * float(sm_scale)
             probs = torch.softmax(logits, dim=-1)
