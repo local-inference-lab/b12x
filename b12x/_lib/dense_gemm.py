@@ -136,6 +136,9 @@ _B12X_TIMING_THRESHOLD_MS = float(
     )
 )
 _B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "1") == "1"
+# Widest split-K slice count for narrow-N (n < 4096) tiny-M FP8 projections;
+# 0 or 1 keeps the single-CTA-per-tile launch.
+_B12X_DENSE_NARROW_SPLITK_MAX = int(os.getenv("B12X_DENSE_NARROW_SPLITK_MAX", "8"))
 
 # MX-FP6 decode uses at most three mainloop stages when two CTAs share an SM.
 _FP6_DECODE_TILE = (16, 64)
@@ -182,17 +185,35 @@ def _reduce_split_k2_bf16_kernel(
     tl.store(out + offs, accum, mask=mask)
 
 
+@triton.jit
+def _reduce_split_kn_bf16_kernel(
+    partials, out, total: tl.constexpr, SLICES: tl.constexpr, BLOCK: tl.constexpr
+) -> None:
+    # Fixed slice order (0..SLICES-1) in FP32, one rounding at the store:
+    # the result does not depend on CTA scheduling.
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    accum = tl.load(partials + offs, mask=mask).to(tl.float32)
+    for s in tl.static_range(1, SLICES):
+        accum += tl.load(partials + s * total + offs, mask=mask).to(tl.float32)
+    tl.store(out + offs, accum, mask=mask)
+
+
 def _reduce_split_k2_bf16(
     partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int
 ) -> None:
-    """Fused 2-way split-K FP32-partials reduction (exact); faster than torch.add.
+    """Fused split-K FP32-partials reduction (exact); faster than torch.add.
 
-    Falls back to torch.add when the scratch/output layout is not the expected
-    [m, n, 2] / [m, n, 1] contiguous-row form.
+    ``partials`` is the ``[m, n, slices]`` view of the ``[slices, m, n]``
+    FP32 scratch. Any slice count is reduced in fixed slice order with one
+    rounding at the store. Falls back to torch when the scratch/output
+    layout is not the expected contiguous-row form.
     """
     total = int(m) * int(n)
+    slices = int(partials.shape[2])
     if (
-        partials.shape == (m, n, 2)
+        partials.shape == (m, n, slices)
         and partials.stride() == (n, 1, total)
         and out.shape == (m, n, 1)
         and out.stride()[0] == n
@@ -200,9 +221,14 @@ def _reduce_split_k2_bf16(
     ):
         block = 1024
         grid = (triton.cdiv(total, block),)
-        _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
+        if slices == 2:
+            _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
+        else:
+            _reduce_split_kn_bf16_kernel[grid](
+                partials, out, total, SLICES=slices, BLOCK=block
+            )
     else:
-        torch.add(partials[:, :, 0], partials[:, :, 1], out=out[:, :, 0])
+        out[:, :, 0].copy_(partials.float().sum(dim=2).to(out.dtype))
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -489,6 +515,34 @@ def _dense_gemm_policy_for(
                 and mma_tiler_mn == (16, 128)
                 else 2
             )
+    split_k_atomic_bf16 = _B12X_DENSE_SPLITK_TURBO
+    if (
+        split_k_slices == 1
+        and _B12X_DENSE_NARROW_SPLITK_MAX > 1
+        and single_work_tile_per_cta
+        and ab_dtype == cutlass.Float8E4M3FN
+        and c_dtype == cutlass.BFloat16
+        and m <= 8
+        and n < 4096
+        and k >= 4096
+        and k % 256 == 0
+        and l == 1
+    ):
+        # Narrow-N, deep-K decode projections (e.g. hidden -> latent, q_a,
+        # kv_a, shared-expert gate/up at TP8) launch only n / tile_n CTAs
+        # and stream their weights at a fraction of HBM bandwidth. Split K
+        # across the widest slice count that keeps every (tile, slice) CTA
+        # resident and divides the K tiles; partials are reduced exactly in
+        # FP32 (never the bf16 atomic path), so the result rounds once.
+        k_tiles = k // 128
+        n_tiles = (n + tile_n - 1) // tile_n
+        for candidate in (8, 4, 2):
+            if candidate > _B12X_DENSE_NARROW_SPLITK_MAX:
+                continue
+            if k_tiles % candidate == 0 and n_tiles * candidate <= max_active_clusters:
+                split_k_slices = candidate
+                split_k_atomic_bf16 = False
+                break
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
     # regime so one warmed kernel covers every live M in that regime.
@@ -536,7 +590,7 @@ def _dense_gemm_policy_for(
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
         split_k_slices=split_k_slices,
-        split_k_atomic_bf16=_B12X_DENSE_SPLITK_TURBO,
+        split_k_atomic_bf16=split_k_atomic_bf16,
         large_m_unroll=(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
         ),
