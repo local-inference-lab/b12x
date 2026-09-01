@@ -1195,6 +1195,35 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         require_bit_exact_replay=False,
         assert_no_replay_allocations=True,
     )
+    from b12x.moe.fused_moe import _impl as fused_moe_impl
+
+    assert fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE, (
+        "the exact GLM-5.3 M8 test must compile and execute the route-pack kernel"
+    )
+
+    compiled_before = {
+        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
+    }
+    monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "112")
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    case.binding.output.fill_(37.0)
+    freeze_kernel_resolution("the M8 compute grid is a runtime launch scalar")
+    try:
+        fused_moe_impl.b12x_moe_fp4(binding=case.binding)
+        torch.cuda.synchronize()
+    finally:
+        unfreeze_kernel_resolution()
+    assert {
+        key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
+    } == compiled_before
+    _assert_oracle(
+        case.binding.output,
+        changed_reference,
+        context="standard-moe-glm53-m8-runtime-compute-grid",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
 
 
 def test_standard_moe_tiny_decode_live_graph_oracle(

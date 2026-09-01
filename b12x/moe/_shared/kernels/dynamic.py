@@ -730,6 +730,10 @@ class MoEDynamicKernelBackend:
                 f"unsupported split_phase {split_phase!r}; "
                 f"expected one of {sorted(_SPLIT_PHASES)}"
             )
+        if split_phase == "compute" and quant_recipe != "nvfp4":
+            raise ValueError(
+                "split_phase='compute' currently supports quant_recipe='nvfp4' only"
+            )
         if quant_recipe != "nvfp4" and activation == SWIGLUOAI_UNINTERLEAVE:
             raise NotImplementedError(
                 "activation='swigluoai_uninterleave' is not supported by W4A8 MoE"
