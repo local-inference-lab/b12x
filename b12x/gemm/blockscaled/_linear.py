@@ -459,6 +459,33 @@ _SERIALIZED_RECIPES = {
 }
 
 
+def _resolved_codes(
+    codes: tuple[int, int, int, int, int, int],
+    *,
+    device: torch.device,
+    recipe: str,
+    in_features: int,
+    out_features: int,
+    max_tokens: int,
+    output_dtype: torch.dtype,
+) -> tuple[int, int, int, int, int, int]:
+    """Explicit plan codes win; all-zero codes consult the ambient policy.
+
+    This runs inside the custom ops (never under Dynamo tracing), so the
+    profile lookup stays out of compiled graphs.
+    """
+    if any(codes):
+        return codes
+    return _auto_launch_codes(
+        device=device,
+        recipe=recipe,
+        in_features=in_features,
+        out_features=out_features,
+        max_tokens=max_tokens,
+        output_dtype=output_dtype,
+    )
+
+
 def _dense_launch_kwargs(
     tile_m: int,
     tile_n: int,
@@ -514,6 +541,20 @@ def _blockscaled_serialized_op(
         raise ValueError("serialized blockscaled operands must both be 2D")
     m, lhs_storage_k = map(int, lhs_values.shape)
     n, rhs_storage_k = map(int, rhs_values.shape)
+    auto_recipe = _SERIALIZED_RECIPES.get(
+        (str(ab_dtype), int(sf_vec_size), bool(block_fp8))
+    )
+    codes = (tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code)
+    if auto_recipe is not None:
+        codes = _resolved_codes(
+            codes,
+            device=lhs_values.device,
+            recipe=auto_recipe,
+            in_features=lhs_storage_k * (2 if ab_dtype == "float4_e2m1fn" else 1),
+            out_features=n,
+            max_tokens=int(expected_m),
+            output_dtype=getattr(torch, str(c_dtype)),
+        )
     if rhs_storage_k != lhs_storage_k:
         raise ValueError(
             "blockscaled operands must have the same storage K extent, got "
@@ -570,9 +611,7 @@ def _blockscaled_serialized_op(
         block_fp8=block_fp8,
         expected_m=expected_m,
         stream=stream_int,
-        **_dense_launch_kwargs(
-            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
-        ),
+        **_dense_launch_kwargs(*codes),
     )[:, :, 0]
 
 
@@ -630,6 +669,15 @@ def _packed_mxfp8_op(
 ) -> torch.Tensor:
     del weight_scale_rows, in_features
     tokens = int(source_2d.shape[0])
+    codes = _resolved_codes(
+        (tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code),
+        device=source_2d.device,
+        recipe="mxfp8",
+        in_features=int(source_2d.shape[1]),
+        out_features=int(out_features),
+        max_tokens=int(expected_m),
+        output_dtype=source_2d.dtype,
+    )
     source_for_quant = _pad_k(source_2d, int(padded_in_features))
     from b12x.gemm._shared.block_fp8 import (
         quantize_block_fp8_linear_input_mxfp8,
@@ -648,9 +696,7 @@ def _packed_mxfp8_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
-        **_dense_launch_kwargs(
-            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
-        ),
+        **_dense_launch_kwargs(*codes),
     )[:, :, 0]
 
 
@@ -705,6 +751,15 @@ def _packed_mxfp8_prequantized_op(
     swap_ab_code: int = 0,
 ) -> torch.Tensor:
     tokens = int(source_values.shape[0])
+    codes = _resolved_codes(
+        (tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code),
+        device=source_values.device,
+        recipe="mxfp8",
+        in_features=int(source_values.shape[1]),
+        out_features=int(out_features),
+        max_tokens=int(expected_m),
+        output_dtype=out_dtype,
+    )
     source_padded = _pad_k(source_values, int(padded_in_features))
     source_scale_mma = _mxfp8_scale_mma_from_input(
         source_scale_storage,
@@ -727,9 +782,7 @@ def _packed_mxfp8_prequantized_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
-        **_dense_launch_kwargs(
-            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
-        ),
+        **_dense_launch_kwargs(*codes),
     )[:, :, 0]
 
 
@@ -842,15 +895,6 @@ def mxfp8_linear(
     _output_dtype_name(resolved_out_dtype)
 
     out_features = int(packed_weight.out_features)
-    if plan is None:
-        launch_codes = _auto_launch_codes(
-            device=source_2d.device,
-            recipe="mxfp8",
-            in_features=in_features,
-            out_features=out_features,
-            max_tokens=int(expected_m) if expected_m is not None else tokens,
-            output_dtype=out_dtype if out_dtype is not None else torch.bfloat16,
-        )
     _validate_bias(
         bias,
         out_features=out_features,
@@ -919,6 +963,15 @@ def _packed_tensor_fp8_op(
     swap_ab_code: int = 0,
 ) -> torch.Tensor:
     tokens = int(source_2d.shape[0])
+    codes = _resolved_codes(
+        (tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code),
+        device=source_2d.device,
+        recipe="tensor_fp8",
+        in_features=int(source_2d.shape[1]),
+        out_features=int(out_features),
+        max_tokens=int(expected_m),
+        output_dtype=out_dtype,
+    )
     source_padded = _pad_k(source_2d, int(padded_in_features))
     if _use_block_fp8_recipe(
         live_m=tokens,
@@ -949,9 +1002,7 @@ def _packed_tensor_fp8_op(
             expected_m=expected_m,
             stream=stream_int,
             block_fp8=True,
-            **_dense_launch_kwargs(
-                tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
-            ),
+            **_dense_launch_kwargs(*codes),
         )[:, :, 0]
 
     source_scale_mma = _activation_scale_mma(
@@ -976,9 +1027,7 @@ def _packed_tensor_fp8_op(
         expected_m=expected_m,
         stream=stream_int,
         plain_fp8=True,
-        **_dense_launch_kwargs(
-            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
-        ),
+        **_dense_launch_kwargs(*codes),
     )[:, :, 0]
 
 
@@ -1043,15 +1092,6 @@ def tensor_fp8_linear(
     _output_dtype_name(out_dtype)
 
     out_features = int(packed_weight.out_features)
-    if plan is None:
-        launch_codes = _auto_launch_codes(
-            device=source_2d.device,
-            recipe="tensor_fp8",
-            in_features=in_features,
-            out_features=out_features,
-            max_tokens=int(expected_m) if expected_m is not None else tokens,
-            output_dtype=out_dtype,
-        )
     _validate_bias(
         bias,
         out_features=out_features,
@@ -1134,30 +1174,12 @@ def blockscaled_mm(
         expected_m = recipe.pop("expected_m", None)
         stream = recipe.pop("stream", None)
         block_fp8 = bool(recipe.pop("block_fp8", False))
-        plan = recipe.pop("plan", None)
-        launch_codes = _launch_codes_from_plan(plan)
+        launch_codes = _launch_codes_from_plan(recipe.pop("plan", None))
         if recipe:
             names = ", ".join(sorted(recipe))
             raise TypeError(
                 "serialized blockscaled.mm does not support these raw-engine "
                 f"options: {names}"
-            )
-        auto_recipe = _SERIALIZED_RECIPES.get(
-            (str(ab_dtype), int(sf_vec_size), block_fp8)
-        )
-        if plan is None and auto_recipe is not None:
-            packed_k = int(lhs_values.shape[1])
-            launch_codes = _auto_launch_codes(
-                device=lhs_values.device,
-                recipe=auto_recipe,
-                in_features=packed_k * (2 if auto_recipe in ("nvfp4", "mxfp4") else 1),
-                out_features=int(rhs_values.shape[0]),
-                max_tokens=(
-                    int(expected_m)
-                    if expected_m is not None
-                    else int(lhs_values.shape[0])
-                ),
-                output_dtype=getattr(torch, str(c_dtype)),
             )
         return torch.ops.b12x.blockscaled_serialized(
             lhs_values,

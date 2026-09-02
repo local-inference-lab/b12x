@@ -2853,6 +2853,31 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     )
     alpha_one = _cached_alpha_one(o.device)
     tokens = int(o.shape[0])
+    if not any(
+        (
+            wo_a_tile_m,
+            wo_a_tile_n,
+            wo_b_tile_m,
+            wo_b_tile_n,
+            wo_b_fused_code,
+            quantized_intermediate_code,
+        )
+    ):
+        (
+            wo_a_tile_m,
+            wo_a_tile_n,
+            wo_b_tile_m,
+            wo_b_tile_n,
+            wo_b_fused_code,
+            quantized_intermediate_code,
+        ) = _auto_wo_launch_codes(
+            o.device,
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+            expected_m=expected_m,
+        )
     # Tiny-M WO-B uses atomic split-K. Clear its output inside the initial
     # inverse-RoPE quantizer so the decode graph does not need a fill launch.
     # WO-A stays on the standalone quantizer + GEMM: fusing the quant into the
@@ -3039,20 +3064,25 @@ _AUTO_WO_CODES_CACHE: dict[tuple[object, ...], tuple[int, int, int, int, int, in
 
 def _auto_wo_launch_codes(
     device: torch.device,
-    weights: WOProjectionMXFP8Weights,
+    *,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
     expected_m: int,
 ) -> tuple[int, int, int, int, int, int]:
     """Profile-resolved launch codes for unbound (functional) WO calls.
 
-    All zeros unless a measured profile or an explicit override selected the
-    chain, so the built-in rules stay in charge everywhere else.
+    Runs inside the fused custom op, so the lookup never enters a compiled
+    graph. All zeros unless a measured profile or an explicit override selected
+    the chain, so the built-in rules stay in charge everywhere else.
     """
     key = (
         device.index,
-        int(weights.groups),
-        int(weights.group_width),
-        int(weights.rank),
-        int(weights.hidden),
+        int(groups),
+        int(group_width),
+        int(rank),
+        int(hidden),
         int(expected_m),
     )
     codes = _AUTO_WO_CODES_CACHE.get(key)
@@ -3069,10 +3099,10 @@ def _auto_wo_launch_codes(
                 WoProjectionQuery(
                     dtype="bfloat16",
                     max_tokens=int(expected_m),
-                    groups=int(weights.groups),
-                    group_width=int(weights.group_width),
-                    rank=int(weights.rank),
-                    hidden=int(weights.hidden),
+                    groups=int(groups),
+                    group_width=int(group_width),
+                    rank=int(rank),
+                    hidden=int(hidden),
                 ),
             )
         except (ValueError, TypeError):
@@ -3140,7 +3170,7 @@ def wo_projection_inv_rope_mxfp8(
         expected_m = binding.expected_m
         launch_codes = _wo_launch_codes(binding.config)
     else:
-        launch_codes = None
+        launch_codes = _NO_WO_LAUNCH_CODES
     if (
         o is None
         or positions is None
@@ -3165,8 +3195,6 @@ def wo_projection_inv_rope_mxfp8(
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
         expected_m = int(tokens)
-    if launch_codes is None:
-        launch_codes = _auto_wo_launch_codes(o.device, weights, int(expected_m))
     # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
     # gemm chain internally, so the token-shaped activation MXFP8 views never
     # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any
