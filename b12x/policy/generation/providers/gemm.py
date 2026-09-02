@@ -1416,10 +1416,15 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            clear_inflight(self._context.work_dir)
             measurements = _confirm_winner(
-                measurements, races, baseline_config=baseline_config
+                measurements,
+                races,
+                baseline_config=baseline_config,
+                on_sample=lambda candidate_id: mark_inflight(
+                    self._context.work_dir, case.case_id, candidate_id
+                ),
             )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 
@@ -1870,10 +1875,15 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            clear_inflight(self._context.work_dir)
             measurements = _confirm_winner(
-                measurements, races, baseline_config=baseline_config
+                measurements,
+                races,
+                baseline_config=baseline_config,
+                on_sample=lambda candidate_id: mark_inflight(
+                    self._context.work_dir, case.case_id, candidate_id
+                ),
             )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 

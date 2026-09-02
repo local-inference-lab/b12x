@@ -73,7 +73,12 @@ def test_confirm_winner_replaces_both_latencies_with_interleaved_medians() -> No
         ms[0].candidate.candidate_id: _race(30.0, [29.0] * CONFIRM_ROUNDS),
         ms[1].candidate.candidate_id: _race(20.0, [28.0] * CONFIRM_ROUNDS),
     }
-    confirmed = _confirm_winner(ms, races, baseline_config=baseline)
+    replayed: list[str] = []
+    confirmed = _confirm_winner(
+        ms, races, baseline_config=baseline, on_sample=replayed.append
+    )
+    leader_id, base_id = ms[1].candidate.candidate_id, ms[0].candidate.candidate_id
+    assert replayed == [leader_id, base_id] * CONFIRM_ROUNDS
     by_id = {m.candidate.candidate_id: m for m in confirmed}
     assert by_id[ms[0].candidate.candidate_id].latency_us == 29.0
     assert by_id[ms[1].candidate.candidate_id].latency_us == 28.0

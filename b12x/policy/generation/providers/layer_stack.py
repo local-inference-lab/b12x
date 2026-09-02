@@ -263,13 +263,16 @@ class _ContextRace:
 CONFIRM_ROUNDS = 8
 
 
-def _confirm_winner(measurements, races, *, baseline_config, passes=None):
+def _confirm_winner(
+    measurements, races, *, baseline_config, passes=None, on_sample=None
+):
     """Re-time the leader and the built-in plan interleaved.
 
     Two sweeps seconds apart can disagree by more than the margin; measuring
     the two contenders alternately in one pass removes that drift before the
     reducer applies the margin. Both latencies are replaced by the confirmed
-    medians; the first-pass values stay in the metrics.
+    medians; the first-pass values stay in the metrics. ``on_sample`` is told
+    which candidate is about to replay, so a crash guard can blame it.
     """
     import statistics
 
@@ -296,7 +299,11 @@ def _confirm_winner(measurements, races, *, baseline_config, passes=None):
         return measurements
     best_samples, base_samples = [], []
     for _ in range(CONFIRM_ROUNDS):
+        if on_sample is not None:
+            on_sample(best.candidate.candidate_id)
         best_samples.append(best_race.sample()[0])
+        if on_sample is not None:
+            on_sample(baseline.candidate.candidate_id)
         base_samples.append(base_race.sample()[0])
     confirmed = {
         best.candidate.candidate_id: statistics.median(best_samples),
