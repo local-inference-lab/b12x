@@ -320,6 +320,7 @@ def run_parallel_measurements(
                     )
                     update_overall(advance=units)
 
+            failed: list[tuple[object, BaseException]] = []
             pending = set(futures)
             while pending:
                 done, pending = wait(
@@ -332,13 +333,16 @@ def run_parallel_measurements(
                     partition = futures[future]
                     try:
                         result = future.result()
-                    except Exception:
+                    except Exception as exc:
+                        # Keep the other GPUs busy: the remaining partitions
+                        # still checkpoint, so a rerun only redoes this one.
                         console.print(
                             "[bold red]GPU measurement partition failed:[/bold red] "
                             f"{partition.component_id}/{partition.partition_id}"
                         )
                         console.print_exception(show_locals=False)
-                        raise
+                        failed.append((partition, exc))
+                        continue
                     if result.partition != partition:
                         raise RuntimeError(
                             "measurement worker returned the wrong partition"
@@ -367,6 +371,15 @@ def run_parallel_measurements(
                         f"{worker_completed[device_ordinal]} partitions · complete"
                     ),
                 )
+            if failed:
+                names = ", ".join(
+                    f"{partition.component_id}/{partition.partition_id}"
+                    for partition, _ in failed
+                )
+                raise RuntimeError(
+                    f"{len(failed)} GPU measurement partition(s) failed: {names}; "
+                    "rerun the same command to resume from the checkpoints"
+                ) from failed[0][1]
     except BaseException:
         stop_event.set()
         for future in futures:

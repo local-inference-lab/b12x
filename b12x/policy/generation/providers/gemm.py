@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass, replace
 import os
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -32,6 +31,15 @@ from b12x.policy.generation.sweep import (
     SweepMeasurement,
 )
 
+from .layer_stack import (
+    BF16_INPUT_RECIPES,
+    CONTEXT_LAYERS,
+    CONTEXT_MARGIN,
+    _confirm_winner,
+    _context_hidden,
+    _context_race,
+    _keep_race,
+)
 from .gpu_workers import (
     _bounded_repetitions,
     _cuda_event_samples_us,
@@ -1027,22 +1035,6 @@ def _graph_race(
 # GEMM, its weights stream cold like every layer's, its output feeds the next
 # kernel, and launches overlap as they do in a real step. The stack is sized
 # from the shape under test, not from any particular model.
-_CONTEXT_LAYERS = 3
-_CONTEXT_MARGIN = 0.02
-_BF16_INPUT_RECIPES = frozenset({"mxfp8", "tensor_fp8"})
-
-
-def _context_hidden(in_features: int, out_features: int) -> int:
-    """Hidden width of the synthetic layer around a (K, N) GEMM.
-
-    An up-like GEMM (K <= N) widens the hidden state, so H = K; a down-like
-    GEMM narrows it back, so H = N. Either way the stack keeps one square
-    H x H neighbour and one H <-> K/N neighbour, like attention-out + MLP.
-    """
-    hidden = in_features if in_features <= out_features else out_features
-    return max(256, -(-hidden // 128) * 128)
-
-
 class _LayerContext:
     """Generic transformer layers around the GEMM under test."""
 
@@ -1054,7 +1046,7 @@ class _LayerContext:
         out_features: int,
         device,
         generator,
-        layers: int = _CONTEXT_LAYERS,
+        layers: int = CONTEXT_LAYERS,
     ) -> None:
         import torch
 
@@ -1139,7 +1131,7 @@ class _LayerContext:
         )
         self.quant_sources = None
         self.quant_buffers = None
-        if self.recipe not in _BF16_INPUT_RECIPES:
+        if self.recipe not in BF16_INPUT_RECIPES:
             # A production quant kernel writes these right before the GEMM; a
             # copy from a fixed source leaves them equally L2-warm.
             self.quant_sources = [
@@ -1205,143 +1197,6 @@ class _LayerContext:
             )
             h = self._rmsnorm(h + b)
         return h
-
-
-def _context_race(*, context, plan, settings, device, flush):
-    """Time the tested op inside the captured layer stack.
-
-    Returns the per-layer in-place op time (the ranking score), the whole
-    stack replay time (secondary evidence), finiteness and the repetitions.
-    """
-    import torch
-
-    for _ in range(settings.warmup):
-        context.run(plan)
-    torch.cuda.synchronize(device)
-    events = [
-        (
-            torch.cuda.Event(enable_timing=True, external=True),
-            torch.cuda.Event(enable_timing=True, external=True),
-        )
-        for _ in range(context.layers)
-    ]
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = context.run(plan, events)
-    graph.replay()
-    torch.cuda.synchronize(device)
-    finite = bool(torch.isfinite(output).all().item())
-
-    def sample():
-        if flush is not None:
-            flush()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        torch.cuda.synchronize(device)
-        op_us = sum(a.elapsed_time(b) for a, b in events) * 1_000.0 / len(events)
-        return op_us, float(start.elapsed_time(end)) * 1_000.0
-
-    pilot_op, pilot_stack = sample()
-    repetitions = _bounded_repetitions(settings, pilot_us=pilot_stack)
-    samples = [sample() for _ in range(settings.groups * repetitions)]
-    op_latency = _median_of_group_medians(
-        tuple(item[0] for item in samples),
-        groups=settings.groups,
-        repetitions=repetitions,
-    )
-    stack_latency = _median_of_group_medians(
-        tuple(item[1] for item in samples),
-        groups=settings.groups,
-        repetitions=repetitions,
-    )
-    return _ContextRace(
-        op_us=op_latency,
-        stack_us=stack_latency,
-        finite=finite,
-        repetitions=repetitions,
-        sample=sample,
-        graph=graph,
-    )
-
-
-def _keep_race(races, candidate, race, baseline_config):
-    """Retain the graphs of the built-in plan and the running leader only."""
-    config = candidate.config.to_dict()
-    is_baseline = baseline_config is not None and config == baseline_config
-    leader = races.get("__leader__")
-    if leader is None or race.op_us < leader[1]:
-        old = leader[0] if leader else None
-        races["__leader__"] = (candidate.candidate_id, race.op_us)
-        races[candidate.candidate_id] = race
-        if old is not None and old != races.get("__baseline__"):
-            races.pop(old, None)
-    elif is_baseline:
-        races[candidate.candidate_id] = race
-    if is_baseline:
-        races["__baseline__"] = candidate.candidate_id
-
-
-@dataclass
-class _ContextRace:
-    op_us: float
-    stack_us: float
-    finite: bool
-    repetitions: int
-    sample: object
-    graph: object
-
-
-_CONFIRM_ROUNDS = 8
-
-
-def _confirm_winner(measurements, races, *, baseline_config):
-    """Re-time the leader and the built-in plan interleaved.
-
-    Two sweeps seconds apart can disagree by more than the margin; measuring
-    the two contenders alternately in one pass removes that drift before the
-    reducer applies the margin. Both latencies are replaced by the confirmed
-    medians; the first-pass values stay in the metrics.
-    """
-    import statistics
-
-    passing = [m for m in measurements if m.correct and m.latency_us is not None]
-    leader = races.get("__leader__")
-    if len(passing) < 2 or baseline_config is None or leader is None:
-        return measurements
-    best = next((m for m in passing if m.candidate.candidate_id == leader[0]), None)
-    baseline = next(
-        (m for m in passing if m.candidate.config.to_dict() == baseline_config), None
-    )
-    if best is None:
-        return measurements
-    if baseline is None or baseline is best:
-        return measurements
-    best_race = races.get(best.candidate.candidate_id)
-    base_race = races.get(baseline.candidate.candidate_id)
-    if best_race is None or base_race is None:
-        return measurements
-    best_samples, base_samples = [], []
-    for _ in range(_CONFIRM_ROUNDS):
-        best_samples.append(best_race.sample()[0])
-        base_samples.append(base_race.sample()[0])
-    confirmed = {
-        best.candidate.candidate_id: statistics.median(best_samples),
-        baseline.candidate.candidate_id: statistics.median(base_samples),
-    }
-    updated = []
-    for m in measurements:
-        value = confirmed.get(m.candidate.candidate_id)
-        if value is None:
-            updated.append(m)
-            continue
-        metrics = dict(m.metrics or {})
-        metrics["first_pass_us"] = m.latency_us
-        metrics["confirmed"] = True
-        updated.append(replace(m, latency_us=value, metrics=metrics))
-    return updated
 
 
 class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
@@ -1526,7 +1381,7 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                     if correct:
                         race = _context_race(
                             context=layers,
-                            plan=plan,
+                            slot=plan,
                             settings=settings,
                             device=device,
                             flush=flush,
@@ -1595,7 +1450,7 @@ class DenseLinearGenerator(DiscreteSweepGenerator):
             coverage={"corpus": "gemm_corpus.MODEL_LINEARS"},
             candidate_contract_version=3,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
-            baseline_margin=_CONTEXT_MARGIN,
+            baseline_margin=CONTEXT_MARGIN,
         )
 
     def baseline_config(self, case, context):
@@ -1669,7 +1524,7 @@ class _WoLayerContext:
         device,
         generator,
         seed: int,
-        layers: int = _CONTEXT_LAYERS,
+        layers: int = CONTEXT_LAYERS,
     ) -> None:
         import torch
 
@@ -1980,7 +1835,7 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                     if correct:
                         race = _context_race(
                             context=layers,
-                            plan=plan,
+                            slot=plan,
                             settings=settings,
                             device=device,
                             flush=flush,
@@ -2062,7 +1917,7 @@ class WoProjectionGenerator(DiscreteSweepGenerator):
             coverage={"corpus": "gemm_corpus.wo_projection_geometries"},
             candidate_contract_version=3,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
-            baseline_margin=_CONTEXT_MARGIN,
+            baseline_margin=CONTEXT_MARGIN,
         )
 
     def baseline_config(self, case, context):
