@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -292,16 +294,21 @@ def test_windowed_plans_scan_one_query_row_per_tile() -> None:
         )
         assert plan.query_tile == 1, mode
     layout = make_smem_layout(query_tile=2, fp8=False, qk_dim=576)
+    kernel_args = dict(
+        layout=layout,
+        page_size=64,
+        num_heads=8,
+        num_splits=4,
+        chunks_per_split=4,
+        query_tile=2,
+        fp8=False,
+        qk_dim=576,
+        value_dim=512,
+        window_size=WINDOW_SIZE,
+    )
+    # Range options the kernel may take besides the geometry above.
+    optional = {"single_split_chunks": 4}
+    accepted = inspect.signature(DenseMlaForwardKernel).parameters
+    kernel_args.update({k: v for k, v in optional.items() if k in accepted})
     with pytest.raises(ValueError, match="one query row per tile"):
-        DenseMlaForwardKernel(
-            layout=layout,
-            page_size=64,
-            num_heads=8,
-            num_splits=4,
-            chunks_per_split=4,
-            query_tile=2,
-            fp8=False,
-            qk_dim=576,
-            value_dim=512,
-            window_size=WINDOW_SIZE,
-        )
+        DenseMlaForwardKernel(**kernel_args)
