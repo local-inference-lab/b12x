@@ -79,7 +79,9 @@ class Caps:
     # Element type of the per-split partial outputs a multi-split launch
     # writes for the merge. bf16 halves the scratch; float32 keeps the split
     # partials exact, so a merged result is rounded once, like a one-split
-    # result, and the answer no longer depends on how the chunks were split.
+    # result. The split assignment still determines the online-softmax
+    # chains and the FP32 merge order, so multi-split results differ from a
+    # one-split result at the FP32 level.
     partial_dtype: torch.dtype = torch.bfloat16
     # A request whose scanned chunks number at most this many is scanned by
     # split 0 alone (the fixed-range association a plan-run kernel used, so the

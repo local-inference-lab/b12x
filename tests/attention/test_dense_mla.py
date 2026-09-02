@@ -682,10 +682,13 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         cu_seqlens_q=cu_seqlens_q,
         q_scale=q_scale,
         kv_scale=kv_scale,
-        # The balanced prefix: one split per live 64-token chunk.
+        # One launched split per live 64-token chunk. The five chunks fit
+        # the plan's single-split threshold (chunks_per_split = 22), so
+        # split 0 scans all of them and splits 1-4 publish empty partials.
         active_splits=5,
     )
     assert binding.active_splits == 5
+    assert plan.single_split_chunks == plan.chunks_per_split == 22
     dense_mla.compile(binding=binding)
     actual_output, actual_lse = dense_mla.run(binding=binding)
     torch.cuda.synchronize()
@@ -719,11 +722,10 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         expected_lse,
     )
 
-    # Split ranges are balanced over the launched splits: a prefix of
-    # min(num_splits, live chunks) splits partitions the live chunks exactly
-    # like the full-plan launch (one chunk per split here, the remaining
-    # full-plan splits empty), so the two must match including the BF16
-    # output bits.
+    # A prefix of min(num_splits, live chunks) launched splits assigns the
+    # live chunks exactly like the full-plan launch (here split 0 takes all
+    # five chunks under either launch and every other split stays empty),
+    # so the two must match including the BF16 output bits.
     full_output = torch.empty_like(output)
     full_binding = dense_mla.bind(
         plan,
@@ -742,6 +744,8 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(full_actual, captured_output, rtol=0, atol=0)
     torch.testing.assert_close(full_lse, captured_lse, rtol=0, atol=0)
+    finite_partials = torch.isfinite(full_binding.scratch.partial_lse[0]).sum(dim=-1)
+    assert int(finite_partials.max().item()) == 1
 
 
 @torch.inference_mode()
