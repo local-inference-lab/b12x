@@ -260,3 +260,48 @@ def test_fp8_page_offset_exceeds_signed_int32() -> None:
     torch.cuda.synchronize(device)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=2e-5, atol=2e-5)
+
+
+def test_windowed_plans_scan_one_query_row_per_tile() -> None:
+    """The windowed producer gathers the chunk range visible to the tile's
+    first query row, so a windowed tile must hold exactly one row: the
+    planner selects that geometry for every mode, and the kernel refuses a
+    wider tile."""
+    from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
+    from b12x.attention.dense_mla._layout import make_smem_layout
+
+    for mode, max_total_q in (("extend", 4), ("decode", 4), ("verify", 4)):
+        plan = dense_mla.plan(
+            dense_mla.Caps(
+                device="cpu",
+                mode=mode,
+                kv_dtype=FP8,
+                q_dtype=torch.bfloat16,
+                num_q_heads=8,
+                page_size=64,
+                max_total_q=max_total_q,
+                max_batch=1,
+                max_cache_tokens=1024,
+                max_page_table_width=16,
+                num_cache_pages=32,
+                head_dim=1088,
+                v_head_dim=1024,
+                physical_record_width=1088,
+                window_size=WINDOW_SIZE,
+            )
+        )
+        assert plan.query_tile == 1, mode
+    layout = make_smem_layout(query_tile=2, fp8=False, qk_dim=576)
+    with pytest.raises(ValueError, match="one query row per tile"):
+        DenseMlaForwardKernel(
+            layout=layout,
+            page_size=64,
+            num_heads=8,
+            num_splits=4,
+            chunks_per_split=4,
+            query_tile=2,
+            fp8=False,
+            qk_dim=576,
+            value_dim=512,
+            window_size=WINDOW_SIZE,
+        )

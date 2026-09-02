@@ -75,6 +75,16 @@ class DenseMlaForwardKernel:
         self.qk_dim = int(qk_dim)
         self.value_dim = int(value_dim)
         self.window_size = None if window_size is None else int(window_size)
+        # The windowed producer derives the gathered chunk range from the
+        # tile's first query row (see the range computation in the kernel);
+        # the later rows of a wider tile would see up to query_tile - 1 more
+        # tokens than that range covers. The planner keeps windowed plans at
+        # one row per tile; the kernel refuses anything else.
+        if self.window_size is not None and self.query_tile != 1:
+            raise ValueError(
+                "windowed dense MLA scans one query row per tile, got "
+                f"query_tile={self.query_tile}"
+            )
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -449,6 +459,8 @@ class DenseMlaForwardKernel:
         first_valid_chunk = Int32(0)
         visible_chunks_end = cache_length
         if cutlass.const_expr(self.window_size is not None):
+            # query_tile == 1 here (enforced at construction), so the tile's
+            # first row is its only row and this range is exact for it.
             tile_local_query = query_start - query_begin
             visible_chunks_end = (
                 cache_length - query_length + tile_local_query + Int32(1)
