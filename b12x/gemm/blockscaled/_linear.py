@@ -81,15 +81,32 @@ def _source_2d(source: torch.Tensor) -> torch.Tensor:
 _FUSED_QUANT_A_MAX_TOKENS = 8
 
 
+@functools.lru_cache(maxsize=1)
 def _fused_quant_a_max_n() -> int:
     """Widest N routed through the in-CTA activation quantization.
 
     B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N (default 4096): 0 keeps the
-    separate quantizer for every shape. The fused GEMM re-quantizes A in each
-    N tile and has no split-K, so above a few thousand columns the separate
-    quantizer plus split-K GEMM is faster on SM120 (measured at N = 7168).
+    separate quantizer for every shape. Every CTA of the fused GEMM
+    re-quantizes its A rows, so the quantization work grows with the number
+    of output tiles; beyond a few thousand columns that repeated work exceeds
+    the two scale fills and the row quantizer the fused path removes, and the
+    separate path stays faster. The value is process configuration: it is
+    read once and cached (``_fused_quant_a_max_n.cache_clear()`` re-reads
+    it), and it must be a non-negative integer.
     """
-    return int(os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096"))
+    raw = os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N must be an integer, "
+            f"got {raw!r}"
+        ) from exc
+    if limit < 0:
+        raise ValueError(
+            f"B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N must be >= 0, got {limit}"
+        )
+    return limit
 
 
 def _use_fused_quant_a(

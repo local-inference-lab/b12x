@@ -12,11 +12,11 @@ Bit identity holds when the separate path reduces split-K partials in FP32
 split-K accumulation is itself order-dependent, so the module constant is
 pinned before the GEMM module is imported.
 """
+from __future__ import annotations
+
 import os
 
-os.environ.setdefault("B12X_DENSE_SPLITK_TURBO", "0")
-
-from __future__ import annotations
+os.environ["B12X_DENSE_SPLITK_TURBO"] = "0"
 
 import pytest
 import torch
@@ -60,10 +60,12 @@ def test_fused_quant_a_matches_separate_quantizer(
     x = (torch.randn((m, k), generator=gen, device=device) * 0.5).to(torch.bfloat16)
 
     monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "0")
+    kernel_module._fused_quant_a_max_n.cache_clear()
     assert not kernel_module._use_fused_quant_a(m, x.dtype, k, k, n)
     separate = mxfp8_linear(x, packed).clone()
 
     monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", str(n))
+    kernel_module._fused_quant_a_max_n.cache_clear()
     assert kernel_module._use_fused_quant_a(m, x.dtype, k, k, n)
     fused = mxfp8_linear(x, packed).clone()
     torch.cuda.synchronize(device)
@@ -74,12 +76,14 @@ def test_fused_quant_a_matches_separate_quantizer(
     torch.cuda.synchronize(device)
 
     assert torch.isfinite(separate).all()
+    assert torch.count_nonzero(separate).item() > 0
     assert torch.equal(separate, fused)
     assert torch.equal(separate, captured)
 
 
 def test_fused_quant_a_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    kernel_module._fused_quant_a_max_n.cache_clear()
     use = kernel_module._use_fused_quant_a
     assert use(8, torch.bfloat16, 7168, 7168, 4096)
     # More than eight tokens, FP16 activations, padded K or a wider N stay on
@@ -92,4 +96,17 @@ def test_fused_quant_a_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not use(8, torch.bfloat16, 7168, 7168, 132)
     assert not use(8, torch.bfloat16, 7168, 7168, 32)
     monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "0")
+    kernel_module._fused_quant_a_max_n.cache_clear()
     assert not use(1, torch.bfloat16, 7168, 7168, 64)
+    # The limit is process configuration: it is read once, and it must be a
+    # non-negative integer.
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    assert not use(1, torch.bfloat16, 7168, 7168, 64)
+    kernel_module._fused_quant_a_max_n.cache_clear()
+    assert use(1, torch.bfloat16, 7168, 7168, 64)
+    for bad in ("-1", "many"):
+        monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", bad)
+        kernel_module._fused_quant_a_max_n.cache_clear()
+        with pytest.raises(ValueError, match="B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N"):
+            use(1, torch.bfloat16, 7168, 7168, 64)
+    kernel_module._fused_quant_a_max_n.cache_clear()
