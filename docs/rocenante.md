@@ -2,7 +2,15 @@
 
 `b12x.comm.roce` (RoCEnante) is an all-reduce and all-gather runtime for tensor
 parallelism across DGX Spark nodes joined by their ConnectX-7 200 GbE ports, one
-GPU per node. It replaces NCCL on the decode path.
+GPU per node. It is a runtime API: a serving integration routes eligible
+collectives to it and keeps everything else on its own backend. The vLLM adapter
+in local-inference-lab/vllm#597 (`vllm/distributed/device_communicators/b12x_roce_all_reduce.py`,
+base branch `dev/jovian-judgement`) does that for decode, which takes NCCL out of
+the decode path for the models measured below.
+
+Status: implemented and qualified on four DGX Spark (GB10, `sm121a`) nodes with
+the tests and receipts named in this page. Other GPUs, hosts with GPUDirect RDMA,
+and integrations other than that adapter are unsupported.
 
 ## Why it works on GB10 without GPUDirect RDMA
 
@@ -28,9 +36,10 @@ and a control record. One kernel launch per collective:
    payload. The doorbell holds only the newest `seq`, and a rank's kernel for
    op N finishes on the peers' payloads alone, so op N+1 can ring before the
    proxy has seen op N; the proxy posts every sequence between the last one it
-   posted and the doorbell (at most two are ever pending). After a few
-   milliseconds without a doorbell the thread sleeps 20 us between polls so an
-   idle runtime does not hold a core;
+   posted and the doorbell (at most two are ever pending). After a run of polls
+   without a doorbell the thread requests a short sleep between polls (the OS
+   decides the actual delay) so an idle runtime does not hold a core; the
+   catch-up keeps the protocol correct however long the thread is away;
 3. wait on `flag[peer][seq & 1] == seq` for every peer (bounded; a timeout
    records the missing peer and the host raises instead of hanging);
 4. all-reduce: sum the local input and every peer slot in fixed rank order, so
@@ -60,7 +69,16 @@ Environment: `B12X_ROCE_HCA` (falls back to `NCCL_IB_HCA`), `B12X_ROCE_GID_INDEX
 Constraints: 2 to 16 ranks, one collective in flight per runtime (single stream),
 integrated GPU with unified addressing, active RDMA devices.
 
-## Results (four DGX Spark, bf16, median of the slowest rank)
+## Results
+
+Measured configuration: four DGX Spark GB10 nodes (`sm121a`, one GPU each,
+unified memory), both ConnectX-7 functions per node, RoCE v2 GID index 3, bf16,
+world size 4. Timing is CUDA events around one call, median over samples per
+rank, then the slowest rank; graph replay is the decode path. The receipt
+`docs/evidence/rocenante/20260902-4spark-bf16-standalone.json` (emitted by
+`benchmarks/benchmark_roce_oneshot.py`) holds the command, source revision,
+worktree state, per-rank GPU identity, correctness results, raw samples, the
+executed arm order, and ratios with their direction.
 
 | Collective | NCCL | RoCEnante, graph replay |
 |---|---|---|
@@ -69,18 +87,27 @@ integrated GPU with unified addressing, active RDMA devices.
 | all-gather [6, 38720] logits shard | 331 us (incl. reshape copy) | 96 us |
 | all-gather [96, 38720] | 1491 us | 1493 us |
 
-Serving GLM-5.3-Flash (TP4, MTP5) with the vLLM shim: per-step decode latency
-lower in every cell of a 15-cell matrix (5 to 19%), c=16 throughput +15 to +23%,
-coding-peak c=1 +12.7%, prefill unchanged (its 64 MB all-reduces stay on NCCL).
-With both collectives routed, a decode-step profile shows zero NCCL kernels.
+Serving A/B, GLM-5.3-Flash TP4 with MTP5 on the same four nodes through the vLLM
+adapter, RoCEnante versus NCCL for the same image and configuration
+(`docs/evidence/rocenante/serving-ab-20260902/`: per-arm decode and prefill
+result JSON from `llm_decode_bench.py`, the arm comparison tables, and the README
+that names the image, compose overrides, and commands): per-step decode latency
+lower in every cell of a 15-cell concurrency-by-context matrix (5 to 19%), c=16
+throughput +15 to +23%, coding-peak c=1 +12.7%, prefill unchanged (its 64 MB
+all-reduces stay above the size cap and remain on NCCL). With both collectives
+routed, a decode-step profile shows zero NCCL kernels.
 
 ## vLLM integration
 
-A thin adapter (`b12x_roce_all_reduce.py`, about 180 lines with the communicator
-hooks and env vars) dispatches eligible all-reduces and all-gathers to the
-runtime; enable with `VLLM_ENABLE_ROCE_ALLREDUCE=1`, bound with
+The adapter lives in the vLLM fork, local-inference-lab/vllm#597 on
+`dev/jovian-judgement` (`vllm/distributed/device_communicators/b12x_roce_all_reduce.py`
+plus hooks in `cuda_communicator.py` and three entries in `envs.py`, about 180
+lines). It dispatches eligible all-reduces and all-gathers to the runtime;
+enable with `VLLM_ENABLE_ROCE_ALLREDUCE=1`, bound with
 `VLLM_ROCE_ALLREDUCE_MAX_SIZE` (2MB) and `VLLM_ROCE_ALLGATHER_MAX_SIZE` (16MB).
 The backend appears as `B12X_ROCENANTE` in the communicator's dispatch list.
+Status: qualified with the serving A/B above against that fork revision; the
+adapter is supported once #597 merges, and no other integration is.
 
 ## Tests and benchmark
 
@@ -89,7 +116,9 @@ bit-identical ranks, dtype/shape eligibility, dim-0/last-dim/unaligned gathers,
 CUDA-graph replay mixing both collectives. `benchmarks/benchmark_roce_oneshot.py`
 times both collectives against NCCL.
 
-## Not yet
+## Unsupported
 
 Fused all-reduce + residual + RMSNorm (the PCIe runtime has it), all-to-all for
-expert parallelism, GPU-initiated posting (needs GDR support the platform lacks).
+expert parallelism, GPU-initiated posting (needs GDR support the platform lacks),
+more than one collective in flight per runtime, and hosts without an integrated
+GPU or without active RDMA devices (`is_supported()` returns False there).

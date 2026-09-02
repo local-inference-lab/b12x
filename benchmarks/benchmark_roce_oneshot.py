@@ -1,14 +1,22 @@
-"""Latency of the RoCE one-shot all-reduce versus torch.distributed (NCCL).
+"""Latency of the RoCEnante collectives versus torch.distributed (NCCL), with a receipt.
 
 Launch with torchrun on every node (one GPU per node)::
 
     torchrun --nnodes=4 --nproc-per-node=1 --node-rank=$RANK \\
         --master-addr=$MASTER --master-port=29651 \\
-        benchmarks/benchmark_roce_oneshot.py --output roce.json
+        benchmarks/benchmark_roce_oneshot.py --output docs/evidence/rocenante/<receipt>.json
 
-Rank 0 prints a table and writes one JSON document with per-size medians of
-the slowest rank (CUDA-event timing around one call, graph replay timing for
-the captured variant), plus a correctness check against NCCL.
+Correctness gates run before any timing: the RoCEnante all-reduce must match
+NCCL within the dtype tolerance and the all-gather must be bit-exact, or the
+benchmark raises.  Both are checked again after timing.  Timing alternates the
+NCCL, RoCEnante eager and RoCEnante graph-replay arms in blocks so clock or
+thermal drift cannot bias one direction, and the executed order is recorded.
+
+Rank 0 prints a table and writes one JSON receipt (schema
+``b12x.comm.roce.oneshot.benchmark`` version 2) with the command, source
+revision and worktree state, per-rank hostname and GPU identity, correctness
+results, unrounded raw samples from rank 0, per-rank medians, the cross-rank
+median-of-slowest summary, and ratios labelled with their direction.
 """
 
 from __future__ import annotations
@@ -17,25 +25,74 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
+import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
-
-def _median_of_max(values: list[float]) -> float:
-    t = torch.tensor([statistics.median(values)], device="cuda")
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return float(t.item())
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _time_eager(fn, warmups: int, samples: int) -> list[float]:
+def _git(*args: str) -> str:
+    """Run ``git`` in the repository, returning stdout or ``""`` when unavailable."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, check=False
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _gpu_identity() -> dict[str, object]:
+    """Physical GPU identity and mode for the receipt (torch plus best-effort nvidia-smi)."""
+    props = torch.cuda.get_device_properties(0)
+    info: dict[str, object] = {
+        "name": props.name,
+        "uuid": str(getattr(props, "uuid", "")),
+        "compute_capability": f"{props.major}.{props.minor}",
+        "multi_processor_count": props.multi_processor_count,
+        "total_memory_bytes": props.total_memory,
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+    }
+    fields = "driver_version,pstate,clocks.sm,clocks.mem,power.limit,persistence_mode,compute_mode"
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False,
+        ).stdout.strip()
+        if smi:
+            info["nvidia_smi"] = dict(zip(fields.split(","), [v.strip() for v in smi.split(",")], strict=False))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return info
+
+
+def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
+    """(rtol, atol) for a ``world``-way sum in ``dtype`` with float32 accumulation."""
+    if dtype == torch.float32:
+        return 1e-5, 1e-5 * world
+    if dtype == torch.bfloat16:
+        return 1e-2, 2e-2 * world
+    return 2e-3, 4e-3 * world
+
+
+def _time_eager(fn: Callable[[], object], warmups: int, samples: int, prep: Callable[[], object] | None = None) -> list[float]:
+    """Time ``samples`` calls of ``fn`` in microseconds with CUDA events; ``prep`` runs untimed before each."""
     for _ in range(warmups):
+        if prep is not None:
+            prep()
         fn()
     torch.cuda.synchronize()
     dist.barrier()
     out = []
     for _ in range(samples):
+        if prep is not None:
+            prep()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -46,7 +103,8 @@ def _time_eager(fn, warmups: int, samples: int) -> list[float]:
     return out
 
 
-def _time_graph(fn, warmups: int, samples: int, per_graph: int) -> list[float]:
+def _capture_graph(fn: Callable[[], object], warmups: int, per_graph: int) -> torch.cuda.CUDAGraph:
+    """Warm ``fn`` on a side stream, then capture ``per_graph`` calls into one graph."""
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -61,31 +119,57 @@ def _time_graph(fn, warmups: int, samples: int, per_graph: int) -> list[float]:
             fn()
     torch.cuda.synchronize()
     dist.barrier()
-    for _ in range(warmups):
-        graph.replay()
-    torch.cuda.synchronize()
-    dist.barrier()
-    out = []
-    for _ in range(samples):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        out.append(start.elapsed_time(end) * 1000.0 / per_graph)
-    return out
+    return graph
+
+
+Arm = tuple[Callable[[], object], Callable[[], object] | None, int]
+
+
+def _time_arms(arms: dict[str, Arm], warmups: int, samples: int, blocks: int) -> tuple[dict[str, list[float]], list[str]]:
+    """Time every arm in ``blocks`` interleaved blocks, reversing the arm order on odd blocks.
+
+    An arm is ``(fn, prep, ops_per_call)``; samples are divided by ``ops_per_call``
+    so a graph that replays several collectives reports per-collective time.
+    Returns the raw samples per arm and the executed order.
+    """
+    per_block = max(1, samples // blocks)
+    raw: dict[str, list[float]] = {name: [] for name in arms}
+    order: list[str] = []
+    names = list(arms)
+    for block in range(blocks):
+        for name in names if block % 2 == 0 else names[::-1]:
+            fn, prep, ops = arms[name]
+            block_warmups = warmups if block == 0 else min(warmups, 5)
+            raw[name].extend(v / ops for v in _time_eager(fn, block_warmups, per_block, prep))
+            order.append(name)
+    return raw, order
+
+
+def _summarize(raw: dict[str, list[float]], world: int) -> dict[str, object]:
+    """Per-arm local median, per-rank medians, and the cross-rank median of the slowest rank."""
+    local = {name: statistics.median(v) for name, v in raw.items()}
+    per_rank: list[dict[str, float]] = [{} for _ in range(world)]
+    dist.all_gather_object(per_rank, local)
+    summary: dict[str, object] = {}
+    for name in raw:
+        medians = [r[name] for r in per_rank]
+        summary[f"{name}_us"] = round(max(medians), 1)
+        summary[f"{name}_per_rank_median_us"] = [round(m, 2) for m in medians]
+    summary["raw_samples_rank0_us"] = raw
+    return summary
 
 
 def main() -> None:
+    """Entry point: correctness gates, interleaved timing, table, receipt."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", default="8192,32768,49152,262144,786432,1048576")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--warmups", type=int, default=50)
     ap.add_argument("--samples", type=int, default=300)
+    ap.add_argument("--blocks", type=int, default=4, help="interleaved timing blocks per size")
     ap.add_argument("--graph-ops", type=int, default=20)
     ap.add_argument("--max-size", type=int, default=2 << 20)
-    ap.add_argument("--gather-rows", default="6,16,96", help="rows of a [rows, 38720] bf16 logits shard to all-gather")
+    ap.add_argument("--gather-rows", default="6,16,96", help="rows of a [rows, 38720] logits shard to all-gather")
     ap.add_argument("--output", default="")
     args = ap.parse_args()
 
@@ -94,6 +178,7 @@ def main() -> None:
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     dtype = getattr(torch, args.dtype)
+    rtol, atol = _tolerance(dtype, world)
 
     from b12x.comm import roce
 
@@ -102,11 +187,17 @@ def main() -> None:
     )
     runtime.prepare((dtype,))
     sizes = [int(s) for s in args.sizes.split(",") if int(s) <= args.max_size]
+
     def progress(msg: str) -> None:
         if rank == 0:
             print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+    identities: list[dict[str, object]] = [{} for _ in range(world)]
+    dist.all_gather_object(
+        identities, {"rank": rank, "hostname": os.uname().nodename, "gpu": _gpu_identity()}
+    )
     progress(f"runtime ready: {runtime.stats()}")
+
     rows = []
     for nbytes in sizes:
         progress(f"size {nbytes}: correctness")
@@ -118,72 +209,129 @@ def main() -> None:
         dist.all_reduce(expected)
         runtime.all_reduce(inp, out=out)
         torch.cuda.synchronize()
+        # Oracle before timing: a mismatch stops the run.
+        torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
         err = (out.float() - expected.float()).abs().max().item()
         scale = expected.float().abs().max().item() or 1.0
         nccl_in = inp.clone()
-        progress(f"size {nbytes}: nccl timing")
-        nccl = _time_eager(lambda: dist.all_reduce(nccl_in), args.warmups, args.samples)
-        progress(f"size {nbytes}: roce eager timing")
-        eager = _time_eager(lambda: runtime.all_reduce(inp, out=out), args.warmups, args.samples)
+        progress(f"size {nbytes}: timing (interleaved)")
+        graph = _capture_graph(lambda: runtime.all_reduce(inp, out=out), args.warmups, args.graph_ops)
+        arms: dict[str, Arm] = {
+            # NCCL reduces in place; reset the input untimed before every call
+            # so the operands stay finite and equal to the RoCEnante operands.
+            "nccl": (lambda: dist.all_reduce(nccl_in), lambda: nccl_in.copy_(inp), 1),
+            "roce_eager": (lambda: runtime.all_reduce(inp, out=out), None, 1),
+            "roce_graph": (graph.replay, None, args.graph_ops),
+        }
+        raw, order = _time_arms(arms, args.warmups, args.samples, args.blocks)
         runtime.check_health()
-        progress(f"size {nbytes}: roce graph timing")
-        graph = _time_graph(
-            lambda: runtime.all_reduce(inp, out=out), args.warmups, args.samples, args.graph_ops
-        )
-        runtime.check_health()
-        row = {
-            "bytes": nbytes,
-            "nccl_us": round(_median_of_max(nccl), 1),
-            "roce_eager_us": round(_median_of_max(eager), 1),
-            "roce_graph_us": round(_median_of_max(graph), 1),
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
+        row: dict[str, object] = {"bytes": nbytes, "order": order}
+        row.update(_summarize(raw, world))
+        row["ratio_nccl_over_roce_eager"] = round(row["nccl_us"] / row["roce_eager_us"], 3)
+        row["ratio_nccl_over_roce_graph"] = round(row["nccl_us"] / row["roce_graph_us"], 3)
+        row["correctness"] = {
             "max_abs_err": err,
             "rel_err": err / scale,
+            "rtol": rtol,
+            "atol": atol,
+            "passed_before_timing": True,
+            "passed_after_timing": True,
         }
         rows.append(row)
         if rank == 0:
             print(
                 f"{nbytes:>9} B  nccl {row['nccl_us']:>8.1f} us  roce eager {row['roce_eager_us']:>8.1f} us"
-                f"  roce graph {row['roce_graph_us']:>8.1f} us  rel_err {row['rel_err']:.2e}",
+                f"  roce graph {row['roce_graph_us']:>8.1f} us  rel_err {err / scale:.2e}",
                 flush=True,
             )
+
     # all-gather of a logits shard [rows, 38720] along the last dim vs NCCL all_gather_into_tensor + copy
     gather_rows = []
-    for rows in (int(r) for r in args.gather_rows.split(",")):
-        shard = torch.randn(rows, 38720, dtype=dtype, device=device)
+    for gather_row_count in (int(r) for r in args.gather_rows.split(",")):
+        shard = torch.randn(gather_row_count, 38720, dtype=dtype, device=device)
         if not runtime.should_all_gather(shard, -1):
             continue
+        progress(f"all-gather [{gather_row_count}, 38720]: correctness")
         parts = [torch.empty_like(shard) for _ in range(world)]
         dist.all_gather(parts, shard)
         expected = torch.cat(parts, dim=-1)
-        got = runtime.all_gather(shard, dim=-1)
+        got = torch.empty_like(expected)
+        runtime.all_gather(shard, dim=-1, out=got)
         torch.cuda.synchronize()
-        exact = bool(torch.equal(got, expected))
-        stacked = torch.empty((world * rows, 38720), dtype=dtype, device=device)
-        def nccl_gather():
+        if not torch.equal(got, expected):
+            raise RuntimeError(f"RoCE all-gather [{gather_row_count}, 38720] is not bit-exact against NCCL")
+        stacked = torch.empty((world * gather_row_count, 38720), dtype=dtype, device=device)
+
+        def nccl_gather(stacked: torch.Tensor = stacked, shard: torch.Tensor = shard, n: int = gather_row_count) -> torch.Tensor:
             dist.all_gather_into_tensor(stacked, shard)
-            return stacked.reshape(world, rows, 38720).movedim(0, 1).reshape(rows, world * 38720)
-        nccl = _time_eager(nccl_gather, args.warmups, args.samples)
-        eager = _time_eager(lambda: runtime.all_gather(shard, dim=-1), args.warmups, args.samples)
-        graph = _time_graph(lambda: runtime.all_gather(shard, dim=-1, out=got), args.warmups, args.samples, args.graph_ops)
-        row = {"rows": rows, "shard_bytes": shard.numel() * shard.element_size(), "nccl_us": round(_median_of_max(nccl), 1),
-               "roce_eager_us": round(_median_of_max(eager), 1), "roce_graph_us": round(_median_of_max(graph), 1), "exact": exact}
+            return stacked.reshape(world, n, 38720).movedim(0, 1).reshape(n, world * 38720)
+
+        progress(f"all-gather [{gather_row_count}, 38720]: timing (interleaved)")
+        graph = _capture_graph(lambda: runtime.all_gather(shard, dim=-1, out=got), args.warmups, args.graph_ops)
+        arms = {
+            "nccl": (nccl_gather, None, 1),
+            "roce_eager": (lambda: runtime.all_gather(shard, dim=-1, out=got), None, 1),
+            "roce_graph": (graph.replay, None, args.graph_ops),
+        }
+        raw, order = _time_arms(arms, args.warmups, args.samples, args.blocks)
+        runtime.check_health()
+        torch.cuda.synchronize()
+        exact_after = bool(torch.equal(got, expected))
+        if not exact_after:
+            raise RuntimeError(f"RoCE all-gather [{gather_row_count}, 38720] diverged from NCCL during timing")
+        row = {
+            "rows": gather_row_count,
+            "shard_bytes": shard.numel() * shard.element_size(),
+            "order": order,
+        }
+        row.update(_summarize(raw, world))
+        row["ratio_nccl_over_roce_eager"] = round(row["nccl_us"] / row["roce_eager_us"], 3)
+        row["ratio_nccl_over_roce_graph"] = round(row["nccl_us"] / row["roce_graph_us"], 3)
+        row["correctness"] = {"exact_before_timing": True, "exact_after_timing": exact_after}
         gather_rows.append(row)
         if rank == 0:
-            print(f"all-gather [{rows}, 38720]  nccl+copy {row['nccl_us']:>8.1f} us  roce eager {row['roce_eager_us']:>8.1f} us  roce graph {row['roce_graph_us']:>8.1f} us  exact={exact}", flush=True)
+            print(
+                f"all-gather [{gather_row_count}, 38720]  nccl+copy {row['nccl_us']:>8.1f} us"
+                f"  roce eager {row['roce_eager_us']:>8.1f} us  roce graph {row['roce_graph_us']:>8.1f} us  exact=True",
+                flush=True,
+            )
+
     stats = runtime.stats()
     if rank == 0:
+        status = _git("status", "--porcelain")
         doc = {
             "schema": "b12x.comm.roce.oneshot.benchmark",
-            "version": 1,
+            "version": 2,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "command": " ".join([sys.executable, *sys.argv]),
+            "launcher_env": {k: os.environ.get(k, "") for k in ("WORLD_SIZE", "MASTER_ADDR", "NCCL_IB_HCA", "NCCL_IB_GID_INDEX", "B12X_ROCE_HCA", "B12X_ROCE_GID_INDEX")},
+            "benchmark_path": str(Path(__file__).resolve().relative_to(REPO_ROOT)),
+            "source_revision": _git("rev-parse", "HEAD"),
+            "worktree": str(REPO_ROOT),
+            "worktree_dirty": bool(status),
+            "git_status": status.splitlines()[:40],
             "world_size": world,
             "dtype": args.dtype,
-            "hostname": os.uname().nodename,
+            "ranks": identities,
             "runtime": stats,
+            "measurement": {
+                "warmups": args.warmups,
+                "samples": args.samples,
+                "blocks": args.blocks,
+                "graph_ops": args.graph_ops,
+                "timing": "CUDA events around one call on the caller's stream; the graph arm replays graph_ops collectives per call and reports per-collective time",
+                "summary": "*_us is the median over a rank's samples, then the maximum over ranks (slowest rank)",
+                "ratio_direction": "ratio_nccl_over_roce_* = nccl_us / roce_*_us; above 1 means RoCEnante is faster",
+                "ordering": "arms run in interleaved blocks, order reversed on odd blocks; the executed order is recorded per row",
+                "target_path": "RoceOneshotAllReduce.all_reduce / all_gather, the entry points the vLLM adapter dispatches to; graph replay is the decode path",
+            },
             "rows": rows,
             "all_gather": gather_rows,
         }
         if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             with open(args.output, "w") as f:
                 json.dump(doc, f, indent=2)
             print(f"wrote {args.output}")

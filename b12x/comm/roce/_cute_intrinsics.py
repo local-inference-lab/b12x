@@ -18,6 +18,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def _asm(result_type, operands, text, constraints, *, side_effects=True, loc=None, ip=None):
+    """Emit one inline PTX statement through the CuTe DSL and return its result."""
     return llvm.inline_asm(
         result_type,
         operands,
@@ -33,6 +34,7 @@ def _asm(result_type, operands, text, constraints, *, side_effects=True, loc=Non
 
 @dsl_user_op
 def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
+    """GPU-scope relaxed 32-bit load."""
     return Uint32(
         _asm(
             T.i32(),
@@ -47,6 +49,7 @@ def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def atomic_add_relaxed_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
+    """GPU-scope relaxed atomic add; returns the prior value."""
     return Uint32(
         _asm(
             T.i32(),
@@ -61,6 +64,7 @@ def atomic_add_relaxed_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None)
 
 @dsl_user_op
 def st_release_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+    """GPU-scope release 32-bit store."""
     _asm(
         None,
         [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip)],
@@ -73,6 +77,7 @@ def st_release_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None
 
 @dsl_user_op
 def st_relaxed_sys_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+    """System-scope relaxed 32-bit store, visible to the host and the NIC."""
     _asm(
         None,
         [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip)],
@@ -85,11 +90,13 @@ def st_relaxed_sys_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> None
 
 @dsl_user_op
 def fence_sc_sys(*, loc=None, ip=None) -> None:
+    """Sequentially consistent system-scope fence."""
     _asm(None, [], "fence.sc.sys;", "", loc=loc, ip=ip)
 
 
 @dsl_user_op
 def fence_sc_gpu(*, loc=None, ip=None) -> None:
+    """Sequentially consistent GPU-scope fence."""
     _asm(None, [], "fence.sc.gpu;", "", loc=loc, ip=ip)
 
 
@@ -154,6 +161,7 @@ def ld_relaxed_sys_v4_u32(
 
 @dsl_user_op
 def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Plain global 16-byte load as four 32-bit words."""
     result = _asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
         [Int64(addr).ir_value(loc=loc, ip=ip)],
@@ -171,6 +179,7 @@ def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32,
 def st_global_v4_u32(
     addr: Int64, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, *, loc=None, ip=None
 ) -> None:
+    """Plain global 16-byte store of four 32-bit words."""
     _asm(
         None,
         [
@@ -189,6 +198,7 @@ def st_global_v4_u32(
 
 @dsl_user_op
 def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
+    """Reinterpret the bits of a 32-bit word as float32."""
     return Float32(
         _asm(
             T.f32(),
@@ -204,6 +214,7 @@ def u32_as_f32(value: Uint32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def f32_as_u32(value: Float32, *, loc=None, ip=None) -> Uint32:
+    """Reinterpret the bits of a float32 as a 32-bit word."""
     return Uint32(
         _asm(
             T.i32(),
@@ -219,6 +230,7 @@ def f32_as_u32(value: Float32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def unpack_bf16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Split a packed bf16 pair into two float32 values, low half first."""
     result = _asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(value).ir_value(loc=loc, ip=ip)],
@@ -243,6 +255,7 @@ def unpack_bf16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32
 
 @dsl_user_op
 def unpack_f16x2(value: Uint32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Split a packed fp16 pair into two float32 values, low half first."""
     result = _asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(value).ir_value(loc=loc, ip=ip)],
@@ -290,6 +303,7 @@ def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint
 
 @dsl_user_op
 def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
+    """Round two float32 values into a packed fp16 pair with ``lo`` in the low half."""
     return Uint32(
         _asm(
             T.i32(),
