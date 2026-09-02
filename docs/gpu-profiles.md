@@ -258,16 +258,18 @@ qualify itself. A case whose every candidate raises or fails the gate is skipped
 and listed under the component's `coverage.skipped_cases`; its query points
 inherit the neighbouring measured plans.
 
-`gemm.dense_linear` candidates are ranked inside a generic three-layer
-transformer-like stack sized from the shape under test (an H x K neighbour
-before, an N x H neighbour after, residual and RMSNorm between layers, with
-H taken from the narrower side of the GEMM). The tested GEMM therefore sees an
-L2-warm activation, cold streamed weights, and real launch overlap, which a
-lone kernel behind an L2 flush does not reproduce; the isolated latency is kept
-in the measurement metrics as evidence only. Both GEMM components reduce with a
-baseline margin (1% of the stack time for dense, 3% of the chain time for WO):
-the built-in plan keeps a query point unless a measured candidate beats it by
-more than that, so the embedded profile only carries deliberate wins.
+`gemm.dense_linear` and `gemm.wo_projection` candidates are ranked inside a
+generic three-layer transformer-like stack sized from the shape under test (an
+H x K neighbour before, an N x H neighbour after, residual and RMSNorm between
+layers, with H taken from the narrower side of the GEMM). The tested op
+therefore sees an L2-warm activation, cold streamed weights, and real launch
+overlap, which a lone kernel behind an L2 flush does not reproduce. The score
+is the op's own device time in place, read from timing events recorded inside
+the captured graph around the tested slot; the whole-stack replay time and the
+isolated latency stay in the measurement metrics as evidence. The leader and
+the built-in plan are then re-timed alternately in one confirmation pass, and
+the reducer keeps the built-in plan unless the confirmed leader beats it by
+more than 2%, so the embedded profile only carries deliberate wins.
 
 A candidate kernel that poisons the CUDA context (illegal address, launch
 failure) ends the generating process. The work directory keeps an in-flight
