@@ -37,14 +37,40 @@ import torch.distributed as dist
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _git(*args: str) -> str:
-    """Run ``git`` in the repository, returning stdout or ``""`` when unavailable."""
+def _git(*args: str) -> str | None:
+    """Run ``git`` in the repository; ``None`` when git is unavailable."""
     try:
         return subprocess.run(
             ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, check=False
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return None
+
+
+def _source_state() -> dict[str, object]:
+    """Source revision and worktree state for the receipt.
+
+    Uses git when present.  A container without git can receive the launcher's
+    values through ``B12X_BENCH_GIT_REV`` and ``B12X_BENCH_GIT_STATUS`` (the
+    output of ``git status --porcelain`` on the host); failing both, the
+    revision is read from ``.git/HEAD`` and the worktree state is unknown.
+    """
+    rev = _git("rev-parse", "HEAD")
+    status = _git("status", "--porcelain")
+    if rev is not None and status is not None:
+        return {"source_revision": rev, "worktree_dirty": bool(status), "git_status": status.splitlines()[:40], "source_state_from": "git"}
+    env_rev = os.environ.get("B12X_BENCH_GIT_REV", "")
+    if env_rev and "B12X_BENCH_GIT_STATUS" in os.environ:
+        status = os.environ["B12X_BENCH_GIT_STATUS"]
+        return {"source_revision": env_rev, "worktree_dirty": bool(status.strip()), "git_status": status.splitlines()[:40], "source_state_from": "launcher environment (B12X_BENCH_GIT_REV, B12X_BENCH_GIT_STATUS)"}
+    head = ""
+    try:
+        head = (REPO_ROOT / ".git" / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            head = (REPO_ROOT / ".git" / head[5:]).read_text().strip()
+    except OSError:
+        pass
+    return {"source_revision": head, "worktree_dirty": None, "git_status": ["unknown: git unavailable"], "source_state_from": ".git/HEAD"}
 
 
 def _gpu_identity() -> dict[str, object]:
@@ -300,7 +326,6 @@ def main() -> None:
 
     stats = runtime.stats()
     if rank == 0:
-        status = _git("status", "--porcelain")
         doc = {
             "schema": "b12x.comm.roce.oneshot.benchmark",
             "version": 2,
@@ -308,10 +333,8 @@ def main() -> None:
             "command": " ".join([sys.executable, *sys.argv]),
             "launcher_env": {k: os.environ.get(k, "") for k in ("WORLD_SIZE", "MASTER_ADDR", "NCCL_IB_HCA", "NCCL_IB_GID_INDEX", "B12X_ROCE_HCA", "B12X_ROCE_GID_INDEX")},
             "benchmark_path": str(Path(__file__).resolve().relative_to(REPO_ROOT)),
-            "source_revision": _git("rev-parse", "HEAD"),
+            **_source_state(),
             "worktree": str(REPO_ROOT),
-            "worktree_dirty": bool(status),
-            "git_status": status.splitlines()[:40],
             "world_size": world,
             "dtype": args.dtype,
             "ranks": identities,
