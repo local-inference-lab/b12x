@@ -161,6 +161,7 @@ def test_direct_table_matches_modal_table_bitwise(
     direct_eager, direct_graph = _run(x, prepared, topk_weights, topk_ids, expert_map)
 
     assert torch.isfinite(modal_eager).all()
+    assert torch.count_nonzero(modal_eager).item() > 0
     assert torch.equal(modal_eager, direct_eager)
     assert torch.equal(modal_graph, direct_graph)
     assert torch.equal(modal_eager, modal_graph)
@@ -169,13 +170,21 @@ def test_direct_table_matches_modal_table_bitwise(
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 def test_direct_table_is_part_of_the_compiled_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compiling with the flag on yields a launch that staged the 64 KiB table
-    (and needs the matching rate slice); compiling with it off does not."""
+    (and needs the matching rate slice) and whose shared-memory footprint grew
+    by that table; compiling with it off does not."""
     staged = {}
     for flag in ("0", "1"):
         monkeypatch.setenv(FLAG, flag)
         launch = compile_w4a16_fused_moe(**_compile_common(bits=2))
-        staged[flag] = bool(launch.sqg_xor_cheb_t12_direct_smem)
-    assert staged == {"0": False, "1": True}
+        staged[flag] = (
+            bool(launch.sqg_xor_cheb_t12_direct_smem),
+            int(launch.shared_memory_bytes),
+        )
+    assert staged["0"][0] is False
+    assert staged["1"][0] is True
+    direct_table_bytes = 1 << 16
+    assert staged["1"][1] >= direct_table_bytes
+    assert staged["1"][1] - staged["0"][1] >= direct_table_bytes - 4096
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
