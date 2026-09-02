@@ -45,6 +45,8 @@ DENSE_LINEAR_SPLIT_K = (0, 1, 2, 4)
 _FP4_RECIPES = frozenset({"nvfp4", "mxfp4"})
 _SWAP_RECIPES = frozenset({"nvfp4", "mxfp8"})
 _CPASYNC_RECIPES = frozenset({"nvfp4"})
+# The cp.async NVFP4 path faults on deeper K (observed at K=16384).
+CPASYNC_MAX_K = 8192
 _TILE_K_RECIPES = frozenset({"nvfp4", "mxfp8"})
 _SPLIT_K_RECIPES = frozenset({"mxfp8", "block_fp8"})
 _DEFAULT_SM_COUNT = 48
@@ -202,6 +204,8 @@ def _validate(
         raise ValueError(f"unsupported dense linear load path {config.load_path!r}")
     if config.load_path == "cpasync" and query.recipe not in _CPASYNC_RECIPES:
         raise ValueError(f"{query.recipe} does not accept the cp.async load path")
+    if config.load_path == "cpasync" and query.in_features > CPASYNC_MAX_K:
+        raise ValueError(f"cp.async load path is limited to K <= {CPASYNC_MAX_K}")
     if config.tile_k not in DENSE_LINEAR_TILE_K:
         raise ValueError("unsupported dense linear K tile")
     if config.tile_k and query.recipe not in _TILE_K_RECIPES:
@@ -247,6 +251,7 @@ DENSE_LINEAR_POLICY = ComponentPolicy(
 
 
 __all__ = [
+    "CPASYNC_MAX_K",
     "FP4_NARROW_TILES",
     "FP4_TILES",
     "FP8_SWAPPED_TILES",

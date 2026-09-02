@@ -551,6 +551,7 @@ _FP8_PREFILL_TILES = ((64, 64), (64, 128), (128, 64), (128, 128))
 _DENSE_TILE_K_RECIPES = frozenset({"nvfp4", "mxfp8"})
 _DENSE_SPLIT_K_RECIPES = frozenset({"mxfp8", "block_fp8"})
 _DENSE_SWAP_RECIPES = frozenset({"mxfp8"})
+_CPASYNC_MAX_K = 8192
 
 
 def _device_identity(context):
@@ -630,7 +631,13 @@ def _dense_linear_candidate_configs(
         tiles = [(tile, False) for tile in base]
         if decode and recipe in _DENSE_SWAP_RECIPES:
             tiles += [(tile, True) for tile in FP8_SWAPPED_TILES]
-    load_paths = ("tma", "cpasync") if (recipe == "nvfp4" and decode) else ("tma",)
+    # The cp.async NVFP4 path faults (illegal address) on deep K such as
+    # K=16384; keep it to the K range where it is known to run.
+    load_paths = (
+        ("tma", "cpasync")
+        if (recipe == "nvfp4" and decode and in_features <= _CPASYNC_MAX_K)
+        else ("tma",)
+    )
     tile_ks: tuple[int, ...] = ()
     if recipe in _DENSE_TILE_K_RECIPES:
         tile_ks = tuple(

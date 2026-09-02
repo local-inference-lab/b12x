@@ -84,15 +84,19 @@ def test_heuristic_reproduces_builtin_planner(recipe: str, max_tokens: int) -> N
         ("block_fp8", {"tile_k": 128}, "K tile"),
         ("nvfp4", {"split_k": 2}, "split-K"),
         ("mxfp8", {"tile_k": 256}, "divide"),
+        ("nvfp4", {"load_path": "cpasync", "tile_m": 64, "tile_n": 64}, "K <="),
     ],
 )
 def test_validate_rejects_unsupported_launches(
     recipe: str, overrides: dict[str, object], message: str
 ) -> None:
     """Profile entries the kernel cannot implement fail closed at resolution."""
-    query = _query(
-        recipe, k=4096 + 128 if "tile_k" in overrides and recipe == "mxfp8" else 4096
-    )
+    k = 4096
+    if "tile_k" in overrides and recipe == "mxfp8":
+        k = 4096 + 128
+    if overrides.get("load_path") == "cpasync" and recipe == "nvfp4":
+        k = 16384
+    query = _query(recipe, k=k)
     with pytest.raises(ValueError, match=message):
         _validate(query, _config(**overrides), _GB10)
 
