@@ -16,6 +16,7 @@ Constraints of this first runtime:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from contextlib import contextmanager
@@ -574,10 +575,8 @@ class RoceOneshotAllReduce:
             self._proxy = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive teardown
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 class _nullcontext:
