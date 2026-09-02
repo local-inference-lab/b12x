@@ -91,6 +91,10 @@ class ComponentPolicy(Generic[QueryT, ConfigT]):
         [QueryT, ConfigT, DeviceIdentity | None],
         None,
     ]
+    # Query fields that identify one heuristic-fallback warning. ``None`` warns
+    # once per distinct query; components with a dense query space (per-shape,
+    # per-capacity GEMM plans) collapse the warning to a coarser key.
+    fallback_warning_fields: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if not _COMPONENT_ID_RE.fullmatch(self.component_id):
@@ -383,11 +387,20 @@ class PolicyContext:
         config = component.heuristic(query, self.device)
         component.validate_config(query, config, self.device)
         if self.mode is PolicyMode.AUTO:
+            warning_query = cache_key[1]
+            if component.fallback_warning_fields is not None:
+                warning_query = FrozenMapping(
+                    {
+                        name: value
+                        for name, value in warning_query.items()
+                        if name in component.fallback_warning_fields
+                    }
+                )
             _warn_heuristic_fallback(
                 component_id=component.component_id,
                 device=self.device,
                 reason=fallback_reason,
-                query=cache_key[1],
+                query=warning_query,
             )
         resolution = PolicyResolution(
             config=config,

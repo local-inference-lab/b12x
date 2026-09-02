@@ -232,6 +232,7 @@ WO_PROJECTION_POLICY = ComponentPolicy(
     decode_profile=WoProjectionConfig.from_profile,
     heuristic=_heuristic,
     validate_config=_validate,
+    fallback_warning_fields=frozenset({"groups", "group_width", "rank", "hidden"}),
 )
 
 

@@ -176,6 +176,32 @@ def test_auto_warns_once_per_missing_profile_query(caplog) -> None:
     assert any("'family': 'b'" in message for message in messages)
 
 
+def test_auto_fallback_warning_collapses_to_declared_fields(caplog) -> None:
+    """Dense query spaces warn once per coarse key, not once per capacity."""
+    component = replace(
+        _component(),
+        component_id="test.coarse_warning",
+        fallback_warning_fields=frozenset({"family"}),
+    )
+    context = PolicyContext.for_identity(
+        _DEVICE,
+        registry=_registry(component_id=component.component_id),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
+        context.resolve(component, _Query(family="a", rows=8))
+        context.resolve(component, _Query(family="a", rows=16))
+        context.resolve(component, _Query(family="b", rows=8))
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "test.coarse_warning is using a heuristic" in record.getMessage()
+    ]
+    assert len(messages) == 2
+    assert all("rows" not in message for message in messages)
+
+
 def test_heuristic_only_does_not_warn(caplog) -> None:
     component = replace(_component(), component_id="test.explicit_heuristic")
     context = PolicyContext.for_identity(

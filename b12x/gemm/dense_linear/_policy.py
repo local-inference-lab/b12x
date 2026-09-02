@@ -242,6 +242,7 @@ DENSE_LINEAR_POLICY = ComponentPolicy(
     decode_profile=DenseLinearConfig.from_profile,
     heuristic=_heuristic,
     validate_config=_validate,
+    fallback_warning_fields=frozenset({"recipe"}),
 )
 
 
