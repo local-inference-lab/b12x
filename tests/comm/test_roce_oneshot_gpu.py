@@ -125,17 +125,28 @@ def test_cuda_graph_replay(runtime):
         torch.testing.assert_close(static_out, expected, rtol=2e-2, atol=2e-2 * world**3)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.int32])
 @pytest.mark.parametrize(
     "shape,dim",
-    [((6, 38720), -1), ((6, 38720), 1), ((16, 4096), 0), ((4096,), 0), ((2, 3, 1024), -1), ((96, 8192), 1)],
+    [
+        ((6, 38720), -1), ((6, 38720), 1), ((16, 4096), 0), ((4096,), 0), ((2, 3, 1024), -1),
+        ((96, 8192), 1), ((6, 8), -1),
+        # unaligned rows / sizes: padded contiguous path + torch reshape
+        ((6, 2), -1), ((5, 2), -1), ((7, 3), 0), ((6, 1), -1), ((3,), 0),
+    ],
 )
 def test_all_gather_matches_torch(runtime, dtype, shape, dim):
     world = dist.get_world_size()
     rank = dist.get_rank()
     for trial in range(3):
         torch.manual_seed(500 * trial + rank)
-        inp = torch.randn(*shape, dtype=dtype, device=runtime.device)
+        if dtype.is_floating_point:
+            inp = torch.randn(*shape, dtype=dtype, device=runtime.device)
+        else:
+            inp = torch.randint(-1000, 1000, shape, dtype=dtype, device=runtime.device)
+        if inp.numel() * inp.element_size() > runtime.max_gather_bytes:
+            assert not runtime.should_all_gather(inp, dim)
+            pytest.skip("shard exceeds the runtime's all-gather capacity")
         assert runtime.should_all_gather(inp, dim)
         gathered = [torch.empty_like(inp) for _ in range(world)]
         dist.all_gather(gathered, inp)
@@ -150,7 +161,8 @@ def test_all_gather_rejects_ineligible(runtime):
     x = torch.zeros(4, 8, 8, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_all_gather(x, 1)  # middle dim
     odd = torch.zeros(6, 5, dtype=torch.bfloat16, device=runtime.device)
-    assert not runtime.should_all_gather(odd, -1)  # rows not 16-byte multiples
+    assert runtime.should_all_gather(odd, -1)  # unaligned rows take the padded path
+    assert not runtime._direct_gather_layout(odd, 1)
     huge = torch.zeros((runtime.max_gather_bytes // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_all_gather(huge, 0)
 

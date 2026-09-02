@@ -429,23 +429,30 @@ class RoceOneshotAllReduce:
         return dim
 
     def should_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
-        """Eligible: contiguous CUDA tensor, concat along dim 0 or the last dim."""
+        """Eligible: contiguous CUDA tensor of any dtype, concat along dim 0 or the last dim.
+
+        16-byte-aligned rows take the direct-layout kernel; anything else goes
+        through a padded contiguous gather plus a torch reshape, so shape never
+        forces a fallback to another backend.
+        """
 
         if self._closed or self._proxy is None or not inp.is_cuda or inp.dim() == 0:
             return False
         if inp.device != self.device or not inp.is_contiguous():
             return False
-        if inp.dtype not in SUPPORTED_DTYPES:
+        if inp.is_complex() or inp.is_sparse or inp.dtype == torch.bool:
             return False
         dim = self._normalize_dim(inp, dim)
         if dim not in (0, inp.dim() - 1):
             return False
         nbytes = inp.numel() * inp.element_size()
-        if not (0 < nbytes <= self.max_gather_bytes) or nbytes % PACK_BYTES != 0:
+        return 0 < nbytes <= self.max_gather_bytes
+
+    def _direct_gather_layout(self, inp: torch.Tensor, dim: int) -> bool:
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes % PACK_BYTES != 0 or inp.data_ptr() % PACK_BYTES != 0:
             return False
-        if dim == inp.dim() - 1 and (inp.shape[-1] * inp.element_size()) % PACK_BYTES != 0:
-            return False
-        return True
+        return dim == 0 or (inp.shape[-1] * inp.element_size()) % PACK_BYTES == 0
 
     def all_gather(
         self,
@@ -457,8 +464,10 @@ class RoceOneshotAllReduce:
     ) -> torch.Tensor:
         """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
 
-        The kernel writes the concatenated layout directly, so a last-dim
-        gather needs no reshape or copy afterwards.
+        With 16-byte-aligned rows the kernel writes the concatenated layout
+        directly (no reshape or copy afterwards).  Otherwise the shards are
+        gathered contiguously with 16-byte padding and finished with a torch
+        reshape, which still keeps the collective on RDMA.
         """
 
         if not self.should_all_gather(inp, dim):
@@ -466,16 +475,42 @@ class RoceOneshotAllReduce:
         dim = self._normalize_dim(inp, dim)
         shape = list(inp.shape)
         shape[dim] *= self.world_size
-        if out is None:
-            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
-        elif list(out.shape) != shape or out.dtype != inp.dtype or not out.is_contiguous():
-            raise ValueError("out must be a contiguous tensor of the gathered shape")
-        nbytes = inp.numel() * inp.element_size()
-        shard_packs = nbytes // PACK_BYTES
-        if dim == 0:
-            row_packs = shard_packs
-        else:
-            row_packs = (inp.shape[-1] * inp.element_size()) // PACK_BYTES
+        context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        with torch.cuda.device(self.device), context:
+            if self._direct_gather_layout(inp, dim):
+                if out is None:
+                    out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+                elif list(out.shape) != shape or out.dtype != inp.dtype or not out.is_contiguous():
+                    raise ValueError("out must be a contiguous tensor of the gathered shape")
+                nbytes = inp.numel() * inp.element_size()
+                row_packs = (
+                    nbytes // PACK_BYTES
+                    if dim == 0
+                    else (inp.shape[-1] * inp.element_size()) // PACK_BYTES
+                )
+                self._launch_gather(inp.data_ptr(), out.data_ptr(), nbytes, row_packs)
+                return out
+            # General path: pad each shard to a whole number of packs, gather
+            # contiguously, then let torch produce the requested layout.
+            nbytes = inp.numel() * inp.element_size()
+            padded = _align_up(nbytes, PACK_BYTES)
+            staged = torch.empty(padded, dtype=torch.uint8, device=inp.device)
+            staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
+            gathered = torch.empty(self.world_size * padded, dtype=torch.uint8, device=inp.device)
+            self._launch_gather(staged.data_ptr(), gathered.data_ptr(), padded, padded // PACK_BYTES)
+            stacked = (
+                gathered.view(self.world_size, padded)[:, :nbytes]
+                .reshape(-1)
+                .view(inp.dtype)
+                .reshape(self.world_size, *inp.shape)
+            )
+            result = stacked.movedim(0, dim).reshape(shape)
+            if out is None:
+                return result.contiguous()
+            out.copy_(result)
+            return out
+
+    def _launch_gather(self, input_address: int, output_address: int, nbytes: int, row_packs: int) -> None:
         key = self._gather_launcher_key()
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and not _allgather_cute.is_launcher_prepared(*key):
@@ -483,26 +518,23 @@ class RoceOneshotAllReduce:
                 "RoCE all-gather launcher must be prepared before CUDA graph capture"
             )
         launcher = _allgather_cute.get_launcher(*key)
-        context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
-        with torch.cuda.device(self.device), context:
-            launcher(
-                inp.data_ptr(),
-                out.data_ptr(),
-                shard_packs,
-                nbytes,
-                row_packs,
-                self._recv_base,
-                self._flag_base,
-                self._send_base,
-                self._ctrl_base,
-                self._slot_bytes,
-                self._epoch_address,
-                self.spin_limit,
-                self._blocks,
-            )
+        launcher(
+            input_address,
+            output_address,
+            nbytes // PACK_BYTES,
+            nbytes,
+            row_packs,
+            self._recv_base,
+            self._flag_base,
+            self._send_base,
+            self._ctrl_base,
+            self._slot_bytes,
+            self._epoch_address,
+            self.spin_limit,
+            self._blocks,
+        )
         if not capturing:
             self.check_health()
-        return out
 
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
