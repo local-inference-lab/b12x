@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, TypeAlias
@@ -13,6 +14,7 @@ import torch
 from b12x._lib.dense_gemm import (
     _dense_spark_policy_for_sm_count,
     dense_gemm,
+    dense_gemm_fused_quant_a,
 )
 from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
 from b12x._lib.utils import cuda_stream_to_int, get_num_sm
@@ -74,6 +76,45 @@ def _source_2d(source: torch.Tensor) -> torch.Tensor:
     if source.ndim < 2:
         raise ValueError(f"source must have at least 2 dims, got {tuple(source.shape)}")
     return source.reshape(-1, source.shape[-1]).contiguous()
+
+
+_FUSED_QUANT_A_MAX_TOKENS = 8
+
+
+def _fused_quant_a_max_n() -> int:
+    """Widest N routed through the in-CTA activation quantization.
+
+    B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N (default 4096): 0 keeps the
+    separate quantizer for every shape. The fused GEMM re-quantizes A in each
+    N tile and has no split-K, so above a few thousand columns the separate
+    quantizer plus split-K GEMM is faster on SM120 (measured at N = 7168).
+    """
+    return int(os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096"))
+
+
+def _use_fused_quant_a(
+    tokens: int,
+    dtype: torch.dtype,
+    in_features: int,
+    padded_in_features: int,
+    out_features: int,
+) -> bool:
+    """Whether the linear runs as one small-M GEMM quantizing BF16 A in-CTA.
+
+    The in-CTA quantization computes the same UE8M0 scales and E4M3 values as
+    the standalone row quantizer, so the output is bit-identical; the fused
+    path only drops the two scale-buffer fills and the quantization kernel.
+    K padding is left to the separate path (the padded source would need its
+    own copy), and so is any N that is not a whole number of 64-wide output
+    tiles: the fused kernel has no N tail handling.
+    """
+    return (
+        tokens <= _FUSED_QUANT_A_MAX_TOKENS
+        and dtype == torch.bfloat16
+        and int(in_features) == int(padded_in_features)
+        and int(out_features) % 64 == 0
+        and 0 < int(out_features) <= _fused_quant_a_max_n()
+    )
 
 
 def _pad_k(tensor: torch.Tensor, padded_k: int) -> torch.Tensor:
@@ -533,8 +574,18 @@ def _packed_mxfp8_op(
     expected_m: int,
     stream_int: int | None,
 ) -> torch.Tensor:
-    del weight_scale_rows, in_features
+    del weight_scale_rows
     tokens = int(source_2d.shape[0])
+    if _use_fused_quant_a(
+        tokens, source_2d.dtype, in_features, padded_in_features, out_features
+    ):
+        return dense_gemm_fused_quant_a(
+            source_2d,
+            weight_values.reshape(out_features, padded_in_features, 1),
+            weight_scale_mma,
+            expected_m=expected_m,
+            stream=stream_int,
+        )[:, :, 0]
     source_for_quant = _pad_k(source_2d, int(padded_in_features))
     from b12x.gemm._shared.block_fp8 import (
         quantize_block_fp8_linear_input_mxfp8,
