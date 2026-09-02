@@ -93,8 +93,9 @@ def _paged_indexer_chunk_geometry(
     )
 
 
-def _read_two_level_fold_policy() -> tuple[str, int]:
-    raw_mode = os.getenv(_TWO_LEVEL_FOLD_MODE_ENV, "auto").strip().lower()
+def _read_two_level_fold_policy(default_mode: str = "auto") -> tuple[str, int]:
+    # The planning policy supplies the default; the environment still wins.
+    raw_mode = os.getenv(_TWO_LEVEL_FOLD_MODE_ENV, default_mode).strip().lower()
     disabled_modes = {"0", "false", "off", "no"}
     forced_modes = {"1", "true", "on", "yes"}
     if raw_mode == "auto":
@@ -136,6 +137,7 @@ def _plan_two_level_fold(
     page_table_width: int,
     supertile_pages: int,
     output_physical_slots: bool,
+    fold_mode: str = "auto",
 ) -> _TwoLevelFoldPlan:
     """Use the parallel fold only while its transient candidate slab fits.
 
@@ -156,7 +158,7 @@ def _plan_two_level_fold(
     if invalid:
         raise ValueError(f"two-level fold dimensions must be positive, got {invalid}")
 
-    mode, budget_nbytes = _read_two_level_fold_policy()
+    mode, budget_nbytes = _read_two_level_fold_policy(fold_mode)
     width_tokens = page_table_width * page_size
     if output_physical_slots:
         return _TwoLevelFoldPlan(
@@ -843,6 +845,8 @@ def index_topk_fp8(
             )
         cache = scratch.get_fused_indexer_scratch(topk=topk)
         quant, scales = _split_index_k_cache_runtime_views(index_k_cache)
+        fused_ctas = int(getattr(scratch, "fused_ctas_per_group", 0))
+        fused_merge = int(getattr(scratch, "fused_merge_threshold", -1))
         idx, _ = run_fused_paged_indexer(
             q_bytes=q_fp8.view(torch.uint8),
             weights=weights,
@@ -854,6 +858,8 @@ def index_topk_fp8(
             topk=topk,
             out_indices=out_indices,
             out_values=out_scores,
+            ctas_per_group=fused_ctas if fused_ctas > 0 else None,
+            merge_threshold=fused_merge if fused_merge >= 0 else None,
             pack_values=cache[0],
             pack_indices=cache[1],
             merge_state=cache[2],
@@ -946,6 +952,7 @@ def index_topk_fp8(
         page_table_width=page_table_width,
         supertile_pages=supertile_pages,
         output_physical_slots=output_physical_slots,
+        fold_mode=str(getattr(scratch, "two_level_fold", "auto")),
     )
     two_level_slices = fold_plan.slices
     total_slices = fold_plan.total_slices

@@ -273,10 +273,39 @@ more than 2%, so the embedded profile only carries deliberate wins.
 
 A candidate kernel that poisons the CUDA context (illegal address, launch
 failure) ends the generating process. The work directory keeps an in-flight
-marker for the candidate being raced; rerunning the same command promotes a
-leftover marker to `crashed-candidates.json`, skips that candidate with an
-explicit error, and resumes from the checkpoints, so a retry loop around the
-command finishes the profile without re-racing the crash.
+marker for the candidate being raced, including the leader and the built-in
+plan while they are re-timed in the confirmation pass; rerunning the same
+command promotes a leftover marker to `crashed-candidates.json`, skips that
+candidate with an explicit error, and resumes from the checkpoints, so a retry
+loop around the command finishes the profile without re-racing the crash.
+
+### DSA indexer launch knobs
+
+`attention.dsa_indexer` is a raced component (query schema 2, config schema
+2). Its config carries the paged indexer's launch knobs: `route` (`auto`,
+`paged_fused`, `paged_tiled`, `packed_contiguous`), the tiled `supertile_k` in
+K rows, the fused kernel's `fused_ctas_per_group` and `fused_merge_threshold`
+(`0` forces the cooperative merge, a large value the serial last-CTA merge),
+and the tiled route's `two_level_fold`. Every field has an auto value, and the
+all-auto config is the heuristic, so a profile that records it changes nothing.
+`plan_indexer_scratch` resolves the policy and fills only the caps the caller
+left on auto; the `B12X_PAGED_INDEX_SUPERTILE_K`, `B12X_FUSED_INDEXER` and
+`B12X_INDEXER_TWO_LEVEL_FOLD` environment knobs still override a profile. The
+fused merge scratch is reserved for two SM waves of CTAs so a profile may
+oversubscribe the auto wave; validation rejects anything larger.
+
+The raced corpus (`b12x/policy/generation/dsa_indexer_corpus.py`) is the C4
+paged decode ladder DeepSeek-V4-Flash and GLM-5.3-Flash serve: TP-sliced head
+counts 64/32/16/8, decode rows 1 through 64, the page-table widths of 128k and
+512k `max_model_len`, each scored at 16k/64k/128k live context as scenarios.
+Candidates are planned through the production policy override (an unavailable
+route fails the candidate, as it would in serving), checked against the paged
+logits reference on the stack's own inputs (the selected slots must be the
+exact top-k set), and timed in place inside the DSV4 attention chain with
+the all-auto config as the baseline and the same 2% confirmation margin.
+GLM-5.2's top-k-2048 decode/extend shapes, packed-contiguous prefill and the
+MiniMax MSA indexer stay single-candidate qualification cases timed on their
+benchmark harnesses.
 
 ### MoE decode in place
 
@@ -306,8 +335,12 @@ until ./scripts/generate_gpu_profile.py --devices all \
 done
 ```
 
-Each worker process keeps its own in-flight marker, a failed partition no
-longer stops the other workers (the command raises after the remaining
-partitions finish), and `--partition-shard i/N` splits the same corpus across
-hosts whose checkpoint directories are merged by copying before one final
-unsharded run reduces and embeds.
+Each worker process keeps its own in-flight marker. A worker whose CUDA
+context turns sticky promotes its own marker at once, reports the blamed
+candidate, and idles until the other workers have drained, so one crash never
+blacklists the bystanders' cases and never lets the poisoned worker fail every
+later partition it would otherwise pick up; the command raises after the
+remaining partitions finish and the rerun resumes from the checkpoints.
+`--partition-shard i/N` splits the same corpus across hosts whose checkpoint
+directories are merged by copying before one final unsharded run reduces and
+embeds.

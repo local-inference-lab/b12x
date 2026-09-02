@@ -42,11 +42,11 @@ from b12x.policy.generation.providers.attention import (
     _QsaProbe,
 )
 from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
-from b12x.policy.generation.providers.qualification import (
-    _DsaIndexerProbe,
-    DsaIndexerGenerator,
-    SparseMlaGenerator,
+from b12x.policy.generation.dsa_indexer_corpus import (
+    qualification_dsa_indexer_cases,
 )
+from b12x.policy.generation.providers.dsa_indexer import DsaIndexerGenerator
+from b12x.policy.generation.providers.qualification import SparseMlaGenerator
 from b12x.policy.generation.providers.norm_sequence import (
     MhcGenerator,
     _MhcSession,
@@ -231,10 +231,14 @@ def test_attention_capacity_axes_cover_serving_and_prefill_buckets() -> None:
         for rows in COMMON_PREFILL_TOKEN_CAPACITIES
         for kv_dtype in ("bf16", "fp8_e4m3")
     }
+    probe_labels = {
+        str(case.metadata["probe"]["label"])
+        for case in qualification_dsa_indexer_cases()
+    }
     assert {
-        int(case[0].removeprefix("glm52-extend-m"))
-        for case in _DsaIndexerProbe._CASES
-        if case[0].startswith("glm52-extend-m")
+        int(label.removeprefix("glm52-extend-m"))
+        for label in probe_labels
+        if label.startswith("glm52-extend-m")
     } == set(COMMON_PREFILL_TOKEN_CAPACITIES)
 
 
@@ -357,8 +361,7 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
     case = next(
         case
         for case in _mhc_cases()
-        if case.query["hidden_size"] == 4_096
-        and case.query["max_tokens"] == 3_072
+        if case.query["hidden_size"] == 4_096 and case.query["max_tokens"] == 3_072
     )
     configs = tuple(
         candidate.config.to_dict()
@@ -388,30 +391,23 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
     mhc_queries = MhcGenerator().reviewed_queries()
 
     assert any(
-        query.num_q_heads == 32 and query.top_k == 2_048
-        for query in dsa_queries
+        query.num_q_heads == 32 and query.top_k == 2_048 for query in dsa_queries
     )
-    assert any(
-        query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries
-    )
+    assert any(query.num_q_heads == 32 and query.top_k == 512 for query in dsa_queries)
     assert {
         (query.qk_head_dim, query.v_head_dim, query.model_type)
         for query in sparse_queries
     } == {(576, 512, None), (512, 512, 2)}
     assert {query.num_q_heads for query in sparse_queries} == {8, 16, 32, 64}
     assert any(
-        query.max_tokens == 6
-        and query.hidden_size == 4_096
-        and query.split_k == 64
+        query.max_tokens == 6 and query.hidden_size == 4_096 and query.split_k == 64
         for query in mhc_queries
     )
     assert {4_096, 7_168} == {query.hidden_size for query in mhc_queries}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_tokens for query in mhc_queries
     }
-    assert {2_304, 3_072, 3_584} <= {
-        query.max_tokens for query in mhc_queries
-    }
+    assert {2_304, 3_072, 3_584} <= {query.max_tokens for query in mhc_queries}
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"
@@ -424,19 +420,13 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
 def test_named_attention_benchmark_presets_are_in_the_reviewed_inventory() -> None:
     preset_ids = {preset.preset_id for preset in ATTENTION_BENCHMARK_PRESETS}
     assert {
-        name.removeprefix("paged:")
-        for name in preset_ids
-        if name.startswith("paged:")
+        name.removeprefix("paged:") for name in preset_ids if name.startswith("paged:")
     } == set(BENCHMARK_PROFILES)
     assert {
-        name.removeprefix("qsa:")
-        for name in preset_ids
-        if name.startswith("qsa:")
+        name.removeprefix("qsa:") for name in preset_ids if name.startswith("qsa:")
     } == set(QSA_PROFILES)
     assert {
-        name.removeprefix("gdn:")
-        for name in preset_ids
-        if name.startswith("gdn:")
+        name.removeprefix("gdn:") for name in preset_ids if name.startswith("gdn:")
     } == {case.name for case in QWEN38_GDN_CASES}
     assert preset_ids == {
         "compressed-mla:deepseek-v4-flash-default",

@@ -683,6 +683,7 @@ def _minimax_m3_queries(
             num_idx_heads=4,
             max_q_rows=4,
             max_k_rows=0,
+            max_page_table_width=128,
             top_k=16,
             page_size=64,
             score_mode="msa",
@@ -778,6 +779,7 @@ def _deepseek_v4_flash_queries(
                 num_idx_heads=1,
                 max_q_rows=1,
                 max_k_rows=0,
+                max_page_table_width=256,
                 top_k=512,
                 page_size=64,
                 score_mode="dsa",
@@ -813,6 +815,7 @@ def _deepseek_v4_flash_queries(
         )
     queries.extend(_moe_queries(tp_size, _MOE_PRESETS["deepseek-v4-flash"]))
     return tuple(queries)
+
 
 def _validate_glm_tp(model: str, tp_size: int) -> None:
     if tp_size not in (1, 2, 4, 8):
@@ -858,6 +861,7 @@ def _glm52_queries(
                 num_idx_heads=1,
                 max_q_rows=4,
                 max_k_rows=0,
+                max_page_table_width=64,
                 top_k=2_048,
                 page_size=64,
                 score_mode="dsa",
@@ -1005,6 +1009,7 @@ def _glm53_flash_queries(
                 num_idx_heads=1,
                 max_q_rows=6,
                 max_k_rows=0,
+                max_page_table_width=64,
                 top_k=512,
                 page_size=64,
                 score_mode="dsa",
@@ -1071,9 +1076,7 @@ _MODEL_FACTORIES = {
     "minimax-m2.7": _minimax_m27_queries,
     "minimax-m3": _minimax_m3_queries,
     "nvidia-nano3.5": _moe_only_factory("nvidia-nano3.5"),
-    "nvidia-nemotron-3-super-120b": _moe_only_factory(
-        "nvidia-nemotron-3-super-120b"
-    ),
+    "nvidia-nemotron-3-super-120b": _moe_only_factory("nvidia-nemotron-3-super-120b"),
     "qwen-gqa": _qwen_gqa_queries,
     "qwen3.5-397b-a17b": _moe_only_factory("qwen3.5-397b-a17b"),
     "qwen3.8-flash-next-180b": _qwen_flash_next_queries,
@@ -1117,9 +1120,7 @@ def _canonical_model(value: str) -> str:
     if canonical in _MODEL_FACTORIES:
         return canonical
     needle = _normalize_name(value)
-    normalized = {
-        _normalize_name(name): name for name in _MODEL_FACTORIES
-    }
+    normalized = {_normalize_name(name): name for name in _MODEL_FACTORIES}
     for alias, target in _MODEL_ALIASES.items():
         normalized[_normalize_name(alias)] = target
     canonical = normalized.get(needle)
@@ -1166,9 +1167,7 @@ def _device_selection(value: str) -> DeviceSelection:
     needle = _normalize_name(value)
     profiles = EMBEDDED_REGISTRY.list_profiles()
     exact_profiles = [
-        profile
-        for profile in profiles
-        if needle == _normalize_name(profile.profile_id)
+        profile for profile in profiles if needle == _normalize_name(profile.profile_id)
     ]
     partial_profiles = [
         profile
@@ -1193,8 +1192,7 @@ def _device_selection(value: str) -> DeviceSelection:
                 partial_targets.append((profile, target))
     matches = exact_targets or partial_targets
     unique = {
-        (profile.profile_id, target): (profile, target)
-        for profile, target in matches
+        (profile.profile_id, target): (profile, target) for profile, target in matches
     }
     if len(unique) != 1:
         choices = ", ".join(
@@ -1279,8 +1277,7 @@ def inspect_model_policy(
         },
         "profile_id": context.profile_id,
         "selections": [
-            _record(item, context.resolve(item.policy, item.query))
-            for item in queries
+            _record(item, context.resolve(item.policy, item.query)) for item in queries
         ],
     }
 
@@ -1323,11 +1320,12 @@ def _parser() -> argparse.ArgumentParser:
         "--device",
         default="auto",
         help=(
-            "auto, a CUDA ordinal, an embedded profile ID, or a device-name "
-            "fragment"
+            "auto, a CUDA ordinal, an embedded profile ID, or a device-name fragment"
         ),
     )
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
     parser.add_argument("--list-models", action="store_true")
     parser.add_argument("--list-devices", action="store_true")
     return parser

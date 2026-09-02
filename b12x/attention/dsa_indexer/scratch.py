@@ -28,7 +28,12 @@ from b12x.attention.dsa_indexer.msa_reference import (
 )
 from b12x.policy import PolicyContext, get_auto_policy
 
-from ._policy import DSA_INDEXER_POLICY, DsaIndexerQuery
+from ._policy import (
+    DSA_INDEXER_POLICY,
+    INDEXER_FUSED_CTAS_WAVES,
+    DsaIndexerConfig,
+    DsaIndexerQuery,
+)
 
 _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
@@ -98,6 +103,11 @@ class B12XIndexerScratchCaps:
     prefill_block_k: int = _INDEXER_CONTIGUOUS_PREFILL_BLOCK_K
     score_mode: str = "dsa"
     num_idx_heads: int = 1
+    # Fused-route and tiled-route launch knobs; the auto values defer to the
+    # planning policy, then to the runtime's own resolution.
+    fused_ctas_per_group: int = 0
+    fused_merge_threshold: int = -1
+    two_level_fold: str = "auto"
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -205,6 +215,9 @@ class B12XIndexerPagedScratchCaps:
     route: str = INDEXER_PAGED_ROUTE_AUTO
     score_mode: str = "dsa"
     num_idx_heads: int = 1
+    fused_ctas_per_group: int = 0
+    fused_merge_threshold: int = -1
+    two_level_fold: str = "auto"
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -396,6 +409,9 @@ class B12XIndexerPagedScratch:
     prefill_block_k: int | None = None
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
+    fused_ctas_per_group: int = 0
+    fused_merge_threshold: int = -1
+    two_level_fold: str = "auto"
     indexer_k_quant_bytes: torch.Tensor | None = None
     indexer_k_scales_bytes: torch.Tensor | None = None
     indexer_contiguous_lengths: torch.Tensor | None = None
@@ -927,10 +943,12 @@ def _indexer_paged_scratch_layout(
             fused_indexer_scratch_capacity,
         )
 
+        # Reserved for every ctas_per_group a profile may select (see
+        # INDEXER_FUSED_CTAS_WAVES), not just the auto single wave.
         fused_pack_elements, fused_state_words = fused_indexer_scratch_capacity(
             max_q_rows,
             int(caps.topk),
-            int(num_sms),
+            int(num_sms) * INDEXER_FUSED_CTAS_WAVES,
         )
     gather_k_rows = (
         int(supertile_tokens) if route == INDEXER_PAGED_ROUTE_PACKED_CONTIGUOUS else 0
@@ -1467,6 +1485,9 @@ def _materialize_indexer_paged_scratch(
         route=layout.route,
         shared_page_table=bool(caps.shared_page_table),
         prefill_block_k=layout.prefill_block_k,
+        fused_ctas_per_group=int(caps.fused_ctas_per_group),
+        fused_merge_threshold=int(caps.fused_merge_threshold),
+        two_level_fold=str(caps.two_level_fold),
         indexer_k_quant_bytes=indexer_k_quant_bytes,
         indexer_k_scales_bytes=indexer_k_scales_bytes,
         indexer_contiguous_lengths=contiguous_lengths,
@@ -2331,6 +2352,43 @@ class B12XIndexerScratchPlan:
         return self.inner.bind_msa(**kwargs)
 
 
+def _apply_indexer_policy(
+    caps: B12XIndexerScratchCaps, config: DsaIndexerConfig
+) -> DsaIndexerConfig:
+    """Merge the resolved policy under the caller's explicit caps and env knobs.
+
+    Precedence: explicit caps field, then the ``B12X_*`` debug environment,
+    then the profile/heuristic config, then the runtime's own auto resolution.
+    """
+    route = caps.route
+    if route == INDEXER_PAGED_ROUTE_AUTO:
+        route = config.route
+        if (
+            route == INDEXER_PAGED_ROUTE_FUSED
+            and os.getenv("B12X_FUSED_INDEXER", "1") == "0"
+        ):
+            route = INDEXER_PAGED_ROUTE_AUTO
+    supertile_k = int(caps.supertile_k)
+    if supertile_k <= 0 and os.environ.get(_PAGED_INDEX_SUPERTILE_K_ENV) is None:
+        supertile_k = int(config.supertile_k)
+    fold = str(caps.two_level_fold)
+    if fold == "auto":
+        fold = str(config.two_level_fold)
+    return DsaIndexerConfig(
+        route=route,
+        supertile_k=supertile_k,
+        fused_ctas_per_group=(
+            int(caps.fused_ctas_per_group) or int(config.fused_ctas_per_group)
+        ),
+        fused_merge_threshold=(
+            int(caps.fused_merge_threshold)
+            if int(caps.fused_merge_threshold) >= 0
+            else int(config.fused_merge_threshold)
+        ),
+        two_level_fold=fold,
+    )
+
+
 def plan_indexer_scratch(
     caps: B12XIndexerScratchCaps,
     *,
@@ -2353,12 +2411,16 @@ def plan_indexer_scratch(
             num_idx_heads=caps.num_idx_heads,
             max_q_rows=caps.max_q_rows,
             max_k_rows=0 if caps.max_k_rows is None else caps.max_k_rows,
+            max_page_table_width=(
+                0 if caps.max_page_table_width is None else caps.max_page_table_width
+            ),
             top_k=caps.topk,
             page_size=caps.page_size,
             score_mode=caps.score_mode,
             shared_page_table=caps.shared_page_table,
         ),
     )
+    knobs = _apply_indexer_policy(caps, resolution.config)
     if caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
         assert caps.max_page_table_width is not None
         inner = plan_indexer_paged_scratch(
@@ -2375,12 +2437,15 @@ def plan_indexer_scratch(
                 max_k_rows=0 if caps.max_k_rows is None else caps.max_k_rows,
                 reserve_paged_logits=caps.reserve_paged_logits,
                 paged_logits_k_rows=caps.paged_logits_k_rows,
-                paged_tile_logits_k_rows=caps.supertile_k,
+                paged_tile_logits_k_rows=knobs.supertile_k,
                 mode=caps.mode,
                 shared_page_table=caps.shared_page_table,
-                route=caps.route,
+                route=knobs.route,
                 score_mode=caps.score_mode,
                 num_idx_heads=caps.num_idx_heads,
+                fused_ctas_per_group=knobs.fused_ctas_per_group,
+                fused_merge_threshold=knobs.fused_merge_threshold,
+                two_level_fold=knobs.two_level_fold,
             )
         )
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS:
@@ -2394,7 +2459,7 @@ def plan_indexer_scratch(
                 topk=caps.topk,
                 k_dtype=caps.k_dtype,
                 supertile_k=(
-                    caps.supertile_k if caps.supertile_k > 0 else caps.max_k_rows
+                    knobs.supertile_k if knobs.supertile_k > 0 else caps.max_k_rows
                 ),
                 prefill_block_k=caps.prefill_block_k,
                 score_mode=caps.score_mode,
