@@ -19,7 +19,15 @@ from b12x.policy.generation.moe_corpus import (
     MoeSweepCase,
 )
 
+from .layer_stack import (
+    CONTEXT_LAYERS,
+    _confirm_winner,
+    _context_race,
+    _keep_race,
+    layer_budget,
+)
 from .moe import MoeCandidate, MoeMeasurement
+from .moe_layer_stack import _MoeLayerStack
 from .timing import (
     _bounded_repetitions,
     _cuda_event_samples_us,
@@ -950,6 +958,27 @@ def _concrete_candidate_path(
     return f"{quant_mode}.dynamic.m{planned_tile_m}"
 
 
+def _baseline_decode_config(geometry, case, device) -> dict[str, object]:
+    """The runtime's built-in choice for this query, as a candidate config."""
+    from dataclasses import asdict
+
+    from b12x.moe.fused_moe._impl import _heuristic_moe_decode_config
+    from b12x.moe.fused_moe._policy import MoeDecodeQuery
+
+    query = MoeDecodeQuery(
+        quant_mode=geometry.recipe.quant_mode,
+        source_format=geometry.recipe.source_format,
+        activation=geometry.activation,
+        num_experts=int(geometry.num_experts),
+        hidden_size=int(geometry.hidden_size),
+        intermediate_size=int(geometry.intermediate_size),
+        top_k=int(case.top_k),
+        num_tokens=int(case.num_tokens),
+        routed_rows=int(case.routed_rows),
+    )
+    return asdict(_heuristic_moe_decode_config(query, device))
+
+
 class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
     def __init__(
         self,
@@ -965,10 +994,27 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         self._device = torch.device("cuda", context.device_ordinal)
         with torch.cuda.device(context.device_ordinal):
             fused_moe.clear_caches()
+            allocated = torch.cuda.memory_allocated(self._device)
             self._experts = _prepare_experts(geometry, device=self._device)
+            torch.cuda.synchronize(self._device)
+            expert_bytes = max(torch.cuda.memory_allocated(self._device) - allocated, 1)
+            # Extra layers of the in-place stack own their own expert weights
+            # so every layer streams them cold; budget from free memory.
+            stack_layers = layer_budget(
+                self._device,
+                expert_bytes * 2,
+                requested=CONTEXT_LAYERS,
+            )
+            self._extra_experts = [
+                _prepare_experts(geometry, device=self._device)
+                for _ in range(stack_layers - 1)
+            ]
             torch.cuda.synchronize(self._device)
             gc.collect()
             torch.cuda.empty_cache()
+        self._stack: _MoeLayerStack | None = None
+        self._races: dict = {}
+        self._baseline_config: dict | None = None
         self._candidates = _candidates_for_geometry(
             geometry,
             sm_count=context.device.sm_count,
@@ -1000,12 +1046,16 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             self._candidate_signatures.clear()
             self._query_inputs = None
             self._query_key = None
+            self._stack = None
+            self._races = {}
             self._flush = None
             self._experts = None
+            self._extra_experts = []
             return None
         self._clear_query_state()
         self._flush = None
         self._experts = None
+        self._extra_experts = []
         fused_moe.clear_caches()
         gc.collect()
         torch.cuda.synchronize(self._device)
@@ -1021,6 +1071,8 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         self._candidate_signatures.clear()
         self._query_inputs = None
         self._query_key = None
+        self._stack = None
+        self._races = {}
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1078,6 +1130,28 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             x=x,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+        )
+        payload = self._experts._impl.representation_for(
+            self._geometry.recipe.quant_mode
+        )
+        output_dtype = (
+            torch.float32
+            if getattr(payload, "weight_layout", "") == "trellis_t256"
+            else x.dtype
+        )
+        self._stack = _MoeLayerStack(
+            geometry=self._geometry,
+            experts_layers=[self._experts, *self._extra_experts],
+            tokens=case.num_tokens,
+            top_k=case.top_k,
+            x_dtype=x.dtype,
+            output_dtype=output_dtype,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            device=self._device,
+            generator=torch.Generator(device=self._device).manual_seed(
+                measurement_seed + 7919
+            ),
         )
         return self._query_inputs
 
@@ -1209,10 +1283,12 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         inputs: _QueryInputs,
         reference_output: object | None,
         reference_kind: str | None,
+        stage: str = "screen",
     ) -> _CandidateResult:
         import torch
 
         settings = self._context.settings
+        in_place = stage != "screen" and self._stack is not None
         try:
             with _candidate_environment(candidate):
                 prepared = self._prepare_candidate(
@@ -1247,17 +1323,20 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                 prepared.graph.replay()
                 end.record()
                 end.synchronize()
-                timed_repetitions = _bounded_repetitions(
-                    settings,
-                    pilot_us=float(start.elapsed_time(end)) * 1_000.0,
-                )
+                pilot_us = float(start.elapsed_time(end)) * 1_000.0
+                timed_repetitions = _bounded_repetitions(settings, pilot_us=pilot_us)
                 allocated_before = torch.cuda.memory_allocated(self._device)
-                samples_us = _cuda_event_samples_us(
-                    prepared.graph.replay,
-                    count=settings.groups * timed_repetitions,
-                    device=self._device,
-                    flush=self._flush,
-                )
+                if in_place:
+                    # The isolated replay above gated correctness; the ranking
+                    # latency comes from the op running inside the layer stack.
+                    samples_us = (pilot_us,) * (settings.groups * timed_repetitions)
+                else:
+                    samples_us = _cuda_event_samples_us(
+                        prepared.graph.replay,
+                        count=settings.groups * timed_repetitions,
+                        device=self._device,
+                        flush=self._flush,
+                    )
                 allocated_after = torch.cuda.memory_allocated(self._device)
                 correct = (
                     finite
@@ -1267,6 +1346,44 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                     <= _maximum_relative_norm_error(self._geometry)
                     and allocated_after <= allocated_before
                 )
+                latency_us = _median_of_group_medians(
+                    tuple(samples_us),
+                    groups=settings.groups,
+                    repetitions=timed_repetitions,
+                )
+                context_metrics: dict[str, object] = {}
+                if in_place and correct:
+                    from b12x.moe import fused_moe
+                    from b12x.policy import MOE_DECODE, get_auto_policy
+
+                    self._stack.prepare_candidate(
+                        candidate.candidate_id,
+                        policy=get_auto_policy(self._device).with_override(
+                            MOE_DECODE,
+                            fused_moe.MoeDecodeConfig.from_profile(candidate.config),
+                        ),
+                        capacity=fused_moe.ExecutionCapacity(
+                            max_tokens=case.num_tokens,
+                            top_k=case.top_k,
+                        ),
+                    )
+                    race = _context_race(
+                        context=self._stack,
+                        slot=candidate.candidate_id,
+                        settings=settings,
+                        device=self._device,
+                        flush=self._flush,
+                    )
+                    correct = race.finite
+                    latency_us = race.op_us
+                    _keep_race(self._races, candidate, race, self._baseline_config)
+                    context_metrics = {
+                        "in_place": True,
+                        "isolated_us": pilot_us,
+                        "stack_us": race.stack_us,
+                        "context_layers": self._stack.layers,
+                        "context_repetitions": race.repetitions,
+                    }
                 graph_cosine_metric = (
                     graph_cosine if math.isfinite(graph_cosine) else None
                 )
@@ -1274,11 +1391,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                 return _CandidateResult(
                     measurement=MoeMeasurement(
                         candidate=candidate,
-                        latency_us=_median_of_group_medians(
-                            tuple(samples_us),
-                            groups=settings.groups,
-                            repetitions=timed_repetitions,
-                        ),
+                        latency_us=latency_us,
                         cosine=(cosine if correct else None),
                         error=(
                             None if correct else "graph replay correctness gate failed"
@@ -1310,6 +1423,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                             "output_norm": _finite_float_or_none(
                                 _stable_l2_norm(prepared.output)
                             ),
+                            **context_metrics,
                         },
                     ),
                     reference_output=_candidate_reference_output(
@@ -1427,11 +1541,19 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         candidates: tuple[MoeCandidate, ...],
         *,
         correctness: bool = False,
+        stage: str | None = None,
     ) -> tuple[MoeMeasurement, ...]:
         if any(candidate not in self._candidates for candidate in candidates):
             raise ValueError("MoE worker received an unknown candidate")
+        if stage is None:
+            stage = "screen" if correctness else "full"
+        correctness = correctness or stage == "screen"
         eligible = self.eligible_candidates(case, candidates)
         inputs = self._stage_query_inputs(case)
+        self._races = {}
+        self._baseline_config = _baseline_decode_config(
+            self._geometry, case, self._context.device
+        )
         measurements_by_id: dict[str, MoeMeasurement] = {}
         reference_output = (
             self._independent_reference(
@@ -1454,11 +1576,21 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
                 inputs=inputs,
                 reference_output=reference_output,
                 reference_kind=reference_kind,
+                stage=stage,
             )
             measurements_by_id[candidate.candidate_id] = result.measurement
             if reference_output is None and result.reference_output is not None:
                 reference_output = result.reference_output
                 reference_kind = "cross_candidate"
+        if stage != "screen":
+            minimum_cosine = self._context.settings.minimum_cosine
+            for measurement in _confirm_winner(
+                list(measurements_by_id.values()),
+                self._races,
+                baseline_config=self._baseline_config,
+                passes=lambda m: m.passes(minimum_cosine),
+            ):
+                measurements_by_id[measurement.candidate.candidate_id] = measurement
         return tuple(
             measurements_by_id.get(
                 candidate.candidate_id,
@@ -1531,6 +1663,7 @@ def _moe_geometry_worker(
                         case,
                         candidates,
                         correctness=bool(request.get("correctness", False)),
+                        stage=request.get("stage"),
                     )
                     connection.send(
                         {
@@ -1738,6 +1871,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         candidates: tuple[MoeCandidate, ...],
         *,
         correctness: bool = False,
+        stage: str | None = None,
     ) -> tuple[MoeMeasurement, ...]:
         def request_measurement(
             requested: tuple[MoeCandidate, ...],
@@ -1748,6 +1882,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
                 case=case,
                 candidate_ids=tuple(candidate.candidate_id for candidate in requested),
                 correctness=correctness,
+                stage=stage,
             )
 
         def parse_measurements(

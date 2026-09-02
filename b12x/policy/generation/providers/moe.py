@@ -52,8 +52,8 @@ _TRITON_ROUTE_MAX_ROWS = 256
 _PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
-_MOE_CANDIDATE_CONTRACT_VERSION = 6
-_MOE_CHECKPOINT_SCHEMA_VERSION = 2
+_MOE_CANDIDATE_CONTRACT_VERSION = 7
+_MOE_CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _config_id(config: FrozenMapping) -> str:
@@ -158,6 +158,7 @@ class MoeGeometrySession(Protocol):
         candidates: tuple[MoeCandidate, ...],
         *,
         correctness: bool = False,
+        stage: str | None = None,
     ) -> tuple[MoeMeasurement, ...]: ...
 
 
@@ -497,6 +498,38 @@ def _correctness_anchor_rank(
     )
 
 
+# A route-robust leader must beat the built-in decode config by this fraction
+# of the geometric-mean in-place latency to replace it.
+MOE_BASELINE_MARGIN = 0.02
+
+
+def _baseline_config_for(case: MoeSweepCase, context) -> dict[str, object] | None:
+    from dataclasses import asdict
+
+    from b12x.moe.fused_moe._impl import _heuristic_moe_decode_config
+    from b12x.moe.fused_moe._policy import MoeDecodeQuery
+
+    geometry = case.geometry
+    try:
+        config = _heuristic_moe_decode_config(
+            MoeDecodeQuery(
+                quant_mode=geometry.recipe.quant_mode,
+                source_format=geometry.recipe.source_format,
+                activation=geometry.activation,
+                num_experts=int(geometry.num_experts),
+                hidden_size=int(geometry.hidden_size),
+                intermediate_size=int(geometry.intermediate_size),
+                top_k=int(case.top_k),
+                num_tokens=int(case.num_tokens),
+                routed_rows=int(case.routed_rows),
+            ),
+            context.device,
+        )
+    except Exception:  # noqa: BLE001 - a heuristic gap only disables the margin
+        return None
+    return asdict(config)
+
+
 class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
@@ -669,6 +702,7 @@ class MoeDecodeGenerator:
             case,
             candidates,
             correctness=stage == "screen",
+            stage=stage,
         )
         measured_ids = [item.candidate.candidate_id for item in measurements]
         if measured_ids != expected_ids:
@@ -918,6 +952,8 @@ class MoeDecodeGenerator:
             results_by_query[_query_key(case)].append((case, measurements))
         records: list[DecisionRecord] = []
         winner_counts: dict[str, int] = defaultdict(int)
+        baseline_kept = 0
+        baseline_missing = 0
         progress.start_stage(
             self.component_id,
             stage="route-robust reduction",
@@ -946,8 +982,23 @@ class MoeDecodeGenerator:
                 raise RuntimeError(
                     f"no route-robust MoE candidate for {_query_dict(case)}"
                 )
-            _, winner = min(robust, key=lambda item: (item[0], item[1].candidate_id))
+            best_score, winner = min(
+                robust, key=lambda item: (item[0], item[1].candidate_id)
+            )
             representative = grouped[0][0]
+            # Keep the runtime's built-in choice unless the in-place leader
+            # beats it by the margin; noise-level flips stay out of the profile.
+            baseline = _baseline_config_for(representative, context)
+            if baseline is None:
+                baseline_missing += 1
+            else:
+                for score, candidate in robust:
+                    if candidate.config.to_dict() != baseline:
+                        continue
+                    if best_score >= score * (1.0 - MOE_BASELINE_MARGIN):
+                        winner = candidate
+                        baseline_kept += 1
+                    break
             records.append(
                 DecisionRecord.create(
                     query=_query_dict(representative),
@@ -1009,6 +1060,9 @@ class MoeDecodeGenerator:
                 "coarse_target_ratio": _COARSE_TARGET_RATIO,
                 "measurement_process_scope": "one_cuda_process_per_physical_geometry",
                 "winner_query_counts": dict(sorted(winner_counts.items())),
+                "baseline_margin": MOE_BASELINE_MARGIN,
+                "baseline_kept_query_points": baseline_kept,
+                "baseline_missing_query_points": baseline_missing,
                 "route_measurements": len(full_results),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (

@@ -827,8 +827,8 @@ class _Session(AbstractContextManager["_Session"]):
             )
         )
 
-    def measure(self, case, candidates, *, correctness=False):
-        del correctness
+    def measure(self, case, candidates, *, correctness=False, stage=None):
+        del correctness, stage
         self._calls.append(
             (case.case_id, tuple(candidate.candidate_id for candidate in candidates))
         )
