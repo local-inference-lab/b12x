@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define ROCE_MAX_PEERS 16
 #define ROCE_MAX_HCAS 2
@@ -38,7 +39,8 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
-#define ROCE_ABI_VERSION 1
+#define ROCE_ABI_VERSION 2
+#define ROCE_IDLE_SPINS 200000
 
 typedef struct {
     uint64_t region_addr;
@@ -74,6 +76,7 @@ typedef struct {
     size_t flag_off;
     size_t send_off;
     size_t ctrl_off;
+    int started;
     uint64_t peer_addr[ROCE_MAX_PEERS];
     uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
     int peer_hca[ROCE_MAX_PEERS];
@@ -422,12 +425,17 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
 static void *proxy_main(void *arg) {
     roce_ctx_t *c = (roce_ctx_t *)arg;
     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
-    uint32_t idle = 0;
+    // Spin hard while ops are flowing; after ROCE_IDLE_SPINS polls without a
+    // doorbell (a few milliseconds) back off to a short sleep so an idle
+    // runtime does not burn a core next to the serving process.  The first
+    // op after a long gap pays at most one sleep interval.
+    uint64_t idle = 0;
+    const struct timespec nap = {0, 20000};
     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
         uint32_t seq = __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE);
         if (seq == c->last_seq) {
-            if (++idle >= 64) {
-                idle = 0;
+            idle++;
+            if (idle % 64 == 0) {
                 for (int h = 0; h < c->n_hca; h++) {
                     if (drain_cq(c, h) != 0) {
                         atomic_store(&c->failed, 1);
@@ -435,15 +443,33 @@ static void *proxy_main(void *arg) {
                     }
                 }
             }
+            if (idle >= ROCE_IDLE_SPINS) {
+                nanosleep(&nap, NULL);
+            }
             continue;
         }
         idle = 0;
-        uint32_t nbytes = ctrl[1];
-        if (post_op(c, seq, nbytes) != 0) {
+        // The doorbell holds only the newest sequence.  Our kernel for op N
+        // completes on the peers' payloads alone, so op N+1 can ring before
+        // this thread has seen op N (it slept, or the scheduler moved it).
+        // Peers cannot get further than one op ahead of us, so at most
+        // ROCE_SLOTS doorbells are pending and every send slot is intact:
+        // post each missed sequence in order using its per-slot byte count.
+        uint32_t pending = seq - c->last_seq;
+        if (pending > ROCE_SLOTS) {
+            snprintf(c->err, sizeof(c->err),
+                     "doorbell skipped %u ops (last %u, now %u)", pending, c->last_seq, seq);
             atomic_store(&c->failed, 1);
             return NULL;
         }
-        c->last_seq = seq;
+        for (uint32_t s = c->last_seq + 1; pending > 0; s++, pending--) {
+            uint32_t nbytes = ctrl[4 + (s & 1u)];
+            if (post_op(c, s, nbytes) != 0) {
+                atomic_store(&c->failed, 1);
+                return NULL;
+            }
+            c->last_seq = s;
+        }
     }
     return NULL;
 }
@@ -452,8 +478,13 @@ int roce_start(roce_ctx_t *c) {
     if (atomic_load(&c->running)) {
         return 0;
     }
-    volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
-    c->last_seq = ctrl[0];
+    if (!c->started) {
+        // A restart continues from the last posted sequence so ops that rang
+        // the doorbell while the thread was stopped are still posted.
+        volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+        c->last_seq = ctrl[0];
+        c->started = 1;
+    }
     atomic_store(&c->failed, 0);
     atomic_store(&c->running, 1);
     int rc = pthread_create(&c->thread, NULL, proxy_main, c);

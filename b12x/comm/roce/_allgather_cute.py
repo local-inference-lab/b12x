@@ -146,6 +146,7 @@ class _RoceAllGatherLaunch:
             prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
             if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                 st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
+                st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes))
                 fence_sc_sys()
                 st_relaxed_sys_u32(ctrl_base, seq)
 

@@ -14,6 +14,7 @@ Without a torchrun environment the tests skip.
 from __future__ import annotations
 
 import os
+import time
 from datetime import timedelta
 
 import pytest
@@ -123,6 +124,47 @@ def test_cuda_graph_replay(runtime):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(static_out, expected, rtol=2e-2, atol=2e-2 * world**3)
+
+
+def test_proxy_catches_up_after_missed_doorbell(runtime):
+    """A proxy that was descheduled across two doorbells must post both ops.
+
+    A rank's kernel for op N completes on the peers' payloads alone, so op N+1
+    can ring the doorbell before the proxy has seen op N.  Rank 1 stops its
+    proxy thread, launches two all-reduces, and restarts the thread only once
+    the second doorbell has overwritten the first; the peers wait on rank 1's
+    first payload in the meantime.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    inputs, expected = [], []
+    for i in range(2):
+        torch.manual_seed(900 + 10 * i + rank)
+        x = torch.randn(8192, dtype=torch.bfloat16, device=runtime.device)
+        e = x.clone()
+        dist.all_reduce(e)
+        inputs.append(x)
+        expected.append(e)
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 1:
+        runtime._proxy.stop()
+    outs = [runtime.all_reduce(x) for x in inputs]
+    if rank == 1:
+        posted = runtime._proxy.stats()["last_seq"]
+        deadline = time.monotonic() + 20
+        # Poll the host-side control word; ``runtime.stats()`` reads the device
+        # epoch and would synchronize the stream, i.e. wait for the stuck op.
+        while int(runtime._ctrl_words[0].item()) != posted + 2:
+            assert time.monotonic() < deadline, "second doorbell never rang"
+            time.sleep(0.001)
+        runtime._proxy.start()
+    torch.cuda.synchronize()
+    runtime.check_health()
+    rtol, atol = _tolerance(torch.bfloat16, world)
+    for out, exp in zip(outs, expected, strict=True):
+        torch.testing.assert_close(out, exp, rtol=rtol, atol=atol)
+    dist.barrier()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.int32])
