@@ -1028,7 +1028,7 @@ def _context_hidden(in_features: int, out_features: int) -> int:
     H x H neighbour and one H <-> K/N neighbour, like attention-out + MLP.
     """
     hidden = in_features if in_features <= out_features else out_features
-    return max(256, (hidden // 128) * 128)
+    return max(256, -(-hidden // 128) * 128)
 
 
 class _LayerContext:
@@ -1067,9 +1067,12 @@ class _LayerContext:
             )
             return operands, k, n
 
+        # The MXFP8 neighbours need K % 32 == 0 and N % 16 == 0; tiny tested
+        # widths (mixer heads, N=48) are zero-padded into the neighbour.
+        self.filler_out_k = -(-out_features // 32) * 32
         self.fillers_in = [filler(self.hidden, in_features) for _ in range(self.layers)]
         self.fillers_out = [
-            filler(out_features, self.hidden) for _ in range(self.layers)
+            filler(self.filler_out_k, self.hidden) for _ in range(self.layers)
         ]
         self.under_test = [
             _DenseLinearOperands(
@@ -1169,6 +1172,10 @@ class _LayerContext:
                     buffer.copy_(source)
                 activation = buffers
             c = self.under_test[layer].run(activation, plan=plan, expected_m=tokens)
+            if self.filler_out_k != self.out_features:
+                c = torch.nn.functional.pad(
+                    c, (0, self.filler_out_k - self.out_features)
+                )
             f_out, k_out, n_out = self.fillers_out[layer]
             b = self._dense_linear.mm(
                 c,
