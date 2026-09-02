@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from rich.progress import (
 
 from b12x.policy import DetectedDevice, DeviceIdentity, detect_device
 
+from .crash_guard import promote_inflight
 from .contracts import (
     ComponentGenerator,
     GenerationContext,
@@ -75,6 +77,54 @@ class _MeasurementProgress:
 @dataclass(frozen=True, kw_only=True)
 class _WorkerReady:
     device_ordinal: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class _WorkerPoisoned:
+    partition: MeasurementPartition
+    device_ordinal: int
+    blamed: tuple[str, str] | None
+
+
+def _cuda_context_poisoned() -> bool:
+    """A sticky CUDA error fails every later call: probe with a tiny one."""
+    import torch
+
+    try:
+        torch.cuda.synchronize()
+        torch.zeros(1, device="cuda").sum().item()
+    except Exception:
+        return True
+    return False
+
+
+def _hold_poisoned_worker(task: _MeasurementTask, exc: BaseException) -> None:
+    """Blame this worker's own in-flight candidate, then idle until released.
+
+    The worker stays alive so the pool keeps its other GPUs busy on the
+    remaining partitions; it fails its partition once the parent sets the
+    stop event, after everything else has drained.
+    """
+    detected = _WORKER_DEVICE
+    ordinal = None if detected is None else detected.ordinal
+    blamed = promote_inflight(task.work_dir, worker=os.getpid())
+    if _WORKER_PROGRESS_QUEUE is not None and ordinal is not None:
+        _WORKER_PROGRESS_QUEUE.put(
+            _WorkerPoisoned(
+                partition=task.partition,
+                device_ordinal=ordinal,
+                blamed=blamed,
+            )
+        )
+    if _WORKER_STOP_EVENT is not None:
+        while not _WORKER_STOP_EVENT.wait(1.0):
+            pass
+    where = "" if blamed is None else f"; blamed candidate {blamed[1]} of {blamed[0]}"
+    raise RuntimeError(
+        f"cuda:{ordinal} CUDA context was poisoned measuring "
+        f"{task.partition.component_id}/{task.partition.partition_id}{where}; "
+        "rerun the same command to resume from the checkpoints"
+    ) from exc
 
 
 class _WorkerProgressReporter:
@@ -183,11 +233,16 @@ def _run_task(task: _MeasurementTask) -> _MeasurementResult:
         )
     progress = _WorkerProgressReporter(task.partition)
     progress.start_component(estimate)
-    result = generator.generate(
-        context,
-        progress=progress,
-        checkpoints=CheckpointStore(task.work_dir / "checkpoints"),
-    )
+    try:
+        result = generator.generate(
+            context,
+            progress=progress,
+            checkpoints=CheckpointStore(task.work_dir / "checkpoints"),
+        )
+    except Exception as exc:
+        if _cuda_context_poisoned():
+            _hold_poisoned_worker(task, exc)
+        raise
     if result.completed_work_units != task.partition.work_units:
         raise RuntimeError(
             f"measurement partition {task.partition.partition_id!r} completed "
@@ -268,6 +323,7 @@ def run_parallel_measurements(
             completed: set[MeasurementPartition] = set()
             worker_tasks: dict[int, int] = {}
             worker_completed: dict[int, int] = {}
+            poisoned: set[MeasurementPartition] = set()
 
             def ensure_worker_task(device_ordinal: int) -> int:
                 task = worker_tasks.get(device_ordinal)
@@ -301,6 +357,25 @@ def run_parallel_measurements(
                     if isinstance(event, _WorkerReady):
                         ensure_worker_task(event.device_ordinal)
                         update_overall()
+                        continue
+                    if isinstance(event, _WorkerPoisoned):
+                        poisoned.add(event.partition)
+                        blamed = (
+                            "the case setup"
+                            if event.blamed is None
+                            else f"candidate {event.blamed[1]} of {event.blamed[0]}"
+                        )
+                        console.print(
+                            f"[bold red]cuda:{event.device_ordinal} CUDA context "
+                            f"poisoned measuring {event.partition.component_id}/"
+                            f"{event.partition.partition_id}; blamed {blamed}; "
+                            "that GPU idles until the other partitions finish"
+                            "[/bold red]"
+                        )
+                        progress.update(
+                            ensure_worker_task(event.device_ordinal),
+                            detail=f"context poisoned · blamed {blamed}",
+                        )
                         continue
                     if not isinstance(event, _MeasurementProgress):
                         raise TypeError("worker progress event has the wrong type")
@@ -361,6 +436,10 @@ def run_parallel_measurements(
                         ),
                     )
                     update_overall(advance=remaining)
+                if pending and all(futures[item] in poisoned for item in pending):
+                    # Only poisoned workers are left holding their partition:
+                    # release them so their failures are reported together.
+                    stop_event.set()
             drain_progress()
             for device_ordinal, worker_task in worker_tasks.items():
                 progress.update(

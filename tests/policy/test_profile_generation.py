@@ -118,9 +118,9 @@ def test_partition_shard_parser_uses_human_friendly_indices() -> None:
 def test_default_profile_id_reuses_embedded_multi_target_profile() -> None:
     profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
 
-    assert {
-        _profile_id_for_device(target) for target in profile.targets
-    } == {profile.profile_id}
+    assert {_profile_id_for_device(target) for target in profile.targets} == {
+        profile.profile_id
+    }
 
 
 def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None:
@@ -153,6 +153,81 @@ def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None
     )
 
     assert events == [parallel._WorkerReady(device_ordinal=3)]
+
+
+def test_poisoned_worker_blames_its_own_candidate_and_holds_until_released(
+    monkeypatch, tmp_path
+) -> None:
+    """A sticky CUDA error must blacklist only the crashing worker's candidate."""
+    import os
+
+    from b12x.policy.generation.crash_guard import load_crashed, mark_inflight
+
+    events = []
+
+    class ProgressQueue:
+        def put(self, event):
+            events.append(event)
+
+    class StopEvent:
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout):
+            del timeout
+            self.waits += 1
+            return self.waits >= 3
+
+        def is_set(self):
+            return False
+
+    class Failing(_Generator):
+        def generate(self, context, *, progress, checkpoints):
+            del context, progress, checkpoints
+            mark_inflight(tmp_path, "case-a", "cand-9")
+            mark_inflight(tmp_path, "case-b", "cand-1", worker=os.getpid() + 1)
+            raise RuntimeError("CUDA error: an illegal memory access")
+
+    identity = object()
+    from b12x.policy.generation.sharding import _FULL_COMPONENT_PARTITION
+
+    partition = MeasurementPartition(
+        component_id="synthetic",
+        partition_id=_FULL_COMPONENT_PARTITION,
+        work_units=1,
+        case_count=1,
+        description="only",
+    )
+    registry = ComponentGeneratorRegistry()
+    registry.register(Failing(component_id="synthetic"))
+    stop_event = StopEvent()
+    monkeypatch.setattr(
+        parallel, "_WORKER_DEVICE", SimpleNamespace(identity=identity, ordinal=5)
+    )
+    monkeypatch.setattr(parallel, "_WORKER_PROGRESS_QUEUE", ProgressQueue())
+    monkeypatch.setattr(parallel, "_WORKER_REGISTRY", registry)
+    monkeypatch.setattr(parallel, "_WORKER_STOP_EVENT", stop_event)
+    monkeypatch.setattr(parallel, "_cuda_context_poisoned", lambda: True)
+    task = parallel._MeasurementTask(
+        partition=partition,
+        expected_device=identity,
+        work_dir=tmp_path,
+        source_revision="test",
+        settings=GenerationSettings(),
+    )
+    with pytest.raises(RuntimeError, match="poisoned.*cand-9 of case-a"):
+        parallel._run_task(task)
+    assert stop_event.waits == 3
+    assert load_crashed(tmp_path) == {("case-a", "cand-9")}
+    assert (tmp_path / f"inflight-candidate-{os.getpid() + 1}.json").exists()
+    poisoned = [
+        event for event in events if isinstance(event, parallel._WorkerPoisoned)
+    ]
+    assert poisoned == [
+        parallel._WorkerPoisoned(
+            partition=partition, device_ordinal=5, blamed=("case-a", "cand-9")
+        )
+    ]
 
 
 @dataclass(frozen=True)

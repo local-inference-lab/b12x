@@ -1304,6 +1304,19 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
         settings = self._context.settings
         device = torch.device("cuda", self._context.device_ordinal)
         tokens = int(case.query["max_tokens"])
+        crashed = load_crashed(self._context.work_dir)
+        if (case.case_id, "*") in crashed:
+            # Setting the case up (operands, reference, layer stack) crashed the
+            # context in an earlier run: report every candidate as such.
+            return tuple(
+                SweepMeasurement(
+                    candidate=candidate,
+                    latency_us=None,
+                    correct=False,
+                    error=CRASHED_ERROR,
+                )
+                for candidate in candidates
+            )
         mark_inflight(self._context.work_dir, case.case_id, "*")
         with torch.cuda.device(self._context.device_ordinal):
             operands = self._operands_for(case, device)
@@ -1328,19 +1341,6 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
             )
             layers = self._layers_for(case, device)
             layers.prepare(tokens, generator)
-            crashed = load_crashed(self._context.work_dir)
-            if (case.case_id, "*") in crashed:
-                # Setting the case up (operands, reference, layer stack) crashed
-                # the context in an earlier run: report every candidate as such.
-                return tuple(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=None,
-                        correct=False,
-                        error=CRASHED_ERROR,
-                    )
-                    for candidate in candidates
-                )
             baseline_config = self._baseline_config(case)
             races: dict = {}
             measurements = []
@@ -1706,6 +1706,19 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
         inv_rope = bool(case.metadata.get("inv_rope", False))
         nope_dim = int(case.metadata.get("nope_dim", 448))
         rope_dim = int(case.metadata.get("rope_dim", 64))
+        crashed = load_crashed(self._context.work_dir)
+        if (case.case_id, "*") in crashed:
+            # Setting the case up (operands, reference, layer stack) crashed the
+            # context in an earlier run: report every candidate as such.
+            return tuple(
+                SweepMeasurement(
+                    candidate=candidate,
+                    latency_us=None,
+                    correct=False,
+                    error=CRASHED_ERROR,
+                )
+                for candidate in candidates
+            )
         mark_inflight(self._context.work_dir, case.case_id, "*")
         with torch.cuda.device(self._context.device_ordinal):
             data = make_case(
@@ -1788,19 +1801,6 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
             )
             layers.caps_nope_dim = nope_dim
             layers.caps_rope_dim = rope_dim
-            crashed = load_crashed(self._context.work_dir)
-            if (case.case_id, "*") in crashed:
-                # Setting the case up (operands, reference, layer stack) crashed
-                # the context in an earlier run: report every candidate as such.
-                return tuple(
-                    SweepMeasurement(
-                        candidate=candidate,
-                        latency_us=None,
-                        correct=False,
-                        error=CRASHED_ERROR,
-                    )
-                    for candidate in candidates
-                )
             baseline_config = self._baseline_config(case)
             races: dict = {}
             measurements = []

@@ -47,14 +47,23 @@ def clear_inflight(work_dir: Path, *, worker: int | None = None) -> None:
         path.unlink()
 
 
-def promote_inflight(work_dir: Path) -> tuple[str, str] | None:
-    """Move every leftover in-flight marker onto the crashed list.
+def promote_inflight(
+    work_dir: Path, *, worker: int | None = None
+) -> tuple[str, str] | None:
+    """Move leftover in-flight markers onto the crashed list.
 
-    Returns the last promoted (case_id, candidate_id), or ``None`` when no
-    marker was left behind.
+    Promotes every marker left behind by a dead run, or only ``worker``'s own
+    marker when a live worker blames itself. Returns the last promoted
+    (case_id, candidate_id), or ``None`` when nothing was in flight.
     """
     promoted: tuple[str, str] | None = None
-    for path in sorted(Path(work_dir).glob(f"{_INFLIGHT_PREFIX}*.json")):
+    if worker is None:
+        paths = sorted(Path(work_dir).glob(f"{_INFLIGHT_PREFIX}*.json"))
+    else:
+        paths = [_inflight_path(work_dir, worker)]
+    for path in paths:
+        if not path.exists():
+            continue
         entry = json.loads(path.read_text())
         crashed_path = Path(work_dir) / _CRASHED
         entries = json.loads(crashed_path.read_text()) if crashed_path.exists() else []

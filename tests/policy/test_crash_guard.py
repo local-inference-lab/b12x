@@ -39,3 +39,13 @@ def test_every_worker_marker_is_promoted_and_only_own_marker_cleared(tmp_path) -
         ("case-c", "cand-3"),
         ("case-d", "cand-4"),
     }
+
+
+def test_live_worker_promotes_only_its_own_marker(tmp_path) -> None:
+    """A worker that poisoned its context blames itself, not its healthy peers."""
+    mark_inflight(tmp_path, "case-a", "cand-1", worker=11)
+    mark_inflight(tmp_path, "case-b", "cand-2", worker=22)
+    assert promote_inflight(tmp_path, worker=22) == ("case-b", "cand-2")
+    assert promote_inflight(tmp_path, worker=22) is None
+    assert load_crashed(tmp_path) == {("case-b", "cand-2")}
+    assert promote_inflight(tmp_path) == ("case-a", "cand-1")
