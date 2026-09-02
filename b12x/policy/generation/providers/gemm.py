@@ -550,11 +550,12 @@ _GEMM_BASELINE_MARGIN = 0.03
 
 def _device_identity(context):
     """Identity the built-in heuristics key on (SM count decides the Spark rules)."""
-    from b12x.policy import PolicyContext, PolicyMode
+    from b12x.policy import DeviceIdentity, PolicyContext, PolicyMode
 
-    return PolicyContext.for_device(
-        context.device, mode=PolicyMode.HEURISTIC_ONLY
-    ).device
+    device = context.device
+    if isinstance(device, DeviceIdentity):
+        return device
+    return PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY).device
 
 
 def _env_filter(name: str) -> tuple[str, ...] | None:
