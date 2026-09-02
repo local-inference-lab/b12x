@@ -25,6 +25,7 @@ BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 
 
 def _cache_dir() -> Path:
+    """Directory for the compiled proxy library: ``B12X_ROCE_CACHE_DIR``, else ``<XDG cache>/b12x/roce``."""
     override = os.getenv("B12X_ROCE_CACHE_DIR")
     if override:
         return Path(override)
@@ -33,6 +34,7 @@ def _cache_dir() -> Path:
 
 
 def _compiler() -> str:
+    """Host C compiler used to build the proxy (``CC``, gcc, cc, or clang)."""
     for candidate in (os.getenv("CC"), "gcc", "cc", "clang"):
         if candidate and shutil.which(candidate):
             return candidate
@@ -43,6 +45,7 @@ def _compiler() -> str:
 
 
 def _build() -> Path:
+    """Compile the proxy source into the cache directory keyed by source hash; returns the .so path."""
     source = _SOURCE.read_bytes()
     digest = hashlib.sha256(source).hexdigest()[:16]
     cache = _cache_dir()
@@ -139,6 +142,7 @@ class Layout:
     )
 
     def __init__(self, world_size: int, slot_bytes: int) -> None:
+        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         out = (ctypes.c_uint64 * 7)()
         if load().roce_layout(int(world_size), int(slot_bytes), out) != 0:
             raise ValueError(
@@ -170,6 +174,7 @@ class Proxy:
         region_bytes: int,
         slot_bytes: int,
     ) -> None:
+        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self._lib = load()
         names = (ctypes.c_char_p * len(hca_names))(*[n.encode() for n in hca_names])
         err = ctypes.create_string_buffer(512)
@@ -192,6 +197,7 @@ class Proxy:
         self.hca_names = tuple(hca_names)
 
     def local_blob(self) -> bytes:
+        """Serialized connection record (region address, keys, queue-pair numbers) to send to every peer."""
         n = int(self._lib.roce_blob_bytes())
         buf = ctypes.create_string_buffer(n)
         if self._lib.roce_local_blob(self._ctx, buf, n) != 0:
@@ -199,6 +205,7 @@ class Proxy:
         return buf.raw
 
     def connect(self, blobs: list[bytes]) -> None:
+        """Connect the queue pairs from every rank's ``local_blob``, in rank order."""
         n = int(self._lib.roce_blob_bytes())
         if len(blobs) != self.world_size or any(len(b) != n for b in blobs):
             raise RuntimeError(BLOB_STRUCT_ERR)
@@ -208,6 +215,7 @@ class Proxy:
             raise RuntimeError(f"RoCE queue-pair connect failed: {self.error()}")
 
     def start(self) -> None:
+        """Start the proxy thread; a restart resumes from the last posted sequence."""
         if self._lib.roce_start(self._ctx) != 0:
             raise RuntimeError(f"RoCE proxy thread failed to start: {self.error()}")
 
@@ -216,13 +224,16 @@ class Proxy:
         self._lib.roce_stop(self._ctx)
 
     def failed(self) -> bool:
+        """True once the proxy thread has stopped on an error."""
         return bool(self._lib.roce_failed(self._ctx))
 
     def error(self) -> str:
+        """The proxy's last error message, empty when none."""
         raw = self._lib.roce_error(self._ctx)
         return raw.decode(errors="replace") if raw else ""
 
     def stats(self) -> dict[str, int]:
+        """Counters: ops posted, RDMA writes completed, last posted sequence."""
         return {
             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
@@ -230,14 +241,17 @@ class Proxy:
         }
 
     def peer_hca(self, peer: int) -> int:
+        """Index of the HCA that carries traffic to ``peer``."""
         return int(self._lib.roce_peer_hca(self._ctx, int(peer)))
 
     def close(self) -> None:
+        """Stop the thread and release the RDMA resources."""
         ctx, self._ctx = self._ctx, None
         if ctx:
             self._lib.roce_destroy(ctx)
 
     def __del__(self) -> None:  # pragma: no cover - defensive teardown
+        """Release the RDMA resources if ``close`` was never called."""
         with contextlib.suppress(Exception):
             self.close()
 
