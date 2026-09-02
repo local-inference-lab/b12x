@@ -154,15 +154,19 @@ B12X_PCIE_DMA_FP8=i8_ring python -m your_server
 ### Graph replay of eager ring all-reduces
 
 An eager `PCIeDmaAllReduce.all_reduce` call issues roughly 250 CUDA API calls
-from Python (per-piece copies, flag kernels, adds, cross-stream events). On a
-prefill-size tensor that host time (about 2.4 ms per 22 MiB call on a
-desktop-class host) exceeds the wire time, so a Python-driven serving loop
-becomes launch-bound. `B12X_PCIE_DMA_GRAPH_REPLAY=1` captures each eligible
-shape once into a CUDA graph over static input/output buffers (on the shape's
-second call, so one-off sizes stay eager) and replays it afterwards with a
-copy in and a copy out. The kernels and their order are unchanged, so the
-result is bit-identical to the eager call; calls made while an enclosing CUDA
-graph is being captured keep recording the eager sequence into that graph.
+from Python (per-piece copies, flag kernels, adds, cross-stream events), so a
+Python-driven serving loop that reduces prefill-size tensors is bound by that
+issue time rather than by the wire. `B12X_PCIE_DMA_GRAPH_REPLAY=1` captures
+each eligible shape once into a CUDA graph over static input/output buffers
+(on the shape's second call, so one-off sizes stay eager) and replays it
+afterward with a copy in and a copy out. The graph records the eager kernels
+in their eager order over the same flag counters, so a replay computes the
+same bits as the eager call (`tests/comm/test_pcie_dma_gpu.py` asserts
+`torch.equal` against the eager result across replays, shape reuse and an
+enclosing capture); calls made while an enclosing CUDA graph is being
+captured keep recording the eager sequence into that graph. A caller-supplied
+`out` must match the input shape and dtype, live on the ring's device and be
+contiguous on both paths.
 
 | Variable | Default | Meaning |
 |---|---|---|
