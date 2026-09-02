@@ -44,6 +44,7 @@ include = ["b12x*"]
 
 [tool.setuptools.package-data]
 "b12x.policy._profiles" = ["data/*.json.gz"]
+"b12x.comm.roce" = ["*.c"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "SIM"]
