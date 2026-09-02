@@ -277,3 +277,37 @@ marker for the candidate being raced; rerunning the same command promotes a
 leftover marker to `crashed-candidates.json`, skips that candidate with an
 explicit error, and resumes from the checkpoints, so a retry loop around the
 command finishes the profile without re-racing the crash.
+
+### MoE decode in place
+
+`moe.decode` keeps its three stages. The screen stage still measures each
+candidate alone (isolated correctness gates and an independent oracle). The
+coarse and full stages run the fused MoE as the tested slot of the generic
+layer stack: an MXFP8 attention-out neighbour writes the MoE input, the
+router's top-k ids and weights are refreshed in-graph from the host-synthesized
+route pattern, every layer owns its own expert weights (the layer count is
+budgeted from free device memory, down to one), and a closing neighbour plus
+residual/RMSNorm feed the next layer. The isolated replay still gates
+correctness; `latency_us` is the in-place op time, with `isolated_us`,
+`stack_us` and `context_layers` in the metrics. The leader is re-timed
+interleaved against the runtime's built-in decode config and the route-robust
+reduction keeps that config unless the leader beats it by 2%
+(`baseline_kept_query_points` / `baseline_missing_query_points` in the
+evidence). MoE checkpoints are schema 3 / candidate contract 7; older
+checkpoints are re-measured.
+
+### Parallel generation on a multi-GPU host
+
+```bash
+# 12 identical GPUs, one shared work dir, checkpoints per case id.
+until ./scripts/generate_gpu_profile.py --devices all \
+      --components moe.decode --work-dir "$WORK" --output "$OUT" --overwrite; do
+  sleep 10   # a crashed candidate is skipped on the rerun; the rest resume
+done
+```
+
+Each worker process keeps its own in-flight marker, a failed partition no
+longer stops the other workers (the command raises after the remaining
+partitions finish), and `--partition-shard i/N` splits the same corpus across
+hosts whose checkpoint directories are merged by copying before one final
+unsharded run reduces and embeds.
