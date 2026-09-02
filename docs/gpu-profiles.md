@@ -258,6 +258,13 @@ qualify itself. A case whose every candidate raises or fails the gate is skipped
 and listed under the component's `coverage.skipped_cases`; its query points
 inherit the neighbouring measured plans.
 
-Both GEMM components reduce with a 3% baseline margin: the built-in plan keeps
-a query point unless a measured candidate beats it by more than that, so the
-embedded profile only carries deliberate wins.
+`gemm.dense_linear` candidates are ranked inside a generic three-layer
+transformer-like stack sized from the shape under test (an H x K neighbour
+before, an N x H neighbour after, residual and RMSNorm between layers, with
+H taken from the narrower side of the GEMM). The tested GEMM therefore sees an
+L2-warm activation, cold streamed weights, and real launch overlap, which a
+lone kernel behind an L2 flush does not reproduce; the isolated latency is kept
+in the measurement metrics as evidence only. Both GEMM components reduce with a
+baseline margin (1% of the stack time for dense, 3% of the chain time for WO):
+the built-in plan keeps a query point unless a measured candidate beats it by
+more than that, so the embedded profile only carries deliberate wins.

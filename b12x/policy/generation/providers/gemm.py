@@ -718,12 +718,21 @@ class _DenseLinearOperands:
     """
 
     def __init__(
-        self, *, recipe: str, in_features: int, out_features: int, device, generator
+        self,
+        *,
+        recipe: str,
+        in_features: int,
+        out_features: int,
+        device,
+        generator,
+        with_reference: bool = True,
     ) -> None:
         import torch
 
         from b12x.gemm import mxfp8_linear, tensor_fp8_linear
 
+        self.with_reference = with_reference
+        self.weight_dequant = None
         self.recipe = recipe
         self.in_features = in_features
         self.out_features = out_features
@@ -737,7 +746,8 @@ class _DenseLinearOperands:
             ).mul_(0.125)
             values, scales = _quantize_bf16_mxfp8(weight)
             self.packed = mxfp8_linear.pack_weight(values, scales)
-            self.weight_dequant = _dequantize_mxfp8(values, scales)
+            if with_reference:
+                self.weight_dequant = _dequantize_mxfp8(values, scales)
         elif recipe == "tensor_fp8":
             weight = torch.randn(
                 (n, k), dtype=torch.bfloat16, device=device, generator=generator
@@ -748,7 +758,8 @@ class _DenseLinearOperands:
             )
             weight_fp8 = weight.to(torch.float8_e4m3fn)
             self.packed = tensor_fp8_linear.pack_weight(weight_fp8, output_scale)
-            self.weight_dequant = weight_fp8.float()
+            if with_reference:
+                self.weight_dequant = weight_fp8.float()
         elif recipe in ("nvfp4", "mxfp4"):
             self.weight = torch.randint(
                 0,
@@ -763,9 +774,10 @@ class _DenseLinearOperands:
             scale_rows, self.weight_scale = _random_block_scales(
                 n, k, vec_size=vec, scale_dtype=sdt, generator=generator, device=device
             )
-            self.weight_dequant = _dequantize_fp4(
-                self.weight, scale_rows, vec_size=vec, scale_dtype=sdt
-            )
+            if with_reference:
+                self.weight_dequant = _dequantize_fp4(
+                    self.weight, scale_rows, vec_size=vec, scale_dtype=sdt
+                )
             if recipe == "nvfp4":
                 self.output_scale = 1.0 / 64.0
                 self.alpha = torch.tensor(
@@ -790,12 +802,13 @@ class _DenseLinearOperands:
                 .mul_(0.5)
                 .add_(0.75)
             )
-            self.weight_dequant = (
-                self.weight.float()
-                * self.weight_scale.repeat_interleave(128, dim=0).repeat_interleave(
-                    128, dim=1
+            if with_reference:
+                self.weight_dequant = (
+                    self.weight.float()
+                    * self.weight_scale.repeat_interleave(128, dim=0).repeat_interleave(
+                        128, dim=1
+                    )
                 )
-            )
             self.packed = None
         else:
             raise ValueError(f"unsupported dense linear recipe {recipe!r}")
@@ -997,11 +1010,209 @@ def _graph_race(
     )
 
 
+# The GEMM under test is timed inside a generic transformer-like stack instead
+# of alone behind an L2 flush: its activation arrives L2-warm from the previous
+# GEMM, its weights stream cold like every layer's, its output feeds the next
+# kernel, and launches overlap as they do in a real step. The stack is sized
+# from the shape under test, not from any particular model.
+_CONTEXT_LAYERS = 3
+_CONTEXT_MARGIN = 0.01
+_BF16_INPUT_RECIPES = frozenset({"mxfp8", "tensor_fp8"})
+
+
+def _context_hidden(in_features: int, out_features: int) -> int:
+    """Hidden width of the synthetic layer around a (K, N) GEMM.
+
+    An up-like GEMM (K <= N) widens the hidden state, so H = K; a down-like
+    GEMM narrows it back, so H = N. Either way the stack keeps one square
+    H x H neighbour and one H <-> K/N neighbour, like attention-out + MLP.
+    """
+    hidden = in_features if in_features <= out_features else out_features
+    return max(256, (hidden // 128) * 128)
+
+
+class _LayerContext:
+    """Generic transformer layers around the GEMM under test."""
+
+    def __init__(
+        self,
+        *,
+        recipe: str,
+        in_features: int,
+        out_features: int,
+        device,
+        generator,
+        layers: int = _CONTEXT_LAYERS,
+    ) -> None:
+        import torch
+
+        from b12x.gemm import dense_linear
+        from b12x.policy import PolicyContext, PolicyMode
+
+        self.recipe = recipe
+        self.in_features = in_features
+        self.out_features = out_features
+        self.device = device
+        self.layers = int(layers)
+        self.hidden = _context_hidden(in_features, out_features)
+
+        def filler(k: int, n: int):
+            operands = _DenseLinearOperands(
+                recipe="mxfp8",
+                in_features=k,
+                out_features=n,
+                device=device,
+                generator=generator,
+                with_reference=False,
+            )
+            return operands, k, n
+
+        self.fillers_in = [filler(self.hidden, in_features) for _ in range(self.layers)]
+        self.fillers_out = [
+            filler(out_features, self.hidden) for _ in range(self.layers)
+        ]
+        self.under_test = [
+            _DenseLinearOperands(
+                recipe=recipe,
+                in_features=in_features,
+                out_features=out_features,
+                device=device,
+                generator=generator,
+                with_reference=False,
+            )
+            for _ in range(self.layers)
+        ]
+        self._heuristic = PolicyContext.for_device(
+            device, mode=PolicyMode.HEURISTIC_ONLY
+        )
+        self._filler_plans: dict[tuple[int, int, int], object] = {}
+        self._dense_linear = dense_linear
+        self.norm_weight = torch.ones(self.hidden, dtype=torch.bfloat16, device=device)
+        self.tokens = 0
+        self.hidden_state = None
+        self.quant_sources = None
+        self.quant_buffers = None
+
+    def _filler_plan(self, k: int, n: int, tokens: int):
+        key = (k, n, tokens)
+        plan = self._filler_plans.get(key)
+        if plan is None:
+            import torch
+
+            caps = self._dense_linear.Caps(
+                device=self.device,
+                recipe="mxfp8",
+                in_features=k,
+                out_features=n,
+                max_tokens=tokens,
+                output_dtype=torch.bfloat16,
+            )
+            plan = self._dense_linear.plan(caps, policy=self._heuristic)
+            self._filler_plans[key] = plan
+        return plan
+
+    def prepare(self, tokens: int, generator) -> None:
+        """Per-capacity buffers: the hidden state and prequantized stand-ins."""
+        import torch
+
+        self.tokens = int(tokens)
+        self.hidden_state = torch.randn(
+            (self.tokens, self.hidden),
+            dtype=torch.bfloat16,
+            device=self.device,
+            generator=generator,
+        )
+        self.quant_sources = None
+        self.quant_buffers = None
+        if self.recipe not in _BF16_INPUT_RECIPES:
+            # A production quant kernel writes these right before the GEMM; a
+            # copy from a fixed source leaves them equally L2-warm.
+            self.quant_sources = [
+                operands.activation(self.tokens, generator)[0]
+                for operands in self.under_test
+            ]
+            self.quant_buffers = [
+                tuple(part.clone() for part in source) for source in self.quant_sources
+            ]
+
+    def _rmsnorm(self, x):
+        import torch
+
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        return (x.float() * torch.rsqrt(variance + 1e-6)).to(torch.bfloat16) * (
+            self.norm_weight
+        )
+
+    def run(self, plan):
+        """One step through every layer with ``plan`` in the tested slot."""
+        import torch
+
+        tokens = self.tokens
+        h = self.hidden_state
+        for layer in range(self.layers):
+            f_in, k_in, n_in = self.fillers_in[layer]
+            a = self._dense_linear.mm(
+                h,
+                f_in.packed,
+                plan=self._filler_plan(k_in, n_in, tokens),
+                expected_m=tokens,
+            )
+            if self.recipe == "mxfp8":
+                activation = (a,)
+            elif self.recipe == "tensor_fp8":
+                activation = (a.to(torch.float8_e4m3fn),)
+            else:
+                buffers = self.quant_buffers[layer]
+                for buffer, source in zip(
+                    buffers, self.quant_sources[layer], strict=True
+                ):
+                    buffer.copy_(source)
+                activation = buffers
+            c = self.under_test[layer].run(activation, plan=plan, expected_m=tokens)
+            f_out, k_out, n_out = self.fillers_out[layer]
+            b = self._dense_linear.mm(
+                c,
+                f_out.packed,
+                plan=self._filler_plan(k_out, n_out, tokens),
+                expected_m=tokens,
+            )
+            h = self._rmsnorm(h + b)
+        return h
+
+
+def _context_race(*, context, plan, settings, device, flush):
+    """Capture the layer stack with ``plan`` in the tested slot and time replays."""
+    import torch
+
+    for _ in range(settings.warmup):
+        context.run(plan)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = context.run(plan)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    finite = bool(torch.isfinite(output).all().item())
+    pilot = _cuda_event_samples_us(graph.replay, count=1, device=device, flush=flush)[0]
+    repetitions = _bounded_repetitions(settings, pilot_us=pilot)
+    samples = _cuda_event_samples_us(
+        graph.replay,
+        count=settings.groups * repetitions,
+        device=device,
+        flush=flush,
+    )
+    latency = _median_of_group_medians(
+        samples, groups=settings.groups, repetitions=repetitions
+    )
+    return latency, finite, repetitions
+
+
 class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
     def __init__(self, context, cases: tuple[SweepCase, ...]) -> None:
         self._context = context
         self._cases = cases
         self._operands: _DenseLinearOperands | None = None
+        self._layers: _LayerContext | None = None
 
     def __enter__(self) -> "_DenseLinearSession":
         return self
@@ -1010,10 +1221,37 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
         import torch
 
         self._operands = None
+        self._layers = None
         gc.collect()
         torch.cuda.synchronize(self._context.device_ordinal)
         torch.cuda.empty_cache()
         return None
+
+    def _layers_for(self, case: SweepCase, device) -> _LayerContext:
+        import torch
+
+        recipe = str(case.query["recipe"])
+        k = int(case.query["in_features"])
+        n = int(case.query["out_features"])
+        if self._layers is None or (
+            self._layers.recipe,
+            self._layers.in_features,
+            self._layers.out_features,
+        ) != (recipe, k, n):
+            self._layers = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            generator = torch.Generator(device=device).manual_seed(
+                self._context.settings.seed + 7919
+            )
+            self._layers = _LayerContext(
+                recipe=recipe,
+                in_features=k,
+                out_features=n,
+                device=device,
+                generator=generator,
+            )
+        return self._layers
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
         return tuple(
@@ -1083,6 +1321,8 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                 max_tokens=tokens,
                 output_dtype=torch.bfloat16,
             )
+            layers = self._layers_for(case, device)
+            layers.prepare(tokens, generator)
             measurements = []
             for candidate in candidates:
                 try:
@@ -1093,7 +1333,10 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                     def run(plan=plan):
                         return operands.run(activation, plan=plan, expected_m=tokens)
 
-                    latency, correct, metrics = _graph_race(
+                    # Correctness and the isolated latency come from the lone
+                    # GEMM; the score that ranks candidates comes from the
+                    # generic layer stack around it.
+                    isolated, correct, metrics = _graph_race(
                         run=run,
                         output_of=lambda out: out,
                         baseline=baseline,
@@ -1101,6 +1344,25 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                         device=device,
                         flush=flush,
                     )
+                    latency = isolated
+                    if correct:
+                        latency, finite, repetitions = _context_race(
+                            context=layers,
+                            plan=plan,
+                            settings=settings,
+                            device=device,
+                            flush=flush,
+                        )
+                        correct = finite
+                        metrics = dict(metrics)
+                        metrics.update(
+                            {
+                                "isolated_us": isolated,
+                                "context_layers": layers.layers,
+                                "context_hidden": layers.hidden,
+                                "context_repetitions": repetitions,
+                            }
+                        )
                     measurements.append(
                         SweepMeasurement(
                             candidate=candidate,
@@ -1146,9 +1408,9 @@ class DenseLinearGenerator(DiscreteSweepGenerator):
             cases=_default_dense_linear_cases() if cases is None else cases,
             benchmark_factory=_DenseLinearFactory(),
             coverage={"corpus": "gemm_corpus.MODEL_LINEARS"},
-            candidate_contract_version=1,
+            candidate_contract_version=2,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
-            baseline_margin=_GEMM_BASELINE_MARGIN,
+            baseline_margin=_CONTEXT_MARGIN,
         )
 
     def baseline_config(self, case, context):
