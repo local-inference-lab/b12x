@@ -48,6 +48,7 @@ _OPS: tuple[str, ...] = (
     "attention.qsa",
     "attention.varlen",
     "comm.pcie",
+    "comm.roce",
     "gemm.bf16_gemv",
     "gemm.bf16_vocab_projection",
     "gemm.blockscaled",
