@@ -228,7 +228,12 @@ def _reduce_split_k2_bf16(
                 partials, out, total, SLICES=slices, BLOCK=block
             )
     else:
-        out[:, :, 0].copy_(partials.float().sum(dim=2).to(out.dtype))
+        # Same arithmetic as the kernels: slices added in index order in
+        # FP32, one rounding at the final store.
+        accum = partials[:, :, 0].to(torch.float32).clone()
+        for s in range(1, slices):
+            accum += partials[:, :, s].to(torch.float32)
+        out[:, :, 0].copy_(accum.to(out.dtype))
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -528,9 +533,12 @@ def _dense_gemm_policy_for(
         and k % 256 == 0
         and l == 1
     ):
-        # Narrow-N, deep-K decode projections (e.g. hidden -> latent, q_a,
-        # kv_a, shared-expert gate/up at TP8) launch only n / tile_n CTAs
-        # and stream their weights at a fraction of HBM bandwidth. Split K
+        # Narrow-N, deep-K decode projections -- the MLA down-projections
+        # from the hidden size to the small query / key-value latent widths
+        # (q_a_proj, kv_a_proj) and the shared-expert gate/up projections
+        # once tensor parallelism has split their N over eight ranks --
+        # launch only n / tile_n CTAs and stream their weights at a fraction
+        # of HBM bandwidth. Split K
         # across the widest slice count that keeps every (tile, slice) CTA
         # resident and divides the K tiles; partials are reduced exactly in
         # FP32 (never the bf16 atomic path), so the result rounds once.
