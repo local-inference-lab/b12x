@@ -213,14 +213,9 @@ def _config_covers_query(
         validate_moe_decode_config(policy_query, parsed_config, None)
     except (TypeError, ValueError):
         return False
-    if config["backend"] == "micro" and not _impl._policy_micro_supported(
-        policy_query
-    ):
+    if config["backend"] == "micro" and not _impl._policy_micro_supported(policy_query):
         return False
-    if (
-        config["backend"] == "dynamic"
-        and config.get("dynamic_route_mode") == "direct"
-    ):
+    if config["backend"] == "dynamic" and config.get("dynamic_route_mode") == "direct":
         try:
             _impl._dynamic_direct_routing_selected(
                 route_mode="direct",
@@ -651,9 +646,7 @@ class MoeDecodeGenerator:
             cached_measurements = tuple(
                 MoeMeasurement.from_dict(item) for item in raw_measurements
             )
-            measured_ids = [
-                item.candidate.candidate_id for item in cached_measurements
-            ]
+            measured_ids = [item.candidate.candidate_id for item in cached_measurements]
             if measured_ids != cached_ids:
                 raise ValueError(
                     "MoE race checkpoint candidate IDs must match its measurements"

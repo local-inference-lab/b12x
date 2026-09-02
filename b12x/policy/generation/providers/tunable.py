@@ -40,10 +40,7 @@ def _nvfp4_cases() -> tuple[SweepCase, ...]:
 def _varlen_attention_cases() -> tuple[SweepCase, ...]:
     return tuple(
         SweepCase.create(
-            group_id=(
-                f"{variant}-d{head_dim}-c{int(causal)}-"
-                "b4-q128-k1024"
-            ),
+            group_id=(f"{variant}-d{head_dim}-c{int(causal)}-b4-q128-k1024"),
             query={
                 "variant": variant,
                 "dtype": "bfloat16",
@@ -294,9 +291,7 @@ def _attention_reference(case: SweepCase, q, k, v, cu_q, cu_k):
     return torch.cat(outputs, dim=0), torch.cat(lses, dim=1)
 
 
-class _VarlenAttentionSession(
-    AbstractContextManager["_VarlenAttentionSession"]
-):
+class _VarlenAttentionSession(AbstractContextManager["_VarlenAttentionSession"]):
     def __init__(self, context) -> None:
         self._context = context
 
@@ -381,9 +376,7 @@ class _VarlenAttentionSession(
                 device=device,
                 generator=generator,
             ).mul_(0.25)
-            expected, _expected_lse = _attention_reference(
-                case, q, k, v, cu_q, cu_k
-            )
+            expected, _expected_lse = _attention_reference(case, q, k, v, cu_q, cu_k)
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
             base_policy = PolicyContext.for_device(
                 device,

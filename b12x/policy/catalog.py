@@ -193,12 +193,10 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=BF16_VOCAB_PROJECTION,
         policy_ref=(
-            "b12x.gemm.bf16_vocab_projection._policy:"
-            "BF16_VOCAB_PROJECTION_POLICY"
+            "b12x.gemm.bf16_vocab_projection._policy:BF16_VOCAB_PROJECTION_POLICY"
         ),
         generator_ref=(
-            "b12x.policy.generation.providers.gemm:"
-            "Bf16VocabProjectionGenerator"
+            "b12x.policy.generation.providers.gemm:Bf16VocabProjectionGenerator"
         ),
     ),
     PlanningComponentRegistration(
@@ -206,27 +204,21 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=BLOCK_FP8_LINEAR,
         policy_ref=("b12x.gemm.block_fp8_linear._policy:BLOCK_FP8_LINEAR_POLICY"),
-        generator_ref=(
-            "b12x.policy.generation.providers.gemm:BlockFp8LinearGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.gemm:BlockFp8LinearGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="gemm.dense_linear",
         mode=PlanningPolicyMode.PROFILED,
         component_id=DENSE_LINEAR,
         policy_ref="b12x.gemm.dense_linear._policy:DENSE_LINEAR_POLICY",
-        generator_ref=(
-            "b12x.policy.generation.providers.gemm:DenseLinearGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.gemm:DenseLinearGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="gemm.wo_projection",
         mode=PlanningPolicyMode.PROFILED,
         component_id=WO_PROJECTION,
         policy_ref="b12x.gemm.wo_projection._policy:WO_PROJECTION_POLICY",
-        generator_ref=(
-            "b12x.policy.generation.providers.gemm:WoProjectionGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.gemm:WoProjectionGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="moe.fused_moe",
@@ -240,9 +232,7 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=EP_MOE,
         policy_ref="b12x.moe.ep_moe._policy:EP_MOE_POLICY",
-        generator_ref=(
-            "b12x.policy.generation.providers.qualification:EpMoeGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.qualification:EpMoeGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="norm.hyperconnection",
@@ -250,8 +240,7 @@ PLANNING_COMPONENTS = (
         component_id=HYPERCONNECTION,
         policy_ref=("b12x.norm.hyperconnection._policy:HYPERCONNECTION_POLICY"),
         generator_ref=(
-            "b12x.policy.generation.providers.norm_sequence:"
-            "HyperConnectionGenerator"
+            "b12x.policy.generation.providers.norm_sequence:HyperConnectionGenerator"
         ),
     ),
     PlanningComponentRegistration(
@@ -259,9 +248,7 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=MHC,
         policy_ref="b12x.norm.mhc._policy:MHC_POLICY",
-        generator_ref=(
-            "b12x.policy.generation.providers.norm_sequence:MhcGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.norm_sequence:MhcGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="quantization.nvfp4",
@@ -269,8 +256,7 @@ PLANNING_COMPONENTS = (
         component_id=NVFP4_QUANTIZATION,
         policy_ref=("b12x.quantization.nvfp4._policy:NVFP4_QUANTIZATION_POLICY"),
         generator_ref=(
-            "b12x.policy.generation.providers.tunable:"
-            "Nvfp4QuantizationGenerator"
+            "b12x.policy.generation.providers.tunable:Nvfp4QuantizationGenerator"
         ),
     ),
     PlanningComponentRegistration(
@@ -303,18 +289,14 @@ PLANNING_COMPONENTS = (
         mode=PlanningPolicyMode.PROFILED,
         component_id=PLE_EMBEDDING,
         policy_ref=("b12x.sequence.ple_embedding._policy:PLE_EMBEDDING_POLICY"),
-        generator_ref=(
-            "b12x.policy.generation.providers.ple:PleEmbeddingGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.ple:PleEmbeddingGenerator"),
     ),
     PlanningComponentRegistration(
         op_qualname="sequence.ple_hash",
         mode=PlanningPolicyMode.PROFILED,
         component_id=PLE_HASH,
         policy_ref="b12x.sequence.ple_hash._policy:PLE_HASH_POLICY",
-        generator_ref=(
-            "b12x.policy.generation.providers.ple:PleHashGenerator"
-        ),
+        generator_ref=("b12x.policy.generation.providers.ple:PleHashGenerator"),
     ),
 )
 

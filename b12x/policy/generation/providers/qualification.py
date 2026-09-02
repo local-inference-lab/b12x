@@ -251,9 +251,7 @@ class _DsaIndexerProbe:
                 raise RuntimeError("DSA benchmark did not emit one timing record")
             record = records[0]
             latency = (
-                record["replay_median_us"]
-                if mode == "decode"
-                else record["median_us"]
+                record["replay_median_us"] if mode == "decode" else record["median_us"]
             )
             measurements.append(
                 GpuProbeMeasurement(
@@ -271,9 +269,7 @@ class _DsaIndexerProbe:
             gc.collect()
             torch.cuda.empty_cache()
         first_msa_index = len(self._CASES)
-        for offset, (label, mode, rows, heads, width) in enumerate(
-            self._MSA_CASES
-        ):
+        for offset, (label, mode, rows, heads, width) in enumerate(self._MSA_CASES):
             output = torch.empty(
                 (heads, rows, MSA_TOPK_BLOCKS),
                 dtype=torch.int32,
@@ -370,9 +366,7 @@ class _SparseMlaProbe:
 
     @property
     def case_ids(self) -> tuple[str, ...]:
-        return tuple(
-            case[0] for case in (*self._GLM52_CASES, *self._GLM53_CASES)
-        )
+        return tuple(case[0] for case in (*self._GLM52_CASES, *self._GLM53_CASES))
 
     @property
     def description(self) -> str:
@@ -589,9 +583,7 @@ class _EpMoeProbe:
 
     @property
     def case_ids(self) -> tuple[str, ...]:
-        return tuple(
-            f"m{tokens}-topk{top_k}" for tokens, top_k in self._CASES
-        )
+        return tuple(f"m{tokens}-topk{top_k}" for tokens, top_k in self._CASES)
 
     @property
     def description(self) -> str:

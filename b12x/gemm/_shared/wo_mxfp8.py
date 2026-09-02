@@ -3030,6 +3030,57 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
 
 
+_AUTO_WO_CODES_CACHE: dict[tuple[object, ...], tuple[int, int, int, int, int, int]] = {}
+
+
+def _auto_wo_launch_codes(
+    device: torch.device,
+    weights: WOProjectionMXFP8Weights,
+    expected_m: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Profile-resolved launch codes for unbound (functional) WO calls.
+
+    All zeros unless a measured profile or an explicit override selected the
+    chain, so the built-in rules stay in charge everywhere else.
+    """
+    key = (
+        device.index,
+        int(weights.groups),
+        int(weights.group_width),
+        int(weights.rank),
+        int(weights.hidden),
+        int(expected_m),
+    )
+    codes = _AUTO_WO_CODES_CACHE.get(key)
+    if codes is None:
+        from b12x.gemm.wo_projection._policy import (
+            WO_PROJECTION_POLICY,
+            WoProjectionQuery,
+        )
+        from b12x.policy import PolicySource, get_auto_policy
+
+        codes = _NO_WO_LAUNCH_CODES
+        try:
+            resolution = get_auto_policy(device).resolve(
+                WO_PROJECTION_POLICY,
+                WoProjectionQuery(
+                    dtype="bfloat16",
+                    max_tokens=int(expected_m),
+                    groups=int(weights.groups),
+                    group_width=int(weights.group_width),
+                    rank=int(weights.rank),
+                    hidden=int(weights.hidden),
+                ),
+            )
+        except (ValueError, TypeError):
+            pass
+        else:
+            if resolution.source is not PolicySource.HEURISTIC:
+                codes = _wo_launch_codes(resolution.config)
+        _AUTO_WO_CODES_CACHE[key] = codes
+    return codes
+
+
 def wo_projection_inv_rope_mxfp8(
     o: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -3086,7 +3137,7 @@ def wo_projection_inv_rope_mxfp8(
         expected_m = binding.expected_m
         launch_codes = _wo_launch_codes(binding.config)
     else:
-        launch_codes = _NO_WO_LAUNCH_CODES
+        launch_codes = None
     if (
         o is None
         or positions is None
@@ -3111,6 +3162,8 @@ def wo_projection_inv_rope_mxfp8(
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
         expected_m = int(tokens)
+    if launch_codes is None:
+        launch_codes = _auto_wo_launch_codes(o.device, weights, int(expected_m))
     # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
     # gemm chain internally, so the token-shaped activation MXFP8 views never
     # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any

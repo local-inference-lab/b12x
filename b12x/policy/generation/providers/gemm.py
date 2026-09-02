@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import os
-import statistics
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 
@@ -14,7 +13,6 @@ from b12x.policy.components import (
     DENSE_LINEAR,
     WO_PROJECTION,
 )
-from b12x.policy.generation.contracts import GenerationContext
 from b12x.policy.generation.gemm_corpus import (
     DENSE_MAX_TOKENS_BOUNDS,
     dense_linear_cases,
@@ -316,9 +314,7 @@ def _block_fp8_cases() -> tuple[SweepCase, ...]:
 
 class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
     _CANDIDATES = tuple(
-        SweepCandidate.create(
-            {"backend": "mxfp8", "tile_m": tile_m, "tile_n": tile_n}
-        )
+        SweepCandidate.create({"backend": "mxfp8", "tile_m": tile_m, "tile_n": tile_n})
         for tile_m, tile_n in _BLOCK_FP8_TILES
     )
 
@@ -368,12 +364,16 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                 device=device,
                 generator=generator,
             ).mul_(0.25)
-            weight = torch.randn(
-                (out_features, in_features),
-                dtype=torch.bfloat16,
-                device=device,
-                generator=generator,
-            ).mul_(0.125).to(torch.float8_e4m3fn)
+            weight = (
+                torch.randn(
+                    (out_features, in_features),
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=generator,
+                )
+                .mul_(0.125)
+                .to(torch.float8_e4m3fn)
+            )
             scale = torch.ones(
                 (out_features // 128, in_features // 128),
                 dtype=torch.float8_e8m0fnu,
@@ -515,15 +515,11 @@ class BlockFp8LinearGenerator(DiscreteSweepGenerator):
                 "out_features",
                 "output_dtype",
             ),
-            range_fields=frozenset(
-                {"max_tokens", "in_features", "out_features"}
-            ),
+            range_fields=frozenset({"max_tokens", "in_features", "out_features"}),
             cases=_block_fp8_cases() if cases is None else cases,
             benchmark_factory=_BlockFp8Factory(),
             coverage={},
         )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +529,15 @@ class BlockFp8LinearGenerator(DiscreteSweepGenerator):
 # Decode/mid/prefill tile menus for the FP8 recipes; FP4 menus come from the
 # policy tables because the FP4 MMA only accepts 64/128-row tiles.
 _FP8_DECODE_TILES = ((16, 64), (16, 128), (32, 64), (32, 128), (64, 64), (64, 128))
-_FP8_MID_TILES = ((16, 128), (32, 64), (32, 128), (64, 64), (64, 128), (128, 64), (128, 128))
+_FP8_MID_TILES = (
+    (16, 128),
+    (32, 64),
+    (32, 128),
+    (64, 64),
+    (64, 128),
+    (128, 64),
+    (128, 128),
+)
 _FP8_PREFILL_TILES = ((64, 64), (64, 128), (128, 64), (128, 128))
 _DENSE_TILE_K_RECIPES = frozenset({"nvfp4", "mxfp8"})
 _DENSE_SPLIT_K_RECIPES = frozenset({"mxfp8", "block_fp8"})
@@ -583,7 +587,11 @@ def _dense_linear_candidate_configs(
     Only combinations ``DenseGemmKernel.can_implement`` accepts are emitted;
     the K-tile and split-K axes are explored independently of each other.
     """
-    from b12x.gemm.dense_linear._policy import FP4_NARROW_TILES, FP4_TILES, FP8_SWAPPED_TILES
+    from b12x.gemm.dense_linear._policy import (
+        FP4_NARROW_TILES,
+        FP4_TILES,
+        FP8_SWAPPED_TILES,
+    )
 
     decode = max_tokens <= 16
     tiles: list[tuple[tuple[int, int], bool]]
@@ -633,7 +641,7 @@ def _dense_linear_candidate_configs(
     return tuple(configs)
 
 
-def _swizzled_scale_storage(
+def _random_block_scales(
     rows: int,
     k: int,
     *,
@@ -642,7 +650,7 @@ def _swizzled_scale_storage(
     generator,
     device,
 ):
-    """Random-but-valid swizzled scale storage in the serialized operand layout."""
+    """Random-but-valid block scales as (row-major rows, swizzled storage)."""
     import torch
 
     from b12x._lib.intrinsics import swizzle_block_scale
@@ -652,15 +660,52 @@ def _swizzled_scale_storage(
     else:
         low, high = 0x30, 0x40  # E4M3 values in [0.5, 2.0]
     raw = torch.randint(
-        low, high, (rows, k // vec_size), dtype=torch.int64, device=device, generator=generator
-    )
-    return swizzle_block_scale(raw.to(torch.uint8)).view(scale_dtype)
+        low,
+        high,
+        (rows, k // vec_size),
+        dtype=torch.int64,
+        device=device,
+        generator=generator,
+    ).to(torch.uint8)
+    return raw, swizzle_block_scale(raw).view(scale_dtype)
+
+
+_FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _dequantize_fp4(packed, scale_rows, *, vec_size: int, scale_dtype):
+    """Expand packed E2M1 nibbles and per-block scales to a float32 matrix."""
+    import torch
+
+    magnitudes = torch.tensor(_FP4_MAGNITUDES, device=packed.device)
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(1)
+    values = magnitudes[(nibbles & 0x7).long()]
+    values = values * torch.where((nibbles & 0x8) != 0, -1.0, 1.0)
+    if scale_dtype == torch.float8_e8m0fnu:
+        scale = torch.exp2(scale_rows.float() - 127.0)
+    else:
+        scale = scale_rows.view(torch.float8_e4m3fn).float()
+    return values * scale.repeat_interleave(vec_size, dim=1)
+
+
+def _dequantize_mxfp8(values, scale_bytes):
+    import torch
+
+    scale = torch.exp2(scale_bytes.float() - 127.0)
+    return values.float() * scale.repeat_interleave(32, dim=1)
 
 
 class _DenseLinearOperands:
-    """Synthetic packed weight + activation for one (recipe, K, N)."""
+    """Synthetic packed weight + activation for one (recipe, K, N).
 
-    def __init__(self, *, recipe: str, in_features: int, out_features: int, device, generator) -> None:
+    ``reference`` dequantizes the same operands in float32 so correctness is
+    gated against the arithmetic definition of the recipe, not against the
+    built-in planner's own launch.
+    """
+
+    def __init__(
+        self, *, recipe: str, in_features: int, out_features: int, device, generator
+    ) -> None:
         import torch
 
         from b12x.gemm import mxfp8_linear, tensor_fp8_linear
@@ -671,57 +716,160 @@ class _DenseLinearOperands:
         self.device = device
         k, n = in_features, out_features
         self.alpha = None
+        self.output_scale = 1.0
         if recipe == "mxfp8":
-            weight = torch.randn((n, k), dtype=torch.bfloat16, device=device, generator=generator).mul_(0.125)
+            weight = torch.randn(
+                (n, k), dtype=torch.bfloat16, device=device, generator=generator
+            ).mul_(0.125)
             values, scales = _quantize_bf16_mxfp8(weight)
             self.packed = mxfp8_linear.pack_weight(values, scales)
+            self.weight_dequant = _dequantize_mxfp8(values, scales)
         elif recipe == "tensor_fp8":
-            weight = torch.randn((n, k), dtype=torch.bfloat16, device=device, generator=generator).mul_(0.125)
-            output_scale = torch.tensor([1.0 / 32.0], dtype=torch.float32, device=device)
-            self.packed = tensor_fp8_linear.pack_weight(weight.to(torch.float8_e4m3fn), output_scale)
+            weight = torch.randn(
+                (n, k), dtype=torch.bfloat16, device=device, generator=generator
+            ).mul_(0.125)
+            self.output_scale = 1.0 / 32.0
+            output_scale = torch.tensor(
+                [self.output_scale], dtype=torch.float32, device=device
+            )
+            weight_fp8 = weight.to(torch.float8_e4m3fn)
+            self.packed = tensor_fp8_linear.pack_weight(weight_fp8, output_scale)
+            self.weight_dequant = weight_fp8.float()
         elif recipe in ("nvfp4", "mxfp4"):
-            self.weight = torch.randint(0, 256, (n, k // 2), dtype=torch.int64, device=device, generator=generator).to(torch.uint8)
+            self.weight = torch.randint(
+                0,
+                256,
+                (n, k // 2),
+                dtype=torch.int64,
+                device=device,
+                generator=generator,
+            ).to(torch.uint8)
             vec = 16 if recipe == "nvfp4" else 32
             sdt = torch.float8_e4m3fn if recipe == "nvfp4" else torch.float8_e8m0fnu
-            self.weight_scale = _swizzled_scale_storage(n, k, vec_size=vec, scale_dtype=sdt, generator=generator, device=device)
+            scale_rows, self.weight_scale = _random_block_scales(
+                n, k, vec_size=vec, scale_dtype=sdt, generator=generator, device=device
+            )
+            self.weight_dequant = _dequantize_fp4(
+                self.weight, scale_rows, vec_size=vec, scale_dtype=sdt
+            )
             if recipe == "nvfp4":
-                self.alpha = torch.tensor([1.0 / 64.0], dtype=torch.float32, device=device)
+                self.output_scale = 1.0 / 64.0
+                self.alpha = torch.tensor(
+                    [self.output_scale], dtype=torch.float32, device=device
+                )
             self.packed = None
         elif recipe == "block_fp8":
-            self.weight = torch.randn((n, k), dtype=torch.bfloat16, device=device, generator=generator).mul_(0.125).to(torch.float8_e4m3fn)
-            self.weight_scale = torch.rand((n // 128, k // 128), dtype=torch.float32, device=device, generator=generator).mul_(0.5).add_(0.75)
+            self.weight = (
+                torch.randn(
+                    (n, k), dtype=torch.bfloat16, device=device, generator=generator
+                )
+                .mul_(0.125)
+                .to(torch.float8_e4m3fn)
+            )
+            self.weight_scale = (
+                torch.rand(
+                    (n // 128, k // 128),
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator,
+                )
+                .mul_(0.5)
+                .add_(0.75)
+            )
+            self.weight_dequant = (
+                self.weight.float()
+                * self.weight_scale.repeat_interleave(128, dim=0).repeat_interleave(
+                    128, dim=1
+                )
+            )
             self.packed = None
         else:
             raise ValueError(f"unsupported dense linear recipe {recipe!r}")
 
     def activation(self, tokens: int, generator):
+        """Return (kernel operands, float32 dequantized activation)."""
         import torch
 
         k = self.in_features
         recipe = self.recipe
         if recipe == "mxfp8":
-            return (torch.randn((tokens, k), dtype=torch.bfloat16, device=self.device, generator=generator).mul_(0.25),)
+            source = torch.randn(
+                (tokens, k),
+                dtype=torch.bfloat16,
+                device=self.device,
+                generator=generator,
+            ).mul_(0.25)
+            values, scales = _quantize_bf16_mxfp8(source)
+            return (source,), _dequantize_mxfp8(values, scales)
         if recipe == "tensor_fp8":
-            return (torch.randn((tokens, k), dtype=torch.bfloat16, device=self.device, generator=generator).mul_(0.25).to(torch.float8_e4m3fn),)
+            source = (
+                torch.randn(
+                    (tokens, k),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                    generator=generator,
+                )
+                .mul_(0.25)
+                .to(torch.float8_e4m3fn)
+            )
+            return (source,), source.float()
         if recipe in ("nvfp4", "mxfp4"):
-            values = torch.randint(0, 256, (tokens, k // 2), dtype=torch.int64, device=self.device, generator=generator).to(torch.uint8)
+            values = torch.randint(
+                0,
+                256,
+                (tokens, k // 2),
+                dtype=torch.int64,
+                device=self.device,
+                generator=generator,
+            ).to(torch.uint8)
             vec = 16 if recipe == "nvfp4" else 32
             sdt = torch.float8_e4m3fn if recipe == "nvfp4" else torch.float8_e8m0fnu
-            return (values, _swizzled_scale_storage(tokens, k, vec_size=vec, scale_dtype=sdt, generator=generator, device=self.device))
+            scale_rows, storage = _random_block_scales(
+                tokens,
+                k,
+                vec_size=vec,
+                scale_dtype=sdt,
+                generator=generator,
+                device=self.device,
+            )
+            return (values, storage), _dequantize_fp4(
+                values, scale_rows, vec_size=vec, scale_dtype=sdt
+            )
         if recipe == "block_fp8":
-            values = torch.randn((tokens, k), dtype=torch.bfloat16, device=self.device, generator=generator).mul_(0.25).to(torch.float8_e4m3fn)
-            scale = torch.rand((tokens, k // 128), dtype=torch.float32, device=self.device, generator=generator).mul_(0.5).add_(0.75)
-            return (values, scale)
+            values = (
+                torch.randn(
+                    (tokens, k),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                    generator=generator,
+                )
+                .mul_(0.25)
+                .to(torch.float8_e4m3fn)
+            )
+            scale = (
+                torch.rand(
+                    (tokens, k // 128),
+                    dtype=torch.float32,
+                    device=self.device,
+                    generator=generator,
+                )
+                .mul_(0.5)
+                .add_(0.75)
+            )
+            return (values, scale), values.float() * scale.repeat_interleave(128, dim=1)
         raise ValueError(recipe)
 
-    def run(self, activation, *, plan, expected_m: int):
-        import torch
+    def reference(self, activation_dequant):
+        return (activation_dequant @ self.weight_dequant.T) * self.output_scale
 
+    def run(self, activation, *, plan, expected_m: int):
         from b12x.gemm import dense_linear
 
         recipe = self.recipe
         if recipe in ("mxfp8", "tensor_fp8"):
-            return dense_linear.mm(activation[0], self.packed, plan=plan, expected_m=expected_m)
+            return dense_linear.mm(
+                activation[0], self.packed, plan=plan, expected_m=expected_m
+            )
         if recipe == "nvfp4":
             return dense_linear.mm_serialized(
                 (activation[0], activation[1]),
@@ -815,14 +963,24 @@ def _graph_race(
         flush=flush,
     )
     allocated_after = torch.cuda.memory_allocated(device)
-    latency = _median_of_group_medians(samples, groups=settings.groups, repetitions=repetitions)
-    correct = finite and cosine >= settings.minimum_cosine and allocated_after <= allocated_before
-    return latency, correct, {
-        "cosine": cosine,
-        "finite": finite,
-        "replay_allocation_bytes": allocated_after - allocated_before,
-        "repetitions": repetitions,
-    }
+    latency = _median_of_group_medians(
+        samples, groups=settings.groups, repetitions=repetitions
+    )
+    correct = (
+        finite
+        and cosine >= settings.minimum_cosine
+        and allocated_after <= allocated_before
+    )
+    return (
+        latency,
+        correct,
+        {
+            "cosine": cosine,
+            "finite": finite,
+            "replay_allocation_bytes": allocated_after - allocated_before,
+            "repetitions": repetitions,
+        },
+    )
 
 
 class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
@@ -859,12 +1017,20 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
         recipe = str(case.query["recipe"])
         k = int(case.query["in_features"])
         n = int(case.query["out_features"])
-        if self._operands is None or (self._operands.recipe, self._operands.in_features, self._operands.out_features) != (recipe, k, n):
+        if self._operands is None or (
+            self._operands.recipe,
+            self._operands.in_features,
+            self._operands.out_features,
+        ) != (recipe, k, n):
             generator = torch.Generator(device=device).manual_seed(
                 self._context.settings.seed + int(case.case_id[-8:], 16) % 1_000_003
             )
             self._operands = _DenseLinearOperands(
-                recipe=recipe, in_features=k, out_features=n, device=device, generator=generator
+                recipe=recipe,
+                in_features=k,
+                out_features=n,
+                device=device,
+                generator=generator,
             )
         return self._operands
 
@@ -887,19 +1053,14 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
             generator = torch.Generator(device=device).manual_seed(
                 settings.seed + int(case.case_id[-8:], 16)
             )
-            activation = operands.activation(tokens, generator)
-            # The built-in planner is the correctness reference for every tile.
-            try:
-                baseline = operands.run(activation, plan=None, expected_m=tokens).detach().clone()
-                torch.cuda.synchronize(device)
-            except Exception as exc:  # noqa: BLE001 - report per candidate
-                error = f"baseline {type(exc).__name__}: {exc}"
-                return tuple(
-                    SweepMeasurement(candidate=candidate, latency_us=None, correct=False, error=error)
-                    for candidate in candidates
-                )
+            activation, activation_dequant = operands.activation(tokens, generator)
+            baseline = operands.reference(activation_dequant)
+            del activation_dequant
+            torch.cuda.synchronize(device)
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
-            base_policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+            base_policy = PolicyContext.for_device(
+                device, mode=PolicyMode.HEURISTIC_ONLY
+            )
             caps = dense_linear.Caps(
                 device=device,
                 recipe=operands.recipe,
@@ -1033,7 +1194,9 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
         return tuple(
             SweepCandidate.create(config)
-            for config in _wo_projection_candidate_configs(int(case.query["max_tokens"]))
+            for config in _wo_projection_candidate_configs(
+                int(case.query["max_tokens"])
+            )
         )
 
     def measure(
@@ -1080,7 +1243,9 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                 rank=rank,
                 hidden=hidden,
             )
-            base_policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+            base_policy = PolicyContext.for_device(
+                device, mode=PolicyMode.HEURISTIC_ONLY
+            )
             reference_plan = wo_projection.plan(caps, policy=base_policy)
             spec = reference_plan.scratch_specs()[0]
             scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
@@ -1107,7 +1272,11 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                     expected_m=tokens,
                 )
 
-            baseline = bind(reference_plan).run().detach().clone()
+            # Ground truth from the dequantized operands, not from the kernel
+            # chain itself: the built-in plan is exactly what is under test.
+            baseline = _wo_projection_reference(
+                data, tokens=tokens, groups=groups, rank=rank
+            )
             torch.cuda.synchronize(device)
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
             measurements = []
@@ -1142,8 +1311,19 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
-            del data, weights, scratch, baseline
             return tuple(measurements)
+
+
+def _wo_projection_reference(data, *, tokens: int, groups: int, rank: int):
+    """Float32 two-GEMM reference over the benchmark case's dequantized operands."""
+    import torch
+
+    tmp = torch.einsum(
+        "tgd,grd->tgr",
+        data["x_deq_tgd"].float(),
+        data["wo_a_deq_grd"].float(),
+    )
+    return tmp.reshape(tokens, groups * rank) @ data["wo_b_deq_hgr"].float().T
 
 
 class _WoProjectionFactory:

@@ -235,10 +235,7 @@ class _HyperConnectionSession(_GpuSession):
                         ),
                         correct=(
                             correctness.get("status") == "passed"
-                            and graph_contract.get(
-                                "replay_allocation_delta_bytes"
-                            )
-                            == 0
+                            and graph_contract.get("replay_allocation_delta_bytes") == 0
                         ),
                         metrics={
                             "operator": "full_chain",
@@ -319,17 +316,15 @@ class _MtpFeedbackSession(_GpuSession):
                 measurements.append(
                     SweepMeasurement(
                         candidate=candidate,
-                        latency_us=float(
-                            timings["cuda_graph_replay"]["median_us"]
-                        ),
+                        latency_us=float(timings["cuda_graph_replay"]["median_us"]),
                         correct=bool(
                             correctness["passed"]
                             and storage["graph_replay_allocation_delta_bytes"] == 0
                         ),
                         metrics={
-                            "cosine": correctness[
-                                "graph_replay_after_output_poison"
-                            ]["cosine"],
+                            "cosine": correctness["graph_replay_after_output_poison"][
+                                "cosine"
+                            ],
                             "replay_allocation_bytes": storage[
                                 "graph_replay_allocation_delta_bytes"
                             ],
@@ -552,9 +547,7 @@ class _MhcSession(_GpuSession):
                         "comb_cosine": cosines[3],
                         "finite": finite,
                         "nonzero": nonzero,
-                        "replay_allocation_bytes": (
-                            allocated_after - allocated_before
-                        ),
+                        "replay_allocation_bytes": (allocated_after - allocated_before),
                     },
                 )
             except Exception as exc:  # noqa: BLE001 - failed configs survive

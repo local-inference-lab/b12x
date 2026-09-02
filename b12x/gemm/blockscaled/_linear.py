@@ -410,7 +410,6 @@ def pack_weight(
     )
 
 
-
 # Launch options resolved by ``gemm.dense_linear`` plans travel through the
 # custom ops as plain integers (0 = leave the built-in planner in charge).
 _LOAD_PATH_CODES = {0: None, 1: "tma", 2: "cpasync"}
@@ -428,6 +427,36 @@ def _launch_codes_from_plan(plan: object | None) -> tuple[int, int, int, int, in
     if len(values) != 6:
         raise ValueError("dense linear launch codes must have six entries")
     return values  # type: ignore[return-value]
+
+
+def _auto_launch_codes(
+    *,
+    device: torch.device,
+    recipe: str,
+    in_features: int,
+    out_features: int,
+    max_tokens: int,
+    output_dtype: torch.dtype,
+) -> tuple[int, int, int, int, int, int]:
+    """Profile-resolved launch codes for calls that did not pass a plan."""
+    from b12x.gemm.dense_linear.api import auto_launch_codes
+
+    return auto_launch_codes(
+        device=device,
+        recipe=recipe,
+        in_features=in_features,
+        out_features=out_features,
+        max_tokens=max_tokens,
+        output_dtype=output_dtype,
+    )
+
+
+_SERIALIZED_RECIPES = {
+    ("float4_e2m1fn", 16, False): "nvfp4",
+    ("float4_e2m1fn", 32, False): "mxfp4",
+    ("float8_e4m3fn", 32, False): "mxfp8",
+    ("float8_e4m3fn", 128, True): "block_fp8",
+}
 
 
 def _dense_launch_kwargs(
@@ -813,6 +842,15 @@ def mxfp8_linear(
     _output_dtype_name(resolved_out_dtype)
 
     out_features = int(packed_weight.out_features)
+    if plan is None:
+        launch_codes = _auto_launch_codes(
+            device=source_2d.device,
+            recipe="mxfp8",
+            in_features=in_features,
+            out_features=out_features,
+            max_tokens=int(expected_m) if expected_m is not None else tokens,
+            output_dtype=out_dtype if out_dtype is not None else torch.bfloat16,
+        )
     _validate_bias(
         bias,
         out_features=out_features,
@@ -1005,6 +1043,15 @@ def tensor_fp8_linear(
     _output_dtype_name(out_dtype)
 
     out_features = int(packed_weight.out_features)
+    if plan is None:
+        launch_codes = _auto_launch_codes(
+            device=source_2d.device,
+            recipe="tensor_fp8",
+            in_features=in_features,
+            out_features=out_features,
+            max_tokens=int(expected_m) if expected_m is not None else tokens,
+            output_dtype=out_dtype,
+        )
     _validate_bias(
         bias,
         out_features=out_features,
@@ -1087,12 +1134,30 @@ def blockscaled_mm(
         expected_m = recipe.pop("expected_m", None)
         stream = recipe.pop("stream", None)
         block_fp8 = bool(recipe.pop("block_fp8", False))
-        launch_codes = _launch_codes_from_plan(recipe.pop("plan", None))
+        plan = recipe.pop("plan", None)
+        launch_codes = _launch_codes_from_plan(plan)
         if recipe:
             names = ", ".join(sorted(recipe))
             raise TypeError(
                 "serialized blockscaled.mm does not support these raw-engine "
                 f"options: {names}"
+            )
+        auto_recipe = _SERIALIZED_RECIPES.get(
+            (str(ab_dtype), int(sf_vec_size), block_fp8)
+        )
+        if plan is None and auto_recipe is not None:
+            packed_k = int(lhs_values.shape[1])
+            launch_codes = _auto_launch_codes(
+                device=lhs_values.device,
+                recipe=auto_recipe,
+                in_features=packed_k * (2 if auto_recipe in ("nvfp4", "mxfp4") else 1),
+                out_features=int(rhs_values.shape[0]),
+                max_tokens=(
+                    int(expected_m)
+                    if expected_m is not None
+                    else int(lhs_values.shape[0])
+                ),
+                output_dtype=getattr(torch, str(c_dtype)),
             )
         return torch.ops.b12x.blockscaled_serialized(
             lhs_values,

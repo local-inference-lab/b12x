@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from b12x.policy.types import PolicySource
+
 from ..._lib.gating import default_is_supported
 from ...policy import PolicyContext, get_auto_policy
 from ..blockscaled._linear import (
@@ -159,8 +161,10 @@ def mm(
 ) -> torch.Tensor:
     """Run a packed dense linear with a resolved plan (no policy lookup)."""
     if isinstance(plan, PlanTable):
-        live = int(expected_m) if expected_m is not None else int(
-            (source[0] if isinstance(source, tuple) else source).shape[0]
+        live = (
+            int(expected_m)
+            if expected_m is not None
+            else int((source[0] if isinstance(source, tuple) else source).shape[0])
         )
         plan = plan.select(max(1, live))
     if isinstance(packed_weight, MXFP8LinearWeight):
@@ -188,7 +192,12 @@ def mm(
     raise TypeError("packed_weight must be an MXFP8 or tensor-FP8 packed weight")
 
 
-def mm_serialized(*args: Any, plan: Plan | PlanTable | None, expected_m: int | None = None, **kwargs: Any) -> torch.Tensor:
+def mm_serialized(
+    *args: Any,
+    plan: Plan | PlanTable | None,
+    expected_m: int | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
     """``blockscaled.mm`` for serialized (values, scale) pairs with a plan."""
     if isinstance(plan, PlanTable):
         live = int(expected_m) if expected_m is not None else int(args[0][0].shape[0])
@@ -202,6 +211,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "auto_launch_codes",
     "Caps",
     "Plan",
     "PlanTable",
@@ -213,3 +223,58 @@ __all__ = [
     "mm_serialized",
     "is_supported",
 ]
+
+
+_AUTO_CODES_CACHE: dict[tuple[object, ...], tuple[int, int, int, int, int, int]] = {}
+_NO_AUTO_CODES = (0, 0, 0, 0, 0, 0)
+
+
+def auto_launch_codes(
+    *,
+    device: torch.device,
+    recipe: str,
+    in_features: int,
+    out_features: int,
+    max_tokens: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[int, int, int, int, int, int]:
+    """Launch codes for callers that never built a plan.
+
+    Resolves the ambient policy once per (device, recipe, geometry, capacity)
+    and returns all zeros unless a measured profile or explicit override chose
+    the launch, so the built-in planner keeps its exact behaviour otherwise.
+    """
+    if device.type != "cuda":
+        return _NO_AUTO_CODES
+    key = (
+        device.index,
+        recipe,
+        int(in_features),
+        int(out_features),
+        int(max_tokens),
+        output_dtype,
+    )
+    codes = _AUTO_CODES_CACHE.get(key)
+    if codes is None:
+        try:
+            resolved = plan(
+                Caps(
+                    device=device,
+                    recipe=recipe,
+                    in_features=int(in_features),
+                    out_features=int(out_features),
+                    max_tokens=int(max_tokens),
+                    output_dtype=output_dtype,
+                )
+            )
+        except (ValueError, TypeError):
+            codes = _NO_AUTO_CODES
+        else:
+            source = resolved.policy_resolution.source
+            codes = (
+                _NO_AUTO_CODES
+                if source is PolicySource.HEURISTIC
+                else resolved.launch_codes()
+            )
+        _AUTO_CODES_CACHE[key] = codes
+    return codes

@@ -194,9 +194,7 @@ def synthesize_integer_axis_coverage(
     field: str,
     minimum: int,
     maximum: int,
-    config_is_valid: Callable[
-        [Mapping[str, object], Mapping[str, object]], bool
-    ]
+    config_is_valid: Callable[[Mapping[str, object], Mapping[str, object]], bool]
     | None = None,
 ) -> tuple[DecisionRecord, ...]:
     """Fill a bounded integer axis from its nearest measured anchors."""
@@ -243,18 +241,14 @@ def synthesize_integer_axis_coverage(
             for anchor in ranked:
                 query = anchor.query.to_dict()
                 query[field] = value
-                if config_is_valid is None or config_is_valid(
-                    query, anchor.config
-                ):
+                if config_is_valid is None or config_is_valid(query, anchor.config):
                     selected = DecisionRecord.create(
                         query=query,
                         config=anchor.config,
                     )
                     break
                 if int(anchor.query[field]) == value:
-                    raise ValueError(
-                        f"measured config is invalid at {field}={value}"
-                    )
+                    raise ValueError(f"measured config is invalid at {field}={value}")
             if selected is None:
                 raise ValueError(
                     f"no measured config can cover {field}={value} for {group}"

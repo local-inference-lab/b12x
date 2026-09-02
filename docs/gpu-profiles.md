@@ -229,3 +229,31 @@ and source revision. The checkpoint tree retains per-candidate correctness and
 timing results needed to audit a run. Package data under
 `b12x/policy/_profiles/data/` is gzip-compressed and contains only the validated
 runtime planner: no corpus pointers, repeated evidence, coverage, or metadata.
+
+## Incremental component profiles
+
+A profile may list `pending_components`: registered components that have not
+been measured on that GPU yet. Pending components resolve through their
+heuristic (with the usual one-time fallback warning) instead of failing the
+import-time lockstep check, so a new component can land in the catalog before
+every embedded GPU has been re-measured. Generating the component on a GPU and
+embedding with `--components <id> --embed --overwrite` drops it from the
+pending list; the merge keeps every previously measured component.
+
+The dense GEMM components (`gemm.dense_linear` for the NVFP4/MXFP4/MXFP8/
+tensor-FP8/block-FP8 recipes and `gemm.wo_projection` for the WO-A/WO-B chain)
+derive their shape corpus from the reviewed model layers in
+`b12x/policy/generation/gemm_corpus.py`. Two environment filters narrow a
+targeted run without editing the corpus:
+
+```bash
+# Only MXFP8 and block-FP8 shards of the Qwen3.8 and DeepSeek models.
+B12X_GEMM_PROFILE_RECIPES=mxfp8,block_fp8 B12X_GEMM_PROFILE_MODELS=qwen3.8,deepseek \
+  ./scripts/generate_gpu_profile.py --components gemm.dense_linear --embed --overwrite
+```
+
+Candidates are gated against a float32 reference computed from the dequantized
+operands, not against the built-in plan, so a broken default launch cannot
+qualify itself. A case whose every candidate raises or fails the gate is skipped
+and listed under the component's `coverage.skipped_cases`; its query points
+inherit the neighbouring measured plans.

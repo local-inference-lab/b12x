@@ -82,8 +82,7 @@ class DenseLinearConfig:
         }
         if set(payload) != expected:
             raise ValueError(
-                "dense linear configs require exactly "
-                + ", ".join(sorted(expected))
+                "dense linear configs require exactly " + ", ".join(sorted(expected))
             )
         if not isinstance(payload["swap_ab"], bool):
             raise TypeError("dense linear swap_ab must be a boolean")
@@ -114,7 +113,9 @@ class DenseLinearConfig:
 
 
 def _encode(query: DenseLinearQuery) -> dict[str, object]:
-    return {name: getattr(query, name) for name in DenseLinearQuery.__dataclass_fields__}
+    return {
+        name: getattr(query, name) for name in DenseLinearQuery.__dataclass_fields__
+    }
 
 
 def recipe_planner_flags(recipe: str) -> dict[str, bool]:

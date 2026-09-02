@@ -774,9 +774,8 @@ def _w4a16_direct_path(
         return "w4a16.small_m_direct"
     if weight_layout != "packed":
         return None
-    if (
-        case.num_tokens <= _TC_DECODE_MAX_M
-        and is_gated_moe_activation(geometry.activation)
+    if case.num_tokens <= _TC_DECODE_MAX_M and is_gated_moe_activation(
+        geometry.activation
     ):
         return "w4a16.tc_decode"
     if case.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
@@ -935,8 +934,7 @@ def _concrete_candidate_path(
 
     if bound_implementation != expected_implementation:
         raise _CandidateContractError(
-            f"candidate {expected_implementation!r} bound "
-            f"{bound_implementation!r}"
+            f"candidate {expected_implementation!r} bound {bound_implementation!r}"
         )
 
     if expected_implementation == "micro":
@@ -1403,10 +1401,10 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
     ):
         recipe = self._geometry.recipe
         weights = self._experts._impl
-        if (
-            recipe.quant_mode == "w4a16"
-            and recipe.source_format not in {"btx", "b12x_trellis"}
-        ):
+        if recipe.quant_mode == "w4a16" and recipe.source_format not in {
+            "btx",
+            "b12x_trellis",
+        }:
             return _uniform_w4a16_reference(
                 self._geometry,
                 x=x,
@@ -1806,9 +1804,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
             return self._request(
                 "measure",
                 case=case,
-                candidate_ids=tuple(
-                    candidate.candidate_id for candidate in requested
-                ),
+                candidate_ids=tuple(candidate.candidate_id for candidate in requested),
                 correctness=correctness,
             )
 
@@ -1860,9 +1856,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         measurements = []
         for candidate in candidates:
             try:
-                (measurement,) = parse_measurements(
-                    request_measurement((candidate,))
-                )
+                (measurement,) = parse_measurements(request_measurement((candidate,)))
             except _MoeRemoteWorkerError as exc:
                 if not exc.retryable or exc.operation == "startup":
                     raise

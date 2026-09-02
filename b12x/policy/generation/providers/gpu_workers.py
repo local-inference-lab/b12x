@@ -879,9 +879,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                 difference = output.float() - expected_output.float()
                 relative_l2 = float(
                     torch.linalg.vector_norm(difference)
-                    / torch.linalg.vector_norm(expected_output.float()).clamp_min(
-                        1e-12
-                    )
+                    / torch.linalg.vector_norm(expected_output.float()).clamp_min(1e-12)
                 )
                 maximum_absolute_error = float(difference.abs().max())
                 allclose = bool(
@@ -940,9 +938,7 @@ class _GqaSession(AbstractContextManager["_GqaSession"]):
                             "physical_cache_pages": self._capture_page_count,
                             "shared_pages_across_requests": True,
                             "graph_ctas_per_sm": config.graph_ctas_per_sm,
-                            "max_chunks_per_request": (
-                                config.max_chunks_per_request
-                            ),
+                            "max_chunks_per_request": (config.max_chunks_per_request),
                         },
                     )
                 )

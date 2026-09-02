@@ -164,18 +164,12 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             raw = cached.get("measurements")
             if not isinstance(raw, list):
                 raise TypeError("GPU qualification checkpoint must contain an array")
-            measurements = tuple(
-                GpuProbeMeasurement.from_dict(item) for item in raw
-            )
+            measurements = tuple(GpuProbeMeasurement.from_dict(item) for item in raw)
             measured_case_ids = tuple(item.label for item in measurements)
             raw_case_ids = cached.get("case_ids")
             raw_config = cached.get("config")
-            case_ids_match = (
-                measured_case_ids == self._case_ids
-                and (
-                    raw_case_ids is None
-                    or raw_case_ids == list(self._case_ids)
-                )
+            case_ids_match = measured_case_ids == self._case_ids and (
+                raw_case_ids is None or raw_case_ids == list(self._case_ids)
             )
             config_matches = (
                 raw_config is None or raw_config == encoded_config.to_dict()
@@ -183,9 +177,7 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
             if case_ids_match and config_matches:
                 raw_generation = cached.get("generation")
                 if not isinstance(raw_generation, Mapping):
-                    raise TypeError(
-                        "GPU qualification generation must be an object"
-                    )
+                    raise TypeError("GPU qualification generation must be an object")
                 if (
                     cached.get("schema_version") != 2
                     or raw_case_ids != list(self._case_ids)
@@ -258,8 +250,7 @@ class MeasuredPolicyGenerator(Generic[QueryT, ConfigT]):
         for measurement in measurements:
             if not measurement.correct:
                 raise RuntimeError(
-                    f"{self.component_id} failed GPU qualification "
-                    f"{measurement.label}"
+                    f"{self.component_id} failed GPU qualification {measurement.label}"
                 )
             progress.advance(self.component_id, detail=measurement.label)
 

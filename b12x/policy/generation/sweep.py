@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import warnings
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from copy import copy
@@ -271,9 +272,7 @@ class DiscreteSweepGenerator:
         partitions = []
         for group_id in sorted(cases_by_group):
             cases = tuple(cases_by_group[group_id])
-            query_count = len(
-                {_query_key(case, self._query_fields) for case in cases}
-            )
+            query_count = len({_query_key(case, self._query_fields) for case in cases})
             partitions.append(
                 MeasurementPartition(
                     component_id=self.component_id,
@@ -327,10 +326,7 @@ class DiscreteSweepGenerator:
         candidate_ids = [candidate.candidate_id for candidate in candidates]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError(f"candidate IDs are not unique for {case.case_id}")
-        if (
-            cached is not None
-            and cached.candidate_ids == tuple(candidate_ids)
-        ):
+        if cached is not None and cached.candidate_ids == tuple(candidate_ids):
             checkpoints.save(
                 self.component_id,
                 case.case_id,
@@ -397,13 +393,9 @@ class DiscreteSweepGenerator:
             SweepMeasurement.from_dict(item) for item in raw_measurements
         )
         candidate_ids = tuple(raw_candidate_ids)
-        measured_ids = tuple(
-            item.candidate.candidate_id for item in measurements
-        )
+        measured_ids = tuple(item.candidate.candidate_id for item in measurements)
         if measured_ids != candidate_ids:
-            raise ValueError(
-                "sweep checkpoint measurements do not match candidate IDs"
-            )
+            raise ValueError("sweep checkpoint measurements do not match candidate IDs")
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("sweep checkpoint candidate IDs are not unique")
         return _CachedSweepMeasurements(
@@ -417,10 +409,7 @@ class DiscreteSweepGenerator:
         self,
         cached: _CachedSweepMeasurements | None,
     ) -> bool:
-        return (
-            cached is not None
-            and cached.checkpoint_schema_version == 2
-        )
+        return cached is not None and cached.checkpoint_schema_version == 2
 
     def _checkpoint_payload(
         self,
@@ -456,6 +445,7 @@ class DiscreteSweepGenerator:
         measured: list[tuple[SweepCase, tuple[SweepMeasurement, ...]]] = []
         qualification_cases = 0
         race_cases = 0
+        skipped_cases: list[dict[str, object]] = []
         progress.start_stage(
             self.component_id,
             stage="correctness and candidate races",
@@ -521,9 +511,12 @@ class DiscreteSweepGenerator:
                         )
             for case, measurements in group_measurements:
                 if not any(item.passes() for item in measurements):
-                    raise RuntimeError(
-                        f"all candidates failed correctness for {case.case_id}"
+                    skipped_cases.append(_skip_summary(case, measurements))
+                    progress.advance(
+                        self.component_id,
+                        detail=f"skip {case.case_id}",
                     )
+                    continue
                 measured.append((case, measurements))
                 if len(measurements) == 1:
                     qualification_cases += 1
@@ -597,12 +590,24 @@ class DiscreteSweepGenerator:
             range_fields=self._range_fields,
             nearest_range_bounds=self._nearest_range_bounds,
         )
+        if not records:
+            raise RuntimeError(
+                f"{self.component_id}: every measurement case was skipped"
+            )
+        if skipped_cases:
+            warnings.warn(
+                f"{self.component_id}: skipped {len(skipped_cases)} case(s) with "
+                "no passing candidate; the profile keeps the neighbouring plans "
+                "for those query points",
+                stacklevel=2,
+            )
         coverage = self._coverage.to_dict()
         coverage.update(
             {
                 "allocation_groups": len(cases_by_group),
                 "measurement_cases": len(self._cases),
                 "runtime_query_points": len(records),
+                "skipped_cases": skipped_cases,
             }
         )
         estimate = self.estimate(context)
@@ -623,6 +628,23 @@ class DiscreteSweepGenerator:
             },
             completed_work_units=estimate.work_units,
         )
+
+
+def _skip_summary(
+    case: SweepCase,
+    measurements: tuple[SweepMeasurement, ...],
+) -> dict[str, object]:
+    """Describe why a case produced no usable plan (kernel errors or bad output)."""
+    errors = sorted({str(item.error) for item in measurements if item.error})
+    ran = [item for item in measurements if item.error is None]
+    return {
+        "case_id": case.case_id,
+        "query": case.query.to_dict(),
+        "candidates": len(measurements),
+        "raised": len(measurements) - len(ran),
+        "incorrect": len(ran),
+        "errors": errors[:4],
+    }
 
 
 __all__ = [

@@ -16,10 +16,40 @@ from b12x.policy.generation.sweep import SweepCase
 # Decode band densely (every M through 8 plus the spec-verify widths), then
 # the anchors the reducer interpolates between.
 DENSE_TOKEN_LADDER: tuple[int, ...] = (
-    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, 128, 256, 512, 1024, 2048,
+    1,
+    2,
+    3,
+    4,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
 )
 WO_TOKEN_LADDER: tuple[int, ...] = (
-    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64, 128, 256, 512, 1024, 2048,
+    1,
+    2,
+    3,
+    4,
+    6,
+    8,
+    12,
+    16,
+    24,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
 )
 DENSE_MAX_TOKENS_BOUNDS: tuple[int, int] = (1, 8192)
 
@@ -214,6 +244,9 @@ def dense_linear_shapes(
                         continue
                     k //= tp
                 if k % _k_alignment(model.recipe) or n % 16 or n <= 0:
+                    continue
+                if model.recipe == "block_fp8" and n % 128:
+                    # The K128 block recipe needs whole 128x128 scale blocks.
                     continue
                 entry = found.setdefault((model.recipe, k, n), (set(), set()))
                 entry[0].add(model.model_id)

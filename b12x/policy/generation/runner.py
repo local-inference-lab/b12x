@@ -179,8 +179,7 @@ def merge_profile_artifacts(
         for item in base_profile.get("pending_components", ())
         if str(item)
         not in {
-            str(component["component_id"])
-            for component in update_profile["components"]
+            str(component["component_id"]) for component in update_profile["components"]
         }
     ]
     components.update(

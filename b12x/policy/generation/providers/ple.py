@@ -163,9 +163,7 @@ class _PleEmbeddingProbe:
 
     @property
     def case_count(self) -> int:
-        return len(self._PROFILES) * len(self._QUANT_MODES) * len(
-            self._TABLE_MEMORIES
-        )
+        return len(self._PROFILES) * len(self._QUANT_MODES) * len(self._TABLE_MEMORIES)
 
     @property
     def case_ids(self) -> tuple[str, ...]:
@@ -218,9 +216,7 @@ class _PleEmbeddingProbe:
                     try:
                         timing, correctness, graph_contract = _time_case(
                             launch=case.launch,
-                            validate=(
-                                lambda active=case: _validate_embedding(active)
-                            ),
+                            validate=(lambda active=case: _validate_embedding(active)),
                             address_tensors=_address_tensors(
                                 case.binding,
                                 stateful=False,

@@ -119,7 +119,9 @@ class WoProjectionConfig:
 
 
 def _encode(query: WoProjectionQuery) -> dict[str, object]:
-    return {name: getattr(query, name) for name in WoProjectionQuery.__dataclass_fields__}
+    return {
+        name: getattr(query, name) for name in WoProjectionQuery.__dataclass_fields__
+    }
 
 
 def _low_sm_max() -> int:
@@ -130,9 +132,7 @@ def _low_sm_max() -> int:
     return int(_WO_SPARK_MAX_SMS)
 
 
-def _fused_wo_b_tile(
-    query: WoProjectionQuery, sm_count: int
-) -> tuple[int, int]:
+def _fused_wo_b_tile(query: WoProjectionQuery, sm_count: int) -> tuple[int, int]:
     """The tile the fused-quant WO-B launch pins today (see
     ``wo_mxfp8._wo_b_fused_tiled_plan``)."""
     try:
@@ -199,15 +199,23 @@ def _validate(
         raise ValueError(f"unsupported WO projection backend {config.backend!r}")
     if query.dtype != "bfloat16":
         raise ValueError(f"unsupported WO projection dtype {query.dtype!r}")
-    if min(query.max_tokens, query.groups, query.group_width, query.rank, query.hidden) <= 0:
+    if (
+        min(query.max_tokens, query.groups, query.group_width, query.rank, query.hidden)
+        <= 0
+    ):
         raise ValueError("WO projection geometry must be positive")
     if query.group_width % 32 or (query.rank * query.groups) % 32:
         raise ValueError("WO projection K extents must be multiples of 32")
-    for name, tile in (("WO-A", (config.wo_a_tile_m, config.wo_a_tile_n)), ("WO-B", (config.wo_b_tile_m, config.wo_b_tile_n))):
+    for name, tile in (
+        ("WO-A", (config.wo_a_tile_m, config.wo_a_tile_n)),
+        ("WO-B", (config.wo_b_tile_m, config.wo_b_tile_n)),
+    ):
         if tile not in WO_PROJECTION_TILES:
             raise ValueError(f"unsupported {name} MMA tile {tile}")
     if config.wo_b_fused_quant and config.quantized_intermediate:
-        raise ValueError("fused-quant WO-B and the quantized intermediate are exclusive")
+        raise ValueError(
+            "fused-quant WO-B and the quantized intermediate are exclusive"
+        )
     if config.wo_b_fused_quant and query.max_tokens > 8:
         raise ValueError("fused-quant WO-B requires max_tokens <= 8")
     if config.quantized_intermediate and query.max_tokens > 16:
