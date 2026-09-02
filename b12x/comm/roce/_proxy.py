@@ -8,6 +8,7 @@ the interpreter on its critical path.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import os
@@ -233,10 +234,8 @@ class Proxy:
             self._lib.roce_destroy(ctx)
 
     def __del__(self) -> None:  # pragma: no cover - defensive teardown
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 __all__ = ["Layout", "Proxy", "load"]
