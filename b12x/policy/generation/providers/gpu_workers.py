@@ -1364,6 +1364,7 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
             and (indexed_width == 0 or indexed_page_size == 64)
         )
         caps = (1,) if uses_single_pass else (1, 2, 4, 8, 16, 32, 64, 256)
+        heuristic_cap = 1 if uses_single_pass else 64
         representatives: dict[tuple[int, int], int] = {}
         for chunk_cap in caps:
             config = compressed_sparse_mla_split_config_for_contract(
@@ -1371,10 +1372,11 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 width=max(1, width),
                 max_chunks=chunk_cap,
             )
-            representatives.setdefault(
-                (int(config.chunk_size), int(config.num_chunks)),
-                chunk_cap,
-            )
+            key = (int(config.chunk_size), int(config.num_chunks))
+            # Caps that collapse to one split contract keep the runtime's own
+            # cap as the representative so the baseline margin can find it.
+            if chunk_cap == heuristic_cap or key not in representatives:
+                representatives[key] = chunk_cap
         candidates = tuple(
             SweepCandidate.create({"max_chunks_per_row": chunk_cap})
             for chunk_cap in sorted(representatives.values())
@@ -1672,7 +1674,123 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 )
                 for candidate in candidates
             )
+            measurements = self._rank_in_place(case, measurements, device=device)
         return measurements
+
+    def _rank_in_place(self, case: SweepCase, measurements, *, device):
+        """Re-time the passing candidates inside the DSV4 attention chain.
+
+        Isolated timing keeps the correctness gate; the ranking latency is the
+        sparse MLA's own time between the indexer and WO of a generic layer.
+        Contracts the chain does not model keep their isolated latency.
+        """
+        from dataclasses import replace
+
+        import torch
+
+        from .dsv4_layer_stack import _DsvLayerContext
+        from .layer_stack import _confirm_winner, _context_race, _keep_race
+
+        query = case.query
+        rows = int(query["query_rows"])
+        heads = int(query["num_q_heads"])
+        modelled = (
+            str(query["mode"]) == "decode"
+            and rows <= 256
+            and int(query["indexed_width"]) == 512
+            and int(query["indexed_page_size"]) == 64
+            and int(query["swa_page_size"]) == 64
+            and heads % 8 == 0
+        )
+        passing = [m for m in measurements if m.correct]
+        if not modelled or len(passing) < 2:
+            return measurements
+        settings = self._context.settings
+        try:
+            context = _DsvLayerContext(
+                heads=heads,
+                rows=rows,
+                swa_width=int(query["swa_width"]),
+                indexed_width=int(query["indexed_width"]),
+                device=device,
+                generator=torch.Generator(device=device).manual_seed(
+                    settings.seed + int(case.case_id[-8:], 16) % 1_000_003 + 7919
+                ),
+                seed=settings.seed + int(case.case_id[-8:], 16) % 1_000_003,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the isolated ranking
+            return tuple(
+                replace(
+                    m,
+                    metrics={**dict(m.metrics or {}), "context_error": str(exc)[:160]},
+                )
+                if m.correct
+                else m
+                for m in measurements
+            )
+        flush = _l2_flush_fn(device, enabled=settings.cold_l2)
+        baseline = self._baseline_config(case, device)
+        races: dict = {}
+        updated = []
+        for m in measurements:
+            if not m.correct:
+                updated.append(m)
+                continue
+            cap = int(m.candidate.config["max_chunks_per_row"])
+            try:
+                context.prepare_attention(cap)
+                race = _context_race(
+                    context=context,
+                    slot=("attention", cap),
+                    settings=settings,
+                    device=device,
+                    flush=flush,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the isolated latency
+                updated.append(
+                    replace(
+                        m,
+                        metrics={
+                            **dict(m.metrics or {}),
+                            "context_error": str(exc)[:160],
+                        },
+                    )
+                )
+                continue
+            _keep_race(races, m.candidate, race, baseline)
+            updated.append(
+                replace(
+                    m,
+                    latency_us=race.op_us,
+                    correct=m.correct and race.finite,
+                    metrics={
+                        **dict(m.metrics or {}),
+                        "in_place": True,
+                        "isolated_us": m.latency_us,
+                        "stack_us": race.stack_us,
+                        "context_layers": context.layers,
+                        "context_repetitions": race.repetitions,
+                    },
+                )
+            )
+        updated = _confirm_winner(updated, races, baseline_config=baseline)
+        del context, races
+        gc.collect()
+        torch.cuda.empty_cache()
+        return tuple(updated)
+
+    def _baseline_config(self, case: SweepCase, device) -> dict[str, object]:
+        from b12x.attention.compressed_sparse_mla._policy import (
+            SparseMlaQuery,
+            _heuristic,
+        )
+        from b12x.policy import PolicyContext, PolicyMode
+
+        identity = PolicyContext.for_device(
+            device, mode=PolicyMode.HEURISTIC_ONLY
+        ).device
+        config = _heuristic(SparseMlaQuery(**dict(case.query)), identity)
+        return {"max_chunks_per_row": int(config.max_chunks_per_row)}
 
 
 class SparseMlaBenchmarkFactory:

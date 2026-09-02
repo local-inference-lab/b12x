@@ -37,6 +37,7 @@ from b12x.policy.generation.sweep import (
     SweepCase,
 )
 
+from .layer_stack import CONTEXT_MARGIN
 from .gpu_workers import (
     GdnBenchmarkFactory,
     GqaBenchmarkFactory,
@@ -71,6 +72,8 @@ class _AttentionGenerator(DiscreteSweepGenerator):
         query_schema_version: int = 1,
         config_schema_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
+        baseline_margin: float = 0.0,
+        candidate_contract_version: int = 1,
     ) -> None:
         del corpus_name
         super().__init__(
@@ -89,6 +92,8 @@ class _AttentionGenerator(DiscreteSweepGenerator):
                 "model_geometries": geometry_count,
             },
             nearest_range_bounds=nearest_range_bounds,
+            baseline_margin=baseline_margin,
+            candidate_contract_version=candidate_contract_version,
         )
 
 
@@ -359,7 +364,18 @@ class CompressedSparseMlaAttentionGenerator(_AttentionGenerator):
             corpus_name="sparse_mla",
             geometry_count=len(SPARSE_MLA_GEOMETRIES),
             benchmark_factory=benchmark_factory or SparseMlaBenchmarkFactory(),
+            baseline_margin=CONTEXT_MARGIN,
+            candidate_contract_version=2,
         )
+
+    def baseline_config(self, case, context):
+        from b12x.attention.compressed_sparse_mla._policy import (
+            SparseMlaQuery,
+            _heuristic,
+        )
+
+        config = _heuristic(SparseMlaQuery(**dict(case.query)), context.device)
+        return {"max_chunks_per_row": int(config.max_chunks_per_row)}
 
 
 __all__ = [
