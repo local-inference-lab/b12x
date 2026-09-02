@@ -256,311 +256,85 @@ def _packed_sequential_kda_decode_kernel(
         tl.float32
     )
 
-    # The hoisted variant below pays for its extra live registers: with the
-    # 16-wide recurrent value tile it is faster (GLM-5.3 TP4 decode on RTX PRO
-    # 6000 Blackwell: 14.5 -> 12.4 us per call at one request, unchanged at
-    # 8-32 requests), with the 32-wide tile it spills and is slower, so the
-    # generic loop stays for BLOCK_V > 16.
-    if BLOCK_V <= 16:
-        # Every per-token operand (q, k, v, beta, gate, destination slot) is
-        # loaded before the serial recurrence so the eight dependent global-load
-        # round trips leave the critical path.  The per-token arithmetic sequence
-        # is the generic loop's (bf16 operands convert to fp32 at use), so
-        # outputs and states are bitwise identical to it.
-        A_log_value = tl.load(A_log + value_head).to(tl.float32)
-        gate_bias = tl.load(
-            dt_bias
-            + value_head.to(tl.int64) * stride_dt_bias_head
-            + key_cols.to(tl.int64),
-            mask=key_mask,
-            other=0.0,
-        ).to(tl.float32)
-        for t in tl.static_range(STATE_INDEX_COLUMNS):
-            ok_t = (t < state_index_columns) & (t < (end - start))
-            token_i64_t = (start + t).to(tl.int64)
-            mixed_base_t = token_i64_t * stride_mixed_token
-            q_offsets_t = key_head * KEY_HEAD_DIM + key_cols
-            k_offsets_t = KEY_HEADS * KEY_HEAD_DIM + q_offsets_t
-            v_offsets_t = (
+    for relative_token in range(STATE_INDEX_COLUMNS):
+        if (relative_token < state_index_columns) & (relative_token < (end - start)):
+            token = start + relative_token
+            token_i64 = token.to(tl.int64)
+            mixed_base = token_i64 * stride_mixed_token
+            q_offsets = key_head * KEY_HEAD_DIM + key_cols
+            k_offsets = KEY_HEADS * KEY_HEAD_DIM + q_offsets
+            v_offsets = (
                 2 * KEY_HEADS * KEY_HEAD_DIM + value_head * VALUE_HEAD_DIM + value_rows
             )
-            q_t = tl.load(
-                mixed_qkv + mixed_base_t + q_offsets_t, mask=key_mask & ok_t, other=0.0
-            )
-            k_t = tl.load(
-                mixed_qkv + mixed_base_t + k_offsets_t, mask=key_mask & ok_t, other=0.0
-            )
-            v_t = tl.load(
-                mixed_qkv + mixed_base_t + v_offsets_t,
-                mask=value_mask & ok_t,
-                other=0.0,
-            )
-            b_t = tl.load(
-                b
-                + token_i64_t * stride_b_token
-                + value_head.to(tl.int64) * stride_b_head,
-                mask=ok_t,
-                other=0.0,
-            )
-            g_t = tl.load(
+            q = tl.load(
+                mixed_qkv + mixed_base + q_offsets, mask=key_mask, other=0.0
+            ).to(tl.float32)
+            k = tl.load(
+                mixed_qkv + mixed_base + k_offsets, mask=key_mask, other=0.0
+            ).to(tl.float32)
+            value = tl.load(
+                mixed_qkv + mixed_base + v_offsets, mask=value_mask, other=0.0
+            ).to(tl.float32)
+            if QK_L2NORM:
+                q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6)
+                k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
+            q *= scale
+
+            b_value = tl.load(
+                b + token_i64 * stride_b_token + value_head.to(tl.int64) * stride_b_head
+            ).to(tl.float32)
+            A_log_value = tl.load(A_log + value_head).to(tl.float32)
+            raw_gate = tl.load(
                 a
-                + token_i64_t * stride_a_token
+                + token_i64 * stride_a_token
                 + value_head.to(tl.int64) * stride_a_head
                 + key_cols.to(tl.int64),
-                mask=key_mask & ok_t,
+                mask=key_mask,
                 other=0.0,
+            ).to(tl.float32)
+            gate_bias = tl.load(
+                dt_bias
+                + value_head.to(tl.int64) * stride_dt_bias_head
+                + key_cols.to(tl.int64),
+                mask=key_mask,
+                other=0.0,
+            ).to(tl.float32)
+            log_decay = lower_bound * tl.sigmoid(
+                tl.exp(A_log_value) * (raw_gate + gate_bias)
             )
-            d_t = tl.load(
+            state *= tl.exp(log_decay)[None, :]
+            beta = tl.sigmoid(b_value)
+
+            value -= tl.sum(state * k[None, :], axis=1)
+            value *= beta
+            state += value[:, None] * k[None, :]
+            decoded = tl.sum(state * q[None, :], axis=1)
+            output_offsets = (
+                token_i64 * stride_output_token
+                + value_head.to(tl.int64) * stride_output_head
+                + value_rows.to(tl.int64)
+            )
+            tl.store(output + output_offsets, decoded, mask=value_mask)
+
+            destination_idx = tl.load(
                 state_indices
                 + request.to(tl.int64) * stride_indices_request
-                + t * stride_indices_column,
-                mask=ok_t,
-                other=0,
+                + relative_token * stride_indices_column
             ).to(tl.int64)
-            if t == 0:
-                q0 = q_t
-                k0 = k_t
-                v0 = v_t
-                b0 = b_t
-                g0 = g_t
-                d0 = d_t
-            elif t == 1:
-                q1 = q_t
-                k1 = k_t
-                v1 = v_t
-                b1 = b_t
-                g1 = g_t
-                d1 = d_t
-            elif t == 2:
-                q2 = q_t
-                k2 = k_t
-                v2 = v_t
-                b2 = b_t
-                g2 = g_t
-                d2 = d_t
-            elif t == 3:
-                q3 = q_t
-                k3 = k_t
-                v3 = v_t
-                b3 = b_t
-                g3 = g_t
-                d3 = d_t
-            elif t == 4:
-                q4 = q_t
-                k4 = k_t
-                v4 = v_t
-                b4 = b_t
-                g4 = g_t
-                d4 = d_t
-            elif t == 5:
-                q5 = q_t
-                k5 = k_t
-                v5 = v_t
-                b5 = b_t
-                g5 = g_t
-                d5 = d_t
-            elif t == 6:
-                q6 = q_t
-                k6 = k_t
-                v6 = v_t
-                b6 = b_t
-                g6 = g_t
-                d6 = d_t
-            elif t == 7:
-                q7 = q_t
-                k7 = k_t
-                v7 = v_t
-                b7 = b_t
-                g7 = g_t
-                d7 = d_t
-        for t in tl.static_range(STATE_INDEX_COLUMNS):
-            if t == 0:
-                q_c = q0
-                k_c = k0
-                v_c = v0
-                b_c = b0
-                g_c = g0
-                d_c = d0
-            elif t == 1:
-                q_c = q1
-                k_c = k1
-                v_c = v1
-                b_c = b1
-                g_c = g1
-                d_c = d1
-            elif t == 2:
-                q_c = q2
-                k_c = k2
-                v_c = v2
-                b_c = b2
-                g_c = g2
-                d_c = d2
-            elif t == 3:
-                q_c = q3
-                k_c = k3
-                v_c = v3
-                b_c = b3
-                g_c = g3
-                d_c = d3
-            elif t == 4:
-                q_c = q4
-                k_c = k4
-                v_c = v4
-                b_c = b4
-                g_c = g4
-                d_c = d4
-            elif t == 5:
-                q_c = q5
-                k_c = k5
-                v_c = v5
-                b_c = b5
-                g_c = g5
-                d_c = d5
-            elif t == 6:
-                q_c = q6
-                k_c = k6
-                v_c = v6
-                b_c = b6
-                g_c = g6
-                d_c = d6
-            elif t == 7:
-                q_c = q7
-                k_c = k7
-                v_c = v7
-                b_c = b7
-                g_c = g7
-                d_c = d7
-            ok_t = (t < state_index_columns) & (t < (end - start))
-            if ok_t:
-                token_i64 = (start + t).to(tl.int64)
-                q = q_c.to(tl.float32)
-                k = k_c.to(tl.float32)
-                value = v_c.to(tl.float32)
-                if QK_L2NORM:
-                    q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6)
-                    k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
-                q *= scale
-
-                b_value = b_c.to(tl.float32)
-                raw_gate = g_c.to(tl.float32)
-                log_decay = lower_bound * tl.sigmoid(
-                    tl.exp(A_log_value) * (raw_gate + gate_bias)
-                )
-                state *= tl.exp(log_decay)[None, :]
-                beta = tl.sigmoid(b_value)
-
-                value -= tl.sum(state * k[None, :], axis=1)
-                value *= beta
-                state += value[:, None] * k[None, :]
-                decoded = tl.sum(state * q[None, :], axis=1)
-                output_offsets = (
-                    token_i64 * stride_output_token
-                    + value_head.to(tl.int64) * stride_output_head
-                    + value_rows.to(tl.int64)
-                )
-                tl.store(output + output_offsets, decoded, mask=value_mask)
-
-                destination_idx = d_c
-                destination_offsets = (
-                    destination_idx * stride_state_slot
-                    + value_head.to(tl.int64) * stride_state_head
-                    + value_rows[:, None].to(tl.int64) * stride_state_v
-                    + key_cols[None, :].to(tl.int64)
-                )
-                destination_mask = state_mask
-                if HAS_NULL_STATE_INDEX:
-                    destination_mask &= destination_idx != NULL_STATE_INDEX
-                tl.store(
-                    recurrent_state + destination_offsets,
-                    state,
-                    mask=destination_mask,
-                )
-    else:
-        for relative_token in range(STATE_INDEX_COLUMNS):
-            if (relative_token < state_index_columns) & (
-                relative_token < (end - start)
-            ):
-                token = start + relative_token
-                token_i64 = token.to(tl.int64)
-                mixed_base = token_i64 * stride_mixed_token
-                q_offsets = key_head * KEY_HEAD_DIM + key_cols
-                k_offsets = KEY_HEADS * KEY_HEAD_DIM + q_offsets
-                v_offsets = (
-                    2 * KEY_HEADS * KEY_HEAD_DIM
-                    + value_head * VALUE_HEAD_DIM
-                    + value_rows
-                )
-                q = tl.load(
-                    mixed_qkv + mixed_base + q_offsets, mask=key_mask, other=0.0
-                ).to(tl.float32)
-                k = tl.load(
-                    mixed_qkv + mixed_base + k_offsets, mask=key_mask, other=0.0
-                ).to(tl.float32)
-                value = tl.load(
-                    mixed_qkv + mixed_base + v_offsets, mask=value_mask, other=0.0
-                ).to(tl.float32)
-                if QK_L2NORM:
-                    q = q * tl.rsqrt(tl.sum(q * q, axis=0) + 1.0e-6)
-                    k = k * tl.rsqrt(tl.sum(k * k, axis=0) + 1.0e-6)
-                q *= scale
-
-                b_value = tl.load(
-                    b
-                    + token_i64 * stride_b_token
-                    + value_head.to(tl.int64) * stride_b_head
-                ).to(tl.float32)
-                A_log_value = tl.load(A_log + value_head).to(tl.float32)
-                raw_gate = tl.load(
-                    a
-                    + token_i64 * stride_a_token
-                    + value_head.to(tl.int64) * stride_a_head
-                    + key_cols.to(tl.int64),
-                    mask=key_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                gate_bias = tl.load(
-                    dt_bias
-                    + value_head.to(tl.int64) * stride_dt_bias_head
-                    + key_cols.to(tl.int64),
-                    mask=key_mask,
-                    other=0.0,
-                ).to(tl.float32)
-                log_decay = lower_bound * tl.sigmoid(
-                    tl.exp(A_log_value) * (raw_gate + gate_bias)
-                )
-                state *= tl.exp(log_decay)[None, :]
-                beta = tl.sigmoid(b_value)
-
-                value -= tl.sum(state * k[None, :], axis=1)
-                value *= beta
-                state += value[:, None] * k[None, :]
-                decoded = tl.sum(state * q[None, :], axis=1)
-                output_offsets = (
-                    token_i64 * stride_output_token
-                    + value_head.to(tl.int64) * stride_output_head
-                    + value_rows.to(tl.int64)
-                )
-                tl.store(output + output_offsets, decoded, mask=value_mask)
-
-                destination_idx = tl.load(
-                    state_indices
-                    + request.to(tl.int64) * stride_indices_request
-                    + relative_token * stride_indices_column
-                ).to(tl.int64)
-                destination_offsets = (
-                    destination_idx * stride_state_slot
-                    + value_head.to(tl.int64) * stride_state_head
-                    + value_rows[:, None].to(tl.int64) * stride_state_v
-                    + key_cols[None, :].to(tl.int64)
-                )
-                destination_mask = state_mask
-                if HAS_NULL_STATE_INDEX:
-                    destination_mask &= destination_idx != NULL_STATE_INDEX
-                tl.store(
-                    recurrent_state + destination_offsets,
-                    state,
-                    mask=destination_mask,
-                )
+            destination_offsets = (
+                destination_idx * stride_state_slot
+                + value_head.to(tl.int64) * stride_state_head
+                + value_rows[:, None].to(tl.int64) * stride_state_v
+                + key_cols[None, :].to(tl.int64)
+            )
+            destination_mask = state_mask
+            if HAS_NULL_STATE_INDEX:
+                destination_mask &= destination_idx != NULL_STATE_INDEX
+            tl.store(
+                recurrent_state + destination_offsets,
+                state,
+                mask=destination_mask,
+            )
 
 
 @triton.jit(do_not_specialize=["token_capacity"])
