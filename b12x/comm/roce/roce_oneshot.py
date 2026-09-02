@@ -1,0 +1,460 @@
+"""RoCE one-shot all-reduce runtime for multi-node tensor parallelism.
+
+Designed for DGX Spark clusters, whose integrated GPU can read pinned host
+memory in place and whose ConnectX-7 can RDMA-write into the same memory.
+Each rank owns one pinned region (see ``_roce_proxy.c``); every all-reduce is
+one kernel launch that stages the input, rings the proxy thread, waits for
+every peer's RDMA-written payload, and reduces in fixed rank order.
+
+Constraints of this first runtime:
+
+* one all-reduce in flight per runtime (single channel, one stream);
+* message sizes up to ``max_size`` bytes, a multiple of 16 bytes;
+* every rank of the exchange group must construct the runtime collectively.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
+
+from ._oneshot_cute import PACK_BYTES, get_launcher, is_launcher_prepared
+from ._proxy import Layout, Proxy
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+SUPPORTED_WORLD_SIZES = tuple(range(2, 17))
+DEFAULT_MAX_SIZE = 1024 * 1024
+DEFAULT_THREADS = 512
+DEFAULT_BLOCKS = 8
+DEFAULT_GID_INDEX = 3
+# Polls of a peer flag before the kernel gives up (each poll is a system-scope
+# load of host memory, roughly a microsecond): about 20 s.
+DEFAULT_SPIN_LIMIT = 20_000_000
+_SLOT_ALIGNMENT = 4096
+_DTYPE_NAMES = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+}
+
+
+def _env_list(*names: str) -> tuple[str, ...]:
+    for name in names:
+        raw = os.getenv(name)
+        if raw:
+            items = []
+            for item in raw.split(","):
+                item = item.strip().lstrip("=^")
+                if item:
+                    items.append(item.split(":")[0])
+            if items:
+                return tuple(items)
+    return ()
+
+
+def _env_int(*names: str, default: int) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw:
+            return int(raw)
+    return default
+
+
+def default_gid_index() -> int:
+    """``B12X_ROCE_GID_INDEX``, else NCCL's ``NCCL_IB_GID_INDEX``, else 3."""
+
+    return _env_int("B12X_ROCE_GID_INDEX", "NCCL_IB_GID_INDEX", default=DEFAULT_GID_INDEX)
+
+
+def discover_hcas(gid_index: Optional[int] = None) -> tuple[str, ...]:
+    """Return the RDMA devices to use, at most two.
+
+    ``B12X_ROCE_HCA`` (or NCCL's ``NCCL_IB_HCA``) selects explicitly; otherwise
+    every active device with a populated GID at ``gid_index`` is used.
+    """
+
+    explicit = _env_list("B12X_ROCE_HCA", "NCCL_IB_HCA")
+    if explicit:
+        return explicit[:2]
+    gid_index = default_gid_index() if gid_index is None else int(gid_index)
+    found = []
+    root = Path("/sys/class/infiniband")
+    for dev in sorted(root.glob("*")):
+        state = dev / "ports" / "1" / "state"
+        gid = dev / "ports" / "1" / "gids" / str(gid_index)
+        try:
+            if "ACTIVE" not in state.read_text():
+                continue
+            if gid.read_text().strip().replace(":", "").strip("0") == "":
+                continue
+        except OSError:
+            continue
+        found.append(dev.name)
+    return tuple(found[:2])
+
+
+def is_supported(device: torch.device | int | str | None = None) -> bool:
+    """True on an integrated GPU with at least one active RDMA device.
+
+    The kernel reads pinned host memory in place, which needs an integrated
+    (unified-memory) GPU such as the DGX Spark GB10.
+    """
+
+    if not torch.cuda.is_available():
+        return False
+    index = torch.cuda.current_device() if device is None else torch.device(device).index
+    props = torch.cuda.get_device_properties(index if index is not None else 0)
+    if not getattr(props, "is_integrated", False):
+        return False
+    return len(discover_hcas()) > 0
+
+
+def _normalize_device(device: torch.device | int | str) -> torch.device:
+    if isinstance(device, int):
+        device = torch.device("cuda", device)
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("RoCE all-reduce requires a CUDA device")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+def _exchange(local: object, group: ProcessGroup) -> list[object]:
+    gathered: list[object] = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, local, group=group)
+    return gathered
+
+
+class RoceOneshotAllReduce:
+    """One-shot RDMA all-reduce over the DGX Spark 200 GbE fabric."""
+
+    algorithm = "roce_oneshot"
+
+    def __init__(
+        self,
+        *,
+        exchange_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        hca_names: Optional[Sequence[str]] = None,
+        gid_index: Optional[int] = None,
+        threads: int = DEFAULT_THREADS,
+        blocks: int = DEFAULT_BLOCKS,
+    ) -> None:
+        self.device = _normalize_device(device)
+        self.rank = dist.get_rank(group=exchange_group)
+        self.world_size = dist.get_world_size(group=exchange_group)
+        self._group = exchange_group
+        self._closed = False
+        self._proxy: Optional[Proxy] = None
+        if self.world_size not in SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                f"unsupported RoCE all-reduce world size {self.world_size}; "
+                f"supported sizes are {SUPPORTED_WORLD_SIZES}"
+            )
+        if int(max_size) < PACK_BYTES:
+            raise ValueError("max_size must hold at least one 16-byte pack")
+        if int(threads) % 32 != 0 or int(threads) < 32 or int(threads) > 1024:
+            raise ValueError("threads must be a multiple of 32 between 32 and 1024")
+        if int(blocks) < 1:
+            raise ValueError("blocks must be positive")
+        self.max_size = int(max_size)
+        self._threads = int(threads)
+        self._blocks = int(blocks)
+        self.gid_index = default_gid_index() if gid_index is None else int(gid_index)
+        self.spin_limit = _env_int("B12X_ROCE_SPIN_LIMIT", default=DEFAULT_SPIN_LIMIT)
+        names = tuple(hca_names) if hca_names else discover_hcas(self.gid_index)
+        if not names:
+            raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
+        self.hca_names = names[:2]
+
+        slot_bytes = _align_up(self.max_size, _SLOT_ALIGNMENT)
+        self._layout = Layout(self.world_size, slot_bytes)
+        self._slot_bytes = slot_bytes
+
+        with torch.cuda.device(self.device):
+            # Pinned, zero-initialised: flags and the control record start at 0
+            # and the first sequence number is 1.
+            self._region = torch.zeros(
+                self._layout.total_bytes, dtype=torch.uint8, pin_memory=True
+            )
+            self._counters = torch.zeros(4, dtype=torch.int32, device=self.device)
+        host_ptr = self._region.data_ptr()
+        device_ptr = self._device_pointer(host_ptr)
+        if device_ptr != host_ptr:
+            raise RuntimeError(
+                "RoCE all-reduce needs host pointers that are directly device "
+                "accessible (integrated GPU with unified addressing)"
+            )
+        self._recv_base = host_ptr + self._layout.recv_off
+        self._flag_base = host_ptr + self._layout.flag_off
+        self._send_base = host_ptr + self._layout.send_off
+        self._ctrl_base = host_ptr + self._layout.ctrl_off
+        # ctrl record: seq, nbytes, error seq, missing peer (kernel-written)
+        self._ctrl_words = self._region[
+            self._layout.ctrl_off : self._layout.ctrl_off + 16
+        ].view(torch.int32)
+        self._error_word = self._ctrl_words[2:3]
+        self._epoch_address = self._counters.data_ptr()
+
+        error: Optional[str] = None
+        try:
+            self._proxy = Proxy(
+                world_size=self.world_size,
+                rank=self.rank,
+                hca_names=self.hca_names,
+                gid_index=self.gid_index,
+                region_ptr=host_ptr,
+                region_bytes=self._layout.total_bytes,
+                slot_bytes=slot_bytes,
+            )
+            blob = self._proxy.local_blob()
+        except Exception as exc:  # noqa: BLE001 - reported collectively below
+            error = str(exc)
+            blob = b""
+        statuses = _exchange((error, blob), exchange_group)
+        failures = [f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None]
+        if failures:
+            self.close()
+            raise RuntimeError("RoCE all-reduce setup failed: " + "; ".join(failures))
+        try:
+            self._proxy.connect([s[1] for s in statuses])
+            self._proxy.start()
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        verdicts = _exchange(error, exchange_group)
+        failures = [f"rank {i}: {v}" for i, v in enumerate(verdicts) if v is not None]
+        if failures:
+            self.close()
+            raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
+        if self.rank == 0:
+            logger.info(
+                "RoCE one-shot all-reduce ready: world=%d hcas=%s gid_index=%d max_size=%d",
+                self.world_size,
+                ",".join(self.hca_names),
+                self.gid_index,
+                self.max_size,
+            )
+
+    @staticmethod
+    def _device_pointer(host_ptr: int) -> int:
+        from cuda.bindings import runtime as cudart
+
+        err, ptr = cudart.cudaHostGetDevicePointer(host_ptr, 0)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaHostGetDevicePointer failed: {err}")
+        return int(ptr)
+
+    @classmethod
+    def from_exchange_group(
+        cls,
+        *,
+        exchange_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        eager_buffer_bytes: Optional[int] = None,
+        **_ignored: Any,
+    ) -> "RoceOneshotAllReduce":
+        """Mirror ``comm.pcie.AllReduce.from_exchange_group``; PCIe-only knobs are ignored."""
+
+        capacity = max(int(max_size), int(eager_buffer_bytes or 0))
+        return cls(exchange_group=exchange_group, device=device, max_size=capacity)
+
+    @classmethod
+    def from_process_group(
+        cls,
+        *,
+        process_group: ProcessGroup,
+        device: torch.device | int | str,
+        max_size: int = DEFAULT_MAX_SIZE,
+        max_input_bytes: Optional[int] = None,
+        **_ignored: Any,
+    ) -> "RoceOneshotAllReduce":
+        capacity = max(int(max_size), int(max_input_bytes or 0))
+        return cls(exchange_group=process_group, device=device, max_size=capacity)
+
+    # -- policy -----------------------------------------------------------------
+
+    @property
+    def supports_all_peer_auxiliary(self) -> bool:
+        return False
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        if self._closed or self._proxy is None:
+            return False
+        if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda:
+            return False
+        if inp.device != self.device or not inp.is_contiguous():
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return 0 < nbytes <= self.max_size and nbytes % PACK_BYTES == 0
+
+    # -- channels / streams (single channel runtime) ---------------------------
+
+    def prepare_channels(self, channel_ids: Sequence[str]) -> None:
+        return None
+
+    def for_stream(self, stream: object = None, *, channel_id: Optional[str] = None):
+        return self
+
+    # -- compilation ------------------------------------------------------------
+
+    def _launcher_key(self, dtype: torch.dtype) -> tuple[object, ...]:
+        return (
+            _DTYPE_NAMES[dtype],
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.slots,
+            self._layout.flag_stride,
+            self.device.index,
+        )
+
+    def prepare(self, dtypes: Sequence[torch.dtype] = (torch.bfloat16,)) -> None:
+        """Compile launchers ahead of CUDA-graph capture."""
+
+        with torch.cuda.device(self.device):
+            for dtype in dtypes:
+                get_launcher(*self._launcher_key(dtype))
+
+    def prepare_graph_all_reduce(self, inp: torch.Tensor, *, stream: object = None) -> None:
+        self.prepare((inp.dtype,))
+
+    # -- execution ----------------------------------------------------------------
+
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+        peer_input_ptrs: Optional[Sequence[int]] = None,
+    ) -> torch.Tensor:
+        if not self.should_allreduce(inp):
+            raise ValueError("input is not eligible for the RoCE one-shot all-reduce")
+        if out is None:
+            out = torch.empty_like(inp)
+        elif out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous():
+            raise ValueError("out must be a contiguous tensor matching the input")
+        key = self._launcher_key(inp.dtype)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not is_launcher_prepared(*key):
+            raise RuntimeError(
+                "RoCE all-reduce launcher must be prepared before CUDA graph capture"
+            )
+        launcher = get_launcher(*key)
+        nbytes = inp.numel() * inp.element_size()
+        context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        with torch.cuda.device(self.device), context:
+            launcher(
+                inp.data_ptr(),
+                out.data_ptr(),
+                nbytes // PACK_BYTES,
+                nbytes,
+                self._recv_base,
+                self._flag_base,
+                self._send_base,
+                self._ctrl_base,
+                self._slot_bytes,
+                self._epoch_address,
+                self.spin_limit,
+                self._blocks,
+            )
+        if not capturing:
+            self.check_health()
+        return out
+
+    def check_health(self) -> None:
+        """Raise if the proxy thread died or a kernel wait timed out.
+
+        Cheap (two host memory reads); call it after graph replays, which
+        cannot check inline.
+        """
+
+        if self._proxy is not None and self._proxy.failed():
+            raise RuntimeError(f"RoCE proxy failed: {self._proxy.error()}")
+        failed_seq = int(self._error_word.item())
+        if failed_seq != 0:
+            peer = int(self._ctrl_words[3].item())
+            raise RuntimeError(
+                f"RoCE all-reduce on rank {self.rank} timed out waiting for rank {peer} "
+                f"at sequence {failed_seq}; that rank's proxy or kernel is dead "
+                "(rank data is no longer trustworthy)"
+            )
+
+    @contextmanager
+    def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
+        yield self
+
+    # -- diagnostics / lifecycle --------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "world_size": self.world_size,
+            "rank": self.rank,
+            "hcas": list(self.hca_names),
+            "max_size": self.max_size,
+            "slot_bytes": self._slot_bytes,
+            "epoch": int(self._counters[0].item()),
+            "error_seq": int(self._error_word.item()),
+            "error_peer": int(self._ctrl_words[3].item()),
+            "ctrl_seq": int(self._ctrl_words[0].item()),
+            "spin_limit": self.spin_limit,
+        }
+        if self._proxy is not None:
+            info.update(self._proxy.stats())
+            info["peer_hca"] = {
+                peer: self._proxy.peer_hca(peer)
+                for peer in range(self.world_size)
+                if peer != self.rank
+            }
+        return info
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._proxy is not None:
+            self._proxy.close()
+            self._proxy = None
+
+    def __del__(self) -> None:  # pragma: no cover - defensive teardown
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+__all__ = [
+    "DEFAULT_MAX_SIZE",
+    "SUPPORTED_DTYPES",
+    "SUPPORTED_WORLD_SIZES",
+    "RoceOneshotAllReduce",
+    "default_gid_index",
+    "discover_hcas",
+    "is_supported",
+]
