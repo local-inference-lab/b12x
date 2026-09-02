@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import dataclass, replace
 import os
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
@@ -1020,7 +1021,7 @@ def _graph_race(
 # kernel, and launches overlap as they do in a real step. The stack is sized
 # from the shape under test, not from any particular model.
 _CONTEXT_LAYERS = 3
-_CONTEXT_MARGIN = 0.01
+_CONTEXT_MARGIN = 0.02
 _BF16_INPUT_RECIPES = frozenset({"mxfp8", "tensor_fp8"})
 
 
@@ -1150,8 +1151,12 @@ class _LayerContext:
             self.norm_weight
         )
 
-    def run(self, plan):
-        """One step through every layer with ``plan`` in the tested slot."""
+    def run(self, plan, events=None):
+        """One step through every layer with ``plan`` in the tested slot.
+
+        ``events`` is an optional per-layer list of (start, end) CUDA events
+        recorded around the tested op so a graph replay can time it in place.
+        """
         import torch
 
         tokens = self.tokens
@@ -1164,6 +1169,8 @@ class _LayerContext:
                 plan=self._filler_plan(k_in, n_in, tokens),
                 expected_m=tokens,
             )
+            if events is not None:
+                events[layer][0].record()
             if self.recipe == "mxfp8":
                 activation = (a,)
             elif self.recipe == "tensor_fp8":
@@ -1176,6 +1183,8 @@ class _LayerContext:
                     buffer.copy_(source)
                 activation = buffers
             c = self.under_test[layer].run(activation, plan=plan, expected_m=tokens)
+            if events is not None:
+                events[layer][1].record()
             if self.filler_out_k != self.out_features:
                 c = torch.nn.functional.pad(
                     c, (0, self.filler_out_k - self.out_features)
@@ -1192,30 +1201,140 @@ class _LayerContext:
 
 
 def _context_race(*, context, plan, settings, device, flush):
-    """Capture the layer stack with ``plan`` in the tested slot and time replays."""
+    """Time the tested op inside the captured layer stack.
+
+    Returns the per-layer in-place op time (the ranking score), the whole
+    stack replay time (secondary evidence), finiteness and the repetitions.
+    """
     import torch
 
     for _ in range(settings.warmup):
         context.run(plan)
     torch.cuda.synchronize(device)
+    events = [
+        (
+            torch.cuda.Event(enable_timing=True, external=True),
+            torch.cuda.Event(enable_timing=True, external=True),
+        )
+        for _ in range(context.layers)
+    ]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = context.run(plan)
+        output = context.run(plan, events)
     graph.replay()
     torch.cuda.synchronize(device)
     finite = bool(torch.isfinite(output).all().item())
-    pilot = _cuda_event_samples_us(graph.replay, count=1, device=device, flush=flush)[0]
-    repetitions = _bounded_repetitions(settings, pilot_us=pilot)
-    samples = _cuda_event_samples_us(
-        graph.replay,
-        count=settings.groups * repetitions,
-        device=device,
-        flush=flush,
+
+    def sample():
+        if flush is not None:
+            flush()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize(device)
+        op_us = sum(a.elapsed_time(b) for a, b in events) * 1_000.0 / len(events)
+        return op_us, float(start.elapsed_time(end)) * 1_000.0
+
+    pilot_op, pilot_stack = sample()
+    repetitions = _bounded_repetitions(settings, pilot_us=pilot_stack)
+    samples = [sample() for _ in range(settings.groups * repetitions)]
+    op_latency = _median_of_group_medians(
+        tuple(item[0] for item in samples),
+        groups=settings.groups,
+        repetitions=repetitions,
     )
-    latency = _median_of_group_medians(
-        samples, groups=settings.groups, repetitions=repetitions
+    stack_latency = _median_of_group_medians(
+        tuple(item[1] for item in samples),
+        groups=settings.groups,
+        repetitions=repetitions,
     )
-    return latency, finite, repetitions
+    return _ContextRace(
+        op_us=op_latency,
+        stack_us=stack_latency,
+        finite=finite,
+        repetitions=repetitions,
+        sample=sample,
+        graph=graph,
+    )
+
+
+def _keep_race(races, candidate, race, baseline_config):
+    """Retain the graphs of the built-in plan and the running leader only."""
+    config = candidate.config.to_dict()
+    is_baseline = baseline_config is not None and config == baseline_config
+    leader = races.get("__leader__")
+    if leader is None or race.op_us < leader[1]:
+        old = leader[0] if leader else None
+        races["__leader__"] = (candidate.candidate_id, race.op_us)
+        races[candidate.candidate_id] = race
+        if old is not None and old != races.get("__baseline__"):
+            races.pop(old, None)
+    elif is_baseline:
+        races[candidate.candidate_id] = race
+    if is_baseline:
+        races["__baseline__"] = candidate.candidate_id
+
+
+@dataclass
+class _ContextRace:
+    op_us: float
+    stack_us: float
+    finite: bool
+    repetitions: int
+    sample: object
+    graph: object
+
+
+_CONFIRM_ROUNDS = 8
+
+
+def _confirm_winner(measurements, races, *, baseline_config):
+    """Re-time the leader and the built-in plan interleaved.
+
+    Two sweeps seconds apart can disagree by more than the margin; measuring
+    the two contenders alternately in one pass removes that drift before the
+    reducer applies the margin. Both latencies are replaced by the confirmed
+    medians; the first-pass values stay in the metrics.
+    """
+    import statistics
+
+    passing = [m for m in measurements if m.correct and m.latency_us is not None]
+    leader = races.get("__leader__")
+    if len(passing) < 2 or baseline_config is None or leader is None:
+        return measurements
+    best = next((m for m in passing if m.candidate.candidate_id == leader[0]), None)
+    baseline = next(
+        (m for m in passing if m.candidate.config.to_dict() == baseline_config), None
+    )
+    if best is None:
+        return measurements
+    if baseline is None or baseline is best:
+        return measurements
+    best_race = races.get(best.candidate.candidate_id)
+    base_race = races.get(baseline.candidate.candidate_id)
+    if best_race is None or base_race is None:
+        return measurements
+    best_samples, base_samples = [], []
+    for _ in range(_CONFIRM_ROUNDS):
+        best_samples.append(best_race.sample()[0])
+        base_samples.append(base_race.sample()[0])
+    confirmed = {
+        best.candidate.candidate_id: statistics.median(best_samples),
+        baseline.candidate.candidate_id: statistics.median(base_samples),
+    }
+    updated = []
+    for m in measurements:
+        value = confirmed.get(m.candidate.candidate_id)
+        if value is None:
+            updated.append(m)
+            continue
+        metrics = dict(m.metrics or {})
+        metrics["first_pass_us"] = m.latency_us
+        metrics["confirmed"] = True
+        updated.append(replace(m, latency_us=value, metrics=metrics))
+    return updated
 
 
 class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
@@ -1263,6 +1382,18 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                 generator=generator,
             )
         return self._layers
+
+    def _baseline_config(self, case: SweepCase):
+        from b12x.gemm.dense_linear._policy import DenseLinearQuery, _heuristic
+
+        query = DenseLinearQuery(
+            recipe=str(case.query["recipe"]),
+            in_features=int(case.query["in_features"]),
+            out_features=int(case.query["out_features"]),
+            max_tokens=int(case.query["max_tokens"]),
+            output_dtype=str(case.query["output_dtype"]),
+        )
+        return _heuristic(query, _device_identity(self._context)).to_dict()
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
         return tuple(
@@ -1335,6 +1466,8 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
             layers = self._layers_for(case, device)
             layers.prepare(tokens, generator)
             crashed = load_crashed(self._context.work_dir)
+            baseline_config = self._baseline_config(case)
+            races: dict = {}
             measurements = []
             for candidate in candidates:
                 if (case.case_id, candidate.candidate_id) in crashed:
@@ -1371,21 +1504,24 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                     )
                     latency = isolated
                     if correct:
-                        latency, finite, repetitions = _context_race(
+                        race = _context_race(
                             context=layers,
                             plan=plan,
                             settings=settings,
                             device=device,
                             flush=flush,
                         )
-                        correct = finite
+                        latency = race.op_us
+                        correct = race.finite
+                        _keep_race(races, candidate, race, baseline_config)
                         metrics = dict(metrics)
                         metrics.update(
                             {
                                 "isolated_us": isolated,
+                                "stack_us": race.stack_us,
                                 "context_layers": layers.layers,
                                 "context_hidden": layers.hidden,
-                                "context_repetitions": repetitions,
+                                "context_repetitions": race.repetitions,
                             }
                         )
                     measurements.append(
@@ -1406,6 +1542,9 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                         )
                     )
             clear_inflight(self._context.work_dir)
+            measurements = _confirm_winner(
+                measurements, races, baseline_config=baseline_config
+            )
             return tuple(measurements)
 
 
@@ -1434,7 +1573,7 @@ class DenseLinearGenerator(DiscreteSweepGenerator):
             cases=_default_dense_linear_cases() if cases is None else cases,
             benchmark_factory=_DenseLinearFactory(),
             coverage={"corpus": "gemm_corpus.MODEL_LINEARS"},
-            candidate_contract_version=2,
+            candidate_contract_version=3,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
             baseline_margin=_CONTEXT_MARGIN,
         )
@@ -1599,7 +1738,7 @@ class _WoLayerContext:
             self._bindings[key] = binding
         return binding
 
-    def run(self, plan):
+    def run(self, plan, events=None):
         import torch
 
         tokens = self.tokens
@@ -1613,7 +1752,11 @@ class _WoLayerContext:
             target.view(tokens, -1).copy_(
                 a.view(tokens, -1)[:, : target.numel() // tokens]
             )
+            if events is not None:
+                events[layer][0].record()
             out = self._binding(plan, layer).run()
+            if events is not None:
+                events[layer][1].record()
             f_out, plan_out = self.fillers_out[layer]
             b = self._dense_linear.mm(
                 out.reshape(tokens, self.hidden),
@@ -1644,6 +1787,19 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
         torch.cuda.synchronize(self._context.device_ordinal)
         torch.cuda.empty_cache()
         return None
+
+    def _baseline_config(self, case: SweepCase):
+        from b12x.gemm.wo_projection._policy import WoProjectionQuery, _heuristic
+
+        query = WoProjectionQuery(
+            dtype=str(case.query["dtype"]),
+            max_tokens=int(case.query["max_tokens"]),
+            groups=int(case.query["groups"]),
+            group_width=int(case.query["group_width"]),
+            rank=int(case.query["rank"]),
+            hidden=int(case.query["hidden"]),
+        )
+        return _heuristic(query, _device_identity(self._context)).to_dict()
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
         return tuple(
@@ -1757,6 +1913,8 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
             layers.caps_nope_dim = nope_dim
             layers.caps_rope_dim = rope_dim
             crashed = load_crashed(self._context.work_dir)
+            baseline_config = self._baseline_config(case)
+            races: dict = {}
             measurements = []
             for candidate in candidates:
                 if (case.case_id, candidate.candidate_id) in crashed:
@@ -1787,21 +1945,24 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                     )
                     latency = isolated
                     if correct:
-                        latency, finite, repetitions = _context_race(
+                        race = _context_race(
                             context=layers,
                             plan=plan,
                             settings=settings,
                             device=device,
                             flush=flush,
                         )
-                        correct = finite
+                        latency = race.op_us
+                        correct = race.finite
+                        _keep_race(races, candidate, race, baseline_config)
                         metrics = dict(metrics)
                         metrics.update(
                             {
                                 "isolated_us": isolated,
+                                "stack_us": race.stack_us,
                                 "context_layers": layers.layers,
                                 "context_hidden": layers.hidden,
-                                "context_repetitions": repetitions,
+                                "context_repetitions": race.repetitions,
                             }
                         )
                     measurements.append(
@@ -1822,6 +1983,9 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                         )
                     )
             clear_inflight(self._context.work_dir)
+            measurements = _confirm_winner(
+                measurements, races, baseline_config=baseline_config
+            )
             return tuple(measurements)
 
 
@@ -1863,7 +2027,7 @@ class WoProjectionGenerator(DiscreteSweepGenerator):
             cases=wo_projection_cases() if cases is None else cases,
             benchmark_factory=_WoProjectionFactory(),
             coverage={"corpus": "gemm_corpus.wo_projection_geometries"},
-            candidate_contract_version=2,
+            candidate_contract_version=3,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
             baseline_margin=_CONTEXT_MARGIN,
         )
