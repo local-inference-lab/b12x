@@ -372,6 +372,15 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
             if (drain_cq(c, h) != 0) {
                 return -1;
             }
+            // A peer that stopped acknowledging keeps the QP retrying for a
+            // long time; honour a stop request instead of blocking roce_stop
+            // (and so teardown) behind it.
+            if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+                snprintf(c->err, sizeof(c->err),
+                         "RoCE proxy stopped with %u writes outstanding to rank %d",
+                         hca->outstanding[p], p);
+                return -1;
+            }
         }
         uint64_t remote = c->peer_addr[p];
         struct ibv_sge data_sge = {
@@ -425,10 +434,11 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
 static void *proxy_main(void *arg) {
     roce_ctx_t *c = (roce_ctx_t *)arg;
     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
-    // Spin hard while ops are flowing; after ROCE_IDLE_SPINS polls without a
-    // doorbell (a few milliseconds) back off to a short sleep so an idle
-    // runtime does not burn a core next to the serving process.  The first
-    // op after a long gap pays at most one sleep interval.
+    // Spin while ops are flowing.  After ROCE_IDLE_SPINS polls without a
+    // doorbell, request a short nanosleep between polls (the OS decides the
+    // actual delay) so an idle runtime does not hold a core next to the
+    // serving process.  The missed-doorbell catch-up below keeps the protocol
+    // correct however long the thread is away.
     uint64_t idle = 0;
     const struct timespec nap = {0, 20000};
     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {

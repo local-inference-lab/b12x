@@ -76,8 +76,14 @@ class _RoceOneshotLaunch:
         slots: int,
         flag_stride: int,
     ) -> None:
+        """Bind one kernel specialization: dtype, world size, rank, and layout constants."""
         if dtype_name not in _DTYPE_PACK_ELEMS:
             raise ValueError(f"unsupported RoCE one-shot dtype {dtype_name!r}")
+        if int(threads) < int(world_size):
+            raise ValueError(
+                f"RoCE kernels need threads >= world_size (one thread waits on one "
+                f"peer flag), got threads={threads} world_size={world_size}"
+            )
         self._dtype_name = dtype_name
         self._pack_elems = _DTYPE_PACK_ELEMS[dtype_name]
         self._world_size = int(world_size)
@@ -93,6 +99,7 @@ class _RoceOneshotLaunch:
         words,
         initialize: cutlass.Constexpr[bool],
     ) -> None:
+        """Add one 16-byte pack of ``dtype`` values to the float32 accumulator."""
         if cutlass.const_expr(self._dtype_name == "float32"):
             for word in cutlass.range_constexpr(4):
                 value = u32_as_f32(words[word])
@@ -116,6 +123,7 @@ class _RoceOneshotLaunch:
 
     @cute.jit
     def _store_accumulator(self, address: Int64, accumulator: cute.Tensor) -> None:
+        """Convert the accumulator back to ``dtype`` and store one 16-byte pack."""
         packed = cute.make_rmem_tensor((4,), cutlass.Uint32)
         if cutlass.const_expr(self._dtype_name == "float32"):
             for word in cutlass.range_constexpr(4):
@@ -150,6 +158,7 @@ class _RoceOneshotLaunch:
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
+        """Host entry: launch the all-reduce kernel with runtime scalars."""
         self.kernel(
             input_ptr,
             output_ptr,
@@ -184,6 +193,7 @@ class _RoceOneshotLaunch:
         epoch_ptr: Int64,
         spin_limit: Uint32,
     ) -> None:
+        """Device kernel: stage, doorbell, wait for peer flags, reduce, advance the epoch."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -265,6 +275,7 @@ class _RoceOneshotLaunch:
 
 
 def _dummy(dtype, alignment: int):
+    """A CUDA tensor of ``dtype`` used to trace launcher argument types."""
     return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment)
 
 
@@ -277,6 +288,7 @@ def _process_key(
     flag_stride: int,
     device_index: int,
 ) -> tuple[object, ...]:
+    """Cache key of one compiled launcher specialization."""
     return (
         str(dtype_name),
         int(world_size),
@@ -304,6 +316,7 @@ def get_launcher(
     flag_stride: int,
     device_index: int,
 ) -> Callable[..., None]:
+    """Compile the launcher for ``key`` once and return it."""
     process_key = _process_key(
         dtype_name, world_size, rank, threads, slots, flag_stride, device_index
     )
@@ -350,6 +363,7 @@ def get_launcher(
         spin_limit: int,
         grid_x: int,
     ) -> None:
+        """Launch the compiled kernel with runtime scalar arguments."""
         raw(
             make_ptr(cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
