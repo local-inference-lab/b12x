@@ -52,6 +52,7 @@ _OPS: tuple[str, ...] = (
     "gemm.bf16_vocab_projection",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
+    "gemm.dense_linear",
     "gemm.bmm",
     "gemm.mxfp8_linear",
     "gemm.tensor_fp8_linear",

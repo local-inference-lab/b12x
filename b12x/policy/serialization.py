@@ -276,13 +276,19 @@ def profile_from_dict(value: object) -> GpuProfile:
         value,
         name="profile",
         required=frozenset({"components", "profile_id", "targets"}),
-        optional=frozenset({"metadata"}),
+        optional=frozenset({"metadata", "pending_components"}),
     )
     targets = _sequence(data["targets"], name="profile.targets")
     components = _sequence(data["components"], name="profile.components")
     metadata = data.get("metadata", {})
     if not isinstance(metadata, Mapping):
         raise TypeError("profile.metadata must be an object")
+    pending = _sequence(
+        data.get("pending_components", ()), name="profile.pending_components"
+    )
+    for item in pending:
+        if not isinstance(item, str) or not item:
+            raise TypeError("profile.pending_components must list component IDs")
     return GpuProfile(
         profile_id=str(data["profile_id"]),
         targets=tuple(
@@ -293,6 +299,7 @@ def profile_from_dict(value: object) -> GpuProfile:
             for index, component in enumerate(components)
         ),
         metadata=FrozenMapping(metadata),
+        pending_components=tuple(str(item) for item in pending),
     )
 
 

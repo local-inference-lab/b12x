@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import triton
@@ -23,7 +23,9 @@ from b12x._lib.scratch import (
 )
 from b12x._lib.utils import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._policy import (
+    WO_B_FUSED_TILED_PLANS,
     WO_PROJECTION_POLICY,
+    WoProjectionConfig,
     WoProjectionQuery,
 )
 from b12x.policy import PolicyContext, get_auto_policy
@@ -59,6 +61,27 @@ _ALPHA_ONE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 def _should_use_exact_b16_wo(*, tokens: int, sm_count: int) -> bool:
     return int(tokens) == 16 and int(sm_count) <= _WO_SPARK_MAX_SMS
+
+
+_NO_WO_LAUNCH_CODES = (0, 0, 0, 0, 0, 0)
+
+
+def _wo_launch_codes(config: object | None) -> tuple[int, int, int, int, int, int]:
+    """Encode a resolved ``WoProjectionConfig`` for the fused custom ops.
+
+    All zeros keeps every built-in selection rule in charge.
+    """
+    if config is None:
+        return _NO_WO_LAUNCH_CODES
+    if not isinstance(config, WoProjectionConfig):
+        raise TypeError("WO projection plan config must be a WoProjectionConfig")
+    return config.launch_codes()
+
+
+def _wo_tile_from_codes(tile_m: int, tile_n: int) -> tuple[int, int] | None:
+    if int(tile_m) and int(tile_n):
+        return (int(tile_m), int(tile_n))
+    return None
 
 
 @dataclass(frozen=True)
@@ -121,6 +144,8 @@ class WOProjectionBinding:
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection (N=hidden,
     # the n>1536 path). None keeps the M-independent default tile.
     expected_m: int | None = None
+    # Resolved ``gemm.wo_projection`` launch config (None -> built-in rules).
+    config: object | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return wo_projection_mxfp8(binding=self, stream=stream)
@@ -142,6 +167,8 @@ class WOProjectionInvRopeBinding:
     return_3d: bool = False
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
+    # Resolved ``gemm.wo_projection`` launch config (None -> built-in rules).
+    config: object | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return wo_projection_inv_rope_mxfp8(binding=self, stream=stream)
@@ -182,6 +209,7 @@ class WOProjectionScratchPlan:
     layout: object
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     policy_resolution: object | None = None
+    config: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -201,7 +229,7 @@ class WOProjectionScratchPlan:
         tokens = _validate_wo_projection_inputs(source_tgd, weights)
         self._check_live_capacity(tokens=tokens, weights=weights)
         views = self._views_from_scratch(scratch=scratch, tokens=tokens)
-        return _build_wo_projection_binding_from_views(
+        binding = _build_wo_projection_binding_from_views(
             x_q=views.x_q,
             tmp=views.tmp,
             tmp_q=views.tmp_q,
@@ -211,6 +239,7 @@ class WOProjectionScratchPlan:
             return_3d=return_3d,
             expected_m=expected_m,
         )
+        return replace(binding, config=self.config)
 
     def bind_inv_rope(
         self,
@@ -235,7 +264,7 @@ class WOProjectionScratchPlan:
         )
         self._check_live_capacity(tokens=tokens, weights=weights)
         views = self._views_from_scratch(scratch=scratch, tokens=tokens)
-        return _build_wo_projection_inv_rope_binding_from_views(
+        binding = _build_wo_projection_inv_rope_binding_from_views(
             x_q=views.x_q,
             tmp=views.tmp,
             tmp_q=views.tmp_q,
@@ -250,6 +279,7 @@ class WOProjectionScratchPlan:
             return_3d=return_3d,
             expected_m=expected_m,
         )
+        return replace(binding, config=self.config)
 
     def _views_from_scratch(
         self,
@@ -2320,6 +2350,7 @@ def plan_wo_projection_scratch(
             ),
         ),
         policy_resolution=resolution,
+        config=resolution.config,
     )
 
 
@@ -2333,6 +2364,7 @@ def wo_a_dense_gemm_mxfp8(
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
     stream: object = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run WO-A as grouped MXFP8 dense GEMM.
 
@@ -2367,8 +2399,9 @@ def wo_a_dense_gemm_mxfp8(
     # When out is None, dense_gemm allocates + returns functionally (no caller
     # view mutated in the compile graph). The returned [M,N,L] is read downstream
     # via strides, so its physical layout does not matter.
-    mma_tiler_mn = None
-    if expected_m is not None and wo_a_rdg.values.shape[0] <= 1536:
+    if mma_tiler_mn is not None:
+        mma_tiler_mn = (int(mma_tiler_mn[0]), int(mma_tiler_mn[1]))
+    elif expected_m is not None and wo_a_rdg.values.shape[0] <= 1536:
         if 1 <= expected_m <= 8:
             mma_tiler_mn = (16, 64)
         # B16 is the existing generic decode policy; the B9-15 extension is
@@ -2424,6 +2457,7 @@ def wo_b_dense_gemm_mxfp8(
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
     stream: object = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run group-major WO-B as MXFP8 dense GEMM.
 
@@ -2442,12 +2476,16 @@ def wo_b_dense_gemm_mxfp8(
         _check_dense_gemm_mnl_view("out", out)
     # Preserve the generic B16 policy while limiting the B9-15 packed tile to
     # the measured DSV4 TP2 WO-B shape.
-    use_decode_tile = expected_m == 16 or (
-        expected_m is not None
-        and 9 <= expected_m <= 15
-        and tuple(wo_b_hgr.values.shape) == (4096, 4096)
-    )
-    mma_tiler_mn = (32, 64) if use_decode_tile else None
+    if mma_tiler_mn is not None:
+        mma_tiler_mn = (int(mma_tiler_mn[0]), int(mma_tiler_mn[1]))
+        use_decode_tile = mma_tiler_mn in ((16, 64), (32, 64), (64, 64))
+    else:
+        use_decode_tile = expected_m == 16 or (
+            expected_m is not None
+            and 9 <= expected_m <= 15
+            and tuple(wo_b_hgr.values.shape) == (4096, 4096)
+        )
+        mma_tiler_mn = (32, 64) if use_decode_tile else None
     # out=None -> dense_gemm allocates + returns functionally (no caller view
     # mutated in the compile graph).
     return dense_gemm(
@@ -2547,6 +2585,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     sfb_k_replicated: bool = False,
     _atomic_output_precleared: bool = False,
     stream: object = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Run WO-B at small M with group-major quantization fused into the GEMM.
 
@@ -2583,8 +2622,11 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         if expected_m is not None and 1 <= expected_m <= 8
         else None
     )
-    mma_tiler_mn = None
-    if rhs_values_tiled is not None:
+    if mma_tiler_mn is not None:
+        mma_tiler_mn = (int(mma_tiler_mn[0]), int(mma_tiler_mn[1]))
+        if mma_tiler_mn not in _WO_B_FUSED_TILED_PLANS:
+            rhs_values_tiled = None
+    elif rhs_values_tiled is not None:
         mma_tiler_mn = _wo_b_fused_tiled_plan(
             tokens, hidden, width, source.device, expected_m
         )
@@ -2603,7 +2645,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     )
 
 
-_WO_B_FUSED_TILED_PLANS = ((16, 64), (16, 128))
+_WO_B_FUSED_TILED_PLANS = WO_B_FUSED_TILED_PLANS
 
 
 def _wo_b_fused_tiled_plan(
@@ -2675,6 +2717,7 @@ def wo_projection_mxfp8(
         output = binding.output
         return_3d = binding.return_3d
         expected_m = binding.expected_m
+        launch_codes = _wo_launch_codes(binding.config)
     else:
         x_q = None
         tmp = None
@@ -2684,6 +2727,8 @@ def wo_projection_mxfp8(
         raise TypeError(
             "wo_projection_mxfp8 requires source_tgd and weights or binding"
         )
+    if binding is None:
+        launch_codes = _NO_WO_LAUNCH_CODES
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     # WO auto-defaults the regime hint to the (capture-fixed) token count so the
     # wo_b up-projection (N=hidden>1536) picks the decode tile (32x128) at small
@@ -2699,6 +2744,8 @@ def wo_projection_mxfp8(
     # WO-A stays on the standalone quantizer + GEMM; fusing quant into the
     # WO-A GEMM measured ~2x slower at M=1 (small N, deep K, per-n-tile
     # requantization) -- see wo_a_dense_gemm_fused_quant_mxfp8.
+    wo_a_tile = _wo_tile_from_codes(launch_codes[0], launch_codes[1])
+    wo_b_tile = _wo_tile_from_codes(launch_codes[2], launch_codes[3])
     quantize_wo_a_input_mxfp8(source_tgd, out=x_q)
     wo_a_dense_gemm_mxfp8(
         x_q,
@@ -2708,8 +2755,12 @@ def wo_projection_mxfp8(
         expected_m=expected_m,
         sfb_k_replicated=weights.sfb_k_replicated,
         stream=stream,
+        mma_tiler_mn=wo_a_tile,
     )
-    if tokens <= 8 and tmp.dtype == torch.bfloat16:
+    use_fused_wo_b = tokens <= 8 and tmp.dtype == torch.bfloat16
+    if launch_codes[4]:
+        use_fused_wo_b = use_fused_wo_b and launch_codes[4] == 2
+    if use_fused_wo_b:
         # Decode band: group-major WO-B quantization runs inside the GEMM's
         # DMA warp; the bound tmp_q scratch is intentionally unused here.
         wo_b_dense_gemm_fused_quant_mxfp8(
@@ -2719,6 +2770,7 @@ def wo_projection_mxfp8(
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
             stream=stream,
+            mma_tiler_mn=wo_b_tile,
         )
     else:
         quantize_wo_b_input_mxfp8(tmp, out=tmp_q)
@@ -2730,6 +2782,7 @@ def wo_projection_mxfp8(
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
             stream=stream,
+            mma_tiler_mn=wo_b_tile,
         )
     if return_3d:
         return output
@@ -2762,6 +2815,12 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
+    wo_a_tile_m: int = 0,
+    wo_a_tile_n: int = 0,
+    wo_b_tile_m: int = 0,
+    wo_b_tile_n: int = 0,
+    wo_b_fused_code: int = 0,
+    quantized_intermediate_code: int = 0,
 ) -> torch.Tensor:
     # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
     # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
@@ -2864,6 +2923,10 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         and nope_dim == 448
         and rope_dim == 64
     )
+    if quantized_intermediate_code:
+        use_quantized_intermediate = quantized_intermediate_code == 2
+    wo_a_tile = _wo_tile_from_codes(wo_a_tile_m, wo_a_tile_n)
+    wo_b_tile = _wo_tile_from_codes(wo_b_tile_m, wo_b_tile_n)
     if use_quantized_intermediate:
         tmp_q_bases = empty_mxfp8_rows_bases(
             tokens,
@@ -2885,6 +2948,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
             stream=stream_int,
+            mma_tiler_mn=wo_a_tile,
         )
         return wo_b_dense_gemm_mxfp8(
             tmp_q,
@@ -2892,6 +2956,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
             stream=stream_int,
+            mma_tiler_mn=wo_b_tile,
         )
     tmp = wo_a_dense_gemm_mxfp8(
         x_q,
@@ -2900,8 +2965,12 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         expected_m=expected_m,
         sfb_k_replicated=weights.sfb_k_replicated,
         stream=stream_int,
+        mma_tiler_mn=wo_a_tile,
     )
-    if tokens <= 8 and tmp.dtype == torch.bfloat16:
+    use_fused_wo_b = tokens <= 8 and tmp.dtype == torch.bfloat16
+    if wo_b_fused_code:
+        use_fused_wo_b = use_fused_wo_b and wo_b_fused_code == 2
+    if use_fused_wo_b:
         # Decode band: quantize the group-major WO-B input inside the GEMM's
         # DMA warp instead of launching a standalone quant kernel.
         return wo_b_dense_gemm_fused_quant_mxfp8(
@@ -2912,6 +2981,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             sfb_k_replicated=weights.sfb_k_replicated,
             _atomic_output_precleared=atomic_output_precleared,
             stream=stream_int,
+            mma_tiler_mn=wo_b_tile,
         )
     tmp_q = quantize_wo_b_input_mxfp8(tmp, _initialize_scales=False)
     return wo_b_dense_gemm_mxfp8(
@@ -2921,6 +2991,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         expected_m=expected_m,
         sfb_k_replicated=weights.sfb_k_replicated,
         stream=stream_int,
+        mma_tiler_mn=wo_b_tile,
     )
 
 
@@ -2947,8 +3018,15 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
+    wo_a_tile_m: int = 0,
+    wo_a_tile_n: int = 0,
+    wo_b_tile_m: int = 0,
+    wo_b_tile_n: int = 0,
+    wo_b_fused_code: int = 0,
+    quantized_intermediate_code: int = 0,
 ) -> torch.Tensor:
-    del stream_int
+    del stream_int, wo_a_tile_m, wo_a_tile_n, wo_b_tile_m, wo_b_tile_n
+    del wo_b_fused_code, quantized_intermediate_code
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
 
 
@@ -3006,6 +3084,9 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim = binding.rope_dim
         return_3d = binding.return_3d
         expected_m = binding.expected_m
+        launch_codes = _wo_launch_codes(binding.config)
+    else:
+        launch_codes = _NO_WO_LAUNCH_CODES
     if (
         o is None
         or positions is None
@@ -3056,6 +3137,7 @@ def wo_projection_inv_rope_mxfp8(
         expected_m,
         weights.sfb_k_replicated,
         cuda_stream_to_int(stream),
+        *launch_codes,
     )
     if return_3d:
         return output

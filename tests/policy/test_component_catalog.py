@@ -41,13 +41,21 @@ def test_profiled_policies_generators_and_embedded_profile_stay_in_lockstep() ->
     profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
 
     assert generator_registry.component_ids() == expected_ids
-    assert tuple(component.component_id for component in profile.components) == (
-        expected_ids
-    )
+    measured_ids = tuple(component.component_id for component in profile.components)
+    pending_ids = tuple(profile.pending_components)
+    # A registered component may ship as pending (heuristic until this GPU is
+    # regenerated), but every registered component must be accounted for and
+    # nothing may be both measured and pending.
+    assert set(pending_ids) <= set(expected_ids)
+    assert not set(measured_ids) & set(pending_ids)
+    assert tuple(sorted(measured_ids + pending_ids)) == tuple(sorted(expected_ids))
     for registration in registrations:
         policy = registration.load_policy()
         generator = registration.create_generator()
         component = profile.component(str(registration.component_id))
+        if str(registration.component_id) in pending_ids:
+            assert component is None
+            continue
         assert component is not None
         assert generator.component_id == policy.component_id
         assert generator.query_schema_version == policy.query_schema_version

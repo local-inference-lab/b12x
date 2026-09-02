@@ -174,6 +174,15 @@ def merge_profile_artifacts(
         str(component["component_id"]): component
         for component in base_profile["components"]
     }
+    pending = [
+        str(item)
+        for item in base_profile.get("pending_components", ())
+        if str(item)
+        not in {
+            str(component["component_id"])
+            for component in update_profile["components"]
+        }
+    ]
     components.update(
         {
             str(component["component_id"]): component
@@ -187,6 +196,8 @@ def merge_profile_artifacts(
         "targets": list(base_profile["targets"]),
         "components": [components[key] for key in sorted(components)],
     }
+    if pending:
+        merged_profile["pending_components"] = sorted(pending)
     if metadata:
         merged_profile["metadata"] = metadata
     profile_from_dict(merged_profile)

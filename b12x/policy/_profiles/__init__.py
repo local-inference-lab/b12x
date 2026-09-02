@@ -29,7 +29,9 @@ def _load_embedded_profiles() -> None:
         str(registration.component_id) for registration in list_profiled_components()
     }
     for profile in EMBEDDED_REGISTRY.list_profiles():
-        actual = {component.component_id for component in profile.components}
+        measured = {component.component_id for component in profile.components}
+        pending = set(profile.pending_components)
+        actual = measured | pending
         if actual != expected:
             raise ValueError(
                 f"embedded profile {profile.profile_id!r} component drift; "

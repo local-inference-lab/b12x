@@ -8,6 +8,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from .components import (
+    DENSE_LINEAR,
     BF16_VOCAB_PROJECTION,
     BLOCK_FP8_LINEAR,
     COMPRESSED_SPARSE_MLA_ATTENTION,
@@ -207,6 +208,15 @@ PLANNING_COMPONENTS = (
         policy_ref=("b12x.gemm.block_fp8_linear._policy:BLOCK_FP8_LINEAR_POLICY"),
         generator_ref=(
             "b12x.policy.generation.providers.gemm:BlockFp8LinearGenerator"
+        ),
+    ),
+    PlanningComponentRegistration(
+        op_qualname="gemm.dense_linear",
+        mode=PlanningPolicyMode.PROFILED,
+        component_id=DENSE_LINEAR,
+        policy_ref="b12x.gemm.dense_linear._policy:DENSE_LINEAR_POLICY",
+        generator_ref=(
+            "b12x.policy.generation.providers.gemm:DenseLinearGenerator"
         ),
     ),
     PlanningComponentRegistration(

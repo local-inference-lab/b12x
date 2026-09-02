@@ -4,6 +4,7 @@
 - ``bmm``: dtype-dispatched batched matrix multiplication.
 - ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
+- ``dense_linear``: profiled launch plans for the packed dense linear recipes.
 - ``bf16_vocab_projection``: profiled decode-time BF16 vocabulary projection.
 - ``mxfp8_linear`` / ``tensor_fp8_linear``: compatibility aliases for
   ``blockscaled`` packed-weight calls.
@@ -21,6 +22,7 @@ _OP_MODULES = (
     "bf16_vocab_projection",
     "blockscaled",
     "block_fp8_linear",
+    "dense_linear",
     "mxfp8_linear",
     "tensor_fp8_linear",
     "mla_query_projection",

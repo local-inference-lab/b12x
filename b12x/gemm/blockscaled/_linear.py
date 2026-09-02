@@ -410,6 +410,50 @@ def pack_weight(
     )
 
 
+
+# Launch options resolved by ``gemm.dense_linear`` plans travel through the
+# custom ops as plain integers (0 = leave the built-in planner in charge).
+_LOAD_PATH_CODES = {0: None, 1: "tma", 2: "cpasync"}
+_SWAP_AB_CODES = {0: None, 1: False, 2: True}
+_NO_LAUNCH_CODES = (0, 0, 0, 0, 0, 0)
+
+
+def _launch_codes_from_plan(plan: object | None) -> tuple[int, int, int, int, int, int]:
+    if plan is None:
+        return _NO_LAUNCH_CODES
+    codes = getattr(plan, "launch_codes", None)
+    if codes is None:
+        raise TypeError("plan must be a gemm.dense_linear Plan")
+    values = tuple(int(value) for value in codes())
+    if len(values) != 6:
+        raise ValueError("dense linear launch codes must have six entries")
+    return values  # type: ignore[return-value]
+
+
+def _dense_launch_kwargs(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    split_k: int,
+    load_path_code: int,
+    swap_ab_code: int,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    if tile_m and tile_n:
+        kwargs["mma_tiler_mn"] = (int(tile_m), int(tile_n))
+    if tile_k:
+        kwargs["_tile_k_override"] = int(tile_k)
+    if split_k:
+        kwargs["_split_k_slices_override"] = int(split_k)
+    load_path = _LOAD_PATH_CODES[int(load_path_code)]
+    if load_path is not None:
+        kwargs["load_path"] = load_path
+    swap_ab = _SWAP_AB_CODES[int(swap_ab_code)]
+    if swap_ab is not None:
+        kwargs["swap_ab"] = swap_ab
+    return kwargs
+
+
 @torch.library.custom_op(
     "b12x::blockscaled_serialized",
     mutates_args=(),
@@ -428,6 +472,12 @@ def _blockscaled_serialized_op(
     block_fp8: bool,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
     """Opaque adapter from checkpoint/quantizer storage to dense-GEMM views."""
 
@@ -491,6 +541,9 @@ def _blockscaled_serialized_op(
         block_fp8=block_fp8,
         expected_m=expected_m,
         stream=stream_int,
+        **_dense_launch_kwargs(
+            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
+        ),
     )[:, :, 0]
 
 
@@ -508,7 +561,14 @@ def _blockscaled_serialized_fake(
     block_fp8: bool,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
+    del tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
     del lhs_scale_storage, rhs_scale_storage, alpha
     del ab_dtype, sf_dtype, sf_vec_size, block_fp8, expected_m, stream_int
     return torch.empty(
@@ -532,6 +592,12 @@ def _packed_mxfp8_op(
     out_features: int,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
     del weight_scale_rows, in_features
     tokens = int(source_2d.shape[0])
@@ -553,6 +619,9 @@ def _packed_mxfp8_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
+        **_dense_launch_kwargs(
+            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
+        ),
     )[:, :, 0]
 
 
@@ -567,7 +636,14 @@ def _packed_mxfp8_fake(
     out_features: int,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
+    del tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
     del weight_values, weight_scale_rows, weight_scale_mma
     del in_features, padded_in_features, expected_m, stream_int
     return torch.empty(
@@ -592,6 +668,12 @@ def _packed_mxfp8_prequantized_op(
     out_dtype: torch.dtype,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
     tokens = int(source_values.shape[0])
     source_padded = _pad_k(source_values, int(padded_in_features))
@@ -616,6 +698,9 @@ def _packed_mxfp8_prequantized_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
+        **_dense_launch_kwargs(
+            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
+        ),
     )[:, :, 0]
 
 
@@ -630,7 +715,14 @@ def _packed_mxfp8_prequantized_fake(
     out_dtype: torch.dtype,
     expected_m: int,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
+    del tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
     del source_scale_storage, weight_values, weight_scale_mma
     del padded_in_features, expected_m, stream_int
     return torch.empty(
@@ -667,8 +759,14 @@ def mxfp8_linear(
     out_dtype: torch.dtype | None = None,
     expected_m: int | None = None,
     stream: object = None,
+    plan: object | None = None,
 ) -> torch.Tensor:
-    """Run plain or prequantized activations through MXFP8 ``blockscaled.mm``."""
+    """Run plain or prequantized activations through MXFP8 ``blockscaled.mm``.
+
+    ``plan`` is an optional ``gemm.dense_linear`` plan whose resolved launch
+    options override the built-in dense planner.
+    """
+    launch_codes = _launch_codes_from_plan(plan)
 
     if not isinstance(packed_weight, MXFP8LinearWeight):
         raise TypeError("packed_weight must be an MXFP8LinearWeight")
@@ -740,6 +838,7 @@ def mxfp8_linear(
             resolved_out_dtype,
             int(expected_m) if expected_m is not None else tokens,
             cuda_stream_to_int(stream),
+            *launch_codes,
         )
     else:
         output = torch.ops.b12x.blockscaled_packed_mxfp8(
@@ -752,6 +851,7 @@ def mxfp8_linear(
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else tokens,
             cuda_stream_to_int(stream),
+            *launch_codes,
         )
     if bias is not None:
         output = output + bias
@@ -773,6 +873,12 @@ def _packed_tensor_fp8_op(
     expected_m: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
     tokens = int(source_2d.shape[0])
     source_padded = _pad_k(source_2d, int(padded_in_features))
@@ -805,6 +911,9 @@ def _packed_tensor_fp8_op(
             expected_m=expected_m,
             stream=stream_int,
             block_fp8=True,
+            **_dense_launch_kwargs(
+                tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
+            ),
         )[:, :, 0]
 
     source_scale_mma = _activation_scale_mma(
@@ -829,6 +938,9 @@ def _packed_tensor_fp8_op(
         expected_m=expected_m,
         stream=stream_int,
         plain_fp8=True,
+        **_dense_launch_kwargs(
+            tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
+        ),
     )[:, :, 0]
 
 
@@ -844,7 +956,14 @@ def _packed_tensor_fp8_fake(
     expected_m: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    split_k: int = 0,
+    load_path_code: int = 0,
+    swap_ab_code: int = 0,
 ) -> torch.Tensor:
+    del tile_m, tile_n, tile_k, split_k, load_path_code, swap_ab_code
     del weight_values, weight_scale_mma, weight_block_scale, output_scale
     del padded_in_features, expected_m, stream_int
     return torch.empty(
@@ -862,8 +981,10 @@ def tensor_fp8_linear(
     out_dtype: torch.dtype = torch.bfloat16,
     expected_m: int | None = None,
     stream: object = None,
+    plan: object | None = None,
 ) -> torch.Tensor:
     """Run static per-tensor E4M3 operands through the SM12x dense GEMM."""
+    launch_codes = _launch_codes_from_plan(plan)
 
     _check_gpu_tensor("source", source)
     if not isinstance(packed_weight, TensorFP8LinearWeight):
@@ -908,6 +1029,7 @@ def tensor_fp8_linear(
             int(expected_m) if expected_m is not None else tokens,
             out_dtype,
             cuda_stream_to_int(stream),
+            *launch_codes,
         )
     if bias is not None:
         output = output + bias
@@ -965,6 +1087,7 @@ def blockscaled_mm(
         expected_m = recipe.pop("expected_m", None)
         stream = recipe.pop("stream", None)
         block_fp8 = bool(recipe.pop("block_fp8", False))
+        launch_codes = _launch_codes_from_plan(recipe.pop("plan", None))
         if recipe:
             names = ", ".join(sorted(recipe))
             raise TypeError(
@@ -984,7 +1107,11 @@ def blockscaled_mm(
             block_fp8,
             (int(expected_m) if expected_m is not None else int(lhs_values.shape[0])),
             cuda_stream_to_int(stream),
+            *launch_codes,
         )
+    plan = kwargs.pop("plan", None)
+    if plan is not None:
+        kwargs.update(_dense_launch_kwargs(*_launch_codes_from_plan(plan)))
     return dense_gemm(lhs, rhs, out, **kwargs)
 
 

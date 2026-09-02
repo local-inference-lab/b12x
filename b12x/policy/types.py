@@ -452,10 +452,28 @@ class GpuProfile:
     targets: tuple[DeviceIdentity, ...]
     components: tuple[ComponentProfile, ...]
     metadata: FrozenMapping = FrozenMapping()
+    # Registered components this device has not been measured for yet. They
+    # resolve to the component heuristic until a generator run replaces them
+    # with a measured entry; the embedded lockstep check accepts them so a
+    # component can land in the catalog before every shipped GPU is re-run.
+    pending_components: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _PROFILE_ID_RE.fullmatch(self.profile_id):
             raise ValueError(f"invalid GPU profile ID {self.profile_id!r}")
+        pending = tuple(str(item) for item in self.pending_components)
+        if len(pending) != len(set(pending)):
+            raise ValueError(
+                f"GPU profile {self.profile_id!r} lists duplicate pending components"
+            )
+        measured = {component.component_id for component in self.components}
+        overlap = sorted(measured & set(pending))
+        if overlap:
+            raise ValueError(
+                f"GPU profile {self.profile_id!r} lists measured components as "
+                f"pending: {overlap}"
+            )
+        object.__setattr__(self, "pending_components", pending)
         if not self.targets:
             raise ValueError("GPU profiles must contain at least one target")
         if len(self.targets) != len(set(self.targets)):
