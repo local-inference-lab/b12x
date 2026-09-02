@@ -28,7 +28,7 @@ from b12x.gemm.wo_projection._policy import (
     WoProjectionConfig,
     WoProjectionQuery,
 )
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.policy import PolicyContext, PolicySource, get_auto_policy
 
 from ..._lib.scratch_layout import (
     layout_wo_projection as _layout_wo_projection,
@@ -2350,7 +2350,11 @@ def plan_wo_projection_scratch(
             ),
         ),
         policy_resolution=resolution,
-        config=resolution.config,
+        # Heuristic resolutions leave the fused op's built-in rules in charge;
+        # only measured or overridden chains are encoded into launch codes.
+        config=(
+            None if resolution.source is PolicySource.HEURISTIC else resolution.config
+        ),
     )
 
 
@@ -3057,7 +3061,6 @@ def _auto_wo_launch_codes(
             WO_PROJECTION_POLICY,
             WoProjectionQuery,
         )
-        from b12x.policy import PolicySource, get_auto_policy
 
         codes = _NO_WO_LAUNCH_CODES
         try:

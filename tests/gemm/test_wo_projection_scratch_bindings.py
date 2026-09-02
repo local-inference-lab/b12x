@@ -4,7 +4,13 @@ import pytest
 import torch
 
 import b12x.gemm._shared.wo_mxfp8 as wo_impl
-from b12x.gemm._shared.wo_mxfp8 import WOProjectionBinding, WOProjectionInvRopeBinding, WOProjectionScratchCaps, empty_mxfp8_rows_for_dense_gemm, plan_wo_projection_scratch
+from b12x.gemm._shared.wo_mxfp8 import (
+    WOProjectionBinding,
+    WOProjectionInvRopeBinding,
+    WOProjectionScratchCaps,
+    empty_mxfp8_rows_for_dense_gemm,
+    plan_wo_projection_scratch,
+)
 from b12x.gemm._shared.wo_mxfp8 import WOProjectionMXFP8Weights
 
 
@@ -131,9 +137,7 @@ def test_wo_projection_binding_supplies_runtime_tensors(monkeypatch) -> None:
 
     monkeypatch.setattr(wo_impl, "quantize_wo_a_input_mxfp8", fake_quantize_a)
     monkeypatch.setattr(wo_impl, "wo_a_dense_gemm_mxfp8", fake_wo_a)
-    monkeypatch.setattr(
-        wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b_fused
-    )
+    monkeypatch.setattr(wo_impl, "wo_b_dense_gemm_fused_quant_mxfp8", fake_wo_b_fused)
 
     out = wo_impl.wo_projection_mxfp8(binding=binding)
 
@@ -190,7 +194,10 @@ def test_wo_projection_inv_rope_binding_supplies_runtime_tensors(monkeypatch) ->
         expected_m,
         sfb_k_replicated,
         stream_int,
+        *launch_codes,
     ):
+        # A heuristic plan leaves every built-in selection rule in charge.
+        assert tuple(launch_codes) == (0, 0, 0, 0, 0, 0)
         calls["o"] = o_arg
         calls["positions"] = positions_arg
         calls["cos_sin_cache"] = cos_sin_cache_arg
