@@ -58,6 +58,7 @@ class DenseMlaForwardKernel:
         num_heads: int,
         num_splits: int,
         chunks_per_split: int,
+        single_split_chunks: int,
         query_tile: int,
         fp8: bool,
         qk_dim: int,
@@ -70,6 +71,7 @@ class DenseMlaForwardKernel:
         self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
+        self.single_split_chunks = int(single_split_chunks)
         self.query_tile = int(query_tile)
         self.fp8 = bool(fp8)
         self.qk_dim = int(qk_dim)
@@ -464,11 +466,14 @@ class DenseMlaForwardKernel:
         valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
-        # Balanced split ranges: the launched splits share this request's
-        # valid chunks (past any window start) evenly, so every launched CTA
-        # scans about (valid_chunks - first_valid_chunk) / active_splits
-        # chunks whatever the live length. The planned chunks_per_split only
-        # sizes the scratch; a fixed range of chunks per split would leave all
+        # Split ranges. A request whose scanned chunks (past any window
+        # start) fit within single_split_chunks is scanned by split 0 alone:
+        # one online-softmax chain in chunk order, written once, which is the
+        # fixed-range association of a kernel that scans chunks_per_split
+        # chunks per split, so those results match it bit for bit. Longer
+        # requests share their chunks evenly over the launched splits, so
+        # every launched CTA scans about scan_chunks / active_splits chunks
+        # whatever the live length; a fixed range per split would leave all
         # but the first few splits idle on sequences much shorter than the
         # planned capacity. Splits past the valid chunks stay empty and
         # publish -inf partials.
@@ -480,6 +485,9 @@ class DenseMlaForwardKernel:
         )
         if balanced_chunks_per_split < Int32(1):
             balanced_chunks_per_split = Int32(1)
+        if cutlass.const_expr(self.single_split_chunks > 0):
+            if scan_chunks <= Int32(self.single_split_chunks):
+                balanced_chunks_per_split = Int32(self.single_split_chunks)
         split_first_chunk = first_valid_chunk + split * balanced_chunks_per_split
         split_last_chunk = split_first_chunk + balanced_chunks_per_split
         if split_last_chunk > valid_chunks:

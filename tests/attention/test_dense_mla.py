@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from b12x.attention import dense_mla
+from b12x.attention.dense_mla._reference import K3_SM_SCALE
 
 from ..conftest import require_b12x
 
@@ -999,3 +1000,200 @@ def test_balanced_splits_cover_a_long_live_sequence_with_every_split() -> None:
     torch.testing.assert_close(full_output, one_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(full_lse, one_lse, rtol=2e-5, atol=2e-5)
 
+
+def _plan_131k(device, **overrides) -> dense_mla.Plan:
+    """A decode plan sized for one DCP-8 shard of a 1M-token window with four
+    query rows (one 8-head tile each), which the wave-balanced planner maps
+    to 47 splits of 44 chunks on a 188-SM device."""
+    page_size = 64
+    max_cache_tokens = 131_072
+    caps = dict(
+        device=device,
+        mode="decode",
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        page_size=page_size,
+        max_total_q=4,
+        max_batch=4,
+        max_cache_tokens=max_cache_tokens,
+        max_page_table_width=max_cache_tokens // page_size,
+        num_cache_pages=1 << 20,
+        use_cuda_graph=True,
+    )
+    caps.update(overrides)
+    return dense_mla.plan(dense_mla.Caps(**caps))
+
+
+def _run_131k(plan, scratch, q, cache, live, *, active_splits=None):
+    device = q.device
+    page_size = 64
+    num_pages = (live + page_size - 1) // page_size
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(1, -1)
+    cache_seqlens = torch.tensor([live], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    output = torch.empty(1, 8, VALUE_DIM, dtype=torch.bfloat16, device=device)
+    kwargs = {} if active_splits is None else {"active_splits": active_splits}
+    binding = dense_mla.bind(
+        plan,
+        scratch=scratch,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        **kwargs,
+    )
+    dense_mla.compile(binding=binding)
+    actual_output, actual_lse = dense_mla.run(binding=binding)
+    torch.cuda.synchronize()
+    return actual_output.clone(), actual_lse.clone(), binding
+
+
+def test_partial_dtype_and_single_split_chunks_are_validated() -> None:
+    common = dict(
+        device="cpu",
+        mode="decode",
+        kv_dtype=torch.bfloat16,
+        num_q_heads=HEADS,
+        page_size=16,
+        max_total_q=1,
+        max_batch=1,
+        max_cache_tokens=128,
+        max_page_table_width=8,
+        num_cache_pages=8,
+    )
+    with pytest.raises(TypeError, match="partial_dtype"):
+        dense_mla.Caps(partial_dtype=torch.float16, **common)
+    with pytest.raises(ValueError, match="single_split_chunks"):
+        dense_mla.Caps(single_split_chunks=-1, **common)
+    plan = dense_mla.plan(dense_mla.Caps(**common))
+    assert plan.single_split_chunks == plan.chunks_per_split
+    assert plan.partial_dtype == torch.bfloat16
+    balanced = dense_mla.plan(dense_mla.Caps(single_split_chunks=0, **common))
+    assert balanced.single_split_chunks == 0
+
+
+def test_fp32_partials_double_the_partial_scratch() -> None:
+    """The partial-output region is the only scratch that scales with the
+    partial element type; the LSE regions keep their float32 size."""
+    device = require_b12x()
+    bf16_plan = _plan_131k(device)
+    fp32_plan = _plan_131k(device, partial_dtype=torch.float32)
+    assert bf16_plan.num_splits == fp32_plan.num_splits > 1
+    (bf16_spec,) = bf16_plan.scratch_specs()
+    (fp32_spec,) = fp32_plan.scratch_specs()
+    rows = bf16_plan.caps.max_total_q
+    partial_bf16_bytes = rows * 8 * bf16_plan.num_splits * VALUE_DIM * 2
+    grown = fp32_spec.shape[0] * fp32_spec.dtype.itemsize - (
+        bf16_spec.shape[0] * bf16_spec.dtype.itemsize
+    )
+    assert grown == partial_bf16_bytes
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("partial_dtype", [torch.bfloat16, torch.float32])
+def test_single_split_requests_match_the_one_split_launch_bitwise(
+    partial_dtype: torch.dtype,
+) -> None:
+    """A request with at most single_split_chunks live chunks is scanned by
+    split 0 alone under a full-plan launch, so its merged result equals the
+    direct one-split write bit for bit (the fixed-range association a
+    chunks_per_split-run kernel produces); the 44-chunk run boundary is the
+    last such length. One chunk past it the request is balanced over the
+    launched splits, which the full-plan and eager launches partition
+    identically."""
+    device = require_b12x()
+    torch.manual_seed(20260903)
+    plan = _plan_131k(device, partial_dtype=partial_dtype)
+    assert plan.num_splits > 8
+    run = plan.chunks_per_split
+    assert plan.single_split_chunks == run
+    scratch = _scratch(plan)
+    q = torch.randn(1, 8, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+    cache = torch.randn(2_048, 64, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+    for live in (1, 63, 64, 65, run * 64 // 2, run * 64 - 1, run * 64):
+        full_output, full_lse, binding = _run_131k(plan, scratch, q, cache, live)
+        finite = torch.isfinite(binding.scratch.partial_lse[0]).sum(dim=-1)
+        assert int(finite.max().item()) == 1, live
+        one_output, one_lse, _ = _run_131k(
+            plan, scratch, q, cache, live, active_splits=1
+        )
+        assert torch.equal(full_output, one_output), live
+        assert torch.equal(full_lse, one_lse), live
+    live = run * 64 + 1
+    full_output, full_lse, binding = _run_131k(plan, scratch, q, cache, live)
+    finite = torch.isfinite(binding.scratch.partial_lse[0]).sum(dim=-1)
+    assert int(finite.min().item()) == min(plan.num_splits, run + 1)
+    eager_output, eager_lse, _ = _run_131k(
+        plan, scratch, q, cache, live, active_splits=min(plan.num_splits, run + 1)
+    )
+    assert torch.equal(full_output, eager_output)
+    assert torch.equal(full_lse, eager_lse)
+
+
+@torch.inference_mode()
+def test_single_split_chunks_zero_balances_short_requests() -> None:
+    device = require_b12x()
+    torch.manual_seed(20260903)
+    plan = _plan_131k(device, single_split_chunks=0)
+    assert plan.single_split_chunks == 0
+    scratch = _scratch(plan)
+    q = torch.randn(1, 8, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+    cache = torch.randn(64, 64, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+    output, lse, binding = _run_131k(plan, scratch, q, cache, 1_000)
+    finite = torch.isfinite(binding.scratch.partial_lse[0]).sum(dim=-1)
+    assert int(finite.min().item()) == 16  # one split per live chunk
+    page_table = torch.arange(16, dtype=torch.int32, device=device).view(1, -1)
+    expected_output, expected_lse = dense_mla.reference(
+        q,
+        cache[:16],
+        page_table,
+        torch.tensor([1_000], dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+    )
+    _assert_matches(output, lse, expected_output, expected_lse)
+
+
+@torch.inference_mode()
+def test_fp32_partials_remove_the_second_rounding() -> None:
+    """With bf16 partials a merged result is rounded twice, so balancing a
+    short request over many one-chunk splits is measurably less accurate
+    than the one-split scan; float32 partials bring the merged result back
+    to the one-split accuracy, and improve every multi-split result."""
+    device = require_b12x()
+    torch.manual_seed(20260903)
+    q = torch.randn(1, 8, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+    cache = torch.randn(2_048, 64, QK_DIM, device=device, dtype=torch.bfloat16) * 0.3
+
+    def relative_error(output, live):
+        num_pages = (live + 63) // 64
+        page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(1, -1)
+        records = cache[:num_pages].reshape(-1, QK_DIM)[:live].double()
+        scores = (q[0].double() @ records.t()) * K3_SM_SCALE
+        probabilities = torch.softmax(scores, dim=-1)
+        reference = probabilities @ records[:, :VALUE_DIM]
+        error = output[0].double() - reference
+        return float(error.norm() / reference.norm())
+
+    plans = {
+        dtype: _plan_131k(device, single_split_chunks=0, partial_dtype=dtype)
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    one_split = _plan_131k(device)
+    assert one_split.chunks_per_split * 64 >= 2_816
+    scratch = _scratch(plans[torch.float32])
+    for live in (1_000, 2_816):
+        one_output, _, _ = _run_131k(one_split, scratch, q, cache, live)
+        bf16_output, _, _ = _run_131k(plans[torch.bfloat16], scratch, q, cache, live)
+        fp32_output, _, _ = _run_131k(plans[torch.float32], scratch, q, cache, live)
+        single = relative_error(one_output, live)
+        bf16 = relative_error(bf16_output, live)
+        fp32 = relative_error(fp32_output, live)
+        assert bf16 > single * 1.05, (live, single, bf16)
+        assert fp32 < bf16 * 0.95, (live, bf16, fp32)
+        assert abs(fp32 - single) < single * 0.05, (live, single, fp32)
+    live = 10_240  # 160 chunks: every plan merges several partials
+    bf16_output, _, _ = _run_131k(plans[torch.bfloat16], scratch, q, cache, live)
+    fp32_output, _, _ = _run_131k(plans[torch.float32], scratch, q, cache, live)
+    assert relative_error(fp32_output, live) < relative_error(bf16_output, live) * 0.95
