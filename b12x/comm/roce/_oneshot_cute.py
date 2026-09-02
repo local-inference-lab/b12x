@@ -3,8 +3,11 @@
 One launch performs a complete all-reduce for one message:
 
 1. stage: copy the device input into ``send[seq & 1]`` in pinned host memory;
-2. doorbell: the last block to finish staging publishes ``nbytes`` and ``seq``
-   in the control record that the RDMA proxy thread polls;
+2. doorbell: the last block to finish staging publishes ``nbytes`` (in the
+   per-slot word ``nbytes[seq & 1]``) and then ``seq`` in the control record
+   that the RDMA proxy thread polls.  The doorbell is a level, not a queue:
+   a proxy that was descheduled across two doorbells finds ``seq`` two ahead
+   and posts both slots, which is why the byte count lives per slot;
 3. wait: spin on ``flag[peer][seq & 1] == seq`` for every peer (the peer's
    proxy writes the flag after the payload on the same reliable QP); a wait
    that exceeds ``spin_limit`` polls records ``seq`` in the control record's
@@ -219,6 +222,7 @@ class _RoceOneshotLaunch:
             prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
             if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                 st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
+                st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes))
                 fence_sc_sys()
                 st_relaxed_sys_u32(ctrl_base, seq)
 

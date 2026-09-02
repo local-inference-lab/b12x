@@ -119,7 +119,7 @@ def load() -> ctypes.CDLL:
         lib.roce_peer_hca.argtypes = [p, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 1:
+        if lib.roce_abi_version() != 2:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
@@ -210,6 +210,10 @@ class Proxy:
     def start(self) -> None:
         if self._lib.roce_start(self._ctx) != 0:
             raise RuntimeError(f"RoCE proxy thread failed to start: {self.error()}")
+
+    def stop(self) -> None:
+        """Stop the proxy thread; ``start`` resumes from the last posted op."""
+        self._lib.roce_stop(self._ctx)
 
     def failed(self) -> bool:
         return bool(self._lib.roce_failed(self._ctx))

@@ -21,10 +21,16 @@ One pinned region per rank: `recv[src][slot]`, `flag[src][slot]`, `send[slot]`,
 and a control record. One kernel launch per collective:
 
 1. stage the input into `send[seq & 1]`;
-2. the last block to finish staging publishes `nbytes` and `seq` to the control
-   record, which a C proxy thread (`_roce_proxy.c`, libibverbs) polls; the proxy
-   posts one RDMA write of the payload and one 4-byte write of `seq` per peer on
-   the same reliable QP, so the flag cannot land before the payload;
+2. the last block to finish staging publishes `nbytes` (per slot) and `seq` to
+   the control record, which a C proxy thread (`_roce_proxy.c`, libibverbs)
+   polls; the proxy posts one RDMA write of the payload and one 4-byte write of
+   `seq` per peer on the same reliable QP, so the flag cannot land before the
+   payload. The doorbell holds only the newest `seq`, and a rank's kernel for
+   op N finishes on the peers' payloads alone, so op N+1 can ring before the
+   proxy has seen op N; the proxy posts every sequence between the last one it
+   posted and the doorbell (at most two are ever pending). After a few
+   milliseconds without a doorbell the thread sleeps 20 us between polls so an
+   idle runtime does not hold a core;
 3. wait on `flag[peer][seq & 1] == seq` for every peer (bounded; a timeout
    records the missing peer and the host raises instead of hanging);
 4. all-reduce: sum the local input and every peer slot in fixed rank order, so
