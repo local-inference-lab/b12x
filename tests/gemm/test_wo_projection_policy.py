@@ -28,11 +28,12 @@ _BIG = DeviceIdentity(
 
 
 def _query(max_tokens: int, *, groups: int = 4) -> WoProjectionQuery:
+    # DSV4-Flash TP2: 4 local groups of 8 heads x 512 = group_width 4096.
     return WoProjectionQuery(
         dtype="bfloat16",
         max_tokens=max_tokens,
         groups=groups,
-        group_width=512,
+        group_width=4096,
         rank=1024,
         hidden=4096,
     )

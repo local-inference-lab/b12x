@@ -308,14 +308,15 @@ class WoProjectionGeometry:
 
 def wo_projection_geometries() -> tuple[WoProjectionGeometry, ...]:
     geometries = []
-    # DeepSeek-V4-Flash: 8 output groups of rank 1024 over 512-wide heads,
+    # DeepSeek-V4-Flash: 8 output groups of rank 1024; every group spans 8
+    # heads of 512 (vLLM: group_width = heads_per_group * head_dim = 4096),
     # served through the fused inverse-RoPE chain.
     for tp in (1, 2, 4, 8):
         geometries.append(
             WoProjectionGeometry(
                 model_id="deepseek-v4-flash",
                 groups=8 // tp,
-                group_width=512,
+                group_width=4096,
                 rank=1024,
                 hidden=4096,
                 inv_rope=True,
