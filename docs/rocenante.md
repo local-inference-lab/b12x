@@ -80,12 +80,19 @@ rank, then the slowest rank; graph replay is the decode path. The receipt
 worktree state, per-rank GPU identity, correctness results, raw samples, the
 executed arm order, and ratios with their direction.
 
-| Collective | NCCL | RoCEnante, graph replay |
-|---|---|---|
-| all-reduce 48 KB (6-token decode step) | 59 us | 23 us |
-| all-reduce 1.5 MB (192-token batch) | 877 us | 277 us |
-| all-gather [6, 38720] logits shard | 331 us (incl. reshape copy) | 96 us |
-| all-gather [96, 38720] | 1491 us | 1493 us |
+| Collective | NCCL | RoCEnante eager | RoCEnante, graph replay | NCCL / graph |
+|---|---|---|---|---|
+| all-reduce 8 KB | 51.3 us | 42.5 us | 15.5 us | 3.3 |
+| all-reduce 48 KB (6-token decode step) | 62.6 us | 48.8 us | 22.4 us | 2.8 |
+| all-reduce 256 KB | 159.9 us | 84.5 us | 56.9 us | 2.8 |
+| all-reduce 1 MB (128-token batch) | 908.4 us | 264.7 us | 238.6 us | 3.8 |
+| all-gather [6, 38720] logits shard | 342.7 us (incl. reshape copy) | 190.0 us | 95.5 us | 3.6 |
+| all-gather [96, 38720] (7.4 MB shard) | 1602.4 us | 1553.2 us | 1529.8 us | 1.05 |
+
+Correctness on the same run: bf16 sums within 6.8e-3 relative error of NCCL
+(float32 accumulation, rank-identical bits), all-gathers bit-exact, checked before
+and after timing. Shards of several megabytes are bandwidth-bound for both
+implementations; the gains are in the latency-bound region that decode lives in.
 
 Serving A/B, GLM-5.3-Flash TP4 with MTP5 on the same four nodes through the vLLM
 adapter, RoCEnante versus NCCL for the same image and configuration
