@@ -392,6 +392,29 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _merge_base(
+    *,
+    selected_ids,
+    merge_from: Path | None,
+    output: Path,
+    embed: bool,
+    embedded_output: Path,
+) -> Path | None:
+    """Base profile whose unselected components a component subset keeps.
+
+    Embedding always builds on the embedded profile: a partial ``--output``
+    artifact from the measuring run carries only the selected components and
+    must not replace everything else in the package.
+    """
+    if selected_ids is None or merge_from is not None:
+        return merge_from
+    if embed and embedded_output.exists():
+        return embedded_output
+    if output.exists():
+        return output
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     console = Console()
@@ -436,12 +459,13 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         embed=args.embed,
     )
-    merge_from = None if args.merge_from is None else args.merge_from.resolve()
-    if selected_ids is not None and merge_from is None:
-        if output.exists():
-            merge_from = output
-        elif args.embed and embedded_output.exists():
-            merge_from = embedded_output
+    merge_from = _merge_base(
+        selected_ids=selected_ids,
+        merge_from=None if args.merge_from is None else args.merge_from.resolve(),
+        output=output,
+        embed=args.embed,
+        embedded_output=embedded_output,
+    )
     if args.embed and selected_ids is not None and merge_from is None:
         raise SystemExit(
             "embedding a component subset requires an existing output profile "

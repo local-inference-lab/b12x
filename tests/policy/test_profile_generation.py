@@ -605,3 +605,37 @@ def test_measured_generator_resume_tracks_case_ids_and_config(tmp_path) -> None:
     assert checkpoint["schema_version"] == 2
     assert checkpoint["case_ids"] == ["case-b"]
     assert checkpoint["config"] == {"backend": "new-fixed"}
+
+
+def test_embedding_a_component_subset_builds_on_the_embedded_profile(tmp_path) -> None:
+    """A partial --output artifact must not become the base that replaces the package profile."""
+    from b12x.tools.generate_gpu_profile import _merge_base
+
+    output = tmp_path / "partial.json"
+    output.write_text("{}")
+    embedded = tmp_path / "embedded.json.gz"
+    embedded.write_bytes(b"")
+    kwargs = dict(selected_ids=("gemm.dense_linear",), merge_from=None, output=output)
+    assert _merge_base(embed=True, embedded_output=embedded, **kwargs) == embedded
+    assert _merge_base(embed=False, embedded_output=embedded, **kwargs) == output
+    explicit = tmp_path / "base.json"
+    assert (
+        _merge_base(
+            selected_ids=("gemm.dense_linear",),
+            merge_from=explicit,
+            output=output,
+            embed=True,
+            embedded_output=embedded,
+        )
+        == explicit
+    )
+    assert (
+        _merge_base(
+            selected_ids=None,
+            merge_from=None,
+            output=output,
+            embed=True,
+            embedded_output=embedded,
+        )
+        is None
+    )
