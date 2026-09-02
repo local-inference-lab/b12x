@@ -34,6 +34,7 @@ from b12x.policy.generation import (
 )
 from b12x.policy.generation.parallel import run_parallel_measurements
 from b12x.policy.generation.progress import RichProgressReporter
+from b12x.policy.generation.crash_guard import promote_inflight
 from b12x.policy.generation.runner import (
     estimate_generators,
     generate_profile_artifact,
@@ -148,12 +149,7 @@ def _profile_output_paths(
     embed: bool,
 ) -> tuple[Path, Path]:
     embedded_output = (
-        _REPO_ROOT
-        / "b12x"
-        / "policy"
-        / "_profiles"
-        / "data"
-        / f"{profile_id}.json.gz"
+        _REPO_ROOT / "b12x" / "policy" / "_profiles" / "data" / f"{profile_id}.json.gz"
     ).resolve()
     if output is not None:
         return output.resolve(), embedded_output
@@ -242,9 +238,7 @@ def _select_partition_shard(
             f"cannot split {len(partitions)} measurement partitions into "
             f"{shard_count} shards"
         )
-    assignments: list[list[MeasurementPartition]] = [
-        [] for _ in range(shard_count)
-    ]
+    assignments: list[list[MeasurementPartition]] = [[] for _ in range(shard_count)]
     loads = [0] * shard_count
     for partition in sorted(
         partitions,
@@ -431,6 +425,12 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("validated CUDA device lost its identity")
     profile_id = args.profile_id or _profile_id_for_device(detected.identity)
     work_dir = (args.work_dir or Path(".b12x-profile-work") / profile_id).resolve()
+    crashed = promote_inflight(work_dir)
+    if crashed is not None:
+        console.print(
+            f"[yellow]candidate {crashed[1]} of case {crashed[0]} crashed the CUDA "
+            "context in the previous run; it is skipped from now on[/yellow]"
+        )
     output, embedded_output = _profile_output_paths(
         profile_id,
         output=args.output,

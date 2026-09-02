@@ -13,6 +13,12 @@ from b12x.policy.components import (
     DENSE_LINEAR,
     WO_PROJECTION,
 )
+from b12x.policy.generation.crash_guard import (
+    CRASHED_ERROR,
+    clear_inflight,
+    load_crashed,
+    mark_inflight,
+)
 from b12x.policy.generation.gemm_corpus import (
     DENSE_MAX_TOKENS_BOUNDS,
     dense_linear_cases,
@@ -259,6 +265,7 @@ class _Bf16VocabProjectionSession(
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 
@@ -490,6 +497,7 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 
@@ -1326,8 +1334,22 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
             )
             layers = self._layers_for(case, device)
             layers.prepare(tokens, generator)
+            crashed = load_crashed(self._context.work_dir)
             measurements = []
             for candidate in candidates:
+                if (case.case_id, candidate.candidate_id) in crashed:
+                    measurements.append(
+                        SweepMeasurement(
+                            candidate=candidate,
+                            latency_us=None,
+                            correct=False,
+                            error=CRASHED_ERROR,
+                        )
+                    )
+                    continue
+                mark_inflight(
+                    self._context.work_dir, case.case_id, candidate.candidate_id
+                )
                 try:
                     config = DenseLinearConfig.from_profile(candidate.config)
                     policy = base_policy.with_override(DENSE_LINEAR, config)
@@ -1383,6 +1405,7 @@ class _DenseLinearSession(AbstractContextManager["_DenseLinearSession"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 
@@ -1733,8 +1756,22 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
             )
             layers.caps_nope_dim = nope_dim
             layers.caps_rope_dim = rope_dim
+            crashed = load_crashed(self._context.work_dir)
             measurements = []
             for candidate in candidates:
+                if (case.case_id, candidate.candidate_id) in crashed:
+                    measurements.append(
+                        SweepMeasurement(
+                            candidate=candidate,
+                            latency_us=None,
+                            correct=False,
+                            error=CRASHED_ERROR,
+                        )
+                    )
+                    continue
+                mark_inflight(
+                    self._context.work_dir, case.case_id, candidate.candidate_id
+                )
                 try:
                     config = WoProjectionConfig.from_profile(candidate.config)
                     policy = base_policy.with_override(WO_PROJECTION, config)
@@ -1784,6 +1821,7 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                             error=f"{type(exc).__name__}: {exc}",
                         )
                     )
+            clear_inflight(self._context.work_dir)
             return tuple(measurements)
 
 
