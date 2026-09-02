@@ -29,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def runtime():
+    """Module-scoped RoCEnante runtime over the torchrun world; skips without RDMA support."""
     from b12x.comm import roce
 
     if not roce.is_supported():
@@ -49,6 +50,7 @@ def runtime():
 
 
 def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
+    """(rtol, atol) for a ``world``-way sum in ``dtype`` with float32 accumulation."""
     if dtype == torch.float32:
         return 1e-5, 1e-5 * world
     if dtype == torch.bfloat16:
@@ -59,6 +61,7 @@ def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
 @pytest.mark.parametrize("numel_bytes", [16, 4096, 48 * 1024, 256 * 1024, 1 << 20])
 def test_matches_nccl_and_is_rank_identical(runtime, dtype, numel_bytes):
+    """All-reduce matches NCCL within tolerance and is bit-identical across ranks."""
     world = dist.get_world_size()
     rank = dist.get_rank()
     numel = numel_bytes // torch.tensor([], dtype=dtype).element_size()
@@ -84,6 +87,7 @@ def test_matches_nccl_and_is_rank_identical(runtime, dtype, numel_bytes):
 
 
 def test_rejects_ineligible_inputs(runtime):
+    """Size, shape, stride, and pointer-alignment boundaries of all-reduce eligibility."""
     huge = torch.zeros((runtime.max_size // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_allreduce(huge)
     odd = torch.zeros(3, dtype=torch.bfloat16, device=runtime.device)
@@ -92,9 +96,18 @@ def test_rejects_ineligible_inputs(runtime):
     assert not runtime.should_allreduce(strided)
     ok = torch.zeros(4096, dtype=torch.bfloat16, device=runtime.device)
     assert runtime.should_allreduce(ok)
+    # 16-byte pointer alignment: a contiguous slice at a one-element offset
+    unaligned = torch.zeros(4097, dtype=torch.float16, device=runtime.device)[1:]
+    assert unaligned.is_contiguous() and unaligned.data_ptr() % 16 != 0
+    assert not runtime.should_allreduce(unaligned)
+    aligned = torch.zeros(4096, dtype=torch.float16, device=runtime.device)
+    assert runtime.should_allreduce(aligned)
+    with pytest.raises(ValueError):
+        runtime.all_reduce(aligned, out=unaligned)
 
 
 def test_cuda_graph_replay(runtime):
+    """Three captured all-reduces replay correctly with the epoch advancing in-graph."""
     world = dist.get_world_size()
     rank = dist.get_rank()
     static_in = torch.zeros(24 * 1024, dtype=torch.bfloat16, device=runtime.device)
@@ -178,6 +191,7 @@ def test_proxy_catches_up_after_missed_doorbell(runtime):
     ],
 )
 def test_all_gather_matches_torch(runtime, dtype, shape, dim):
+    """All-gather equals ``torch.cat`` of NCCL shards on both gather paths."""
     world = dist.get_world_size()
     rank = dist.get_rank()
     for trial in range(3):
@@ -200,6 +214,7 @@ def test_all_gather_matches_torch(runtime, dtype, shape, dim):
 
 
 def test_all_gather_rejects_ineligible(runtime):
+    """Dim, capacity, and ``out`` validation of the all-gather, before any launch."""
     x = torch.zeros(4, 8, 8, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_all_gather(x, 1)  # middle dim
     odd = torch.zeros(6, 5, dtype=torch.bfloat16, device=runtime.device)
@@ -207,9 +222,20 @@ def test_all_gather_rejects_ineligible(runtime):
     assert not runtime._direct_gather_layout(odd, 1)
     huge = torch.zeros((runtime.max_gather_bytes // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_all_gather(huge, 0)
+    # ``out`` is validated before anything is launched, on both gather paths
+    world = dist.get_world_size()
+    aligned = torch.zeros(6, 8, dtype=torch.bfloat16, device=runtime.device)
+    for shard in (odd, aligned):
+        wrong_dtype = torch.empty(shard.shape[0], shard.shape[1] * world, dtype=torch.float32, device=runtime.device)
+        with pytest.raises(ValueError):
+            runtime.all_gather(shard, dim=-1, out=wrong_dtype)
+        wrong_shape = torch.empty(shard.shape[0], shard.shape[1], dtype=torch.bfloat16, device=runtime.device)
+        with pytest.raises(ValueError):
+            runtime.all_gather(shard, dim=-1, out=wrong_shape)
 
 
 def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
+    """A captured graph mixing both collectives replays correctly."""
     world = dist.get_world_size()
     rank = dist.get_rank()
     x = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)

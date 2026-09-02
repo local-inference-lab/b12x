@@ -50,6 +50,12 @@ class _RoceAllGatherLaunch:
     def __init__(
         self, world_size: int, rank: int, threads: int, slots: int, flag_stride: int
     ) -> None:
+        """Bind one kernel specialization: world size, rank, and layout constants."""
+        if int(threads) < int(world_size):
+            raise ValueError(
+                f"RoCE kernels need threads >= world_size (one thread waits on one "
+                f"peer flag), got threads={threads} world_size={world_size}"
+            )
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._threads = int(threads)
@@ -74,6 +80,7 @@ class _RoceAllGatherLaunch:
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
+        """Host entry: launch the all-gather kernel with runtime scalars."""
         self.kernel(
             input_ptr,
             output_ptr,
@@ -110,6 +117,7 @@ class _RoceAllGatherLaunch:
         epoch_ptr: Int64,
         spin_limit: Uint32,
     ) -> None:
+        """Device kernel: stage, doorbell, wait for peer flags, strided copy, advance the epoch."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -198,16 +206,19 @@ class _RoceAllGatherLaunch:
 
 
 def _dummy(dtype, alignment: int):
+    """A CUDA tensor of ``dtype`` used to trace launcher argument types."""
     return make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=alignment)
 
 
 def _process_key(
     world_size: int, rank: int, threads: int, slots: int, flag_stride: int, device_index: int
 ) -> tuple[object, ...]:
+    """Cache key of one compiled launcher specialization."""
     return (int(world_size), int(rank), int(threads), int(slots), int(flag_stride), int(device_index))
 
 
 def is_launcher_prepared(*key) -> bool:
+    """True when the launcher for ``key`` is already compiled."""
     return _process_key(*key) in _PREPARED_LAUNCHERS
 
 
@@ -215,6 +226,7 @@ def is_launcher_prepared(*key) -> bool:
 def get_launcher(
     world_size: int, rank: int, threads: int, slots: int, flag_stride: int, device_index: int
 ) -> Callable[..., None]:
+    """Compile the launcher for ``key`` once and return it."""
     process_key = _process_key(world_size, rank, threads, slots, flag_stride, device_index)
     del device_index
     launch = _RoceAllGatherLaunch(world_size, rank, threads, slots, flag_stride)
@@ -254,6 +266,7 @@ def get_launcher(
         spin_limit: int,
         grid_x: int,
     ) -> None:
+        """Launch the compiled kernel with runtime scalar arguments."""
         raw(
             make_ptr(cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
