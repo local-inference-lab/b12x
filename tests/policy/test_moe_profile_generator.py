@@ -74,8 +74,7 @@ _DEVICE = DeviceIdentity(
 )
 
 
-def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
-) -> None:
+def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs() -> None:
     cases = expand_sweep_cases()
     queries = {tuple(sorted(case.query().items())): case.query() for case in cases}
     base_queries = {}
@@ -87,9 +86,7 @@ def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
     for base_query in base_queries.values():
         top_k = int(base_query["top_k"])
         direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
-        triton_limit = (
-            fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
-        )
+        triton_limit = fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
         for num_tokens in (9, direct_limit, direct_limit + 1, triton_limit + 1):
             if not 1 <= num_tokens <= 8_192:
                 continue
@@ -337,15 +334,9 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
     )
 
     assert _w4a16_weight_layout(glm_decode.geometry) == "modelopt"
-    assert (
-        _w4a16_direct_path(glm_decode.geometry, glm_decode)
-        == "w4a16.small_m_direct"
-    )
+    assert _w4a16_direct_path(glm_decode.geometry, glm_decode) == "w4a16.small_m_direct"
     assert _w4a16_weight_layout(e8m0_decode.geometry) == "packed"
-    assert (
-        _w4a16_direct_path(e8m0_decode.geometry, e8m0_decode)
-        == "w4a16.tc_decode"
-    )
+    assert _w4a16_direct_path(e8m0_decode.geometry, e8m0_decode) == "w4a16.tc_decode"
     assert _w4a16_weight_layout(compressed_direct.geometry) == "packed"
     assert (
         _w4a16_direct_path(compressed_direct.geometry, compressed_direct)
@@ -394,9 +385,10 @@ def test_w4a16_tuner_layout_matches_canonical_weight_planning() -> None:
             ),
         )
 
-        assert _w4a16_weight_layout(geometry) == expected_layout[
-            plan.prepared_format.packing
-        ]
+        assert (
+            _w4a16_weight_layout(geometry)
+            == expected_layout[plan.prepared_format.packing]
+        )
 
 
 def test_concrete_candidate_path_reads_the_exact_execution_variant() -> None:
@@ -521,8 +513,7 @@ def test_concrete_candidate_path_reports_w4a8_specializations(
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.recipe_id == recipe_id
-        and geometry.activation == "silu"
+        if geometry.recipe.recipe_id == recipe_id and geometry.activation == "silu"
     )
     case = next(
         case
@@ -599,8 +590,7 @@ def test_nvfp4_triton_route_candidates_only_use_the_supported_tile() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.quant_mode == "nvfp4"
-        and geometry.activation == "silu"
+        if geometry.recipe.quant_mode == "nvfp4" and geometry.activation == "silu"
     )
 
     configs = tuple(
@@ -648,8 +638,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.quant_mode == quant_mode
-        and geometry.activation == "silu"
+        if geometry.recipe.quant_mode == quant_mode and geometry.activation == "silu"
     )
     cases = expand_sweep_cases(geometries=(geometry,))
     small = next(
@@ -702,8 +691,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         is expect_dynamic_direct
     )
     assert not any(
-        config["backend"] == "dynamic"
-        and config["dynamic_route_mode"] == "direct"
+        config["backend"] == "dynamic" and config["dynamic_route_mode"] == "direct"
         for config in large_configs
     )
     if quant_mode == "w4a8_nvfp4":
@@ -714,8 +702,7 @@ def test_nvfp4_relu2_tuner_excludes_oversized_dynamic_tiles() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.quant_mode == "nvfp4"
-        and geometry.activation == "relu2"
+        if geometry.recipe.quant_mode == "nvfp4" and geometry.activation == "relu2"
     )
 
     candidates = _candidates_for_geometry(geometry, sm_count=48)
@@ -794,9 +781,7 @@ class _Session(AbstractContextManager["_Session"]):
             configs = (
                 {
                     "backend": backend,
-                    "dynamic_route_mode": (
-                        "grouped" if backend == "dynamic" else None
-                    ),
+                    "dynamic_route_mode": ("grouped" if backend == "dynamic" else None),
                     "dynamic_tile_m": 128 if backend == "dynamic" else None,
                     "route_planner": "internal",
                     "max_active_clusters": None,
@@ -1950,3 +1935,52 @@ def test_production_moe_resume_does_not_start_a_gpu_worker(tmp_path) -> None:
         assert candidates
         assert session.eligible_candidates(case, candidates)
         assert session._process is None
+
+
+def test_reduction_keeps_the_builtin_config_inside_the_margin(
+    tmp_path, monkeypatch
+) -> None:
+    """The built-in decode config wins a query point unless the leader beats it
+    by more than the margin: at 1 token the fake session times micro at 10us
+    and dynamic at 20us, a 2x win over a dynamic baseline."""
+    from b12x.policy.generation.providers import moe as moe_provider
+
+    generator = _generator([], token_counts=(1,), top_ks=(2,))
+    dynamic = {
+        "backend": "dynamic",
+        "dynamic_route_mode": "grouped",
+        "dynamic_tile_m": 128,
+        "route_planner": "internal",
+        "max_active_clusters": None,
+        "w4a16_route_mode": None,
+    }
+    micro = {
+        **dynamic,
+        "backend": "micro",
+        "dynamic_route_mode": None,
+        "dynamic_tile_m": None,
+    }
+    monkeypatch.setattr(
+        moe_provider, "_baseline_config_for", lambda case, context: dynamic
+    )
+
+    def run(margin):
+        monkeypatch.setattr(moe_provider, "MOE_BASELINE_MARGIN", margin)
+        result = generator.generate(
+            _context(tmp_path / f"m{margin}"),
+            progress=NullProgressReporter(),
+            checkpoints=CheckpointStore(tmp_path / f"m{margin}" / "checkpoints"),
+        )
+        return result.evidence
+
+    evidence = run(0.02)
+    assert evidence["baseline_kept_query_points"] == 0
+    assert evidence["baseline_missing_query_points"] == 0
+    assert list(evidence["winner_query_counts"]) == [
+        MoeCandidate.create(micro).candidate_id
+    ]
+    evidence = run(0.6)
+    assert evidence["baseline_kept_query_points"] == 1
+    assert list(evidence["winner_query_counts"]) == [
+        MoeCandidate.create(dynamic).candidate_id
+    ]
