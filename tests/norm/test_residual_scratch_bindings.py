@@ -10,6 +10,7 @@ from b12x.norm.mhc._policy import MHC_POLICY, MhcConfig, MhcQuery
 from b12x.policy import (
     MHC,
     DeviceIdentity,
+    InvalidPreplannedPolicyError,
     PolicyContext,
     PolicyMode,
     PolicySource,
@@ -19,6 +20,15 @@ from b12x.policy import (
 def _medium_tf32_config(*, stages: int) -> MhcConfig:
     return MhcConfig(
         backend="tf32_tma",
+        native_post_pre_backend="decode",
+        decode_source_splits=0,
+        decode_tile_n=0,
+        decode_bf16x2=False,
+        decode_partials_per_cta=4,
+        decode_finalize_threads=0,
+        decode_finalize_ctas=1,
+        prefill_block_m=0,
+        prefill_tile_n=0,
         projection_tile_m=64,
         projection_tile_n=24,
         projection_tile_k=64,
@@ -53,38 +63,13 @@ def test_mhc_policy_owns_medium_prefill_projection_geometry() -> None:
     assert plan.config.projection_k_splits == 8
 
 
-@pytest.mark.parametrize(
-    ("device", "tile_m", "k_splits"),
-    (
-        (
-            DeviceIdentity(
-                vendor="nvidia",
-                product_name="nvidia gb10",
-                compute_capability=(12, 1),
-                sm_count=48,
-            ),
-            128,
-            4,
-        ),
-        (
-            DeviceIdentity(
-                vendor="nvidia",
-                product_name=(
-                    "nvidia rtx pro 6000 blackwell max-q workstation edition"
-                ),
-                compute_capability=(12, 0),
-                sm_count=188,
-            ),
-            64,
-            8,
-        ),
-    ),
-)
-def test_embedded_mhc_profiles_resolve_measured_medium_prefill_geometry(
-    device: DeviceIdentity,
-    tile_m: int,
-    k_splits: int,
-) -> None:
+def test_rtx_6000_profile_resolves_measured_medium_prefill_geometry() -> None:
+    device = DeviceIdentity(
+        vendor="nvidia",
+        product_name="nvidia rtx pro 6000 blackwell max-q workstation edition",
+        compute_capability=(12, 0),
+        sm_count=188,
+    )
     resolution = PolicyContext.for_identity(device).resolve(
         MHC_POLICY,
         MhcQuery(
@@ -97,8 +82,91 @@ def test_embedded_mhc_profiles_resolve_measured_medium_prefill_geometry(
 
     assert resolution.source is PolicySource.PREPLANNED
     assert resolution.config.backend == "tf32_tma"
-    assert resolution.config.projection_tile_m == tile_m
-    assert resolution.config.projection_k_splits == k_splits
+    assert resolution.config.projection_tile_m == 128
+    assert resolution.config.projection_k_splits == 4
+
+
+def test_gb10_mhc_profile_requires_regeneration() -> None:
+    device = DeviceIdentity(
+        vendor="nvidia",
+        product_name="nvidia gb10",
+        compute_capability=(12, 1),
+        sm_count=48,
+    )
+
+    with pytest.raises(InvalidPreplannedPolicyError, match="config schema mismatch"):
+        PolicyContext.for_identity(device).resolve(
+            MHC_POLICY,
+            MhcQuery(
+                dtype="bfloat16",
+                max_tokens=3_072,
+                hidden_size=4_096,
+                split_k=64,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "tokens",
+        "hidden_size",
+        "split_k",
+        "backend",
+        "post_pre_backend",
+        "source_splits",
+        "bf16x2",
+        "partials_per_cta",
+        "finalize_threads",
+        "finalize_ctas",
+    ),
+    (
+        (8, 4_096, 64, "native", "decode", 0, False, 4, 0, 1),
+        (10, 4_096, 64, "native", "decode", 0, False, 4, 0, 1),
+        (13, 4_096, 64, "native", "decode", 0, False, 4, 0, 1),
+        (16, 4_096, 64, "native", "decode", 8, True, 4, 0, 1),
+        (32, 4_096, 64, "native", "decode", 8, False, 4, 0, 1),
+        (192, 4_096, 64, "native", "decode", 4, False, 4, 0, 1),
+        (320, 4_096, 64, "native", "prefill_block_m", 0, False, 4, 0, 1),
+        (384, 4_096, 64, "tf32_tma", "decode", 0, False, 4, 0, 1),
+        (64, 7_168, 112, "native", "prefill_block_m", 0, False, 4, 0, 1),
+    ),
+)
+def test_rtx_6000_profile_resolves_measured_post_pre_schedules(
+    tokens: int,
+    hidden_size: int,
+    split_k: int,
+    backend: str,
+    post_pre_backend: str,
+    source_splits: int,
+    bf16x2: bool,
+    partials_per_cta: int,
+    finalize_threads: int,
+    finalize_ctas: int,
+) -> None:
+    device = DeviceIdentity(
+        vendor="nvidia",
+        product_name="nvidia rtx pro 6000 blackwell max-q workstation edition",
+        compute_capability=(12, 0),
+        sm_count=188,
+    )
+    resolution = PolicyContext.for_identity(device).resolve(
+        MHC_POLICY,
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=tokens,
+            hidden_size=hidden_size,
+            split_k=split_k,
+        ),
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.backend == backend
+    assert resolution.config.native_post_pre_backend == post_pre_backend
+    assert resolution.config.decode_source_splits == source_splits
+    assert resolution.config.decode_bf16x2 is bf16x2
+    assert resolution.config.decode_partials_per_cta == partials_per_cta
+    assert resolution.config.decode_finalize_threads == finalize_threads
+    assert resolution.config.decode_finalize_ctas == finalize_ctas
 
 
 @pytest.mark.parametrize(

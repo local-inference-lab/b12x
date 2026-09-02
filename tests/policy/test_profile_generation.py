@@ -33,6 +33,7 @@ from b12x.policy.generation.runner import (
     write_artifact_atomic,
 )
 from b12x.tools.generate_gpu_profile import (
+    _bind_inline_generation_device,
     _is_generated_profile_data,
     _parse_devices,
     _parse_partition_shard,
@@ -121,6 +122,17 @@ def test_default_profile_id_reuses_embedded_multi_target_profile() -> None:
     assert {
         _profile_id_for_device(target) for target in profile.targets
     } == {profile.profile_id}
+
+
+def test_inline_generation_binds_the_requested_cuda_device(monkeypatch) -> None:
+    selected = []
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+
+    _bind_inline_generation_device(
+        SimpleNamespace(identity=_DEVICE, ordinal=7)
+    )
+
+    assert selected == [7]
 
 
 def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None:

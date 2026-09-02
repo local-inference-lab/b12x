@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import gzip
+import json
 from contextlib import AbstractContextManager
+from pathlib import Path
 from types import SimpleNamespace
 
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
@@ -451,6 +454,15 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
         config
         == {
             "backend": "tf32_tma",
+                "native_post_pre_backend": "decode",
+                "decode_source_splits": 0,
+                "decode_tile_n": 0,
+                "decode_bf16x2": False,
+                "decode_partials_per_cta": 4,
+                "decode_finalize_threads": 0,
+                "decode_finalize_ctas": 1,
+                "prefill_block_m": 0,
+            "prefill_tile_n": 0,
             "projection_tile_m": 64,
             "projection_tile_n": 24,
             "projection_tile_k": 64,
@@ -461,6 +473,117 @@ def test_mhc_tuner_races_the_medium_prefill_plan() -> None:
         }
         for config in configs
     )
+
+
+def test_mhc_tuner_races_decode_and_block_m_crossover_schedules() -> None:
+    case = next(
+        case
+        for case in _mhc_cases()
+        if case.query["hidden_size"] == 4_096 and case.query["max_tokens"] == 96
+    )
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _MhcSession(SimpleNamespace(device=None)).candidates(case)
+    )
+
+    assert {
+        (
+            config["native_post_pre_backend"],
+            config["decode_source_splits"],
+            config["decode_tile_n"],
+            config["prefill_block_m"],
+            config["prefill_tile_n"],
+        )
+        for config in configs
+    } == {
+        ("decode", 0, 0, 0, 0),
+        ("decode", 4, 6, 0, 0),
+        ("decode", 8, 6, 0, 0),
+        ("prefill_block_m", 0, 0, 2, 24),
+    }
+
+
+def test_mhc_tuner_exposes_static_decode_and_finalize_schedule_knobs() -> None:
+    case = next(
+        case
+        for case in _mhc_cases()
+        if case.query["hidden_size"] == 4_096
+        and case.query["max_tokens"] == 16
+    )
+    configs = tuple(
+        candidate.config
+        for candidate in _MhcSession(SimpleNamespace(device=None)).candidates(case)
+    )
+
+    assert {config["decode_partials_per_cta"] for config in configs} == {4, 9, 25}
+    assert {
+        (config["decode_finalize_threads"], config["decode_finalize_ctas"])
+        for config in configs
+    } == {(0, 1), (128, 1), (128, 8), (512, 1)}
+    assert {
+        config["decode_bf16x2"]
+        for config in configs
+        if config["decode_source_splits"]
+    } == {False, True}
+
+
+def test_mhc_profile_regeneration_manifest_tracks_every_artifact() -> None:
+    manifest = json.loads(
+        Path("validation/gpu_profiles/requirements/norm.mhc.json").read_text()
+    )
+
+    assert manifest["component_id"] == "norm.mhc"
+    assert manifest["status"] == "research-only"
+    assert manifest["target"] == {
+        "query_schema_version": 1,
+        "config_schema_version": 4,
+        "candidate_contract_version": 5,
+    }
+    assert {
+        artifact["path"]
+        for profile in manifest["profiles"]
+        for artifact in profile["artifacts"]
+    } == {
+        "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
+        "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz",
+        "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz",
+        "validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz",
+    }
+    assert {
+        artifact["path"]: artifact["observed_config_schema_version"]
+        for profile in manifest["profiles"]
+        for artifact in profile["artifacts"]
+    } == {
+        "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz": 2,
+        "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz": 4,
+        "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz": 1,
+        "validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz": 4,
+    }
+    assert {profile["profile_id"]: profile["status"] for profile in manifest["profiles"]} == {
+        "nvidia.gb10.48sm": "unsupported",
+        "nvidia.rtx.pro.6000.blackwell": "qualified",
+    }
+    for profile in manifest["profiles"]:
+        for artifact in profile["artifacts"]:
+            payload = json.loads(gzip.decompress(Path(artifact["path"]).read_bytes()))
+            profile_payload = payload.get("profile", payload)
+            component = next(
+                item
+                for item in profile_payload["components"]
+                if item["component_id"] == manifest["component_id"]
+            )
+            assert (
+                component["config_schema_version"]
+                == artifact["observed_config_schema_version"]
+            )
+            if profile["status"] == "qualified":
+                assert component["config_schema_version"] == manifest["target"][
+                    "config_schema_version"
+                ]
+            else:
+                assert component["config_schema_version"] < manifest["target"][
+                    "config_schema_version"
+                ]
 
 
 def test_glm_profile_generation_envelope_matches_presets() -> None:
@@ -486,6 +609,9 @@ def test_glm_profile_generation_envelope_matches_presets() -> None:
         query.max_tokens for query in mhc_queries
     }
     assert {2_304, 3_072, 3_584} <= {query.max_tokens for query in mhc_queries}
+    assert {24, 32, 48, 64, 96, 128, 192, 256, 320, 384} <= {
+        query.max_tokens for query in mhc_queries
+    }
     assert {query.score_mode for query in dsa_queries} == {"dsa", "msa"}
     assert set(COMMON_PREFILL_TOKEN_CAPACITIES) <= {
         query.max_q_rows for query in dsa_queries if query.mode == "prefill"

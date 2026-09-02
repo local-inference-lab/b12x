@@ -516,6 +516,33 @@ def _selected_mhc_decode_finalize_threads(
     return threads
 
 
+def _validate_mhc_decode_finalize_schedule(
+    *,
+    threads: int,
+    ctas: int,
+    hidden_size: int,
+) -> tuple[int, int]:
+    threads = int(threads)
+    ctas = int(ctas)
+    if threads == 0:
+        if ctas != 1:
+            raise ValueError("multi-CTA mHC finalize must use ctas=1")
+        return threads, ctas
+    if (
+        threads < 0
+        or threads > 1_024
+        or threads % 32 != 0
+        or int(hidden_size) % (2 * threads) != 0
+    ):
+        raise ValueError(
+            "mHC decode finalize threads must be a positive multiple of 32 "
+            "that evenly vectorizes hidden_size"
+        )
+    if ctas <= 0:
+        raise ValueError("mHC decode finalize ctas must be positive")
+    return threads, ctas
+
+
 def _selected_post_pre_partials_per_cta(
     *,
     num_tokens: int,
@@ -4046,25 +4073,34 @@ def _run_mhc_post_pre_partial_launch(
     fn: torch.Tensor,
     partials: torch.Tensor,
     out: torch.Tensor,
-    compute_gram: bool = False,
+    compute_gram: bool,
+    decode_source_splits: int,
+    decode_tile_n: int,
+    decode_bf16x2: bool,
+    decode_partials_per_cta: int,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
-    )
-    raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
-    decode_bf16x2 = (
-        raw_bf16x2 != "0"
-        if raw_bf16x2 is not None
-        else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
-    )
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
+    decode_source_splits = int(decode_source_splits)
+    decode_tile_n = int(decode_tile_n)
+    if decode_source_splits == 0:
+        if decode_tile_n != 0:
+            raise ValueError("unsplit mHC decode must set decode_tile_n=0")
+    elif (
+        hidden_size != _HIDDEN
+        or decode_source_splits not in {4, 8}
+        or decode_tile_n <= 0
+        or _MIXES % decode_tile_n
+    ):
+        raise ValueError(
+            "split mHC decode requires hidden_size=4096, source_splits in "
+            "{4, 8}, and a positive tile_n that divides 24"
+        )
+    decode_bf16x2 = bool(decode_bf16x2)
+    partials_per_cta = _validate_post_pre_partials_per_cta(
+        decode_partials_per_cta
     )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
@@ -4244,6 +4280,10 @@ def _mhc_post_pre_partial_launch_op(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    decode_source_splits: int,
+    decode_tile_n: int,
+    decode_bf16x2: bool,
+    decode_partials_per_cta: int,
 ) -> None:
     _run_mhc_post_pre_partial_launch(
         x=x,
@@ -4254,6 +4294,10 @@ def _mhc_post_pre_partial_launch_op(
         partials=partials,
         out=out,
         compute_gram=compute_gram,
+        decode_source_splits=decode_source_splits,
+        decode_tile_n=decode_tile_n,
+        decode_bf16x2=decode_bf16x2,
+        decode_partials_per_cta=decode_partials_per_cta,
     )
 
 
@@ -4267,6 +4311,10 @@ def _mhc_post_pre_partial_launch_fake(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    decode_source_splits: int,
+    decode_tile_n: int,
+    decode_bf16x2: bool,
+    decode_partials_per_cta: int,
 ) -> None:
     return None
 
@@ -4281,7 +4329,37 @@ def run_mhc_post_pre_partial(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    config: MhcConfig | None = None,
 ) -> None:
+    if config is None:
+        decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+            num_tokens=int(x.shape[0]),
+            hidden_size=int(residual.shape[2]),
+        )
+        raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
+        decode_bf16x2 = (
+            raw_bf16x2 != "0"
+            if raw_bf16x2 is not None
+            else int(x.shape[0]) == 16
+            and int(residual.shape[2]) == _HIDDEN
+            and decode_source_splits > 0
+        )
+        decode_partials_per_cta = _selected_post_pre_partials_per_cta(
+            num_tokens=int(x.shape[0]),
+            hidden_size=int(residual.shape[2]),
+        )
+    else:
+        decode_source_splits = int(config.decode_source_splits)
+        decode_tile_n = int(config.decode_tile_n)
+        decode_bf16x2 = bool(config.decode_bf16x2)
+        decode_partials_per_cta = int(config.decode_partials_per_cta)
+        if decode_bf16x2 and not all(
+            tensor.is_contiguous() and tensor.data_ptr() % 4 == 0
+            for tensor in (x, residual, out)
+        ):
+            raise ValueError(
+                "planned decode_bf16x2 requires contiguous, 4-byte-aligned tensors"
+            )
     torch.ops.b12x.mhc_post_pre_partial_launch(
         x,
         residual,
@@ -4291,6 +4369,10 @@ def run_mhc_post_pre_partial(
         partials,
         out,
         bool(compute_gram),
+        decode_source_splits,
+        decode_tile_n,
+        decode_bf16x2,
+        decode_partials_per_cta,
     )
 
 
@@ -5163,6 +5245,15 @@ def _legacy_mhc_prefill_tf32_config(
         geometry = (16, 8, 256, 1, 1, 1, 1)
     return MhcConfig(
         backend="tf32_tma",
+        native_post_pre_backend="decode",
+        decode_source_splits=0,
+        decode_tile_n=0,
+        decode_bf16x2=False,
+        decode_partials_per_cta=4,
+        decode_finalize_threads=0,
+        decode_finalize_ctas=1,
+        prefill_block_m=0,
+        prefill_tile_n=0,
         projection_tile_m=geometry[0],
         projection_tile_n=geometry[1],
         projection_tile_k=geometry[2],
@@ -5296,6 +5387,22 @@ def _mhc_post_pre_partial_alloc_op(
         (tokens, split_k, _PARTIALS), dtype=torch.float32, device=residual.device
     )
     out = torch.empty(residual.shape, dtype=residual.dtype, device=residual.device)
+    decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+    )
+    raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
+    decode_bf16x2 = (
+        raw_bf16x2 != "0"
+        if raw_bf16x2 is not None
+        else tokens == 16
+        and hidden_size == _HIDDEN
+        and decode_source_splits > 0
+    )
+    decode_partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=tokens,
+        hidden_size=hidden_size,
+    )
     _run_mhc_post_pre_partial_launch(
         x=x,
         residual=residual,
@@ -5305,6 +5412,10 @@ def _mhc_post_pre_partial_alloc_op(
         partials=partials,
         out=out,
         compute_gram=compute_gram,
+        decode_source_splits=decode_source_splits,
+        decode_tile_n=decode_tile_n,
+        decode_bf16x2=decode_bf16x2,
+        decode_partials_per_cta=decode_partials_per_cta,
     )
     return partials, out
 
@@ -5686,6 +5797,8 @@ def _run_mhc_finalize_gram_launch(
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
     active_source_splits: int = 0,
+    decode_finalize_threads: int | None = None,
+    decode_finalize_ctas: int | None = None,
 ) -> None:
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
@@ -5703,20 +5816,16 @@ def _run_mhc_finalize_gram_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    single_cta_threads = (
-        0
-        if compact_partials
-        else _selected_mhc_decode_finalize_threads(
+    if compact_partials:
+        single_cta_threads, single_cta_groups = 0, 1
+    elif decode_finalize_threads is None:
+        single_cta_threads = _selected_mhc_decode_finalize_threads(
             num_tokens=tokens,
             hidden_size=hidden_size,
         )
-    )
-    single_cta = single_cta_threads > 0
-    raw_single_cta_groups = os.environ.get(
-        "B12X_MHC_DECODE_FINALIZE_CTAS"
-    )
-    single_cta_groups = 1
-    if single_cta:
+        raw_single_cta_groups = os.environ.get(
+            "B12X_MHC_DECODE_FINALIZE_CTAS"
+        )
         single_cta_groups = (
             int(raw_single_cta_groups)
             if raw_single_cta_groups is not None
@@ -5724,6 +5833,19 @@ def _run_mhc_finalize_gram_launch(
             if single_cta_threads == 128 and tokens >= 10
             else 1
         )
+    else:
+        if decode_finalize_ctas is None:
+            raise ValueError(
+                "decode_finalize_ctas is required with decode_finalize_threads"
+            )
+        single_cta_threads = int(decode_finalize_threads)
+        single_cta_groups = int(decode_finalize_ctas)
+    single_cta_threads, single_cta_groups = _validate_mhc_decode_finalize_schedule(
+        threads=single_cta_threads,
+        ctas=single_cta_groups,
+        hidden_size=hidden_size,
+    )
+    single_cta = single_cta_threads > 0
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("scale", scale, (3,))
@@ -5914,6 +6036,8 @@ def _mhc_finalize_gram_launch_op(
     compact_partials: bool,
     compact_projection_splits: int,
     active_source_splits: int,
+    decode_finalize_threads: int,
+    decode_finalize_ctas: int,
 ) -> None:
     _run_mhc_finalize_gram_launch(
         residual=residual,
@@ -5932,6 +6056,8 @@ def _mhc_finalize_gram_launch_op(
         compact_partials=compact_partials,
         compact_projection_splits=compact_projection_splits,
         active_source_splits=active_source_splits,
+        decode_finalize_threads=decode_finalize_threads,
+        decode_finalize_ctas=decode_finalize_ctas,
     )
 
 
@@ -5953,6 +6079,8 @@ def _mhc_finalize_gram_launch_fake(
     compact_partials: bool,
     compact_projection_splits: int,
     active_source_splits: int,
+    decode_finalize_threads: int,
+    decode_finalize_ctas: int,
 ) -> None:
     return None
 
@@ -5974,6 +6102,8 @@ def run_mhc_finalize_gram(
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
     active_source_splits: int = 0,
+    decode_finalize_threads: int | None = None,
+    decode_finalize_ctas: int | None = None,
 ) -> None:
     # When norm_weight is None the kernel ignores it (fuse_norm=False), but it
     # still needs a valid tensor arg. Do NOT alias `y` here: `y` is a mutated arg
@@ -5984,6 +6114,25 @@ def run_mhc_finalize_gram(
     norm_weight_for_kernel = (
         norm_weight if norm_weight is not None else torch.empty_like(y)
     )
+    if compact_partials:
+        decode_finalize_threads, decode_finalize_ctas = 0, 1
+    elif decode_finalize_threads is None:
+        decode_finalize_threads = _selected_mhc_decode_finalize_threads(
+            num_tokens=int(residual.shape[0]),
+            hidden_size=int(residual.shape[2]),
+        )
+        raw_finalize_ctas = os.environ.get("B12X_MHC_DECODE_FINALIZE_CTAS")
+        decode_finalize_ctas = (
+            int(raw_finalize_ctas)
+            if raw_finalize_ctas is not None
+            else 8
+            if decode_finalize_threads == 128 and int(residual.shape[0]) >= 10
+            else 1
+        )
+    elif decode_finalize_ctas is None:
+        raise ValueError(
+            "decode_finalize_ctas is required with decode_finalize_threads"
+        )
     torch.ops.b12x.mhc_finalize_gram_launch(
         residual,
         partials,
@@ -6001,6 +6150,8 @@ def run_mhc_finalize_gram(
         bool(compact_partials),
         int(compact_projection_splits),
         int(active_source_splits),
+        int(decode_finalize_threads),
+        int(decode_finalize_ctas),
     )
 
 
@@ -6230,6 +6381,22 @@ def _mhc_post_pre_launch_functional_op(
         device=residual.device,
     )
     if tokens != 0:
+        decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
+        raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
+        decode_bf16x2 = (
+            raw_bf16x2 != "0"
+            if raw_bf16x2 is not None
+            else tokens == 16
+            and hidden_size == _HIDDEN
+            and decode_source_splits > 0
+        )
+        decode_partials_per_cta = _selected_post_pre_partials_per_cta(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
         _run_mhc_post_pre_partial_launch(
             x=x,
             residual=residual,
@@ -6239,10 +6406,10 @@ def _mhc_post_pre_launch_functional_op(
             partials=partials,
             out=residual_out,
             compute_gram=fuse_norm,
-        )
-        decode_source_splits, _ = _selected_post_pre_decode_split_n(
-            num_tokens=tokens,
-            hidden_size=hidden_size,
+            decode_source_splits=decode_source_splits,
+            decode_tile_n=decode_tile_n,
+            decode_bf16x2=decode_bf16x2,
+            decode_partials_per_cta=decode_partials_per_cta,
         )
         _run_mhc_finalize_gram_launch(
             residual=residual_out,

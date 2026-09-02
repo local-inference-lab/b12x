@@ -264,3 +264,43 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
     assert component is not None
     assert component.lookup({"family": "a", "rows": 1}).config["backend"] == "left"
     assert component.lookup({"family": "a", "rows": 4}).config["backend"] == "right"
+
+
+class _MarginGenerator(DiscreteSweepGenerator):
+    def baseline_config(self, case, context):
+        del case, context
+        return {"backend": "left"}
+
+
+def test_baseline_margin_requires_a_material_win(tmp_path) -> None:
+    calls: list[str] = []
+    candidate_calls: list[str] = []
+    session_calls: list[str] = []
+    generator = _MarginGenerator(
+        component_id="test.margin",
+        query_schema_version=1,
+        config_schema_version=1,
+        query_fields=("family", "rows"),
+        range_fields=frozenset({"rows"}),
+        cases=_cases(),
+        benchmark_factory=_Factory(calls, candidate_calls, session_calls),
+        coverage={},
+        baseline_margin=0.6,
+    )
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+
+    result = generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    baseline_id = SweepCandidate.create({"backend": "left"}).candidate_id
+    assert result.evidence["winner_query_counts"] == {baseline_id: 2}
+    assert result.evidence["baseline_margin_retentions"] == 1
