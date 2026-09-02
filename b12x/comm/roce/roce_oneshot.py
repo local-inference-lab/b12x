@@ -1,4 +1,4 @@
-"""RoCE one-shot all-reduce runtime for multi-node tensor parallelism.
+"""RoCE one-shot all-reduce and all-gather runtime for multi-node tensor parallelism.
 
 Designed for DGX Spark clusters, whose integrated GPU can read pinned host
 memory in place and whose ConnectX-7 can RDMA-write into the same memory.
@@ -9,7 +9,8 @@ every peer's RDMA-written payload, and reduces in fixed rank order.
 Constraints of this first runtime:
 
 * one all-reduce in flight per runtime (single channel, one stream);
-* message sizes up to ``max_size`` bytes, a multiple of 16 bytes;
+* all-reduce messages up to ``max_size`` bytes and all-gather shards up to
+  ``max_gather_bytes``, both multiples of 16 bytes;
 * every rank of the exchange group must construct the runtime collectively.
 """
 
@@ -25,6 +26,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from . import _allgather_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher, is_launcher_prepared
 from ._proxy import Layout, Proxy
 
@@ -32,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 SUPPORTED_WORLD_SIZES = tuple(range(2, 17))
-DEFAULT_MAX_SIZE = 1024 * 1024
+DEFAULT_MAX_SIZE = 2 * 1024 * 1024
+DEFAULT_MAX_GATHER_BYTES = 16 * 1024 * 1024
 DEFAULT_THREADS = 512
 DEFAULT_BLOCKS = 8
 DEFAULT_GID_INDEX = 3
@@ -151,6 +154,7 @@ class RoceOneshotAllReduce:
         exchange_group: ProcessGroup,
         device: torch.device | int | str,
         max_size: int = DEFAULT_MAX_SIZE,
+        max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
         hca_names: Optional[Sequence[str]] = None,
         gid_index: Optional[int] = None,
         threads: int = DEFAULT_THREADS,
@@ -174,6 +178,7 @@ class RoceOneshotAllReduce:
         if int(blocks) < 1:
             raise ValueError("blocks must be positive")
         self.max_size = int(max_size)
+        self.max_gather_bytes = int(max_gather_bytes)
         self._threads = int(threads)
         self._blocks = int(blocks)
         self.gid_index = default_gid_index() if gid_index is None else int(gid_index)
@@ -183,7 +188,7 @@ class RoceOneshotAllReduce:
             raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
         self.hca_names = names[:2]
 
-        slot_bytes = _align_up(self.max_size, _SLOT_ALIGNMENT)
+        slot_bytes = _align_up(max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT)
         self._layout = Layout(self.world_size, slot_bytes)
         self._slot_bytes = slot_bytes
 
@@ -268,12 +273,18 @@ class RoceOneshotAllReduce:
         device: torch.device | int | str,
         max_size: int = DEFAULT_MAX_SIZE,
         eager_buffer_bytes: Optional[int] = None,
+        max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
         **_ignored: Any,
     ) -> "RoceOneshotAllReduce":
         """Mirror ``comm.pcie.AllReduce.from_exchange_group``; PCIe-only knobs are ignored."""
 
         capacity = max(int(max_size), int(eager_buffer_bytes or 0))
-        return cls(exchange_group=exchange_group, device=device, max_size=capacity)
+        return cls(
+            exchange_group=exchange_group,
+            device=device,
+            max_size=capacity,
+            max_gather_bytes=max_gather_bytes,
+        )
 
     @classmethod
     def from_process_group(
@@ -325,12 +336,23 @@ class RoceOneshotAllReduce:
             self.device.index,
         )
 
+    def _gather_launcher_key(self) -> tuple[object, ...]:
+        return (
+            self.world_size,
+            self.rank,
+            self._threads,
+            self._layout.slots,
+            self._layout.flag_stride,
+            self.device.index,
+        )
+
     def prepare(self, dtypes: Sequence[torch.dtype] = (torch.bfloat16,)) -> None:
-        """Compile launchers ahead of CUDA-graph capture."""
+        """Compile the all-reduce launchers for ``dtypes`` and the all-gather launcher."""
 
         with torch.cuda.device(self.device):
             for dtype in dtypes:
                 get_launcher(*self._launcher_key(dtype))
+            _allgather_cute.get_launcher(*self._gather_launcher_key())
 
     def prepare_graph_all_reduce(self, inp: torch.Tensor, *, stream: object = None) -> None:
         self.prepare((inp.dtype,))
@@ -398,6 +420,90 @@ class RoceOneshotAllReduce:
                 "(rank data is no longer trustworthy)"
             )
 
+    # -- all-gather ---------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_dim(inp: torch.Tensor, dim: int) -> int:
+        if dim < 0:
+            dim += inp.dim()
+        return dim
+
+    def should_all_gather(self, inp: torch.Tensor, dim: int = -1) -> bool:
+        """Eligible: contiguous CUDA tensor, concat along dim 0 or the last dim."""
+
+        if self._closed or self._proxy is None or not inp.is_cuda or inp.dim() == 0:
+            return False
+        if inp.device != self.device or not inp.is_contiguous():
+            return False
+        if inp.dtype not in SUPPORTED_DTYPES:
+            return False
+        dim = self._normalize_dim(inp, dim)
+        if dim not in (0, inp.dim() - 1):
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        if not (0 < nbytes <= self.max_gather_bytes) or nbytes % PACK_BYTES != 0:
+            return False
+        if dim == inp.dim() - 1 and (inp.shape[-1] * inp.element_size()) % PACK_BYTES != 0:
+            return False
+        return True
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        dim: int = -1,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+    ) -> torch.Tensor:
+        """Concatenate every rank's ``inp`` along ``dim`` (0 or the last dim).
+
+        The kernel writes the concatenated layout directly, so a last-dim
+        gather needs no reshape or copy afterwards.
+        """
+
+        if not self.should_all_gather(inp, dim):
+            raise ValueError("input is not eligible for the RoCE all-gather")
+        dim = self._normalize_dim(inp, dim)
+        shape = list(inp.shape)
+        shape[dim] *= self.world_size
+        if out is None:
+            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        elif list(out.shape) != shape or out.dtype != inp.dtype or not out.is_contiguous():
+            raise ValueError("out must be a contiguous tensor of the gathered shape")
+        nbytes = inp.numel() * inp.element_size()
+        shard_packs = nbytes // PACK_BYTES
+        if dim == 0:
+            row_packs = shard_packs
+        else:
+            row_packs = (inp.shape[-1] * inp.element_size()) // PACK_BYTES
+        key = self._gather_launcher_key()
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not _allgather_cute.is_launcher_prepared(*key):
+            raise RuntimeError(
+                "RoCE all-gather launcher must be prepared before CUDA graph capture"
+            )
+        launcher = _allgather_cute.get_launcher(*key)
+        context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        with torch.cuda.device(self.device), context:
+            launcher(
+                inp.data_ptr(),
+                out.data_ptr(),
+                shard_packs,
+                nbytes,
+                row_packs,
+                self._recv_base,
+                self._flag_base,
+                self._send_base,
+                self._ctrl_base,
+                self._slot_bytes,
+                self._epoch_address,
+                self.spin_limit,
+                self._blocks,
+            )
+        if not capturing:
+            self.check_health()
+        return out
+
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
         yield self
@@ -410,6 +516,7 @@ class RoceOneshotAllReduce:
             "rank": self.rank,
             "hcas": list(self.hca_names),
             "max_size": self.max_size,
+            "max_gather_bytes": self.max_gather_bytes,
             "slot_bytes": self._slot_bytes,
             "epoch": int(self._counters[0].item()),
             "error_seq": int(self._error_word.item()),
@@ -450,6 +557,7 @@ class _nullcontext:
 
 
 __all__ = [
+    "DEFAULT_MAX_GATHER_BYTES",
     "DEFAULT_MAX_SIZE",
     "SUPPORTED_DTYPES",
     "SUPPORTED_WORLD_SIZES",
