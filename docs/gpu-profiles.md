@@ -257,3 +257,7 @@ operands, not against the built-in plan, so a broken default launch cannot
 qualify itself. A case whose every candidate raises or fails the gate is skipped
 and listed under the component's `coverage.skipped_cases`; its query points
 inherit the neighbouring measured plans.
+
+Both GEMM components reduce with a 3% baseline margin: the built-in plan keeps
+a query point unless a measured candidate beats it by more than that, so the
+embedded profile only carries deliberate wins.

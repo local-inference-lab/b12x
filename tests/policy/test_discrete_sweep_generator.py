@@ -264,3 +264,54 @@ def test_discrete_sweep_reduces_scenarios_and_resumes(tmp_path) -> None:
     assert component is not None
     assert component.lookup({"family": "a", "rows": 1}).config["backend"] == "left"
     assert component.lookup({"family": "a", "rows": 4}).config["backend"] == "right"
+
+
+class _MarginGenerator(DiscreteSweepGenerator):
+    """Baseline is the ``left`` backend everywhere."""
+
+    def baseline_config(self, case, context):
+        del case, context
+        return {"backend": "left"}
+
+
+def test_baseline_margin_keeps_builtin_plan_unless_clearly_beaten(tmp_path) -> None:
+    """rows=4: right (15us) beats left (30us) by far -> switch; rows=1: left wins."""
+    calls, candidate_calls, session_calls = [], [], []
+
+    def build(margin):
+        return _MarginGenerator(
+            component_id="test.margin",
+            query_schema_version=1,
+            config_schema_version=1,
+            query_fields=("family", "rows"),
+            range_fields=frozenset({"rows"}),
+            cases=_cases(),
+            benchmark_factory=_Factory(calls, candidate_calls, session_calls),
+            coverage={"corpus_sha256": "synthetic"},
+            baseline_margin=margin,
+        )
+
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    result = build(0.03).generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+    winners = result.evidence["winner_query_counts"]
+    left = SweepCandidate.create({"backend": "left"}).candidate_id
+    right = SweepCandidate.create({"backend": "right"}).candidate_id
+    assert winners == {left: 1, right: 1}
+
+    # A margin wider than the rows=4 win (2x) pins every query to the baseline.
+    result = build(0.6).generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints-wide"),
+    )
+    assert result.evidence["winner_query_counts"] == {left: 2}

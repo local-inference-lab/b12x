@@ -544,6 +544,19 @@ _DENSE_SPLIT_K_RECIPES = frozenset({"mxfp8", "block_fp8"})
 _DENSE_SWAP_RECIPES = frozenset({"mxfp8"})
 
 
+# A profile plan must beat the built-in plan by this fraction to replace it.
+_GEMM_BASELINE_MARGIN = 0.03
+
+
+def _device_identity(context):
+    """Identity the built-in heuristics key on (SM count decides the Spark rules)."""
+    from b12x.policy import PolicyContext, PolicyMode
+
+    return PolicyContext.for_device(
+        context.device, mode=PolicyMode.HEURISTIC_ONLY
+    ).device
+
+
 def _env_filter(name: str) -> tuple[str, ...] | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -1134,7 +1147,20 @@ class DenseLinearGenerator(DiscreteSweepGenerator):
             coverage={"corpus": "gemm_corpus.MODEL_LINEARS"},
             candidate_contract_version=1,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
+            baseline_margin=_GEMM_BASELINE_MARGIN,
         )
+
+    def baseline_config(self, case, context):
+        from b12x.gemm.dense_linear._policy import DenseLinearQuery, _heuristic
+
+        query = DenseLinearQuery(
+            recipe=str(case.query["recipe"]),
+            in_features=int(case.query["in_features"]),
+            out_features=int(case.query["out_features"]),
+            max_tokens=int(case.query["max_tokens"]),
+            output_dtype=str(case.query["output_dtype"]),
+        )
+        return _heuristic(query, _device_identity(context)).to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -1354,7 +1380,21 @@ class WoProjectionGenerator(DiscreteSweepGenerator):
             coverage={"corpus": "gemm_corpus.wo_projection_geometries"},
             candidate_contract_version=1,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
+            baseline_margin=_GEMM_BASELINE_MARGIN,
         )
+
+    def baseline_config(self, case, context):
+        from b12x.gemm.wo_projection._policy import WoProjectionQuery, _heuristic
+
+        query = WoProjectionQuery(
+            dtype=str(case.query["dtype"]),
+            max_tokens=int(case.query["max_tokens"]),
+            groups=int(case.query["groups"]),
+            group_width=int(case.query["group_width"]),
+            rank=int(case.query["rank"]),
+            hidden=int(case.query["hidden"]),
+        )
+        return _heuristic(query, _device_identity(context)).to_dict()
 
 
 __all__ = [
