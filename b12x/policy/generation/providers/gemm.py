@@ -544,10 +544,6 @@ _DENSE_SPLIT_K_RECIPES = frozenset({"mxfp8", "block_fp8"})
 _DENSE_SWAP_RECIPES = frozenset({"mxfp8"})
 
 
-# A profile plan must beat the built-in plan by this fraction to replace it.
-_GEMM_BASELINE_MARGIN = 0.03
-
-
 def _device_identity(context):
     """Identity the built-in heuristics key on (SM count decides the Spark rules)."""
     from b12x.policy import DeviceIdentity, PolicyContext, PolicyMode
@@ -1471,6 +1467,145 @@ def _wo_projection_candidate_configs(max_tokens: int) -> tuple[dict[str, object]
     return tuple(configs)
 
 
+class _WoLayerContext:
+    """Generic transformer layers around the WO-A/WO-B chain under test.
+
+    Each layer owns its own WO weights, scratch and attention-output buffer.
+    An MXFP8 neighbour produces the attention output (H -> groups*group_width),
+    the chain under test projects it back to ``hidden``, and a square
+    neighbour plus residual/RMSNorm close the layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        make_case,
+        wo_projection,
+        caps,
+        case_kwargs: dict,
+        inv_rope: bool,
+        device,
+        generator,
+        seed: int,
+        layers: int = _CONTEXT_LAYERS,
+    ) -> None:
+        import torch
+
+        from b12x.gemm import dense_linear
+        from b12x.policy import PolicyContext, PolicyMode
+
+        self.layers = int(layers)
+        self.device = device
+        self.inv_rope = inv_rope
+        self.caps = caps
+        self.wo_projection = wo_projection
+        self.tokens = int(caps.max_tokens)
+        self.hidden = int(caps.hidden)
+        width = int(caps.groups) * int(caps.group_width)
+        self.data = [
+            make_case(seed=seed + 1 + layer, **case_kwargs)
+            for layer in range(self.layers)
+        ]
+        heuristic = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
+        reference_plan = wo_projection.plan(caps, policy=heuristic)
+        spec = reference_plan.scratch_specs()[0]
+        self.scratch = [
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for _ in range(self.layers)
+        ]
+        self._dense_linear = dense_linear
+
+        def filler(k: int, n: int):
+            operands = _DenseLinearOperands(
+                recipe="mxfp8",
+                in_features=k,
+                out_features=n,
+                device=device,
+                generator=generator,
+                with_reference=False,
+            )
+            plan_caps = dense_linear.Caps(
+                device=device,
+                recipe="mxfp8",
+                in_features=k,
+                out_features=n,
+                max_tokens=self.tokens,
+                output_dtype=torch.bfloat16,
+            )
+            return operands, dense_linear.plan(plan_caps, policy=heuristic)
+
+        self.fillers_in = [filler(self.hidden, width) for _ in range(self.layers)]
+        self.fillers_out = [
+            filler(self.hidden, self.hidden) for _ in range(self.layers)
+        ]
+        self.norm_weight = torch.ones(self.hidden, dtype=torch.bfloat16, device=device)
+        self.hidden_state = torch.randn(
+            (self.tokens, self.hidden),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        self._bindings: dict[tuple[int, int], object] = {}
+
+    def _binding(self, plan, layer: int):
+        key = (plan.config, layer)
+        binding = self._bindings.get(key)
+        if binding is None:
+            data = self.data[layer]
+            if self.inv_rope:
+                binding = self.wo_projection.bind_inv_rope(
+                    plan,
+                    scratch=self.scratch[layer],
+                    o=data["o"],
+                    positions=data["positions"],
+                    cos_sin_cache=data["cos_sin_cache"],
+                    weights=data["weights"],
+                    heads_per_group=int(data["heads_per_group"]),
+                    nope_dim=int(self.caps_nope_dim),
+                    rope_dim=int(self.caps_rope_dim),
+                    expected_m=self.tokens,
+                )
+            else:
+                binding = self.wo_projection.bind(
+                    plan,
+                    scratch=self.scratch[layer],
+                    source_tgd=data["x_tgd"],
+                    weights=data["weights"],
+                    expected_m=self.tokens,
+                )
+            self._bindings[key] = binding
+        return binding
+
+    def run(self, plan):
+        import torch
+
+        tokens = self.tokens
+        h = self.hidden_state
+        for layer in range(self.layers):
+            f_in, plan_in = self.fillers_in[layer]
+            a = self._dense_linear.mm(h, f_in.packed, plan=plan_in, expected_m=tokens)
+            data = self.data[layer]
+            target = data["o"] if self.inv_rope else data["x_tgd"]
+            # The attention kernel would write this buffer right before WO.
+            target.view(tokens, -1).copy_(
+                a.view(tokens, -1)[:, : target.numel() // tokens]
+            )
+            out = self._binding(plan, layer).run()
+            f_out, plan_out = self.fillers_out[layer]
+            b = self._dense_linear.mm(
+                out.reshape(tokens, self.hidden),
+                f_out.packed,
+                plan=plan_out,
+                expected_m=tokens,
+            )
+            residual = h + b
+            variance = residual.float().pow(2).mean(dim=-1, keepdim=True)
+            h = (residual.float() * torch.rsqrt(variance + 1e-6)).to(torch.bfloat16) * (
+                self.norm_weight
+            )
+        return h
+
+
 class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
     def __init__(self, context, cases: tuple[SweepCase, ...]) -> None:
         self._context = context
@@ -1575,6 +1710,29 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
             )
             torch.cuda.synchronize(device)
             flush = _l2_flush_fn(device, enabled=settings.cold_l2)
+            case_seed = settings.seed + int(case.case_id[-8:], 16) % 1_000_003
+            layers = _WoLayerContext(
+                make_case=make_case,
+                wo_projection=wo_projection,
+                caps=caps,
+                case_kwargs=dict(
+                    tokens=tokens,
+                    groups=groups,
+                    group_width=group_width,
+                    rank=rank,
+                    hidden=hidden,
+                    inv_rope=inv_rope,
+                    context_length=max(4096, tokens),
+                    nope_dim=nope_dim,
+                    rope_dim=rope_dim,
+                ),
+                inv_rope=inv_rope,
+                device=device,
+                generator=torch.Generator(device=device).manual_seed(case_seed + 7919),
+                seed=case_seed,
+            )
+            layers.caps_nope_dim = nope_dim
+            layers.caps_rope_dim = rope_dim
             measurements = []
             for candidate in candidates:
                 try:
@@ -1582,7 +1740,7 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                     policy = base_policy.with_override(WO_PROJECTION, config)
                     plan = wo_projection.plan(caps, policy=policy)
                     binding = bind(plan)
-                    latency, correct, metrics = _graph_race(
+                    isolated, correct, metrics = _graph_race(
                         run=binding.run,
                         output_of=lambda out: out,
                         baseline=baseline,
@@ -1590,6 +1748,25 @@ class _WoProjectionSession(AbstractContextManager["_WoProjectionSession"]):
                         device=device,
                         flush=flush,
                     )
+                    latency = isolated
+                    if correct:
+                        latency, finite, repetitions = _context_race(
+                            context=layers,
+                            plan=plan,
+                            settings=settings,
+                            device=device,
+                            flush=flush,
+                        )
+                        correct = finite
+                        metrics = dict(metrics)
+                        metrics.update(
+                            {
+                                "isolated_us": isolated,
+                                "context_layers": layers.layers,
+                                "context_hidden": layers.hidden,
+                                "context_repetitions": repetitions,
+                            }
+                        )
                     measurements.append(
                         SweepMeasurement(
                             candidate=candidate,
@@ -1648,9 +1825,9 @@ class WoProjectionGenerator(DiscreteSweepGenerator):
             cases=wo_projection_cases() if cases is None else cases,
             benchmark_factory=_WoProjectionFactory(),
             coverage={"corpus": "gemm_corpus.wo_projection_geometries"},
-            candidate_contract_version=1,
+            candidate_contract_version=2,
             nearest_range_bounds={"max_tokens": DENSE_MAX_TOKENS_BOUNDS},
-            baseline_margin=_GEMM_BASELINE_MARGIN,
+            baseline_margin=_CONTEXT_MARGIN,
         )
 
     def baseline_config(self, case, context):
