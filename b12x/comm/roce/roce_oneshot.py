@@ -211,9 +211,10 @@ class RoceOneshotAllReduce:
         self._flag_base = host_ptr + self._layout.flag_off
         self._send_base = host_ptr + self._layout.send_off
         self._ctrl_base = host_ptr + self._layout.ctrl_off
-        # ctrl record: seq, nbytes, error seq, missing peer (kernel-written)
+        # ctrl record (kernel-written): seq, nbytes, error seq, missing peer,
+        # nbytes per slot (the proxy uses these when it has to catch up)
         self._ctrl_words = self._region[
-            self._layout.ctrl_off : self._layout.ctrl_off + 16
+            self._layout.ctrl_off : self._layout.ctrl_off + 24
         ].view(torch.int32)
         self._error_word = self._ctrl_words[2:3]
         self._epoch_address = self._counters.data_ptr()
@@ -313,6 +314,9 @@ class RoceOneshotAllReduce:
             return False
         if inp.device != self.device or not inp.is_contiguous():
             return False
+        # The kernel moves 16-byte packs, so the buffer must be pack-aligned.
+        if inp.data_ptr() % PACK_BYTES != 0:
+            return False
         nbytes = inp.numel() * inp.element_size()
         return 0 < nbytes <= self.max_size and nbytes % PACK_BYTES == 0
 
@@ -373,8 +377,13 @@ class RoceOneshotAllReduce:
             raise ValueError("input is not eligible for the RoCE one-shot all-reduce")
         if out is None:
             out = torch.empty_like(inp)
-        elif out.shape != inp.shape or out.dtype != inp.dtype or not out.is_contiguous():
-            raise ValueError("out must be a contiguous tensor matching the input")
+        elif (
+            out.shape != inp.shape
+            or out.dtype != inp.dtype
+            or not out.is_contiguous()
+            or out.data_ptr() % PACK_BYTES != 0
+        ):
+            raise ValueError("out must be a contiguous, 16-byte-aligned tensor matching the input")
         key = self._launcher_key(inp.dtype)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and not is_launcher_prepared(*key):
@@ -567,9 +576,19 @@ class RoceOneshotAllReduce:
         return info
 
     def close(self) -> None:
+        """Stop the proxy and release the transport.
+
+        Waits for the device first so no in-flight kernel still reads the
+        pinned region or rings the doorbell after the proxy is gone.  Peers
+        that write to this rank afterwards see a remote-access completion
+        error and raise on their side, which is the intended shutdown signal.
+        """
+
         if self._closed:
             return
         self._closed = True
+        with contextlib.suppress(Exception):
+            torch.cuda.synchronize(self.device)
         if self._proxy is not None:
             self._proxy.close()
             self._proxy = None
