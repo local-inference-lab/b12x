@@ -22,9 +22,10 @@ def prepare_rank_sliced_trellis_weights(
     """Validate and wrap one uniform-rate, rank-sliced Trellis layer.
 
     The checkpoint tensors already use B12X's native projection-major tile
-    layout, so preparation transfers ownership without copying model-sized
-    payloads. This adapter deliberately accepts only the uniform-rate contract;
-    mixed-rate checkpoints use the canonical atom-container path instead.
+    layout, so preparation reuses their storage through flat views instead of
+    copying model-sized payloads. This adapter deliberately accepts only the
+    uniform-rate contract; mixed-rate checkpoints use the canonical
+    atom-container path instead.
     """
 
     if not isinstance(plan, MoEWeightPreparationPlan):

@@ -10,15 +10,15 @@ from b12x.moe import fused_moe
 from b12x.moe.fused_moe import rank_sliced_trellis
 
 
-def _plan():
+def _plan(*, hidden_size: int = 128, intermediate_size: int = 256):
     return fused_moe.plan_weights(
         quant_modes="w4a16",
         source_format="b12x_trellis",
         activation="silu",
         params_dtype=torch.bfloat16,
         num_experts=4,
-        hidden_size=128,
-        intermediate_size=256,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         w13_layout="w13",
         w4a16_layout="trellis_native",
         trellis_bits=3,
@@ -76,6 +76,62 @@ def test_rank_sliced_trellis_adapter_is_public_and_transfers_prepared_storage(
             "tile_config": (64, 256, 64, 256),
         }
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_rank_sliced_trellis_adapter_reuses_real_prepared_storage() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = 4
+    hidden = intermediate = 256
+    bits = 3
+    plan = _plan(hidden_size=hidden, intermediate_size=intermediate)
+
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.ones(shape, dtype=torch.float16, device=device)
+
+    result = fused_moe.prepare_rank_sliced_trellis_weights(
+        plan=plan,
+        w13=w13,
+        w2=w2,
+        gate_suh=scales((experts, hidden)),
+        up_suh=scales((experts, hidden)),
+        intermediate_rotations=scales((experts, 3 * intermediate)),
+        down_svh=scales((experts, hidden)),
+    )
+
+    assert result.w1_fp4.data_ptr() == w13.data_ptr()
+    assert result.w2_fp4.data_ptr() == w2.data_ptr()
+    assert result.w1_fp4.dtype == torch.int32
+    assert result.w2_fp4.dtype == torch.int32
+    assert result.w1_fp4.numel() == w13.numel() // 2
+    assert result.w2_fp4.numel() == w2.numel() // 2
+    assert result.representation is not None
+    assert result.representation.layout.value == "trellis_native"
+    assert result.representation.value.weight_layout == "trellis_t256"
+    assert result.representation.value.w13_layout == "trellis_t256_proj"
+    for value in (
+        result.a1_gscale,
+        result.w1_alphas,
+        result.a2_gscale,
+        result.w2_alphas,
+    ):
+        assert torch.isfinite(value).all()
+        assert torch.count_nonzero(value) == value.numel()
 
 
 def test_rank_sliced_trellis_adapter_rejects_nonuniform_rate_plan() -> None:
