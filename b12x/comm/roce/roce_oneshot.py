@@ -1,4 +1,4 @@
-"""RoCE one-shot all-reduce and all-gather runtime for multi-node tensor parallelism.
+"""RoCEnante: one-shot RoCE all-reduce and all-gather runtime for multi-node tensor parallelism.
 
 Designed for DGX Spark clusters, whose integrated GPU can read pinned host
 memory in place and whose ConnectX-7 can RDMA-write into the same memory.
@@ -146,7 +146,7 @@ def _exchange(local: object, group: ProcessGroup) -> list[object]:
 class RoceOneshotAllReduce:
     """One-shot RDMA all-reduce over the DGX Spark 200 GbE fabric."""
 
-    algorithm = "roce_oneshot"
+    algorithm = "rocenante"
 
     def __init__(
         self,
@@ -249,7 +249,7 @@ class RoceOneshotAllReduce:
             raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
         if self.rank == 0:
             logger.info(
-                "RoCE one-shot all-reduce ready: world=%d hcas=%s gid_index=%d max_size=%d",
+                "RoCEnante ready: world=%d hcas=%s gid_index=%d max_size=%d",
                 self.world_size,
                 ",".join(self.hca_names),
                 self.gid_index,
