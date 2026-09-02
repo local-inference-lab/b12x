@@ -268,3 +268,10 @@ in the measurement metrics as evidence only. Both GEMM components reduce with a
 baseline margin (1% of the stack time for dense, 3% of the chain time for WO):
 the built-in plan keeps a query point unless a measured candidate beats it by
 more than that, so the embedded profile only carries deliberate wins.
+
+A candidate kernel that poisons the CUDA context (illegal address, launch
+failure) ends the generating process. The work directory keeps an in-flight
+marker for the candidate being raced; rerunning the same command promotes a
+leftover marker to `crashed-candidates.json`, skips that candidate with an
+explicit error, and resumes from the checkpoints, so a retry loop around the
+command finishes the profile without re-racing the crash.
