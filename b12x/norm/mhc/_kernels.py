@@ -45,6 +45,8 @@ from b12x.norm.mhc._policy import MhcConfig
 _MHC_MULT = 4
 _TOKENS = 1
 _HIDDEN = 4096
+# SM120 decode graphs use the four-way source split from this many padded rows.
+_SM120_DECODE_SPLIT_MIN_TOKENS = 32
 _TOTAL_K = _MHC_MULT * _HIDDEN
 _SPLIT_K = 64
 _SOURCE_TILE_H = 128
@@ -451,12 +453,29 @@ def _selected_post_pre_decode_split_n(
     else:
         if compute_capability is None and torch.cuda.is_available():
             compute_capability = tuple(torch.cuda.get_device_capability())
-        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
+        if int(hidden_size) != _HIDDEN:
             return 0, 0
-        if int(num_tokens) >= 10:
-            splits, tile_n = 8, 6
-        elif int(num_tokens) >= 8:
-            splits, tile_n = 4, 6
+        if compute_capability == (12, 1):
+            if int(num_tokens) >= 10:
+                splits, tile_n = 8, 6
+            elif int(num_tokens) >= 8:
+                splits, tile_n = 4, 6
+            else:
+                return 0, 0
+        elif compute_capability == (12, 0):
+            # RTX PRO 6000 Blackwell (SM120), measured 2026-09-01 on GLM-5.3
+            # decode graphs (hidden size 4096): the four-way source split is
+            # 19-24% faster from 32 padded rows up (32 rows 20.2 -> 16.4 us,
+            # 64 rows 35.1 -> 26.7, 96 rows 43.0 -> 33.3, 128 rows 44.8 ->
+            # 41.0) while at 8-16 rows the unsplit kernel is faster in-graph.
+            # The residual update is bitwise identical to the unsplit kernel;
+            # the fn partials are reduced over four source splits, so the
+            # gate/mix values differ by fp32 rounding (at most a few ulp) and
+            # y by at most one bf16 ulp.
+            if int(num_tokens) >= _SM120_DECODE_SPLIT_MIN_TOKENS:
+                splits, tile_n = 4, 6
+            else:
+                return 0, 0
         else:
             return 0, 0
     if splits <= 0 or splits > _SOURCE_TILES or int(hidden_size) % splits != 0:

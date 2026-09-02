@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -875,6 +876,42 @@ def _b12x_mhc_pre_impl(
     )
 
 
+
+_DEFAULT_MHC_PREFILL_MIN_TOKENS = 96
+_SM120_MHC_PREFILL_MIN_TOKENS = 192
+
+
+def _mhc_prefill_min_tokens_for_capability(
+    compute_capability: tuple[int, int] | None,
+) -> int:
+    """Padded row count from which the prefill mHC kernels replace the decode
+    partial kernel when no override is configured.
+
+    On SM120 (RTX PRO 6000 Blackwell) the four-way decode source split is
+    faster than the block-M prefill kernel up to 128 padded rows (96 rows:
+    33.6 vs 43.0 us; 128 rows: 41 vs 45 us) and slower from 192 rows
+    (57 vs 47 us, measured 2026-09-01 on GLM-5.3 hidden size 4096), so the
+    crossover moves from 96 to 192 rows there.
+    """
+    if compute_capability == (12, 0):
+        return _SM120_MHC_PREFILL_MIN_TOKENS
+    return _DEFAULT_MHC_PREFILL_MIN_TOKENS
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_prefill_min_tokens(device_index: int) -> int:
+    return _mhc_prefill_min_tokens_for_capability(
+        tuple(torch.cuda.get_device_capability(device_index))
+    )
+
+
+def _default_mhc_prefill_min_tokens(device: torch.device) -> int:
+    if device.type != "cuda":
+        return _DEFAULT_MHC_PREFILL_MIN_TOKENS
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _cuda_prefill_min_tokens(int(index))
+
+
 def _b12x_mhc_post_pre_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1161,7 +1198,10 @@ def _b12x_mhc_post_pre_impl(
             )
 
         prefill_min_tokens = int(
-            os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
+            os.environ.get(
+                "B12X_MHC_PREFILL_MIN_TOKENS",
+                str(_default_mhc_prefill_min_tokens(residual.device)),
+            )
         )
         if planned_config is not None:
             tf32_enabled = planned_config.backend == "tf32_tma"
