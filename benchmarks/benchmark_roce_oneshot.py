@@ -84,7 +84,8 @@ def main() -> None:
     ap.add_argument("--warmups", type=int, default=50)
     ap.add_argument("--samples", type=int, default=300)
     ap.add_argument("--graph-ops", type=int, default=20)
-    ap.add_argument("--max-size", type=int, default=1 << 20)
+    ap.add_argument("--max-size", type=int, default=2 << 20)
+    ap.add_argument("--gather-rows", default="6,16,96", help="rows of a [rows, 38720] bf16 logits shard to all-gather")
     ap.add_argument("--output", default="")
     args = ap.parse_args()
 
@@ -97,7 +98,7 @@ def main() -> None:
     from b12x.comm import roce
 
     runtime = roce.AllReduce.from_exchange_group(
-        exchange_group=dist.group.WORLD, device=device, max_size=args.max_size
+        exchange_group=dist.group.WORLD, device=device, max_size=args.max_size, max_gather_bytes=16 << 20
     )
     runtime.prepare((dtype,))
     sizes = [int(s) for s in args.sizes.split(",") if int(s) <= args.max_size]
@@ -145,6 +146,30 @@ def main() -> None:
                 f"  roce graph {row['roce_graph_us']:>8.1f} us  rel_err {row['rel_err']:.2e}",
                 flush=True,
             )
+    # all-gather of a logits shard [rows, 38720] along the last dim vs NCCL all_gather_into_tensor + copy
+    gather_rows = []
+    for rows in (int(r) for r in args.gather_rows.split(",")):
+        shard = torch.randn(rows, 38720, dtype=dtype, device=device)
+        if not runtime.should_all_gather(shard, -1):
+            continue
+        parts = [torch.empty_like(shard) for _ in range(world)]
+        dist.all_gather(parts, shard)
+        expected = torch.cat(parts, dim=-1)
+        got = runtime.all_gather(shard, dim=-1)
+        torch.cuda.synchronize()
+        exact = bool(torch.equal(got, expected))
+        stacked = torch.empty((world * rows, 38720), dtype=dtype, device=device)
+        def nccl_gather():
+            dist.all_gather_into_tensor(stacked, shard)
+            return stacked.reshape(world, rows, 38720).movedim(0, 1).reshape(rows, world * 38720)
+        nccl = _time_eager(nccl_gather, args.warmups, args.samples)
+        eager = _time_eager(lambda: runtime.all_gather(shard, dim=-1), args.warmups, args.samples)
+        graph = _time_graph(lambda: runtime.all_gather(shard, dim=-1, out=got), args.warmups, args.samples, args.graph_ops)
+        row = {"rows": rows, "shard_bytes": shard.numel() * shard.element_size(), "nccl_us": round(_median_of_max(nccl), 1),
+               "roce_eager_us": round(_median_of_max(eager), 1), "roce_graph_us": round(_median_of_max(graph), 1), "exact": exact}
+        gather_rows.append(row)
+        if rank == 0:
+            print(f"all-gather [{rows}, 38720]  nccl+copy {row['nccl_us']:>8.1f} us  roce eager {row['roce_eager_us']:>8.1f} us  roce graph {row['roce_graph_us']:>8.1f} us  exact={exact}", flush=True)
     stats = runtime.stats()
     if rank == 0:
         doc = {
@@ -156,6 +181,7 @@ def main() -> None:
             "hostname": os.uname().nodename,
             "runtime": stats,
             "rows": rows,
+            "all_gather": gather_rows,
         }
         if args.output:
             with open(args.output, "w") as f:

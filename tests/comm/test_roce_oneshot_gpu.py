@@ -39,7 +39,7 @@ def runtime():
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     rt = roce.AllReduce.from_exchange_group(
-        exchange_group=dist.group.WORLD, device=device, max_size=1 << 20
+        exchange_group=dist.group.WORLD, device=device, max_size=1 << 20, max_gather_bytes=4 << 20
     )
     rt.prepare((torch.bfloat16, torch.float32, torch.float16))
     yield rt
@@ -123,3 +123,70 @@ def test_cuda_graph_replay(runtime):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(static_out, expected, rtol=2e-2, atol=2e-2 * world**3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,dim",
+    [((6, 38720), -1), ((6, 38720), 1), ((16, 4096), 0), ((4096,), 0), ((2, 3, 1024), -1), ((96, 8192), 1)],
+)
+def test_all_gather_matches_torch(runtime, dtype, shape, dim):
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    for trial in range(3):
+        torch.manual_seed(500 * trial + rank)
+        inp = torch.randn(*shape, dtype=dtype, device=runtime.device)
+        assert runtime.should_all_gather(inp, dim)
+        gathered = [torch.empty_like(inp) for _ in range(world)]
+        dist.all_gather(gathered, inp)
+        expected = torch.cat(gathered, dim=dim)
+        out = runtime.all_gather(inp, dim=dim)
+        torch.cuda.synchronize()
+        assert out.shape == expected.shape
+        assert torch.equal(out, expected)
+
+
+def test_all_gather_rejects_ineligible(runtime):
+    x = torch.zeros(4, 8, 8, dtype=torch.bfloat16, device=runtime.device)
+    assert not runtime.should_all_gather(x, 1)  # middle dim
+    odd = torch.zeros(6, 5, dtype=torch.bfloat16, device=runtime.device)
+    assert not runtime.should_all_gather(odd, -1)  # rows not 16-byte multiples
+    huge = torch.zeros((runtime.max_gather_bytes // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
+    assert not runtime.should_all_gather(huge, 0)
+
+
+def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    x = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)
+    h = torch.zeros(6 * 4096, dtype=torch.bfloat16, device=runtime.device)
+    gathered = torch.empty(6, 38720 * world, dtype=torch.bfloat16, device=runtime.device)
+    reduced = torch.empty_like(h)
+    stream = torch.cuda.Stream(device=runtime.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runtime.all_reduce(h, out=reduced)
+        runtime.all_gather(x, dim=-1, out=gathered)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        runtime.all_reduce(h, out=reduced)
+        runtime.all_gather(x, dim=-1, out=gathered)
+        runtime.all_reduce(h, out=reduced)
+    torch.cuda.synchronize()
+    dist.barrier()
+    for replay in range(4):
+        torch.manual_seed(11 * replay + rank)
+        x.copy_(torch.randn_like(x))
+        h.copy_(torch.randn_like(h))
+        parts = [torch.empty_like(x) for _ in range(world)]
+        dist.all_gather(parts, x)
+        expected_gather = torch.cat(parts, dim=-1)
+        expected_reduce = h.clone()
+        dist.all_reduce(expected_reduce)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(gathered, expected_gather)
+        torch.testing.assert_close(reduced, expected_reduce, rtol=2e-2, atol=2e-2 * world)
