@@ -710,6 +710,10 @@ _MG_PREFILL_SERVING_CASES = (
     _MGPrefillServingCase("dsv4", "fp8", 32, 512, 2),
     _MGPrefillServingCase("dsv4-dual", "fp8", 16, 512, 1),
     _MGPrefillServingCase("dsv4-dual", "fp8", 32, 512, 2),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 1024, 1),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 1024, 2),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 2048, 1),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 2048, 2),
     _MGPrefillServingCase("dsv4", "bf16", 16, 128, 1),
     _MGPrefillServingCase("dsv4", "bf16", 32, 128, 2),
     _MGPrefillServingCase("glm", "fp8", 16, 512, 1),
@@ -794,7 +798,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
 ) -> None:
     """Validate each typed-SMEM MG group-count/compute arm under live replay.
 
-    These ten nodes compile the single-cache and dual-cache production
+    These fourteen nodes compile the single-cache and dual-cache production
     specializations: DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each
     with ``mg_n_hg`` 1 and 2. DSV4 BF16 uses two 64-candidate tiles; every
     512-wide main section uses eight.
