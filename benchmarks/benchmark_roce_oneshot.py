@@ -40,11 +40,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def _git(*args: str) -> str | None:
     """Run ``git`` in the repository; ``None`` when git is unavailable."""
     try:
-        return subprocess.run(
+        done = subprocess.run(
             ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, check=False
-        ).stdout.strip()
+        )
     except (OSError, subprocess.SubprocessError):
         return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.strip()
 
 
 def _source_state() -> dict[str, object]:
@@ -184,7 +187,11 @@ def _time_arms(arms: dict[str, Arm], warmups: int, samples: int, blocks: int) ->
     so a graph that replays several collectives reports per-collective time.
     Returns the raw samples per arm and the executed order.
     """
-    per_block = max(1, samples // blocks)
+    if samples < 1 or blocks < 1:
+        raise ValueError("samples and blocks must be positive")
+    blocks = min(blocks, samples)
+    # exactly ``samples`` per arm: the remainder goes one each to the first blocks
+    per_block = [samples // blocks + (1 if b < samples % blocks else 0) for b in range(blocks)]
     raw: dict[str, list[float]] = {name: [] for name in arms}
     order: list[str] = []
     names = list(arms)
@@ -192,8 +199,9 @@ def _time_arms(arms: dict[str, Arm], warmups: int, samples: int, blocks: int) ->
         for name in names if block % 2 == 0 else names[::-1]:
             fn, prep, ops = arms[name]
             block_warmups = warmups if block == 0 else min(warmups, 5)
-            raw[name].extend(v / ops for v in _time_eager(fn, block_warmups, per_block, prep))
+            raw[name].extend(v / ops for v in _time_eager(fn, block_warmups, per_block[block], prep))
             order.append(name)
+    assert all(len(v) == samples for v in raw.values())
     return raw, order
 
 
