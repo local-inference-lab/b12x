@@ -172,11 +172,18 @@ def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=4e-5)
 
 
-def test_glm53_mhc_rms_eps_match_reference() -> None:
+@pytest.mark.parametrize(
+    ("rms_eps", "input_scale"),
+    [(1e-20, 1e-11), (1e-5, 1.0)],
+    ids=["deepseek-v4-vision", "glm53"],
+)
+def test_mhc_supported_rms_eps_match_reference(
+    rms_eps: float,
+    input_scale: float,
+) -> None:
     device = require_b12x()
     tokens = 3
     hidden_size = 4096
-    rms_eps = 1e-5
     hc_eps = 1e-6
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -184,6 +191,8 @@ def test_glm53_mhc_rms_eps_match_reference() -> None:
         seed=53_001,
         device=device,
     )
+    residual.mul_(input_scale)
+    x.mul_(input_scale)
     fn_broadcast = fn.view(24, 4, hidden_size).sum(dim=1).contiguous()
     norm_gen = torch.Generator(device="cpu")
     norm_gen.manual_seed(53_002)
@@ -1067,3 +1076,74 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=4e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
+
+
+def test_deepseek_v4_vision_mhc_graph_replay() -> None:
+    device = require_b12x()
+    tokens = 2
+    hidden_size = 4096
+    rms_eps = 1e-20
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        seed=91_461,
+        device=device,
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual,
+        fn,
+        scale,
+        bias,
+        rms_eps=rms_eps,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    norm_weight = torch.ones(
+        (hidden_size,), dtype=torch.bfloat16, device=device
+    )
+    binding = _make_mhc_binding(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        device=device,
+    )
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return b12x_mhc_post_pre(
+            x,
+            residual,
+            prev_post.contiguous(),
+            prev_comb.contiguous(),
+            fn,
+            scale,
+            bias,
+            rms_eps=rms_eps,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
+            binding=binding,
+            norm_weight=norm_weight,
+            norm_eps=rms_eps,
+        )
+
+    eager_outputs = run()
+    torch.cuda.synchronize(device)
+    eager_values = tuple(output.clone() for output in eager_outputs)
+    output_ptrs = tuple(output.data_ptr() for output in eager_outputs)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = run()
+    torch.cuda.synchronize(device)
+    capture_values = tuple(output.clone() for output in graph_outputs)
+    assert tuple(output.data_ptr() for output in graph_outputs) == output_ptrs
+
+    for output in graph_outputs:
+        output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert tuple(output.data_ptr() for output in graph_outputs) == output_ptrs
+    for eager, captured, replayed in zip(
+        eager_values, capture_values, graph_outputs, strict=True
+    ):
+        assert bool(torch.isfinite(replayed).all())
+        torch.testing.assert_close(captured, eager, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(replayed, eager, rtol=0.0, atol=0.0)
