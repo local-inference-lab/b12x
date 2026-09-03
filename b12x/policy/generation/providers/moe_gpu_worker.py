@@ -109,8 +109,8 @@ def _condition_benchmark_inputs(
     if geometry.recipe.quant_mode == "w4a8_mx":
         from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
 
-        # The profile chooses an execution kernel, not an activation
-        # quantizer. Values on the MXFP8 grid give BF16-input and A8-input
+        # W4A8 profile generation compares execution kernels, not activation
+        # quantizers. Values on the MXFP8 grid give BF16-input and A8-input
         # candidates the same logical operand before their timed region.
         return quant_dequant_mxfp8_torch(x)
     if not (

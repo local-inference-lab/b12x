@@ -133,11 +133,19 @@ def test_rtx_profile_uses_tiny_decode_for_deepseek_v4_flash_tp2() -> None:
     }
 
     for num_tokens in (1, 2, 3, 4):
-        hit = component.lookup({**query, "num_tokens": num_tokens})
+        hit = component.lookup(
+            {
+                **query,
+                "num_tokens": num_tokens,
+                "routed_rows": num_tokens * query["top_k"],
+            }
+        )
         assert hit is not None
         assert hit.config["backend"] == "micro"
 
-    cutover = component.lookup({**query, "num_tokens": 5})
+    cutover = component.lookup(
+        {**query, "num_tokens": 5, "routed_rows": 5 * query["top_k"]}
+    )
     assert cutover is not None
     assert cutover.config["backend"] == "dynamic"
     assert cutover.config["dynamic_route_mode"] == "direct"
