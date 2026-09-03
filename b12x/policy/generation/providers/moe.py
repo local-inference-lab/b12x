@@ -818,9 +818,13 @@ class MoeDecodeGenerator:
                 if item.passes(context.settings.minimum_cosine)
             ]
             if not valid:
-                raise RuntimeError(
-                    f"all MoE candidates failed coarse race {case.case_id}"
+                # A coarse case nobody passes says nothing about the ranking;
+                # the full stage and the reducer handle the kernel gap.
+                progress.advance(
+                    self.component_id,
+                    detail=f"coarse {case.case_id}: no passing candidate",
                 )
+                continue
             measurements_by_case.append(tuple(valid))
             progress.advance(
                 self.component_id,
@@ -954,6 +958,8 @@ class MoeDecodeGenerator:
         winner_counts: dict[str, int] = defaultdict(int)
         baseline_kept = 0
         baseline_missing = 0
+        no_robust_query_points: list[dict[str, object]] = []
+        unresolved_query_points: list[dict[str, object]] = []
         progress.start_stage(
             self.component_id,
             stage="route-robust reduction",
@@ -978,10 +984,28 @@ class MoeDecodeGenerator:
                 )
                 robust.append((score, measurements[0].candidate))
             if not robust:
-                case = grouped[0][0]
-                raise RuntimeError(
-                    f"no route-robust MoE candidate for {_query_dict(case)}"
+                # Nothing passed every route pattern (a kernel gap on this
+                # GPU): keep the runtime's built-in config for the query
+                # point instead of failing the component, and say so.
+                representative = grouped[0][0]
+                baseline = _baseline_config_for(representative, context)
+                if baseline is None:
+                    unresolved_query_points.append(_query_dict(representative))
+                else:
+                    fallback = MoeCandidate.create(baseline)
+                    records.append(
+                        DecisionRecord.create(
+                            query=_query_dict(representative),
+                            config=fallback.config,
+                        )
+                    )
+                    winner_counts[fallback.candidate_id] += 1
+                    no_robust_query_points.append(_query_dict(representative))
+                progress.advance(
+                    self.component_id,
+                    detail=f"no robust candidate {representative.case_id}",
                 )
+                continue
             best_score, winner = min(
                 robust, key=lambda item: (item[0], item[1].candidate_id)
             )
@@ -1063,6 +1087,8 @@ class MoeDecodeGenerator:
                 "baseline_margin": MOE_BASELINE_MARGIN,
                 "baseline_kept_query_points": baseline_kept,
                 "baseline_missing_query_points": baseline_missing,
+                "no_robust_query_points": no_robust_query_points,
+                "unresolved_query_points": unresolved_query_points,
                 "route_measurements": len(full_results),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (

@@ -1984,3 +1984,74 @@ def test_reduction_keeps_the_builtin_config_inside_the_margin(
     assert list(evidence["winner_query_counts"]) == [
         MoeCandidate.create(dynamic).candidate_id
     ]
+
+
+class _PatternSplitSession(_Session):
+    """At 1 token each route pattern passes a different lone candidate, so no
+    candidate is robust across both patterns although every case has a pass."""
+
+    def measure(self, case, candidates, *, correctness=False, stage=None):
+        measurements = super().measure(
+            case, candidates, correctness=correctness, stage=stage
+        )
+        if case.num_tokens != 1:
+            return measurements
+        keep = 0 if case.route_pattern == "hot" else 1
+        return tuple(
+            m
+            if index == keep
+            else MoeMeasurement(
+                candidate=m.candidate,
+                latency_us=None,
+                cosine=None,
+                error="graph replay correctness gate failed",
+            )
+            for index, m in enumerate(measurements)
+        )
+
+
+def test_query_point_without_a_route_robust_candidate_keeps_the_builtin_config(
+    tmp_path, monkeypatch
+) -> None:
+    """A kernel gap on one route pattern must not fail the component: the
+    query point records the runtime's built-in config and is listed in the
+    evidence; without a built-in config it is left unresolved."""
+    from b12x.policy.generation.providers import moe as moe_provider
+
+    dynamic = {
+        "backend": "dynamic",
+        "dynamic_route_mode": "grouped",
+        "dynamic_tile_m": 128,
+        "route_planner": "internal",
+        "max_active_clusters": None,
+        "w4a16_route_mode": None,
+    }
+    calls: list = []
+    generator = _generator(calls, token_counts=(1, 4), top_ks=(2,))
+    generator._benchmark_factory = lambda geometry, context: _PatternSplitSession(
+        calls, quant_mode=geometry.recipe.quant_mode
+    )
+    monkeypatch.setattr(
+        moe_provider, "_baseline_config_for", lambda case, context: dynamic
+    )
+    result = generator.generate(
+        _context(tmp_path / "with-baseline"),
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "with-baseline" / "checkpoints"),
+    )
+    evidence = result.evidence
+    assert [q["num_tokens"] for q in evidence["no_robust_query_points"]] == [1]
+    assert evidence["unresolved_query_points"] == []
+    assert MoeCandidate.create(dynamic).candidate_id in evidence["winner_query_counts"]
+
+    monkeypatch.setattr(
+        moe_provider, "_baseline_config_for", lambda case, context: None
+    )
+    result = generator.generate(
+        _context(tmp_path / "no-baseline"),
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "no-baseline" / "checkpoints"),
+    )
+    evidence = result.evidence
+    assert evidence["no_robust_query_points"] == []
+    assert [q["num_tokens"] for q in evidence["unresolved_query_points"]] == [1]
