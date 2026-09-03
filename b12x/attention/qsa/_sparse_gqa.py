@@ -1,10 +1,11 @@
-"""CuTeDSL indexed sparse paged causal GQA for Qwen3.8 Flash Next.
+"""Indexed sparse paged causal GQA for Qwen3.8 Flash Next.
 
 This private stage reads BF16 or globally scaled FP8 E4M3 main-cache K/V at
-caller-selected logical token positions. It never writes either cache. The
-supported Qwen geometry always launches the CuTe split and merge kernels;
-every other geometry, layout, or device fails instead of selecting an alternate
-implementation.
+caller-selected logical token positions. It never writes either cache. Small
+batches use split CuTe kernels to expose enough parallel work. Large prefill
+batches use one Triton program per query-row and KV-head pair and write output
+directly, avoiding FP32 split tensors and a merge launch. Every unsupported
+geometry, layout, or device fails closed.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import math
 import torch
 
 from ._sparse_gqa_cute_config import (
+    MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
     is_candidate as _cute_is_candidate,
     is_qwen_geometry as _is_qwen_geometry,
 )
@@ -222,6 +224,22 @@ def launch_sparse_paged_gqa(
             f"head_dim={int(query.shape[2])}, page_size={int(key_cache.shape[1])}, "
             f"selection_width={int(selected_positions.shape[1])}, "
             f"block_n={int(block_n)}, splits={int(splits)}"
+        )
+    if rows > _MAX_SPLIT_ROWS:
+        from ._sparse_gqa_triton import launch_sparse_paged_gqa_prefill
+
+        return launch_sparse_paged_gqa_prefill(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            block_table=block_table,
+            request_ids=request_ids,
+            selected_positions=selected_positions,
+            query_positions=query_positions,
+            output=output,
+            softmax_scale=softmax_scale,
         )
     assert partial_output is not None and partial_lse is not None
     if not _cute_is_candidate(

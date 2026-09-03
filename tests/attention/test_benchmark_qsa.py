@@ -292,7 +292,7 @@ def test_benchmark_calls_only_the_public_qsa_lifecycle() -> None:
     )
 
 
-def test_sparse_gqa_has_no_triton_alternate() -> None:
+def test_sparse_gqa_implementation_modules_are_imported_lazily() -> None:
     repository = Path(benchmark_qsa.__file__).resolve().parents[1]
     source = textwrap.dedent(
         """
@@ -302,12 +302,15 @@ def test_sparse_gqa_has_no_triton_alternate() -> None:
         from b12x.attention.qsa import _sparse_gqa
 
         cute_module = "b12x.attention.qsa._sparse_gqa_cute"
+        triton_module = "b12x.attention.qsa._sparse_gqa_triton"
         assert cute_module not in sys.modules
+        assert triton_module not in sys.modules
         source = inspect.getsource(_sparse_gqa).lower()
-        assert "triton" not in source
         assert "_cute_is_candidate" in source
+        assert "launch_sparse_paged_gqa_prefill" in source
         assert "notimplementederror" in source
         assert cute_module not in sys.modules
+        assert triton_module not in sys.modules
         """
     )
 

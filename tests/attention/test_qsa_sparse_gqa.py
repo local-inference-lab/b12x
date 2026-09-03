@@ -269,9 +269,7 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
                 ),
                 torch.float32,
             ),
-            partial_lse=_CandidateTensor(
-                (rows, splits, q_heads), torch.float32
-            ),
+            partial_lse=_CandidateTensor((rows, splits, q_heads), torch.float32),
             block_n=cute_config.BLOCK_N,
             splits=splits,
         )
@@ -279,7 +277,7 @@ def test_cute_candidate_accepts_all_qwen_rows_for_interleaved_blh_cache_views(
     )
 
 
-def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
+def test_qwen_split_policy_uses_unsplit_large_rows() -> None:
     caps = SimpleNamespace(
         q_heads=12,
         kv_heads=1,
@@ -291,6 +289,8 @@ def test_qwen_split_policy_does_not_route_large_rows_to_triton() -> None:
     assert _target_splits(caps, 1) == (16, 64)
     assert _target_splits(caps, 4) == (16, 32)
     assert _target_splits(caps, 32) == (16, 16)
+    assert _target_splits(caps, 64) == (16, 16)
+    assert _target_splits(caps, 65) == (16, 1)
 
     with pytest.raises(NotImplementedError, match="requires the CuTe Qwen"):
         _target_splits(
@@ -395,10 +395,10 @@ def test_non_qwen_geometry_has_no_sparse_gqa_fallback(
         "splits",
         "layout",
     ),
-        [
-            (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
-            (1, 8, 2, 256, 16, 2051, 16, 64, "contiguous"),
-            (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
+    [
+        (1, 24, 2, 256, 16, 2051, 16, 64, "contiguous"),
+        (1, 8, 2, 256, 16, 2051, 16, 64, "contiguous"),
+        (1, 6, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
         (5, 12, 1, 256, 16, 2051, 16, 64, "interleaved_page"),
     ],
 )
@@ -511,6 +511,175 @@ def test_sparse_gqa_matches_gathered_dense_reference(
         softmax_scale,
     )
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
+
+
+@pytest.mark.parametrize("page_size", [16, 3008])
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_large_prefill_sparse_gqa_addresses_paged_cache(
+    page_size: int,
+    kv_dtype: torch.dtype,
+) -> None:
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
+    pages, batches = 4, 2
+    storage = torch.randn(
+        (pages, 2, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(kv_dtype)
+    key_cache, value_cache = storage.unbind(1)
+    block_table = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32, device=device)
+    request_ids = torch.arange(rows, dtype=torch.int64, device=device) % batches
+    request_ids[-1] = -1
+    query_positions = torch.zeros(rows, dtype=torch.int64, device=device)
+    selected_positions = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    selected_positions[:, 0] = 0
+    query = torch.randn((rows, q_heads, head_dim), dtype=torch.bfloat16, device=device)
+    output = torch.full_like(query, float("nan"))
+    k_descale = None
+    v_descale = None
+    value_scale = 1.0
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        value_scale = float(v_descale)
+
+    actual = launch_sparse_paged_gqa(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=output,
+        partial_output=None,
+        partial_lse=None,
+        softmax_scale=1.0 / math.sqrt(head_dim),
+        block_n=16,
+        splits=1,
+    )
+
+    expected = torch.zeros_like(query)
+    heads_per_kv = q_heads // kv_heads
+    for row in range(rows - 1):
+        request = int(request_ids[row])
+        physical_page = int(block_table[request, 0])
+        expected[row].copy_(
+            (value_cache[physical_page, 0].float() * value_scale)
+            .repeat_interleave(heads_per_kv, dim=0)
+            .to(torch.bfloat16)
+        )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_large_prefill_sparse_gqa_matches_cute_for_full_selection(
+    kv_dtype: torch.dtype,
+) -> None:
+    from b12x.attention.qsa._sparse_gqa_cute import (
+        launch_sparse_gqa_merge,
+        launch_sparse_gqa_split,
+    )
+    from b12x.attention.qsa._sparse_gqa_triton import (
+        launch_sparse_paged_gqa_prefill,
+    )
+
+    device = require_sm120()
+    rows, q_heads, kv_heads, head_dim = 65, 24, 2, 256
+    page_size, pages, selection_width = 3008, 4, 2051
+    generator = torch.Generator(device="cpu").manual_seed(93865)
+    source = torch.randn(
+        (pages, 2, page_size, kv_heads, head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ).to(device)
+    k_descale = None
+    v_descale = None
+    if kv_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.125], dtype=torch.float32, device=device)
+        storage = torch.empty_like(source, dtype=kv_dtype)
+        storage[:, 0].copy_((source[:, 0].float() / k_descale).to(kv_dtype))
+        storage[:, 1].copy_((source[:, 1].float() / v_descale).to(kv_dtype))
+    else:
+        storage = source
+    key_cache, value_cache = storage.unbind(1)
+    block_table = torch.arange(pages, dtype=torch.int32, device=device).view(1, -1)
+    request_ids = torch.zeros(rows, dtype=torch.int64, device=device)
+    query_positions = torch.full(
+        (rows,), pages * page_size - 1, dtype=torch.int64, device=device
+    )
+    selected = torch.randperm(
+        pages * page_size, generator=generator, dtype=torch.int64
+    )[:selection_width]
+    selected_positions = (
+        selected.to(device=device, dtype=torch.int32)
+        .view(1, -1)
+        .expand(rows, -1)
+        .contiguous()
+    )
+    query = torch.randn(
+        (rows, q_heads, head_dim),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device="cpu",
+    ).to(device)
+    triton_output = torch.empty_like(query)
+    cute_output = torch.empty_like(query)
+    split_output = torch.empty(
+        (rows, 16, q_heads, head_dim), dtype=torch.float32, device=device
+    )
+    split_lse = torch.empty((rows, 16, q_heads), dtype=torch.float32, device=device)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    launch_sparse_paged_gqa_prefill(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        output=triton_output,
+        softmax_scale=scale,
+    )
+    launch_sparse_gqa_split(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        block_table=block_table,
+        request_ids=request_ids,
+        selected_positions=selected_positions,
+        query_positions=query_positions,
+        partial_output=split_output,
+        partial_lse=split_lse,
+        softmax_scale=scale,
+        splits=16,
+    )
+    launch_sparse_gqa_merge(
+        partial_output=split_output,
+        partial_lse=split_lse,
+        output=cute_output,
+        rows=rows,
+        splits=16,
+    )
+    torch.testing.assert_close(triton_output, cute_output, rtol=0.0, atol=3e-2)
 
 
 def test_sparse_gqa_matches_reference_for_1504_token_pages() -> None:
