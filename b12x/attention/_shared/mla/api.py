@@ -657,9 +657,11 @@ def _run_sparse_mla(
     # The cache ABI is a plan invariant. Runtime recipe kwargs are retained as
     # compatibility assertions only; they never select a specialization.
     cache_traits = getattr(workspace, "cache_traits", None)
-    if cache_traits is None and _sm120_route:
+    if cache_traits is None:
         # Compatibility path for the retired arena-style workspace. Production
         # sparse-MLA integrations use Caps/Plan/Binding and never enter here.
+        # Resolve the cache recipe even on the reference path so unsupported
+        # widths and formats cannot bypass the cache ABI checks below.
         cache_traits = resolve_unplanned_traits(
             int(q_all.shape[-1]),
             kv_cache.dtype,

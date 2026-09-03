@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from b12x.attention import sparse_mla
+from b12x.attention._shared.mla import api as sparse_mla_api
 from b12x.attention._shared.mla.reference import (
     _sparse_attention_reference,
     pack_mla_kv_cache_reference,
@@ -33,6 +36,19 @@ _GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _GLM_NEXT_PAGE_SIZE = 64
 _GLM_NEXT_HEAD_DIM = 512
 _GLM_NEXT_SM_SCALE = 256**-0.5
+_ALLOCATOR_COUNTERS = (
+    "allocation.all.allocated",
+    "allocation.all.freed",
+    "segment.all.allocated",
+    "segment.all.freed",
+    "num_alloc_retries",
+    "num_ooms",
+)
+
+
+def _allocator_counters(device: torch.device) -> dict[str, int]:
+    stats = torch.cuda.memory_stats(device)
+    return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
 
 
 def _glm_next_plan_and_binding(
@@ -799,6 +815,39 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
         )
 
 
+def test_glm_next_legacy_reference_path_validates_cache_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros((1, 1, 512), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 1, 528), dtype=torch.uint8)
+    selected = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.ones((1,), dtype=torch.int32)
+    workspace = SimpleNamespace(
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        v_head_dim=512,
+        page_size=1,
+    )
+    monkeypatch.setattr(sparse_mla_api, "_use_sm120_sparse_mla", lambda **_: False)
+
+    with pytest.raises(ValueError, match="does not match its recipe"):
+        sparse_mla_api._run_sparse_mla(
+            q_all=q,
+            kv_cache=cache,
+            selected_indices=selected,
+            cache_seqlens_int32=lengths,
+            active_token_counts=lengths,
+            workspace=workspace,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            v_head_dim=512,
+            model_type=ModelType.GLM_NEXT,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            fp8_rope=False,
+            latent_scale_per_token=True,
+        )
+
+
 @pytest.mark.parametrize("container_width", [2051, 2112])
 def test_glm_next_prefill_routes_exact_or_aligned_selector_width(
     monkeypatch: pytest.MonkeyPatch,
@@ -1387,6 +1436,53 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
 
     _assert_glm_next_attention_close(actual, expected)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0.0, atol=0.05)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        captured_output, captured_lse = sparse_mla.run_extend(
+            binding=binding,
+            sm_scale=_GLM_NEXT_SM_SCALE,
+            return_lse=True,
+        )
+    assert captured_output.data_ptr() == actual.data_ptr()
+    assert captured_lse.data_ptr() == actual_lse.data_ptr()
+
+    q.copy_(
+        (
+            torch.randn(q.shape, generator=generator, device=device) / 4
+        ).to(torch.bfloat16)
+    )
+    latent.copy_(
+        (
+            torch.randn(latent.shape, generator=generator, device=device) / 4
+        ).to(torch.bfloat16)
+    )
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    dequantized, _ = dequantize_nvfp4_mla_nope(
+        cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
+        latent_scale_offset=292,
+    )
+    replay_expected, replay_expected_lse = _sparse_attention_reference(
+        q_all=q,
+        k_all=dequantized,
+        v_all=dequantized,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=_GLM_NEXT_SM_SCALE,
+        return_lse=True,
+    )
+    allocator_before = _allocator_counters(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert _allocator_counters(device) == allocator_before
+    assert captured_output.data_ptr() == actual.data_ptr()
+    assert captured_lse.data_ptr() == actual_lse.data_ptr()
+    _assert_glm_next_attention_close(captured_output, replay_expected)
+    torch.testing.assert_close(
+        captured_lse, replay_expected_lse, rtol=0.0, atol=0.05
+    )
 
 
 @torch.inference_mode()
