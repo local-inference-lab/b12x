@@ -1219,7 +1219,7 @@ def test_unified_prefill_dual_cache_fp8_matches_extra_ref(
     main_lengths = torch.full((1,), topk, dtype=torch.int32, device=device)
     extra_lengths = torch.full((1,), extra_topk, dtype=torch.int32, device=device)
 
-    expected, _ = dsv4_extra_ref.dsv4_extra_decode_reference(
+    expected, expected_lse = dsv4_extra_ref.dsv4_extra_decode_reference(
         q,
         case["kv_cache"],
         main_indices,
@@ -1251,6 +1251,12 @@ def test_unified_prefill_dual_cache_fp8_matches_extra_ref(
     assert torch.isfinite(got).all()
     assert torch.count_nonzero(got).item() > 0
     assert torch.isfinite(lse).all()
+    torch.testing.assert_close(
+        lse.float(),
+        expected_lse.float(),
+        atol=6.0e-2,
+        rtol=2.0e-2,
+    )
     cos = _cosine(got, expected)
     assert cos > 0.999, f"DSV4 dual-cache FP8 prefill heads={num_heads} O cos={cos}"
     assert (got - expected).abs().max().item() < 2e-2

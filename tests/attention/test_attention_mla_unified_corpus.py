@@ -62,11 +62,13 @@ class _UnifiedInputs:
     extra_index_scenarios: tuple[torch.Tensor, torch.Tensor] | None
     extra_lengths: torch.Tensor | None
     extra_length_scenarios: tuple[torch.Tensor, torch.Tensor] | None
+    extra_page_size: int | None
 
 
 def _make_cache(
     *,
     tokens: int,
+    page_size: int = _PAGE_SIZE,
     device: torch.device,
     generator: torch.Generator,
 ) -> torch.Tensor:
@@ -83,7 +85,7 @@ def _make_cache(
     return pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope,
-        page_size=_PAGE_SIZE,
+        page_size=page_size,
     )
 
 
@@ -93,6 +95,7 @@ def _make_inputs(
     heads: int,
     main_width: int,
     extra_width: int,
+    extra_page_size: int = _PAGE_SIZE,
     per_token: bool,
     device: torch.device,
 ) -> _UnifiedInputs:
@@ -142,9 +145,10 @@ def _make_inputs(
     extra_lengths: torch.Tensor | None = None
     extra_length_scenarios: tuple[torch.Tensor, torch.Tensor] | None = None
     if extra_width:
-        extra_tokens = max(extra_width, _PAGE_SIZE)
+        extra_tokens = max(extra_width, extra_page_size)
         extra_cache = _make_cache(
             tokens=extra_tokens,
+            page_size=extra_page_size,
             device=device,
             generator=generator,
         )
@@ -183,6 +187,7 @@ def _make_inputs(
         extra_index_scenarios=extra_index_scenarios,
         extra_lengths=extra_lengths,
         extra_length_scenarios=extra_length_scenarios,
+        extra_page_size=extra_page_size if extra_width else None,
     )
 
 
@@ -238,7 +243,7 @@ def _reference(
         ),
         extra_topk_lengths=extra_lengths,
         swa_page_size=_PAGE_SIZE,
-        extra_page_size=_PAGE_SIZE if inputs.extra_cache is not None else None,
+        extra_page_size=inputs.extra_page_size,
         return_lse=True,
     )
     assert isinstance(result, tuple)
@@ -337,7 +342,7 @@ def test_unified_decode_entrypoint_live_graph_oracle(entrypoint: str) -> None:
             indexed_k_cache=inputs.extra_cache,
             indexed_indices=inputs.extra_indices,
             indexed_topk_lengths=inputs.extra_lengths,
-            indexed_page_size=_PAGE_SIZE if has_extra else None,
+            indexed_page_size=inputs.extra_page_size,
             forced_num_splits=1,
             out=output,
         )
@@ -410,7 +415,7 @@ def test_unified_prefill_entrypoint_live_graph_oracle(entrypoint: str) -> None:
             extra_kv_cache=inputs.extra_cache,
             extra_indices=inputs.extra_indices,
             extra_topk_length=inputs.extra_lengths,
-            extra_page_block_size=_PAGE_SIZE if has_extra else None,
+            extra_page_block_size=inputs.extra_page_size,
         )
 
     _install_scenario(inputs, 0)
@@ -813,6 +818,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             heads=case.heads,
             main_width=case.topk,
             extra_width=64 if has_extra else 0,
+            extra_page_size=2 if has_extra else _PAGE_SIZE,
             per_token=True,
             device=device,
         )
@@ -982,7 +988,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
                 extra_kv_cache=inputs.extra_cache,
                 extra_indices=inputs.extra_indices,
                 extra_topk_length=inputs.extra_lengths,
-                extra_page_block_size=_PAGE_SIZE,
+                extra_page_block_size=inputs.extra_page_size,
             )
         return run_unified_prefill(**kwargs)
 
