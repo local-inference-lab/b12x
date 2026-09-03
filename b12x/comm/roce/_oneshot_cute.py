@@ -215,7 +215,11 @@ class _RoceOneshotLaunch:
 
         # A recorded timeout poisons the runtime: later launches do nothing so
         # the host sees the failure without waiting another spin limit per op.
-        poisoned = ld_relaxed_sys_u32(ctrl_base + Int64(8))
+        # The device poison word (fourth counter) is written by the same waiting
+        # threads that write the host error word and only ever goes from 0 to
+        # the failed sequence, so a cheap GPU-scope load is enough here.
+        poison_ptr = epoch_ptr + Int64(12)
+        poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the input into the pinned send slot
             stage_index = index
@@ -251,10 +255,11 @@ class _RoceOneshotLaunch:
                     if timed_out != Uint32(0):
                         st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(tidx))
                         st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
+                        st_release_gpu_u32(poison_ptr, seq)
             cute.arch.sync_threads()
-            # A wait that timed out anywhere in this block leaves the peer slot
-            # unreliable: skip the data phase so nothing derived from it is stored.
-            failed = ld_relaxed_sys_u32(ctrl_base + Int64(8))
+            # A wait that timed out in this block leaves the peer slot unreliable:
+            # skip the data phase so nothing derived from it is stored.
+            failed = ld_relaxed_gpu_u32(poison_ptr)
             if failed == Uint32(0):
                 # 4. reduce in fixed rank order so every rank stores identical bits
                 reduce_index = index

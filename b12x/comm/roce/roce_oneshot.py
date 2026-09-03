@@ -141,6 +141,23 @@ def _normalize_device(device: torch.device | int | str) -> torch.device:
     return device
 
 
+def _capture_id(stream: torch.cuda.Stream) -> int:
+    """CUDA's id of the capture ``stream`` is in, 0 when it is not capturing.
+
+    Two captures are distinct even on the same stream, and one capture can be
+    joined by several streams; the id identifies the capture itself.
+    """
+
+    from cuda.bindings import runtime as cudart
+
+    info = cudart.cudaStreamGetCaptureInfo(stream.cuda_stream)
+    if info[0] != cudart.cudaError_t.cudaSuccess:
+        return 0
+    if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return 0
+    return int(info[2])
+
+
 def _align_up(value: int, alignment: int) -> int:
     """Round ``value`` up to a multiple of ``alignment``."""
     return (int(value) + alignment - 1) // alignment * alignment
@@ -183,6 +200,7 @@ class RoceOneshotAllReduce:
         self._stream_event = torch.cuda.Event()
         self._last_stream: Optional[torch.cuda.Stream] = None
         self._capture_stream: Optional[torch.cuda.Stream] = None
+        self._capture_id = 0
         if self.world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(
                 f"unsupported RoCE all-reduce world size {self.world_size}; "
@@ -236,6 +254,9 @@ class RoceOneshotAllReduce:
             self._layout.ctrl_off : self._layout.ctrl_off + 24
         ].view(torch.int32)
         self._error_word = self._ctrl_words[2:3]
+        # numpy view of the control words: reading it costs nanoseconds, so the
+        # health check before and after every launch stays off the profile.
+        self._ctrl_np = self._ctrl_words.numpy()
         self._epoch_address = self._counters.data_ptr()
 
         error: Optional[str] = None
@@ -530,12 +551,15 @@ class RoceOneshotAllReduce:
         The runtime has one epoch, one doorbell and two transport slots, so
         collectives must execute in launch order even across streams.  Under
         capture no event is used: every collective must be on the capture
-        stream, which keeps the graph's own ordering.
+        stream, which keeps the graph's own ordering; captures are told apart
+        by CUDA's capture id, so consecutive captures may use different streams.
         """
 
         current = torch.cuda.current_stream(self.device)
         if capturing:
-            if self._capture_stream is None:
+            capture_id = _capture_id(current)
+            if capture_id != self._capture_id:
+                self._capture_id = capture_id
                 self._capture_stream = current
             elif current != self._capture_stream:
                 raise RuntimeError("RoCE collectives must all be captured on one stream")
@@ -561,9 +585,9 @@ class RoceOneshotAllReduce:
 
         if self._proxy is not None and self._proxy.failed():
             raise RuntimeError(f"RoCE proxy failed: {self._proxy.error()}")
-        failed_seq = int(self._error_word.item())
+        failed_seq = int(self._ctrl_np[2])
         if failed_seq != 0:
-            peer = int(self._ctrl_words[3].item())
+            peer = int(self._ctrl_np[3])
             raise RuntimeError(
                 f"RoCE collective on rank {self.rank} timed out waiting for rank {peer} "
                 f"at sequence {failed_seq}; the runtime is poisoned (its epoch stopped at "
@@ -575,7 +599,7 @@ class RoceOneshotAllReduce:
     def poisoned(self) -> bool:
         """True once a wait timed out or the proxy failed; the runtime cannot be reused."""
 
-        return (self._proxy is not None and self._proxy.failed()) or int(self._error_word.item()) != 0
+        return (self._proxy is not None and self._proxy.failed()) or int(self._ctrl_np[2]) != 0
 
     # -- all-gather ---------------------------------------------------------------
 
@@ -751,10 +775,12 @@ class RoceOneshotAllReduce:
 
         self._last_stream = None
         self._capture_stream = None
+        self._capture_id = 0
         try:
             yield self
         finally:
             self._capture_stream = None
+            self._capture_id = 0
             self._last_stream = None
 
     # -- diagnostics / lifecycle --------------------------------------------------
