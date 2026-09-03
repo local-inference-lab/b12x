@@ -25,6 +25,7 @@ from b12x.attention._shared.mla.traits import (
     ScaleFormat,
     infer_model_type,
     make_unified_traits,
+    resolve_unplanned_traits,
 )
 from tests._reference.helpers import dequantize_nvfp4_mla_nope
 
@@ -357,6 +358,15 @@ def test_glm_next_accepts_inline_scale_nvfp4_without_rope() -> None:
     assert nvfp4_traits.d_rope == 0
     assert nvfp4_traits.compute_mode == ComputeMode.BF16
 
+    compatibility_traits = resolve_unplanned_traits(
+        512,
+        torch.uint8,
+        _GLM_NEXT_NVFP4_RECORD_BYTES,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+    )
+    assert compatibility_traits.latent_scale_per_token is True
+
     with pytest.raises(ValueError, match="inline per-token latent scale"):
         make_unified_traits(
             ModelType.GLM_NEXT,
@@ -413,6 +423,14 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
         sparse_mla.bind(
             plan,
             kv_cache=torch.empty((1, 1, 528), dtype=torch.uint8),
+            **bind_kwargs,
+        )
+    with pytest.raises(ValueError, match="page size does not match"):
+        sparse_mla.bind(
+            plan,
+            kv_cache=torch.empty(
+                (1, 2, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8
+            ),
             **bind_kwargs,
         )
     binding = sparse_mla.bind(

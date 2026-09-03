@@ -378,6 +378,11 @@ def build_sparse_mla_binding(
                 f"got {int(kv_cache.shape[-1])}, expected "
                 f"{int(scratch.cache_record_bytes)}"
             )
+        if int(kv_cache.shape[1]) != int(scratch.page_size):
+            raise ValueError(
+                "kv_cache page size does not match the sparse MLA plan: "
+                f"got {int(kv_cache.shape[1])}, expected {int(scratch.page_size)}"
+            )
     return B12XSparseMLABinding(
         scratch=scratch,
         q=q,

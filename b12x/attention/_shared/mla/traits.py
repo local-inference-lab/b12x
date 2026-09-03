@@ -396,6 +396,7 @@ def resolve_unplanned_traits(
             if fp8_rope not in (None, False):
                 raise ValueError("GLM_NEXT has no RoPE cache payload")
             fp8_rope = False
+            latent_scale_per_token = True
         elif fp8_rope is None:
             if int(record_bytes) not in (368, 432):
                 raise ValueError(
