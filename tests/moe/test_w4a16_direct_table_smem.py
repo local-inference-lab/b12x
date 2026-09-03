@@ -70,8 +70,15 @@ def _prepared(*, experts: int, hidden: int, intermediate: int, bits: int, seed: 
     )
 
 
-def _run(x: torch.Tensor, prepared, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
-         expert_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_launch(
+    x: torch.Tensor,
+    prepared,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    *,
+    fused_launch=None,
+):
     m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
     buffers = make_w4a16_packed_buffers(
         prepared, m=m, topk=topk, dtype=torch.float16, device=x.device,
@@ -101,8 +108,15 @@ def _run(x: torch.Tensor, prepared, topk_weights: torch.Tensor, topk_ids: torch.
             svh_table=prepared.down_svh,
             rotation_a_gate=buffers.rotation_a_gate,
             rotation_a_up=buffers.rotation_a_up,
+            fused_launch=fused_launch,
         )
 
+    return launch
+
+
+def _run(x: torch.Tensor, prepared, topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+         expert_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    launch = _make_launch(x, prepared, topk_weights, topk_ids, expert_map)
     eager = launch().clone()
     torch.cuda.synchronize(x.device)
     graph = torch.cuda.CUDAGraph()
@@ -185,6 +199,82 @@ def test_direct_table_is_part_of_the_compiled_launch(monkeypatch: pytest.MonkeyP
     direct_table_bytes = 1 << 16
     assert staged["1"][1] >= direct_table_bytes
     assert staged["1"][1] - staged["0"][1] >= direct_table_bytes - 4096
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_direct_table_is_prewarmed_before_first_graph_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planning owns the direct table, so its first launch can be captured."""
+    bits = 2
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, topk, hidden, intermediate = 16, 16, 128, 128
+    prepared = _prepared(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        bits=bits,
+        seed=20260904,
+        device=device,
+    )
+    generator = torch.Generator(device="cpu").manual_seed(20260904)
+    x = (torch.randn((4, hidden), generator=generator) * 1.0e-3).to(
+        torch.bfloat16
+    ).to(device)
+    topk_ids = torch.stack(
+        [torch.randperm(experts, generator=generator)[:topk] for _ in range(4)]
+    ).to(torch.int32).to(device)
+    topk_weights = torch.rand((4, topk), generator=generator).to(device)
+    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+    expert_map = torch.arange(experts, dtype=torch.int32, device=device)
+
+    w4a16_kernel.clear_w4a16_kernel_cache()
+    monkeypatch.setenv(FLAG, "0")
+    modal_launch = _make_launch(
+        x, prepared, topk_weights, topk_ids, expert_map
+    )
+    modal = modal_launch().clone()
+    torch.cuda.synchronize(device)
+
+    monkeypatch.setenv(FLAG, "1")
+    real_direct_lut = w4a16_kernel.sqg_xor_cheb_t12_direct_lut
+    capture_states: list[bool] = []
+
+    def tracked_direct_lut(selected_device: torch.device | str) -> torch.Tensor:
+        capture_states.append(torch.cuda.is_current_stream_capturing())
+        return real_direct_lut(selected_device)
+
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "sqg_xor_cheb_t12_direct_lut",
+        tracked_direct_lut,
+    )
+    direct_compile = _compile_common(bits=bits)
+    direct_compile.update(
+        size_m=4,
+        max_m_blocks=4 * topk,
+        rotation_input_dtype="bf16",
+    )
+    direct_fused = compile_w4a16_fused_moe(**direct_compile)
+    assert direct_fused.sqg_xor_cheb_t12_direct_lut is not None
+    assert capture_states == [False]
+
+    direct_launch = _make_launch(
+        x,
+        prepared,
+        topk_weights,
+        topk_ids,
+        expert_map,
+        fused_launch=direct_fused,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = direct_launch()
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert capture_states == [False]
+    assert torch.equal(captured, modal)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

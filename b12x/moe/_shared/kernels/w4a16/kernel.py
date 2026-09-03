@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import NamedTuple
 
@@ -745,6 +745,11 @@ class W4A16FusedMoeCompileResult:
     # The kernel staged the 64 KiB direct rate table instead of the 4 KiB
     # modal table; the launch must pass the matching rate slice.
     sqg_xor_cheb_t12_direct_smem: bool = False
+    sqg_xor_cheb_t12_direct_lut: torch.Tensor | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     cta_threads: int = -1
     shared_memory_bytes: int = -1
 
@@ -9677,6 +9682,16 @@ def compile_w4a16_fused_moe(
         ),
         dsl_compile_options=OptLevel(2),
     )
+    direct_lut = None
+    if kernel.sqg_xor_cheb_t12_direct_smem:
+        if device is None:
+            raise RuntimeError("the direct W4A16 trellis table requires CUDA")
+        direct_bits = int(kernel.trellis_bits)
+        direct_lut = sqg_xor_cheb_t12_direct_lut(
+            torch.device("cuda", device)
+        )[(direct_bits - 2) << 16 : (direct_bits - 1) << 16]
+        if not direct_lut.is_contiguous():
+            direct_lut = direct_lut.contiguous()
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
         size_m=size_m,
@@ -9714,6 +9729,7 @@ def compile_w4a16_fused_moe(
         sqg_xor_cheb_t12_direct_smem=bool(
             getattr(kernel, "sqg_xor_cheb_t12_direct_smem", False)
         ),
+        sqg_xor_cheb_t12_direct_lut=direct_lut,
         fc1_trellis_pair_kind=kernel.fc1_trellis_pair_kind,
         fc2_trellis_pair_kind=kernel.fc2_trellis_pair_kind,
         full_rotation=full_rotation,
@@ -10404,14 +10420,16 @@ def _w4a16_fused_moe_launch_flat(
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     if weight_layout == "trellis_t256" and trellis_codebook != "mcg":
         if fused.sqg_xor_cheb_t12_direct_smem:
-            # The kernel stages the 64 KiB rate slice of the precomposed
-            # direct table (byte(state, bits) = table[((bits-2) << 16) | state]).
-            direct_bits = int(fused.trellis_bits)
-            trellis_rank_lut = sqg_xor_cheb_t12_direct_lut(a_input.device)[
-                (direct_bits - 2) << 16 : (direct_bits - 1) << 16
-            ]
-            if not trellis_rank_lut.is_contiguous():
-                trellis_rank_lut = trellis_rank_lut.contiguous()
+            trellis_rank_lut = fused.sqg_xor_cheb_t12_direct_lut
+            if trellis_rank_lut is None:
+                raise RuntimeError(
+                    "the direct W4A16 trellis launch has no prewarmed rate table"
+                )
+            if trellis_rank_lut.device != a_input.device:
+                raise RuntimeError(
+                    "the direct W4A16 trellis table and input must use the same "
+                    f"device, got {trellis_rank_lut.device} and {a_input.device}"
+                )
         else:
             trellis_rank_lut = _trellis256_execution_lut(
                 a_input.device, trellis_codebook
