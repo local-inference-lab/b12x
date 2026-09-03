@@ -4,6 +4,28 @@ Measurements that back the `sequence.kda_prefill` performance claims. Each JSON
 file records the device, the commit of the checkout that produced it, and raw
 samples; the tables below summarize them.
 
+## 20260903-glm53-nvfp4-vllm-e2e.json
+
+End-to-end GLM-5.3 NVFP4 serving qualification for the production B12X KDA
+prefill integration. The comparison holds model, vLLM and B12X source trees,
+four RTX PRO 6000 Blackwell GPUs, tensor parallelism, scheduler budget, cache
+geometry, collectives, and CUDA graph mode constant. Tensor parallelism is four;
+decode-context parallelism is one or four. The four-way decode-context-parallel
+case uses full cross-rank KV-cache gathering during prefill.
+
+| Decode-context parallelism | B12X KDA tok/s | FlashKDA tok/s | B12X difference |
+|---:|---:|---:|---:|
+| 1 | 14,899 | 14,900 | -0.01% |
+| 4 | 13,106 | 13,242 | -1.03% |
+
+B12X and FlashKDA are equivalent within run noise when decode-context
+parallelism is one. FlashKDA is 1.03% faster with four-way decode-context
+parallelism, so FlashKDA remains the automatic selection and B12X is qualified
+as an explicit backend. The JSON receipt records source trees, clean-worktree
+state, physical GPU identities, operating mode, exact launch and measurement
+commands, correctness results, raw run measurements, medians, and directed
+comparison ratios.
+
 ## 20260903-rtx-pro-6000-flashkda-triton-baselines.json
 
 Baseline for the vLLM KDA prefill backends that b12x must beat, measured on an

@@ -1,0 +1,144 @@
+{
+  "schema": "b12x.kda_prefill.vllm_serving_evidence.v1",
+  "status": "qualified_explicit_backend_not_automatic",
+  "operation": "GLM-5.3 gated-delta-network prefill through vLLM's production B12X integration",
+  "production_path": "vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py -> b12x.sequence.kda_prefill",
+  "source": {
+    "vllm": {
+      "revision": "e2eaf734cb997cbfbf6c4fcfb6d69f8ee4f8eb23",
+      "tree": "cb8efe698c04d21e73a25568ac120b701ec805c4",
+      "clean_worktree": true
+    },
+    "b12x": {
+      "revision": "ca8052c7f4692c3241858c9bdace3053764be22d",
+      "tree": "08bff16624bd0c37f5902a454270888ad42a62d7",
+      "clean_worktree": true
+    }
+  },
+  "model": {
+    "repository": "local-inference-lab/GLM-5.3-Flash-NVFP4",
+    "revision": "378ca54585c46542bad1f3cb3ed0d73ae51cdb62"
+  },
+  "hardware": {
+    "gpus": [
+      {
+        "physical_index": 4,
+        "uuid": "GPU-8800cf0c-1ba5-7136-d796-2a91f9e9586e",
+        "pci_bus_id": "00000000:43:00.0"
+      },
+      {
+        "physical_index": 5,
+        "uuid": "GPU-4a0aa20b-8e36-2e05-4efb-8befbf1181d4",
+        "pci_bus_id": "00000000:44:00.0"
+      },
+      {
+        "physical_index": 6,
+        "uuid": "GPU-1a0323f7-8113-a1e1-c68b-f23fecf77171",
+        "pci_bus_id": "00000000:63:00.0"
+      },
+      {
+        "physical_index": 7,
+        "uuid": "GPU-0027fc86-3322-ce2a-856c-f49eb61eb63e",
+        "pci_bus_id": "00000000:64:00.0"
+      }
+    ],
+    "model": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "power_limit_watts": 600,
+    "pcie_generation": 5,
+    "pcie_width": 16,
+    "clock_mode": "stock automatic clocks; no graphics or memory offset"
+  },
+  "serving_configuration": {
+    "tensor_parallelism": 4,
+    "decode_context_parallelism": [1, 4],
+    "dcp4_prefill_mode": "full-CKV gather",
+    "max_num_batched_tokens": 4096,
+    "max_num_sequences": 32,
+    "target_cache_page_tokens": 2048,
+    "kv_cache_dtype": "fp8_ds_mla",
+    "cuda_graph_mode": "full and piecewise",
+    "nccl_channels": 16,
+    "nccl_buffer_bytes": 2097152,
+    "kv_cache_memory_bytes_per_rank": 30064771072,
+    "backend_selector": "--kda-prefill-backend flashkda|b12x"
+  },
+  "commands": {
+    "server": "GLM53_KDA_PREFILL_BACKEND=<flashkda|b12x> DCP=<1|4> TP=4 MAX_NUM_BATCHED_TOKENS=4096 GLM53_TARGET_BLOCK_SIZE=2048 CUDAGRAPH_MODE=FULL_AND_PIECEWISE NCCL_MIN_NCHANNELS=16 NCCL_MAX_NCHANNELS=16 NCCL_BUFFSIZE=2097152 launch_glm53_b12x_kda_prefill_ab.sh <flashkda|b12x> <dcp1|dcp4>",
+    "measurement": "BENCH_PORT=5051 BENCH_MODEL=GLM-5.3-Flash-NVFP4 measure_32k_prefill_case.sh <result-directory> 3 30",
+    "measurement_expansion": "llm_decode_bench.py --host 127.0.0.1 --port 5051 --model GLM-5.3-Flash-NVFP4 --standalone-prefill --prefill-only --prefill-contexts 32k --prefill-duration 30 --max-tokens 1 --display-mode plain --no-hw-monitor --no-resume --output <result-file>",
+    "measurement_tool_version": "llm-decode-bench 0.4.29"
+  },
+  "method": {
+    "prompt": "one independently generated cold prompt targeting 32K tokens per sample",
+    "output_tokens": 1,
+    "metric": "client prompt tokens divided by time to first token",
+    "warmup": "one 30-second standalone cold-prefill run per arm",
+    "measured_runs": 3,
+    "duration_seconds_per_run": 30,
+    "requests_per_run": 12,
+    "summary_statistic": "median throughput across the three measured runs",
+    "direction": "higher throughput is better"
+  },
+  "correctness": {
+    "measured_requests": "all requests completed with valid token accounting and the server remained healthy",
+    "vllm_integration": "four GLM-5.3 tests passed, including mixed decode/prefill dispatch and B12X-versus-Triton numerical parity",
+    "b12x_operation": "fifteen selected GPU tests passed after adding the three-window ring-reuse test; eager execution and CUDA graph replay match the oracle, preserve state, retain fixed workspace capacity and stable addresses, and allocate zero bytes during replay",
+    "server_lifecycle": "tensor-parallel server startup, kernel warmup, full graph capture, and piecewise graph capture completed for decode-context parallelism of one and four"
+  },
+  "cases": [
+    {
+      "backend": "b12x",
+      "decode_context_parallelism": 1,
+      "samples": [
+        {"prompt_tokens": 32321, "ttft_seconds": 2.162, "tokens_per_second": 14952},
+        {"prompt_tokens": 32320, "ttft_seconds": 2.169, "tokens_per_second": 14899},
+        {"prompt_tokens": 32321, "ttft_seconds": 2.172, "tokens_per_second": 14883}
+      ],
+      "median_tokens_per_second": 14899
+    },
+    {
+      "backend": "flashkda",
+      "decode_context_parallelism": 1,
+      "samples": [
+        {"prompt_tokens": 32320, "ttft_seconds": 2.168, "tokens_per_second": 14909},
+        {"prompt_tokens": 32322, "ttft_seconds": 2.169, "tokens_per_second": 14900},
+        {"prompt_tokens": 32321, "ttft_seconds": 2.175, "tokens_per_second": 14863}
+      ],
+      "median_tokens_per_second": 14900
+    },
+    {
+      "backend": "b12x",
+      "decode_context_parallelism": 4,
+      "samples": [
+        {"prompt_tokens": 32321, "ttft_seconds": 2.457, "tokens_per_second": 13154},
+        {"prompt_tokens": 32321, "ttft_seconds": 2.466, "tokens_per_second": 13106},
+        {"prompt_tokens": 32320, "ttft_seconds": 2.474, "tokens_per_second": 13063}
+      ],
+      "median_tokens_per_second": 13106
+    },
+    {
+      "backend": "flashkda",
+      "decode_context_parallelism": 4,
+      "samples": [
+        {"prompt_tokens": 32320, "ttft_seconds": 2.436, "tokens_per_second": 13267},
+        {"prompt_tokens": 32321, "ttft_seconds": 2.441, "tokens_per_second": 13242},
+        {"prompt_tokens": 32321, "ttft_seconds": 2.443, "tokens_per_second": 13232}
+      ],
+      "median_tokens_per_second": 13242
+    }
+  ],
+  "comparisons": [
+    {
+      "decode_context_parallelism": 1,
+      "b12x_over_flashkda_ratio": 0.999933,
+      "b12x_percent_difference": -0.01,
+      "conclusion": "equivalent within run noise"
+    },
+    {
+      "decode_context_parallelism": 4,
+      "b12x_over_flashkda_ratio": 0.98973,
+      "b12x_percent_difference": -1.03,
+      "conclusion": "FlashKDA is faster and remains the automatic selection"
+    }
+  ]
+}
