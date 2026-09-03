@@ -26,6 +26,7 @@ from ._policy import GDN_POLICY, GdnQuery
 
 GateActivation = Literal["silu", "sigmoid"]
 KdaMetadataValidation = Literal["transactional", "trusted"]
+QwenMetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -65,6 +66,7 @@ class Caps:
     qk_l2norm: bool = True
     null_state_index: int | None = None
     kda_metadata_validation: KdaMetadataValidation = "transactional"
+    qwen_metadata_validation: QwenMetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -113,6 +115,11 @@ class Caps:
             raise ValueError(
                 "kda_metadata_validation must be 'transactional' or 'trusted', got "
                 f"{self.kda_metadata_validation!r}"
+            )
+        if self.qwen_metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "qwen_metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.qwen_metadata_validation!r}"
             )
         null_state_index = self.null_state_index
         if null_state_index is not None:
@@ -883,7 +890,7 @@ def run(
         duplicate_table_size=binding.plan.duplicate_table_size,
         recurrent_num_warps=binding.plan.recurrent_num_warps,
         norm_num_warps=binding.plan.norm_num_warps,
-        validate_metadata=True,
+        validate_metadata=caps.qwen_metadata_validation == "transactional",
     )
     return binding.output
 

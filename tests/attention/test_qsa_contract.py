@@ -735,6 +735,67 @@ def test_qsa_prefill_capacity_uses_full_row_workspace() -> None:
     assert prefill.max_split_row_product == 4096 * 16
 
 
+def test_qsa_caps_reject_unknown_metadata_validation() -> None:
+    with pytest.raises(ValueError, match="metadata_validation"):
+        _caps(metadata_validation="unchecked")
+
+
+def test_qsa_trusted_metadata_matches_transactional_decode_under_graph_replay() -> None:
+    device = require_sm120()
+    common = dict(
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+    )
+    transactional = _allocate_binding(_caps(device, **common))
+    trusted = _allocate_binding(_caps(device, metadata_validation="trusted", **common))
+    for binding in (transactional, trusted):
+        binding.main_block_table[0, 0] = 0
+        binding.main_k_cache.zero_()
+        binding.main_v_cache.zero_()
+        binding.compressed_k_cache.zero_()
+        binding.index_q_norm_weight.zero_()
+        binding.index_k_norm_weight.zero_()
+    transactional_inputs = _dynamic_inputs(transactional, positions=(0,))
+    trusted_inputs = _dynamic_inputs(trusted, positions=(0,))
+    trusted.state_errors.fill_(73)
+
+    expected = qsa.run(transactional, **transactional_inputs).clone()
+    expected_selected = transactional.selected_positions.clone()
+    qsa.run(trusted, **trusted_inputs)
+
+    def reset_trusted_state() -> None:
+        trusted.compressed_k_cache.zero_()
+        trusted.raw_k_ring.zero_()
+        trusted.raw_logical_positions.fill_(-1)
+        trusted.raw_rope_positions.fill_(-1)
+        trusted.raw_interval_start_positions.fill_(-1)
+        trusted.output.zero_()
+        trusted.selected_positions.zero_()
+        trusted.state_errors.fill_(73)
+
+    reset_trusted_state()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = qsa.run(trusted, **trusted_inputs)
+
+    reset_trusted_state()
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(trusted.selected_positions, expected_selected)
+    assert trusted.state_errors.item() == 0
+
+
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
 def test_qsa_scaled_topk_scratch_executes_fixed_capacity_rows(rows: int) -> None:
     device = require_sm120()

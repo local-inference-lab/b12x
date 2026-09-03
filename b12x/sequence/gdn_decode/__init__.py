@@ -11,9 +11,10 @@ outside this package.
 raw gate while preserving the same state, transaction, and serving lifecycle.
 KDA bindings accept live tensor capacities within the plan, so serving runtimes
 can bind projection, metadata, and output tensors directly without staging.
-``Caps.kda_metadata_validation="trusted"`` disables device-side validation when
-the runtime already guarantees packed-request geometry, unique active state
-ownership, and in-range state indices.
+``Caps.kda_metadata_validation="trusted"`` and
+``Caps.qwen_metadata_validation="trusted"`` disable device-side validation for
+their respective recurrence when the runtime already guarantees packed-request
+geometry, unique active state ownership, and in-range state indices.
 
 The recurrent-state pool uses the optimized physical layout
 ``[slot, value_head, value_dim, key_dim]``. This is the transpose of the

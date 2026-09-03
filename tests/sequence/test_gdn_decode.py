@@ -42,6 +42,7 @@ def _make_case(
     dt_bias_dtype: torch.dtype = torch.float32,
     norm_dtype: torch.dtype = torch.bfloat16,
     qk_l2norm: bool = True,
+    metadata_validation: str = "transactional",
 ) -> tuple[gdn.Binding, dict[str, torch.Tensor]]:
     live_seqs = len(query_lengths)
     columns = 4 if columns is None else columns
@@ -62,6 +63,7 @@ def _make_case(
         state_dtype=state_dtype,
         gate_activation=activation,
         qk_l2norm=qk_l2norm,
+        qwen_metadata_validation=metadata_validation,
     )
     plan = gdn.plan(caps)
     (scratch_spec,) = plan.scratch_specs()
@@ -350,6 +352,46 @@ def test_public_qwen38_cute_path_is_graph_safe_without_replay_allocation() -> No
     )
     assert binding.error_code.item() == 0
     torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(
+        binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
+    )
+
+
+def test_public_qwen38_cuda_graph_replays_with_trusted_metadata() -> None:
+    device = require_sm120()
+    binding, _ = _make_case(
+        device=device,
+        query_lengths=(4, 2, 1, 3),
+        max_tokens=16,
+        max_seqs=4,
+        columns=4,
+        state_slots=17,
+        key_heads=16,
+        value_heads=48,
+        activation="sigmoid",
+        state_dtype=torch.float32,
+        metadata_validation="trusted",
+    )
+    initial_state = binding.recurrent_state.clone()
+    expected_state = initial_state.clone()
+    expected = _reference(binding, expected_state)
+
+    binding.error_code.fill_(11)
+    gdn.run(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gdn.run(binding)
+
+    binding.recurrent_state.copy_(initial_state)
+    binding.output.fill_(float("nan"))
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert captured.data_ptr() == binding.output.data_ptr()
+    assert binding.error_code.item() == 11
+    torch.testing.assert_close(captured, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
     )
@@ -1148,4 +1190,14 @@ def test_caps_accept_divisible_head_ratios_and_reject_invalid_capacity() -> None
             key_heads=1,
             value_heads=1,
             state_index_columns=1,
+        )
+    with pytest.raises(ValueError, match="qwen_metadata_validation"):
+        gdn.Caps(
+            device=device,
+            max_tokens=1,
+            max_seqs=1,
+            max_state_slots=1,
+            key_heads=1,
+            value_heads=3,
+            qwen_metadata_validation="unchecked",
         )

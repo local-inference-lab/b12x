@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -17,6 +18,7 @@ _SCORE_WORKSPACE_LIMIT_BYTES = 128 * 1024 * 1024
 _MIN_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _STABLE_TOPK_BLOCK = 512
 _MAX_SCORE_CHUNK_GROUPS = 65536
+MetadataValidation = Literal["transactional", "trusted"]
 
 
 def _align_up(value: int, alignment: int = _ALIGN_BYTES) -> int:
@@ -200,6 +202,7 @@ class Caps:
     rms_norm_eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
     kv_dtype: torch.dtype = torch.bfloat16
+    metadata_validation: MetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -250,6 +253,11 @@ class Caps:
             raise TypeError("QSA query and selector-cache dtype must be torch.bfloat16")
         if self.kv_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise TypeError("QSA main KV cache dtype must be BF16 or FP8 E4M3FN")
+        if self.metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.metadata_validation!r}"
+            )
         if int(self.index_kv_heads) != 1:
             raise ValueError("QSA requires exactly one index KV head")
         if int(self.q_heads) % int(self.kv_heads):
@@ -1436,6 +1444,7 @@ def _qsa_decode_impl(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     """Launch the complete decode transaction inside one dispatcher boundary."""
     rows = int(query.shape[0])
@@ -1621,67 +1630,71 @@ def _qsa_decode_impl(
         launch_topk_groups,
         launch_commit_raw_ring,
         launch_validate_completed_groups,
+        launch_clear_state_errors,
         launch_validate_rows,
         launch_validate_page_tables,
         launch_validate_shared_pool_ownership,
     )
 
-    launch_validate_rows(
-        request_ids=request_ids,
-        query_positions=query_positions,
-        rope_positions=rope_positions,
-        sequence_lengths=sequence_lengths,
-        query_start_loc=query_start_loc,
-        num_accepted_tokens=num_accepted_tokens,
-        is_prefilling=is_prefilling,
-        raw_state_slot_ids=raw_state_slot_ids,
-        raw_interval_start_positions=raw_interval_start_positions,
-        request_errors=request_errors,
-        state_errors=state_errors,
-        rope_position_rows=int(rope_cos.shape[0]),
-        caps=caps,
-    )
-    launch_validate_page_tables(
-        request_ids=request_ids,
-        sequence_lengths=sequence_lengths,
-        main_block_table=main_block_table,
-        compressed_block_table=compressed_block_table,
-        raw_state_slot_ids=raw_state_slot_ids,
-        state_errors=state_errors,
-        num_main_pages=int(main_k_cache.shape[0]),
-        num_compressed_pages=int(compressed_k_cache.shape[0]),
-        shared_compressed_raw_pool=shared_compressed_raw_pool,
-        caps=caps,
-    )
-    if shared_compressed_raw_pool:
-        launch_validate_shared_pool_ownership(
+    if validate_metadata:
+        launch_validate_rows(
+            request_ids=request_ids,
+            query_positions=query_positions,
+            rope_positions=rope_positions,
+            sequence_lengths=sequence_lengths,
+            query_start_loc=query_start_loc,
+            num_accepted_tokens=num_accepted_tokens,
+            is_prefilling=is_prefilling,
+            raw_state_slot_ids=raw_state_slot_ids,
+            raw_interval_start_positions=raw_interval_start_positions,
+            request_errors=request_errors,
+            state_errors=state_errors,
+            rope_position_rows=int(rope_cos.shape[0]),
+            caps=caps,
+        )
+        launch_validate_page_tables(
             request_ids=request_ids,
             sequence_lengths=sequence_lengths,
+            main_block_table=main_block_table,
             compressed_block_table=compressed_block_table,
             raw_state_slot_ids=raw_state_slot_ids,
             state_errors=state_errors,
-            occupancy=shared_page_occupancy,
+            num_main_pages=int(main_k_cache.shape[0]),
             num_compressed_pages=int(compressed_k_cache.shape[0]),
+            shared_compressed_raw_pool=shared_compressed_raw_pool,
             caps=caps,
         )
-    launch_validate_completed_groups(
-        query_positions=query_positions,
-        rope_positions=rope_positions,
-        request_ids=request_ids,
-        query_start_loc=query_start_loc,
-        raw_state_slot_ids=raw_state_slot_ids,
-        raw_logical_positions=raw_logical_positions,
-        raw_rope_positions=raw_rope_positions,
-        state_errors=state_errors,
-        rope_position_rows=int(rope_cos.shape[0]),
-        caps=caps,
-    )
-    launch_propagate_request_errors(
-        request_ids=request_ids,
-        request_errors=request_errors,
-        state_errors=state_errors,
-        caps=caps,
-    )
+        if shared_compressed_raw_pool:
+            launch_validate_shared_pool_ownership(
+                request_ids=request_ids,
+                sequence_lengths=sequence_lengths,
+                compressed_block_table=compressed_block_table,
+                raw_state_slot_ids=raw_state_slot_ids,
+                state_errors=state_errors,
+                occupancy=shared_page_occupancy,
+                num_compressed_pages=int(compressed_k_cache.shape[0]),
+                caps=caps,
+            )
+        launch_validate_completed_groups(
+            query_positions=query_positions,
+            rope_positions=rope_positions,
+            request_ids=request_ids,
+            query_start_loc=query_start_loc,
+            raw_state_slot_ids=raw_state_slot_ids,
+            raw_logical_positions=raw_logical_positions,
+            raw_rope_positions=raw_rope_positions,
+            state_errors=state_errors,
+            rope_position_rows=int(rope_cos.shape[0]),
+            caps=caps,
+        )
+        launch_propagate_request_errors(
+            request_ids=request_ids,
+            request_errors=request_errors,
+            state_errors=state_errors,
+            caps=caps,
+        )
+    else:
+        launch_clear_state_errors(state_errors)
     # Completion consumes the old ring before the current suffix can wrap it.
     launch_compress_completed_groups(
         raw_index_key=raw_index_key,
@@ -1857,7 +1870,8 @@ def _qsa_decode_impl(
             block_n=block_n,
             splits=splits,
         )
-        launch_poison_failed_rows(output=active_output, state_errors=chunk_errors)
+        if validate_metadata:
+            launch_poison_failed_rows(output=active_output, state_errors=chunk_errors)
 
 
 _QSA_MUTATED_ARGUMENTS = (
@@ -1935,6 +1949,7 @@ def _qsa_decode_op(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     _require_mutation_alias_contract(
         mutable=(
@@ -2019,6 +2034,7 @@ def _qsa_decode_op(
         partial_output_offset_bytes,
         partial_lse_offset_bytes,
         work_metadata_offset_bytes,
+        validate_metadata,
     )
 
 
@@ -2082,6 +2098,7 @@ def _qsa_decode_fake(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     return None
 
@@ -2211,6 +2228,7 @@ def _qsa_decode_shared_op(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     _require_mutation_alias_contract(
         mutable=(
@@ -2303,6 +2321,7 @@ def _qsa_decode_shared_op(
         partial_output_offset_bytes,
         partial_lse_offset_bytes,
         work_metadata_offset_bytes,
+        validate_metadata,
     )
 
 
@@ -2364,6 +2383,7 @@ def _qsa_decode_shared_fake(
     partial_output_offset_bytes: int,
     partial_lse_offset_bytes: int,
     work_metadata_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     return None
 
@@ -2568,6 +2588,7 @@ def run(
             int(layout.partial_output_offset_bytes),
             int(layout.partial_lse_offset_bytes),
             int(layout.work_metadata_offset_bytes),
+            caps.metadata_validation == "transactional",
         )
         return binding.output[:rows]
     _qsa_decode_op(
@@ -2629,6 +2650,7 @@ def run(
         int(layout.partial_output_offset_bytes),
         int(layout.partial_lse_offset_bytes),
         int(layout.work_metadata_offset_bytes),
+        caps.metadata_validation == "transactional",
     )
     return binding.output[:rows]
 
