@@ -17,6 +17,7 @@ from benchmarks.benchmark_qsrt_checkpoint_profiles import (
     _parse_positive_list,
     _tensor_sha256,
     _validate_completion,
+    _validate_profile_tp_size,
     _write_new_result,
 )
 
@@ -26,11 +27,21 @@ def test_profile_contracts_match_production_transform_policies() -> None:
     assert _K2.trellis_bits == 2
     assert _K2.coupled_hadamard is True
     assert _K2.tile_config == (128, 128, 128, 128)
+    assert _K2.supported_tp_sizes == (8, 12)
 
     assert _H308.profile == "k3x22_k4x2"
     assert _H308.trellis_bits == 3
     assert _H308.coupled_hadamard is False
     assert _H308.tile_config == (64, 256, 64, 256)
+    assert _H308.supported_tp_sizes == (12,)
+
+
+def test_profile_contract_rejects_unsupported_tp_size_before_loading() -> None:
+    _validate_profile_tp_size((_K2,), 8)
+    _validate_profile_tp_size((_K2, _H308), 12)
+
+    with pytest.raises(ValueError, match="legacy_3p08_k34 supports \\(12,\\)"):
+        _validate_profile_tp_size((_H308,), 8)
 
 
 def test_tp12_atom_partition_is_complete_and_pair_aligned() -> None:

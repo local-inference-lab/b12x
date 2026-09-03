@@ -1,8 +1,9 @@
 # W4A16 direct-table bulk-copy qualification on SM120 TP8
 
-Status: **qualified** for Kimi-K3 QSRT K2 layer-10 execution on one SM120
-GPU at TP8; **not deployed**. The qualification covers exact output identity,
-CUDA graph replay, and hot-cache latency for four and eight routed tokens.
+Status: **qualified** for exact output identity and CUDA graph replay on
+Kimi-K3 QSRT K2 layer 10 using one SM120 GPU at TP8; **not deployed**.
+Hot-cache latency values are independent observations, not paired performance
+qualification.
 
 ## Implementations
 
@@ -41,8 +42,10 @@ complete records, including every replay sample, are:
   reduction through CUDA graph replay. Checkpoint loading, weight preparation,
   compilation, graph capture, and 50 warmup replays are excluded.
 - Samples: 400 hot-cache replays per implementation and routed-token count.
-  Lower time is faster; ratios below are bulk-copy time divided by vector-copy
-  time.
+  The implementations ran in separate processes, with the vector-copy process
+  followed by the bulk-copy process. Lower time is faster; ratios below are
+  descriptive bulk-copy medians divided by vector-copy medians and do not
+  control for run-order drift.
 - Runtime image:
   `kimi-k3-production-issue75-dspark@sha256:bb9843ca63fe61b258077a3231a4136f143f942e259676225446df030afda767`.
 - GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition,
@@ -57,7 +60,8 @@ Each JSON artifact records its exact executable command. The shared arguments
 were:
 
 ```text
-/opt/venv/bin/python3 benchmarks/benchmark_qsrt_checkpoint_profiles.py \
+B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM=1 CUDA_VISIBLE_DEVICES=0 \
+  /opt/venv/bin/python3 benchmarks/benchmark_qsrt_checkpoint_profiles.py \
   --k2-checkpoint /mnt/models/Kimi-K3-QSRT-K2 \
   --profiles uniform_k2_coupled --tp-size 8 --tp-rank 0 --layer 10 \
   --tokens 4,8 --warmup 50 --replays 400 --cold-replays 0 \
@@ -66,10 +70,10 @@ were:
 
 ## Results
 
-| Routed tokens | Vector median | Bulk median | Bulk/vector | Reduction | Output SHA-256 equal |
-|---:|---:|---:|---:|---:|:---:|
-| 4 | 116.384 µs | 114.336 µs | 0.9824 | 1.76% | yes |
-| 8 | 171.680 µs | 167.600 µs | 0.9762 | 2.38% | yes |
+| Routed tokens | Vector median | Bulk median | Independent bulk/vector observation | Output SHA-256 equal |
+|---:|---:|---:|---:|:---:|
+| 4 | 116.384 µs | 114.336 µs | 0.9824 | yes |
+| 8 | 171.680 µs | 167.600 µs | 0.9762 | yes |
 
 For four routed tokens, the vector-copy p10/p90 interval was
 115.360/119.424 µs and the bulk-copy interval was 114.304/117.888 µs. For
@@ -88,10 +92,12 @@ bit-identical to its CUDA graph replay output.
 
 ## Conclusion and limitations
 
-The bulk-copy prologue preserves the real checkpoint output exactly and lowers
-the complete fused graph-replay median at both measured routed-token counts.
-This evidence qualifies the implementation for the stated SM120 TP8 layer
-contract.
+The bulk-copy prologue preserves the real checkpoint output exactly. Its
+independent process run recorded a lower complete fused graph-replay median at
+both routed-token counts, but the measurements do not isolate the copy
+mechanism from run-order drift. This evidence qualifies correctness and capture
+for the stated SM120 TP8 layer contract; a balanced or paired A/B is required
+for performance qualification.
 
 The benchmark uses one workstation-class GPU that also hosts a resident draft
 model process. It does not measure an eight-GPU serving step, request-level

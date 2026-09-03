@@ -100,6 +100,7 @@ class ProfileContract:
     format_code: int
     tile_config: tuple[int, int, int, int]
     coupled_hadamard: bool
+    supported_tp_sizes: tuple[int, ...]
 
 
 _K2 = ProfileContract(
@@ -112,6 +113,7 @@ _K2 = ProfileContract(
     format_code=0x44,
     tile_config=(128, 128, 128, 128),
     coupled_hadamard=True,
+    supported_tp_sizes=(8, 12),
 )
 _H308 = ProfileContract(
     label="legacy_3p08_k34",
@@ -126,6 +128,7 @@ _H308 = ProfileContract(
     format_code=0x33,
     tile_config=(64, 256, 64, 256),
     coupled_hadamard=False,
+    supported_tp_sizes=(12,),
 )
 _CONTRACTS = (_K2, _H308)
 _CONTRACT_BY_LABEL = {contract.label: contract for contract in _CONTRACTS}
@@ -213,6 +216,22 @@ def _parse_positive_list(value: str) -> tuple[int, ...]:
     ):
         raise argparse.ArgumentTypeError("batch sizes must be unique positive integers")
     return result
+
+
+def _validate_profile_tp_size(
+    contracts: Sequence[ProfileContract], tp_size: int
+) -> None:
+    incompatible = [
+        contract
+        for contract in contracts
+        if tp_size not in contract.supported_tp_sizes
+    ]
+    if incompatible:
+        details = ", ".join(
+            f"{contract.label} supports {contract.supported_tp_sizes}"
+            for contract in incompatible
+        )
+        raise ValueError(f"tensor-parallel size {tp_size} is incompatible: {details}")
 
 
 def _balanced_atom_partition(shard_count: int, shard_index: int) -> tuple[int, int]:
@@ -732,6 +751,11 @@ def main() -> None:
     args = _parse_args()
     if len(set(args.profiles)) != len(args.profiles):
         raise SystemExit("--profiles entries must be unique")
+    contracts = tuple(_CONTRACT_BY_LABEL[label] for label in args.profiles)
+    try:
+        _validate_profile_tp_size(contracts, args.tp_size)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.output is not None and args.output.expanduser().exists():
         raise SystemExit(f"refusing to overwrite benchmark result: {args.output}")
     if not 1 <= args.layer <= 92:
@@ -758,7 +782,6 @@ def main() -> None:
         raise SystemExit(f"SM120/SM121 is required, got SM{major}{minor}")
 
     torch.manual_seed(args.seed)
-    contracts = tuple(_CONTRACT_BY_LABEL[label] for label in args.profiles)
     profile_roots = {
         _K2.label: args.k2_checkpoint,
         _H308.label: args.legacy_checkpoint,
@@ -797,6 +820,12 @@ def main() -> None:
             "source_sha256": _source_sha256(),
             "worktree": str(Path(__file__).resolve().parents[1]),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "environment": {
+                "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": os.environ.get(
+                    "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM"
+                ),
+                "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            },
             "artifacts": artifact_provenance,
         },
         "contract": {
@@ -822,6 +851,7 @@ def main() -> None:
                     "trellis_bits": contract.trellis_bits,
                     "tile_config": list(contract.tile_config),
                     "coupled_hadamard": contract.coupled_hadamard,
+                    "supported_tp_sizes": list(contract.supported_tp_sizes),
                 }
                 for contract in contracts
             },

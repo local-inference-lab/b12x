@@ -1017,6 +1017,10 @@
     "command": "/opt/venv/bin/python3 benchmarks/benchmark_qsrt_checkpoint_profiles.py --k2-checkpoint /mnt/models/Kimi-K3-QSRT-K2 --profiles uniform_k2_coupled --tp-size 8 --tp-rank 0 --layer 10 --tokens 4,8 --warmup 50 --replays 400 --cold-replays 0 --bootstrap-replicates 100 --seed 20260904 --output benchmarks/results/w4a16_direct_table_bulk_copy_sm120_tp8.json",
     "commit": "ca02251b4ee41cfd343fcabf3a50d1d01b3e83df",
     "cuda_visible_devices": "0",
+    "environment": {
+      "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": "1",
+      "CUDA_VISIBLE_DEVICES": "0"
+    },
     "git_dirty": false,
     "source_sha256": "d012d17ac6a4af4b123fb6186ab2e8b6714fb12bb9662c136d160cc410921dbc",
     "worktree": "/home/g0san/src/local-inference-lab/wt-b12x-direct-t12-bulk-followup"
