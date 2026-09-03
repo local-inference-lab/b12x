@@ -2135,7 +2135,13 @@ def _side_resources(device: torch.device, windows: int) -> _SideResources:
                 "KDA prefill pipeline resources must be created by a warm run before CUDA graph capture"
             )
         if resources is None:
-            resources = _SideResources(stream=torch.cuda.Stream(device=device), events=[])
+            # Give the prepare stream higher priority so preparation for the
+            # following window can make progress while the persistent
+            # recurrence grid consumes the current window. The pipeline below
+            # makes each recurrence depend on its own completed prepare.
+            resources = _SideResources(
+                stream=torch.cuda.Stream(device=device, priority=-1), events=[]
+            )
             _SIDE[device.index] = resources
         current = torch.cuda.current_stream(device)
         while len(resources.events) < needed:
@@ -2150,9 +2156,9 @@ def run_prefill(
 ) -> None:
     """Launch the window pipeline: prologue, then prepare and recurrence per window.
 
-    Prepare launches run on a per-device side stream, recurrence launches on
-    the current stream. A window's recurrence overlaps its own prepare through
-    the ready flags; prepare of window ``w`` waits for the recurrence of window
+    Prepare launches run on a high-priority per-device side stream. Recurrence
+    for window ``w`` starts after prepare ``w`` completes, while prepare
+    ``w + 1`` may overlap recurrence ``w``. Prepare ``w`` waits for recurrence
     ``w - 2`` before reusing that workspace ring slot. Under stream capture the
     fork and join are recorded as graph dependencies.
     """
@@ -2169,19 +2175,30 @@ def run_prefill(
         prepared = resources.events[:launched]
         consumed = resources.events[launched : 2 * launched]
         run_prologue(binding, windows=launched)
-        # Enqueue window by window so every event is recorded before a stream
-        # waits on it (a wait binds to the event's most recent record).
         fork.record(main)
         side.wait_event(fork)
-        for window in range(launched):
+
+        def enqueue_prepare(window: int) -> None:
+            """Prepare one window after its ring slot is no longer in use."""
             with torch.cuda.stream(side):
                 if window >= 2:
                     side.wait_event(consumed[window - 2])
-                run_prepare(binding, lower_bound=lower_bound, scale=scale, eps=eps, window=window)
+                run_prepare(
+                    binding,
+                    lower_bound=lower_bound,
+                    scale=scale,
+                    eps=eps,
+                    window=window,
+                )
                 prepared[window].record(side)
+
+        enqueue_prepare(0)
+        for window in range(launched):
+            main.wait_event(prepared[window])
             run_recurrence(binding, window=window)
             consumed[window].record(main)
-        main.wait_event(prepared[launched - 1])
+            if window + 1 < launched:
+                enqueue_prepare(window + 1)
 
 
 def prewarm_binding(binding: Binding) -> None:
