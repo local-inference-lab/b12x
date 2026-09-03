@@ -708,6 +708,8 @@ class _MGPrefillServingCase:
 _MG_PREFILL_SERVING_CASES = (
     _MGPrefillServingCase("dsv4", "fp8", 16, 512, 1),
     _MGPrefillServingCase("dsv4", "fp8", 32, 512, 2),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 512, 1),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 512, 2),
     _MGPrefillServingCase("dsv4", "bf16", 16, 128, 1),
     _MGPrefillServingCase("dsv4", "bf16", 32, 128, 2),
     _MGPrefillServingCase("glm", "fp8", 16, 512, 1),
@@ -792,19 +794,21 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
 ) -> None:
     """Validate each typed-SMEM MG group-count/compute arm under live replay.
 
-    These eight nodes compile the exact production single-cache specializations:
-    DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each with ``mg_n_hg`` 1
-    and 2.  DSV4 BF16 uses two 64-candidate tiles; every 512-wide case uses eight.
+    These ten nodes compile the single-cache and dual-cache production
+    specializations: DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each
+    with ``mg_n_hg`` 1 and 2. DSV4 BF16 uses two 64-candidate tiles; every
+    512-wide main section uses eight.
     """
     device = require_b12x()
     rows = 2
 
-    if case.family == "dsv4":
+    has_extra = case.family == "dsv4-dual"
+    if case.family in ("dsv4", "dsv4-dual"):
         inputs = _make_inputs(
             rows=rows,
             heads=case.heads,
             main_width=case.topk,
-            extra_width=0,
+            extra_width=64 if has_extra else 0,
             per_token=True,
             device=device,
         )
@@ -813,6 +817,16 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             inputs.main_index_scenarios,
             inputs.main_length_scenarios,
         )
+        if has_extra:
+            assert inputs.extra_cache is not None
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            assert inputs.extra_index_scenarios is not None
+            assert inputs.extra_length_scenarios is not None
+            _poison_inactive_topk_tails(
+                inputs.extra_index_scenarios,
+                inputs.extra_length_scenarios,
+            )
         expected = tuple(_reference(inputs, scenario) for scenario in range(2))
         index_scenarios = inputs.main_index_scenarios
         length_scenarios = inputs.main_length_scenarios
@@ -929,10 +943,22 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
         "lse": lse_base2,
         "workspace": fixed_workspace,
     }
+    if has_extra:
+        assert case.family == "dsv4-dual"
+        assert inputs.extra_cache is not None
+        assert inputs.extra_indices is not None
+        assert inputs.extra_lengths is not None
+        stable_tensors.update(
+            {
+                "extra_cache": inputs.extra_cache,
+                "extra_indices": inputs.extra_indices,
+                "extra_lengths": inputs.extra_lengths,
+            }
+        )
     stable_ptrs = {name: tensor.data_ptr() for name, tensor in stable_tensors.items()}
 
     def launch() -> tuple[torch.Tensor, torch.Tensor]:
-        return run_unified_prefill(
+        kwargs = dict(
             q=live_q,
             kv_cache=kv_cache,
             topk_indices=live_indices,
@@ -944,6 +970,17 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             workspace=fixed_workspace,
             scale_format=scale_format,
         )
+        if has_extra:
+            assert inputs.extra_cache is not None
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            kwargs.update(
+                extra_kv_cache=inputs.extra_cache,
+                extra_indices=inputs.extra_indices,
+                extra_topk_length=inputs.extra_lengths,
+                extra_page_block_size=_PAGE_SIZE,
+            )
+        return run_unified_prefill(**kwargs)
 
     install(0)
     warm_output, warm_lse = launch()
@@ -967,6 +1004,18 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             expected_lengths=length_scenarios[scenario],
             topk=case.topk,
         )
+        if has_extra:
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            assert inputs.extra_index_scenarios is not None
+            assert inputs.extra_length_scenarios is not None
+            _assert_live_topk_contract(
+                live_indices=inputs.extra_indices,
+                live_lengths=inputs.extra_lengths,
+                expected_indices=inputs.extra_index_scenarios[scenario],
+                expected_lengths=inputs.extra_length_scenarios[scenario],
+                topk=64,
+            )
         assert {
             name: tensor.data_ptr() for name, tensor in stable_tensors.items()
         } == stable_ptrs
