@@ -127,19 +127,21 @@ Measured configuration: four DGX Spark GB10 nodes (`sm121a`, one GPU each,
 unified memory), both ConnectX-7 functions per node, RoCE v2 GID index 3, bf16,
 world size 4. Timing is CUDA events around one call, median over samples per
 rank, then the slowest rank; graph replay is the decode path. The receipt
-`docs/evidence/rocenante/20260902-4spark-bf16-standalone.json` (emitted by
+`docs/evidence/rocenante/20260903-4spark-bf16-standalone-00280f2.json` (emitted by
 `benchmarks/benchmark_roce_oneshot.py`) holds the command, source revision,
 worktree state, per-rank GPU identity, correctness results, raw samples, the
-executed arm order, and ratios with their direction.
+executed arm order, and ratios with their direction. The earlier receipt
+`20260902-4spark-bf16-standalone.json` (commit 3478415, before the fail-stop
+change) is kept for comparison: graph replay is within 1.3 us at every size.
 
 | Collective | NCCL | RoCEnante eager | RoCEnante, graph replay | NCCL / graph |
 |---|---|---|---|---|
-| all-reduce 8 KB | 51.3 us | 42.5 us | 15.5 us | 3.3 |
-| all-reduce 48 KB (6-token decode step) | 62.6 us | 48.8 us | 22.4 us | 2.8 |
-| all-reduce 256 KB | 159.9 us | 84.5 us | 56.9 us | 2.8 |
-| all-reduce 1 MB (128-token batch) | 908.4 us | 264.7 us | 238.6 us | 3.8 |
-| all-gather [6, 38720] logits shard | 342.7 us (incl. reshape copy) | 190.0 us | 95.5 us | 3.6 |
-| all-gather [96, 38720] (7.4 MB shard) | 1602.4 us | 1553.2 us | 1529.8 us | 1.05 |
+| all-reduce 8 KB | 52.6 us | 46.6 us | 16.8 us | 3.1 |
+| all-reduce 48 KB (6-token decode step) | 65.5 us | 52.8 us | 23.6 us | 2.8 |
+| all-reduce 256 KB | 174.3 us | 88.4 us | 58.3 us | 3.0 |
+| all-reduce 1 MB (128-token batch) | 899.2 us | 261.7 us | 238.9 us | 3.8 |
+| all-gather [6, 38720] logits shard | 337.3 us (incl. reshape copy) | 190.8 us | 96.9 us | 3.48 |
+| all-gather [96, 38720] (7.4 MB shard) | 1540.3 us | 1552.0 us | 1528.2 us | 1.01 |
 
 Correctness on the same run: bf16 sums within 6.8e-3 relative error of NCCL
 (float32 accumulation, rank-identical bits), all-gathers bit-exact, checked before
