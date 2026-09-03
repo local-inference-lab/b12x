@@ -25,6 +25,7 @@ META = OpMeta(
     group="sequence",
     api_style="planned",
     entry_points=(
+        "MetadataValidation",
         "QuantMode",
         "TableMemory",
         "TableStorage",
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        MetadataValidation,
         Plan,
         PleEmbeddingConfig,
         PleEmbeddingQuery,

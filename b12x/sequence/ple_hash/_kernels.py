@@ -100,11 +100,14 @@ def _request_ids_kernel(
     request_ids_ptr,
     error_code_ptr,
     MAX_TOKENS: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     token = tl.program_id(0)
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
     num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    valid_metadata = tl.full((), True, tl.int1)
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
     live = (token < num_tokens) & valid_metadata
 
     low = tl.zeros((), tl.int32)
@@ -165,12 +168,15 @@ def _hash_ids_kernel(
     MAX_ORDER: tl.constexpr,
     HEADS_PER_ORDER: tl.constexpr,
     HEAD_COUNT: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
     request = tl.load(request_ids_ptr + token).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    valid_metadata = tl.full((), True, tl.int1)
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
     live = (token < num_tokens) & (request >= 0) & valid_metadata
     query_start = tl.load(query_start_loc_ptr + request, mask=live, other=0).to(
         tl.int32
@@ -247,23 +253,25 @@ def _launch_hash_pipeline(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    validate_metadata: bool,
 ) -> None:
     """Launch fixed-capacity request mapping and hash kernels."""
     head_count = (max_order - 1) * heads_per_order
-    _reset_error_kernel[(1,)](error_code, num_warps=1)
-    _validate_metadata_kernel[(max(max_tokens, max_seqs),)](
-        token_ids,
-        query_start_loc,
-        committed_history,
-        num_seqs,
-        num_tokens,
-        error_code,
-        VOCAB_SIZE=vocab_size,
-        MAX_ORDER=max_order,
-        MAX_SEQS=max_seqs,
-        MAX_TOKENS=max_tokens,
-        num_warps=1,
-    )
+    if validate_metadata:
+        _reset_error_kernel[(1,)](error_code, num_warps=1)
+        _validate_metadata_kernel[(max(max_tokens, max_seqs),)](
+            token_ids,
+            query_start_loc,
+            committed_history,
+            num_seqs,
+            num_tokens,
+            error_code,
+            VOCAB_SIZE=vocab_size,
+            MAX_ORDER=max_order,
+            MAX_SEQS=max_seqs,
+            MAX_TOKENS=max_tokens,
+            num_warps=1,
+        )
     _request_ids_kernel[(max_tokens,)](
         query_start_loc,
         num_seqs,
@@ -271,6 +279,7 @@ def _launch_hash_pipeline(
         request_ids,
         error_code,
         MAX_TOKENS=max_tokens,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=1,
     )
     _hash_ids_kernel[(max_tokens, head_count)](
@@ -289,6 +298,7 @@ def _launch_hash_pipeline(
         MAX_ORDER=max_order,
         HEADS_PER_ORDER=heads_per_order,
         HEAD_COUNT=head_count,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=1,
     )
 
@@ -315,6 +325,7 @@ def _hash_pipeline_op(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    validate_metadata: bool,
 ) -> None:
     _launch_hash_pipeline(
         token_ids,
@@ -334,6 +345,7 @@ def _hash_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        validate_metadata,
     )
 
 
@@ -356,10 +368,12 @@ def _hash_pipeline_fake(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    validate_metadata: bool,
 ) -> None:
     del token_ids, query_start_loc, committed_history, num_seqs, num_tokens
     del multipliers, prime_sizes, table_offsets, out, request_ids, error_code
     del eos_token_id, vocab_size, max_order, heads_per_order, max_seqs, max_tokens
+    del validate_metadata
 
 
 def run_hash_kernel(binding: Binding) -> None:
@@ -383,6 +397,7 @@ def run_hash_kernel(binding: Binding) -> None:
         caps.heads_per_order,
         caps.max_seqs,
         caps.max_tokens,
+        caps.metadata_validation == "transactional",
     )
 
 

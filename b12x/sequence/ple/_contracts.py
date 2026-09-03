@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -18,6 +19,8 @@ from b12x._lib.scratch_layout import (
 from b12x.policy import PolicyContext, get_auto_policy
 
 from ._policy import PLE_POLICY, PleQuery
+
+MetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -123,7 +126,12 @@ def _require_mutation_alias_contract(
 
 @dataclass(frozen=True, kw_only=True)
 class LayerCaps:
-    """Capacity contract for the stateful PLE residual contribution."""
+    """Capacity contract for the stateful PLE residual contribution.
+
+    ``metadata_validation="trusted"`` removes device validation and requires
+    the caller to guarantee packed boundaries, decode lengths, accepted-token
+    counts, and exclusive ownership of every nonnegative state slot.
+    """
 
     device: torch.device | str
     mode: str
@@ -136,6 +144,7 @@ class LayerCaps:
     kernel_size: int
     dilation: int
     dtype: torch.dtype = torch.bfloat16
+    metadata_validation: MetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -168,6 +177,11 @@ class LayerCaps:
         if self.dtype != torch.bfloat16:
             raise TypeError(
                 f"PLE layer currently requires torch.bfloat16, got {self.dtype}"
+            )
+        if self.metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.metadata_validation!r}"
             )
 
     @property
@@ -540,6 +554,7 @@ def run_mixed(binding: LayerBinding, *, eps: float) -> torch.Tensor:
 
 
 __all__ = [
+    "MetadataValidation",
     "LayerCaps",
     "LayerPlan",
     "LayerBinding",

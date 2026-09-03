@@ -7,6 +7,7 @@ from ._contracts import (
     LayerBinding as Binding,
     LayerCaps as Caps,
     LayerPlan as Plan,
+    MetadataValidation,
     bind_layer as bind,
     plan_layer as plan,
     run_decode,
@@ -22,6 +23,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "MetadataValidation",
     "Caps",
     "Plan",
     "Binding",

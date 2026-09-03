@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -20,6 +21,7 @@ from ._policy import PLE_HASH_POLICY, PleHashQuery
 from .reference import is_prime_64, ple_multipliers, ple_table_geometry
 
 _SIGNED_INT64_MAX = (1 << 63) - 1
+MetadataValidation = Literal["transactional", "trusted"]
 
 
 def _canonical_device(device: torch.device | str) -> torch.device:
@@ -93,6 +95,8 @@ class Caps:
     ``max_tokens`` and ``max_seqs`` are serving capacities and therefore part
     of the compile/cache identity. ``dense_layer_ordinal`` is the zero-based
     ordinal among PLE-enabled layers, not the decoder layer index.
+    ``metadata_validation="trusted"`` removes device validation and requires
+    the caller to guarantee all packed-metadata invariants.
     """
 
     device: torch.device | str
@@ -105,6 +109,7 @@ class Caps:
     dense_layer_ordinal: int
     base_table_size: int
     table_alignment: int = 128
+    metadata_validation: MetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -133,6 +138,11 @@ class Caps:
                 f"eos_token_id must be in [0, {self.vocab_size}), got {eos_token_id}"
             )
         object.__setattr__(self, "eos_token_id", eos_token_id)
+        if self.metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.metadata_validation!r}"
+            )
 
     @property
     def head_count(self) -> int:
@@ -432,4 +442,12 @@ def run(binding: Binding) -> torch.Tensor:
     return binding.out
 
 
-__all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run"]
+__all__ = [
+    "MetadataValidation",
+    "Caps",
+    "Plan",
+    "Binding",
+    "plan",
+    "bind",
+    "run",
+]

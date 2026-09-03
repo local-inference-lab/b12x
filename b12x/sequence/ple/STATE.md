@@ -51,14 +51,20 @@ A `state_slot_ids[r]` value of `-1` is a dummy sink for CUDA-graph padding. Its
 tokens produce zero output and no state mutation. Other negative values and
 values at or above `max_state_slots` are invalid.
 
-`run_decode`, `run_prefill`, and `run_mixed` reset and then populate
-`binding.error_code`, a one-element device `int32` scratch view. A nonzero code
-means the entire launch wrote zero output and did not mutate state. The masks
-are `1` for capacity metadata, `2` for packed-query boundaries, `4` for decode
-query length, `8` for accepted-token count, and `16` for state-slot ID. Serving
-integrations must inspect this value after stream or graph completion and treat
-any nonzero value as fatal.
-The additional mask `32` reports duplicate nonnegative live state-slot IDs.
+The default `metadata_validation="transactional"` mode makes `run_decode`,
+`run_prefill`, and `run_mixed` reset and populate `binding.error_code`, a
+one-element device `int32` scratch view. A nonzero code means the entire launch
+wrote zero output and did not mutate state. The masks are `1` for capacity
+metadata, `2` for packed-query boundaries, `4` for decode query length, `8` for
+accepted-token count, `16` for state-slot ID, and `32` for duplicate
+nonnegative live state-slot IDs. Transactional integrations must inspect this
+value after stream or graph completion and treat any nonzero value as fatal.
+
+The opt-in `metadata_validation="trusted"` mode performs neither the validation
+transaction nor any access to `binding.error_code`. The caller must guarantee
+the same capacity, packed-query, decode-length, accepted-token, state-slot
+range, and state-slot exclusivity invariants before launch. The error-code
+contents are not meaningful in trusted mode.
 
 Norm weights bind as flat `[streams * hidden_size]` tensors. A checkpoint
 depthwise-convolution weight shaped

@@ -7,6 +7,7 @@ from . import META
 from ._contracts import (
     Binding,
     Caps,
+    MetadataValidation,
     Plan,
     QuantMode,
     TableMemory,
@@ -24,6 +25,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "MetadataValidation",
     "QuantMode",
     "TableMemory",
     "TableStorage",
