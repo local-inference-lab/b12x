@@ -35,11 +35,12 @@ from b12x._lib.intrinsics import (
     fmax_f32,
     f16_mma_m16n8k16_f32,
     f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+    cp_async_bulk_g2s_mbar,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     fp8x4_e4m3_to_half2x2,
-    half2_to_float2_scaled,
     get_ptr_as_int64,
     half2_mul,
+    half2_to_float2_scaled,
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_v4_f32,
@@ -6415,6 +6416,10 @@ class W4A16FusedMoeKernel:
                 cute.struct.MemRange[cutlass.Uint32, self.shared_words],
                 1024,
             ]
+            direct_copy_mbar: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint64, 1],
+                16,
+            ]
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
@@ -6426,13 +6431,31 @@ class W4A16FusedMoeKernel:
         fc1_phase_lut_addr = fc1_trellis_lut_addr
         fc2_phase_lut_addr = fc2_trellis_lut_addr
         if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
-            self._sqg_smem_copy(
-                fc1_trellis_lut_addr,
-                smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
-                self.sqg_xor_cheb_t12_smem_region_bytes,
-                tid,
-            )
-            cute.arch.sync_threads()
+            if cutlass.const_expr(self.sqg_xor_cheb_t12_direct_smem):
+                direct_copy_mbar = storage.direct_copy_mbar.data_ptr()
+                if tid == Int32(0):
+                    cute.arch.mbarrier_init(direct_copy_mbar, Int32(1))
+                cute.arch.barrier()
+                if tid == Int32(0):
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        direct_copy_mbar,
+                        Int32(self.sqg_xor_cheb_t12_smem_region_bytes),
+                    )
+                    cp_async_bulk_g2s_mbar(
+                        smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
+                        fc1_trellis_lut_addr,
+                        Int32(self.sqg_xor_cheb_t12_smem_region_bytes),
+                        shared_ptr_to_u32(direct_copy_mbar),
+                    )
+                cute.arch.mbarrier_wait(direct_copy_mbar, phase=0)
+            else:
+                self._sqg_smem_copy(
+                    fc1_trellis_lut_addr,
+                    smem_base + Int32(self.sqg_xor_cheb_t12_smem_off),
+                    self.sqg_xor_cheb_t12_smem_region_bytes,
+                    tid,
+                )
+                cute.arch.sync_threads()
             table_addr = Int64(
                 smem_base + Int32(self.sqg_xor_cheb_t12_smem_off)
             )
