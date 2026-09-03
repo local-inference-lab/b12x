@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from collections.abc import Callable
 
@@ -72,6 +73,25 @@ def test_compressed_sparse_mla_layout_rejects_short_page() -> None:
             page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
             name="cache",
         )
+
+
+@pytest.mark.parametrize("page_size", [16, 64, 256])
+def test_compressed_sparse_mla_layout_accepts_compact_nvfp4_pages(
+    page_size: int,
+) -> None:
+    _validate_compressed_cache_layout(
+        torch.empty((2, page_size * 432), dtype=torch.uint8),
+        page_size=page_size,
+        name="cache",
+        record_bytes=432,
+    )
+
+
+def test_compressed_sparse_mla_exposes_native_nvfp4_contract() -> None:
+    signature = inspect.signature(compressed_sparse_mla_decode_forward)
+
+    assert signature.parameters["cache_record_bytes"].default == 584
+    assert signature.parameters["latent_scale"].default == 1.0
 
 
 @pytest.mark.parametrize(
