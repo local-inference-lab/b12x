@@ -30,10 +30,13 @@ from torch.distributed import ProcessGroup
 
 from . import _allgather_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher, is_launcher_prepared
-from ._proxy import Layout, Proxy
+from ._proxy import Layout, Proxy, load as _load_proxy_library
 
 logger = logging.getLogger(__name__)
 
+# Bumped when the adapter-visible surface (constructor keywords, methods, their
+# semantics) changes incompatibly; integrations pin the value they were built for.
+API_VERSION = 1
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 SUPPORTED_WORLD_SIZES = tuple(range(2, 17))
 DEFAULT_MAX_SIZE = 2 * 1024 * 1024
@@ -176,6 +179,10 @@ class RoceOneshotAllReduce:
         self._lock = threading.Lock()
         self._proxy: Optional[Proxy] = None
         self._gather_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._align_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._stream_event = torch.cuda.Event()
+        self._last_stream: Optional[torch.cuda.Stream] = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         if self.world_size not in SUPPORTED_WORLD_SIZES:
             raise ValueError(
                 f"unsupported RoCE all-reduce world size {self.world_size}; "
@@ -246,8 +253,30 @@ class RoceOneshotAllReduce:
         except Exception as exc:  # noqa: BLE001 - reported collectively below
             error = str(exc)
             blob = b""
-        statuses = _exchange((error, blob), exchange_group)
+        # Every rank publishes the configuration the protocol depends on; the
+        # ranks must agree exactly, and all of them see the same verdict.
+        config = {
+            "api_version": API_VERSION,
+            "proxy_abi": _load_proxy_library().roce_abi_version() if error is None else None,
+            "world_size": self.world_size,
+            "hca_count": len(self.hca_names),
+            "slot_bytes": slot_bytes,
+            "slots": self._layout.slots,
+            "flag_stride": self._layout.flag_stride,
+            "max_size": self.max_size,
+            "max_gather_bytes": self.max_gather_bytes,
+            "spin_limit": self.spin_limit,
+            "threads": self._threads,
+            "blocks": self._blocks,
+        }
+        statuses = _exchange((error, blob, config), exchange_group)
         failures = [f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None]
+        if not failures:
+            reference = statuses[0][2]
+            for i, s in enumerate(statuses):
+                differing = {k: (reference[k], s[2].get(k)) for k in reference if s[2].get(k) != reference[k]}
+                if differing:
+                    failures.append(f"rank {i} configuration differs from rank 0: {differing}")
         if failures:
             self.close()
             raise RuntimeError("RoCE all-reduce setup failed: " + "; ".join(failures))
@@ -323,15 +352,18 @@ class RoceOneshotAllReduce:
         return False
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
-        """Eligible: contiguous, 16-byte-aligned CUDA tensor of a supported dtype within ``max_size``."""
+        """Eligible: contiguous CUDA tensor of a supported dtype, 16-byte total size within ``max_size``.
+
+        The decision depends only on dtype, shape, contiguity and size, which
+        tensor-parallel ranks share, never on the pointer value; a closed runtime
+        raises rather than declining, so no rank can silently fall back alone.
+        """
+
         if self._closed or self._proxy is None:
-            return False
+            raise RuntimeError("RoCE runtime is closed")
         if inp.dtype not in SUPPORTED_DTYPES or not inp.is_cuda:
             return False
         if inp.device != self.device or not inp.is_contiguous():
-            return False
-        # The kernel moves 16-byte packs, so the buffer must be pack-aligned.
-        if inp.data_ptr() % PACK_BYTES != 0:
             return False
         nbytes = inp.numel() * inp.element_size()
         return 0 < nbytes <= self.max_size and nbytes % PACK_BYTES == 0
@@ -371,18 +403,25 @@ class RoceOneshotAllReduce:
             self.device.index,
         )
 
-    def prepare(self, dtypes: Sequence[torch.dtype] = (torch.bfloat16,)) -> None:
-        """Compile the launchers for ``dtypes`` and allocate the all-gather scratch.
+    def prepare(
+        self, dtypes: Sequence[torch.dtype] = (torch.bfloat16,), *, padded_gather: bool = False
+    ) -> None:
+        """Compile the launchers for ``dtypes`` and allocate scratch ahead of capture.
 
-        Call it before CUDA graph capture: compilation and the scratch
-        allocation are refused inside a capture.
+        Always allocates the two ``max_size`` alignment buffers.  The padded
+        all-gather scratch (``max_gather_bytes`` plus ``world_size`` times that)
+        is allocated only with ``padded_gather=True`` or on first eager use, so
+        a workload whose shards have 16-byte rows never pays for it.
+        Compilation and allocation are refused inside a capture.
         """
 
         with torch.cuda.device(self.device):
             for dtype in dtypes:
                 get_launcher(*self._launcher_key(dtype))
             _allgather_cute.get_launcher(*self._gather_launcher_key())
-            self._gather_scratch(PACK_BYTES)
+            self._aligned_scratch(0, self._region[:PACK_BYTES])
+            if padded_gather:
+                self._gather_scratch(PACK_BYTES)
 
     def prepare_graph_all_reduce(self, inp: torch.Tensor, *, stream: object = None) -> None:
         """Compile the launcher for ``inp.dtype`` ahead of CUDA graph capture."""
@@ -401,26 +440,30 @@ class RoceOneshotAllReduce:
     ) -> torch.Tensor:
         """Sum ``inp`` across ranks into ``out`` (allocated like ``inp`` when omitted).
 
-        Admission through kernel enqueue holds the lifecycle lock, so ``close``
-        cannot release the proxy while a collective is being launched.  Without
-        ``out`` the output comes from the caller's allocator; under CUDA graph
-        capture that is the graph's private pool, which replays at a fixed
-        address.  The launcher for ``inp.dtype`` must already be compiled
-        (``prepare``) when capturing.
+        Eligibility (``should_allreduce``) depends only on dtype, shape and size,
+        so every tensor-parallel rank takes the same decision; a pointer that is
+        not 16-byte aligned is staged through runtime scratch instead of being
+        rejected.  A poisoned runtime (a previous wait timed out) raises here
+        before anything is launched: a failed collective is fatal, never a
+        fallback.  Admission through kernel enqueue holds the lifecycle lock so
+        ``close`` cannot release the proxy meanwhile.  Launches on different
+        streams are ordered with an event; under CUDA graph capture every
+        collective must be captured on one stream.  Without ``out`` the output
+        comes from the caller's allocator; under capture that is the graph's
+        private pool, which replays at a fixed address.
         """
 
         with self._lock:
+            self.check_health()
             if not self.should_allreduce(inp):
                 raise ValueError("input is not eligible for the RoCE one-shot all-reduce")
-            if out is None:
-                out = torch.empty_like(inp)
-            elif (
+            if out is not None and (
                 out.shape != inp.shape
                 or out.dtype != inp.dtype
+                or out.device != inp.device
                 or not out.is_contiguous()
-                or out.data_ptr() % PACK_BYTES != 0
             ):
-                raise ValueError("out must be a contiguous, 16-byte-aligned tensor matching the input")
+                raise ValueError("out must be a contiguous tensor on the input's device matching the input")
             key = self._launcher_key(inp.dtype)
             nbytes = inp.numel() * inp.element_size()
             context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
@@ -432,9 +475,17 @@ class RoceOneshotAllReduce:
                         "RoCE all-reduce launcher must be prepared before CUDA graph capture"
                     )
                 launcher = get_launcher(*key)
+                if out is None:
+                    out = torch.empty_like(inp)
+                src = inp
+                if inp.data_ptr() % PACK_BYTES != 0:
+                    src = self._aligned_scratch(0, inp)
+                    src.copy_(inp)
+                dst = out if out.data_ptr() % PACK_BYTES == 0 else self._aligned_scratch(1, out)
+                self._order_stream(capturing)
                 launcher(
-                    inp.data_ptr(),
-                    out.data_ptr(),
+                    src.data_ptr(),
+                    dst.data_ptr(),
                     nbytes // PACK_BYTES,
                     nbytes,
                     self._recv_base,
@@ -446,9 +497,60 @@ class RoceOneshotAllReduce:
                     self.spin_limit,
                     self._blocks,
                 )
+                if dst is not out:
+                    out.copy_(dst)
+                self._mark_stream(capturing)
         if not capturing:
             self.check_health()
         return out
+
+    def _aligned_scratch(self, which: int, like: torch.Tensor) -> torch.Tensor:
+        """16-byte-aligned device scratch shaped like ``like`` (input 0, output 1).
+
+        Allocated by ``prepare`` (two ``max_size`` buffers); a first use under
+        CUDA graph capture is refused.
+        """
+
+        if self._align_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "RoCE all-reduce alignment scratch must be allocated before CUDA graph "
+                    "capture; call prepare() first"
+                )
+            self._align_buffers = (
+                torch.empty(self.max_size, dtype=torch.uint8, device=self.device),
+                torch.empty(self.max_size, dtype=torch.uint8, device=self.device),
+            )
+        nbytes = like.numel() * like.element_size()
+        return self._align_buffers[which][:nbytes].view(like.dtype).view(like.shape)
+
+    def _order_stream(self, capturing: bool) -> None:
+        """Make the current stream wait for the previous collective's stream.
+
+        The runtime has one epoch, one doorbell and two transport slots, so
+        collectives must execute in launch order even across streams.  Under
+        capture no event is used: every collective must be on the capture
+        stream, which keeps the graph's own ordering.
+        """
+
+        current = torch.cuda.current_stream(self.device)
+        if capturing:
+            if self._capture_stream is None:
+                self._capture_stream = current
+            elif current != self._capture_stream:
+                raise RuntimeError("RoCE collectives must all be captured on one stream")
+            return
+        if self._last_stream is not None and current != self._last_stream:
+            current.wait_event(self._stream_event)
+
+    def _mark_stream(self, capturing: bool) -> None:
+        """Record the ordering event on the current stream after a launch."""
+
+        if capturing:
+            return
+        current = torch.cuda.current_stream(self.device)
+        self._stream_event.record(current)
+        self._last_stream = current
 
     def check_health(self) -> None:
         """Raise if the proxy thread died or a kernel wait timed out.
@@ -463,10 +565,17 @@ class RoceOneshotAllReduce:
         if failed_seq != 0:
             peer = int(self._ctrl_words[3].item())
             raise RuntimeError(
-                f"RoCE all-reduce on rank {self.rank} timed out waiting for rank {peer} "
-                f"at sequence {failed_seq}; that rank's proxy or kernel is dead "
-                "(rank data is no longer trustworthy)"
+                f"RoCE collective on rank {self.rank} timed out waiting for rank {peer} "
+                f"at sequence {failed_seq}; the runtime is poisoned (its epoch stopped at "
+                f"{failed_seq - 1}, later launches do nothing) and rank data is no "
+                "longer trustworthy"
             )
+
+    @property
+    def poisoned(self) -> bool:
+        """True once a wait timed out or the proxy failed; the runtime cannot be reused."""
+
+        return (self._proxy is not None and self._proxy.failed()) or int(self._error_word.item()) != 0
 
     # -- all-gather ---------------------------------------------------------------
 
@@ -485,7 +594,9 @@ class RoceOneshotAllReduce:
         forces a fallback to another backend.
         """
 
-        if self._closed or self._proxy is None or not inp.is_cuda or inp.dim() == 0:
+        if self._closed or self._proxy is None:
+            raise RuntimeError("RoCE runtime is closed")
+        if not inp.is_cuda or inp.dim() == 0:
             return False
         if inp.device != self.device or not inp.is_contiguous():
             return False
@@ -521,17 +632,24 @@ class RoceOneshotAllReduce:
         """
 
         with self._lock:
+            self.check_health()
             if not self.should_all_gather(inp, dim):
                 raise ValueError("input is not eligible for the RoCE all-gather")
             dim = self._normalize_dim(inp, dim)
             shape = list(inp.shape)
             shape[dim] *= self.world_size
             if out is not None and (
-                list(out.shape) != shape or out.dtype != inp.dtype or not out.is_contiguous()
+                list(out.shape) != shape
+                or out.dtype != inp.dtype
+                or out.device != inp.device
+                or not out.is_contiguous()
             ):
-                raise ValueError("out must be a contiguous tensor of the gathered shape")
+                raise ValueError("out must be a contiguous tensor on the input's device of the gathered shape")
             context = torch.cuda.stream(stream) if stream is not None else _nullcontext()
             with torch.cuda.device(self.device), context:
+                capturing = torch.cuda.is_current_stream_capturing()
+                # Both paths stage the shard contiguously and only the reader is
+                # strided, so ranks may take different paths for one collective.
                 direct = self._direct_gather_layout(inp, dim) and (
                     out is None or out.data_ptr() % PACK_BYTES == 0
                 )
@@ -544,18 +662,22 @@ class RoceOneshotAllReduce:
                         if dim == 0
                         else (inp.shape[-1] * inp.element_size()) // PACK_BYTES
                     )
+                    self._order_stream(capturing)
                     self._launch_gather(inp.data_ptr(), out.data_ptr(), nbytes, row_packs)
+                    self._mark_stream(capturing)
                     return out
-                # General path: pad each shard to a whole number of packs, gather
+                # Padded path: pad each shard to a whole number of packs, gather
                 # contiguously into fixed scratch, then let torch produce the
                 # requested layout.
                 nbytes = inp.numel() * inp.element_size()
                 padded = _align_up(nbytes, PACK_BYTES)
                 staged, gathered = self._gather_scratch(padded)
                 staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
+                self._order_stream(capturing)
                 self._launch_gather(
                     staged.data_ptr(), gathered.data_ptr(), padded, padded // PACK_BYTES
                 )
+                self._mark_stream(capturing)
                 stacked = (
                     gathered.view(self.world_size, padded)[:, :nbytes]
                     .reshape(-1)
@@ -571,15 +693,16 @@ class RoceOneshotAllReduce:
     def _gather_scratch(self, padded: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Fixed device scratch for the padded all-gather path, allocated once.
 
-        ``prepare`` allocates it; a first use under CUDA graph capture is
-        refused so a captured graph never owns the scratch.
+        ``prepare(padded_gather=True)`` or the first eager padded gather
+        allocates it; a first use under CUDA graph capture is refused so a
+        captured graph never owns the scratch.
         """
 
         if self._gather_buffers is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "RoCE all-gather scratch must be allocated before CUDA graph capture; "
-                    "call prepare() first"
+                    "call prepare(padded_gather=True) first"
                 )
             capacity = _align_up(self.max_gather_bytes, PACK_BYTES)
             self._gather_buffers = (
@@ -618,8 +741,21 @@ class RoceOneshotAllReduce:
 
     @contextmanager
     def capture(self, stream: object = None, *, channel_id: Optional[str] = None):
-        """Context manager for CUDA graph capture; the launchers must already be prepared."""
-        yield self
+        """Context manager for CUDA graph capture; the launchers must already be prepared.
+
+        The cross-stream ordering event is dropped for the capture: an event
+        recorded outside a capture must not be waited on inside one, and
+        ``torch.cuda.graph`` has already synchronized the device before the
+        capture began.  Inside, every collective must use one stream.
+        """
+
+        self._last_stream = None
+        self._capture_stream = None
+        try:
+            yield self
+        finally:
+            self._capture_stream = None
+            self._last_stream = None
 
     # -- diagnostics / lifecycle --------------------------------------------------
 

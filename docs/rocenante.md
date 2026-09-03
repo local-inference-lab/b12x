@@ -41,7 +41,8 @@ and a control record. One kernel launch per collective:
    decides the actual delay) so an idle runtime does not hold a core; the
    catch-up keeps the protocol correct however long the thread is away;
 3. wait on `flag[peer][seq & 1] == seq` for every peer (bounded; a timeout
-   records the missing peer and the host raises instead of hanging);
+   records the missing peer, the kernel skips its data phase and keeps the
+   epoch, later launches do nothing, and the host raises: see Contract);
 4. all-reduce: sum the local input and every peer slot in fixed rank order, so
    all ranks produce bit-identical output; all-gather: strided copy that writes
    the concatenated layout directly (dim 0 or last dim);
@@ -57,8 +58,10 @@ pass the wait before a slower block has staged).
 
 `AllReduce.from_exchange_group(exchange_group=<gloo group>, device=..., max_size=,
 max_gather_bytes=)` mirrors `comm.pcie.AllReduce`: `should_allreduce`,
-`all_reduce`, `should_all_gather`, `all_gather(inp, dim=)`, `prepare(dtypes)`
-(compile before graph capture), `for_stream`, `capture`, `check_health`, `close`.
+`all_reduce`, `should_all_gather`, `all_gather(inp, dim=)`,
+`prepare(dtypes, padded_gather=)` (compile and allocate before graph capture),
+`for_stream`, `capture`, `check_health`, `poisoned`, `close`. `API_VERSION` is
+bumped on incompatible surface changes; integrations pin the value they target.
 Exchange setup over a CPU (gloo) group: using a torch NCCL group would create a
 torch NCCL communicator costing about 3.4 GB of unified memory per rank.
 
@@ -66,8 +69,57 @@ Environment: `B12X_ROCE_HCA` (falls back to `NCCL_IB_HCA`), `B12X_ROCE_GID_INDEX
 (falls back to `NCCL_IB_GID_INDEX`, default 3), `B12X_ROCE_SPIN_LIMIT`,
 `B12X_ROCE_CACHE_DIR` (where the proxy .so is built with the host C compiler).
 
-Constraints: 2 to 16 ranks, one collective in flight per runtime (single stream),
-integrated GPU with unified addressing, active RDMA devices.
+Constraints: 2 to 16 ranks, one collective in flight per runtime, integrated
+GPU with unified addressing, active RDMA devices.
+
+## Contract
+
+**Eligibility is rank-invariant.** `should_allreduce` and `should_all_gather`
+decide from dtype, shape, contiguity and byte size only, which tensor-parallel
+ranks share; a pointer that is not 16-byte aligned is staged through runtime
+scratch rather than declined, and strides are part of the contract (a
+non-contiguous tensor is declined on every rank alike). A closed runtime raises
+instead of declining, so no rank can fall back to another backend alone. Both
+gather paths stage the shard contiguously and only the reader is strided, so
+ranks may take different paths for the same collective.
+
+**Configuration is checked at setup.** Every rank publishes its API version,
+proxy ABI, HCA count, slot geometry, size limits, spin limit and launch geometry
+in the setup exchange; any difference fails construction on every rank.
+
+**Failures are fail-stop, never a fallback.** A wait that exceeds the spin limit
+records the sequence and the missing peer in the control record; the kernel
+skips its data phase and does not advance the epoch, so every later launch on
+that rank is a no-op. `check_health` raises from then on, before any further
+launch and whenever the integration calls it. The integration calls it after
+each step's own device-to-host synchronization (vLLM copies the sampled tokens
+to the host every step), so no extra synchronization is added and the step's
+output never leaves the worker. Inside the step, kernels after the failed
+collective do consume its output, inside a worker that is about to exit. Ranks
+converge without a supervisor: a rank that stops posting starves its peers'
+next wait, so each peer times out and poisons itself within one spin limit,
+including the asymmetric case where one rank received every flag and advanced
+while another timed out. Choose the spin limit as the failure-detection latency
+(`B12X_ROCE_SPIN_LIMIT`, about a microsecond per poll; the default 20M is about
+half a minute); it must exceed the longest legitimate rank skew, which for
+tensor-parallel decode is milliseconds.
+
+**Streams.** Collectives on different streams are ordered with an event
+recorded under the admission lock, so they execute in launch order; inside a
+CUDA graph capture every collective must use the capture stream.
+
+**Memory.** The pinned transport region is `world_size x 2` receive slots plus
+2 send slots of `max(max_size, max_gather_bytes)` bytes each, plus flags: 160 MB
+for four ranks at the 16 MB gather limit, 576 MB for sixteen. `prepare`
+allocates two `max_size` alignment buffers; the padded-gather scratch
+(`max_gather_bytes x (world_size + 1)`) is allocated only by
+`prepare(padded_gather=True)` or the first eager padded gather, so a workload
+with 16-byte-aligned rows never pays for it.
+
+**Native proxy.** `_roce_proxy.c` is compiled once per source hash with the host
+C compiler into `B12X_ROCE_CACHE_DIR` (default `~/.cache/b12x/roce`); it needs a
+C compiler and the libibverbs headers. Serving images build it at image build
+time (one import in the Dockerfile) so no compiler runs at startup.
 
 ## Results
 
@@ -119,8 +171,11 @@ adapter is supported once #597 merges, and no other integration is.
 ## Tests and benchmark
 
 `tests/comm/test_roce_oneshot_gpu.py` (torchrun, 2+ nodes): NCCL parity,
-bit-identical ranks, dtype/shape eligibility, dim-0/last-dim/unaligned gathers,
-CUDA-graph replay mixing both collectives. `benchmarks/benchmark_roce_oneshot.py`
+bit-identical ranks, dtype/shape eligibility and unaligned staging, dim-0/
+last-dim/padded gathers, CUDA-graph replay mixing both collectives, the exact
+adapter call pattern replayed with stable addresses, alternating eager streams,
+a proxy that misses a doorbell, and fault injection (a stopped proxy) in eager
+and graph mode checking the fail-stop contract on every rank. `benchmarks/benchmark_roce_oneshot.py`
 times both collectives against NCCL.
 
 ## Unsupported

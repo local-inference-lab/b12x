@@ -32,18 +32,8 @@
     "dcp_size": 0,
     "metrics_available": true,
     "metrics_warning": "",
-    "concurrency_levels": [
-      1,
-      2,
-      4,
-      8,
-      16
-    ],
-    "context_lengths": [
-      0,
-      16384,
-      32768
-    ],
+    "concurrency_levels": [1, 2, 4, 8, 16],
+    "context_lengths": [0, 16384, 32768],
     "startup_diagnostics_available": true,
     "nvidia_p2p_override_effective": false,
     "p2pmark_status": "not_run",
@@ -464,13 +454,7 @@
       "server_spec_drafts": 463,
       "server_spec_draft_tokens": 2315,
       "server_spec_accepted_tokens": 824,
-      "server_spec_pos_accept": [
-        0.7279,
-        0.5032,
-        0.2743,
-        0.1771,
-        0.0972
-      ],
+      "server_spec_pos_accept": [0.7279, 0.5032, 0.2743, 0.1771, 0.0972],
       "server_engine_steps": 463.0,
       "server_steps_per_s": 15.463311448113359,
       "server_accept_len_effective": 2.777537796976242,
@@ -587,13 +571,7 @@
       "server_spec_drafts": 447,
       "server_spec_draft_tokens": 2235,
       "server_spec_accepted_tokens": 714,
-      "server_spec_pos_accept": [
-        0.7069,
-        0.4362,
-        0.2528,
-        0.1253,
-        0.0761
-      ],
+      "server_spec_pos_accept": [0.7069, 0.4362, 0.2528, 0.1253, 0.0761],
       "server_engine_steps": 447.0,
       "server_steps_per_s": 14.92986063644962,
       "server_accept_len_effective": 2.5906040268456376,
@@ -710,13 +688,7 @@
       "server_spec_drafts": 446,
       "server_spec_draft_tokens": 2230,
       "server_spec_accepted_tokens": 760,
-      "server_spec_pos_accept": [
-        0.6749,
-        0.4484,
-        0.2982,
-        0.1726,
-        0.1099
-      ],
+      "server_spec_pos_accept": [0.6749, 0.4484, 0.2982, 0.1726, 0.1099],
       "server_engine_steps": 448.0,
       "server_steps_per_s": 14.947921898666667,
       "server_accept_len_effective": 2.6964285714285716,
@@ -869,13 +841,7 @@
       "server_spec_drafts": 677,
       "server_spec_draft_tokens": 3385,
       "server_spec_accepted_tokens": 1126,
-      "server_spec_pos_accept": [
-        0.7134,
-        0.4668,
-        0.26,
-        0.1477,
-        0.0753
-      ],
+      "server_spec_pos_accept": [0.7134, 0.4668, 0.26, 0.1477, 0.0753],
       "server_engine_steps": 677.0,
       "server_steps_per_s": 22.593777452299108,
       "server_accept_len_effective": 2.6602658788774005,
@@ -1052,13 +1018,7 @@
       "server_spec_drafts": 1118,
       "server_spec_draft_tokens": 5590,
       "server_spec_accepted_tokens": 1877,
-      "server_spec_pos_accept": [
-        0.7084,
-        0.4624,
-        0.2809,
-        0.1538,
-        0.0733
-      ],
+      "server_spec_pos_accept": [0.7084, 0.4624, 0.2809, 0.1538, 0.0733],
       "server_engine_steps": 1118.0,
       "server_steps_per_s": 37.344224492647555,
       "server_accept_len_effective": 2.676207513416816,
@@ -1307,13 +1267,7 @@
       "server_spec_drafts": 1473,
       "server_spec_draft_tokens": 7365,
       "server_spec_accepted_tokens": 2382,
-      "server_spec_pos_accept": [
-        0.6918,
-        0.4467,
-        0.2587,
-        0.1466,
-        0.0733
-      ],
+      "server_spec_pos_accept": [0.6918, 0.4467, 0.2587, 0.1466, 0.0733],
       "server_engine_steps": 1476.0,
       "server_steps_per_s": 49.33494579324432,
       "server_accept_len_effective": 2.613821138211382,
@@ -1586,13 +1540,7 @@
       "server_spec_drafts": 1968,
       "server_spec_draft_tokens": 9840,
       "server_spec_accepted_tokens": 3265,
-      "server_spec_pos_accept": [
-        0.6966,
-        0.4675,
-        0.2622,
-        0.1524,
-        0.0803
-      ],
+      "server_spec_pos_accept": [0.6966, 0.4675, 0.2622, 0.1524, 0.0803],
       "server_engine_steps": 1968.0,
       "server_steps_per_s": 66.04790536934077,
       "server_accept_len_effective": 2.6590447154471546,
@@ -1721,13 +1669,7 @@
       "server_spec_drafts": 660,
       "server_spec_draft_tokens": 3300,
       "server_spec_accepted_tokens": 1080,
-      "server_spec_pos_accept": [
-        0.6924,
-        0.4545,
-        0.2576,
-        0.1455,
-        0.0864
-      ],
+      "server_spec_pos_accept": [0.6924, 0.4545, 0.2576, 0.1455, 0.0864],
       "server_engine_steps": 660.0,
       "server_steps_per_s": 22.05518644111858,
       "server_accept_len_effective": 2.6363636363636362,
@@ -1904,13 +1846,7 @@
       "server_spec_drafts": 1029,
       "server_spec_draft_tokens": 5145,
       "server_spec_accepted_tokens": 1559,
-      "server_spec_pos_accept": [
-        0.6783,
-        0.4179,
-        0.2264,
-        0.1234,
-        0.069
-      ],
+      "server_spec_pos_accept": [0.6783, 0.4179, 0.2264, 0.1234, 0.069],
       "server_engine_steps": 1029.0,
       "server_steps_per_s": 34.39565219012721,
       "server_accept_len_effective": 2.5150631681243927,
@@ -2135,13 +2071,7 @@
       "server_spec_drafts": 1435,
       "server_spec_draft_tokens": 7175,
       "server_spec_accepted_tokens": 2126,
-      "server_spec_pos_accept": [
-        0.6439,
-        0.3875,
-        0.216,
-        0.1415,
-        0.0927
-      ],
+      "server_spec_pos_accept": [0.6439, 0.3875, 0.216, 0.1415, 0.0927],
       "server_engine_steps": 1436.0,
       "server_steps_per_s": 47.974490648753374,
       "server_accept_len_effective": 2.48050139275766,
@@ -2414,13 +2344,7 @@
       "server_spec_drafts": 1904,
       "server_spec_draft_tokens": 9520,
       "server_spec_accepted_tokens": 3143,
-      "server_spec_pos_accept": [
-        0.678,
-        0.437,
-        0.27,
-        0.167,
-        0.0987
-      ],
+      "server_spec_pos_accept": [0.678, 0.437, 0.27, 0.167, 0.0987],
       "server_engine_steps": 1904.0,
       "server_steps_per_s": 63.396393945204046,
       "server_accept_len_effective": 2.650735294117647,
@@ -2549,13 +2473,7 @@
       "server_spec_drafts": 667,
       "server_spec_draft_tokens": 3335,
       "server_spec_accepted_tokens": 1069,
-      "server_spec_pos_accept": [
-        0.6852,
-        0.4333,
-        0.2609,
-        0.1394,
-        0.084
-      ],
+      "server_spec_pos_accept": [0.6852, 0.4333, 0.2609, 0.1394, 0.084],
       "server_engine_steps": 667.0,
       "server_steps_per_s": 22.256688453798958,
       "server_accept_len_effective": 2.60119940029985,
@@ -2732,13 +2650,7 @@
       "server_spec_drafts": 1028,
       "server_spec_draft_tokens": 5140,
       "server_spec_accepted_tokens": 1654,
-      "server_spec_pos_accept": [
-        0.6877,
-        0.4251,
-        0.2588,
-        0.1556,
-        0.0817
-      ],
+      "server_spec_pos_accept": [0.6877, 0.4251, 0.2588, 0.1556, 0.0817],
       "server_engine_steps": 1028.0,
       "server_steps_per_s": 34.32642010096655,
       "server_accept_len_effective": 2.6070038910505837,
@@ -2927,13 +2839,7 @@
       "server_spec_drafts": 1402,
       "server_spec_draft_tokens": 7010,
       "server_spec_accepted_tokens": 2138,
-      "server_spec_pos_accept": [
-        0.6469,
-        0.4058,
-        0.2454,
-        0.1427,
-        0.0842
-      ],
+      "server_spec_pos_accept": [0.6469, 0.4058, 0.2454, 0.1427, 0.0842],
       "server_engine_steps": 1402.0,
       "server_steps_per_s": 47.614509472115074,
       "server_accept_len_effective": 2.5242510699001426,
@@ -3206,13 +3112,7 @@
       "server_spec_drafts": 1952,
       "server_spec_draft_tokens": 9760,
       "server_spec_accepted_tokens": 2837,
-      "server_spec_pos_accept": [
-        0.6399,
-        0.4103,
-        0.2249,
-        0.1199,
-        0.0584
-      ],
+      "server_spec_pos_accept": [0.6399, 0.4103, 0.2249, 0.1199, 0.0584],
       "server_engine_steps": 1952.0,
       "server_steps_per_s": 65.33910381649652,
       "server_accept_len_effective": 2.4533811475409837,

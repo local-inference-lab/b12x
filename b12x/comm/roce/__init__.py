@@ -23,6 +23,7 @@ META = OpMeta(
     group="comm",
     api_style="stateful",
     entry_points=(
+        "API_VERSION",
         "AllReduce",
         "DEFAULT_MAX_GATHER_BYTES",
         "DEFAULT_MAX_SIZE",
@@ -50,6 +51,7 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        API_VERSION,
         DEFAULT_MAX_GATHER_BYTES,
         DEFAULT_MAX_SIZE,
         SUPPORTED_DTYPES,

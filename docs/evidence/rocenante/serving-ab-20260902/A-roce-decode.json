@@ -32,18 +32,8 @@
     "dcp_size": 0,
     "metrics_available": true,
     "metrics_warning": "",
-    "concurrency_levels": [
-      1,
-      2,
-      4,
-      8,
-      16
-    ],
-    "context_lengths": [
-      0,
-      16384,
-      32768
-    ],
+    "concurrency_levels": [1, 2, 4, 8, 16],
+    "context_lengths": [0, 16384, 32768],
     "startup_diagnostics_available": true,
     "nvidia_p2p_override_effective": false,
     "p2pmark_status": "not_run",
@@ -464,13 +454,7 @@
       "server_spec_drafts": 498,
       "server_spec_draft_tokens": 2490,
       "server_spec_accepted_tokens": 640,
-      "server_spec_pos_accept": [
-        0.5904,
-        0.3514,
-        0.1867,
-        0.1044,
-        0.0522
-      ],
+      "server_spec_pos_accept": [0.5904, 0.3514, 0.1867, 0.1044, 0.0522],
       "server_engine_steps": 498.0,
       "server_steps_per_s": 16.608066131896464,
       "server_accept_len_effective": 2.285140562248996,
@@ -587,13 +571,7 @@
       "server_spec_drafts": 491,
       "server_spec_draft_tokens": 2455,
       "server_spec_accepted_tokens": 734,
-      "server_spec_pos_accept": [
-        0.6599,
-        0.4012,
-        0.224,
-        0.1385,
-        0.0713
-      ],
+      "server_spec_pos_accept": [0.6599, 0.4012, 0.224, 0.1385, 0.0713],
       "server_engine_steps": 491.0,
       "server_steps_per_s": 16.381650749069152,
       "server_accept_len_effective": 2.4908350305498983,
@@ -710,13 +688,7 @@
       "server_spec_drafts": 497,
       "server_spec_draft_tokens": 2485,
       "server_spec_accepted_tokens": 758,
-      "server_spec_pos_accept": [
-        0.6801,
-        0.4266,
-        0.2374,
-        0.1187,
-        0.0624
-      ],
+      "server_spec_pos_accept": [0.6801, 0.4266, 0.2374, 0.1187, 0.0624],
       "server_engine_steps": 497.0,
       "server_steps_per_s": 16.608063072962793,
       "server_accept_len_effective": 2.523138832997988,
@@ -869,13 +841,7 @@
       "server_spec_drafts": 709,
       "server_spec_draft_tokens": 3545,
       "server_spec_accepted_tokens": 1178,
-      "server_spec_pos_accept": [
-        0.6982,
-        0.4584,
-        0.2638,
-        0.1509,
-        0.0903
-      ],
+      "server_spec_pos_accept": [0.6982, 0.4584, 0.2638, 0.1509, 0.0903],
       "server_engine_steps": 710.0,
       "server_steps_per_s": 23.721106454035485,
       "server_accept_len_effective": 2.659154929577465,
@@ -1052,13 +1018,7 @@
       "server_spec_drafts": 1190,
       "server_spec_draft_tokens": 5950,
       "server_spec_accepted_tokens": 1758,
-      "server_spec_pos_accept": [
-        0.6487,
-        0.4084,
-        0.2286,
-        0.1252,
-        0.0664
-      ],
+      "server_spec_pos_accept": [0.6487, 0.4084, 0.2286, 0.1252, 0.0664],
       "server_engine_steps": 1190.0,
       "server_steps_per_s": 39.76008396341166,
       "server_accept_len_effective": 2.4747899159663866,
@@ -1331,13 +1291,7 @@
       "server_spec_drafts": 1664,
       "server_spec_draft_tokens": 8320,
       "server_spec_accepted_tokens": 2717,
-      "server_spec_pos_accept": [
-        0.6965,
-        0.4519,
-        0.2626,
-        0.1484,
-        0.0733
-      ],
+      "server_spec_pos_accept": [0.6965, 0.4519, 0.2626, 0.1484, 0.0733],
       "server_engine_steps": 1665.0,
       "server_steps_per_s": 55.641815878199594,
       "server_accept_len_effective": 2.631831831831832,
@@ -1622,13 +1576,7 @@
       "server_spec_drafts": 2421,
       "server_spec_draft_tokens": 12105,
       "server_spec_accepted_tokens": 3999,
-      "server_spec_pos_accept": [
-        0.6972,
-        0.4577,
-        0.2635,
-        0.1545,
-        0.0789
-      ],
+      "server_spec_pos_accept": [0.6972, 0.4577, 0.2635, 0.1545, 0.0789],
       "server_engine_steps": 2421.0,
       "server_steps_per_s": 80.75374364069523,
       "server_accept_len_effective": 2.650970673275506,
@@ -1781,13 +1729,7 @@
       "server_spec_drafts": 715,
       "server_spec_draft_tokens": 3575,
       "server_spec_accepted_tokens": 1164,
-      "server_spec_pos_accept": [
-        0.7119,
-        0.4559,
-        0.2517,
-        0.1441,
-        0.0643
-      ],
+      "server_spec_pos_accept": [0.7119, 0.4559, 0.2517, 0.1441, 0.0643],
       "server_engine_steps": 715.0,
       "server_steps_per_s": 23.880282052153582,
       "server_accept_len_effective": 2.6237762237762237,
@@ -1964,13 +1906,7 @@
       "server_spec_drafts": 1161,
       "server_spec_draft_tokens": 5805,
       "server_spec_accepted_tokens": 1937,
-      "server_spec_pos_accept": [
-        0.696,
-        0.4582,
-        0.261,
-        0.1688,
-        0.0844
-      ],
+      "server_spec_pos_accept": [0.696, 0.4582, 0.261, 0.1688, 0.0844],
       "server_engine_steps": 1161.0,
       "server_steps_per_s": 38.731402689198305,
       "server_accept_len_effective": 2.6675279931093883,
@@ -2219,13 +2155,7 @@
       "server_spec_drafts": 1484,
       "server_spec_draft_tokens": 7420,
       "server_spec_accepted_tokens": 2425,
-      "server_spec_pos_accept": [
-        0.6772,
-        0.4414,
-        0.2581,
-        0.1543,
-        0.1031
-      ],
+      "server_spec_pos_accept": [0.6772, 0.4414, 0.2581, 0.1543, 0.1031],
       "server_engine_steps": 1484.0,
       "server_steps_per_s": 49.82711936005937,
       "server_accept_len_effective": 2.634097035040431,
@@ -2510,13 +2440,7 @@
       "server_spec_drafts": 2263,
       "server_spec_draft_tokens": 11315,
       "server_spec_accepted_tokens": 3495,
-      "server_spec_pos_accept": [
-        0.6544,
-        0.4127,
-        0.2391,
-        0.1511,
-        0.0871
-      ],
+      "server_spec_pos_accept": [0.6544, 0.4127, 0.2391, 0.1511, 0.0871],
       "server_engine_steps": 2264.0,
       "server_steps_per_s": 75.61429266932612,
       "server_accept_len_effective": 2.543727915194346,
@@ -2645,13 +2569,7 @@
       "server_spec_drafts": 705,
       "server_spec_draft_tokens": 3525,
       "server_spec_accepted_tokens": 1101,
-      "server_spec_pos_accept": [
-        0.6738,
-        0.4241,
-        0.2426,
-        0.139,
-        0.0823
-      ],
+      "server_spec_pos_accept": [0.6738, 0.4241, 0.2426, 0.139, 0.0823],
       "server_engine_steps": 705.0,
       "server_steps_per_s": 23.544361615840895,
       "server_accept_len_effective": 2.554609929078014,
@@ -2828,13 +2746,7 @@
       "server_spec_drafts": 1184,
       "server_spec_draft_tokens": 5920,
       "server_spec_accepted_tokens": 1909,
-      "server_spec_pos_accept": [
-        0.6985,
-        0.4367,
-        0.25,
-        0.1512,
-        0.076
-      ],
+      "server_spec_pos_accept": [0.6985, 0.4367, 0.25, 0.1512, 0.076],
       "server_engine_steps": 1184.0,
       "server_steps_per_s": 39.44183672210954,
       "server_accept_len_effective": 2.612331081081081,
@@ -3047,13 +2959,7 @@
       "server_spec_drafts": 1499,
       "server_spec_draft_tokens": 7495,
       "server_spec_accepted_tokens": 2003,
-      "server_spec_pos_accept": [
-        0.6111,
-        0.3576,
-        0.1895,
-        0.1167,
-        0.0614
-      ],
+      "server_spec_pos_accept": [0.6111, 0.3576, 0.1895, 0.1167, 0.0614],
       "server_engine_steps": 1499.0,
       "server_steps_per_s": 50.19335434885411,
       "server_accept_len_effective": 2.33555703802535,
@@ -3326,13 +3232,7 @@
       "server_spec_drafts": 2288,
       "server_spec_draft_tokens": 11440,
       "server_spec_accepted_tokens": 3423,
-      "server_spec_pos_accept": [
-        0.6455,
-        0.3955,
-        0.2356,
-        0.1403,
-        0.0791
-      ],
+      "server_spec_pos_accept": [0.6455, 0.3955, 0.2356, 0.1403, 0.0791],
       "server_engine_steps": 2288.0,
       "server_steps_per_s": 76.40812697365726,
       "server_accept_len_effective": 2.4960664335664338,
@@ -3455,7 +3355,7 @@
         "content_chars": 2911,
         "reasoning_chars": 0,
         "cjk_chars": 0,
-        "content_preview": "# Sieve of Eratosthenes\n\nHere's a well-documented implementation with two variants — a classic version and an optimized version:\n\n```python\ndef sieve_of_eratosthenes(n):\n    \"\"\"\n    Find all prime numbers up to and including n using the\n    Sieve of Eratosthenes.\n\n    Args:\n        n (int): Upper limit (inclusive) for prime generation.\n\n    Returns:\n        list[int]: All prime numbers <= n.\n    \"\"\"\n    if n < 2:\n        return []\n\n    # Assume all numbers are prime initially; 0 and 1 are not pr"
+        "content_preview": "# Sieve of Eratosthenes\n\nHere's a well-documented implementation with two variants \u2014 a classic version and an optimized version:\n\n```python\ndef sieve_of_eratosthenes(n):\n    \"\"\"\n    Find all prime numbers up to and including n using the\n    Sieve of Eratosthenes.\n\n    Args:\n        n (int): Upper limit (inclusive) for prime generation.\n\n    Returns:\n        list[int]: All prime numbers <= n.\n    \"\"\"\n    if n < 2:\n        return []\n\n    # Assume all numbers are prime initially; 0 and 1 are not pr"
       },
       {
         "run": 3,

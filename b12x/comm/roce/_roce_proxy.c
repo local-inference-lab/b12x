@@ -102,11 +102,21 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
     if (world < 2 || world > ROCE_MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0) {
         return -1;
     }
+    // Reject a layout whose arithmetic would wrap; the caller sizes slots from
+    // configuration, so a wrapped region must fail here rather than at the NIC.
+    uint64_t recv_bytes, send_bytes, flag_off, send_off, ctrl_off, total;
+    if (slot_bytes > ((uint64_t)1 << 40) ||
+        __builtin_mul_overflow((uint64_t)world * ROCE_SLOTS, slot_bytes, &recv_bytes) ||
+        __builtin_mul_overflow((uint64_t)ROCE_SLOTS, slot_bytes, &send_bytes) ||
+        __builtin_add_overflow(recv_bytes, (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE, &flag_off) ||
+        __builtin_add_overflow(flag_off, (uint64_t)0, &send_off) ||
+        __builtin_add_overflow(recv_bytes + (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE, send_bytes, &ctrl_off) ||
+        __builtin_add_overflow(ctrl_off, (uint64_t)ROCE_FLAG_STRIDE, &total)) {
+        return -1;
+    }
     uint64_t recv_off = 0;
-    uint64_t flag_off = recv_off + (uint64_t)world * ROCE_SLOTS * slot_bytes;
-    uint64_t send_off = flag_off + (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE;
-    uint64_t ctrl_off = send_off + (uint64_t)ROCE_SLOTS * slot_bytes;
-    uint64_t total = ctrl_off + ROCE_FLAG_STRIDE;
+    flag_off = recv_off + recv_bytes;
+    send_off = flag_off + (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE;
     out[0] = recv_off;
     out[1] = flag_off;
     out[2] = send_off;

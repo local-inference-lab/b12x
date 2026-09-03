@@ -32,23 +32,8 @@
     "dcp_size": 0,
     "metrics_available": true,
     "metrics_warning": "",
-    "concurrency_levels": [
-      1,
-      2,
-      4,
-      8,
-      16,
-      32,
-      64,
-      128
-    ],
-    "context_lengths": [
-      0,
-      16384,
-      32768,
-      65536,
-      131072
-    ],
+    "concurrency_levels": [1, 2, 4, 8, 16, 32, 64, 128],
+    "context_lengths": [0, 16384, 32768, 65536, 131072],
     "startup_diagnostics_available": true,
     "nvidia_p2p_override_effective": false,
     "p2pmark_status": "not_run",

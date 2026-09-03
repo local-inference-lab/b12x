@@ -96,14 +96,26 @@ def test_rejects_ineligible_inputs(runtime):
     assert not runtime.should_allreduce(strided)
     ok = torch.zeros(4096, dtype=torch.bfloat16, device=runtime.device)
     assert runtime.should_allreduce(ok)
-    # 16-byte pointer alignment: a contiguous slice at a one-element offset
-    unaligned = torch.zeros(4097, dtype=torch.float16, device=runtime.device)[1:]
+    # Eligibility is rank-invariant: a pointer that is not 16-byte aligned is
+    # still eligible and is staged through scratch, for input and for output.
+    rank = dist.get_rank()
+    torch.manual_seed(4242 + rank)
+    backing = torch.randn(4097, dtype=torch.float16, device=runtime.device)
+    unaligned = backing[1:]
     assert unaligned.is_contiguous() and unaligned.data_ptr() % 16 != 0
-    assert not runtime.should_allreduce(unaligned)
-    aligned = torch.zeros(4096, dtype=torch.float16, device=runtime.device)
-    assert runtime.should_allreduce(aligned)
+    assert runtime.should_allreduce(unaligned)
+    expected = unaligned.clone()
+    dist.all_reduce(expected)
+    rtol, atol = _tolerance(torch.float16, dist.get_world_size())
+    torch.testing.assert_close(runtime.all_reduce(unaligned), expected, rtol=rtol, atol=atol)
+    out_backing = torch.empty(4097, dtype=torch.float16, device=runtime.device)
+    aligned_in = unaligned.clone()
+    torch.testing.assert_close(
+        runtime.all_reduce(aligned_in, out=out_backing[1:]), expected, rtol=rtol, atol=atol
+    )
+    # a foreign-device output never reaches the kernel
     with pytest.raises(ValueError):
-        runtime.all_reduce(aligned, out=unaligned)
+        runtime.all_reduce(aligned_in, out=torch.empty(4096, dtype=torch.float16))
 
 
 def test_cuda_graph_replay(runtime):
@@ -180,6 +192,197 @@ def test_proxy_catches_up_after_missed_doorbell(runtime):
     dist.barrier()
 
 
+def test_alternating_eager_streams_are_ordered(runtime):
+    """Collectives issued on two alternating streams execute in launch order.
+
+    The runtime has one epoch and two transport slots, so it chains a launch
+    on a different stream behind the previous one with an event; without that
+    the two streams could run two collectives concurrently.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    torch.manual_seed(77 + rank)
+    x = torch.randn(48 * 1024, dtype=torch.bfloat16, device=runtime.device)
+    expected = x.clone()
+    dist.all_reduce(expected)
+    streams = (torch.cuda.Stream(device=runtime.device), torch.cuda.Stream(device=runtime.device))
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+    outs = []
+    for i in range(8):
+        with torch.cuda.stream(streams[i % 2]):
+            outs.append(runtime.all_reduce(x * (i + 1)))
+    torch.cuda.synchronize()
+    runtime.check_health()
+    rtol, atol = _tolerance(torch.bfloat16, world)
+    for i, out in enumerate(outs):
+        torch.testing.assert_close(out, expected * (i + 1), rtol=rtol, atol=atol * (i + 1))
+    dist.barrier()
+
+
+def test_adapter_path_graph_replay(runtime):
+    """The exact vLLM adapter calls, captured once and replayed many times.
+
+    ``all_reduce(inp)`` and ``all_gather(inp, dim=-1)`` without ``out``, a
+    direct-layout gather, a padded gather, and mixed ordering.  Outputs are
+    allocated inside the capture; every replay must land in the same tensors
+    (stable addresses) with the right values, and the runtime must stay healthy.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    runtime.prepare((torch.bfloat16,), padded_gather=True)
+    h = torch.zeros(6 * 4096, dtype=torch.bfloat16, device=runtime.device)
+    logits = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)
+    odd = torch.zeros(5, 3, dtype=torch.bfloat16, device=runtime.device)  # 30-byte rows: padded path
+    stream = torch.cuda.Stream(device=runtime.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runtime.all_reduce(h)
+        runtime.all_gather(logits, dim=-1)
+        runtime.all_gather(odd, dim=-1)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        r1 = runtime.all_reduce(h)
+        g1 = runtime.all_gather(logits, dim=-1)
+        r2 = runtime.all_reduce(r1)
+        g2 = runtime.all_gather(odd, dim=-1)
+        r3 = runtime.all_reduce(r2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    addresses = (r1.data_ptr(), g1.data_ptr(), r2.data_ptr(), g2.data_ptr(), r3.data_ptr())
+    rtol, atol = _tolerance(torch.bfloat16, world)
+    for replay in range(24):
+        torch.manual_seed(31 * replay + rank)
+        h.copy_(torch.randn_like(h) * 0.01)
+        logits.copy_(torch.randn_like(logits))
+        odd.copy_(torch.randn_like(odd))
+        e1 = h.clone()
+        dist.all_reduce(e1)
+        e2 = e1.clone()
+        dist.all_reduce(e2)
+        e3 = e2.clone()
+        dist.all_reduce(e3)
+        parts = [torch.empty_like(logits) for _ in range(world)]
+        dist.all_gather(parts, logits)
+        eg1 = torch.cat(parts, dim=-1)
+        parts = [torch.empty_like(odd) for _ in range(world)]
+        dist.all_gather(parts, odd)
+        eg2 = torch.cat(parts, dim=-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        runtime.check_health()
+        assert (r1.data_ptr(), g1.data_ptr(), r2.data_ptr(), g2.data_ptr(), r3.data_ptr()) == addresses
+        torch.testing.assert_close(r1, e1, rtol=rtol, atol=atol)
+        torch.testing.assert_close(r2, e2, rtol=rtol, atol=atol * world)
+        torch.testing.assert_close(r3, e3, rtol=rtol, atol=atol * world**2)
+        assert torch.equal(g1, eg1)
+        assert torch.equal(g2, eg2)
+    dist.barrier()
+
+
+def _fresh_runtime(spin_limit: int):
+    """A runtime of its own with a short spin limit, for fault injection."""
+    from b12x.comm import roce
+
+    previous = os.environ.get("B12X_ROCE_SPIN_LIMIT")
+    os.environ["B12X_ROCE_SPIN_LIMIT"] = str(spin_limit)
+    try:
+        rt = roce.AllReduce.from_exchange_group(
+            exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=1 << 20
+        )
+    finally:
+        if previous is None:
+            del os.environ["B12X_ROCE_SPIN_LIMIT"]
+        else:
+            os.environ["B12X_ROCE_SPIN_LIMIT"] = previous
+    rt.prepare((torch.bfloat16,))
+    return rt
+
+
+def test_fail_stop_on_timeout_eager(runtime):
+    """A wait that times out poisons the runtime: the epoch stops, the failure
+    is raised on the next check, another launch raises before enqueue, and the
+    peers converge to the same state on their own.
+
+    Rank 1 stops its proxy for good.  Every other rank's first collective times
+    out (asymmetric: rank 1's own kernel completes on the peers' payloads).
+    Rank 1 then times out on its second collective because the poisoned peers
+    launch no-ops and never post again, so no rank can proceed alone.
+    """
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    rt = _fresh_runtime(2_000_000)
+    epoch_before = rt.stats()["epoch"]
+    dist.barrier()
+    if rank == 1:
+        rt._proxy.stop()
+    x = torch.ones(4096, dtype=torch.bfloat16, device=rt.device)
+    out = rt.all_reduce(x)  # enqueue succeeds: the fault is only visible once the kernel waited
+    torch.cuda.synchronize()
+    if rank != 1:
+        with pytest.raises(RuntimeError, match="poisoned"):
+            rt.check_health()
+        assert rt.poisoned
+        assert rt.stats()["epoch"] == epoch_before
+        with pytest.raises(RuntimeError, match="poisoned"):
+            rt.all_reduce(x)  # fatal, never a fallback
+    else:
+        rt.check_health()
+        assert rt.stats()["epoch"] == epoch_before + 1
+        torch.testing.assert_close(out, x * world)
+        rt.all_reduce(x)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="poisoned"):
+            rt.check_health()
+    assert rt.poisoned
+    rt.close()  # teardown during failure must not hang
+    dist.barrier()
+
+
+def test_fail_stop_on_timeout_graph_replay(runtime):
+    """A faulted replay leaves the epoch where it was and raises on the post-step check."""
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    rt = _fresh_runtime(2_000_000)
+    static = torch.ones(4096, dtype=torch.bfloat16, device=rt.device)
+    stream = torch.cuda.Stream(device=rt.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rt.all_reduce(static)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), rt.capture(stream=stream):
+        o1 = rt.all_reduce(static)
+        o2 = rt.all_reduce(o1)
+        o3 = rt.all_reduce(o2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    rt.check_health()
+    torch.testing.assert_close(o3, static * world**3)
+    epoch_ok = rt.stats()["epoch"]
+    dist.barrier()
+    if rank == 1:
+        rt._proxy.stop()
+    o3.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        rt.check_health()
+    # no rank advanced past the failed sequence by more than the ops that
+    # completed on the peers' payloads, and none produced the step's result
+    assert rt.stats()["epoch"] < epoch_ok + 3
+    assert not torch.equal(o3, static * world**3)
+    rt.close()
+    dist.barrier()
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.int32])
 @pytest.mark.parametrize(
     "shape,dim",
@@ -232,6 +435,8 @@ def test_all_gather_rejects_ineligible(runtime):
         wrong_shape = torch.empty(shard.shape[0], shard.shape[1], dtype=torch.bfloat16, device=runtime.device)
         with pytest.raises(ValueError):
             runtime.all_gather(shard, dim=-1, out=wrong_shape)
+        with pytest.raises(ValueError):
+            runtime.all_gather(shard, dim=-1, out=torch.empty(shard.shape[0], shard.shape[1] * world, dtype=torch.bfloat16))
 
 
 def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):

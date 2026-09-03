@@ -73,6 +73,32 @@ def _source_state() -> dict[str, object]:
     return {"source_revision": head, "worktree_dirty": None, "git_status": ["unknown: git unavailable"], "source_state_from": ".git/HEAD"}
 
 
+def dump_compact_json(doc: object, path: Path) -> None:
+    """Write ``doc`` indented, with lists of numbers on one line each.
+
+    The receipt keeps every raw sample; this layout keeps it reviewable (one
+    line per sample array instead of one per number).
+    """
+    markers: dict[str, list[float]] = {}
+
+    def mark(obj: object) -> object:
+        if isinstance(obj, dict):
+            return {k: mark(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            if obj and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in obj):
+                key = f"__compact_{len(markers)}__"
+                markers[key] = obj
+                return key
+            return [mark(v) for v in obj]
+        return obj
+
+    text = json.dumps(mark(doc), indent=2)
+    for key, values in markers.items():
+        text = text.replace(f'"{key}"', "[" + ", ".join(json.dumps(v) for v in values) + "]")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n")
+
+
 def _gpu_identity() -> dict[str, object]:
     """Physical GPU identity and mode for the receipt (torch plus best-effort nvidia-smi)."""
     props = torch.cuda.get_device_properties(0)
@@ -354,9 +380,7 @@ def main() -> None:
             "all_gather": gather_rows,
         }
         if args.output:
-            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.output, "w") as f:
-                json.dump(doc, f, indent=2)
+            dump_compact_json(doc, Path(args.output))
             print(f"wrote {args.output}")
     dist.barrier()
     runtime.close()

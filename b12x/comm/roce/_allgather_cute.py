@@ -35,6 +35,7 @@ from ._cute_intrinsics import (
     fence_sc_sys,
     ld_global_v4_u32,
     ld_relaxed_gpu_u32,
+    ld_relaxed_sys_u32,
     ld_relaxed_sys_v4_u32,
     spin_until_eq_acquire_sys,
     st_global_v4_u32,
@@ -134,75 +135,87 @@ class _RoceAllGatherLaunch:
         index = Int32(bidx) * Int32(self._threads) + Int32(tidx)
         stride = Int32(gdim) * Int32(self._threads)
 
-        # 1. stage the local shard into the pinned send slot
-        stage_index = index
-        while stage_index < shard_packs:
-            words = ld_global_v4_u32(input_base + Int64(stage_index) * Int64(PACK_BYTES))
-            st_global_v4_u32(
-                send_slot + Int64(stage_index) * Int64(PACK_BYTES),
-                words[0],
-                words[1],
-                words[2],
-                words[3],
-            )
-            stage_index += stride
-        fence_sc_sys()
-        cute.arch.sync_threads()
+        # A recorded timeout poisons the runtime: later launches do nothing so
+        # the host sees the failure without waiting another spin limit per op.
+        poisoned = ld_relaxed_sys_u32(ctrl_base + Int64(8))
+        if poisoned == Uint32(0):
+            # 1. stage the local shard into the pinned send slot
+            stage_index = index
+            while stage_index < shard_packs:
+                words = ld_global_v4_u32(input_base + Int64(stage_index) * Int64(PACK_BYTES))
+                st_global_v4_u32(
+                    send_slot + Int64(stage_index) * Int64(PACK_BYTES),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+                stage_index += stride
+            fence_sc_sys()
+            cute.arch.sync_threads()
 
-        # 2. the last block to finish staging rings the proxy doorbell
-        if Int32(tidx) == Int32(0):
-            prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
-            if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
-                st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
-                st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes))
-                fence_sc_sys()
-                st_relaxed_sys_u32(ctrl_base, seq)
+            # 2. the last block to finish staging rings the proxy doorbell
+            if Int32(tidx) == Int32(0):
+                prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
+                if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
+                    st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
+                    st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes))
+                    fence_sc_sys()
+                    st_relaxed_sys_u32(ctrl_base, seq)
 
-        # 3. wait for every peer's payload flag
-        if Int32(tidx) < Int32(self._world_size):
-            if Int32(tidx) != Int32(self._rank):
-                flag_addr = flag_base + (
-                    Int64(tidx) * Int64(self._slots) + slot
-                ) * Int64(self._flag_stride)
-                timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
-                if timed_out != Uint32(0):
-                    st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(tidx))
-                    st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
-        cute.arch.sync_threads()
+            # 3. wait for every peer's payload flag
+            if Int32(tidx) < Int32(self._world_size):
+                if Int32(tidx) != Int32(self._rank):
+                    flag_addr = flag_base + (
+                        Int64(tidx) * Int64(self._slots) + slot
+                    ) * Int64(self._flag_stride)
+                    timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
+                    if timed_out != Uint32(0):
+                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(tidx))
+                        st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
+            cute.arch.sync_threads()
+            # A wait that timed out anywhere in this block leaves the peer slot
+            # unreliable: skip the data phase so nothing derived from it is stored.
+            failed = ld_relaxed_sys_u32(ctrl_base + Int64(8))
+            if failed == Uint32(0):
+                # 4. concatenate: shard s occupies column block s of every output row
+                out_row_packs = Int32(self._world_size) * row_packs
+                for source in cutlass.range_constexpr(self._world_size):
+                    copy_index = index
+                    while copy_index < shard_packs:
+                        row = copy_index // row_packs
+                        col = copy_index - row * row_packs
+                        dest = output_base + (
+                            Int64(row) * Int64(out_row_packs)
+                            + Int64(source) * Int64(row_packs)
+                            + Int64(col)
+                        ) * Int64(PACK_BYTES)
+                        if cutlass.const_expr(source == self._rank):
+                            words = ld_global_v4_u32(
+                                input_base + Int64(copy_index) * Int64(PACK_BYTES)
+                            )
+                        else:
+                            peer_slot = recv_base + (
+                                Int64(source) * Int64(self._slots) + slot
+                            ) * slot_bytes
+                            words = ld_relaxed_sys_v4_u32(
+                                peer_slot + Int64(copy_index) * Int64(PACK_BYTES)
+                            )
+                        st_global_v4_u32(dest, words[0], words[1], words[2], words[3])
+                        copy_index += stride
 
-        # 4. concatenate: shard s occupies column block s of every output row
-        out_row_packs = Int32(self._world_size) * row_packs
-        for source in cutlass.range_constexpr(self._world_size):
-            copy_index = index
-            while copy_index < shard_packs:
-                row = copy_index // row_packs
-                col = copy_index - row * row_packs
-                dest = output_base + (
-                    Int64(row) * Int64(out_row_packs)
-                    + Int64(source) * Int64(row_packs)
-                    + Int64(col)
-                ) * Int64(PACK_BYTES)
-                if cutlass.const_expr(source == self._rank):
-                    words = ld_global_v4_u32(
-                        input_base + Int64(copy_index) * Int64(PACK_BYTES)
-                    )
-                else:
-                    peer_slot = recv_base + (
-                        Int64(source) * Int64(self._slots) + slot
-                    ) * slot_bytes
-                    words = ld_relaxed_sys_v4_u32(
-                        peer_slot + Int64(copy_index) * Int64(PACK_BYTES)
-                    )
-                st_global_v4_u32(dest, words[0], words[1], words[2], words[3])
-                copy_index += stride
-
-        # 5. the last block to finish publishes the next epoch
-        fence_sc_gpu()
-        cute.arch.sync_threads()
-        if Int32(tidx) == Int32(0):
-            prior = atomic_add_relaxed_gpu_u32(tail_counter_ptr, Uint32(1))
-            if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
-                st_release_gpu_u32(epoch_ptr, seq)
+            # 5. the last block to finish publishes the next epoch
+            fence_sc_gpu()
+            cute.arch.sync_threads()
+            if Int32(tidx) == Int32(0):
+                prior = atomic_add_relaxed_gpu_u32(tail_counter_ptr, Uint32(1))
+                if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
+                    fence_sc_gpu()
+                    # Every block's timeout store precedes its tail arrival, so the
+                    # error word is final here.  A failed sequence keeps the epoch,
+                    # which makes every later launch a no-op until the host raises.
+                    if ld_relaxed_sys_u32(ctrl_base + Int64(8)) == Uint32(0):
+                        st_release_gpu_u32(epoch_ptr, seq)
 
 
 def _dummy(dtype, alignment: int):

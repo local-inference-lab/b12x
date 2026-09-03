@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .roce_oneshot import (
+    API_VERSION,
     DEFAULT_MAX_GATHER_BYTES,
     DEFAULT_MAX_SIZE,
     SUPPORTED_DTYPES,
@@ -14,6 +15,7 @@ from .roce_oneshot import (
 )
 
 __all__ = [
+    "API_VERSION",
     "AllReduce",
     "DEFAULT_MAX_GATHER_BYTES",
     "DEFAULT_MAX_SIZE",

@@ -48,6 +48,21 @@ def ld_relaxed_gpu_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_relaxed_sys_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
+    """System-scope relaxed 32-bit load (sees host and NIC writes)."""
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.sys.global.u32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def atomic_add_relaxed_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
     """GPU-scope relaxed atomic add; returns the prior value."""
     return Uint32(
