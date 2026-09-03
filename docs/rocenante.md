@@ -148,9 +148,17 @@ Correctness on the same run: bf16 sums within 6.8e-3 relative error of NCCL
 and after timing. Shards of several megabytes are bandwidth-bound for both
 implementations; the gains are in the latency-bound region that decode lives in.
 
-Serving A/B, GLM-5.3-Flash TP4 with MTP5 on the same four nodes through the vLLM
-adapter, RoCEnante versus NCCL for the same image and configuration
-(`docs/evidence/rocenante/serving-ab-20260902/`: per-arm decode and prefill
+Serving A/B on the final revisions (b12x `00280f2`, vLLM adapter `aef3576`, one
+image, RoCEnante toggled by one environment variable, arms back to back;
+`docs/evidence/rocenante/serving-ab-final-20260903/` with commands, revisions,
+GPU identities, startup lines, sanity output and raw samples): per-step decode
+latency lower in 14 of 15 cells of the concurrency-by-context matrix (c=1 62-64
+vs 65-66 ms, c=16 194-212 vs 246-259 ms), throughput c=4 +6 to +22%, c=8 +5 to
++14%, c=16 +22 to +32%, prefill unchanged, coding-peak c=1 within noise (-2%).
+
+Earlier serving A/B (2026-09-02, before the fail-stop change), GLM-5.3-Flash TP4
+with MTP5 on the same four nodes through the vLLM adapter, RoCEnante versus NCCL
+for the same image and configuration (`docs/evidence/rocenante/serving-ab-20260902/`: per-arm decode and prefill
 result JSON from `llm_decode_bench.py`, the arm comparison tables, and the README
 that names the image, compose overrides, and commands): per-step decode latency
 lower in every cell of a 15-cell concurrency-by-context matrix (5 to 19%), c=16
