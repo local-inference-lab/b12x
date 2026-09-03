@@ -196,3 +196,19 @@ def test_reduction_keeps_auto_unless_a_candidate_clears_the_margin(tmp_path) -> 
     assert configs, result.component
     assert all(config["route"] == "auto" for config in configs)
     assert result.evidence["single_candidate_qualification_cases"] == 1
+
+
+def test_generator_extends_measured_anchors_to_the_served_domain() -> None:
+    """A 64k max_model_len (width 256) or a 128-row batch must resolve to the
+    nearest measured anchor rather than the heuristic."""
+    from b12x.policy.generation.providers.dsa_indexer import (
+        INDEXER_ROWS_BOUNDS,
+        INDEXER_WIDTH_BOUNDS,
+    )
+
+    generator = DsaIndexerGenerator()
+    bounds = generator._nearest_range_bounds
+    assert bounds["max_page_table_width"] == INDEXER_WIDTH_BOUNDS
+    assert bounds["max_q_rows"] == INDEXER_ROWS_BOUNDS
+    assert INDEXER_WIDTH_BOUNDS[0] <= 256 and INDEXER_WIDTH_BOUNDS[1] >= 2048
+    assert INDEXER_ROWS_BOUNDS[0] <= 1 and INDEXER_ROWS_BOUNDS[1] >= 16_384

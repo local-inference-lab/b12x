@@ -69,6 +69,8 @@ INDEXER_QUERY_FIELDS = (
     "shared_page_table",
 )
 INDEXER_RANGE_FIELDS = frozenset({"max_q_rows", "max_k_rows", "max_page_table_width"})
+INDEXER_WIDTH_BOUNDS = (0, 1 << 20)
+INDEXER_ROWS_BOUNDS = (1, 1 << 16)
 AUTO_CONFIG: dict[str, object] = DsaIndexerConfig().to_dict()
 # Tiled supertile widths in K rows; 0 is the capacity-aware default.
 SUPERTILE_ROWS = (0, 8_192, 16_384, 65_536)
@@ -571,6 +573,13 @@ class DsaIndexerGenerator(DiscreteSweepGenerator):
                 "raced_cases": len(raced_dsa_indexer_cases()),
                 "qualification_cases": len(qualification_dsa_indexer_cases()),
             },
+            # Serving widths follow max_model_len and decode rows follow the
+            # batch, so the nearest measured anchor covers the whole domain
+            # instead of falling back to the heuristic between anchors.
+            nearest_range_bounds={
+                "max_page_table_width": INDEXER_WIDTH_BOUNDS,
+                "max_q_rows": INDEXER_ROWS_BOUNDS,
+            },
             baseline_margin=CONTEXT_MARGIN,
             candidate_contract_version=1,
         )
@@ -589,6 +598,8 @@ class DsaIndexerGenerator(DiscreteSweepGenerator):
 
 __all__ = [
     "AUTO_CONFIG",
+    "INDEXER_ROWS_BOUNDS",
+    "INDEXER_WIDTH_BOUNDS",
     "DsaIndexerBenchmarkFactory",
     "DsaIndexerGenerator",
     "candidate_configs",
