@@ -13,9 +13,8 @@ returning either output.
 ## Qualification contract
 
 - Serial implementation revision: `9ae41c5cb9935d740456479954b0089f80bd2ef2`.
-- Paired implementation revision: `51531638c0642ec1bc70c6df7a488a5adebfb570`.
+- Paired implementation revision: `f6cf4e953679a84b0d999515821c5b03f162320d`.
 - Benchmark: `benchmarks/benchmark_mxfp8_linear_pair.py`.
-- Host worktree: `/root/vllm/worktrees/b12x-parallel-mxfp8-pair-20260904`.
 - Physical GPU: index 2, UUID
   `GPU-167fbc3f-fd06-7f08-9e06-ee02946d041c`, PCI address
   `00000000:23:00.0`.
@@ -45,8 +44,8 @@ python benchmarks/benchmark_mxfp8_linear_pair.py \
 
 | Rows | Serial median | Paired median | Speedup | Latency reduction |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.025888 ms | 0.020800 ms | 1.245x | 19.65% |
-| 4 | 0.027744 ms | 0.016768 ms | 1.655x | 39.56% |
+| 1 | 0.027424 ms | 0.020752 ms | 1.322x | 24.33% |
+| 4 | 0.027680 ms | 0.016720 ms | 1.656x | 39.60% |
 
 The paired operation preserves exact outputs and reduces the complete
 projection-pair GPU interval for both Qwen decode row counts. The committed JSON
