@@ -565,9 +565,16 @@ def _run_sparse_mla(
             "nsa_cache_seqlens_int32 device "
             f"{active_token_counts.device} does not match workspace device {workspace.device}"
         )
-    if q_all.dtype != workspace.dtype:
+    from b12x.attention.sparse_mla._scratch import (
+        PACKED_QUERY_RECORD_BYTES,
+        is_packed_query,
+    )
+
+    q_packed = is_packed_query(q_all, head_dim=int(workspace.head_dim))
+    if q_all.dtype != workspace.dtype and not q_packed:
         raise ValueError(
-            f"q_all dtype {q_all.dtype} does not match workspace dtype {workspace.dtype}"
+            f"q_all dtype {q_all.dtype} does not match workspace dtype {workspace.dtype} "
+            f"(or the uint8 packed {PACKED_QUERY_RECORD_BYTES}-byte query record)"
         )
     if kv_cache.dtype != workspace.kv_dtype:
         raise ValueError(
@@ -686,12 +693,18 @@ def _run_sparse_mla(
         raise ValueError(
             f"q_all num_heads {q_all.shape[1]} does not match workspace num_q_heads {workspace.num_q_heads}"
         )
-    if q_all.shape[-1] != workspace.head_dim:
+    if q_all.shape[-1] != workspace.head_dim and not q_packed:
         raise ValueError(
             f"q_all head_dim {q_all.shape[-1]} does not match workspace head_dim {workspace.head_dim}"
         )
+    if q_packed and (
+        not _sm120_route or workspace.mode in ("extend", "verify", "draft_extend")
+    ):
+        raise ValueError(
+            "packed query records require the SM120 sparse MLA decode kernel path"
+        )
     if _sm120_route:
-        q_head_dim = int(q_all.shape[-1])
+        q_head_dim = int(workspace.head_dim) if q_packed else int(q_all.shape[-1])
         if q_head_dim != _MLA_UNIFIED_GLM_Q_HEAD_DIM:
             raise ValueError(
                 f"SM120 sparse MLA decode requires the GLM_NSA contract "

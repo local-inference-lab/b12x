@@ -2426,3 +2426,92 @@ def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> No
         assert rel < 2e-2, f"{label} rel-L2 vs reference {rel}"
     rel = ((serial - per_chunk).norm() / exp.norm()).item()
     assert rel < 1e-2, f"serial vs per-chunk rel-L2 {rel}"
+
+
+def pack_glm_query_reference(q: torch.Tensor) -> torch.Tensor:
+    """Torch replica of the in-kernel S0 query quantization as a packed record.
+
+    ``q`` is ``(rows, heads, 576)`` bf16. Returns uint8 ``(rows, heads, 656)``:
+    512 E4M3 nope bytes (per 128-dim tile: absmax -> ``max(amax, 1e-4) /
+    FP8_MAX`` rounded up to a power of two -> ``q * (1 / scale)`` clamped and
+    rounded to nearest even), the four fp32 pow2 scales, then the 64 bf16 rope
+    values.
+    """
+    from b12x._lib.intrinsics import pow2_ceil_ue8m0_torch
+
+    fp8_max = 448.0
+    nope = q[..., :512].float().reshape(*q.shape[:2], 4, 128)
+    amax = nope.abs().amax(dim=-1, keepdim=True)
+    raw = torch.clamp_min(amax, 1e-4) * torch.tensor(1.0 / fp8_max, dtype=torch.float32, device=q.device)
+    rounded, _ = pow2_ceil_ue8m0_torch(raw)
+    scaled = (nope * (1.0 / rounded)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    nope_bytes = scaled.reshape(*q.shape[:2], 512).view(torch.uint8)
+    scale_bytes = rounded.reshape(*q.shape[:2], 4).contiguous().view(torch.uint8)
+    rope_bytes = q[..., 512:].contiguous().view(torch.uint8)
+    return torch.cat([nope_bytes, scale_bytes, rope_bytes], dim=-1).contiguous()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens,topk", [(1, 512), (4, 2048)])
+def test_unified_decode_glm_packed_query_bit_identical(monkeypatch, num_tokens, topk) -> None:
+    """A packed query record (host-side S0 quantization) is bit-identical to
+    the bf16 query on the fast path, and is rejected without the fast path."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+    import b12x.attention._shared.mla.kernel as launch
+
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=7800 + num_tokens, device=device,
+    )
+    q = case["q"].contiguous()
+    kv_cache_flat = case["kv_cache"].contiguous()
+    kv_cache = kv_cache_flat.view(nblk, _GLM_PAGE, kv_cache_flat.shape[-1])
+    idx = case["topk_indices"].contiguous()
+    lengths = _mixed_lengths(num_tokens, topk, device)
+    caps = B12XSparseMLAScratchCaps(
+        device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=num_tokens,
+        max_batch=num_tokens, max_width=topk, max_kv_rows=nblk * _GLM_PAGE,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=max(8, (topk + 63) // 64), page_size=_GLM_PAGE,
+        partial_dtype=torch.float32,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (spec,) = plan.scratch_specs()
+    storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+    cache_seqlens = torch.full((num_tokens,), nblk * _GLM_PAGE, dtype=torch.int32, device=device)
+    packed = pack_glm_query_reference(q)
+    assert packed.shape == (num_tokens, _GLM_NUM_HEADS, 656) and packed.dtype == torch.uint8
+
+    def run(q_in):
+        binding = plan.bind(
+            scratch=storage, q=q_in, selected_indices=idx,
+            cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=lengths,
+        )
+        out = run_unified_decode(
+            q_all=binding.q, swa_k_cache=kv_cache, swa_indices=idx, swa_topk_lengths=lengths,
+            workspace=binding.scratch, sm_scale=case["sm_scale"], swa_page_size=_GLM_PAGE,
+            forced_num_splits=8, split_policy="balanced",
+        )
+        torch.cuda.synchronize()
+        return out.float().clone()
+
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_W_HW_DEQUANT", "1")
+    bf16_out = run(q)
+    packed_out = run(packed)
+    assert launch.LAST_DECODE_PLAN.get("glm_fastpath") is True
+    assert torch.equal(bf16_out, packed_out)
+    exp = glm_ref.glm_decode_reference(
+        q, kv_cache_flat, idx, case["sm_scale"], active_token_counts=lengths,
+    ).float()
+    _assert_glm_rows_match_reference(packed_out, exp, lengths, label="packed query")
+
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "0")
+    with pytest.raises(ValueError, match="packed query"):
+        run(packed)

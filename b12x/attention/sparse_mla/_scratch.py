@@ -189,11 +189,32 @@ def _validate_device(
         )
 
 
+# Packed GLM query record: 512 E4M3 nope bytes, four fp32 pow2 tile scales
+# (the ``q_sc`` values the in-kernel S0 stage would compute) and 64 bf16 rope
+# values; the same framing as the 656-byte packed KV record.
+PACKED_QUERY_RECORD_BYTES = 656
+PACKED_QUERY_HEAD_DIM = 576
+
+
+def is_packed_query(q: torch.Tensor, *, head_dim: int) -> bool:
+    """True for a uint8 ``(rows, heads, 656)`` packed query of a 576-dim head."""
+    return (
+        q.dtype == torch.uint8
+        and q.ndim == 3
+        and int(q.shape[-1]) == PACKED_QUERY_RECORD_BYTES
+        and int(head_dim) == PACKED_QUERY_HEAD_DIM
+    )
+
+
 def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
     if q.ndim != 3:
         raise ValueError(f"q must be rank-3, got {tuple(q.shape)}")
-    if q.dtype != scratch.dtype:
-        raise TypeError(f"q must have dtype {scratch.dtype}, got {q.dtype}")
+    packed = is_packed_query(q, head_dim=scratch.head_dim)
+    if q.dtype != scratch.dtype and not packed:
+        raise TypeError(
+            f"q must have dtype {scratch.dtype} (or a uint8 packed "
+            f"{PACKED_QUERY_RECORD_BYTES}-byte query record), got {q.dtype}"
+        )
     _validate_device(q, scratch=scratch, name="q")
     if int(q.shape[0]) > int(scratch.max_total_q):
         raise ValueError(
@@ -203,7 +224,7 @@ def _validate_q(q: torch.Tensor, *, scratch: object) -> torch.Tensor:
         raise ValueError(
             f"q heads {int(q.shape[1])} do not match scratch heads {scratch.num_q_heads}"
         )
-    if int(q.shape[2]) != int(scratch.head_dim):
+    if not packed and int(q.shape[2]) != int(scratch.head_dim):
         raise ValueError(
             f"q head_dim {int(q.shape[2])} does not match scratch head_dim {scratch.head_dim}"
         )
