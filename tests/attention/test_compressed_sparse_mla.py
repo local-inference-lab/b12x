@@ -116,7 +116,7 @@ def test_dsv4_nvfp4_traits_keep_the_dsv4_query_contract() -> None:
     assert (native.d_nope, native.d_rope, native.d_v) == (448, 64, 512)
     assert native.kv_gmem_stride == 432
     assert native.rope_gmem_offset == 304
-    assert native.v_has_rope is True
+    assert native.v_has_rope is False
     assert native.has_extra_cache is False
 
 

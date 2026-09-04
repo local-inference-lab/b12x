@@ -155,7 +155,10 @@ def make_unified_traits(
                 block_threads=288,
                 math_threads=256,
                 bulk_tx_bytes=26624,
-                v_has_rope=True,
+                # The eight FP4 V chunks already cover all 512 latent values,
+                # including the rotated 64-wide tail.  ``kv_rope`` remains for
+                # QK-RoPE, but must not contribute a second XV tail.
+                v_has_rope=False,
                 has_extra_cache=False,
                 fp8_rope=False,
                 rope_gmem_offset=304,
