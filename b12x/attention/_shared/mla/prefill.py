@@ -54,14 +54,18 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if is_glm_model_type(model_type):
+    if record_bytes is not None:
+        expected = int(page_size) * int(record_bytes)
+    elif is_glm_model_type(model_type):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
-        rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
-        expected = int(page_size) * rec
+        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
     else:
         expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    if is_glm_model_type(model_type) and cache.is_contiguous():
+    if (
+        cache.is_contiguous()
+        and int(expected) != int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    ):
         return expected
     # The runtime page stride is part of the packed/padded cache contract.
     if cache.ndim >= 2:
@@ -209,8 +213,11 @@ def run_unified_prefill(
         scale_format = inferred_scale_format
     else:
         scale_format = int(scale_format)
-        if model_type == ModelType.GLM_NSA and scale_format == ScaleFormat.NVFP4_E4M3:
-            # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
+        if (
+            model_type in (ModelType.DSV4, ModelType.GLM_NSA)
+            and scale_format == ScaleFormat.NVFP4_E4M3
+        ):
+            # Native NVFP4 prefill runs the BF16-QK MG arm (E2M1/E4M3
             # dequant + BF16 MMA); FP8 compute would misread the 432B record.
             compute_mode = ComputeMode.BF16
         elif scale_format != inferred_scale_format:
@@ -402,20 +409,21 @@ def run_unified_prefill(
             model_type=model_type,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
-    # ── NVFP4 (E2M1 + E4M3 group-16, GLM-family) MG gate ───────────────────────
-    # Same MG head-group structure as GLM; the math arms are the BF16-QK path
+    # ── NVFP4 (E2M1 + E4M3 group-16) MG gate ──────────────────────────────────
+    # DSV4 and GLM share the BF16-QK math arm while retaining their own query
+    # geometry and value/RoPE traits.
     # with native in-register E2M1/E4M3 dequant (the same math as the validated
     # NVFP4 decode). topk==128 additionally routes here (BF16-QK shape).
     _mg_nvfp4 = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and model_type in (ModelType.DSV4, ModelType.GLM_NSA)
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
     if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.NVFP4_E4M3,
         )
     _mg_base = (
@@ -474,6 +482,6 @@ def run_unified_prefill(
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
         "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
-        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
+        "NVFP4 (DSV4/GLM_NSA, scale_format=2) topk in {128, 512, 1024, 2048}. "
         "No decode-reuse fallback."
     )

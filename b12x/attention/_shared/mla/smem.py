@@ -558,6 +558,7 @@ def _run_module_asserts() -> None:
 
     dsv4 = _assert_model(ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
     _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.UE8M0_BYTE)
+    _assert_model(ModelType.DSV4, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)

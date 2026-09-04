@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from collections.abc import Callable
 
@@ -17,6 +18,12 @@ from b12x.attention._shared.mla.prefill import (
 )
 from b12x.attention._shared.mla.prefill_mg import (
     _cache_block_stride_bytes as _prefill_mg_cache_block_stride_bytes,
+)
+from b12x.attention._shared.mla.traits import (
+    ComputeMode,
+    ModelType,
+    ScaleFormat,
+    make_unified_traits,
 )
 from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
@@ -72,6 +79,52 @@ def test_compressed_sparse_mla_layout_rejects_short_page() -> None:
             page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
             name="cache",
         )
+
+
+@pytest.mark.parametrize("page_size", [16, 64, 256])
+def test_compressed_sparse_mla_layout_accepts_compact_nvfp4_pages(
+    page_size: int,
+) -> None:
+    _validate_compressed_cache_layout(
+        torch.empty((2, page_size * 432), dtype=torch.uint8),
+        page_size=page_size,
+        name="cache",
+        record_bytes=432,
+    )
+
+
+def test_compressed_sparse_mla_layout_rejects_short_nvfp4_page() -> None:
+    page_size = 64
+    with pytest.raises(ValueError, match="contiguous payload"):
+        _validate_compressed_cache_layout(
+            torch.empty((2, page_size * 432 - 1), dtype=torch.uint8),
+            page_size=page_size,
+            name="cache",
+            record_bytes=432,
+        )
+
+
+def test_dsv4_nvfp4_traits_keep_the_dsv4_query_contract() -> None:
+    native = make_unified_traits(
+        ModelType.DSV4,
+        ComputeMode.FP8,
+        ScaleFormat.NVFP4_E4M3,
+        fp8_rope=False,
+    )
+
+    assert native.compute_mode == ComputeMode.BF16
+    assert (native.d_nope, native.d_rope, native.d_v) == (448, 64, 512)
+    assert native.kv_gmem_stride == 432
+    assert native.rope_gmem_offset == 304
+    assert native.v_has_rope is False
+    assert native.has_extra_cache is False
+
+
+def test_compressed_sparse_mla_exposes_native_nvfp4_contract() -> None:
+    signature = inspect.signature(compressed_sparse_mla_decode_forward)
+
+    assert signature.parameters["cache_record_bytes"].default == 584
+    assert signature.parameters["latent_scale"].default == 1.0
 
 
 @pytest.mark.parametrize(

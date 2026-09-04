@@ -120,9 +120,55 @@ def make_unified_traits(
         )
 
     if model_type == ModelType.DSV4:
+        if scale_format == ScaleFormat.NVFP4_E4M3:
+            if fp8_rope is True:
+                raise ValueError(
+                    "DSV4 NVFP4 uses the 432-byte BF16-RoPE record; "
+                    "fp8_rope=True is unsupported"
+                )
+            if latent_scale_per_token:
+                raise ValueError(
+                    "DSV4 NVFP4 does not define a per-token latent scale"
+                )
+            # DeepSeek-V4 retains its 448 NoPE + 64 RoPE query contract while
+            # changing only the cache encoding.  The writer packs all 512 latent
+            # values as E2M1, stores 32 E4M3 group-16 scales, and keeps the
+            # rotated 64-wide RoPE tail in BF16 at byte offset 304.  The final
+            # four packed/scaled groups are the duplicated RoPE tail; QK consumes
+            # the first 448 NoPE values and XV consumes the full 512-value latent.
+            return UnifiedMLATraits(
+                model_type=ModelType.DSV4,
+                compute_mode=ComputeMode.BF16,
+                scale_format=ScaleFormat.NVFP4_E4M3,
+                d_nope=448,
+                d_rope=64,
+                d_v=512,
+                quant_tile=64,
+                num_scales=7,
+                n_v_chunks=8,
+                nt_per_warp_xv=1,
+                kv_gmem_stride=432,
+                kv_smem_stride=288,
+                q_nope_stride=456,
+                bi=64,
+                hpb=16,
+                block_threads=288,
+                math_threads=256,
+                bulk_tx_bytes=26624,
+                # The eight FP4 V chunks already cover all 512 latent values,
+                # including the rotated 64-wide tail.  ``kv_rope`` remains for
+                # QK-RoPE, but must not contribute a second XV tail.
+                v_has_rope=False,
+                has_extra_cache=False,
+                fp8_rope=False,
+                rope_gmem_offset=304,
+                rope_payload_bytes=128,
+                rope_scale_offset=-1,
+            )
         if scale_format != ScaleFormat.UE8M0_BYTE:
             raise ValueError(
-                "DSV4 requires ScaleFormat.UE8M0_BYTE (footer); "
+                "DSV4 requires ScaleFormat.UE8M0_BYTE (footer) or "
+                "ScaleFormat.NVFP4_E4M3 (432-byte native record); "
                 f"got scale_format={scale_format!r}"
             )
         # DSV4 column of verified_traits.md (UE8M0_BYTE, V_HAS_ROPE=true).

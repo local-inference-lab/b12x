@@ -24,6 +24,8 @@ from .compressed_reference import (
 
 
 _LN2 = math.log(2.0)
+_DSV4_FP8_RECORD_BYTES = COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+_DSV4_NVFP4_RECORD_BYTES = 432
 
 
 def _should_use_sm121_single_pass_decode(
@@ -60,6 +62,7 @@ def compressed_sparse_mla_decode_forward(
     swa_topk_lengths: torch.Tensor | None = None,
     binding=None,
     sm_scale: float,
+    latent_scale: float = 1.0,
     swa_page_size: int = COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     indexed_k_cache: torch.Tensor | None = None,
     indexed_indices: torch.Tensor | None = None,
@@ -71,6 +74,7 @@ def compressed_sparse_mla_decode_forward(
     return_lse: bool = False,
     lse_scale: Literal["base2", "natural"] = "base2",
     backend: str | None = None,
+    cache_record_bytes: int = _DSV4_FP8_RECORD_BYTES,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages.
@@ -82,6 +86,12 @@ def compressed_sparse_mla_decode_forward(
 
     if lse_scale not in ("base2", "natural"):
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
+    cache_record_bytes = int(cache_record_bytes)
+    if cache_record_bytes not in (_DSV4_FP8_RECORD_BYTES, _DSV4_NVFP4_RECORD_BYTES):
+        raise ValueError(
+            "compressed DSV4 MLA cache_record_bytes must be 584 (FP8) or "
+            f"432 (NVFP4), got {cache_record_bytes}"
+        )
 
     if binding is None:
         raise TypeError("compressed_sparse_mla_decode_forward requires binding")
@@ -136,6 +146,7 @@ def compressed_sparse_mla_decode_forward(
         swa_k_cache,
         page_size=swa_page_size,
         name="swa_k_cache",
+        record_bytes=cache_record_bytes,
     )
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
@@ -181,6 +192,7 @@ def compressed_sparse_mla_decode_forward(
             indexed_k_cache,
             page_size=int(indexed_page_size),
             name="indexed_k_cache",
+            record_bytes=cache_record_bytes,
         )
         indexed_indices_2d = _normalize_index_matrix(
             indexed_indices, name="indexed_indices"
@@ -239,6 +251,7 @@ def compressed_sparse_mla_decode_forward(
             swa_topk_lengths=swa_topk_lengths,
             workspace=scratch,
             sm_scale=sm_scale,
+            latent_scale=latent_scale,
             swa_page_size=swa_page_size,
             indexed_k_cache=indexed_k_cache if has_indexed else None,
             indexed_indices=indexed_indices_2d,
@@ -247,10 +260,11 @@ def compressed_sparse_mla_decode_forward(
             attn_sink=attn_sink,
             return_lse=return_lse,
             lse_scale=lse_scale,
+            cache_record_bytes=cache_record_bytes,
             out=out,
         )
 
-    if _should_use_sm121_single_pass_decode(
+    if cache_record_bytes == _DSV4_FP8_RECORD_BYTES and _should_use_sm121_single_pass_decode(
         rows=rows,
         heads=heads,
         swa_width=int(swa_indices_2d.shape[1]),
@@ -265,6 +279,7 @@ def compressed_sparse_mla_decode_forward(
             swa_topk_lengths=swa_topk_lengths,
             workspace=scratch,
             sm_scale=sm_scale,
+            latent_scale=latent_scale,
             swa_page_size=swa_page_size,
             indexed_k_cache=indexed_k_cache if has_indexed else None,
             indexed_indices=indexed_indices_2d,
@@ -273,6 +288,7 @@ def compressed_sparse_mla_decode_forward(
             attn_sink=attn_sink,
             return_lse=return_lse,
             lse_scale=lse_scale,
+            cache_record_bytes=cache_record_bytes,
             out=out,
         )
 
@@ -285,6 +301,7 @@ def compressed_sparse_mla_decode_forward(
         swa_topk_lengths=swa_topk_lengths,
         workspace=scratch,
         sm_scale=sm_scale,
+        latent_scale=latent_scale,
         swa_page_size=swa_page_size,
         indexed_k_cache=indexed_k_cache if has_indexed else None,
         indexed_indices=indexed_indices_2d,
@@ -293,6 +310,12 @@ def compressed_sparse_mla_decode_forward(
         attn_sink=attn_sink,
         return_lse=return_lse,
         lse_scale=lse_scale,
+        scale_format_override=(
+            2 if cache_record_bytes == _DSV4_NVFP4_RECORD_BYTES else None
+        ),
+        fp8_rope_override=(
+            False if cache_record_bytes == _DSV4_NVFP4_RECORD_BYTES else None
+        ),
         out=out,
     )
 
@@ -322,6 +345,7 @@ def _run_sm120_compressed_prefill(
     swa_topk_lengths: torch.Tensor,
     workspace: object,
     sm_scale: float,
+    latent_scale: float,
     swa_page_size: int,
     indexed_k_cache: torch.Tensor | None,
     indexed_indices: torch.Tensor | None,
@@ -330,6 +354,7 @@ def _run_sm120_compressed_prefill(
     attn_sink: torch.Tensor | None,
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
+    cache_record_bytes: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
@@ -370,10 +395,15 @@ def _run_sm120_compressed_prefill(
         kv_cache=swa_k_cache,
         topk_indices=swa_indices_2d,
         sm_scale=float(sm_scale),
+        latent_scale=float(latent_scale),
         page_block_size=int(swa_page_size),
         topk_length=swa_topk_lengths,
         attn_sink=attn_sink,
         output=output,
+        scale_format=(
+            2 if cache_record_bytes == _DSV4_NVFP4_RECORD_BYTES else None
+        ),
+        fp8_rope=False if cache_record_bytes == _DSV4_NVFP4_RECORD_BYTES else None,
         **extra_kwargs,
     )
     if not return_lse:
@@ -526,12 +556,17 @@ def _validate_compressed_cache_layout(
     *,
     page_size: int,
     name: str,
+    record_bytes: int = _DSV4_FP8_RECORD_BYTES,
 ) -> None:
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-    payload_nbytes = page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    padded_page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
+    payload_nbytes = page_size * int(record_bytes)
+    padded_page_nbytes = (
+        compressed_sparse_mla_page_nbytes(page_size)
+        if int(record_bytes) == _DSV4_FP8_RECORD_BYTES
+        else payload_nbytes
+    )
     page_nbytes = int(cache.shape[1])
     if page_nbytes not in (payload_nbytes, padded_page_nbytes):
         raise ValueError(
