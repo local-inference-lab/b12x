@@ -218,6 +218,69 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
 
 
+def test_mm_pair_matches_independent_projections() -> None:
+    """Paired execution preserves both independently computed MXFP8 results."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260904)
+
+    source, _, primary = _make_inputs(4, 256, 384)
+    _, _, secondary = _make_inputs(4, 256, 64)
+    secondary_stream = torch.cuda.Stream(device=source.device)
+
+    expected_primary = mxfp8_linear.mm(source, primary)
+    expected_secondary = mxfp8_linear.mm(source, secondary)
+    actual_primary, actual_secondary = mxfp8_linear.mm_pair(
+        source,
+        primary,
+        secondary,
+        parallel_max_tokens=8,
+        secondary_stream=int(secondary_stream.cuda_stream),
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual_primary, expected_primary, rtol=0, atol=0)
+    torch.testing.assert_close(actual_secondary, expected_secondary, rtol=0, atol=0)
+
+
+def test_mm_pair_captures_both_streams_and_replays() -> None:
+    """Graph replay waits for the secondary projection before returning outputs."""
+    require_b12x()
+    require_mxf8_mma()
+    torch.manual_seed(20260905)
+
+    source, _, primary = _make_inputs(4, 256, 384)
+    _, _, secondary = _make_inputs(4, 256, 64)
+    replacement = torch.randn_like(source).div_(4)
+    secondary_stream = torch.cuda.Stream(device=source.device)
+    mxfp8_linear.mm_pair(
+        source,
+        primary,
+        secondary,
+        parallel_max_tokens=8,
+        secondary_stream=secondary_stream,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_primary, actual_secondary = mxfp8_linear.mm_pair(
+            source,
+            primary,
+            secondary,
+            parallel_max_tokens=8,
+            secondary_stream=secondary_stream,
+        )
+    source.copy_(replacement)
+    expected_primary = mxfp8_linear.mm(source, primary)
+    expected_secondary = mxfp8_linear.mm(source, secondary)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual_primary, expected_primary, rtol=0, atol=0)
+    torch.testing.assert_close(actual_secondary, expected_secondary, rtol=0, atol=0)
+
+
 def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
     require_b12x()
     require_mxf8_mma()
