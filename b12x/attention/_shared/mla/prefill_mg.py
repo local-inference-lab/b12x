@@ -208,14 +208,18 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if is_glm:
+    if record_bytes is not None:
+        expected = int(page_size) * int(record_bytes)
+    elif is_glm:
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
-        rec = int(record_bytes) if record_bytes is not None else _GLM_IO_STRIDE
-        expected = int(page_size) * rec
+        expected = int(page_size) * _GLM_IO_STRIDE
     else:
         expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    if is_glm and cache.is_contiguous():
+    if (
+        cache.is_contiguous()
+        and int(expected) != int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    ):
         return expected
     # Use the tensor's physical page stride for padded views.
     if cache.ndim >= 2:
@@ -2357,10 +2361,10 @@ class UnifiedPrefillMGKernel:
             t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
         )
         has_rope = cutlass.const_expr(t.d_rope > 0)
-        # NVFP4 (E2M1 + E4M3 group-16) GLM-family arm: BF16-QK with native
-        # in-register dequant, BF16 P.V staged in the dead W_FP8 region, and
-        # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
-        # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
+        # NVFP4 (E2M1 + E4M3 group-16) uses BF16-QK with native in-register
+        # dequant, BF16 P.V staged in the dead W_FP8 region, and the
+        # 432B/288B record geometry. DSV4 keeps its 448+64 query/value traits;
+        # the shared inline-scale gather is selected by ``is_nvfp4`` below.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
         q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
@@ -2378,7 +2382,9 @@ class UnifiedPrefillMGKernel:
         # NVFP4 per-token latent-scale mode, which stages one fp32 per
         # candidate.  DSV4 stages XV-RoPE weights into the W_FP8 region after
         # XV-NoPE consumes it.
-        if cutlass.const_expr(is_glm and not t.latent_scale_per_token):
+        if cutlass.const_expr(
+            not t.has_extra_cache and not t.latent_scale_per_token
+        ):
             kv_sc_addr = Int32(0)
         else:
             kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
@@ -2532,7 +2538,7 @@ class UnifiedPrefillMGKernel:
                 g_end0 = Int32(_CAND_WINDOW)
                 if g_end0 > section_len:
                     g_end0 = section_len
-                if cutlass.const_expr(is_glm):
+                if cutlass.const_expr(is_glm or is_nvfp4):
                     io_issue_gather_glm_mg(
                         kv_cache_u8,
                         topk_row,
@@ -2633,7 +2639,7 @@ class UnifiedPrefillMGKernel:
                         g_end = g_start + Int32(_CAND_WINDOW)
                         if g_end > section_len:
                             g_end = section_len
-                        if cutlass.const_expr(is_glm):
+                        if cutlass.const_expr(is_glm or is_nvfp4):
                             io_issue_gather_glm_mg(
                                 kv_cache_u8,
                                 topk_row,
@@ -4135,6 +4141,11 @@ def run_unified_prefill_mg(
     if scale_format is None:
         scale_format = ScaleFormat.ARBITRARY_FP32 if is_glm else ScaleFormat.UE8M0_BYTE
     scale_format = int(scale_format)
+    if (
+        model_type == ModelType.DSV4
+        and scale_format == ScaleFormat.NVFP4_E4M3
+    ):
+        compute_mode = ComputeMode.BF16
     expected_qdim = {
         ModelType.DSV4: _DSV4_HEAD_DIM,
         ModelType.GLM_NSA: _GLM_HEAD_DIM,

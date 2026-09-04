@@ -58,6 +58,7 @@ from .decode_math import (
 from .io import io_issue_gather, io_issue_gather_packed, io_issue_packed_payload
 from .smem import get_unified_shared_storage_cls, make_smem_layout
 from .traits import (
+    ComputeMode,
     ModelType,
     ScaleFormat,
     infer_model_type,
@@ -1944,14 +1945,18 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if is_glm_model_type(model_type):
+    if record_bytes is not None:
+        expected = int(page_size) * int(record_bytes)
+    elif is_glm_model_type(model_type):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
-        rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
-        expected = int(page_size) * rec
+        expected = int(page_size) * _GLM_KV_GMEM_STRIDE
     else:
         expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    if is_glm_model_type(model_type) and cache.is_contiguous():
+    if (
+        cache.is_contiguous()
+        and int(expected) != int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    ):
         return expected
     # Use the tensor's physical page stride for padded views.
     if cache.ndim >= 2:
@@ -2018,10 +2023,13 @@ def _sparse_mla_decode_grid_flat_launch(
         and _env_glm_h8_native_enabled()
     )
     native_dsv4_h8 = bool(
-        int(model_type) == int(ModelType.DSV4) and int(valid_hpb) == 8
+        int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) == int(ScaleFormat.UE8M0_BYTE)
+        and int(valid_hpb) == 8
     )
     native_dsv4_h16 = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) == int(ScaleFormat.UE8M0_BYTE)
         and int(valid_hpb) == 16
         and int(head_block_offset) == 0
         and (int(topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
@@ -2502,6 +2510,11 @@ def run_unified_decode(
     )
     if scale_format_override is not None:
         scale_format = int(scale_format_override)
+    if (
+        int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) == int(ScaleFormat.NVFP4_E4M3)
+    ):
+        compute_mode = ComputeMode.BF16
     if scale_format == ScaleFormat.NVFP4_E4M3 and fp8_rope_override is None:
         record_bytes = int(swa_k_cache.shape[-1])
         if record_bytes not in (368, 432):
@@ -2563,6 +2576,7 @@ def run_unified_decode(
 
     h16_allowed = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) == int(ScaleFormat.UE8M0_BYTE)
         and heads % 16 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
     )
@@ -2587,6 +2601,7 @@ def run_unified_decode(
         native_dsv4_h16 = bool(h16_allowed and h16_mode)
     native_dsv4_h8 = bool(
         int(model_type) == int(ModelType.DSV4)
+        and int(scale_format) == int(ScaleFormat.UE8M0_BYTE)
         and heads % 8 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
         and not native_dsv4_h16
