@@ -1,8 +1,9 @@
 """MoE ops for b12x.
 
 - ``fused_moe``: fused tensor-parallel routed-expert FFN (route -> FC1 ->
-  activation -> FC2 -> scatter); recipes nvfp4/w4a8_mx/w4a8_nvfp4/w6a8_mx/
-  w4a16, including the TP-independent ``btx`` trellis checkpoint container.
+  activation -> FC2 -> scatter); recipes nvfp4/mxfp4/w4a8_mx/w4a8_nvfp4/w4a16,
+  including legacy ``exl3_trellis_mcg`` and TP-independent
+  ``qsrt_sqg_e4m3`` plus uniform-K5/K6 ``sqg_fp16_d3l`` W4A16 source formats.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
 """

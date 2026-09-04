@@ -24,7 +24,9 @@ from .pcie_oneshot import (
 )
 
 
-SUPPORTED_WORLD_SIZES = (16,)
+# kimi-k3-island-rs-ws8: two 4-GPU islands map onto the TP8 cascade
+# (PEX88096 switch boundary = ranks 0-3 / 4-7).
+SUPPORTED_WORLD_SIZES = (8, 16)
 SUPPORTED_BLOCKS = (1, 2, 4, 8, 16, 32)
 _ISLAND_SIZE = 4
 _ALIGNMENT = 256

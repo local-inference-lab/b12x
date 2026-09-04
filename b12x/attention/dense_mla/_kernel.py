@@ -21,7 +21,6 @@ from b12x._lib.compiler import (
     tensor_key,
 )
 
-from .._shared import static_fp8_quant
 from ._forward import DenseMlaForwardKernel
 from ._layout import make_smem_layout
 from ._merge import DenseMlaMergeKernel
@@ -53,6 +52,21 @@ def _to_cute(
     return converted
 
 
+def _partial_dtype_name(scratch) -> str:
+    return "fp32" if scratch.partial_dtype == torch.float32 else "bf16"
+
+
+def _partial_cute_dtype(scratch):
+    """Element type of the split-partial operand handed to the kernels.
+
+    A one-split plan has no partial buffer; the forward kernel then receives
+    the bf16 output tensor as a never-written placeholder.
+    """
+    if scratch.partial_output is None:
+        return cutlass.BFloat16
+    return cutlass.Float32 if scratch.partial_dtype == torch.float32 else cutlass.BFloat16
+
+
 def _byte_base_pointer(tensor: torch.Tensor) -> torch.Tensor:
     """Return a one-element byte view at the tensor's physical base.
 
@@ -80,13 +94,17 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.page_size,
         scratch.max_total_q,
         scratch.max_batch,
+        scratch.uses_query_cache_seqlens,
+        scratch.sparse_stride,
+        scratch.sparse_min_tokens,
+        scratch.sparse_sink_chunks,
+        scratch.sparse_recent_chunks,
+        scratch.sparse_refresh_interval,
         scratch.query_tile,
         scratch.num_splits,
         scratch.chunks_per_split,
-        scratch.physical_record_width,
-        scratch.head_dim,
-        scratch.v_head_dim,
-        scratch.window_size,
+        scratch.single_split_chunks,
+        str(scratch.partial_dtype),
         tuple(int(value) for value in binding.q.stride()),
         tuple(int(value) for value in binding.kv_cache.stride()),
         tuple(int(value) for value in binding.output.stride()),
@@ -118,7 +136,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     layout = make_smem_layout(
         query_tile=scratch.query_tile,
         fp8=fp8,
-        qk_dim=scratch.head_dim,
     )
     entry = DenseMlaForwardKernel(
         layout=layout,
@@ -126,11 +143,15 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         num_heads=scratch.num_q_heads,
         num_splits=scratch.num_splits,
         chunks_per_split=scratch.chunks_per_split,
+        single_split_chunks=scratch.single_split_chunks,
         query_tile=scratch.query_tile,
+        uses_query_cache_seqlens=scratch.uses_query_cache_seqlens,
+        sparse_stride=scratch.sparse_stride,
+        sparse_min_tokens=scratch.sparse_min_tokens,
+        sparse_sink_chunks=scratch.sparse_sink_chunks,
+        sparse_recent_chunks=scratch.sparse_recent_chunks,
+        sparse_refresh_interval=scratch.sparse_refresh_interval,
         fp8=fp8,
-        qk_dim=scratch.head_dim,
-        value_dim=scratch.v_head_dim,
-        window_size=scratch.window_size,
     )
 
     q_bytes = _byte_base_pointer(binding.q)
@@ -180,13 +201,19 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dynamic_layout=True,
         ),
         _to_cute(
+            binding.query_cache_seqlens,
+            cutlass.Int32,
+            align=4,
+            dynamic_layout=True,
+        ),
+        _to_cute(
             output,
             cutlass.BFloat16,
             align=16,
             dynamic_layout=True,
         ),
         _to_cute(final_lse, cutlass.Float32, align=4),
-        _to_cute(partial_output, cutlass.BFloat16, align=16),
+        _to_cute(partial_output, _partial_cute_dtype(scratch), align=16),
         _to_cute(partial_lse, cutlass.Float32, align=4),
         _to_cute(kv_scale, cutlass.Float32, align=4),
         _to_cute(q_scale, cutlass.Float32, align=4),
@@ -194,7 +221,6 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         Int64(int(binding.q.stride(0)) * binding.q.element_size()),
         Int64(int(binding.q.stride(1)) * binding.q.element_size()),
         Int64(int(binding.kv_cache.stride(0)) * binding.kv_cache.element_size()),
-        Int64(int(binding.kv_cache.stride(1)) * binding.kv_cache.element_size()),
         Int64(int(binding.page_table.stride(0))),
         Int32(int(binding.q.shape[0])),
         Int32(int(binding.cache_seqlens.shape[0])),
@@ -203,19 +229,26 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.forward",
-        4,
+        6,
         key_field("dtype", "fp8" if fp8 else "bf16"),
         key_field("heads", scratch.num_q_heads),
         key_field("page_size", scratch.page_size),
         key_field("max_total_q", scratch.max_total_q),
         key_field("max_batch", scratch.max_batch),
         key_field("query_tile", scratch.query_tile),
+        key_field(
+            "uses_query_cache_seqlens",
+            scratch.uses_query_cache_seqlens,
+        ),
+        key_field("sparse_stride", scratch.sparse_stride),
+        key_field("sparse_min_tokens", scratch.sparse_min_tokens),
+        key_field("sparse_sink_chunks", scratch.sparse_sink_chunks),
+        key_field("sparse_recent_chunks", scratch.sparse_recent_chunks),
+        key_field("sparse_refresh_interval", scratch.sparse_refresh_interval),
         key_field("num_splits", scratch.num_splits),
         key_field("chunks_per_split", scratch.chunks_per_split),
-        key_field("physical_record_width", scratch.physical_record_width),
-        key_field("head_dim", scratch.head_dim),
-        key_field("v_head_dim", scratch.v_head_dim),
-        key_field("window_size", scratch.window_size),
+        key_field("single_split_chunks", scratch.single_split_chunks),
+        key_field("partial_dtype", _partial_dtype_name(scratch)),
         key_field("record_stride_bytes", layout.record_stride_bytes),
         tensor_key(
             "q",
@@ -223,7 +256,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.head_dim),
+                DimKey.exact(576),
             ),
         ),
         tensor_key(
@@ -232,7 +265,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.page_size),
-                DimKey.exact(scratch.physical_record_width),
+                DimKey.exact(576),
             ),
         ),
         tensor_key(
@@ -241,7 +274,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
     )
@@ -254,12 +287,15 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
         return None
     assert scratch.partial_output is not None
     assert scratch.partial_lse is not None
-    entry = DenseMlaMergeKernel(scratch.num_splits, scratch.v_head_dim)
+    entry = DenseMlaMergeKernel(
+        scratch.num_splits,
+        partial_fp32=scratch.partial_dtype == torch.float32,
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (
         _to_cute(
             scratch.partial_output,
-            cutlass.BFloat16,
+            _partial_cute_dtype(scratch),
             align=16,
         ),
         _to_cute(scratch.partial_lse, cutlass.Float32, align=4),
@@ -275,10 +311,10 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
     )
     spec = KernelCompileSpec.from_fields(
         "attention.dense_mla.merge",
-        4,
+        5,
         key_field("num_splits", scratch.num_splits),
         key_field("heads", scratch.num_q_heads),
-        key_field("v_head_dim", scratch.v_head_dim),
+        key_field("partial_dtype", _partial_dtype_name(scratch)),
         tensor_key(
             "partial_output",
             scratch.partial_output,
@@ -286,7 +322,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
                 DimKey.capacity(scratch.max_total_q),
                 DimKey.exact(scratch.num_q_heads),
                 DimKey.exact(scratch.num_splits),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
         tensor_key(
@@ -295,7 +331,7 @@ def _merge_launch(binding: Binding) -> _MergeLaunch | None:
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(scratch.num_q_heads),
-                DimKey.exact(scratch.v_head_dim),
+                DimKey.exact(512),
             ),
         ),
     )
@@ -333,8 +369,6 @@ def compile_dense_mla(*, binding: Binding) -> None:
     """Compile the exact native forward/merge entries without launching."""
     if not binding.q.is_cuda:
         raise ValueError("dense MLA native compilation requires CUDA tensors")
-    if binding.query_quant is not None:
-        static_fp8_quant.compile(binding=binding.query_quant)
     _compile_entries(binding)
 
 
@@ -345,8 +379,6 @@ def run_dense_mla(
     """Launch only previously planned storage; no device allocation occurs."""
     if not binding.q.is_cuda:
         raise ValueError("dense MLA native execution requires CUDA tensors")
-    if binding.query_quant is not None:
-        static_fp8_quant.run(binding=binding.query_quant)
     signature = _signature(binding)
     with _LOCK:
         compiled_forward = _FORWARD_CACHE.get(signature)
@@ -374,7 +406,6 @@ def run_dense_mla(
 
 
 def clear_dense_mla_kernel_caches() -> None:
-    static_fp8_quant.clear_caches()
     with _LOCK:
         _FORWARD_CACHE.clear()
         _MERGE_CACHE.clear()

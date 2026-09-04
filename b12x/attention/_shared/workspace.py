@@ -2541,7 +2541,7 @@ class B12XAttentionWorkspace:
         )
 
         return build_compressed_mla_binding(
-            scratch=self,
+            workspace=self,
             q=q,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,

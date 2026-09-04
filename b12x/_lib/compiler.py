@@ -1934,12 +1934,6 @@ def _compile_options_cache_key(compile_callable: Any) -> tuple[str, ...]:
     return tuple(serialized)
 
 
-def _dsl_compile_options_kwargs_key(compile_callable: Any) -> tuple[str, ...]:
-    """Return the raw subscripted compile options for cache provenance."""
-
-    return _compile_options_cache_key(compile_callable)
-
-
 def _compile_disk_cache_payload(
     compile_callable: Any,
     func: Any,
@@ -2645,9 +2639,7 @@ def compile(
 
             compile_callable = CompileCallable(dsl_compile_options)
         kwargs = dict(kwargs)
-        kwargs["__dsl_compile_options_key"] = _dsl_compile_options_kwargs_key(
-            compile_callable
-        )
+        kwargs["__dsl_compile_options_key"] = _structural_cache_key(dsl_compile_options)
     memory_cache_key = _compile_memory_cache_key(
         compile_callable, func, args, kwargs, compile_spec
     )

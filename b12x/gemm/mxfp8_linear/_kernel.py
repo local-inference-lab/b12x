@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import cutlass.cute as cute
@@ -9,7 +10,7 @@ from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.block_fp8 import (
     quantize_block_fp8_linear_input_mxfp8,
 )
-from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.dense_gemm import dense_gemm, dense_gemm_fused_quant_a
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
@@ -84,6 +85,51 @@ def _pad_source_2d_k(source_2d: torch.Tensor, padded_k: int) -> torch.Tensor:
     padded = source_2d.new_zeros((tokens, padded_k))
     padded[:, :k] = source_2d
     return padded.contiguous()
+
+
+def _dense_gemm_kwargs_for_n(out_features: int) -> dict[str, object]:
+    if int(out_features) < 64:
+        return {"mma_tiler_mn": (64, 32), "swap_ab": True}
+    return {}
+
+
+_FUSED_QUANT_A_MAX_TOKENS = 8
+
+
+def _fused_quant_a_max_n() -> int:
+    """Widest N routed through the in-CTA activation quantization.
+
+    B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N (default 4096): 0 keeps the
+    separate quantizer for every shape. The fused GEMM re-quantizes A in each
+    N tile and has no split-K, so above a few thousand columns the separate
+    quantizer plus split-K GEMM is faster on SM120 (measured at N = 7168).
+    """
+    return int(os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096"))
+
+
+def _use_fused_quant_a(
+    tokens: int,
+    dtype: torch.dtype,
+    in_features: int,
+    padded_in_features: int,
+    out_features: int,
+) -> bool:
+    """Whether the linear runs as one small-M GEMM quantizing BF16 A in-CTA.
+
+    The in-CTA quantization computes the same UE8M0 scales and E4M3 values as
+    the standalone row quantizer, so the output is bit-identical; the fused
+    path only drops the two scale-buffer fills and the quantization kernel.
+    K padding is left to the separate path (the padded source would need its
+    own copy), and so is any N that is not a whole number of 64-wide output
+    tiles: the fused kernel has no N tail handling.
+    """
+    return (
+        tokens <= _FUSED_QUANT_A_MAX_TOKENS
+        and dtype == torch.bfloat16
+        and int(in_features) == int(padded_in_features)
+        and int(out_features) % 64 == 0
+        and 0 < int(out_features) <= _fused_quant_a_max_n()
+    )
 
 
 def is_mxfp8_linear_supported() -> tuple[bool, str | None]:
@@ -177,6 +223,17 @@ def _mxfp8_linear_fused_op(
 ) -> torch.Tensor:
     del weight_scale_rows
     tokens = int(source_2d.shape[0])
+    if _use_fused_quant_a(
+        tokens, source_2d.dtype, in_features, padded_in_features, out_features
+    ):
+        return dense_gemm_fused_quant_a(
+            source_2d,
+            weight_values.reshape(out_features, padded_in_features, 1),
+            weight_scale_mma,
+            expected_m=expected_m,
+            stream=stream_int,
+            **_dense_gemm_kwargs_for_n(out_features),
+        )[:, :, 0]
     source_for_quant = _pad_source_2d_k(source_2d, int(padded_in_features))
     x_q = quantize_block_fp8_linear_input_mxfp8(source_for_quant)
     return dense_gemm(
@@ -191,6 +248,7 @@ def _mxfp8_linear_fused_op(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=expected_m,
         stream=stream_int,
+        **_dense_gemm_kwargs_for_n(out_features),
     )[:, :, 0]
 
 

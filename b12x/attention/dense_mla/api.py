@@ -1,4 +1,4 @@
-"""Public planned API for paged dense MLA."""
+"""Public planned API for dense Kimi-K3 MLA."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from ._scratch import (
 )
 from .planner import Budget
 from .planner import (
+    dynamic_sparse_chunk_indices,
     infer_dense_mla_mode,
 )
 from ._reference import dense_mla_reference
@@ -43,7 +44,7 @@ def run(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def reference(*args, **kwargs):
-    """Run the FP32 paged dense-MLA oracle."""
+    """Run the FP32 paged K3 dense-MLA oracle."""
     return dense_mla_reference(*args, **kwargs)
 
 
@@ -55,10 +56,9 @@ def is_supported(device=None) -> bool:
     """True only for the fail-closed SM120/SM121 production envelope."""
     if not default_is_supported(device, requires=META.requires):
         return False
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        device = torch.device(device)
+    device = torch.device(
+        device if device is not None else ("cuda", torch.cuda.current_device())
+    )
     return tuple(torch.cuda.get_device_capability(device)) in ((12, 0), (12, 1))
 
 
@@ -75,6 +75,7 @@ __all__ = [
     "bind",
     "clear_caches",
     "compile",
+    "dynamic_sparse_chunk_indices",
     "infer_mode",
     "is_supported",
     "plan",

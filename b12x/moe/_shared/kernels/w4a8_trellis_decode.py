@@ -21,7 +21,6 @@ from b12x._lib.intrinsics import (
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
     packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
 )
-from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
 
 
 @cute.jit
@@ -134,11 +133,20 @@ def _w4a8_trellis_lane_geom(lane: Int32, bits: cutlass.Constexpr):
 
     ``ia``/``ib`` are the two ring word indices covering the lane's
     overlapping L16 windows and ``s2`` the merge shift; they depend only on
-    the lane id and the bitrate. The W4A8 kernels always decode the full
-    eight-weight span starting at the lane origin.
+    the lane id and the bitrate.
     """
 
-    ia, ib, s2, _ = trellis256_lane_geom_bits(lane, 0, 8, bits)
+    bits_i32 = Int32(int(bits))
+    ring_u32 = Int32(8 * int(bits))
+    t_offset = Int32(8) * lane
+    b1 = (t_offset + Int32(257)) * bits_i32
+    b0 = b1 - Int32(16)
+    b2 = b1 + Int32(7 * int(bits))
+    i0 = b0 >> Int32(5)
+    i2 = (b2 - Int32(1)) >> Int32(5)
+    ia = i0 - ring_u32 * (i0 >= ring_u32).to(Int32)
+    ib = i2 - ring_u32 * (i2 >= ring_u32).to(Int32)
+    s2 = (i2 + Int32(1)) * Int32(32) - b2
     return ia, ib, s2
 
 

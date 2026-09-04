@@ -18,10 +18,10 @@ class MoEMicroKernelSitu(MoEMicroKernelBackend):
 
     The compact NVFP4 intermediate quantization has not passed its
     correctness gate, so ``is_supported`` stays False and the nvfp4-family
-    dispatch never selects this class. The trellis_t256 arm quantizes its
+    dispatch never selects this class. The trellis3_t256 arm quantizes its
     intermediate through per-32 UE8M0 E4M3 (a8_mx) instead; the w4a8_mx
     trellis band dispatches it explicitly and constructs this class with
-    ``weight_layout="trellis_t256"``.
+    ``weight_layout="trellis3_t256"``.
     """
 
     @classmethod
@@ -37,9 +37,9 @@ class MoEMicroKernelSitu(MoEMicroKernelBackend):
         return False
 
     def __init__(self, *args: object, **kwargs: object):
-        if kwargs.get("weight_layout") != "trellis_t256":
+        if kwargs.get("weight_layout") != "trellis3_t256":
             raise NotImplementedError(
-                "SiTU compact micro serves only the trellis_t256 weight "
+                "SiTU compact micro serves only the trellis3_t256 weight "
                 "layout; select the fused dynamic kernel"
             )
         kwargs["activation"] = SITU

@@ -20,7 +20,6 @@ from b12x._lib.scratch_layout import (
     materialize_scratch_view,
 )
 
-from .._shared import static_fp8_quant
 from .planner import Budget, choose_num_splits
 from ._layout import make_smem_layout
 from ._reference import (
@@ -30,7 +29,7 @@ from ._reference import (
 )
 
 _FP8 = torch.float8_e4m3fn
-_MAX_Q_ROWS = 65_536
+_MAX_Q_ROWS = 1_024
 _MAX_CACHE_TOKENS = 1_048_576
 
 
@@ -42,18 +41,13 @@ def _canonical_device(device: torch.device | str) -> torch.device:
 
 
 def _query_tile(caps: Caps) -> int:
-    if caps.mode == "decode" or caps.max_batch != 1 or caps.window_size is not None:
+    if caps.mode == "verify" and caps.max_total_q == caps.max_batch * 4:
+        return 4 if caps.kv_dtype == _FP8 else 1
+    if caps.mode == "decode" or caps.max_batch != 1:
         return 1
     if caps.kv_dtype == _FP8 and caps.max_total_q >= 3:
         return 4
     return 2
-
-
-def _max_attended_tokens(caps: Caps) -> int:
-    if caps.window_size is None:
-        return caps.max_cache_tokens
-    # A local interval can begin and end in partial physical pages.
-    return min(caps.max_cache_tokens, caps.window_size + caps.page_size - 1)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -69,48 +63,46 @@ class Caps:
     max_page_table_width: int
     num_cache_pages: int
     dtype: torch.dtype = torch.bfloat16
-    q_dtype: torch.dtype | None = None
     head_dim: int = K3_ABSORBED_DIM
     v_head_dim: int = K3_VALUE_DIM
-    physical_record_width: int = K3_ABSORBED_DIM
-    window_size: int | None = None
     use_cuda_graph: bool = False
+    uses_query_cache_seqlens: bool = False
+    sparse_stride: int = 1
+    sparse_min_tokens: int = 0
+    sparse_sink_chunks: int = 0
+    sparse_recent_chunks: int = 0
+    sparse_refresh_interval: int = 0
     budget: Budget | None = None
+    # Element type of the per-split partial outputs a multi-split launch
+    # writes for the merge. bf16 halves the scratch; float32 keeps the split
+    # partials exact, so a merged result is rounded once, like a one-split
+    # result, and the answer no longer depends on how the chunks were split.
+    partial_dtype: torch.dtype = torch.bfloat16
+    # A request whose selected chunks number at most this many is scanned by
+    # split 0 alone (the fixed-range association a plan-run kernel used, so the
+    # bits match it there); longer requests spread their chunks evenly over
+    # the launched splits. None resolves to the plan's chunks_per_split; 0
+    # balances every request.
+    single_split_chunks: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
         if self.mode not in ("decode", "extend", "verify"):
             raise ValueError(f"unsupported dense MLA mode {self.mode!r}")
         if self.dtype != torch.bfloat16:
-            raise TypeError("dense MLA output must be torch.bfloat16")
+            raise TypeError("K3 dense MLA activations/output must be torch.bfloat16")
         if self.kv_dtype not in (torch.bfloat16, _FP8):
-            raise TypeError("dense MLA KV must be BF16 or E4M3")
-        q_dtype = self.kv_dtype if self.q_dtype is None else self.q_dtype
-        if q_dtype not in (torch.bfloat16, _FP8):
-            raise TypeError("dense MLA query must be BF16 or E4M3")
-        if q_dtype != self.kv_dtype and not (
-            q_dtype == torch.bfloat16 and self.kv_dtype == _FP8
-        ):
-            raise TypeError(
-                "dense MLA supports matching query/cache dtypes or a BF16 "
-                "query with an E4M3 cache"
-            )
-        object.__setattr__(self, "q_dtype", q_dtype)
-        geometry = (int(self.head_dim), int(self.v_head_dim))
-        if geometry not in ((K3_ABSORBED_DIM, K3_VALUE_DIM), (1088, 1024)):
-            raise ValueError(
-                "dense MLA supports logical (QK, V) widths (576, 512) and (1088, 1024)"
-            )
-        if int(self.physical_record_width) < int(self.head_dim):
-            raise ValueError("physical_record_width must cover the logical key record")
-        if self.window_size is not None and int(self.window_size) <= 0:
-            raise ValueError("window_size must be positive or None")
+            raise TypeError("K3 dense MLA KV must be BF16 or E4M3")
+        if int(self.head_dim) != K3_ABSORBED_DIM:
+            raise ValueError(f"K3 dense MLA head_dim must be {K3_ABSORBED_DIM}")
+        if int(self.v_head_dim) != K3_VALUE_DIM:
+            raise ValueError(f"K3 dense MLA v_head_dim must be {K3_VALUE_DIM}")
         heads = int(self.num_q_heads)
         if heads <= 0:
             raise ValueError("num_q_heads must be positive")
         page_size = int(self.page_size)
-        if page_size <= 0 or (page_size != 1 and page_size % 16):
-            raise ValueError("page_size must be 1 or a positive multiple of 16")
+        if page_size <= 0 or page_size % 16:
+            raise ValueError("page_size must be a positive multiple of 16")
         max_total_q = int(self.max_total_q)
         if not 1 <= max_total_q <= _MAX_Q_ROWS:
             raise ValueError(f"max_total_q must be in [1, {_MAX_Q_ROWS}]")
@@ -130,6 +122,29 @@ class Caps:
             raise ValueError("num_cache_pages must be positive")
         if self.budget is not None and not isinstance(self.budget, Budget):
             raise TypeError("budget must be dense_mla.Budget or None")
+        if self.partial_dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("partial_dtype must be torch.bfloat16 or torch.float32")
+        if self.single_split_chunks is not None:
+            single_split_chunks = int(self.single_split_chunks)
+            if single_split_chunks < 0:
+                raise ValueError("single_split_chunks must be >= 0 or None")
+            object.__setattr__(self, "single_split_chunks", single_split_chunks)
+        uses_query_cache_seqlens = bool(self.uses_query_cache_seqlens)
+        if uses_query_cache_seqlens and self.mode != "verify":
+            raise ValueError(
+                "per-query cache lengths are supported only by verify plans"
+            )
+        for name, minimum in (
+            ("sparse_stride", 1),
+            ("sparse_min_tokens", 0),
+            ("sparse_sink_chunks", 0),
+            ("sparse_recent_chunks", 0),
+            ("sparse_refresh_interval", 0),
+        ):
+            value = int(getattr(self, name))
+            if value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+            object.__setattr__(self, name, value)
         for name in (
             "num_q_heads",
             "page_size",
@@ -140,12 +155,14 @@ class Caps:
             "num_cache_pages",
             "head_dim",
             "v_head_dim",
-            "physical_record_width",
         ):
             object.__setattr__(self, name, int(getattr(self, name)))
         object.__setattr__(self, "use_cuda_graph", bool(self.use_cuda_graph))
-        if self.window_size is not None:
-            object.__setattr__(self, "window_size", int(self.window_size))
+        object.__setattr__(
+            self,
+            "uses_query_cache_seqlens",
+            uses_query_cache_seqlens,
+        )
 
 
 @dataclass(frozen=True)
@@ -153,24 +170,22 @@ class _ScratchLayout:
     nbytes: int
     num_splits: int
     chunks_per_split: int
+    single_split_chunks: int
     partial_output_offset_bytes: int | None
     partial_lse_offset_bytes: int | None
     final_lse_offset_bytes: int
-    quantized_q_offset_bytes: int | None
 
 
 def _dense_mla_scratch_layout(
     caps: Caps,
 ) -> _ScratchLayout:
     query_tile = _query_tile(caps)
-    max_attended_tokens = _max_attended_tokens(caps)
     if caps.device.type == "cuda":
         properties = torch.cuda.get_device_properties(caps.device)
         sm_count = int(properties.multi_processor_count)
         shared_layout = make_smem_layout(
             query_tile=query_tile,
             fp8=caps.kv_dtype == _FP8,
-            qk_dim=caps.head_dim,
         )
         shared_limit = int(properties.shared_memory_per_block_optin)
         if shared_layout.total_bytes > shared_limit:
@@ -182,15 +197,20 @@ def _dense_mla_scratch_layout(
     else:
         sm_count = 1
     num_splits = choose_num_splits(
-        max_cache_tokens=max_attended_tokens,
+        max_cache_tokens=caps.max_cache_tokens,
         max_total_q=caps.max_total_q,
         num_q_heads=caps.num_q_heads,
         query_tile=query_tile,
         sm_count=sm_count,
         budget=caps.budget,
     )
-    num_chunks = (max_attended_tokens + 63) // 64
+    num_chunks = (caps.max_cache_tokens + 63) // 64
     chunks_per_split = (num_chunks + num_splits - 1) // num_splits
+    single_split_chunks = (
+        chunks_per_split
+        if caps.single_split_chunks is None
+        else int(caps.single_split_chunks)
+    )
     partial_rows = caps.max_total_q * num_splits
     if (
         caps.budget is not None
@@ -213,8 +233,8 @@ def _dense_mla_scratch_layout(
             caps.max_total_q
             * caps.num_q_heads
             * num_splits
-            * caps.v_head_dim
-            * dtype_nbytes(torch.bfloat16)
+            * K3_VALUE_DIM
+            * dtype_nbytes(caps.partial_dtype)
         )
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         partial_lse_offset_bytes = cursor
@@ -228,22 +248,15 @@ def _dense_mla_scratch_layout(
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
     final_lse_offset_bytes = cursor
     cursor += caps.max_total_q * caps.num_q_heads * dtype_nbytes(torch.float32)
-    quantized_q_offset_bytes = None
-    if caps.q_dtype != caps.kv_dtype:
-        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
-        quantized_q_offset_bytes = cursor
-        cursor += (
-            caps.max_total_q * caps.num_q_heads * caps.head_dim * dtype_nbytes(_FP8)
-        )
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
     return _ScratchLayout(
         nbytes=max(cursor, SCRATCH_ALIGN_BYTES),
         num_splits=num_splits,
         chunks_per_split=chunks_per_split,
+        single_split_chunks=single_split_chunks,
         partial_output_offset_bytes=partial_output_offset_bytes,
         partial_lse_offset_bytes=partial_lse_offset_bytes,
         final_lse_offset_bytes=final_lse_offset_bytes,
-        quantized_q_offset_bytes=quantized_q_offset_bytes,
     )
 
 
@@ -252,7 +265,6 @@ class Scratch:
     shared_scratch: torch.Tensor
     device: torch.device
     mode: str
-    q_dtype: torch.dtype
     kv_dtype: torch.dtype
     num_q_heads: int
     page_size: int
@@ -261,18 +273,21 @@ class Scratch:
     max_cache_tokens: int
     max_page_table_width: int
     num_cache_pages: int
-    physical_record_width: int
-    head_dim: int
-    v_head_dim: int
-    window_size: int | None
     num_splits: int
     chunks_per_split: int
+    single_split_chunks: int
+    partial_dtype: torch.dtype
     query_tile: int
     use_cuda_graph: bool
+    uses_query_cache_seqlens: bool
+    sparse_stride: int
+    sparse_min_tokens: int
+    sparse_sink_chunks: int
+    sparse_recent_chunks: int
+    sparse_refresh_interval: int
     partial_output: torch.Tensor | None
     partial_lse: torch.Tensor | None
     final_lse: torch.Tensor
-    quantized_q: torch.Tensor | None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -283,12 +298,12 @@ class Binding:
     output: torch.Tensor
     page_table: torch.Tensor
     cache_seqlens: torch.Tensor
+    query_cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     kv_scale: torch.Tensor | None
     q_scale: torch.Tensor | None
     sm_scale: float
     active_splits: int
-    query_quant: static_fp8_quant.Binding | None
 
 
 def _storage_bounds(tensor: torch.Tensor, *, name: str) -> None:
@@ -350,8 +365,7 @@ def _rank3_cache(
         cache = cache[:, :, 0, :]
     if cache.ndim != 3:
         raise ValueError(
-            "kv_cache must be [pages,page_size,physical_record_width] or "
-            "[pages,page_size,1,physical_record_width]"
+            "kv_cache must be [pages,page_size,576] or [pages,page_size,1,576]"
         )
     if cache.dtype != scratch.kv_dtype:
         raise TypeError(
@@ -359,26 +373,18 @@ def _rank3_cache(
         )
     if cache.device != scratch.device:
         raise ValueError("kv_cache device does not match dense MLA plan")
-    if tuple(cache.shape[1:]) != (
-        scratch.page_size,
-        scratch.physical_record_width,
-    ):
+    if tuple(cache.shape[1:]) != (scratch.page_size, K3_ABSORBED_DIM):
         raise ValueError(
             "kv_cache inner shape must be "
-            f"({scratch.page_size}, {scratch.physical_record_width}), got "
-            f"{tuple(cache.shape[1:])}"
+            f"({scratch.page_size}, {K3_ABSORBED_DIM}), got {tuple(cache.shape[1:])}"
         )
     if int(cache.shape[0]) > scratch.num_cache_pages:
         raise ValueError("kv_cache page count exceeds planned capacity")
-    if (
-        int(cache.stride(2)) != 1
-        or int(cache.stride(1)) < scratch.physical_record_width
-    ):
+    if int(cache.stride(2)) != 1 or int(cache.stride(1)) != K3_ABSORBED_DIM:
         raise ValueError(
-            "kv_cache requires contiguous elements and a token stride covering "
-            "physical_record_width"
+            "kv_cache requires contiguous records/tokens (stride[-1]=1, stride[-2]=576)"
         )
-    if int(cache.stride(0)) < scratch.page_size * int(cache.stride(1)):
+    if int(cache.stride(0)) < scratch.page_size * K3_ABSORBED_DIM:
         raise ValueError("kv_cache page stride is smaller than one page payload")
     _require_16_byte_records(
         cache,
@@ -397,6 +403,7 @@ def _validate_binding(
     output: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    query_cache_seqlens: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     kv_scale: torch.Tensor | None,
     q_scale: torch.Tensor | None,
@@ -405,23 +412,21 @@ def _validate_binding(
 ) -> Binding:
     if q.ndim != 3 or tuple(q.shape[1:]) != (
         scratch.num_q_heads,
-        scratch.head_dim,
+        K3_ABSORBED_DIM,
     ):
         raise ValueError(
             "q must have shape "
-            f"[total_q,{scratch.num_q_heads},{scratch.head_dim}], got {tuple(q.shape)}"
+            f"[total_q,{scratch.num_q_heads},{K3_ABSORBED_DIM}], got {tuple(q.shape)}"
         )
-    if q.dtype != scratch.q_dtype:
-        raise TypeError(
-            f"q dtype {q.dtype} does not match planned query dtype {scratch.q_dtype}"
-        )
+    if q.dtype not in (torch.bfloat16, _FP8):
+        raise TypeError("q must be BF16 or E4M3")
     if q.device != scratch.device:
         raise ValueError("q device does not match dense MLA plan")
     if not 1 <= int(q.shape[0]) <= scratch.max_total_q:
         raise ValueError("q rows exceed planned capacity")
-    if int(q.stride(2)) != 1 or int(q.stride(1)) != scratch.head_dim:
+    if int(q.stride(2)) != 1 or int(q.stride(1)) != K3_ABSORBED_DIM:
         raise ValueError("q requires contiguous absorbed head records")
-    if int(q.stride(0)) < scratch.num_q_heads * scratch.head_dim:
+    if int(q.stride(0)) < scratch.num_q_heads * K3_ABSORBED_DIM:
         raise ValueError("q row stride overlaps absorbed head records")
     _require_16_byte_records(
         q,
@@ -431,21 +436,26 @@ def _validate_binding(
     _storage_bounds(q, name="q")
 
     cache = _rank3_cache(kv_cache, scratch=scratch)
+    if q.dtype != cache.dtype:
+        raise TypeError(
+            "q and kv_cache must use the same native dense MLA format "
+            "(BF16/BF16 or E4M3/E4M3)"
+        )
     if output.ndim != 3 or tuple(output.shape) != (
         int(q.shape[0]),
         scratch.num_q_heads,
-        scratch.v_head_dim,
+        K3_VALUE_DIM,
     ):
         raise ValueError(
             "output must have shape "
-            f"{(int(q.shape[0]), scratch.num_q_heads, scratch.v_head_dim)}, "
+            f"{(int(q.shape[0]), scratch.num_q_heads, K3_VALUE_DIM)}, "
             f"got {tuple(output.shape)}"
         )
     if output.dtype != torch.bfloat16 or output.device != scratch.device:
         raise TypeError("output must be BF16 on the plan device")
-    if int(output.stride(2)) != 1 or int(output.stride(1)) != scratch.v_head_dim:
+    if int(output.stride(2)) != 1 or int(output.stride(1)) != K3_VALUE_DIM:
         raise ValueError("output requires contiguous latent head records")
-    if int(output.stride(0)) < scratch.num_q_heads * scratch.v_head_dim:
+    if int(output.stride(0)) < scratch.num_q_heads * K3_VALUE_DIM:
         raise ValueError("output row stride overlaps latent head records")
     _require_16_byte_records(
         output,
@@ -465,6 +475,34 @@ def _validate_binding(
             raise TypeError(f"{name} must be contiguous int32 with shape {shape}")
         if tensor.device != scratch.device or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous on the plan device")
+    if scratch.uses_query_cache_seqlens:
+        if query_cache_seqlens is None:
+            raise ValueError("verify plan requires per-query cache lengths")
+        if query_cache_seqlens.dtype != torch.int32 or tuple(
+            query_cache_seqlens.shape
+        ) != (int(q.shape[0]),):
+            raise TypeError(
+                "query_cache_seqlens must be contiguous int32 with shape [total_q]"
+            )
+        if (
+            query_cache_seqlens.device != scratch.device
+            or not query_cache_seqlens.is_contiguous()
+        ):
+            raise ValueError(
+                "query_cache_seqlens must be contiguous on the plan device"
+            )
+    elif query_cache_seqlens is not None:
+        raise ValueError("decode plan does not accept per-query cache lengths")
+    else:
+        query_cache_seqlens = cache_seqlens
+    if (
+        scratch.mode == "verify"
+        and scratch.query_tile > 1
+        and int(q.shape[0]) != batch * scratch.query_tile
+    ):
+        raise ValueError(
+            "tiled verify plan requires one complete query tile per request"
+        )
     if (
         page_table.ndim != 2
         or int(page_table.shape[0]) != batch
@@ -488,24 +526,10 @@ def _validate_binding(
         q_scale,
         name="q_scale",
         device=scratch.device,
-        required=cache.dtype == _FP8,
+        required=q.dtype == _FP8,
     )
-    if cache.dtype != _FP8 and (kv_scale is not None or q_scale is not None):
+    if q.dtype != _FP8 and (kv_scale is not None or q_scale is not None):
         raise ValueError("BF16 dense MLA does not accept quantization scales")
-    query_quant = None
-    native_q = q
-    if q.dtype != cache.dtype:
-        if scratch.quantized_q is None:
-            raise RuntimeError("dense MLA query quantization scratch is missing")
-        if q_scale is None:
-            raise RuntimeError("dense MLA query quantization scale is missing")
-        native_q = scratch.quantized_q[: int(q.shape[0])]
-        query_quant = static_fp8_quant.bind(
-            source=q,
-            output=native_q,
-            scale=q_scale,
-            max_numel=(scratch.max_total_q * scratch.num_q_heads * scratch.head_dim),
-        )
     sm_scale = float(sm_scale)
     if not (sm_scale > 0.0):
         raise ValueError("sm_scale must be positive")
@@ -517,17 +541,17 @@ def _validate_binding(
         )
     return Binding(
         scratch=scratch,
-        q=native_q.detach(),
+        q=q.detach(),
         kv_cache=cache,
         output=output,
         page_table=page_table.detach(),
         cache_seqlens=cache_seqlens.detach(),
+        query_cache_seqlens=query_cache_seqlens.detach(),
         cu_seqlens_q=cu_seqlens_q.detach(),
         kv_scale=kv_scale,
         q_scale=q_scale,
         sm_scale=sm_scale,
         active_splits=active_splits,
-        query_quant=query_quant,
     )
 
 
@@ -548,9 +572,9 @@ def _materialize(
                 caps.max_total_q,
                 caps.num_q_heads,
                 layout.num_splits,
-                caps.v_head_dim,
+                K3_VALUE_DIM,
             ),
-            dtype=torch.bfloat16,
+            dtype=caps.partial_dtype,
         )
         partial_lse, _ = materialize_scratch_view(
             scratch_storage,
@@ -564,20 +588,11 @@ def _materialize(
         shape=(caps.max_total_q, caps.num_q_heads),
         dtype=torch.float32,
     )
-    quantized_q = None
-    if layout.quantized_q_offset_bytes is not None:
-        quantized_q, _ = materialize_scratch_view(
-            scratch_storage,
-            offset_bytes=layout.quantized_q_offset_bytes,
-            shape=(caps.max_total_q, caps.num_q_heads, caps.head_dim),
-            dtype=_FP8,
-        )
     query_tile = _query_tile(caps)
     return Scratch(
         shared_scratch=scratch_storage,
         device=caps.device,
         mode=caps.mode,
-        q_dtype=caps.q_dtype,
         kv_dtype=caps.kv_dtype,
         num_q_heads=caps.num_q_heads,
         page_size=caps.page_size,
@@ -586,18 +601,21 @@ def _materialize(
         max_cache_tokens=caps.max_cache_tokens,
         max_page_table_width=caps.max_page_table_width,
         num_cache_pages=caps.num_cache_pages,
-        physical_record_width=caps.physical_record_width,
-        head_dim=caps.head_dim,
-        v_head_dim=caps.v_head_dim,
-        window_size=caps.window_size,
         num_splits=layout.num_splits,
         chunks_per_split=layout.chunks_per_split,
+        single_split_chunks=layout.single_split_chunks,
+        partial_dtype=caps.partial_dtype,
         query_tile=query_tile,
         use_cuda_graph=caps.use_cuda_graph,
+        uses_query_cache_seqlens=caps.uses_query_cache_seqlens,
+        sparse_stride=caps.sparse_stride,
+        sparse_min_tokens=caps.sparse_min_tokens,
+        sparse_sink_chunks=caps.sparse_sink_chunks,
+        sparse_recent_chunks=caps.sparse_recent_chunks,
+        sparse_refresh_interval=caps.sparse_refresh_interval,
         partial_output=partial_output,
         partial_lse=partial_lse,
         final_lse=final_lse,
-        quantized_q=quantized_q,
     )
 
 
@@ -625,6 +643,15 @@ class Plan:
     def chunks_per_split(self) -> int:
         return int(self.layout.chunks_per_split)
 
+    @property
+    def single_split_chunks(self) -> int:
+        """Largest selected-chunk count that split 0 scans alone."""
+        return int(self.layout.single_split_chunks)
+
+    @property
+    def partial_dtype(self) -> torch.dtype:
+        return self.caps.partial_dtype
+
     def bind(
         self,
         *,
@@ -634,6 +661,7 @@ class Plan:
         output: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        query_cache_seqlens: torch.Tensor | None = None,
         cu_seqlens_q: torch.Tensor,
         kv_scale: torch.Tensor | None = None,
         q_scale: torch.Tensor | None = None,
@@ -653,6 +681,7 @@ class Plan:
             output=output,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
+            query_cache_seqlens=query_cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             kv_scale=kv_scale,
             q_scale=q_scale,

@@ -58,11 +58,15 @@ class DenseMlaForwardKernel:
         num_heads: int,
         num_splits: int,
         chunks_per_split: int,
+        single_split_chunks: int,
         query_tile: int,
+        uses_query_cache_seqlens: bool,
+        sparse_stride: int,
+        sparse_min_tokens: int,
+        sparse_sink_chunks: int,
+        sparse_recent_chunks: int,
+        sparse_refresh_interval: int,
         fp8: bool,
-        qk_dim: int,
-        value_dim: int,
-        window_size: int | None,
     ):
         self.layout = layout
         self.page_size = int(page_size)
@@ -70,11 +74,15 @@ class DenseMlaForwardKernel:
         self.head_tiles = (self.num_heads + HEADS_PER_TILE - 1) // HEADS_PER_TILE
         self.num_splits = int(num_splits)
         self.chunks_per_split = int(chunks_per_split)
+        self.single_split_chunks = int(single_split_chunks)
         self.query_tile = int(query_tile)
+        self.uses_query_cache_seqlens = bool(uses_query_cache_seqlens)
+        self.sparse_stride = int(sparse_stride)
+        self.sparse_min_tokens = int(sparse_min_tokens)
+        self.sparse_sink_chunks = int(sparse_sink_chunks)
+        self.sparse_recent_chunks = int(sparse_recent_chunks)
+        self.sparse_refresh_interval = int(sparse_refresh_interval)
         self.fp8 = bool(fp8)
-        self.qk_dim = int(qk_dim)
-        self.value_dim = int(value_dim)
-        self.window_size = None if window_size is None else int(window_size)
         self.kv_stages = int(layout.kv_stages)
         self.math_warps = MATH_WARPS_PER_QUERY * self.query_tile
         self.math_threads = self.math_warps * 32
@@ -88,6 +96,7 @@ class DenseMlaForwardKernel:
         page_table: cute.Tensor,
         cache_seqlens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
+        query_cache_seqlens: cute.Tensor,
         output: cute.Tensor,
         final_lse: cute.Tensor,
         partial_output: cute.Tensor,
@@ -98,7 +107,6 @@ class DenseMlaForwardKernel:
         q_stride_row_bytes: Int64,
         q_stride_head_bytes: Int64,
         page_stride_bytes: Int64,
-        cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
@@ -112,6 +120,7 @@ class DenseMlaForwardKernel:
             page_table,
             cache_seqlens,
             cu_seqlens_q,
+            query_cache_seqlens,
             output,
             final_lse,
             partial_output,
@@ -122,7 +131,6 @@ class DenseMlaForwardKernel:
             q_stride_row_bytes,
             q_stride_head_bytes,
             page_stride_bytes,
-            cache_record_stride_bytes,
             page_table_stride,
             total_q,
             batch,
@@ -133,6 +141,34 @@ class DenseMlaForwardKernel:
             min_blocks_per_mp=1,
             stream=stream,
         )
+
+    @cute.jit
+    def _selected_chunk(
+        self,
+        selected_index: Int32,
+        valid_chunks: Int32,
+        sparse_active: Int32,
+    ) -> Int32:
+        chunk = selected_index
+        if sparse_active != Int32(0):
+            sink = Int32(self.sparse_sink_chunks)
+            if sink > valid_chunks:
+                sink = valid_chunks
+            recent = Int32(self.sparse_recent_chunks)
+            if recent > valid_chunks - sink:
+                recent = valid_chunks - sink
+            middle_end = valid_chunks - recent
+            middle_span = middle_end - sink
+            middle_count = (middle_span + Int32(self.sparse_stride - 1)) // Int32(
+                self.sparse_stride
+            )
+            if selected_index < sink:
+                chunk = selected_index
+            elif selected_index < sink + middle_count:
+                chunk = sink + (selected_index - sink) * Int32(self.sparse_stride)
+            else:
+                chunk = middle_end + selected_index - sink - middle_count
+        return chunk
 
     @cute.jit
     def _run_math_group(
@@ -146,7 +182,8 @@ class DenseMlaForwardKernel:
         mbar_base,
         active_chunks: Int32,
         split_first_chunk: Int32,
-        visible_begin: Int32,
+        valid_chunks: Int32,
+        sparse_active: Int32,
         visible_end: Int32,
         query_row: Int32,
         head_base: Int32,
@@ -165,10 +202,10 @@ class DenseMlaForwardKernel:
         *,
         barrier_id: cutlass.Constexpr,
     ):
-        accumulator_fragment = cute.make_rmem_tensor(self.value_dim // 16, Float32)
+        accumulator_fragment = cute.make_rmem_tensor(32, Float32)
         global_max_fragment = cute.make_rmem_tensor(2, Float32)
         global_sum_fragment = cute.make_rmem_tensor(2, Float32)
-        for idx in cutlass.range_constexpr(self.value_dim // 16):
+        for idx in cutlass.range_constexpr(32):
             accumulator_fragment[idx] = Float32(0.0)
         global_max_fragment[0] = Float32(-1.0e30)
         global_max_fragment[1] = Float32(-1.0e30)
@@ -180,7 +217,12 @@ class DenseMlaForwardKernel:
         kv_buffer_bytes = Int32(CANDIDATES_PER_CHUNK * self.layout.record_stride_bytes)
 
         for local_chunk in cutlass.range(active_chunks, unroll=1):
-            chunk = split_first_chunk + Int32(local_chunk)
+            selected_index = split_first_chunk + Int32(local_chunk)
+            chunk = self._selected_chunk(
+                selected_index,
+                valid_chunks,
+                sparse_active,
+            )
             chunk_begin = chunk * Int32(CANDIDATES_PER_CHUNK)
             buffer = Int32(0)
             if cutlass.const_expr(self.kv_stages == 2):
@@ -201,7 +243,7 @@ class DenseMlaForwardKernel:
                         accumulator_fragment[tile * 2],
                         accumulator_fragment[tile * 2 + 1],
                     ]
-                    for tile in range(self.value_dim // 32)
+                    for tile in range(16)
                 ]
                 global_max = [
                     global_max_fragment[0],
@@ -225,7 +267,6 @@ class DenseMlaForwardKernel:
                         local_warp,
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
-                        qk_dim=self.qk_dim,
                     )
                 else:
                     qk = qk_bf16(
@@ -235,12 +276,10 @@ class DenseMlaForwardKernel:
                         local_warp,
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
-                        qk_dim=self.qk_dim,
                     )
                 qk = mask_and_scale(
                     qk,
                     chunk_begin,
-                    visible_begin,
                     visible_end,
                     score_scale_log2,
                     local_warp,
@@ -264,7 +303,6 @@ class DenseMlaForwardKernel:
                     lane,
                     local_tid,
                     barrier_id=barrier_id,
-                    value_dim=self.value_dim,
                 )
                 weights = [
                     probability[0] * warp_scale0,
@@ -284,7 +322,6 @@ class DenseMlaForwardKernel:
                         local_tid,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
-                        value_dim=self.value_dim,
                     )
                 else:
                     accumulator = pv_bf16(
@@ -296,9 +333,8 @@ class DenseMlaForwardKernel:
                         lane,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
-                        value_dim=self.value_dim,
                     )
-                for tile in cutlass.range_constexpr(self.value_dim // 32):
+                for tile in cutlass.range_constexpr(16):
                     accumulator_fragment[tile * 2] = accumulator[tile][0]
                     accumulator_fragment[tile * 2 + 1] = accumulator[tile][1]
                 global_max_fragment[0] = global_max[0]
@@ -324,7 +360,7 @@ class DenseMlaForwardKernel:
                 accumulator_fragment[tile * 2],
                 accumulator_fragment[tile * 2 + 1],
             ]
-            for tile in range(self.value_dim // 32)
+            for tile in range(16)
         ]
         global_max = [
             global_max_fragment[0],
@@ -353,7 +389,6 @@ class DenseMlaForwardKernel:
                     has_splits=True,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
-                    value_dim=self.value_dim,
                 )
             else:
                 write_partial_or_final(
@@ -373,7 +408,6 @@ class DenseMlaForwardKernel:
                     has_splits=False,
                     fp8=self.fp8,
                     ln2=0.6931471805599453,
-                    value_dim=self.value_dim,
                 )
         else:
             write_partial_or_final(
@@ -393,7 +427,6 @@ class DenseMlaForwardKernel:
                 has_splits=False,
                 fp8=self.fp8,
                 ln2=0.6931471805599453,
-                value_dim=self.value_dim,
             )
 
     @cute.kernel
@@ -404,6 +437,7 @@ class DenseMlaForwardKernel:
         page_table: cute.Tensor,
         cache_seqlens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
+        query_cache_seqlens: cute.Tensor,
         output: cute.Tensor,
         final_lse: cute.Tensor,
         partial_output: cute.Tensor,
@@ -414,7 +448,6 @@ class DenseMlaForwardKernel:
         q_stride_row_bytes: Int64,
         q_stride_head_bytes: Int64,
         page_stride_bytes: Int64,
-        cache_record_stride_bytes: Int64,
         page_table_stride: Int64,
         total_q: Int32,
         batch: Int32,
@@ -441,33 +474,60 @@ class DenseMlaForwardKernel:
                 else:
                     upper = middle
             request = lower
+        else:
+            request = query_tile_index
         query_begin = Int32(cu_seqlens_q[request])
         query_end = Int32(cu_seqlens_q[request + Int32(1)])
         query_length = query_end - query_begin
         cache_length = Int32(cache_seqlens[request])
 
-        first_valid_chunk = Int32(0)
-        visible_chunks_end = cache_length
-        if cutlass.const_expr(self.window_size is not None):
-            tile_local_query = query_start - query_begin
-            visible_chunks_end = (
-                cache_length - query_length + tile_local_query + Int32(1)
-            )
-            if visible_chunks_end < Int32(0):
-                visible_chunks_end = Int32(0)
-            if visible_chunks_end > cache_length:
-                visible_chunks_end = cache_length
-            visible_chunks_begin = visible_chunks_end - Int32(self.window_size)
-            if visible_chunks_begin < Int32(0):
-                visible_chunks_begin = Int32(0)
-            first_valid_chunk = visible_chunks_begin // Int32(CANDIDATES_PER_CHUNK)
-        valid_chunks = (visible_chunks_end + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
+        valid_chunks = (cache_length + Int32(CANDIDATES_PER_CHUNK - 1)) // Int32(
             CANDIDATES_PER_CHUNK
         )
-        split_first_chunk = first_valid_chunk + split * Int32(self.chunks_per_split)
-        split_last_chunk = split_first_chunk + Int32(self.chunks_per_split)
-        if split_last_chunk > valid_chunks:
-            split_last_chunk = valid_chunks
+        sparse_active = Int32(0)
+        selected_chunks = valid_chunks
+        if cutlass.const_expr(self.sparse_stride > 1):
+            if cache_length > Int32(self.sparse_min_tokens):
+                sparse_active = Int32(1)
+            if cutlass.const_expr(self.sparse_refresh_interval > 0):
+                refresh_position = cache_length % Int32(self.sparse_refresh_interval)
+                if refresh_position < query_length:
+                    sparse_active = Int32(0)
+            if sparse_active != Int32(0):
+                sink = Int32(self.sparse_sink_chunks)
+                if sink > valid_chunks:
+                    sink = valid_chunks
+                recent = Int32(self.sparse_recent_chunks)
+                if recent > valid_chunks - sink:
+                    recent = valid_chunks - sink
+                middle_span = valid_chunks - recent - sink
+                middle_count = (middle_span + Int32(self.sparse_stride - 1)) // Int32(
+                    self.sparse_stride
+                )
+                selected_chunks = sink + middle_count + recent
+        # Split ranges. A request whose selected chunks fit within
+        # single_split_chunks is scanned by split 0 alone: one online-softmax
+        # chain in chunk order, written once, which is the fixed-range
+        # association of a kernel that scans chunks_per_split chunks per
+        # split, so those results match it bit for bit. Longer requests share
+        # their chunks evenly over the launched splits, so every launched CTA
+        # scans about selected_chunks / active_splits chunks whatever the
+        # live length; a fixed range per split would leave all but the first
+        # selected_chunks / chunks_per_split splits idle on sequences much
+        # shorter than the planned capacity. Splits past the selected chunks
+        # stay empty and publish -inf partials.
+        balanced_chunks_per_split = (selected_chunks + active_splits - Int32(1)) // (
+            active_splits
+        )
+        if balanced_chunks_per_split < Int32(1):
+            balanced_chunks_per_split = Int32(1)
+        if cutlass.const_expr(self.single_split_chunks > 0):
+            if selected_chunks <= Int32(self.single_split_chunks):
+                balanced_chunks_per_split = Int32(self.single_split_chunks)
+        split_first_chunk = split * balanced_chunks_per_split
+        split_last_chunk = split_first_chunk + balanced_chunks_per_split
+        if split_last_chunk > selected_chunks:
+            split_last_chunk = selected_chunks
         active_chunks = split_last_chunk - split_first_chunk
         if active_chunks < Int32(0):
             active_chunks = Int32(0)
@@ -527,7 +587,12 @@ class DenseMlaForwardKernel:
                 CANDIDATES_PER_CHUNK * self.layout.record_stride_bytes
             )
             for local_chunk in cutlass.range(active_chunks, unroll=1):
-                chunk = split_first_chunk + Int32(local_chunk)
+                selected_index = split_first_chunk + Int32(local_chunk)
+                chunk = self._selected_chunk(
+                    selected_index,
+                    valid_chunks,
+                    sparse_active,
+                )
                 token_begin = chunk * Int32(CANDIDATES_PER_CHUNK)
                 buffer = Int32(0)
                 if cutlass.const_expr(self.kv_stages == 2):
@@ -546,7 +611,6 @@ class DenseMlaForwardKernel:
                     cache_length,
                     io_lane,
                     page_stride_bytes,
-                    cache_record_stride_bytes,
                     page_table_stride,
                     page_size=self.page_size,
                     record_bytes=self.layout.record_bytes,
@@ -585,15 +649,12 @@ class DenseMlaForwardKernel:
                 query_valid = Int32(0)
             local_query = query_row - query_begin
             visible_end = cache_length - query_length + local_query + Int32(1)
+            if cutlass.const_expr(self.uses_query_cache_seqlens):
+                visible_end = Int32(query_cache_seqlens[query_row])
             if visible_end < Int32(0):
                 visible_end = Int32(0)
             if visible_end > cache_length:
                 visible_end = cache_length
-            visible_begin = Int32(0)
-            if cutlass.const_expr(self.window_size is not None):
-                visible_begin = visible_end - Int32(self.window_size)
-                if visible_begin < Int32(0):
-                    visible_begin = Int32(0)
 
             score_scale = sm_scale_log2
             value_scale = Float32(1.0)
@@ -628,7 +689,8 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
-                    visible_begin,
+                    valid_chunks,
+                    sparse_active,
                     visible_end,
                     query_row,
                     head_base,
@@ -657,7 +719,8 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
-                    visible_begin,
+                    valid_chunks,
+                    sparse_active,
                     visible_end,
                     query_row,
                     head_base,
@@ -686,7 +749,8 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
-                    visible_begin,
+                    valid_chunks,
+                    sparse_active,
                     visible_end,
                     query_row,
                     head_base,
@@ -715,7 +779,8 @@ class DenseMlaForwardKernel:
                     mbar_base,
                     active_chunks,
                     split_first_chunk,
-                    visible_begin,
+                    valid_chunks,
+                    sparse_active,
                     visible_end,
                     query_row,
                     head_base,

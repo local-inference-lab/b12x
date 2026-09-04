@@ -1,4 +1,10 @@
-"""Base-2 split reduction for standalone dense MLA."""
+"""Base-2 split reduction for standalone dense MLA.
+
+Split partials are normalized per split and stored either as bf16 (two
+roundings between the fp32 accumulators and the merged bf16 output) or as
+float32 (one rounding, at the merged output, so the merged value of a
+single valid split is bit-identical to the direct one-split write).
+"""
 
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     get_ptr_as_int64,
     ld_global_v2_u32,
+    ld_global_v4_f32,
     pack_f32x2_to_bfloat2,
     st_global_v2_u32,
 )
@@ -19,11 +26,11 @@ from ._math import exp2_approx, log2_approx
 
 
 class DenseMlaMergeKernel:
-    """Merge normalized BF16 split partials and emit natural-log LSE."""
+    """Merge normalized split partials and emit natural-log LSE."""
 
-    def __init__(self, num_splits: int, value_dim: int):
+    def __init__(self, num_splits: int, *, partial_fp32: bool = False):
         self.num_splits = int(num_splits)
-        self.value_dim = int(value_dim)
+        self.partial_fp32 = bool(partial_fp32)
 
     def _get_shared_storage_cls(self):
         """Return the per-CTA split-weight storage.
@@ -149,23 +156,31 @@ class DenseMlaMergeKernel:
 
         cute.arch.barrier()
 
-        while dimension < Int32(self.value_dim):
-            accumulator = cute.make_rmem_tensor(4, Float32)
-            for idx in cutlass.range_constexpr(4):
-                accumulator[idx] = Float32(0.0)
+        accumulator = cute.make_rmem_tensor(4, Float32)
+        for idx in cutlass.range_constexpr(4):
+            accumulator[idx] = Float32(0.0)
 
-            split = Int32(0)
-            while split < active_splits:
-                weight = Float32(split_weight[split])
-                # Capture-static tail splits deliberately leave their partial
-                # vectors undefined and publish -inf LSE.  Do not load those
-                # vectors: NaN * 0 would otherwise poison the merged output.
-                if weight > Float32(0.0):
-                    partial_offset = (
-                        (Int64(query) * Int64(partial_output.shape[1]) + Int64(head))
-                        * Int64(self.num_splits)
-                        + Int64(split)
-                    ) * Int64(self.value_dim) + Int64(dimension)
+        split = Int32(0)
+        while split < active_splits:
+            weight = Float32(split_weight[split])
+            # Capture-static tail splits deliberately leave their partial
+            # vectors undefined and publish -inf LSE.  Do not load those
+            # vectors: NaN * 0 would otherwise poison the merged output.
+            if weight > Float32(0.0):
+                partial_offset = (
+                    (Int64(query) * Int64(partial_output.shape[1]) + Int64(head))
+                    * Int64(self.num_splits)
+                    + Int64(split)
+                ) * Int64(512) + Int64(dimension)
+                if cutlass.const_expr(self.partial_fp32):
+                    value0, value1, value2, value3 = ld_global_v4_f32(
+                        get_ptr_as_int64(partial_output, partial_offset)
+                    )
+                    accumulator[0] += value0 * weight
+                    accumulator[1] += value1 * weight
+                    accumulator[2] += value2 * weight
+                    accumulator[3] += value3 * weight
+                else:
                     packed0, packed1 = ld_global_v2_u32(
                         get_ptr_as_int64(partial_output, partial_offset)
                     )
@@ -181,25 +196,24 @@ class DenseMlaMergeKernel:
                     accumulator[1] += value1
                     accumulator[2] += value2
                     accumulator[3] += value3
-                split += Int32(1)
+            split += Int32(1)
 
-            inverse = Float32(inverse_storage[0])
-            output_offset = cute.crd2idx(
-                (query, head, dimension),
-                output.layout,
-            )
-            st_global_v2_u32(
-                get_ptr_as_int64(output, output_offset),
-                pack_f32x2_to_bfloat2(
-                    accumulator[0] * inverse,
-                    accumulator[1] * inverse,
-                ),
-                pack_f32x2_to_bfloat2(
-                    accumulator[2] * inverse,
-                    accumulator[3] * inverse,
-                ),
-            )
-            dimension += Int32(128 * 4)
+        inverse = Float32(inverse_storage[0])
+        output_offset = cute.crd2idx(
+            (query, head, dimension),
+            output.layout,
+        )
+        st_global_v2_u32(
+            get_ptr_as_int64(output, output_offset),
+            pack_f32x2_to_bfloat2(
+                accumulator[0] * inverse,
+                accumulator[1] * inverse,
+            ),
+            pack_f32x2_to_bfloat2(
+                accumulator[2] * inverse,
+                accumulator[3] * inverse,
+            ),
+        )
 
 
 __all__ = ["DenseMlaMergeKernel"]

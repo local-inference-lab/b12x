@@ -46,7 +46,6 @@ _OPS: tuple[str, ...] = (
     "attention.nsa_indexer",
     "attention.varlen",
     "comm.pcie",
-    "gemm.bf16_gemv",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
     "gemm.bmm",

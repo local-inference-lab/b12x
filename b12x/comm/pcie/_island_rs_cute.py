@@ -1,3 +1,4 @@
+# kimi-k3-island-rs-ws8
 """CuTeDSL pull-based island reduce-scatter TP16 collective.
 
 Rank ``island * 4 + lane`` owns one equal quarter of the vector. Each rank
@@ -206,13 +207,17 @@ MAX_BLOCKS = 32
 def island_rs_peers(rank: int, world_size: int) -> tuple[int, ...]:
     """Slabs this rank maps: three island lanes, three same-lane partners."""
 
-    if world_size != _MAX_WORLD_SIZE:
-        raise ValueError(f"island reduce-scatter requires TP16, got TP{world_size}")
+    # kimi-k3-island-rs-ws8: any whole-island world up to _MAX_WORLD_SIZE.
+    if world_size % _ISLAND_SIZE or not 0 < world_size <= _MAX_WORLD_SIZE:
+        raise ValueError(
+            f"island reduce-scatter requires a whole-island world, got TP{world_size}"
+        )
     if not 0 <= rank < world_size:
         raise ValueError(f"invalid rank {rank} for TP{world_size}")
     island, lane = divmod(rank, _ISLAND_SIZE)
+    num_islands = world_size // _ISLAND_SIZE
     lanes = {island * _ISLAND_SIZE + p for p in range(_ISLAND_SIZE)}
-    partners = {j * _ISLAND_SIZE + lane for j in range(_MAX_ISLANDS)}
+    partners = {j * _ISLAND_SIZE + lane for j in range(num_islands)}
     return tuple(sorted((lanes | partners) - {rank}))
 
 
@@ -227,7 +232,8 @@ class _IslandRSLaunch:
         threads: int = 128,
         wait_nanosleep_cycles: int = 24,
     ) -> None:
-        if world_size != _MAX_WORLD_SIZE:
+        # kimi-k3-island-rs-ws8: two-island TP8 or four-island TP16.
+        if world_size not in (8, _MAX_WORLD_SIZE):
             raise ValueError(f"unsupported world size {world_size}")
         if not 0 <= rank < world_size:
             raise ValueError(f"invalid rank {rank} for world size {world_size}")
@@ -239,6 +245,7 @@ class _IslandRSLaunch:
         self._wait_nanosleep_cycles = int(wait_nanosleep_cycles)
         self._island = self._rank // _ISLAND_SIZE
         self._lane = self._rank % _ISLAND_SIZE
+        self._num_islands = self._world_size // _ISLAND_SIZE
 
     @cute.jit
     def __call__(
@@ -470,7 +477,7 @@ class _IslandRSLaunch:
         if tidx == Int32(0):
             _fence_sc_sys()
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
-                if cutlass.const_expr(j != self._island):
+                if cutlass.const_expr(j != self._island and j < self._num_islands):
                     partner = j * _ISLAND_SIZE + self._lane
                     _store_release_sys_u32(
                         _flag_address(
@@ -482,7 +489,7 @@ class _IslandRSLaunch:
                         generation,
                     )
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
-                if cutlass.const_expr(j != self._island):
+                if cutlass.const_expr(j != self._island and j < self._num_islands):
                     _wait_for(
                         _flag_address(self_base, _XS_ARRIVED, bidx, Int32(j)),
                         generation,
@@ -504,19 +511,20 @@ class _IslandRSLaunch:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
-                partner = j * _ISLAND_SIZE + self._lane
-                partner_part = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[partner].toint()) + part_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
-                lo, hi = unpack_bf16x2(partner_part[index])
-                total_lo += lo
-                total_hi += hi
+                if cutlass.const_expr(j < self._num_islands):
+                    partner = j * _ISLAND_SIZE + self._lane
+                    partner_part = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[partner].toint()) + part_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                    lo, hi = unpack_bf16x2(partner_part[index])
+                    total_lo += lo
+                    total_hi += hi
             value = pack_f32x2_to_bf16x2(total_lo, total_hi)
             self_final[mine_begin + index] = value
             output_words[mine_begin + index] = value
