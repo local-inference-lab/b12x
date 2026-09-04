@@ -1529,9 +1529,14 @@ def s4_online_softmax(
     result is bit-identical; after the first few chunks most chunks skip.
 
     ``return_state`` additionally returns ``(acc_nope, acc_rope, global_max,
-    global_sum)``; the unified decode kernel's chunk loop must rebind these
-    from the return value (in-place mutation alone leaves the accumulators
-    un-rescaled when the running maximum rises in a later chunk).
+    global_sum)`` and the unified decode kernel's chunk loop rebinds them from
+    the return value. The accumulator rescale below sits inside ``if rescale:``,
+    which the DSL lowers as a region even when ``rescale`` is the Python
+    constant ``True``; nested-list element assignments made inside such a
+    region do not reach the caller's list objects, so a caller that relies on
+    in-place mutation keeps un-rescaled accumulators whenever the running
+    maximum rises in a later chunk (research
+    ``fp8-ds-mla-perf-20260905/dsl_if_region_probe.py``).
 
     Returns ``(p, warp_rescale0, warp_rescale1)``; mutates ``acc_nope`` /
     ``acc_rope`` (rescaled by the cross-chunk alpha) and ``global_max`` /
@@ -1645,11 +1650,9 @@ def s4_online_softmax(
     global_max[1] = new_gmax1
 
     if cutlass.const_expr(return_state):
-        # The accumulator rescale above must be handed back explicitly: with
-        # the containers mutated in place only, the chunk loop of the unified
-        # decode kernel accumulates the next chunk onto the un-rescaled values
-        # (measured: a split whose running maximum rises in a later chunk
-        # over-weights its earlier chunks by 1 / alpha).
+        # The rescale inside ``if rescale:`` is invisible to the caller's list
+        # objects (see the docstring); hand the containers back explicitly so
+        # the chunk loop accumulates the next chunk onto rescaled values.
         return p, warp_rescale0, warp_rescale1, acc_nope, acc_rope, global_max, global_sum
     return p, warp_rescale0, warp_rescale1
 
