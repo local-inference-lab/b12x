@@ -35,6 +35,7 @@ from b12x._lib.compiler import (
 from b12x._lib.intrinsics import shared_ptr_to_u32
 
 from .decode_math import (
+    s0_load_packed_q_to_smem,
     s0_load_q_bf16_to_smem,
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
@@ -78,6 +79,7 @@ _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
 _GLM_NOPE_SCALE_BYTES_SMEM = 528  # rope offset inside a packed 656-byte staged row
+_PACKED_QUERY_RECORD_BYTES = 656  # packed query: 512 e4m3 + 16 scale + 128 rope bytes
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -462,6 +464,7 @@ class UnifiedDecodeKernel:
         balanced_splits=False,
         glm_fastpath=False,
         glm_w_hw_dequant=False,
+        q_packed=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -484,6 +487,11 @@ class UnifiedDecodeKernel:
         # Hardware E4M3 -> f16 reconstruction of the W HIGH byte for the LOW
         # residual (fast path only; not bit-identical to the software expansion).
         self.glm_w_hw_dequant = bool(glm_w_hw_dequant and self.glm_fastpath)
+        # Packed query: q_all is a uint8 (rows, heads, 656) record per head
+        # (E4M3 nope, four fp32 pow2 tile scales, bf16 rope) and S0 copies it
+        # into the Q stages instead of quantizing a bf16 query (GLM generic
+        # per-token entry; bit-identical to the bf16-query path).
+        self.q_packed = bool(q_packed and self.glm_fastpath)
         # Balanced split policy (per-token single-cache entry only). False keeps
         # the static chunk ranges ``[split * chunks_per_split, +chunks_per_split)``
         # and the existing entry points byte-identical. True selects
@@ -502,6 +510,7 @@ class UnifiedDecodeKernel:
         self.q_stride_row = int(q_stride[0])
         self.q_stride_head = int(q_stride[1])
         self.q_stride_dim = int(q_stride[2])
+        self.q_row_bytes = _PACKED_QUERY_RECORD_BYTES
         self.swa_indices_stride_row = int(swa_indices_stride0)
         self.extra_indices_stride_row = int(extra_indices_stride0)
         self.mid_out_stride_row = int(mid_out_stride[0])
@@ -1795,11 +1804,12 @@ class UnifiedDecodeKernel:
             )
         else:
             extra_row = topk_row
-        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]).
+        # q for THIS token row: a 2-D (heads, D_QK) view (s0 indexes [head_base+h, d]);
+        # with a packed query the row is (heads, 656) bytes.
         q_token = cute.make_tensor(
             q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
             cute.make_layout(
-                (self.num_heads, self.q_head_dim),
+                (self.num_heads, self.q_row_bytes if self.q_packed else self.q_head_dim),
                 stride=(self.q_stride_head, self.q_stride_dim),
             ),
         )
@@ -1978,7 +1988,25 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+            if cutlass.const_expr(self.q_packed):
+                s0_load_packed_q_to_smem(
+                    q_token,
+                    q_fp8_stage,
+                    q_sc_stage_view,
+                    q_rope_stage,
+                    head_base_stage,
+                    Int32(self.valid_hpb),
+                    tid_sel,
+                    d_nope=t.d_nope,
+                    d_rope=t.d_rope,
+                    num_scales=t.num_scales,
+                    hpb=t.hpb,
+                    q_nope_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=nt_stage,
+                    barrier_id=2,
+                )
+            elif cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
                 s0_load_q_bf16_to_smem(
                     q_token,
                     q_fp8_stage,
@@ -2586,7 +2614,10 @@ def _sparse_mla_decode_grid_flat_launch(
     latent_scale_per_token: bool = False,
     balanced_split_target: int = 0,
 ) -> None:
-    q_head_dim = int(q_all.shape[-1])
+    q_packed = bool(
+        q_all.dtype == torch.uint8 and int(q_all.shape[-1]) == _PACKED_QUERY_RECORD_BYTES
+    )
+    q_head_dim = _GLM_HEAD_DIM if q_packed else int(q_all.shape[-1])
     rows = int(q_all.shape[0])
     balanced_splits = int(balanced_split_target) > 0
     if balanced_splits and (has_extra or not per_token_len):
@@ -2649,6 +2680,7 @@ def _sparse_mla_decode_grid_flat_launch(
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    q_all_cute_dtype = cutlass.Uint8 if q_packed else cutlass.BFloat16
     # Split partials are bf16 by default; an fp32 partial workspace keeps every
     # split result exact until the merge rounds once at the output.
     if mid_out.dtype == torch.bfloat16:
@@ -2662,7 +2694,7 @@ def _sparse_mla_decode_grid_flat_launch(
 
     if per_token_len:
         pertok_base = (
-            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(q_all, q_all_cute_dtype, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
             _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
             _to_cute(mid_out, mid_out_cute_dtype, align=16, dynamic_layout=True),
@@ -2688,7 +2720,7 @@ def _sparse_mla_decode_grid_flat_launch(
             args = pertok_base + (Int32(rows), stream)
     else:
         base_args = (
-            _to_cute(q_all, cutlass.BFloat16, dynamic_layout=True),
+            _to_cute(q_all, q_all_cute_dtype, dynamic_layout=True),
             _to_cute(kv_flat, cutlass.Uint8, align=16),
             _to_cute(swa_indices, cutlass.Int32, align=4, dynamic_layout=True),
             _to_cute(mid_out, mid_out_cute_dtype, align=16, dynamic_layout=True),
@@ -2738,12 +2770,19 @@ def _sparse_mla_decode_grid_flat_launch(
         balanced_splits=balanced_splits,
         glm_fastpath=glm_fastpath,
         glm_w_hw_dequant=glm_w_hw_dequant,
+        q_packed=q_packed,
     )
+    if q_packed and not kernel.q_packed:
+        raise ValueError(
+            "SM120 sparse MLA decode packed query requires the GLM generic "
+            "per-token fast path (B12X_MLA_SM120_GLM_FASTPATH=1)"
+        )
     spec_fields = [
         key_field("model_type", traits.model_type),
         key_field("balanced_splits", int(balanced_splits)),
         key_field("glm_fastpath", int(kernel.glm_fastpath)),
         key_field("glm_w_hw_dequant", int(kernel.glm_w_hw_dequant)),
+        key_field("q_packed", int(kernel.q_packed)),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
@@ -2770,7 +2809,7 @@ def _sparse_mla_decode_grid_flat_launch(
             dims=(
                 DimKey.dynamic(),
                 DimKey.exact(heads),
-                DimKey.exact(q_head_dim),
+                DimKey.exact(int(q_all.shape[-1])),
             ),
         ),
         tensor_key(
@@ -3053,7 +3092,10 @@ def run_unified_decode(
                 "(q_head_dim==512); GLM/DSV3.2 has no extra cache"
             )
 
-    q_head_dim = int(q_all.shape[-1])
+    q_packed = bool(
+        q_all.dtype == torch.uint8 and int(q_all.shape[-1]) == _PACKED_QUERY_RECORD_BYTES
+    )
+    q_head_dim = _GLM_HEAD_DIM if q_packed else int(q_all.shape[-1])
     if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM):
         raise NotImplementedError(
             f"SM120 sparse MLA decode supports q_head_dim 512 (DSV4) or 576 (GLM); "

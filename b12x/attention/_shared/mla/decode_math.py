@@ -71,9 +71,11 @@ from b12x._lib.intrinsics import (
     ld_shared_f32,
     ld_shared_u8_offset,
     ld_shared_u32,
+    ld_global_nc_v4_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m16n16x2_trans_b8,
+    st_shared_v4_u32,
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -482,6 +484,83 @@ def s0_quantize_q_to_smem(
             (fp8_bits & Uint32(0xFF)).to(cutlass.Uint8),
         )
         idx += Int32(num_threads)
+    cute.arch.barrier(**bar_kw)
+
+
+@cute.jit
+def s0_load_packed_q_to_smem(
+    q_token: cute.Tensor,  # (NUM_HEADS, 656) u8 view for this token (packed query)
+    q_fp8_base_addr: Int32,  # u32 smem addr of q_fp8 (HPB x Q_NOPE_STRIDE)
+    q_sc_view: cute.Tensor,  # smem fp32 view (HPB*NUM_SCALES,) -- pow2 scales
+    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (HPB x q_rope_stride bf16)
+    head_base: Int32,  # first head index of this CTA (h_start)
+    valid_hpb: Int32,  # number of valid heads (<= HPB)
+    tid: Int32,  # flat thread id in [0, MATH_THREADS)
+    *,
+    d_nope: cutlass.Constexpr,  # 512
+    d_rope: cutlass.Constexpr,  # 64
+    num_scales: cutlass.Constexpr,  # 4
+    hpb: cutlass.Constexpr,  # 16
+    q_nope_stride: cutlass.Constexpr,  # 528
+    q_rope_stride: cutlass.Constexpr,  # 64 (+ optional bank-layout pad)
+    num_threads: cutlass.Constexpr,  # 256
+    barrier_id: cutlass.Constexpr,
+):
+    """S0 (packed query): copy a pre-quantized query record into the Q stages.
+
+    The record per head is ``[512 B E4M3 nope][16 B: NUM_SCALES fp32 pow2
+    scales][128 B bf16 rope]``, produced by the host with the same algorithm
+    as :func:`s0_quantize_q_to_smem` (per-tile absmax, ``max(amax, 1e-4) /
+    FP8_MAX`` rounded up to a power of two, ``q * (1 / scale)`` clamped and
+    converted with ``cvt.rn.satfinite.e4m3``). The stages therefore hold the
+    same bytes S0 would have written, so the attention result is bit-identical
+    to the bf16-query path. Each thread copies 16-byte chunks; invalid tail
+    heads are zero-filled.
+    """
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    nope_chunks = d_nope // 16
+    scale_chunks = (num_scales * 4) // 16
+    rope_chunks = (d_rope * 2) // 16
+    chunks_per_head = nope_chunks + scale_chunks + rope_chunks
+    q_sc_addr = shared_ptr_to_u32(q_sc_view.iterator)
+    i = tid
+    while i < Int32(hpb * chunks_per_head):
+        h = i // Int32(chunks_per_head)
+        c = i - h * Int32(chunks_per_head)
+        v0 = Uint32(0)
+        v1 = Uint32(0)
+        v2 = Uint32(0)
+        v3 = Uint32(0)
+        if h < valid_hpb:
+            src = get_ptr_as_int64(
+                q_token, cute.crd2idx((head_base + h, c * Int32(16)), q_token.layout)
+            )
+            v0, v1, v2, v3 = ld_global_nc_v4_u32(src)
+        if c < Int32(nope_chunks):
+            st_shared_v4_u32(
+                q_fp8_base_addr + h * Int32(q_nope_stride) + c * Int32(16), v0, v1, v2, v3
+            )
+        elif c < Int32(nope_chunks + scale_chunks):
+            st_shared_v4_u32(
+                q_sc_addr
+                + h * Int32(num_scales * 4)
+                + (c - Int32(nope_chunks)) * Int32(16),
+                v0,
+                v1,
+                v2,
+                v3,
+            )
+        else:
+            st_shared_v4_u32(
+                q_rope_base_addr
+                + h * Int32(q_rope_stride * 2)
+                + (c - Int32(nope_chunks + scale_chunks)) * Int32(16),
+                v0,
+                v1,
+                v2,
+                v3,
+            )
+        i += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
 
 
