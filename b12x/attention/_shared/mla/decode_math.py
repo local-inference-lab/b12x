@@ -1439,6 +1439,7 @@ def s4_online_softmax(
     barrier_id: cutlass.Constexpr,  # math-only named-barrier slot
     n_acc_tiles: cutlass.Constexpr = None,  # len(acc_nope); defaults to n_v_chunks
     skip_unit_rescale: cutlass.Constexpr = False,  # warp-uniform skip when alpha == 1
+    return_state: cutlass.Constexpr = False,  # also return acc/max/sum containers
 ):
     """S4: per-warp + cross-warp max/sum, exp2(qk-max), cross-chunk rescale.
 
@@ -1447,6 +1448,11 @@ def s4_online_softmax(
     both of the lane's heads did not change), decided with a warp vote so the
     branch is uniform. Multiplying by exactly 1.0 is the identity, so the
     result is bit-identical; after the first few chunks most chunks skip.
+
+    ``return_state`` additionally returns ``(acc_nope, acc_rope, global_max,
+    global_sum)``; the unified decode kernel's chunk loop must rebind these
+    from the return value (in-place mutation alone leaves the accumulators
+    un-rescaled when the running maximum rises in a later chunk).
 
     Returns ``(p, warp_rescale0, warp_rescale1)``; mutates ``acc_nope`` /
     ``acc_rope`` (rescaled by the cross-chunk alpha) and ``global_max`` /
@@ -1559,6 +1565,13 @@ def s4_online_softmax(
     global_max[0] = new_gmax0
     global_max[1] = new_gmax1
 
+    if cutlass.const_expr(return_state):
+        # The accumulator rescale above must be handed back explicitly: with
+        # the containers mutated in place only, the chunk loop of the unified
+        # decode kernel accumulates the next chunk onto the un-rescaled values
+        # (measured: a split whose running maximum rises in a later chunk
+        # over-weights its earlier chunks by 1 / alpha).
+        return p, warp_rescale0, warp_rescale1, acc_nope, acc_rope, global_max, global_sum
     return p, warp_rescale0, warp_rescale1
 
 
@@ -1583,6 +1596,7 @@ def s4_online_softmax_glm_h8_swap_ab(
     barrier_id: cutlass.Constexpr,
     rope_tiles_per_warp: cutlass.Constexpr = 0,
     barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
+    return_state: cutlass.Constexpr = False,  # also return acc/max/sum containers
 ):
     """Online softmax for the swapped 16-candidate x 8-head score tile.
 
@@ -1693,6 +1707,8 @@ def s4_online_softmax_glm_h8_swap_ab(
     global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_rescale1
     global_max[0] = new_gmax0
     global_max[1] = new_gmax1
+    if cutlass.const_expr(return_state):
+        return p, warp_rescale0, warp_rescale1, acc_nope, acc_rope, global_max, global_sum
     return p, warp_rescale0, warp_rescale1
 
 
