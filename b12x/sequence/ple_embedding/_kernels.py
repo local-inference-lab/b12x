@@ -81,9 +81,7 @@ def _bf16_lookup_kernel(
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -190,9 +188,7 @@ def _nvfp4_lookup_kernel(
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -546,6 +542,7 @@ def _launch_hash(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    validate_metadata: bool,
 ) -> None:
     _launch_hash_pipeline(
         token_ids,
@@ -565,6 +562,7 @@ def _launch_hash(
         heads_per_order,
         max_seqs,
         max_tokens,
+        validate_metadata,
     )
 
 
@@ -599,6 +597,7 @@ def _bf16_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -626,6 +625,7 @@ def _bf16_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        validate_metadata,
     )
     _launch_bf16_lookup(
         weight,
@@ -670,6 +670,7 @@ def _bf16_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     del weight, token_ids, query_start_loc, committed_history
     del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
@@ -677,6 +678,7 @@ def _bf16_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
+    del validate_metadata
 
 
 @torch.library.custom_op(
@@ -711,6 +713,7 @@ def _fp8_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -738,6 +741,7 @@ def _fp8_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        validate_metadata,
     )
     _launch_fp8_lookup(
         weight,
@@ -784,6 +788,7 @@ def _fp8_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     del weight, weight_scale, token_ids, query_start_loc, committed_history
     del num_seqs, num_tokens, multipliers, prime_sizes, table_offsets
@@ -791,6 +796,7 @@ def _fp8_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
+    del validate_metadata
 
 
 @torch.library.custom_op(
@@ -826,6 +832,7 @@ def _nvfp4_pipeline_op(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     ids, request_ids, error_code = _pipeline_scratch_views(
         scratch,
@@ -853,6 +860,7 @@ def _nvfp4_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        validate_metadata,
     )
     _launch_nvfp4_lookup(
         weight,
@@ -901,6 +909,7 @@ def _nvfp4_pipeline_fake(
     ids_offset_bytes: int,
     request_ids_offset_bytes: int,
     error_code_offset_bytes: int,
+    validate_metadata: bool,
 ) -> None:
     del weight, weight_scale, weight_scale_2
     del token_ids, query_start_loc, committed_history
@@ -909,6 +918,7 @@ def _nvfp4_pipeline_fake(
     del max_seqs, max_tokens, head_count, head_dim, embedding_dim
     del table_vocab_size, shard_start, shard_end
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
+    del validate_metadata
 
 
 def run_pipeline(binding: Binding) -> None:
@@ -943,6 +953,7 @@ def run_pipeline(binding: Binding) -> None:
         + plan._hash_plan.layout.request_ids_offset_bytes,
         plan._layout.hash_scratch_offset_bytes
         + plan._hash_plan.layout.error_code_offset_bytes,
+        caps.metadata_validation == "transactional",
     )
     if caps.quant_mode == "bf16":
         torch.ops.b12x.ple_embedding_bf16_pipeline(binding.weight, *hash_args)

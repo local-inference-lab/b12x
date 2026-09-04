@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 _SIGNED_INT64_MAX = (1 << 63) - 1
 QuantMode = Literal["bf16", "fp8_e4m3_per_tensor", "nvfp4_group16"]
 TableMemory = Literal["device", "mapped_host"]
+MetadataValidation = Literal["transactional", "trusted"]
 _BF16_MODE: QuantMode = "bf16"
 _FP8_QUANT_MODE: QuantMode = "fp8_e4m3_per_tensor"
 _NVFP4_QUANT_MODE: QuantMode = "nvfp4_group16"
@@ -114,7 +115,9 @@ class Caps:
     ``scale_dtype`` is validated against the selected storage format.
     ``table_memory="mapped_host"`` places row payloads and row-associated
     scales in CUDA-mapped, write-combined host memory while scalar scales stay
-    device-resident.
+    device-resident. ``metadata_validation="trusted"`` removes device
+    validation and requires the caller to guarantee every packed-hash metadata
+    invariant.
     """
 
     device: torch.device | str
@@ -134,6 +137,7 @@ class Caps:
     table_memory: TableMemory = "device"
     scale_dtype: torch.dtype | None = None
     output_dtype: torch.dtype = torch.bfloat16
+    metadata_validation: MetadataValidation = "transactional"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", _canonical_device(self.device))
@@ -222,6 +226,11 @@ class Caps:
         if self.output_dtype != torch.bfloat16:
             raise TypeError(
                 f"PLE embedding output must use torch.bfloat16, got {self.output_dtype}"
+            )
+        if self.metadata_validation not in ("transactional", "trusted"):
+            raise ValueError(
+                "metadata_validation must be 'transactional' or 'trusted', got "
+                f"{self.metadata_validation!r}"
             )
 
     @property
@@ -372,6 +381,7 @@ def plan(
             dense_layer_ordinal=caps.dense_layer_ordinal,
             base_table_size=caps.base_table_size,
             table_alignment=caps.table_alignment,
+            metadata_validation=caps.metadata_validation,
         ),
         prime_sizes=prime_sizes,
         table_offsets=table_offsets,
@@ -612,6 +622,7 @@ def run(binding: Binding) -> torch.Tensor:
 
 
 __all__ = [
+    "MetadataValidation",
     "QuantMode",
     "TableMemory",
     "Caps",

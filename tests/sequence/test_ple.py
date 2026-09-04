@@ -75,6 +75,36 @@ def test_ple_hash_geometry_is_distinct_deterministic_and_aligned() -> None:
     assert minimum_offsets.tolist() == [0, 2, 5, 10]
 
 
+def test_ple_caps_reject_unknown_metadata_validation() -> None:
+    with pytest.raises(ValueError, match="metadata_validation"):
+        ple_hash.Caps(
+            device="cpu",
+            max_tokens=1,
+            max_seqs=1,
+            vocab_size=100,
+            eos_token_id=99,
+            max_order=2,
+            heads_per_order=1,
+            dense_layer_ordinal=0,
+            base_table_size=101,
+            metadata_validation="unchecked",
+        )
+    with pytest.raises(ValueError, match="metadata_validation"):
+        ple.Caps(
+            device="cpu",
+            mode="decode",
+            max_tokens=1,
+            max_seqs=1,
+            max_state_slots=1,
+            max_speculative_tokens=0,
+            streams=1,
+            hidden_size=16,
+            kernel_size=2,
+            dilation=1,
+            metadata_validation="unchecked",
+        )
+
+
 def test_ple_hash_plan_rejects_cumulative_table_extent_beyond_int64() -> None:
     caps = ple_hash.Caps(
         device="cpu",
@@ -360,6 +390,7 @@ def _bind_cuda_layer(
     max_speculative_tokens: int,
     dilation: int,
     request_is_prefill: torch.Tensor | None = None,
+    metadata_validation: str = "transactional",
 ):
     max_tokens, streams, hidden = residual.shape
     max_seqs = int(state_slot_ids.numel())
@@ -375,6 +406,7 @@ def _bind_cuda_layer(
             hidden_size=hidden,
             kernel_size=conv_weight.shape[-1],
             dilation=dilation,
+            metadata_validation=metadata_validation,
         )
     )
     out = torch.full_like(residual, 91)
@@ -1088,6 +1120,71 @@ def test_ple_hash_cuda_graph_replay_is_allocation_free() -> None:
     assert captured_out.data_ptr() == output_address == binding.out.data_ptr()
     assert allocated_after_replay == allocated_before_replay
     torch.testing.assert_close(captured_out, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_ple_hash_trusted_metadata_ignores_stale_error_under_graph_replay() -> None:
+    device = require_b12x()
+    caps = ple_hash.Caps(
+        device=device,
+        max_tokens=4,
+        max_seqs=2,
+        vocab_size=100,
+        eos_token_id=99,
+        max_order=3,
+        heads_per_order=2,
+        dense_layer_ordinal=0,
+        base_table_size=101,
+        metadata_validation="trusted",
+    )
+    plan = ple_hash.plan(caps)
+    token_ids = torch.tensor([1, 2, 0, 0], dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor([0, 2, 2], dtype=torch.int32, device=device)
+    committed_history = torch.tensor(
+        [[99, 99], [99, 99]], dtype=torch.int64, device=device
+    )
+    binding = ple_hash.bind(
+        plan,
+        scratch=_scratch(plan),
+        token_ids=token_ids,
+        query_start_loc=query_start_loc,
+        committed_history=committed_history,
+        num_seqs=torch.tensor([1], dtype=torch.int32, device=device),
+        num_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+        out=torch.empty(
+            (caps.max_tokens, caps.head_count), dtype=torch.int64, device=device
+        ),
+    )
+    binding.error_code.fill_(73)
+    ple_hash.run(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ple_hash.run(binding)
+
+    token_ids.copy_(torch.tensor([3, 4, 5, 0], dtype=torch.int64, device=device))
+    query_start_loc.copy_(torch.tensor([0, 1, 3], dtype=torch.int32, device=device))
+    binding.num_seqs.fill_(2)
+    binding.num_tokens.fill_(3)
+    binding.out.fill_(91)
+    binding.error_code.fill_(73)
+    expected = ple_hash_packed_reference(
+        token_ids[:3],
+        query_start_loc,
+        committed_history,
+        eos_token_id=caps.eos_token_id,
+        multipliers=plan.multipliers,
+        prime_sizes=plan.prime_sizes,
+        table_offsets=plan.table_offsets,
+        heads_per_order=caps.heads_per_order,
+    )
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert binding.error_code.item() == 73
+    torch.testing.assert_close(captured[:3], expected, rtol=0, atol=0)
+    assert bool((captured[3:] == -1).all().item())
 
 
 @torch.inference_mode()
@@ -1901,6 +1998,88 @@ def test_ple_dummy_slots_replay_under_cuda_graph_without_state_mutation() -> Non
     assert bool((binding.out == 0).all().item())
     torch.testing.assert_close(conv_state, state_before, rtol=0, atol=0)
     assert allocated_after_replay == allocated_before_replay
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["decode", "mixed"])
+def test_ple_trusted_metadata_matches_transactional_graph_replay(mode: str) -> None:
+    device = require_b12x()
+    tokens, streams, hidden = 4, 2, 32
+    kernel_size, dilation, max_speculative = 4, 3, 4
+    residual, key, value, weights, generator = _cuda_projected_inputs(
+        tokens, streams, hidden, device=device, seed=1219
+    )
+    conv_weight = torch.randn(
+        (streams * hidden, kernel_size),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    ).contiguous()
+    state_length = dilation * (kernel_size - 1)
+    initial_state = torch.randn(
+        (1, streams * hidden, state_length + max_speculative),
+        generator=generator,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    def make_binding(metadata_validation: str):
+        return _bind_cuda_layer(
+            mode=mode,
+            residual=residual.clone(),
+            key=key.clone(),
+            value=value.clone(),
+            weights=[weight.clone() for weight in weights],
+            conv_weight=conv_weight.clone(),
+            query_start_loc=torch.tensor([0, tokens], dtype=torch.int32, device=device),
+            state_slot_ids=torch.tensor([0], dtype=torch.int64, device=device),
+            state_is_fresh=torch.tensor([False], dtype=torch.bool, device=device),
+            num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=device),
+            num_seqs=1,
+            num_tokens=tokens,
+            conv_state=initial_state.clone(),
+            max_speculative_tokens=max_speculative,
+            dilation=dilation,
+            request_is_prefill=(
+                torch.tensor([False], dtype=torch.bool, device=device)
+                if mode == "mixed"
+                else None
+            ),
+            metadata_validation=metadata_validation,
+        )[1]
+
+    def run(binding):
+        if mode == "mixed":
+            return ple.run_mixed(binding, eps=1e-6)
+        return ple.run_decode(binding, eps=1e-6)
+
+    transactional = make_binding("transactional")
+    run(transactional)
+    torch.cuda.synchronize(device)
+    expected_out = transactional.out.clone()
+    expected_state = transactional.conv_state.clone()
+
+    trusted = make_binding("trusted")
+    trusted.error_code.fill_(73)
+    run(trusted)
+    trusted.conv_state.copy_(initial_state)
+    trusted.out.fill_(91)
+    trusted.error_code.fill_(73)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(trusted)
+
+    trusted.conv_state.copy_(initial_state)
+    trusted.out.fill_(91)
+    trusted.error_code.fill_(73)
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert trusted.error_code.item() == 73
+    torch.testing.assert_close(captured, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(trusted.conv_state, expected_state, rtol=0, atol=0)
 
 
 @torch.inference_mode()

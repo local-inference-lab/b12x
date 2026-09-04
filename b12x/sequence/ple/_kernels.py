@@ -142,11 +142,15 @@ def _request_ids_kernel(
     request_ids_ptr,
     error_code_ptr,
     MAX_TOKENS: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     token = tl.program_id(0)
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
     num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    else:
+        valid_metadata = tl.full((), True, tl.int1)
     live = (token < num_tokens) & valid_metadata
 
     low = tl.zeros((), tl.int32)
@@ -180,13 +184,17 @@ def _prepare_history_kernel(
     DECODE: tl.constexpr,
     MIXED: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     request = tl.program_id(0)
     channel_block = tl.program_id(1)
     channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
     channel_mask = channels < CHANNELS
     num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    else:
+        valid_metadata = tl.full((), True, tl.int1)
     request_live = (request < num_seqs) & valid_metadata
     slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(
         tl.int64
@@ -253,13 +261,17 @@ def _gated_u_norm_kernel(
     HIDDEN_SIZE: tl.constexpr,
     CHANNELS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     token = tl.program_id(0)
     stream = tl.program_id(1)
     columns = tl.arange(0, BLOCK_H)
     column_mask = columns < HIDDEN_SIZE
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    else:
+        valid_metadata = tl.full((), True, tl.int1)
     token_live = (token < num_tokens) & valid_metadata
     request = tl.load(request_ids_ptr + token).to(tl.int32)
     slot = tl.load(
@@ -342,13 +354,17 @@ def _dilated_conv_kernel(
     KERNEL_SIZE: tl.constexpr,
     DILATION: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     token = tl.program_id(0)
     channel_block = tl.program_id(1)
     channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
     channel_mask = channels < CHANNELS
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    else:
+        valid_metadata = tl.full((), True, tl.int1)
     token_live = (token < num_tokens) & valid_metadata
     request = tl.load(request_ids_ptr + token).to(tl.int32)
     slot = tl.load(
@@ -432,13 +448,17 @@ def _update_state_kernel(
     DECODE: tl.constexpr,
     MIXED: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    VALIDATE_METADATA: tl.constexpr,
 ):
     request = tl.program_id(0)
     channel_block = tl.program_id(1)
     channels = channel_block * BLOCK_C + tl.arange(0, BLOCK_C)
     channel_mask = channels < CHANNELS
     num_seqs = tl.load(num_seqs_ptr).to(tl.int32)
-    valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    if VALIDATE_METADATA:
+        valid_metadata = tl.load(error_code_ptr).to(tl.int32) == 0
+    else:
+        valid_metadata = tl.full((), True, tl.int1)
     request_live = (request < num_seqs) & valid_metadata
     slot = tl.load(state_slot_ids_ptr + request, mask=request_live, other=-1).to(
         tl.int64
@@ -568,6 +588,7 @@ def _launch_layer_pipeline(
     dilation: int,
     decode: bool,
     mixed: bool,
+    validate_metadata: bool,
 ) -> None:
     """Launch the allocation-free PLE pipeline on the current CUDA stream."""
     channels = streams * hidden_size
@@ -575,25 +596,26 @@ def _launch_layer_pipeline(
     state_capacity = state_length + max_speculative_tokens
     state_strides = tuple(int(stride) for stride in conv_state.stride())
     channel_grid = triton.cdiv(channels, _CHANNEL_BLOCK)
-    _reset_error_kernel[(1,)](error_code, num_warps=1)
-    request_block = 128
-    _validate_metadata_kernel[(max_seqs, triton.cdiv(max_seqs, request_block))](
-        query_start_loc,
-        state_slot_ids,
-        num_accepted_tokens,
-        request_is_prefill,
-        num_seqs,
-        num_tokens,
-        error_code,
-        MAX_TOKENS=max_tokens,
-        MAX_SEQS=max_seqs,
-        MAX_STATE_SLOTS=max_state_slots,
-        MAX_SPECULATIVE=max_speculative_tokens,
-        DECODE=decode,
-        MIXED=mixed,
-        BLOCK_R=request_block,
-        num_warps=1,
-    )
+    if validate_metadata:
+        _reset_error_kernel[(1,)](error_code, num_warps=1)
+        request_block = 128
+        _validate_metadata_kernel[(max_seqs, triton.cdiv(max_seqs, request_block))](
+            query_start_loc,
+            state_slot_ids,
+            num_accepted_tokens,
+            request_is_prefill,
+            num_seqs,
+            num_tokens,
+            error_code,
+            MAX_TOKENS=max_tokens,
+            MAX_SEQS=max_seqs,
+            MAX_STATE_SLOTS=max_state_slots,
+            MAX_SPECULATIVE=max_speculative_tokens,
+            DECODE=decode,
+            MIXED=mixed,
+            BLOCK_R=request_block,
+            num_warps=1,
+        )
     _request_ids_kernel[(max_tokens,)](
         query_start_loc,
         num_seqs,
@@ -601,6 +623,7 @@ def _launch_layer_pipeline(
         request_ids,
         error_code,
         MAX_TOKENS=max_tokens,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=1,
     )
     _prepare_history_kernel[(max_seqs, channel_grid)](
@@ -622,6 +645,7 @@ def _launch_layer_pipeline(
         DECODE=decode,
         MIXED=mixed,
         BLOCK_C=_CHANNEL_BLOCK,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=4,
     )
     block_h = max(16, triton.next_power_of_2(hidden_size))
@@ -644,6 +668,7 @@ def _launch_layer_pipeline(
         HIDDEN_SIZE=hidden_size,
         CHANNELS=channels,
         BLOCK_H=block_h,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=reduction_warps,
     )
     _dilated_conv_kernel[(max_tokens, channel_grid)](
@@ -661,6 +686,7 @@ def _launch_layer_pipeline(
         KERNEL_SIZE=kernel_size,
         DILATION=dilation,
         BLOCK_C=_CHANNEL_BLOCK,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=4,
     )
     _update_state_kernel[(max_seqs, channel_grid)](
@@ -682,6 +708,7 @@ def _launch_layer_pipeline(
         DECODE=decode,
         MIXED=mixed,
         BLOCK_C=_CHANNEL_BLOCK,
+        VALIDATE_METADATA=validate_metadata,
         num_warps=4,
     )
 
@@ -727,6 +754,7 @@ def _layer_pipeline_op(
     kernel_size: int,
     dilation: int,
     decode: bool,
+    validate_metadata: bool,
 ) -> None:
     _launch_layer_pipeline(
         residual,
@@ -760,6 +788,7 @@ def _layer_pipeline_op(
         dilation,
         decode,
         False,
+        validate_metadata,
     )
 
 
@@ -794,13 +823,14 @@ def _layer_pipeline_fake(
     kernel_size: int,
     dilation: int,
     decode: bool,
+    validate_metadata: bool,
 ) -> None:
     del residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight
     del conv_weight, query_start_loc, state_slot_ids, state_is_fresh
     del num_accepted_tokens, num_seqs, num_tokens, conv_state, out
     del normalized_u, gathered_state, request_ids, error_code, eps
     del max_tokens, max_seqs, max_state_slots, max_speculative_tokens
-    del streams, hidden_size, kernel_size, dilation, decode
+    del streams, hidden_size, kernel_size, dilation, decode, validate_metadata
 
 
 @torch.library.custom_op(
@@ -844,6 +874,7 @@ def _layer_mixed_pipeline_op(
     hidden_size: int,
     kernel_size: int,
     dilation: int,
+    validate_metadata: bool,
 ) -> None:
     _launch_layer_pipeline(
         residual,
@@ -877,6 +908,7 @@ def _layer_mixed_pipeline_op(
         dilation,
         False,
         True,
+        validate_metadata,
     )
 
 
@@ -911,13 +943,14 @@ def _layer_mixed_pipeline_fake(
     hidden_size: int,
     kernel_size: int,
     dilation: int,
+    validate_metadata: bool,
 ) -> None:
     del residual, key, value, k_norm_weight, q_norm_weight, u_norm_weight
     del conv_weight, query_start_loc, state_slot_ids, state_is_fresh
     del num_accepted_tokens, request_is_prefill, num_seqs, num_tokens
     del conv_state, out, normalized_u, gathered_state, request_ids, error_code, eps
     del max_tokens, max_seqs, max_state_slots, max_speculative_tokens
-    del streams, hidden_size, kernel_size, dilation
+    del streams, hidden_size, kernel_size, dilation, validate_metadata
 
 
 def run_layer_kernels(binding: LayerBinding, *, eps: float, decode: bool) -> None:
@@ -953,6 +986,7 @@ def run_layer_kernels(binding: LayerBinding, *, eps: float, decode: bool) -> Non
         caps.kernel_size,
         caps.dilation,
         decode,
+        caps.metadata_validation == "transactional",
     )
 
 
@@ -991,6 +1025,7 @@ def run_layer_mixed_kernels(binding: LayerBinding, *, eps: float) -> None:
         caps.hidden_size,
         caps.kernel_size,
         caps.dilation,
+        caps.metadata_validation == "transactional",
     )
 
 

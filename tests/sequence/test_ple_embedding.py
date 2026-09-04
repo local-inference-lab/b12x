@@ -28,6 +28,7 @@ def _small_plan(
     tp_size: int = 2,
     max_tokens: int = 5,
     quant_mode: str = "fp8_e4m3_per_tensor",
+    metadata_validation: str = "transactional",
 ) -> ple_embedding.Plan:
     prime_sizes, table_offsets, multipliers = _small_geometry()
     return ple_embedding.plan(
@@ -46,6 +47,7 @@ def _small_plan(
             tp_rank=tp_rank,
             table_alignment=8,
             quant_mode=quant_mode,
+            metadata_validation=metadata_validation,
         ),
         prime_sizes=prime_sizes,
         table_offsets=table_offsets,
@@ -279,6 +281,8 @@ def test_caps_and_plan_reject_unsupported_storage_contracts() -> None:
         ple_embedding.Caps(**{**common, "quant_mode": "int8"})
     with pytest.raises(ValueError, match="table_memory"):
         ple_embedding.Caps(**{**common, "table_memory": "managed"})
+    with pytest.raises(ValueError, match="metadata_validation"):
+        ple_embedding.Caps(**{**common, "metadata_validation": "unchecked"})
     with pytest.raises(ValueError, match="requires a CUDA device"):
         ple_embedding.Caps(**{**common, "table_memory": "mapped_host"})
     with pytest.raises(TypeError, match="BF16.*scale_dtype must be None"):
@@ -697,6 +701,43 @@ def test_cuda_graph_replay_uses_bound_storage_without_allocating(
     assert captured.data_ptr() == output_address == binding.out.data_ptr()
     assert binding.scratch.data_ptr() == scratch_address
     assert allocated_after == allocated_before
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_cuda_trusted_metadata_ignores_stale_error_under_graph_replay() -> None:
+    device = require_b12x()
+    plan = _small_plan(
+        device,
+        quant_mode="nvfp4_group16",
+        metadata_validation="trusted",
+    )
+    binding = _bind_small(plan)
+    binding.error_code.fill_(73)
+    ple_embedding.run(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ple_embedding.run(binding)
+    output_address = captured.data_ptr()
+    scratch_address = binding.scratch.data_ptr()
+
+    binding.token_ids[:2].copy_(torch.tensor([8, 9], dtype=torch.int64, device=device))
+    binding.query_start_loc.copy_(
+        torch.tensor([0, 2, 0], dtype=torch.int32, device=device)
+    )
+    binding.num_seqs.fill_(1)
+    binding.num_tokens.fill_(2)
+    binding.out.fill_(37)
+    binding.error_code.fill_(73)
+    expected = _reference(binding)
+    allocated_before = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert captured.data_ptr() == output_address == binding.out.data_ptr()
+    assert binding.scratch.data_ptr() == scratch_address
+    assert binding.error_code.item() == 73
     torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
