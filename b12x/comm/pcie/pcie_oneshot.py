@@ -1807,16 +1807,19 @@ class _CuTeOneshotBackend:
         capturing = _is_current_stream_capturing(inp.device)
         size_packs = inp.numel() * inp.element_size() // 16
         graph_channel = state.device_slot_selection or capturing
-        plan = (
-            state.plain_graph_plans.get(self._plain_graph_plan_key(inp))
-            if graph_channel
-            else None
-        )
+        plan_key = self._plain_graph_plan_key(inp)
+        plan = state.plain_graph_plans.get(plan_key) if graph_channel else None
+        bind_plan_after_launcher_check = False
         if graph_channel and plan is None:
-            raise RuntimeError(
-                "plain PCIe oneshot graph shape is not prepared; call "
-                "prepare_graph_all_reduce() before capture"
-            )
+            if capturing:
+                # PIECEWISE capture can expose a row count outside the explicit
+                # capture-size set. Binding host metadata is safe only when the
+                # required launcher specialization is already resident.
+                plan = self._plain_graph_plan(state, inp)
+                bind_plan_after_launcher_check = True
+            else:
+                self.prepare_all_reduce(handle, inp)
+                plan = state.plain_graph_plans[plan_key]
         if plan is None:
             transport, threads, blocks = self._plain_launch_config(
                 state,
@@ -1858,6 +1861,8 @@ class _CuTeOneshotBackend:
                     "cold PCIe oneshot CUDA graph capture is not allowed; "
                     "call prepare_graph_all_reduce() before capture"
                 )
+            if bind_plan_after_launcher_check:
+                state.plain_graph_plans[plan_key] = plan
         if (
             capturing
             and state.eager_tables is not None

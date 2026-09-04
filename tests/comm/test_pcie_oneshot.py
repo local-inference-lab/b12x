@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -463,6 +464,74 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
         (True, 0, "tp2_remote_push", 64),
         (True, 1, "tp2_remote_push", 64),
     ]
+
+
+def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda _device: True,
+    )
+    monkeypatch.setattr(
+        _CuTeOneshotBackend,
+        "_device_index",
+        staticmethod(lambda _device: 0),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(
+        "b12x.comm.pcie._oneshot_cute.is_oneshot_launcher_prepared",
+        lambda *args: True,
+    )
+    launches = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie._oneshot_cute.get_oneshot_launcher",
+        lambda *args: lambda *launch_args: launches.append((args, launch_args)),
+    )
+    backend = _CuTeOneshotBackend()
+    state = _make_cute_state(2)
+    state.device_slot_selection = True
+    backend._states[7] = state
+    inp = torch.empty((5, 4096), dtype=torch.bfloat16)
+
+    backend.all_reduce(7, inp, torch.empty_like(inp), 0, 0)
+
+    key = backend._plain_graph_plan_key(inp)
+    assert state.plain_graph_plans[key].transport == "tp2_remote_push"
+    assert (
+        state.plain_graph_plans[key].threads,
+        state.plain_graph_plans[key].blocks,
+    ) == (
+        64,
+        16,
+    )
+    assert len(launches) == 1
+
+
+def test_capture_rejects_unseen_shape_for_a_cold_launcher(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._is_current_stream_capturing",
+        lambda _device: True,
+    )
+    monkeypatch.setattr(
+        _CuTeOneshotBackend,
+        "_device_index",
+        staticmethod(lambda _device: 0),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie._oneshot_cute.is_oneshot_launcher_prepared",
+        lambda *args: False,
+    )
+    backend = _CuTeOneshotBackend()
+    state = _make_cute_state(2)
+    state.device_slot_selection = True
+    backend._states[7] = state
+    inp = torch.empty((5, 4096), dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="cold PCIe oneshot CUDA graph capture"):
+        backend.all_reduce(7, inp, torch.empty_like(inp), 0, 0)
+
+    assert backend._plain_graph_plan_key(inp) not in state.plain_graph_plans
 
 
 def test_plain_tp2_remote_push_is_not_selected_for_eager_execution(
