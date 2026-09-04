@@ -2350,3 +2350,31 @@ def test_sparse_mla_scratch_fp32_partials_layout() -> None:
     assert fp32.nbytes > bf16.nbytes
     with pytest.raises(TypeError):
         B12XSparseMLAScratchCaps(**common, partial_dtype=torch.float16)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens,topk", [(1, 512), (4, 2048)])
+def test_unified_decode_glm_fastpath_bit_identical(monkeypatch, num_tokens, topk) -> None:
+    """``B12X_MLA_SM120_GLM_FASTPATH=1`` stages packed 656-byte records, loads
+    the PV B-fragments with the b8 transposed ldmatrix and keeps W hi/lo in
+    fixed slots; bytes and MMA order are unchanged, so the output is
+    bit-identical to the base path and the plan records the mode."""
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
+
+    n_chunks = (topk + 63) // 64
+    forced = min(n_chunks, 8)
+    monkeypatch.delenv("B12X_MLA_SM120_GLM_FASTPATH", raising=False)
+    base, exp, lengths = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7700 + num_tokens, split_policy="balanced",
+    )
+    assert launch.LAST_DECODE_PLAN.get("glm_fastpath") is False
+    monkeypatch.setenv("B12X_MLA_SM120_GLM_FASTPATH", "1")
+    ldsm, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7700 + num_tokens, split_policy="balanced",
+    )
+    assert launch.LAST_DECODE_PLAN.get("glm_fastpath") is True
+    assert torch.equal(base, ldsm)
+    _assert_glm_rows_match_reference(ldsm, exp, lengths, label="glm_fastpath")

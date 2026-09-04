@@ -77,6 +77,7 @@ _DSV4_HEAD_DIM = 512
 _GLM_HEAD_DIM = 576
 # GLM per-token packed cache record (reference.pack_mla_kv_cache_reference).
 _GLM_KV_GMEM_STRIDE = 656
+_GLM_NOPE_SCALE_BYTES_SMEM = 528  # rope offset inside a packed 656-byte staged row
 # DSV4 H8 packs the contiguous 576-byte data record into a 592-byte smem row.
 # The 16-byte pad preserves KV_SMEM_STRIDE/4 % 32 == 20, matching the generic
 # 464-byte row's bank rotation while allowing one bulk copy per candidate.
@@ -283,6 +284,31 @@ def _wave_balanced_num_splits(
 # multi-split is numerically identical to single-split).
 # ---------------------------------------------------------------------------
 _MLA_SM120_BALANCED_WAVES_ENV = "B12X_MLA_SM120_BALANCED_WAVES"
+_MLA_SM120_GLM_FASTPATH_ENV = "B12X_MLA_SM120_GLM_FASTPATH"
+_MLA_SM120_GLM_W_HW_DEQUANT_ENV = "B12X_MLA_SM120_GLM_W_HW_DEQUANT"
+
+
+def _env_glm_w_hw_dequant_enabled() -> bool:
+    """GLM fast path: reconstruct the W HIGH byte with cvt.rn.f16x2.e4m3x2.
+
+    Exact for every E4M3 value; the software expansion it replaces mis-decodes
+    subnormals and -0, so LOW residual bytes (and results) change slightly.
+    Off by default; requires the fast path.
+    """
+    raw = os.environ.get(_MLA_SM120_GLM_W_HW_DEQUANT_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _env_glm_fastpath_enabled() -> bool:
+    """GLM generic (HPB=16) per-token decode fast path (sm_120a).
+
+    Packed 656-byte KV staging (one bulk copy per token), PV B-fragments via
+    ``ldmatrix.m16n16.x2.trans.b8`` and W hi/lo slots without the residual
+    serialization barrier. Bit-identical to the base path; off by default so
+    existing compile keys and PTX are unchanged.
+    """
+    raw = os.environ.get(_MLA_SM120_GLM_FASTPATH_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "on", "yes"}
 
 
 def _env_balanced_waves() -> float:
@@ -434,11 +460,30 @@ class UnifiedDecodeKernel:
         native_dsv4_h8=False,
         native_dsv4_h16=False,
         balanced_splits=False,
+        glm_fastpath=False,
+        glm_w_hw_dequant=False,
     ):
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
         self.chunks_per_split = int(chunks_per_split)
+        # GLM generic (HPB=16, 8 math warps) per-token fast path: the IO warp
+        # stages each 656-byte record with one bulk copy (rope inline at +528,
+        # row stride 656 over the contiguous kv_fp8+kv_rope allocation), the PV
+        # stage loads V B-fragments with ldmatrix.m16n16.x2.trans.b8 and keeps
+        # W hi/lo in fixed slots (see decode_math.s6_xv_nope), and the epilogue
+        # maps each warp's 16 consecutive V dims. Bytes and MMA order are
+        # unchanged, so results are bit-identical to the base path.
+        self.glm_fastpath = bool(
+            glm_fastpath
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        )
+        # Hardware E4M3 -> f16 reconstruction of the W HIGH byte for the LOW
+        # residual (fast path only; not bit-identical to the software expansion).
+        self.glm_w_hw_dequant = bool(glm_w_hw_dequant and self.glm_fastpath)
         # Balanced split policy (per-token single-cache entry only). False keeps
         # the static chunk ranges ``[split * chunks_per_split, +chunks_per_split)``
         # and the existing entry points byte-identical. True selects
@@ -1247,6 +1292,7 @@ class UnifiedDecodeKernel:
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        v_ldsm_b8=False,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -1363,6 +1409,7 @@ class UnifiedDecodeKernel:
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 1),
+                warp_contiguous_dims=False,
             )
 
     @cute.kernel
@@ -1684,7 +1731,7 @@ class UnifiedDecodeKernel:
 
         # Match the single-cache body's allocation-preserving packed H8 layout.
         staged_kv_stride = t.kv_smem_stride
-        if cutlass.const_expr(self.native_glm_h8):
+        if cutlass.const_expr(self.native_glm_h8 or self.glm_fastpath):
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
@@ -1695,6 +1742,12 @@ class UnifiedDecodeKernel:
             kv_rope_addr = kv_fp8_addr + Int32(_DSV4_PACKED_ROPE_OFFSET)
             kv_rope_buf = kv_fp8_buf
             kv_sc_addr = kv_fp8_addr + Int32(2) * kv_fp8_buf
+        if cutlass.const_expr(self.glm_fastpath):
+            # Packed GLM record staging: rope follows the 528-byte nope+scales
+            # inside each 656-byte row of the kv_fp8 stage (the two 64x656
+            # stages exactly cover the kv_fp8 + kv_rope allocation).
+            kv_rope_addr = kv_fp8_addr + Int32(_GLM_NOPE_SCALE_BYTES_SMEM)
+            kv_rope_buf = kv_fp8_buf
         tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
 
         # mbarrier array: full[0], full[1], empty[0], empty[1] (u64 each).
@@ -1797,7 +1850,7 @@ class UnifiedDecodeKernel:
                     io_threads=self.io_threads,
                     split_mbar_arrival=self.native_dsv4_h16,
                     fp8_rope=t.fp8_rope,
-                    packed_glm=self.native_glm_h8,
+                    packed_glm=self.native_glm_h8 or self.glm_fastpath,
                     packed_dsv4=self.native_dsv4_h8 or self.native_dsv4_h16,
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
@@ -2178,7 +2231,7 @@ class UnifiedDecodeKernel:
                         num_scales=t.num_scales,
                         quant_tile=t.quant_tile,
                         q_nope_stride=t.q_nope_stride,
-                        kv_smem_stride=t.kv_smem_stride,
+                        kv_smem_stride=staged_kv_stride,
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
                         latent_scale_per_token=t.latent_scale_per_token,
@@ -2192,6 +2245,9 @@ class UnifiedDecodeKernel:
                         d_rope=t.d_rope,
                         q_rope_stride=L.q_rope_stride,
                         fp8_rope=t.fp8_rope,
+                        kv_rope_stride_bytes=(
+                            _GLM_KV_GMEM_STRIDE if self.glm_fastpath else t.d_rope * 2
+                        ),
                     )
 
                     # Per-chunk section dispatch for the S3 mask: compare the
@@ -2251,6 +2307,7 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
+                        skip_unit_rescale=self.glm_fastpath,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2288,7 +2345,7 @@ class UnifiedDecodeKernel:
                         v_chunk=t.quant_tile,
                         hpb=t.hpb,
                         bi=t.bi,
-                        kv_smem_stride=t.kv_smem_stride,
+                        kv_smem_stride=staged_kv_stride,
                         w_fp8_stride=t.bi + 16,
                         n_warps=8,
                         scale_bytes_per_token=8,
@@ -2299,6 +2356,8 @@ class UnifiedDecodeKernel:
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        v_ldsm_b8=self.glm_fastpath,
+                        w_hw_dequant=self.glm_w_hw_dequant,
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -2417,6 +2476,7 @@ class UnifiedDecodeKernel:
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),
+                warp_contiguous_dims=self.glm_fastpath,
             )
 
 
@@ -2530,6 +2590,8 @@ def _sparse_mla_decode_grid_flat_launch(
             "SM120 sparse MLA decode balanced splits require the single-cache "
             "per-token entry"
         )
+    glm_fastpath = _env_glm_fastpath_enabled()
+    glm_w_hw_dequant = _env_glm_w_hw_dequant_enabled()
     heads = int(q_all.shape[1])
     native_glm_h8 = bool(
         int(model_type) == int(ModelType.GLM_NSA)
@@ -2670,10 +2732,14 @@ def _sparse_mla_decode_grid_flat_launch(
         native_dsv4_h8=native_dsv4_h8,
         native_dsv4_h16=native_dsv4_h16,
         balanced_splits=balanced_splits,
+        glm_fastpath=glm_fastpath,
+        glm_w_hw_dequant=glm_w_hw_dequant,
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
         key_field("balanced_splits", int(balanced_splits)),
+        key_field("glm_fastpath", int(kernel.glm_fastpath)),
+        key_field("glm_w_hw_dequant", int(kernel.glm_w_hw_dequant)),
         key_field("compute_mode", traits.compute_mode),
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
@@ -3287,6 +3353,21 @@ def run_unified_decode(
         per_token_len=bool(per_token_len),
         split_policy=str(split_policy),
         balanced_split_target=int(balanced_split_target),
+        glm_fastpath=bool(
+            _env_glm_fastpath_enabled()
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        ),
+        glm_w_hw_dequant=bool(
+            _env_glm_w_hw_dequant_enabled()
+            and _env_glm_fastpath_enabled()
+            and per_token_len
+            and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+            and int(traits.nt_per_warp_xv) == 2
+            and not (native_glm_h8 or native_dsv4_h8 or native_dsv4_h16)
+        ),
         partial_dtype=(
             str(workspace.tmp_output.dtype)
             if workspace.tmp_output is not None

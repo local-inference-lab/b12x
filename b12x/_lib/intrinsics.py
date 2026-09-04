@@ -1029,6 +1029,39 @@ def ldmatrix_m8n8x4_right_half_b16(
 
 
 @dsl_user_op
+def ldmatrix_m16n16x2_trans_b8(
+    smem_addr: Int32, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Issue ``ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8`` (sm_120a).
+
+    Two 16x16 byte matrices; lanes 0-15 supply the 16-byte row addresses of
+    matrix 0 and lanes 16-31 those of matrix 1. Each returned register holds
+    four bytes of one *column*: lane ``i`` receives column ``i // 4`` (r0, r2)
+    and column ``i // 4 + 8`` (r1, r3) at rows ``4 * (i % 4) .. +3`` of matrix
+    0 (r0, r1) and matrix 1 (r2, r3). With rows = K (tokens) and columns = N
+    (dims) this is exactly the ``mma.m16n8k32`` B fragment: for dims
+    ``[d, d+8)`` b0 = r0 (K 0-15), b1 = r2 (K 16-31); for dims ``[d+8, d+16)``
+    b0 = r1, b1 = r3. Row addresses must be 16-byte aligned.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+    return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
 def ldmatrix_m8n8x4_trans_b16(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
