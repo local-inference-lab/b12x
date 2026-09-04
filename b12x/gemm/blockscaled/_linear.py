@@ -913,6 +913,13 @@ def mxfp8_linear_pair(
         if weight.weight.values.device != source_2d.device:
             raise ValueError(f"source and {name} must be on the same device")
 
+    leading_shape = source.shape[:-1]
+    if tokens == 0:
+        return (
+            source.new_empty((*leading_shape, primary_weight.out_features)),
+            source.new_empty((*leading_shape, secondary_weight.out_features)),
+        )
+
     secondary_stream_int = (
         int(secondary_stream)
         if isinstance(secondary_stream, int)
@@ -934,7 +941,6 @@ def mxfp8_linear_pair(
         int(parallel_max_tokens),
         secondary_stream_int,
     )
-    leading_shape = source.shape[:-1]
     return (
         primary.view(*leading_shape, primary_weight.out_features),
         secondary.view(*leading_shape, secondary_weight.out_features),
