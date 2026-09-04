@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, TypeAlias
 
 import cutlass.cute as cute
@@ -48,6 +50,35 @@ class TensorFP8LinearWeight:
 
 
 Weight: TypeAlias = MXFP8LinearWeight | TensorFP8LinearWeight
+
+
+_PAIR_STREAM_LOCK = Lock()
+_PAIR_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _paired_projection_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the B12X-owned projection stream for this process and device.
+
+    CUDA stream handles are process-local resources.  Keeping the stream
+    behind the custom-op boundary prevents Torch AOT artifacts from embedding
+    a handle created by the process that populated the compile cache.
+    """
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (os.getpid(), int(device_index))
+    with _PAIR_STREAM_LOCK:
+        stream = _PAIR_STREAMS.get(key)
+        if stream is not None:
+            return stream
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the B12X paired-projection stream must be initialized before "
+                "CUDA graph capture"
+            )
+        stream = torch.cuda.Stream(device=device)
+        _PAIR_STREAMS[key] = stream
+        return stream
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -595,7 +626,6 @@ def _packed_mxfp8_pair_op(
     secondary_out_features: int,
     expected_m: int,
     parallel_max_tokens: int,
-    secondary_stream_int: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute independent packed MXFP8 projections with an optional overlap."""
 
@@ -619,7 +649,7 @@ def _packed_mxfp8_pair_op(
         )
 
     tokens = int(source_2d.shape[0])
-    if secondary_stream_int is None or tokens > parallel_max_tokens:
+    if tokens > parallel_max_tokens:
         return (
             project(
                 primary_weight_values,
@@ -638,10 +668,7 @@ def _packed_mxfp8_pair_op(
         )
 
     current_stream = torch.cuda.current_stream(source_2d.device)
-    secondary_stream = torch.cuda.ExternalStream(
-        secondary_stream_int,
-        device=source_2d.device,
-    )
+    secondary_stream = _paired_projection_stream(source_2d.device)
     secondary_stream.wait_stream(current_stream)
     primary = project(
         primary_weight_values,
@@ -677,14 +704,12 @@ def _packed_mxfp8_pair_fake(
     secondary_out_features: int,
     expected_m: int,
     parallel_max_tokens: int,
-    secondary_stream_int: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Describe paired projection outputs without allocating CUDA storage."""
     del primary_weight_values, primary_weight_scale_rows, primary_weight_scale_mma
     del secondary_weight_values, secondary_weight_scale_rows
     del secondary_weight_scale_mma, primary_padded_in_features
     del secondary_padded_in_features, expected_m, parallel_max_tokens
-    del secondary_stream_int
     return (
         source_2d.new_empty((source_2d.shape[0], primary_out_features)),
         source_2d.new_empty((source_2d.shape[0], secondary_out_features)),
@@ -879,15 +904,15 @@ def mxfp8_linear_pair(
     *,
     expected_m: int | None = None,
     parallel_max_tokens: int,
-    secondary_stream: object = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project one activation tensor through two independent MXFP8 weights.
 
     The primary projection runs on the caller's current CUDA stream. When the
     row count does not exceed ``parallel_max_tokens``, the secondary projection
-    runs on ``secondary_stream`` and the current stream waits for it before the
-    function returns. Larger inputs execute serially on the current stream so
-    bandwidth-bound prefill projections do not contend with each other.
+    runs on a B12X-owned process-local stream and the current stream waits for
+    it before the function returns. Larger inputs execute serially on the
+    current stream so bandwidth-bound prefill projections do not contend with
+    each other.
     """
     if not isinstance(primary_weight, MXFP8LinearWeight):
         raise TypeError("primary_weight must be an MXFP8LinearWeight")
@@ -920,11 +945,6 @@ def mxfp8_linear_pair(
             source.new_empty((*leading_shape, secondary_weight.out_features)),
         )
 
-    secondary_stream_int = (
-        int(secondary_stream)
-        if isinstance(secondary_stream, int)
-        else cuda_stream_to_int(secondary_stream)
-    )
     primary, secondary = torch.ops.b12x.blockscaled_packed_mxfp8_pair(
         source_2d,
         primary_weight.weight.values,
@@ -939,7 +959,6 @@ def mxfp8_linear_pair(
         secondary_weight.out_features,
         int(expected_m) if expected_m is not None else tokens,
         int(parallel_max_tokens),
-        secondary_stream_int,
     )
     return (
         primary.view(*leading_shape, primary_weight.out_features),

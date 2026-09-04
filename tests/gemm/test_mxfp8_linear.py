@@ -14,6 +14,7 @@ import torch
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import block_fp8_linear as bfl
 from b12x.gemm import blockscaled, mxfp8_linear
+from b12x.gemm.blockscaled import _linear as blockscaled_linear
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
 )
@@ -227,8 +228,6 @@ def test_mm_pair_matches_independent_projections(tokens: int) -> None:
 
     source, _, primary = _make_inputs(tokens, 256, 384)
     _, _, secondary = _make_inputs(tokens, 256, 64)
-    secondary_stream = torch.cuda.Stream(device=source.device)
-
     expected_primary = mxfp8_linear.mm(source, primary)
     expected_secondary = mxfp8_linear.mm(source, secondary)
     actual_primary, actual_secondary = mxfp8_linear.mm_pair(
@@ -236,7 +235,6 @@ def test_mm_pair_matches_independent_projections(tokens: int) -> None:
         primary,
         secondary,
         parallel_max_tokens=8,
-        secondary_stream=int(secondary_stream.cuda_stream),
     )
     current_stream = torch.cuda.current_stream(source.device)
     observed_primary = actual_primary.clone()
@@ -257,7 +255,7 @@ def test_mm_pair_joins_secondary_work_to_the_caller_stream() -> None:
     _, _, secondary = _make_inputs(4, 256, 64)
     expected_secondary = mxfp8_linear.mm(source, secondary)
     current_stream = torch.cuda.current_stream(source.device)
-    secondary_stream = torch.cuda.Stream(device=source.device)
+    secondary_stream = blockscaled_linear._paired_projection_stream(source.device)
     current_stream.synchronize()
     with torch.cuda.stream(secondary_stream):
         torch.cuda._sleep(20_000_000)
@@ -267,7 +265,6 @@ def test_mm_pair_joins_secondary_work_to_the_caller_stream() -> None:
         primary,
         secondary,
         parallel_max_tokens=8,
-        secondary_stream=secondary_stream,
     )
     observed_secondary = actual_secondary.clone()
     current_stream.synchronize()
@@ -284,13 +281,11 @@ def test_mm_pair_captures_both_streams_and_replays() -> None:
     source, _, primary = _make_inputs(4, 256, 384)
     _, _, secondary = _make_inputs(4, 256, 64)
     replacement = torch.randn_like(source).div_(4)
-    secondary_stream = torch.cuda.Stream(device=source.device)
     mxfp8_linear.mm_pair(
         source,
         primary,
         secondary,
         parallel_max_tokens=8,
-        secondary_stream=secondary_stream,
     )
     current_stream = torch.cuda.current_stream(source.device)
     current_stream.synchronize()
@@ -302,7 +297,6 @@ def test_mm_pair_captures_both_streams_and_replays() -> None:
             primary,
             secondary,
             parallel_max_tokens=8,
-            secondary_stream=secondary_stream,
         )
     source.copy_(replacement)
     expected_primary = mxfp8_linear.mm(source, primary)
