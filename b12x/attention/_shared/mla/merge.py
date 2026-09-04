@@ -715,9 +715,12 @@ def run_sparse_mla_split_decode_merge(
         raise ValueError("sparse MLA merge tensors must be on the same device")
     if tmp_lse.dtype != torch.float32:
         raise TypeError(f"tmp_lse must have dtype torch.float32, got {tmp_lse.dtype}")
-    if tmp_output.dtype != output.dtype:
+    if tmp_output.dtype != output.dtype and tmp_output.dtype != torch.float32:
+        # Partials are either the output element type or fp32 (exact split
+        # partials merged in fp32 and rounded once at the output).
         raise TypeError(
-            f"tmp_output dtype {tmp_output.dtype} must match output dtype {output.dtype}"
+            f"tmp_output dtype {tmp_output.dtype} must match output dtype "
+            f"{output.dtype} or be torch.float32"
         )
     if tmp_output.ndim != 4:
         raise ValueError(
