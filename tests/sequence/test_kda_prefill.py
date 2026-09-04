@@ -320,6 +320,7 @@ def make_binding(
     *,
     max_tokens: int,
     max_seqs: int,
+    final_stride: int = 1,
     metadata_validation: str = "transactional",
     policy=None,
     **caps_extra,
@@ -351,6 +352,12 @@ def make_binding(
         out[: t.shape[0]] = t
         return out
 
+    final_storage = torch.zeros(
+        (max_seqs, final_stride), dtype=inputs["final"].dtype, device=device
+    )
+    final_state_indices = final_storage[:, 0]
+    final_state_indices[: inputs["final"].shape[0]] = inputs["final"]
+
     tensors = {
         "q": pad_rows(inputs["q"]), "k": pad_rows(inputs["k"]), "v": pad_rows(inputs["v"]),
         "raw_g": pad_rows(inputs["raw_g"]), "raw_beta": pad_rows(inputs["raw_beta"]),
@@ -358,7 +365,7 @@ def make_binding(
         "recurrent_state": inputs["pool"].clone(),
         "cu_seqlens": pad_seqs(inputs["cu_seqlens"], extra=1),
         "initial_state_indices": pad_seqs(inputs["initial"]),
-        "final_state_indices": pad_seqs(inputs["final"]),
+        "final_state_indices": final_state_indices,
         "checkpoint_state_indices": pad_seqs(inputs["checkpoint_slots"]),
         "checkpoint_offsets": pad_seqs(inputs["checkpoint_offsets"]),
         "num_seqs": torch.tensor([inputs["num_seqs"]], dtype=torch.int32, device=device),
@@ -669,7 +676,14 @@ def test_op_cuda_graph_replay_is_allocation_free_with_poison() -> None:
 
     device = require_b12x()
     inputs = make_inputs(lengths=[100, 30], heads=2, seed=69, device=device, checkpoint=[(32, 7), (0, 0)], state_slots=9)
-    binding, tensors = make_binding(inputs, max_tokens=256, max_seqs=4, checkpoint_export=True)
+    binding, tensors = make_binding(
+        inputs,
+        max_tokens=256,
+        max_seqs=4,
+        final_stride=3,
+        checkpoint_export=True,
+    )
+    assert binding.final_state_indices.stride() == (3,)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
@@ -828,7 +842,14 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
     beta_storage = torch.zeros(tokens, 2 * heads + 3, dtype=torch.bfloat16, device=device)
     beta_storage[:, 1 : 2 * heads + 1 : 2] = inputs["raw_beta"]
     raw_beta = beta_storage[:, 1 : 2 * heads + 1 : 2]
-    assert not q.is_contiguous() and not raw_beta.is_contiguous()
+    final_storage = torch.zeros((2, 3), dtype=torch.int32, device=device)
+    final_storage[:, 0] = inputs["final"]
+    final_state_indices = final_storage[:, 0]
+    assert (
+        not q.is_contiguous()
+        and not raw_beta.is_contiguous()
+        and not final_state_indices.is_contiguous()
+    )
     caps = impl.Caps(device=device, max_tokens=tokens, max_seqs=2, max_state_slots=8, heads=heads, metadata_validation="trusted")
     plan = impl.plan(caps, policy=PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY))
     scratch = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
@@ -837,7 +858,8 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
         plan, scratch=scratch, q=q, k=k, v=v, raw_g=inputs["raw_g"], raw_beta=raw_beta,
         A_log=inputs["A_log"], dt_bias=inputs["dt_bias"], recurrent_state=pool,
         cu_seqlens=inputs["cu_seqlens"], initial_state_indices=inputs["initial"],
-        final_state_indices=inputs["final"], checkpoint_state_indices=inputs["checkpoint_slots"],
+        final_state_indices=final_state_indices,
+        checkpoint_state_indices=inputs["checkpoint_slots"],
         checkpoint_offsets=inputs["checkpoint_offsets"],
         num_seqs=torch.tensor([2], dtype=torch.int32, device=device),
         num_tokens=torch.tensor([tokens], dtype=torch.int32, device=device),

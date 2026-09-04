@@ -3,8 +3,8 @@
 // One rank owns one pinned host region laid out as:
 //
 //   recv[src][slot]  (world * SLOTS * slot_bytes)  filled by peers' RDMA writes
-//   flag[src][slot]  (world * SLOTS * FLAG_STRIDE) sequence number written by
-//                                                  the peer after its payload
+//   flag[src][slot][hca] sequence number written on each HCA after that HCA's
+//                         payload stripe
 //   send[slot]       (SLOTS * slot_bytes)          staged by the local GPU kernel
 //   ctrl             (FLAG_STRIDE)                 {u32 seq, u32 nbytes, u32 error,
 //                                                   u32 missing_peer} doorbell; the
@@ -12,10 +12,12 @@
 //                                                  when a wait times out
 //
 // The GPU kernel stages its input into send[seq & 1], publishes nbytes and seq
-// in ctrl, then spins on flag[peer][seq & 1] for every peer.  The proxy thread
-// below spins on ctrl.seq and, for every peer, posts one RDMA write of the
-// payload followed by one 4-byte RDMA write of seq on the same reliable QP, so
-// the flag cannot become visible before the payload.  Nothing on the receive
+// in ctrl, then spins on flag[peer][seq & 1][hca] for every peer and HCA.  The
+// proxy thread
+// below spins on ctrl.seq and, for every peer, stripes the payload across every
+// HCA.  Each stripe is followed by its own 4-byte seq write on the same reliable
+// QP, so its flag cannot become visible before its payload.  The GPU waits for
+// every stripe flag before consuming the receive slot.  Nothing on the receive
 // path involves the host.
 //
 // This file is compiled by b12x.comm.roce._proxy at first use with the host
@@ -39,8 +41,11 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
-#define ROCE_ABI_VERSION 2
-#define ROCE_IDLE_SPINS 200000
+#define ROCE_ABI_VERSION 3
+// Model graphs leave sub-millisecond gaps between collectives.  Keep the
+// proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+// every collective on the graph's critical path.
+#define ROCE_IDLE_SPINS 20000000
 
 typedef struct {
     uint64_t region_addr;
@@ -58,6 +63,8 @@ typedef struct {
     struct ibv_cq *cq;
     struct ibv_qp *qp[ROCE_MAX_PEERS];
     uint32_t outstanding[ROCE_MAX_PEERS];
+    uint64_t writes_completed;
+    uint64_t bytes_posted;
     union ibv_gid gid;
     uint16_t lid;
     enum ibv_mtu mtu;
@@ -79,7 +86,6 @@ typedef struct {
     int started;
     uint64_t peer_addr[ROCE_MAX_PEERS];
     uint32_t peer_rkey[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
-    int peer_hca[ROCE_MAX_PEERS];
     pthread_t thread;
     atomic_int running;
     atomic_int failed;
@@ -104,19 +110,21 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
     }
     // Reject a layout whose arithmetic would wrap; the caller sizes slots from
     // configuration, so a wrapped region must fail here rather than at the NIC.
-    uint64_t recv_bytes, send_bytes, flag_off, send_off, ctrl_off, total;
+    uint64_t recv_bytes, flag_bytes, send_bytes, send_off, ctrl_off, total;
     if (slot_bytes > ((uint64_t)1 << 40) ||
         __builtin_mul_overflow((uint64_t)world * ROCE_SLOTS, slot_bytes, &recv_bytes) ||
+        __builtin_mul_overflow(
+            (uint64_t)world * ROCE_SLOTS * ROCE_MAX_HCAS,
+            (uint64_t)ROCE_FLAG_STRIDE,
+            &flag_bytes) ||
         __builtin_mul_overflow((uint64_t)ROCE_SLOTS, slot_bytes, &send_bytes) ||
-        __builtin_add_overflow(recv_bytes, (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE, &flag_off) ||
-        __builtin_add_overflow(flag_off, (uint64_t)0, &send_off) ||
-        __builtin_add_overflow(recv_bytes + (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE, send_bytes, &ctrl_off) ||
+        __builtin_add_overflow(recv_bytes, flag_bytes, &send_off) ||
+        __builtin_add_overflow(send_off, send_bytes, &ctrl_off) ||
         __builtin_add_overflow(ctrl_off, (uint64_t)ROCE_FLAG_STRIDE, &total)) {
         return -1;
     }
     uint64_t recv_off = 0;
-    flag_off = recv_off + recv_bytes;
-    send_off = flag_off + (uint64_t)world * ROCE_SLOTS * ROCE_FLAG_STRIDE;
+    uint64_t flag_off = recv_off + recv_bytes;
     out[0] = recv_off;
     out[1] = flag_off;
     out[2] = send_off;
@@ -332,9 +340,6 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
             continue;
         }
         c->peer_addr[p] = all[p].region_addr;
-        // Spread rank pairs across the available HCAs; both ends compute the
-        // same value so the pair meets on one device.
-        c->peer_hca[p] = (c->rank + p) % c->n_hca;
         for (int h = 0; h < c->n_hca; h++) {
             c->peer_rkey[h][p] = all[p].rkey[h];
             if (connect_qp(c, h, p, &all[p]) != 0) {
@@ -361,76 +366,103 @@ static int drain_cq(roce_ctx_t *c, int h) {
             return -1;
         }
         c->hca[h].outstanding[wc[i].wr_id] -= 1;
+        c->hca[h].writes_completed += 1;
         c->writes_completed += 1;
     }
     return 0;
 }
 
 static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+    if (nbytes == 0 || nbytes % 16 != 0) {
+        snprintf(c->err, sizeof(c->err),
+                 "RoCE payload size must be a positive multiple of 16 bytes, got %u",
+                 nbytes);
+        return -1;
+    }
     uint32_t slot = seq & 1u;
     uint8_t *send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
     uint32_t seq_copy = seq;
+    uint32_t total_packs = nbytes / 16;
     for (int p = 0; p < c->world; p++) {
         if (p == c->rank) {
             continue;
         }
-        int h = c->peer_hca[p];
-        roce_hca_t *hca = &c->hca[h];
-        // Two work requests per op; keep the queue at most a quarter full so a
-        // provider that needs extra entries can never fail a post.
-        while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
-            if (drain_cq(c, h) != 0) {
+        uint32_t pack_offset = 0;
+        for (int h = 0; h < c->n_hca; h++) {
+            roce_hca_t *hca = &c->hca[h];
+            // Two work requests per stripe; keep the queue at most a quarter
+            // full so a provider that needs extra entries can never fail a post.
+            while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
+                if (drain_cq(c, h) != 0) {
+                    return -1;
+                }
+                // A peer that stopped acknowledging keeps the QP retrying for
+                // a long time; honour a stop request instead of blocking
+                // roce_stop (and so teardown) behind it.
+                if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
+                    snprintf(c->err, sizeof(c->err),
+                             "RoCE proxy stopped with %u writes outstanding to rank %d",
+                             hca->outstanding[p], p);
+                    return -1;
+                }
+            }
+            uint32_t stripe_packs = total_packs / (uint32_t)c->n_hca;
+            if ((uint32_t)h < total_packs % (uint32_t)c->n_hca) {
+                stripe_packs += 1;
+            }
+            uint32_t stripe_bytes = stripe_packs * 16;
+            uint64_t byte_offset = (uint64_t)pack_offset * 16;
+            uint64_t remote = c->peer_addr[p];
+            struct ibv_sge flag_sge = {
+                .addr = (uint64_t)(uintptr_t)&seq_copy,
+                .length = 4,
+                .lkey = 0,
+            };
+            struct ibv_send_wr flag_wr;
+            memset(&flag_wr, 0, sizeof(flag_wr));
+            flag_wr.wr_id = (uint64_t)p;
+            flag_wr.sg_list = &flag_sge;
+            flag_wr.num_sge = 1;
+            flag_wr.opcode = IBV_WR_RDMA_WRITE;
+            flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+            flag_wr.wr.rdma.remote_addr =
+                remote + c->flag_off +
+                (((uint64_t)c->rank * ROCE_SLOTS + slot) * (uint64_t)c->n_hca +
+                 (uint64_t)h) * ROCE_FLAG_STRIDE;
+            flag_wr.wr.rdma.rkey = c->peer_rkey[h][p];
+
+            struct ibv_send_wr data_wr;
+            struct ibv_sge data_sge;
+            struct ibv_send_wr *first_wr = &flag_wr;
+            if (stripe_bytes != 0) {
+                data_sge = (struct ibv_sge){
+                    .addr = (uint64_t)(uintptr_t)(send + byte_offset),
+                    .length = stripe_bytes,
+                    .lkey = hca->mr->lkey,
+                };
+                memset(&data_wr, 0, sizeof(data_wr));
+                data_wr.wr_id = (uint64_t)p;
+                data_wr.next = &flag_wr;
+                data_wr.sg_list = &data_sge;
+                data_wr.num_sge = 1;
+                data_wr.opcode = IBV_WR_RDMA_WRITE;
+                data_wr.wr.rdma.remote_addr =
+                    remote + c->recv_off +
+                    ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes +
+                    byte_offset;
+                data_wr.wr.rdma.rkey = c->peer_rkey[h][p];
+                first_wr = &data_wr;
+            }
+            struct ibv_send_wr *bad = NULL;
+            int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
+            if (rc != 0) {
+                set_err(c, "ibv_post_send", rc);
                 return -1;
             }
-            // A peer that stopped acknowledging keeps the QP retrying for a
-            // long time; honour a stop request instead of blocking roce_stop
-            // (and so teardown) behind it.
-            if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
-                snprintf(c->err, sizeof(c->err),
-                         "RoCE proxy stopped with %u writes outstanding to rank %d",
-                         hca->outstanding[p], p);
-                return -1;
-            }
+            hca->outstanding[p] += 1;
+            hca->bytes_posted += stripe_bytes;
+            pack_offset += stripe_packs;
         }
-        uint64_t remote = c->peer_addr[p];
-        struct ibv_sge data_sge = {
-            .addr = (uint64_t)(uintptr_t)send,
-            .length = nbytes,
-            .lkey = hca->mr->lkey,
-        };
-        struct ibv_sge flag_sge = {
-            .addr = (uint64_t)(uintptr_t)&seq_copy,
-            .length = 4,
-            .lkey = 0,
-        };
-        struct ibv_send_wr flag_wr;
-        memset(&flag_wr, 0, sizeof(flag_wr));
-        flag_wr.wr_id = (uint64_t)p;
-        flag_wr.sg_list = &flag_sge;
-        flag_wr.num_sge = 1;
-        flag_wr.opcode = IBV_WR_RDMA_WRITE;
-        flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-        flag_wr.wr.rdma.remote_addr =
-            remote + c->flag_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) * ROCE_FLAG_STRIDE;
-        flag_wr.wr.rdma.rkey = c->peer_rkey[h][p];
-        struct ibv_send_wr data_wr;
-        memset(&data_wr, 0, sizeof(data_wr));
-        data_wr.wr_id = (uint64_t)p;
-        data_wr.next = &flag_wr;
-        data_wr.sg_list = &data_sge;
-        data_wr.num_sge = 1;
-        data_wr.opcode = IBV_WR_RDMA_WRITE;
-        data_wr.send_flags = 0;
-        data_wr.wr.rdma.remote_addr =
-            remote + c->recv_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes;
-        data_wr.wr.rdma.rkey = c->peer_rkey[h][p];
-        struct ibv_send_wr *bad = NULL;
-        int rc = ibv_post_send(hca->qp[p], &data_wr, &bad);
-        if (rc != 0) {
-            set_err(c, "ibv_post_send", rc);
-            return -1;
-        }
-        hca->outstanding[p] += 1;
     }
     c->ops_posted += 1;
     for (int h = 0; h < c->n_hca; h++) {
@@ -539,11 +571,18 @@ uint64_t roce_stat(roce_ctx_t *c, int which) {
     }
 }
 
-int roce_peer_hca(roce_ctx_t *c, int peer) {
-    if (peer < 0 || peer >= c->world) {
+uint64_t roce_hca_stat(roce_ctx_t *c, int hca, int which) {
+    if (hca < 0 || hca >= c->n_hca) {
         return -1;
     }
-    return c->peer_hca[peer];
+    switch (which) {
+    case 0:
+        return c->hca[hca].writes_completed;
+    case 1:
+        return c->hca[hca].bytes_posted;
+    default:
+        return 0;
+    }
 }
 
 void roce_destroy(roce_ctx_t *c) {

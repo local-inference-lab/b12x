@@ -21,28 +21,31 @@ reads in place. No dmabuf or `nvidia_peermem` support is needed (neither is
 available on the DGX Spark driver stack; NCCL therefore stays host-staged there).
 
 Each Spark's single cabled QSFP port is exposed as two PCIe Gen5 x4 functions
-(`rocep1s0f0`, `roceP2p1s0f0`). The runtime spreads rank pairs across both.
+(`rocep1s0f0`, `roceP2p1s0f0`). The runtime stripes every peer payload across
+both functions so one rank pair can use both SoC-facing PCIe links.
 
 ## Protocol
 
-One pinned region per rank: `recv[src][slot]`, `flag[src][slot]`, `send[slot]`,
-and a control record. One kernel launch per collective:
+One pinned region per rank: `recv[src][slot]`, `flag[src][slot][hca]`,
+`send[slot]`, and a control record. One kernel launch per collective:
 
 1. stage the input into `send[seq & 1]`;
 2. the last block to finish staging publishes `nbytes` (per slot) and `seq` to
    the control record, which a C proxy thread (`_roce_proxy.c`, libibverbs)
-   polls; the proxy posts one RDMA write of the payload and one 4-byte write of
-   `seq` per peer on the same reliable QP, so the flag cannot land before the
-   payload. The doorbell holds only the newest `seq`, and a rank's kernel for
+   polls; the proxy divides each peer payload into one stripe per HCA, then
+   posts each stripe followed by a 4-byte write of `seq` on the same reliable
+   QP, so a stripe flag cannot land before its data. The doorbell holds only
+   the newest `seq`, and a rank's kernel for
    op N finishes on the peers' payloads alone, so op N+1 can ring before the
    proxy has seen op N; the proxy posts every sequence between the last one it
    posted and the doorbell (at most two are ever pending). After a run of polls
    without a doorbell the thread requests a short sleep between polls (the OS
    decides the actual delay) so an idle runtime does not hold a core; the
    catch-up keeps the protocol correct however long the thread is away;
-3. wait on `flag[peer][seq & 1] == seq` for every peer (bounded; a timeout
-   records the missing peer, the kernel skips its data phase and keeps the
-   epoch, later launches do nothing, and the host raises: see Contract);
+3. wait on `flag[peer][seq & 1][hca] == seq` for every peer and HCA (bounded; a
+   timeout records the missing peer and HCA, the kernel skips its data phase
+   and keeps the epoch, later launches do nothing, and the host raises: see
+   Contract);
 4. all-reduce: sum the local input and every peer slot in fixed rank order, so
    all ranks produce bit-identical output; all-gather: strided copy that writes
    the concatenated layout directly (dim 0 or last dim);

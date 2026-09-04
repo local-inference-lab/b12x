@@ -33,7 +33,9 @@ def runtime():
     from b12x.comm import roce
 
     if not roce.is_supported():
-        pytest.skip("RoCE all-reduce needs an integrated GPU with an active RDMA device")
+        pytest.skip(
+            "RoCE all-reduce needs an integrated GPU with an active RDMA device"
+        )
     if not dist.is_initialized():
         # A short timeout turns a rank that failed early into an error on every
         # rank instead of a silent hang in the next collective.
@@ -41,7 +43,10 @@ def runtime():
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     rt = roce.AllReduce.from_exchange_group(
-        exchange_group=dist.group.WORLD, device=device, max_size=1 << 20, max_gather_bytes=4 << 20
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_size=1 << 20,
+        max_gather_bytes=4 << 20,
     )
     rt.prepare((torch.bfloat16, torch.float32, torch.float16))
     yield rt
@@ -56,6 +61,49 @@ def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
     if dtype == torch.bfloat16:
         return 1e-2, 2e-2 * world
     return 2e-3, 4e-3 * world
+
+
+def test_payload_is_striped_across_every_hca(runtime):
+    """One peer payload is split evenly across both QSFP PCIe functions."""
+    if len(runtime.hca_names) < 2:
+        pytest.skip("requires two RoCE interfaces for one QSFP port")
+    world = dist.get_world_size()
+    nbytes = 256 * 1024
+    before = runtime.stats()
+    before_bytes = before["bytes_posted_per_hca"]
+    before_writes = before["writes_completed_per_hca"]
+    inp = torch.full(
+        (nbytes // 2,), dist.get_rank() + 1, dtype=torch.bfloat16, device=runtime.device
+    )
+    out = runtime.all_reduce(inp)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.full_like(out, world * (world + 1) // 2))
+
+    expected_bytes = (world - 1) * nbytes // len(runtime.hca_names)
+    expected_writes = world - 1
+    deadline = time.monotonic() + 5
+    while True:
+        after = runtime.stats()
+        byte_deltas = [
+            current - previous
+            for current, previous in zip(
+                after["bytes_posted_per_hca"], before_bytes, strict=True
+            )
+        ]
+        write_deltas = [
+            current - previous
+            for current, previous in zip(
+                after["writes_completed_per_hca"], before_writes, strict=True
+            )
+        ]
+        if all(delta >= expected_writes for delta in write_deltas):
+            break
+        assert time.monotonic() < deadline, after
+        time.sleep(0.001)
+    assert byte_deltas == [expected_bytes] * len(runtime.hca_names)
+    assert all(delta >= expected_writes for delta in write_deltas)
+    assert after["stripe_hcas"] == list(range(len(runtime.hca_names)))
+    dist.barrier()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float16])
@@ -88,7 +136,9 @@ def test_matches_nccl_and_is_rank_identical(runtime, dtype, numel_bytes):
 
 def test_rejects_ineligible_inputs(runtime):
     """Size, shape, stride, and pointer-alignment boundaries of all-reduce eligibility."""
-    huge = torch.zeros((runtime.max_size // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
+    huge = torch.zeros(
+        (runtime.max_size // 2) + 8, dtype=torch.bfloat16, device=runtime.device
+    )
     assert not runtime.should_allreduce(huge)
     odd = torch.zeros(3, dtype=torch.bfloat16, device=runtime.device)
     assert not runtime.should_allreduce(odd)
@@ -107,11 +157,16 @@ def test_rejects_ineligible_inputs(runtime):
     expected = unaligned.clone()
     dist.all_reduce(expected)
     rtol, atol = _tolerance(torch.float16, dist.get_world_size())
-    torch.testing.assert_close(runtime.all_reduce(unaligned), expected, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        runtime.all_reduce(unaligned), expected, rtol=rtol, atol=atol
+    )
     out_backing = torch.empty(4097, dtype=torch.float16, device=runtime.device)
     aligned_in = unaligned.clone()
     torch.testing.assert_close(
-        runtime.all_reduce(aligned_in, out=out_backing[1:]), expected, rtol=rtol, atol=atol
+        runtime.all_reduce(aligned_in, out=out_backing[1:]),
+        expected,
+        rtol=rtol,
+        atol=atol,
     )
     # a foreign-device output never reaches the kernel
     with pytest.raises(ValueError):
@@ -148,7 +203,48 @@ def test_cuda_graph_replay(runtime):
             dist.all_reduce(expected)
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(static_out, expected, rtol=2e-2, atol=2e-2 * world**3)
+        torch.testing.assert_close(
+            static_out, expected, rtol=2e-2, atol=2e-2 * world**3
+        )
+
+
+def test_cuda_graph_replay_with_alternating_grid_sizes(runtime):
+    """Small and MTP-sized reductions may alternate without sharing arrivals."""
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    small = torch.zeros(4096, dtype=torch.bfloat16, device=runtime.device)
+    mtp = torch.zeros(32768, dtype=torch.bfloat16, device=runtime.device)
+    small_out = torch.empty_like(small)
+    mtp_out = torch.empty_like(mtp)
+    stream = torch.cuda.Stream(device=runtime.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runtime.all_reduce(small, out=small_out)
+        runtime.all_reduce(mtp, out=mtp_out)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        runtime.all_reduce(small, out=small_out)
+        runtime.all_reduce(mtp, out=mtp_out)
+        runtime.all_reduce(small, out=small_out)
+    torch.cuda.synchronize()
+    dist.barrier()
+    rtol, atol = _tolerance(torch.bfloat16, world)
+    for replay in range(24):
+        torch.manual_seed(101 * replay + rank)
+        small.copy_(torch.randn_like(small))
+        mtp.copy_(torch.randn_like(mtp))
+        expected_small = small.clone()
+        expected_mtp = mtp.clone()
+        dist.all_reduce(expected_small)
+        dist.all_reduce(expected_mtp)
+        graph.replay()
+        torch.cuda.synchronize()
+        runtime.check_health()
+        torch.testing.assert_close(small_out, expected_small, rtol=rtol, atol=atol)
+        torch.testing.assert_close(mtp_out, expected_mtp, rtol=rtol, atol=atol)
 
 
 def test_proxy_catches_up_after_missed_doorbell(runtime):
@@ -205,7 +301,10 @@ def test_alternating_eager_streams_are_ordered(runtime):
     x = torch.randn(48 * 1024, dtype=torch.bfloat16, device=runtime.device)
     expected = x.clone()
     dist.all_reduce(expected)
-    streams = (torch.cuda.Stream(device=runtime.device), torch.cuda.Stream(device=runtime.device))
+    streams = (
+        torch.cuda.Stream(device=runtime.device),
+        torch.cuda.Stream(device=runtime.device),
+    )
     for s in streams:
         s.wait_stream(torch.cuda.current_stream())
     outs = []
@@ -216,7 +315,9 @@ def test_alternating_eager_streams_are_ordered(runtime):
     runtime.check_health()
     rtol, atol = _tolerance(torch.bfloat16, world)
     for i, out in enumerate(outs):
-        torch.testing.assert_close(out, expected * (i + 1), rtol=rtol, atol=atol * (i + 1))
+        torch.testing.assert_close(
+            out, expected * (i + 1), rtol=rtol, atol=atol * (i + 1)
+        )
     dist.barrier()
 
 
@@ -233,7 +334,9 @@ def test_adapter_path_graph_replay(runtime):
     runtime.prepare((torch.bfloat16,), padded_gather=True)
     h = torch.zeros(6 * 4096, dtype=torch.bfloat16, device=runtime.device)
     logits = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)
-    odd = torch.zeros(5, 3, dtype=torch.bfloat16, device=runtime.device)  # 30-byte rows: padded path
+    odd = torch.zeros(
+        5, 3, dtype=torch.bfloat16, device=runtime.device
+    )  # 30-byte rows: padded path
     stream = torch.cuda.Stream(device=runtime.device)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -252,7 +355,13 @@ def test_adapter_path_graph_replay(runtime):
         r3 = runtime.all_reduce(r2)
     torch.cuda.synchronize()
     dist.barrier()
-    addresses = (r1.data_ptr(), g1.data_ptr(), r2.data_ptr(), g2.data_ptr(), r3.data_ptr())
+    addresses = (
+        r1.data_ptr(),
+        g1.data_ptr(),
+        r2.data_ptr(),
+        g2.data_ptr(),
+        r3.data_ptr(),
+    )
     rtol, atol = _tolerance(torch.bfloat16, world)
     for replay in range(24):
         torch.manual_seed(31 * replay + rank)
@@ -274,7 +383,13 @@ def test_adapter_path_graph_replay(runtime):
         graph.replay()
         torch.cuda.synchronize()
         runtime.check_health()
-        assert (r1.data_ptr(), g1.data_ptr(), r2.data_ptr(), g2.data_ptr(), r3.data_ptr()) == addresses
+        assert (
+            r1.data_ptr(),
+            g1.data_ptr(),
+            r2.data_ptr(),
+            g2.data_ptr(),
+            r3.data_ptr(),
+        ) == addresses
         torch.testing.assert_close(r1, e1, rtol=rtol, atol=atol)
         torch.testing.assert_close(r2, e2, rtol=rtol, atol=atol * world)
         torch.testing.assert_close(r3, e3, rtol=rtol, atol=atol * world**2)
@@ -291,7 +406,9 @@ def _fresh_runtime(spin_limit: int):
     os.environ["B12X_ROCE_SPIN_LIMIT"] = str(spin_limit)
     try:
         rt = roce.AllReduce.from_exchange_group(
-            exchange_group=dist.group.WORLD, device=torch.device("cuda", 0), max_size=1 << 20
+            exchange_group=dist.group.WORLD,
+            device=torch.device("cuda", 0),
+            max_size=1 << 20,
         )
     finally:
         if previous is None:
@@ -320,7 +437,9 @@ def test_fail_stop_on_timeout_eager(runtime):
     if rank == 1:
         rt._proxy.stop()
     x = torch.ones(4096, dtype=torch.bfloat16, device=rt.device)
-    out = rt.all_reduce(x)  # enqueue succeeds: the fault is only visible once the kernel waited
+    out = rt.all_reduce(
+        x
+    )  # enqueue succeeds: the fault is only visible once the kernel waited
     torch.cuda.synchronize()
     if rank != 1:
         with pytest.raises(RuntimeError, match="poisoned"):
@@ -383,14 +502,25 @@ def test_fail_stop_on_timeout_graph_replay(runtime):
     dist.barrier()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.int32])
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float32, torch.int64, torch.int32]
+)
 @pytest.mark.parametrize(
     "shape,dim",
     [
-        ((6, 38720), -1), ((6, 38720), 1), ((16, 4096), 0), ((4096,), 0), ((2, 3, 1024), -1),
-        ((96, 8192), 1), ((6, 8), -1),
+        ((6, 38720), -1),
+        ((6, 38720), 1),
+        ((16, 4096), 0),
+        ((4096,), 0),
+        ((2, 3, 1024), -1),
+        ((96, 8192), 1),
+        ((6, 8), -1),
         # unaligned rows / sizes: padded contiguous path + torch reshape
-        ((6, 2), -1), ((5, 2), -1), ((7, 3), 0), ((6, 1), -1), ((3,), 0),
+        ((6, 2), -1),
+        ((5, 2), -1),
+        ((7, 3), 0),
+        ((6, 1), -1),
+        ((3,), 0),
     ],
 )
 def test_all_gather_matches_torch(runtime, dtype, shape, dim):
@@ -423,20 +553,35 @@ def test_all_gather_rejects_ineligible(runtime):
     odd = torch.zeros(6, 5, dtype=torch.bfloat16, device=runtime.device)
     assert runtime.should_all_gather(odd, -1)  # unaligned rows take the padded path
     assert not runtime._direct_gather_layout(odd, 1)
-    huge = torch.zeros((runtime.max_gather_bytes // 2) + 8, dtype=torch.bfloat16, device=runtime.device)
+    huge = torch.zeros(
+        (runtime.max_gather_bytes // 2) + 8, dtype=torch.bfloat16, device=runtime.device
+    )
     assert not runtime.should_all_gather(huge, 0)
     # ``out`` is validated before anything is launched, on both gather paths
     world = dist.get_world_size()
     aligned = torch.zeros(6, 8, dtype=torch.bfloat16, device=runtime.device)
     for shard in (odd, aligned):
-        wrong_dtype = torch.empty(shard.shape[0], shard.shape[1] * world, dtype=torch.float32, device=runtime.device)
+        wrong_dtype = torch.empty(
+            shard.shape[0],
+            shard.shape[1] * world,
+            dtype=torch.float32,
+            device=runtime.device,
+        )
         with pytest.raises(ValueError):
             runtime.all_gather(shard, dim=-1, out=wrong_dtype)
-        wrong_shape = torch.empty(shard.shape[0], shard.shape[1], dtype=torch.bfloat16, device=runtime.device)
+        wrong_shape = torch.empty(
+            shard.shape[0], shard.shape[1], dtype=torch.bfloat16, device=runtime.device
+        )
         with pytest.raises(ValueError):
             runtime.all_gather(shard, dim=-1, out=wrong_shape)
         with pytest.raises(ValueError):
-            runtime.all_gather(shard, dim=-1, out=torch.empty(shard.shape[0], shard.shape[1] * world, dtype=torch.bfloat16))
+            runtime.all_gather(
+                shard,
+                dim=-1,
+                out=torch.empty(
+                    shard.shape[0], shard.shape[1] * world, dtype=torch.bfloat16
+                ),
+            )
 
 
 def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
@@ -445,7 +590,9 @@ def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
     rank = dist.get_rank()
     x = torch.zeros(6, 38720, dtype=torch.bfloat16, device=runtime.device)
     h = torch.zeros(6 * 4096, dtype=torch.bfloat16, device=runtime.device)
-    gathered = torch.empty(6, 38720 * world, dtype=torch.bfloat16, device=runtime.device)
+    gathered = torch.empty(
+        6, 38720 * world, dtype=torch.bfloat16, device=runtime.device
+    )
     reduced = torch.empty_like(h)
     stream = torch.cuda.Stream(device=runtime.device)
     stream.wait_stream(torch.cuda.current_stream())
@@ -474,4 +621,6 @@ def test_all_gather_graph_replay_mixed_with_all_reduce(runtime):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(gathered, expected_gather)
-        torch.testing.assert_close(reduced, expected_reduce, rtol=2e-2, atol=2e-2 * world)
+        torch.testing.assert_close(
+            reduced, expected_reduce, rtol=2e-2, atol=2e-2 * world
+        )

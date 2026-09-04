@@ -8,10 +8,10 @@ One launch performs a complete all-reduce for one message:
    that the RDMA proxy thread polls.  The doorbell is a level, not a queue:
    a proxy that was descheduled across two doorbells finds ``seq`` two ahead
    and posts both slots, which is why the byte count lives per slot;
-3. wait: spin on ``flag[peer][seq & 1] == seq`` for every peer (the peer's
-   proxy writes the flag after the payload on the same reliable QP); a wait
-   that exceeds ``spin_limit`` polls records ``seq`` in the control record's
-   error word and the host raises instead of hanging;
+3. wait: spin on ``flag[peer][seq & 1][hca] == seq`` for every peer and HCA
+   (the peer's proxy writes each flag after that HCA's payload stripe on the
+   same reliable QP); a wait that exceeds ``spin_limit`` polls records ``seq``
+   in the control record's error word and the host raises instead of hanging;
 4. reduce: sum the local input and every peer slot in fixed rank order, so all
    ranks produce bit-identical output, and store the result;
 5. epoch: the last block to finish reduction advances the device-resident
@@ -23,8 +23,8 @@ stages nothing can pass the peer wait (peers do not depend on our doorbell)
 and reach the tail before a slower block has staged, so one shared counter
 would ring the doorbell early and publish stale bytes.
 
-Every launch of one runtime uses the same grid, which both counters' moduli
-rely on.  Message size is a runtime scalar.
+Each power-of-two grid size has separate staging and tail counters, so message
+size and launch grid remain runtime scalars and may vary across graph launches.
 """
 
 from __future__ import annotations
@@ -76,14 +76,16 @@ class _RoceOneshotLaunch:
         threads: int,
         slots: int,
         flag_stride: int,
+        hca_count: int,
     ) -> None:
         """Bind one kernel specialization: dtype, world size, rank, and layout constants."""
         if dtype_name not in _DTYPE_PACK_ELEMS:
             raise ValueError(f"unsupported RoCE one-shot dtype {dtype_name!r}")
-        if int(threads) < int(world_size):
+        if int(threads) < int(world_size) * int(hca_count):
             raise ValueError(
-                f"RoCE kernels need threads >= world_size (one thread waits on one "
-                f"peer flag), got threads={threads} world_size={world_size}"
+                "RoCE kernels need threads >= world_size * hca_count "
+                f"(one thread per stripe flag), got threads={threads} "
+                f"world_size={world_size} hca_count={hca_count}"
             )
         self._dtype_name = dtype_name
         self._pack_elems = _DTYPE_PACK_ELEMS[dtype_name]
@@ -92,6 +94,7 @@ class _RoceOneshotLaunch:
         self._threads = int(threads)
         self._slots = int(slots)
         self._flag_stride = int(flag_stride)
+        self._hca_count = int(hca_count)
 
     @cute.jit
     def _accumulate_words(
@@ -155,6 +158,9 @@ class _RoceOneshotLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
         grid_x: Int32,
         stream: cuda.CUstream,
@@ -171,6 +177,9 @@ class _RoceOneshotLaunch:
             ctrl_base,
             slot_bytes,
             epoch_ptr,
+            stage_counter_ptr,
+            tail_counter_ptr,
+            poison_ptr,
             spin_limit,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -192,6 +201,9 @@ class _RoceOneshotLaunch:
         ctrl_base: Int64,
         slot_bytes: Int64,
         epoch_ptr: Int64,
+        stage_counter_ptr: Int64,
+        tail_counter_ptr: Int64,
+        poison_ptr: Int64,
         spin_limit: Uint32,
     ) -> None:
         """Device kernel: stage, doorbell, wait for peer flags, reduce, advance the epoch."""
@@ -200,9 +212,6 @@ class _RoceOneshotLaunch:
         gdim, _, _ = cute.arch.grid_dim()
         input_base = Int64(input_ptr.toint())
         output_base = Int64(output_ptr.toint())
-        stage_counter_ptr = epoch_ptr + Int64(4)
-        tail_counter_ptr = epoch_ptr + Int64(8)
-
         # Every block reads the epoch before any block can advance it: the
         # advance happens only after all blocks arrived at the tail counter.
         epoch = ld_relaxed_gpu_u32(epoch_ptr)
@@ -218,13 +227,14 @@ class _RoceOneshotLaunch:
         # The device poison word (fourth counter) is written by the same waiting
         # threads that write the host error word and only ever goes from 0 to
         # the failed sequence, so a cheap GPU-scope load is enough here.
-        poison_ptr = epoch_ptr + Int64(12)
         poisoned = ld_relaxed_gpu_u32(poison_ptr)
         if poisoned == Uint32(0):
             # 1. stage the input into the pinned send slot
             stage_index = index
             while stage_index < size_packs:
-                words = ld_global_v4_u32(input_base + Int64(stage_index) * Int64(PACK_BYTES))
+                words = ld_global_v4_u32(
+                    input_base + Int64(stage_index) * Int64(PACK_BYTES)
+                )
                 st_global_v4_u32(
                     send_slot + Int64(stage_index) * Int64(PACK_BYTES),
                     words[0],
@@ -233,27 +243,34 @@ class _RoceOneshotLaunch:
                     words[3],
                 )
                 stage_index += stride
-            fence_sc_sys()
             cute.arch.sync_threads()
 
             # 2. the last block to finish staging rings the proxy doorbell
             if Int32(tidx) == Int32(0):
+                fence_sc_sys()
                 prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
                 if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
                     st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
-                    st_relaxed_sys_u32(ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes))
+                    st_relaxed_sys_u32(
+                        ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes)
+                    )
                     fence_sc_sys()
                     st_relaxed_sys_u32(ctrl_base, seq)
 
-            # 3. wait for every peer's payload flag
-            if Int32(tidx) < Int32(self._world_size):
-                if Int32(tidx) != Int32(self._rank):
+            # 3. wait for every peer's payload-stripe flags
+            if Int32(tidx) < Int32(self._world_size * self._hca_count):
+                peer = Int32(tidx) // Int32(self._hca_count)
+                hca = Int32(tidx) - peer * Int32(self._hca_count)
+                if peer != Int32(self._rank):
                     flag_addr = flag_base + (
-                        Int64(tidx) * Int64(self._slots) + slot
+                        (Int64(peer) * Int64(self._slots) + slot)
+                        * Int64(self._hca_count)
+                        + Int64(hca)
                     ) * Int64(self._flag_stride)
                     timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
                     if timed_out != Uint32(0):
-                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(tidx))
+                        st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(peer))
+                        st_relaxed_sys_u32(ctrl_base + Int64(24), Uint32(hca))
                         st_relaxed_sys_u32(ctrl_base + Int64(8), seq)
                         st_release_gpu_u32(poison_ptr, seq)
             cute.arch.sync_threads()
@@ -264,15 +281,19 @@ class _RoceOneshotLaunch:
                 # 4. reduce in fixed rank order so every rank stores identical bits
                 reduce_index = index
                 while reduce_index < size_packs:
-                    accumulator = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                    accumulator = cute.make_rmem_tensor(
+                        (self._pack_elems,), cutlass.Float32
+                    )
                     offset = Int64(reduce_index) * Int64(PACK_BYTES)
                     for source in cutlass.range_constexpr(self._world_size):
                         if cutlass.const_expr(source == self._rank):
                             words = ld_global_v4_u32(input_base + offset)
                         else:
-                            peer_slot = recv_base + (
-                                Int64(source) * Int64(self._slots) + slot
-                            ) * slot_bytes
+                            peer_slot = (
+                                recv_base
+                                + (Int64(source) * Int64(self._slots) + slot)
+                                * slot_bytes
+                            )
                             words = ld_relaxed_sys_v4_u32(peer_slot + offset)
                         self._accumulate_words(accumulator, words, source == 0)
                     self._store_accumulator(output_base + offset, accumulator)
@@ -304,6 +325,7 @@ def _process_key(
     threads: int,
     slots: int,
     flag_stride: int,
+    hca_count: int,
     device_index: int,
 ) -> tuple[object, ...]:
     """Cache key of one compiled launcher specialization."""
@@ -314,6 +336,7 @@ def _process_key(
         int(threads),
         int(slots),
         int(flag_stride),
+        int(hca_count),
         int(device_index),
     )
 
@@ -332,14 +355,24 @@ def get_launcher(
     threads: int,
     slots: int,
     flag_stride: int,
+    hca_count: int,
     device_index: int,
 ) -> Callable[..., None]:
     """Compile the launcher for ``key`` once and return it."""
     process_key = _process_key(
-        dtype_name, world_size, rank, threads, slots, flag_stride, device_index
+        dtype_name,
+        world_size,
+        rank,
+        threads,
+        slots,
+        flag_stride,
+        hca_count,
+        device_index,
     )
     del device_index  # retained in the functools and preparation keys only
-    launch = _RoceOneshotLaunch(dtype_name, world_size, rank, threads, slots, flag_stride)
+    launch = _RoceOneshotLaunch(
+        dtype_name, world_size, rank, threads, slots, flag_stride, hca_count
+    )
     cache_key = (
         str(dtype_name),
         int(world_size),
@@ -347,8 +380,11 @@ def get_launcher(
         int(threads),
         int(slots),
         int(flag_stride),
+        int(hca_count),
     )
-    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=cache_key)
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=launch, cache_key=cache_key
+    )
     raw = b12x_compile(
         launch,
         _dummy(cutlass.Uint32, 16),
@@ -361,10 +397,13 @@ def get_launcher(
         16,
         4096,
         16,
+        16,
+        16,
+        16,
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 1, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 5, cache_key),
     )
 
     def run(
@@ -378,13 +417,20 @@ def get_launcher(
         ctrl_base: int,
         slot_bytes: int,
         epoch_address: int,
+        stage_counter_address: int,
+        tail_counter_address: int,
+        poison_address: int,
         spin_limit: int,
         grid_x: int,
     ) -> None:
         """Launch the compiled kernel with runtime scalar arguments."""
         raw(
-            make_ptr(cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(
+                cutlass.Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16
+            ),
             int(size_packs),
             int(nbytes),
             int(recv_base),
@@ -393,6 +439,9 @@ def get_launcher(
             int(ctrl_base),
             int(slot_bytes),
             int(epoch_address),
+            int(stage_counter_address),
+            int(tail_counter_address),
+            int(poison_address),
             int(spin_limit),
             int(grid_x),
             current_cuda_stream(),
