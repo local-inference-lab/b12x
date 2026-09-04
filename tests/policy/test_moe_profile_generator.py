@@ -60,6 +60,7 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _reset_cuda_graphs,
     _relative_norm_error,
     _trellis_weights,
+    _uniform_w4a8_mx_reference,
     _uniform_w4a16_reference,
     _w4a16_direct_path,
     _w4a16_weight_layout,
@@ -111,6 +112,44 @@ def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
                 query,
                 hit.config,
             )
+
+
+def test_rtx_profile_uses_tiny_decode_for_deepseek_v4_flash_tp2() -> None:
+    profile = next(
+        profile
+        for profile in EMBEDDED_REGISTRY.list_profiles()
+        if profile.profile_id == "nvidia.rtx.pro.6000.blackwell"
+    )
+    component = profile.component("moe.decode")
+    assert component is not None
+    query = {
+        "quant_mode": "w4a8_mx",
+        "source_format": "fp4_e8m0_k32",
+        "activation": "silu",
+        "num_experts": 256,
+        "hidden_size": 4096,
+        "intermediate_size": 1024,
+        "top_k": 6,
+    }
+
+    for num_tokens in (1, 2, 3, 4):
+        hit = component.lookup(
+            {
+                **query,
+                "num_tokens": num_tokens,
+                "routed_rows": num_tokens * query["top_k"],
+            }
+        )
+        assert hit is not None
+        assert hit.config["backend"] == "micro"
+
+    cutover = component.lookup(
+        {**query, "num_tokens": 5, "routed_rows": 5 * query["top_k"]}
+    )
+    assert cutover is not None
+    assert cutover.config["backend"] == "dynamic"
+    assert cutover.config["dynamic_route_mode"] == "direct"
+    assert cutover.config["dynamic_tile_m"] == 16
 
 
 def test_modelopt_w4a8_profile_worker_uses_a8_activation() -> None:
@@ -252,6 +291,55 @@ def test_uniform_w4a16_profile_fixture_has_stable_positive_projections() -> None
         rtol=0.0,
         atol=1.0e-3,
     )
+
+
+def test_uniform_w4a8_profile_reference_models_checkpoint_semantics() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+        and geometry.activation == "silu"
+    )
+    x = torch.zeros((2, geometry.hidden_size))
+    x[:, 0::2] = 2.0**-5
+    x[:, 1::2] = -(2.0**-6)
+    topk_ids = torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]])
+
+    output = _uniform_w4a8_mx_reference(
+        geometry,
+        x=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+    effective_weight = 0.5 * 2.0**-5
+    fc1 = (x[:, 0::2].sum(dim=-1) - x[:, 1::2].sum(dim=-1)) * effective_weight
+    intermediate = torch.nn.functional.silu(fc1) * fc1
+    expected = intermediate * geometry.intermediate_size * effective_weight
+    expected = expected * torch.tensor([1.0, 0.6])
+    assert torch.equal(output, output[:, :1].expand_as(output))
+    assert torch.allclose(output[:, 0], expected)
+
+
+def test_w4a8_profile_inputs_are_mxfp8_representable() -> None:
+    from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+    )
+    generator = torch.Generator(device="cpu").manual_seed(29)
+    inputs = torch.randn(
+        (2, geometry.hidden_size),
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    conditioned = _condition_benchmark_inputs(geometry, inputs)
+
+    assert torch.equal(conditioned, quant_dequant_mxfp8_torch(conditioned))
 
 
 def test_w4a16_tuner_enumerates_distinct_kernel_routes() -> None:
