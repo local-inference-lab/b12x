@@ -286,9 +286,10 @@ def _validate_split_workspace_views(
 
     if tmp_output.device != workspace.device or tmp_lse.device != workspace.device:
         raise ValueError("split MLA scratch buffers must be on the workspace device")
-    if tmp_output.dtype != workspace.dtype:
+    if tmp_output.dtype != workspace.dtype and tmp_output.dtype != torch.float32:
         raise TypeError(
-            f"split MLA tmp_output dtype {tmp_output.dtype} does not match workspace dtype {workspace.dtype}"
+            f"split MLA tmp_output dtype {tmp_output.dtype} must match workspace "
+            f"dtype {workspace.dtype} or be torch.float32"
         )
     if tmp_lse.dtype != torch.float32:
         raise TypeError(
@@ -389,6 +390,7 @@ def sparse_mla_decode_forward(
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    split_policy: Literal["static", "balanced"] = "static",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q_all, page_table_1, cache_seqlens_int32, nsa_cache_seqlens_int32, workspace = (
         _resolve_sparse_mla_binding(
@@ -421,6 +423,7 @@ def sparse_mla_decode_forward(
         scale_format=scale_format,
         fp8_rope=fp8_rope,
         latent_scale_per_token=latent_scale_per_token,
+        split_policy=split_policy,
     )
 
 
@@ -497,7 +500,12 @@ def _run_sparse_mla(
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    split_policy: Literal["static", "balanced"] = "static",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if split_policy not in ("static", "balanced"):
+        raise ValueError(
+            f"split_policy must be 'static' or 'balanced', got {split_policy!r}"
+        )
     if q_all.ndim != 3:
         raise ValueError(f"q_all must be rank-3, got {tuple(q_all.shape)}")
     if kv_cache.ndim != 3:
@@ -724,6 +732,7 @@ def _run_sparse_mla(
             scale_format_override=scale_format_for_call,
             fp8_rope_override=fp8_rope_for_call,
             latent_scale_per_token=latent_scale_per_token,
+            split_policy=split_policy,
         )
     if _is_cuda_graph_capture_active(q_all.device):
         raise RuntimeError(

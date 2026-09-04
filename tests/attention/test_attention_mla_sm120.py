@@ -1229,6 +1229,7 @@ def _run_unified_glm(
     seed,
     num_heads=_GLM_NUM_HEADS,
     use_length_tensor=True,
+    split_policy="static",
 ):
     """Build a glm_ref GLM decode case and run the real unified launcher."""
     from b12x.attention._shared.mla.kernel import run_unified_decode
@@ -1266,6 +1267,7 @@ def _run_unified_glm(
         sm_scale=sm_scale,
         swa_page_size=_GLM_PAGE,
         forced_num_splits=forced_num_splits,
+        split_policy=split_policy,
     )
     torch.cuda.synchronize()
     return out[0].float(), exp_O, min(forced_num_splits, n_chunks)
@@ -1987,3 +1989,364 @@ def test_unified_prefill_glm_mixed_per_token_length_with_zero_row(
             f"neg_pad={neg_pad_past_len}) O cos={cos}"
         )
         assert (got[t] - exp_O[t]).abs().max().item() < 3e-2
+
+
+# ── Split policy and partial precision (Kimi-K3 packed dense decode) ─────────
+#
+# The vLLM K3 adapter drives the GLM_NSA decode kernel as an exact-dense reader
+# with 64 planned splits over a capacity-sized slot table. These tests cover the
+# two knobs it uses: ``split_policy="balanced"`` (runtime chunk ranges derived
+# from each row's live chunk count) and ``partial_dtype=torch.float32`` (exact
+# split partials merged in fp32).
+
+
+def _run_glm_multitoken(
+    device,
+    *,
+    topk,
+    num_tokens,
+    forced_num_splits,
+    seed,
+    split_policy="static",
+    partial_dtype=None,
+    lengths=None,
+    graph_lengths=None,
+    num_heads=_GLM_NUM_HEADS,
+):
+    """Run the unified GLM decode with per-token lengths and return
+    ``(out, expected, lengths)``. With ``graph_lengths`` the launch is captured
+    into a CUDA graph at ``lengths`` and replayed after the length tensor is
+    overwritten with ``graph_lengths``; the returned output and expectation then
+    correspond to ``graph_lengths``."""
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+
+    nblk = max(1, (topk + _GLM_PAGE - 1) // _GLM_PAGE)
+    case = glm_ref.make_glm_decode_case(
+        num_heads=num_heads, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=seed, device=device,
+    )
+    q = case["q"].contiguous()
+    kv_cache_flat = case["kv_cache"].contiguous()  # (slots, 1, 656) token-major
+    idx = case["topk_indices"].contiguous()
+    sm_scale = case["sm_scale"]
+    s_kv = kv_cache_flat.shape[0]
+    # The launcher addresses pages as block * page_bytes + slot * 656, so the
+    # token-major reference cache is the same bytes as a (blocks, page, 656) view.
+    kv_cache = kv_cache_flat.view(nblk, _GLM_PAGE, kv_cache_flat.shape[-1])
+    if lengths is None:
+        lengths = _mixed_lengths(num_tokens, topk, device)
+    lengths = lengths.to(device=device, dtype=torch.int32).contiguous()
+
+    n_chunks = (topk + 64 - 1) // 64
+    caps = B12XSparseMLAScratchCaps(
+        device=device, num_q_heads=num_heads, max_q_rows=num_tokens,
+        max_batch=num_tokens, max_width=topk, max_kv_rows=s_kv,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=max(8, n_chunks, forced_num_splits), page_size=_GLM_PAGE,
+        partial_dtype=partial_dtype,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (spec,) = plan.scratch_specs()
+    storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+    cache_seqlens = torch.full((num_tokens,), s_kv, dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=storage, q=q, selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=lengths,
+    )
+
+    def launch():
+        return run_unified_decode(
+            q_all=q, swa_k_cache=kv_cache, swa_indices=idx, swa_topk_lengths=lengths,
+            workspace=binding.scratch, sm_scale=sm_scale, swa_page_size=_GLM_PAGE,
+            forced_num_splits=forced_num_splits, split_policy=split_policy,
+        )
+
+    if graph_lengths is None:
+        out = launch()
+        torch.cuda.synchronize()
+        exp = glm_ref.glm_decode_reference(
+            q, kv_cache_flat, idx, sm_scale, active_token_counts=lengths,
+        ).float()
+        return out.float().clone(), exp, lengths
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        launch()  # warm up (compiles) outside capture
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = launch()
+    torch.cuda.synchronize()
+    graph_lengths = graph_lengths.to(device=device, dtype=torch.int32)
+    lengths.copy_(graph_lengths)
+    graph.replay()
+    torch.cuda.synchronize()
+    exp = glm_ref.glm_decode_reference(
+        q, kv_cache_flat, idx, sm_scale, active_token_counts=lengths,
+    ).float()
+    return out.float().clone(), exp, lengths.clone()
+
+
+def _assert_glm_rows_match_reference(got, exp, lengths, *, label):
+    for t in range(int(got.shape[0])):
+        cos = _cosine(got[t], exp[t])
+        assert cos > 0.995, f"{label} token {t} (len={int(lengths[t])}) O cos={cos}"
+        assert (got[t] - exp[t]).abs().max().item() < 3e-2, (
+            f"{label} token {t} (len={int(lengths[t])}) O atol exceeded"
+        )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens,topk", [(1, 512), (4, 2048), (16, 512)])
+def test_unified_decode_glm_balanced_split_policy(num_tokens, topk) -> None:
+    """``split_policy="balanced"`` reproduces the static-policy result up to the
+    merge rounding of bf16 partials, activates at most
+    ``min(num_splits, sm_count // (rows * head_blocks))`` splits, and matches the
+    reference for mixed per-token lengths."""
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
+
+    n_chunks = (topk + 63) // 64
+    forced = min(n_chunks, 64)
+    static_out, exp, lengths = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7100 + num_tokens, split_policy="static",
+    )
+    assert launch.LAST_DECODE_PLAN.get("balanced_split_target") == 0
+    assert launch.LAST_DECODE_PLAN.get("split_policy") == "static"
+    balanced_out, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7100 + num_tokens, split_policy="balanced",
+    )
+    plan = launch.LAST_DECODE_PLAN
+    assert plan.get("split_policy") == "balanced"
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    h_blocks = (_GLM_NUM_HEADS + 15) // 16
+    expected_target = max(1, min(plan["num_splits"], sm_count // (num_tokens * h_blocks)))
+    assert plan.get("balanced_split_target") == expected_target
+
+    _assert_glm_rows_match_reference(balanced_out, exp, lengths, label="balanced")
+    _assert_glm_rows_match_reference(static_out, exp, lengths, label="static")
+    # Same attention math, different partial grouping: bf16 rounding only.
+    assert _cosine(balanced_out, static_out) > 0.99999
+    assert (balanced_out - static_out).abs().max().item() < 1.5e-2
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_balanced_split_policy_active_splits() -> None:
+    """Under the balanced policy the partial LSE of split ``s`` is finite exactly
+    when ``s * ceil(n / target) < n`` for the row's live chunk count ``n``."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    import b12x.attention._shared.mla.kernel as launch
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+
+    topk, num_tokens, forced = 4096, 2, 8
+    nblk = (topk + _GLM_PAGE - 1) // _GLM_PAGE
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_tokens=num_tokens, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=7300, device=device,
+    )
+    q = case["q"].contiguous()
+    kv_cache = case["kv_cache"].contiguous()
+    kv_cache = kv_cache.view(nblk, _GLM_PAGE, kv_cache.shape[-1])
+    idx = case["topk_indices"].contiguous()
+    lengths = torch.tensor([64 * 3 + 5, 4096], dtype=torch.int32, device=device)
+    caps = B12XSparseMLAScratchCaps(
+        device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=num_tokens,
+        max_batch=num_tokens, max_width=topk, max_kv_rows=nblk * _GLM_PAGE,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=64, page_size=_GLM_PAGE,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (spec,) = plan.scratch_specs()
+    storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+    cache_seqlens = torch.full((num_tokens,), nblk * _GLM_PAGE, dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=storage, q=q, selected_indices=idx,
+        cache_seqlens_int32=cache_seqlens, nsa_cache_seqlens_int32=lengths,
+    )
+    binding.scratch.tmp_lse.fill_(float("nan"))
+    run_unified_decode(
+        q_all=q, swa_k_cache=kv_cache, swa_indices=idx, swa_topk_lengths=lengths,
+        workspace=binding.scratch, sm_scale=case["sm_scale"], swa_page_size=_GLM_PAGE,
+        forced_num_splits=forced, split_policy="balanced",
+    )
+    torch.cuda.synchronize()
+    target = launch.LAST_DECODE_PLAN["balanced_split_target"]
+    num_splits = launch.LAST_DECODE_PLAN["num_splits"]
+    static_cps = launch.LAST_DECODE_PLAN["chunks_per_split"]
+    assert num_splits == forced and static_cps == 8
+    assert target == forced  # 188 // (2 rows * 8 head blocks) = 11 > 8 splits
+    lse = binding.scratch.tmp_lse[:num_tokens, :, :num_splits]
+    expected_active = []
+    for t in range(num_tokens):
+        n = (int(lengths[t]) + 63) // 64
+        cps = min(-(-n // target), static_cps)
+        active = -(-n // cps)
+        expected_active.append(active)
+        assert active <= max(target, num_splits)
+        finite = torch.isfinite(lse[t]).all(dim=0)
+        assert finite[:active].all(), f"row {t}: expected {active} active splits"
+        assert (lse[t, :, active:] == float("-inf")).all(), (
+            f"row {t}: splits >= {active} must be neutral"
+        )
+    # Row 0 (4 live chunks) spreads over 4 single-chunk splits where the static
+    # ranges would keep one 8-chunk split busy; row 1 (64 chunks) keeps the
+    # static 8-chunk ranges.
+    assert expected_active == [4, 8]
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_balanced_split_policy_waves_env(monkeypatch) -> None:
+    """``B12X_MLA_SM120_BALANCED_WAVES`` scales the active-split bound."""
+    from b12x.attention._shared.mla.kernel import balanced_split_target_for
+
+    kwargs = dict(num_splits=64, rows=4, h_blocks=4, sm_count=188)
+    monkeypatch.delenv("B12X_MLA_SM120_BALANCED_WAVES", raising=False)
+    assert balanced_split_target_for(**kwargs) == 11
+    monkeypatch.setenv("B12X_MLA_SM120_BALANCED_WAVES", "2")
+    assert balanced_split_target_for(**kwargs) == 23
+    monkeypatch.setenv("B12X_MLA_SM120_BALANCED_WAVES", "8")
+    assert balanced_split_target_for(**kwargs) == 64
+    monkeypatch.delenv("B12X_MLA_SM120_BALANCED_WAVES")
+    assert balanced_split_target_for(num_splits=64, rows=64, h_blocks=8, sm_count=188) == 1
+    monkeypatch.setenv("B12X_MLA_SM120_BALANCED_WAVES", "0")
+    with pytest.raises(ValueError):
+        balanced_split_target_for(**kwargs)
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_balanced_split_policy_requires_per_token_lengths() -> None:
+    """The balanced policy is limited to the per-token single-cache entry."""
+    device = require_b12x_sparse_mla()
+    from b12x.attention._shared.mla.kernel import run_unified_decode
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        plan_sparse_mla_scratch,
+    )
+
+    topk = 256
+    nblk = (topk + _GLM_PAGE - 1) // _GLM_PAGE
+    case = glm_ref.make_glm_decode_case(
+        num_heads=_GLM_NUM_HEADS, topk=topk, num_blocks=nblk,
+        page_block_size=_GLM_PAGE, invalidate_half=False, seed=52_300, device=device,
+    )
+    kv_cache = case["kv_cache"].contiguous()
+    kv_cache = kv_cache.view(nblk, _GLM_PAGE, kv_cache.shape[-1])
+    caps = B12XSparseMLAScratchCaps(
+        device=device, num_q_heads=_GLM_NUM_HEADS, max_q_rows=1, max_batch=1,
+        max_width=topk, max_kv_rows=nblk * _GLM_PAGE,
+        head_dim=glm_ref.GLM_Q_HEAD_DIM, v_head_dim=glm_ref.GLM_D_V,
+        max_chunks_per_row=8, page_size=_GLM_PAGE,
+    )
+    plan = plan_sparse_mla_scratch(caps)
+    (spec,) = plan.scratch_specs()
+    storage = torch.zeros(spec.shape, dtype=spec.dtype, device=device)
+    lens = torch.full((1,), topk, dtype=torch.int32, device=device)
+    binding = plan.bind(
+        scratch=storage, q=case["q"].contiguous(), selected_indices=case["topk_indices"].contiguous(),
+        cache_seqlens_int32=lens, nsa_cache_seqlens_int32=lens,
+    )
+    with pytest.raises(ValueError, match="per-token lengths"):
+        run_unified_decode(
+            q_all=binding.q, swa_k_cache=kv_cache, swa_indices=binding.selected_indices,
+            swa_topk_lengths=None, workspace=binding.scratch, sm_scale=case["sm_scale"],
+            swa_page_size=_GLM_PAGE, forced_num_splits=4, split_policy="balanced",
+        )
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_balanced_split_policy_graph_replay() -> None:
+    """A CUDA graph captured under the balanced policy stays exact when the
+    per-token lengths change between replays: the grid is capacity-based and
+    every CTA derives its chunk range at replay time."""
+    device = require_b12x_sparse_mla()
+    topk, num_tokens = 2048, 4
+    capture = torch.tensor([2048, 700, 65, 1], dtype=torch.int32)
+    replay = torch.tensor([129, 2048, 1000, 64 * 7], dtype=torch.int32)
+    got, exp, lengths = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=32,
+        seed=7400, split_policy="balanced", lengths=capture, graph_lengths=replay,
+    )
+    _assert_glm_rows_match_reference(got, exp, lengths, label="graph replay")
+    eager, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=32,
+        seed=7400, split_policy="balanced", lengths=replay,
+    )
+    assert torch.equal(got, eager), "graph replay must be bit-identical to eager"
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens,topk,forced", [(1, 512, 8), (4, 2048, 32)])
+def test_unified_decode_glm_fp32_partials(num_tokens, topk, forced) -> None:
+    """``partial_dtype=torch.float32`` keeps split partials exact: the merged
+    result matches the fp32 reference at least as closely as bf16 partials, the
+    plan records the partial dtype, and the output buffer no longer aliases the
+    partial workspace."""
+    device = require_b12x_sparse_mla()
+    import b12x.attention._shared.mla.kernel as launch
+
+    bf16_out, exp, lengths = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7500 + num_tokens, split_policy="balanced",
+    )
+    assert launch.LAST_DECODE_PLAN.get("partial_dtype") == "torch.bfloat16"
+    fp32_out, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=forced,
+        seed=7500 + num_tokens, split_policy="balanced", partial_dtype=torch.float32,
+    )
+    assert launch.LAST_DECODE_PLAN.get("partial_dtype") == "torch.float32"
+    _assert_glm_rows_match_reference(fp32_out, exp, lengths, label="fp32 partials")
+    err_bf16 = (bf16_out - exp).norm().item()
+    err_fp32 = (fp32_out - exp).norm().item()
+    assert err_fp32 <= err_bf16 * 1.05, (err_fp32, err_bf16)
+    assert _cosine(fp32_out, bf16_out) > 0.99999
+
+
+@torch.inference_mode()
+def test_unified_decode_glm_fp32_partials_single_split_bit_identical() -> None:
+    """With one active split the fp32-partial merge reproduces the bf16-partial
+    result bit for bit: the merge scales the single partial by 1 and rounds
+    once, exactly like the direct bf16 store."""
+    device = require_b12x_sparse_mla()
+    lengths = torch.tensor([64, 20, 64, 64], dtype=torch.int32)
+    bf16_out, _, _ = _run_glm_multitoken(
+        device, topk=64, num_tokens=4, forced_num_splits=1, seed=7600,
+        lengths=lengths,
+    )
+    fp32_out, _, _ = _run_glm_multitoken(
+        device, topk=64, num_tokens=4, forced_num_splits=1, seed=7600,
+        lengths=lengths, partial_dtype=torch.float32,
+    )
+    assert torch.equal(bf16_out, fp32_out)
+
+
+def test_sparse_mla_scratch_fp32_partials_layout() -> None:
+    """fp32 partials get their own output region; bf16 partials keep aliasing."""
+    from b12x.attention.sparse_mla._scratch import (
+        B12XSparseMLAScratchCaps,
+        _sparse_mla_scratch_layout,
+    )
+
+    common = dict(
+        device="cpu", num_q_heads=64, max_q_rows=4, max_width=4096,
+        head_dim=576, v_head_dim=512, max_chunks_per_row=64, page_size=64,
+    )
+    bf16 = _sparse_mla_scratch_layout(B12XSparseMLAScratchCaps(**common))
+    fp32 = _sparse_mla_scratch_layout(
+        B12XSparseMLAScratchCaps(**common, partial_dtype=torch.float32)
+    )
+    assert bf16.output_offset_bytes == bf16.tmp_output_offset_bytes
+    partial_bytes = 4 * 64 * 64 * 512
+    assert fp32.output_offset_bytes >= fp32.tmp_output_offset_bytes + 4 * partial_bytes
+    assert fp32.nbytes > bf16.nbytes
+    with pytest.raises(TypeError):
+        B12XSparseMLAScratchCaps(**common, partial_dtype=torch.float16)

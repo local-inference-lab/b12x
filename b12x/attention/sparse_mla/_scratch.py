@@ -54,6 +54,11 @@ class B12XSparseMLAScratchCaps:
     max_q_chunks: int | None = None
     page_size: int = 64
     head_major_output: bool = False
+    # Element type of the split-K decode partials (``tmp_output``). ``dtype``
+    # (bf16) rounds every split partial before the merge; ``torch.float32``
+    # keeps the partials exact so the merged result is rounded once, at the
+    # output. Prefill-like modes have no partials and ignore this field.
+    partial_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -86,6 +91,13 @@ class B12XSparseMLAScratchCaps:
         if self.max_q_chunks is not None:
             object.__setattr__(self, "max_q_chunks", max(int(self.max_q_chunks), 1))
         object.__setattr__(self, "page_size", max(int(self.page_size), 1))
+        partial_dtype = self.dtype if self.partial_dtype is None else self.partial_dtype
+        if partial_dtype not in (self.dtype, torch.float32):
+            raise TypeError(
+                "partial_dtype must be the activation dtype or torch.float32, "
+                f"got {partial_dtype}"
+            )
+        object.__setattr__(self, "partial_dtype", partial_dtype)
 
 
 @dataclass(kw_only=True)
@@ -325,16 +337,22 @@ def _sparse_mla_scratch_layout(
     if split:
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         tmp_output_offset_bytes = cursor
-        # output_buffer aliases tmp_output[:, :, 0, :] (chunk-major stride), so no
-        # separate output allocation is needed for decode.
+        # With partials in the output dtype, output_buffer aliases
+        # tmp_output[:, :, 0, :] (chunk-major stride) and needs no separate
+        # allocation. fp32 partials cannot alias a bf16 output, so the output
+        # gets its own region after the partials.
         output_offset_bytes = cursor
         cursor += (
             max_total_q
             * max_chunks_per_row
             * num_q_heads
             * v_head_dim
-            * dtype_nbytes(caps.dtype)
+            * dtype_nbytes(caps.partial_dtype)
         )
+        if caps.partial_dtype != caps.dtype:
+            cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+            output_offset_bytes = cursor
+            cursor += max_total_q * num_q_heads * v_head_dim * dtype_nbytes(caps.dtype)
         cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
         tmp_lse_offset_bytes = cursor
         cursor += (
@@ -400,12 +418,28 @@ def _materialize_sparse_mla_scratch(
                 v_head_dim=v_head_dim,
                 head_major_output=caps.head_major_output,
             ),
-            dtype=caps.dtype,
+            dtype=caps.partial_dtype,
         )
-        output_buffer = _split_output_buffer_from_tmp(
-            tmp_output,
-            head_major_output=caps.head_major_output,
-        )
+        if caps.partial_dtype == caps.dtype:
+            output_buffer = _split_output_buffer_from_tmp(
+                tmp_output,
+                head_major_output=caps.head_major_output,
+            )
+        elif caps.head_major_output:
+            output_buffer, _ = materialize_scratch_strided_view(
+                scratch_storage,
+                offset_bytes=layout.output_offset_bytes,
+                shape=(max_total_q, num_q_heads, v_head_dim),
+                stride=(v_head_dim, max_total_q * v_head_dim, 1),
+                dtype=caps.dtype,
+            )
+        else:
+            output_buffer, _ = materialize_scratch_view(
+                scratch_storage,
+                offset_bytes=layout.output_offset_bytes,
+                shape=(max_total_q, num_q_heads, v_head_dim),
+                dtype=caps.dtype,
+            )
         tmp_lse, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=layout.tmp_lse_offset_bytes,
