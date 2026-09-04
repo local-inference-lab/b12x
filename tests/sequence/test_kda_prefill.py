@@ -637,6 +637,62 @@ def test_op_long_sequence_accumulation_long_memory(tokens) -> None:
     _assert_op_matches_oracle(binding, tensors, inputs)
 
 
+def test_op_near_collinear_long_sequence_remains_finite() -> None:
+    """Reject non-finite output or state from ill-conditioned key blocks.
+
+    Repeating one key for every token makes each sixteen-token block nearly
+    rank one after BF16 rounding. A saturated update coefficient and slow
+    decay amplify errors in the blockwise triangular inverse. The KDA prefill
+    contract requires finite BF16 output and FP32 recurrent state for this
+    supported input.
+    """
+    from ..conftest import require_b12x
+
+    device = require_b12x()
+    tokens, heads = 16384, 1
+    inputs = make_inputs(
+        lengths=[tokens], heads=heads, seed=0, device=device, state_slots=2
+    )
+
+    torch.manual_seed(0)
+    key = torch.randn(1, heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    qk = key.expand(tokens, heads, HEAD_DIM).contiguous()
+    value_block = torch.randn(
+        16, heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    inputs.update(
+        q=qk,
+        k=qk,
+        v=value_block.repeat(tokens // 16, 1, 1),
+        raw_g=torch.full_like(qk, -12.0),
+        raw_beta=torch.full(
+            (tokens, heads), 8.0, dtype=torch.bfloat16, device=device
+        ),
+        A_log=torch.zeros(heads, dtype=torch.float32, device=device),
+        dt_bias=torch.zeros(heads, HEAD_DIM, dtype=torch.float32, device=device),
+        pool=torch.zeros(
+            2, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device=device
+        ),
+    )
+
+    binding, tensors = make_binding(inputs, max_tokens=tokens, max_seqs=1)
+    _run(binding, inputs)
+    torch.cuda.synchronize(device)
+
+    assert binding.error_code.item() == 0
+    output_nonfinite = (~torch.isfinite(binding.output[:tokens])).sum().item()
+    final_slot = int(inputs["final"][0])
+    state_nonfinite = (
+        ~torch.isfinite(tensors["recurrent_state"][final_slot])
+    ).sum().item()
+    assert output_nonfinite == 0, (
+        f"output contains {output_nonfinite} non-finite values"
+    )
+    assert state_nonfinite == 0, (
+        f"state contains {state_nonfinite} non-finite values"
+    )
+
+
 @pytest.mark.parametrize("key_profile", ["repeated", "alternating"])
 def test_op_adversarial_keys(key_profile) -> None:
     from ..conftest import require_b12x
