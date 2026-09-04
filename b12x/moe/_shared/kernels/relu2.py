@@ -70,11 +70,16 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
         separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        trellis_bits: int | None = None,
+        trellis_coupled: bool = False,
         direct_routing: bool = False,
+        external_route_plan: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -89,11 +94,16 @@ class MoEDynamicKernelRelu2(MoEDynamicKernelBackend):
             separate_w13_halves=separate_w13_halves,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
+            trellis_bits=trellis_bits,
+            trellis_coupled=trellis_coupled,
             direct_routing=direct_routing,
+            external_route_plan=external_route_plan,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
+            split_phase=split_phase,
+            low_smem_pipeline=low_smem_pipeline,
         )
 
 

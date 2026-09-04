@@ -70,6 +70,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
         benchmark_factory: SweepBenchmarkFactory | None,
         query_schema_version: int = 1,
         config_schema_version: int = 1,
+        candidate_contract_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         del corpus_name
@@ -88,6 +89,7 @@ class _AttentionGenerator(DiscreteSweepGenerator):
             coverage={
                 "model_geometries": geometry_count,
             },
+            candidate_contract_version=candidate_contract_version,
             nearest_range_bounds=nearest_range_bounds,
         )
 
@@ -125,6 +127,7 @@ class GdnAttentionGenerator(_AttentionGenerator):
             geometry_count=len(GDN_GEOMETRIES),
             benchmark_factory=benchmark_factory or GdnBenchmarkFactory(),
             config_schema_version=3,
+            candidate_contract_version=2,
             nearest_range_bounds={
                 "max_seqs": (1, max(COMMON_SEQUENCE_CAPACITIES)),
                 "max_tokens": (
@@ -134,6 +137,27 @@ class GdnAttentionGenerator(_AttentionGenerator):
                 "state_index_columns": (1, max(GDN_STATE_INDEX_COLUMNS)),
             },
         )
+
+    def _cases_for_context(
+        self,
+        context: GenerationContext,
+    ) -> tuple[SweepCase, ...]:
+        cases = super()._cases_for_context(context)
+        applicable = []
+        for case in cases:
+            profile_ids = case.metadata.get("profile_ids")
+            if profile_ids is None:
+                applicable.append(case)
+                continue
+            if (
+                not isinstance(profile_ids, Sequence)
+                or isinstance(profile_ids, (str, bytes))
+                or any(not isinstance(profile_id, str) for profile_id in profile_ids)
+            ):
+                raise TypeError("GDN case profile_ids must be an array of strings")
+            if context.profile_id in profile_ids:
+                applicable.append(case)
+        return tuple(applicable)
 
 
 class GqaAttentionGenerator(_AttentionGenerator):

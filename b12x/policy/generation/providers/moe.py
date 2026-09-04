@@ -527,38 +527,53 @@ class MoeDecodeGenerator:
         if any(case.geometry.key not in known_keys for case in self._cases):
             raise ValueError("MoE sweep cases reference unknown geometries")
 
+    def _corpus_for_context(
+        self,
+        context: GenerationContext,
+    ) -> tuple[tuple[MoePhysicalGeometry, ...], tuple[MoeSweepCase, ...]]:
+        geometries = tuple(
+            geometry
+            for geometry in self._geometries
+            if geometry.applies_to_profile(context.profile_id)
+        )
+        applicable_keys = frozenset(geometry.key for geometry in geometries)
+        cases = tuple(
+            case for case in self._cases if case.geometry.key in applicable_keys
+        )
+        return geometries, cases
+
     def estimate(self, context: GenerationContext) -> WorkEstimate:
-        del context
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         coarse = tuple(
             case
-            for geometry in self._geometries
+            for geometry in geometries
             if _has_tunable_backend(geometry)
             for case in _coarse_cases(cases_by_geometry[geometry.key])
         )
         measured = tuple(
             case
-            for geometry in self._geometries
+            for geometry in geometries
             for case in _measurement_cases(cases_by_geometry[geometry.key])
         )
-        query_count = len({_query_key(case) for case in self._cases})
-        work_units = len(self._geometries) + len(coarse) + len(measured) + query_count
+        query_count = len({_query_key(case) for case in cases})
+        work_units = len(geometries) + len(coarse) + len(measured) + query_count
         return WorkEstimate(
             component_id=self.component_id,
             work_units=work_units,
             case_count=len(measured),
             description=(
-                f"{len(self._geometries)} physical geometries; concrete MoE "
+                f"{len(geometries)} physical geometries; concrete MoE "
                 "candidate races, fixed-backend qualification, tree reduction"
             ),
             dimensions={
-                "physical_geometries": len(self._geometries),
+                "physical_geometries": len(geometries),
                 "measurement_cases": len(measured),
-                "runtime_route_cases": len(self._cases),
+                "runtime_route_cases": len(cases),
                 "runtime_queries": query_count,
                 "coarse_cases": len(coarse),
             },
@@ -568,14 +583,14 @@ class MoeDecodeGenerator:
         self,
         context: GenerationContext,
     ) -> tuple[MeasurementPartition, ...]:
-        del context
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[tuple[object, ...], list[MoeSweepCase]] = defaultdict(
             list
         )
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         partitions = []
-        for geometry in self._geometries:
+        for geometry in geometries:
             cases = tuple(cases_by_geometry[geometry.key])
             measured = _measurement_cases(cases)
             coarse = _coarse_cases(cases) if _has_tunable_backend(geometry) else ()
@@ -814,23 +829,24 @@ class MoeDecodeGenerator:
         progress: ProgressReporter,
         checkpoints: CheckpointStore,
     ) -> ComponentGenerationResult:
+        geometries, cases = self._corpus_for_context(context)
         cases_by_geometry: dict[
             tuple[object, ...],
             list[MoeSweepCase],
         ] = defaultdict(list)
-        for case in self._cases:
+        for case in cases:
             cases_by_geometry[case.geometry.key].append(case)
         full_results: list[tuple[MoeSweepCase, tuple[MoeMeasurement, ...]]] = []
         fixed_configs: dict[tuple[object, ...], FrozenMapping] = {}
         single_candidate_route_cases = 0
         coarse_measurement_cases = 0
-        for geometry_index, geometry in enumerate(self._geometries, start=1):
+        for geometry_index, geometry in enumerate(geometries, start=1):
             geometry_cases = tuple(cases_by_geometry[geometry.key])
             measurement_cases = _measurement_cases(geometry_cases)
             progress.start_stage(
                 self.component_id,
                 stage=(
-                    f"geometry {geometry_index}/{len(self._geometries)}: "
+                    f"geometry {geometry_index}/{len(geometries)}: "
                     "prepare and correctness screen"
                 ),
                 total=1,
@@ -969,7 +985,7 @@ class MoeDecodeGenerator:
 
         measured_query_keys = {record.query for record in records}
         qualified_fixed_query_points = 0
-        for case in self._cases:
+        for case in cases:
             config = fixed_configs.get(case.geometry.key)
             if config is None:
                 continue
@@ -981,7 +997,7 @@ class MoeDecodeGenerator:
             qualified_fixed_query_points += 1
 
         measured_records = tuple(records)
-        token_values = {case.num_tokens for case in self._cases}
+        token_values = {case.num_tokens for case in cases}
         records = list(
             _synthesize_token_capacity_coverage(
                 measured_records,
@@ -1002,7 +1018,7 @@ class MoeDecodeGenerator:
             "query_schema_version": self.query_schema_version,
             "config_schema_version": self.config_schema_version,
             "coverage": {
-                "physical_geometries": len(self._geometries),
+                "physical_geometries": len(geometries),
                 "measured_query_points": len(results_by_query),
                 "qualified_fixed_query_points": qualified_fixed_query_points,
                 "runtime_query_points": len(records),
@@ -1019,7 +1035,7 @@ class MoeDecodeGenerator:
                 "route_measurements": len(full_results),
                 "single_candidate_route_cases": single_candidate_route_cases,
                 "gpu_measurement_cases": (
-                    len(self._geometries) + coarse_measurement_cases + len(full_results)
+                    len(geometries) + coarse_measurement_cases + len(full_results)
                 ),
                 "fixed_backend_qualification_tokens": sorted(_QUALIFICATION_TOKENS),
                 "fixed_backend_qualification_patterns": sorted(_QUALIFICATION_PATTERNS),

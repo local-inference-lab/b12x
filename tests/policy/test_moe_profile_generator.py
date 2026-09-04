@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -74,36 +74,46 @@ _DEVICE = DeviceIdentity(
 )
 
 
-def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
-) -> None:
+def test_embedded_moe_profiles_cover_every_applicable_corpus_query() -> None:
     cases = expand_sweep_cases()
-    queries = {tuple(sorted(case.query().items())): case.query() for case in cases}
-    base_queries = {}
-    for case in cases:
-        query = case.query()
-        query.pop("num_tokens")
-        query.pop("routed_rows")
-        base_queries.setdefault(tuple(sorted(query.items())), query)
-    for base_query in base_queries.values():
-        top_k = int(base_query["top_k"])
-        direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
-        triton_limit = (
-            fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
+
+    def queries_for_profile(profile_id: str) -> tuple[dict[str, object], ...]:
+        applicable = tuple(
+            case
+            for case in cases
+            if case.geometry.applies_to_profile(profile_id)
         )
-        for num_tokens in (9, direct_limit, direct_limit + 1, triton_limit + 1):
-            if not 1 <= num_tokens <= 8_192:
-                continue
-            query = {
-                **base_query,
-                "num_tokens": num_tokens,
-                "routed_rows": num_tokens * top_k,
-            }
-            queries.setdefault(tuple(sorted(query.items())), query)
+        queries = {
+            tuple(sorted(case.query().items())): case.query()
+            for case in applicable
+        }
+        base_queries = {}
+        for case in applicable:
+            query = case.query()
+            query.pop("num_tokens")
+            query.pop("routed_rows")
+            base_queries.setdefault(tuple(sorted(query.items())), query)
+        for base_query in base_queries.values():
+            top_k = int(base_query["top_k"])
+            direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
+            triton_limit = (
+                fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
+            )
+            for num_tokens in (9, direct_limit, direct_limit + 1, triton_limit + 1):
+                if not 1 <= num_tokens <= 8_192:
+                    continue
+                query = {
+                    **base_query,
+                    "num_tokens": num_tokens,
+                    "routed_rows": num_tokens * top_k,
+                }
+                queries.setdefault(tuple(sorted(query.items())), query)
+        return tuple(queries.values())
 
     for profile in EMBEDDED_REGISTRY.list_profiles():
         component = profile.component("moe.decode")
         assert component is not None, profile.profile_id
-        for query in queries.values():
+        for query in queries_for_profile(profile.profile_id):
             hit = component.lookup(query)
             assert hit is not None, (profile.profile_id, query)
             assert _config_covers_query(query, hit.config), (
@@ -111,6 +121,148 @@ def test_embedded_moe_profiles_cover_every_corpus_query_with_valid_configs(
                 query,
                 hit.config,
             )
+
+@pytest.mark.parametrize("num_tokens", (1, 8, 64))
+def test_rtx_profile_resolves_qualified_glm53_tp3_n704_geometry(
+    num_tokens: int,
+) -> None:
+    query = {
+        "activation": "silu",
+        "hidden_size": 4096,
+        "intermediate_size": 704,
+        "num_experts": 288,
+        "num_tokens": num_tokens,
+        "quant_mode": "nvfp4",
+        "routed_rows": num_tokens * 8,
+        "source_format": "modelopt_nvfp4",
+        "top_k": 8,
+    }
+    component = EMBEDDED_REGISTRY.get(
+        "nvidia.rtx.pro.6000.blackwell"
+    ).component("moe.decode")
+    assert component is not None
+
+    hit = component.lookup(query)
+    assert hit is not None
+    assert _config_covers_query(query, hit.config)
+
+
+def test_context_corpus_matches_equivalent_physical_geometry_keys(tmp_path) -> None:
+    profile_id = "nvidia.rtx.pro.6000.blackwell"
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.intermediate_size == 704
+        and geometry.profile_ids == (profile_id,)
+        and any(
+            alias.model_id == "glm-5.3-flash" and alias.tp_size == 3
+            for alias in geometry.aliases
+        )
+    )
+    case_geometry = replace(geometry, aliases=(), profile_ids=())
+    cases = expand_sweep_cases(
+        geometries=(case_geometry,),
+        top_ks=(8,),
+        token_counts=(1,),
+    )
+    generator = MoeDecodeGenerator(
+        benchmark_factory=_Factory([]),
+        geometries=(geometry,),
+        cases=cases,
+    )
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+        profile_id=profile_id,
+    )
+
+    selected_geometries, selected_cases = generator._corpus_for_context(context)
+
+    assert selected_geometries == (geometry,)
+    assert selected_cases == cases
+
+
+def test_rtx_generator_reproduces_profiled_glm53_tp3_n704_geometry(
+    tmp_path,
+) -> None:
+    profile_id = "nvidia.rtx.pro.6000.blackwell"
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.intermediate_size == 704
+        and geometry.profile_ids == (profile_id,)
+        and any(
+            alias.model_id == "glm-5.3-flash" and alias.tp_size == 3
+            for alias in geometry.aliases
+        )
+    )
+    cases = expand_sweep_cases(
+        geometries=(geometry,),
+        top_ks=(8,),
+        token_counts=(1, 8, 64),
+    )
+    generator = MoeDecodeGenerator(
+        benchmark_factory=_Factory([]),
+        geometries=(geometry,),
+        cases=cases,
+    )
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+        profile_id=profile_id,
+    )
+
+    result = generator.generate(
+        context,
+        progress=NullProgressReporter(),
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+    generated = profile_from_dict(
+        {
+            "profile_id": profile_id,
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "compute_capability": [12, 1],
+                    "sm_count": 188,
+                    "product_name": "NVIDIA RTX PRO 6000 Blackwell",
+                }
+            ],
+            "components": [result.component],
+        }
+    ).component("moe.decode")
+    assert generated is not None
+    for num_tokens in (1, 8, 64):
+        query = {
+            "activation": "silu",
+            "hidden_size": 4096,
+            "intermediate_size": 704,
+            "num_experts": 288,
+            "num_tokens": num_tokens,
+            "quant_mode": "nvfp4",
+            "routed_rows": num_tokens * 8,
+            "source_format": "modelopt_nvfp4",
+            "top_k": 8,
+        }
+        hit = generated.lookup(query)
+        assert hit is not None
+        assert _config_covers_query(query, hit.config)
+
+    gb10_context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path / "gb10",
+        source_revision="abc123",
+        settings=GenerationSettings(),
+        profile_id="nvidia.gb10.48sm",
+    )
+    assert generator.estimate(gb10_context).case_count == 0
 
 
 def test_modelopt_w4a8_profile_worker_uses_a8_activation() -> None:

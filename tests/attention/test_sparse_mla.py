@@ -1,6 +1,5 @@
-"""attention.sparse_mla: decode over top-k-selected tokens vs the in-tree
-pure-torch reference (packed NSA MLA cache layout), through the public
-plan -> bind -> run lifecycle, including -1-padded selections.
+"""Sparse MLA decode through the public planned lifecycle and small prefill
+output-layout coverage, checked against the in-tree pure-torch reference.
 """
 
 from __future__ import annotations
@@ -19,6 +18,51 @@ NOPE_DIM = 512
 ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM
 V_HEAD_DIM = NOPE_DIM
+
+@torch.inference_mode()
+def test_prefill_writes_caller_provided_strided_bf16_output() -> None:
+    require_b12x()
+    from b12x.attention._shared.mla.kernel import run_unified_prefill
+
+    rows, heads, cache_tokens, width = 1, 8, 512, 512
+    q, kv, selected, _, active = _make_case(
+        rows=rows,
+        heads=heads,
+        cache_tokens=cache_tokens,
+        width=width,
+    )
+    sm_scale = HEAD_DIM**-0.5
+    ref = sparse_mla_reference(
+        q_all=q,
+        kv_cache=kv,
+        page_table_1=selected,
+        active_token_counts=active,
+        sm_scale=sm_scale,
+        v_head_dim=V_HEAD_DIM,
+    )
+
+    backing = torch.full(
+        (rows, heads, V_HEAD_DIM * 2),
+        17,
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    output = backing[..., ::2]
+    actual, _ = run_unified_prefill(
+        q=q,
+        kv_cache=kv.reshape(cache_tokens // 64, 64, kv.shape[-1]),
+        topk_indices=selected,
+        topk_length=active,
+        sm_scale=sm_scale,
+        page_block_size=64,
+        output=output,
+    )
+
+    assert actual is output
+    assert output.stride(-1) == 2
+    _assert_matches(actual, ref)
+    assert bool((backing[..., 1::2] == 17).all().item())
+
 
 
 def _make_case(*, rows: int, heads: int, cache_tokens: int, width: int):

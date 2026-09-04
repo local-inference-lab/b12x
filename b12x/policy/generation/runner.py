@@ -6,6 +6,7 @@ import gzip
 import json
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,13 @@ def generate_profile_artifact(
     progress: ProgressReporter,
 ) -> dict[str, object]:
     """Run all selected providers and assemble one validated profile artifact."""
+
+    if context.profile_id is None:
+        context = replace(context, profile_id=profile_id)
+    elif context.profile_id != profile_id:
+        raise ValueError(
+            "generation context profile ID does not match the artifact profile ID"
+        )
 
     estimates = estimate_generators(generators, context)
     checkpoints = CheckpointStore(context.work_dir / "checkpoints")

@@ -88,7 +88,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
         with pytest.raises(ValueError, match="device"):
-            ring.all_reduce(explicit_inp, out=torch.empty_like(explicit_inp, device="cpu"))
+            ring.all_reduce(
+                explicit_inp, out=torch.empty_like(explicit_inp, device="cpu")
+            )
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
                 explicit_inp,
@@ -143,7 +145,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_pcie_dma_all_reduce_eager_and_graph() -> None:
+def _run_configured_all_reduce() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     world_size = int(os.getenv("B12X_PCIE_DMA_WORLD_SIZE", "2"))
@@ -153,6 +155,15 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
         )
     _load_kernels()
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def test_pcie_dma_all_reduce_eager_and_graph() -> None:
+    _run_configured_all_reduce()
+
+
+def test_pcie_dma_all_reduce_eager_and_graph_tp3(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_DMA_WORLD_SIZE", "3")
+    _run_configured_all_reduce()
 
 
 def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
@@ -260,9 +271,7 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     absolute_bits = bit_patterns.to(torch.int32) & 0x7FFF
     exponent = absolute_bits >> 7
     fraction = absolute_bits & 0x7F
-    expected_scales = torch.clamp(
-        exponent - 8 + (fraction > 96).to(torch.int32), min=0
-    )
+    expected_scales = torch.clamp(exponent - 8 + (fraction > 96).to(torch.int32), min=0)
     expected_scales = torch.where(
         absolute_bits == 0, torch.full_like(expected_scales, 127), expected_scales
     )
@@ -285,8 +294,8 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
         expected_scales == 255, torch.tensor(float("nan")), scale_values
     )
     expected_payload = (
-        source_values.float() / scale_values
-    ).to(torch.float8_e4m3fn).view(torch.uint8)
+        (source_values.float() / scale_values).to(torch.float8_e4m3fn).view(torch.uint8)
+    )
     is_inf = (exponent == 255) & (fraction == 0)
     is_nan = (exponent == 255) & (fraction != 0)
     expected_payload = torch.where(
@@ -303,6 +312,4 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     )
 
     assert torch.equal(scales.cpu(), expected_scales)
-    assert torch.equal(
-        payload.cpu(), expected_payload.repeat_interleave(32)
-    )
+    assert torch.equal(payload.cpu(), expected_payload.repeat_interleave(32))

@@ -1,9 +1,9 @@
-# GLM-5.3 M8 Routed-Expert Qualification
+# GLM-5.3 M8 Routed-Expert Evidence
 
 ## Status and contract
 
-Status: **implemented and qualified** for the GLM-5.3 Flash target-model
-routed-expert shape.
+Status: **implemented; not qualified by this record** for the GLM-5.3 Flash
+target-model routed-expert shape.
 
 The specialization applies only to ModelOpt NVFP4 SiLU experts with 288
 experts, hidden size 4096, intermediate size 512, eight input rows, top-k 8,
@@ -11,12 +11,12 @@ grouped external routing, and a materialized or persistent work source. It
 separates fixed-geometry route preparation from expert computation. Other
 shapes retain the existing dynamic fused path.
 
-Host policy is immutable after `plan_tp_moe_execution` returns. Scratch
-planning compiles the route-preparation and compute artifacts for both int32
-and int64 route indices and retains strong references to all four artifacts.
-The execution path therefore cannot perform first-use compilation during CUDA
-graph capture. Live input-row counts and cluster limits remain launch scalars
-and are not compiled-kernel cache keys.
+The intended execution contract makes host policy immutable after
+`plan_tp_moe_execution` returns, precompiles and retains the route-preparation
+and compute artifacts for both int32 and int64 route indices, and keeps live
+input-row counts and cluster limits out of compiled-kernel cache identities.
+This record does not independently qualify that contract during CUDA graph
+capture.
 
 ## Source identity
 
@@ -34,27 +34,11 @@ The pull-request representation of the specialized source ends at
 plan-time artifact compilation without changing the kernel implementation.
 The implementation commit retains `MadeBy561 <madeby561@gmail.com>` as author.
 
-## Hardware and serving configuration
+## Performance evidence limitation
 
-Both performance arms used physical GPUs 4, 5, 6, and 7 on one host:
-
-- four NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs;
-- PCIe Gen5 x16 links;
-- tensor parallelism 4 and decode-context parallelism 1;
-- a +6000 MHz memory-clock offset in both isolated performance arms;
-- full decode CUDA graphs;
-- B12X attention, linear, NVFP4 W4A4 MoE, and PCIe all-reduce;
-- independent 512-token target and recurrent cache pages;
-- 4096 maximum batched target tokens and 32 NCCL channels;
-- GLM-5.3 Flash NVFP4 checkpoint revision
-  `378ca54585c46542bad1f3cb3ed0d73ae51cdb62`.
-
-Each server completed CUDA-graph capture and a five-second concurrency-one
-warmup before measurement. No other process used GPUs 4-7.
-
-## Isolated performance evidence
-
-The production server was measured with `llm-decode-bench` 0.4.29:
+The historical comparison notes identify the B12X commits and Git trees above,
+the GLM-5.3 checkpoint revision
+`378ca54585c46542bad1f3cb3ed0d73ae51cdb62`, and this benchmark command:
 
 ```bash
 python /root/llm_decode_bench.py \
@@ -74,21 +58,15 @@ python /root/llm_decode_bench.py \
   --output RESULT.json
 ```
 
-The table contains every measured 30-second sample. Warmup throughput is not
-included. Change is `(specialized / reference - 1) * 100`.
+They do not identify the per-arm worktrees, image or compiled-artifact hashes,
+physical GPU UUIDs and operating modes, or the CUTLASS/PTXAS artifact map. The
+retained notes also do not bind a correctness result to each measured arm.
+Therefore this document retains no throughput values, ratio, or performance
+qualification from that comparison.
 
-| Concurrency | Reference output tok/s | Specialized output tok/s | Change |
-| --- | ---: | ---: | ---: |
-| 1 | 167.543290554 | 168.022133113 | +0.286% |
-| 8 | 752.782287994 | 790.077085974 | +4.954% |
+## Plan-time correctness evidence limitation
 
-The specialization is throughput-neutral at concurrency one and improves the
-eight-request production path by 4.95% under the declared configuration.
-
-## Plan-time compilation correctness
-
-The plan-time compilation commit was validated on one NVIDIA RTX PRO 6000
-Blackwell Workstation Edition GPU with these repository test targets:
+The following test commands were recorded:
 
 ```bash
 pytest -q tests/moe/test_fused_moe_planning.py
@@ -99,40 +77,22 @@ pytest -q \
   tests/moe/test_w4a8_dynamic_kernel.py
 ```
 
-The results were 54 passed, 1 passed, and 56 passed. The exact-shape oracle
-poisons caller-owned scratch, freezes kernel resolution before eager execution
-and graph capture, captures and replays the CUDA graph, verifies stable tensor
-addresses and allocation-free replay, and checks the output against the
-pure-Torch NVFP4 reference. Changing
-`B12X_DYNAMIC_SPLIT_COMPUTE_MAC` from 224 to 112 after planning does not change
-the planned scalar or any compiled-artifact identity.
+The record does not identify the worktree, exact source tree, runtime artifact,
+compiled kernels, physical GPU UUID and mode, or raw test output for these
+commands. No correctness or CUDA graph-replay qualification is retained from
+them.
 
-## End-to-end compatibility after plan-time compilation
+## End-to-end evidence limitation
 
-An integration comparison isolated commit `13bbc002f0d4cc1e4ce8b929ff61e2341bdcd880`
-on stock-clock GPUs 4-7. Both arms used the same vLLM tree, target and DFlash2
-MXFP8 checkpoints, seven probabilistic draft tokens, and the complete B12X
-execution stack. The reference B12X integration commit was
-`035a74c2`; the planned-artifact integration commit was `d393b6a2` with package
-tree `d3f504f98ca7f645c322304a4cb3674ffeab6569`.
+The historical integration notes identify reference B12X integration commit
+`035a74c2` and planned-artifact integration commit `d393b6a2` with package tree
+`d3f504f98ca7f645c322304a4cb3674ffeab6569`. They do not retain the benchmark
+command, both worktree and artifact identities, physical GPU UUIDs and modes,
+correctness state, or independent raw records needed to bind the reported
+serving measurements to those revisions.
 
-Five 4096-token concurrency-one requests used seeds 20260828 through 20260901.
-Draft sampling does not honor per-request generators, so emitted-token rate and
-accepted length vary stochastically. Verifier steps per second is the stable
-execution metric.
-
-| Seed | Reference steps/s | Planned-artifact steps/s |
-| ---: | ---: | ---: |
-| 20260828 | 81.298708003 | 80.947930733 |
-| 20260829 | 81.306328871 | 81.456265853 |
-| 20260830 | 81.286600180 | 81.172607529 |
-| 20260831 | 81.332062822 | 82.130121545 |
-| 20260901 | 81.205706571 | 81.379033115 |
-| Median | 81.298708003 | 81.379033115 |
-
-The median change is +0.099%, which is within run-to-run variation. A separate
-30-second sustained-decode run measured 85.144 and 278.445 verifier steps/s at
-concurrency one and eight. A 30-second cold 32k prefill run measured 14,415
-prompt tok/s; the matching integration reference measured 14,416 prompt tok/s.
-The plan-time compilation contract therefore introduces no measured decode or
-prefill regression.
+The supplemental sustained-decode and cold-prefill measurements likewise lack
+independent commands, source and worktree identities, artifact identities, GPU
+identities and modes, correctness state, and raw samples. This document
+therefore retains neither those numbers nor a decode or prefill regression
+verdict.

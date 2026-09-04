@@ -66,6 +66,7 @@ def _make_nvfp4_weights(
     device: torch.device,
     *,
     seed: int,
+    gated: bool = True,
     num_experts: int = _E,
     hidden_size: int = _K,
     intermediate_size: int = _N,
@@ -73,10 +74,11 @@ def _make_nvfp4_weights(
 ) -> _Weights:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
+    w1_rows = (2 if gated else 1) * intermediate_size
     w1_fp4 = torch.randint(
         0,
         256,
-        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        (num_experts, w1_rows, hidden_size // 2),
         dtype=torch.uint8,
         device=device,
         generator=generator,
@@ -94,7 +96,7 @@ def _make_nvfp4_weights(
     # A constant exact power of two keeps the synthetic layer well-conditioned
     # while the random FP4 payload still exercises every nibble value.
     w1_logical_scale = torch.full(
-        (num_experts, 2 * intermediate_size, hidden_size // 16),
+        (num_experts, w1_rows, hidden_size // 16),
         2.0**-5,
         dtype=torch.float32,
         device=device,
@@ -113,10 +115,12 @@ def _make_nvfp4_weights(
                 "no larger than intermediate_size"
             )
         w1_fp4[:, logical_n:intermediate_size].zero_()
-        w1_fp4[:, intermediate_size + logical_n :].zero_()
+        if gated:
+            w1_fp4[:, intermediate_size + logical_n :].zero_()
         w2_fp4[:, :, logical_n // 2 :].zero_()
         w1_logical_scale[:, logical_n:intermediate_size].fill_(0)
-        w1_logical_scale[:, intermediate_size + logical_n :].fill_(0)
+        if gated:
+            w1_logical_scale[:, intermediate_size + logical_n :].fill_(0)
         w2_logical_scale[:, :, logical_n // 16 :].fill_(0)
     w1_scale = swizzle_block_scale_reference(w1_logical_scale).contiguous()
     w2_scale = swizzle_block_scale_reference(w2_logical_scale).contiguous()
@@ -222,6 +226,7 @@ def _nvfp4_oracle(
     num_experts: int = _E,
     hidden_size: int = _K,
     intermediate_size: int = _N,
+    activation: str = "silu",
 ) -> torch.Tensor:
     # This is the pure-Torch GPU oracle; it does not instantiate or call a CuTe
     # kernel and consumes the original checkpoint layout directly.
@@ -247,7 +252,7 @@ def _nvfp4_oracle(
         num_experts,
         hidden_size,
         intermediate_size,
-        activation="silu",
+        activation=activation,
         quant_scale_math=quant_scale_math,
     )
 
@@ -290,6 +295,7 @@ def _prepare_and_bind(
     source_format: str,
     num_topk: int = _TOPK,
     fast_math: bool = False,
+    activation: str = "silu",
 ) -> _BoundCase:
     from b12x.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -303,7 +309,7 @@ def _prepare_and_bind(
         w2_fp4=weights.w2_fp4,
         w2_blockscale=weights.w2_scale,
         w2_alphas=weights.w2_alpha,
-        activation="silu",
+        activation=activation,
         quant_mode=quant_mode,
         source_format=source_format,
         w13_layout="w13",
@@ -559,6 +565,72 @@ def test_standard_moe_micro_live_graph_oracle(
     )
 
 
+def test_glm53_tp3_n704_micro_m1_rowpair_fc2_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the native three-chunk M=1 FC2 row-pair implementation."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["silu"]
+
+    class RecordingMicroKernel(spec.micro_kernel_cls):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            recorded["micro_kernel"] = self
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "silu",
+        replace(spec, micro_kernel_cls=RecordingMicroKernel),
+    )
+    intermediate_size = 704
+    weights = _make_nvfp4_weights(
+        device,
+        seed=121,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(device, m=1, seed=122, route_shift=0)
+    changed = _make_inputs(device, m=1, seed=123, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="glm53-tp3-n704-micro-m1-rowpair-fc2",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+    kernel = recorded["micro_kernel"]
+    assert kernel._cfg.n == intermediate_size
+    assert kernel._cfg.fc2_n_chunks == 3
+
+
 def test_standard_moe_glm53_m1_rowpair_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -806,6 +878,91 @@ def test_standard_moe_micro_masks_source_native_w2_tail(
     )
 
 
+@pytest.mark.parametrize(
+    ("intermediate_size", "expected_swap_ab", "expected_fused_fc1", "expected_sa_m"),
+    [
+        pytest.param(512, False, True, 16, id="tp4-n512-aligned-fused"),
+        pytest.param(704, True, False, 128, id="tp3-n704-swapped"),
+    ],
+)
+def test_glm53_dynamic_small_batch_native_shard_geometry_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    intermediate_size: int,
+    expected_swap_ab: bool,
+    expected_fused_fc1: bool,
+    expected_sa_m: int,
+) -> None:
+    """Keep TP4 aligned FC1 and exercise TP3's swapped dynamic FC1 route."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["silu"]
+
+    def make_recorded_kernel(**kwargs):
+        kernel = spec.dynamic_kernel_cls(**kwargs)
+        recorded["dynamic_kernel"] = kernel
+        return kernel
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "silu",
+        replace(spec, dynamic_kernel_cls=make_recorded_kernel),
+    )
+    weights = _make_nvfp4_weights(
+        device,
+        seed=181 + intermediate_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=9,
+        seed=182 + intermediate_size,
+        route_shift=0,
+    )
+    changed = _make_inputs(
+        device,
+        m=9,
+        seed=183 + intermediate_size,
+        route_shift=2,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+    )
+
+    assert case.scratch_plan.launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context=f"glm53-dynamic-small-batch-n{intermediate_size}",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+    kernel = recorded["dynamic_kernel"]
+    assert kernel.swap_ab is expected_swap_ab
+    assert kernel.w4a4_fc1_fused is expected_fused_fc1
+    assert kernel.sa_tile_shape_mk[0] == expected_sa_m
+
+
 def test_standard_moe_dynamic_prefill_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -839,6 +996,70 @@ def test_standard_moe_dynamic_prefill_live_graph_oracle(
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )
+
+
+def test_dynamic_relu2_refreshes_a_and_sfa_across_fc1_k_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise main and tail K tiles with non-fused slot-zero FC1 operands."""
+
+    from b12x.moe.fused_moe import _impl as tp_moe_impl
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
+    recorded: dict[str, object] = {}
+    spec = tp_moe_impl._ACTIVATION_KERNEL_SPECS["relu2"]
+
+    def make_recorded_kernel(**kwargs):
+        kernel = spec.dynamic_kernel_cls(**kwargs)
+        recorded["dynamic_kernel"] = kernel
+        return kernel
+
+    monkeypatch.setitem(
+        tp_moe_impl._ACTIVATION_KERNEL_SPECS,
+        "relu2",
+        replace(spec, dynamic_kernel_cls=make_recorded_kernel),
+    )
+    weights = _make_nvfp4_weights(device, seed=221, gated=False)
+    initial = _make_inputs(device, m=32, seed=222, route_shift=0)
+    changed = _make_inputs(device, m=32, seed=223, route_shift=2)
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        activation="relu2",
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        activation="relu2",
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="relu2",
+    )
+
+    assert case.scratch_plan.launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="dynamic-relu2-multi-k-slot-zero-refresh",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+    kernel = recorded["dynamic_kernel"]
+    assert not kernel.is_w6a8
+    assert not kernel.w4a4_fc1_fused
+    assert not kernel.swap_ab
+    assert _K // kernel.tile_shape_mnk[2] == 4
+    assert kernel.num_k_blocks > 1
 
 
 @pytest.mark.parametrize("tile_m", [16, 32, 64, 128])
@@ -1100,8 +1321,19 @@ def test_standard_moe_dynamic_inactive_route_live_graph_oracle(
     assert torch.count_nonzero(case.binding.output[-8:]).item() == 0
 
 
+@pytest.mark.parametrize(
+    ("scalar_scales", "fast_math"),
+    (
+        pytest.param(False, True, id="expert-scales-fast-math"),
+        pytest.param(True, True, id="scalar-scales-fast-math"),
+        pytest.param(False, False, id="expert-scales-precise-math"),
+        pytest.param(True, False, id="scalar-scales-precise-math"),
+    ),
+)
 def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
+    scalar_scales: bool,
+    fast_math: bool,
 ) -> None:
     """Exercise the exact GLM-5.3 M8 split route/compute specialization."""
 
@@ -1123,6 +1355,8 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     monkeypatch.setenv("B12X_DYNAMIC_SPLIT_COMPUTE_MAC", "224")
     from b12x.moe.fused_moe import _impl as fused_moe_impl
 
+    monkeypatch.setattr(fused_moe_impl, "_FAST_MATH_DEFAULT", fast_math)
+
     fused_moe_impl.clear_tp_moe_caches()
 
     weights = _make_nvfp4_weights(
@@ -1132,11 +1366,12 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    weights = replace(
-        weights,
-        a1_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
-        a2_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
-    )
+    if not scalar_scales:
+        weights = replace(
+            weights,
+            a1_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+            a2_scale=torch.ones(num_experts, dtype=torch.float32, device=device),
+        )
     initial = _make_inputs(
         device,
         m=m,
@@ -1155,10 +1390,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         hidden_size=hidden_size,
         topk=topk,
     )
+    quant_scale_math = "reciprocal_multiply" if fast_math else "direct_division"
     initial_reference = _nvfp4_oracle(
         weights,
         initial,
-        quant_scale_math="reciprocal_multiply",
+        quant_scale_math=quant_scale_math,
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -1166,7 +1402,7 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     changed_reference = _nvfp4_oracle(
         weights,
         changed,
-        quant_scale_math="reciprocal_multiply",
+        quant_scale_math=quant_scale_math,
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -1177,7 +1413,7 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         num_topk=topk,
-        fast_math=True,
+        fast_math=fast_math,
     )
     launch_plan = case.scratch_plan.launch_plan
     assert launch_plan.implementation == "dynamic"
@@ -1188,14 +1424,23 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     assert dynamic_config is not None
     assert dynamic_config.split_route_compute
     assert dynamic_config.split_compute_mac == 224
+    assert dynamic_config.fast_math is fast_math
+    assert dynamic_config.split_fast_prepare is fast_math
+    expected_prepare = "route_pack" if fast_math else "prepare"
     assert {
         kind for kind, _dtype, _launch in case.scratch_plan._prewarmed_dynamic_launches
     } == {
-        "route_pack",
+        "fused_shared",
+        expected_prepare,
         "compute",
     }
-    assert len(case.scratch_plan._prewarmed_dynamic_launches) == 4
-    assert fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE
+    assert len(case.scratch_plan._prewarmed_dynamic_launches) == 6
+    assert {
+        dtype
+        for kind, dtype, _launch in case.scratch_plan._prewarmed_dynamic_launches
+        if kind == "fused_shared"
+    } == {torch.int32, torch.int64}
+    assert bool(fused_moe_impl._M8_ROUTE_PACK_KERNEL_CACHE) is fast_math
 
     compiled_before = {
         key: id(value) for key, value in fused_moe_impl._DYNAMIC_KERNEL_CACHE.items()
@@ -1215,7 +1460,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
             changed=changed,
             initial_reference=initial_reference,
             changed_reference=changed_reference,
-            context="standard-moe-glm53-m8-split-route-compute",
+            context=(
+                "standard-moe-glm53-m8-split-route-compute-"
+                f"{'scalar' if scalar_scales else 'expert'}-"
+                f"{'fast' if fast_math else 'precise'}"
+            ),
             min_cos=0.999,
             max_normalized_rmse=0.03,
             replay_count=3,
@@ -1239,7 +1488,11 @@ def test_standard_moe_glm53_m8_split_route_compute_live_graph_oracle(
     _assert_oracle(
         case.binding.output,
         changed_reference,
-        context="standard-moe-glm53-m8-runtime-compute-grid",
+        context=(
+            "standard-moe-glm53-m8-runtime-compute-grid-"
+            f"{'scalar' if scalar_scales else 'expert'}-"
+            f"{'fast' if fast_math else 'precise'}"
+        ),
         min_cos=0.999,
         max_normalized_rmse=0.03,
     )

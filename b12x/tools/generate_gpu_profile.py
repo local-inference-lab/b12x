@@ -477,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             cold_l2=args.cold_l2,
             max_candidate_seconds=args.max_candidate_seconds,
         ),
+        profile_id=profile_id,
     )
     if args.partition_shard is not None:
         try:

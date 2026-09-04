@@ -417,16 +417,19 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
 
 
 @pytest.mark.parametrize("recurrent_block_v", [16, 32])
+@pytest.mark.parametrize("heads", [2, 22])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_packed_kda_matches_reference(
     state_dtype: torch.dtype,
     recurrent_block_v: int,
+    heads: int,
 ) -> None:
     device = require_sm120()
     binding = _make_case(
         device=device,
         state_dtype=state_dtype,
         recurrent_block_v=recurrent_block_v,
+        heads=heads,
     )
     state_reference = binding.recurrent_state.clone()
     expected = _reference(binding, state_reference)

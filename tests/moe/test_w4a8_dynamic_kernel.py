@@ -7,14 +7,19 @@ against the pure-Torch oracle (moe_reference_w4a8_mx).
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import pytest
 import torch
 from cutlass.cute.runtime import make_ptr
 
-from b12x._lib.intrinsics import _fp4_encode_nibbles, fp4_quantize_values_torch
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from b12x._lib.intrinsics import (
+    _fp4_encode_nibbles,
+    fp4_quantize_values_torch,
+    st_global_u8,
+)
 from cutlass.base_dsl.compiler import OptLevel as _DSLOptLevel
 
 _OPT_LEVEL_2 = _DSLOptLevel(2)
@@ -24,7 +29,12 @@ from b12x.moe.fused_moe._impl import (
     _pad_w4a8_grid_rows,
     current_cuda_stream,
 )
-from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.dynamic import (
+    MoEDynamicKernelBackend,
+    _row_major_offset,
+    _scale_atom_offset,
+    _trellis_rotation_offset,
+)
 from b12x.moe._shared.kernels.reference import (
     compare_to_reference,
     decompose_nvfp4_scales_to_mx_residual,
@@ -37,6 +47,84 @@ _TILE_M = 128
 _TILE_N = 128
 
 
+class _LargeRoutedRowOffsetProbe:
+    def __init__(self, *, packed_row: int, scale_row: int):
+        self.packed_row = packed_row
+        self.scale_row = scale_row
+        self.packed_stride = 256
+        self.packed_column = 24
+        self.num_k_tiles = 8
+        self.scale_k_tile = 3
+        self.scale_inner_k = 2
+
+    @cute.jit
+    def __call__(self, storage: cute.Pointer, stream: cuda.CUstream):
+        self.kernel(storage).launch(
+            grid=(1, 1, 1),
+            block=[1, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, storage: cute.Pointer):
+        base = cutlass.Int64(storage.toint())
+        packed_offset = _row_major_offset(
+            cutlass.Int32(self.packed_row),
+            cutlass.Int32(self.packed_stride),
+            cutlass.Int32(self.packed_column),
+        )
+        scale_offset = _scale_atom_offset(
+            cutlass.Int32(self.scale_row),
+            cutlass.Int32(self.num_k_tiles),
+            cutlass.Int32(self.scale_k_tile),
+            cutlass.Int32(self.scale_inner_k),
+        )
+        st_global_u8(base + packed_offset, cutlass.Uint8(0xA5))
+        st_global_u8(base + scale_offset, cutlass.Uint8(0x5A))
+
+
+class _LargeTrellisRotationOffsetProbe:
+    def __init__(
+        self,
+        *,
+        expert_idx: int,
+        rotations_per_expert: int,
+        intermediate_size: int,
+        rotation_idx: int,
+        column: int,
+        rotation_elements: int,
+    ):
+        self.expert_idx = expert_idx
+        self.rotations_per_expert = rotations_per_expert
+        self.intermediate_size = intermediate_size
+        self.rotation_idx = rotation_idx
+        self.column = column
+        self.rotation_elements = rotation_elements
+
+    @cute.jit
+    def __call__(self, storage: cute.Pointer, stream: cuda.CUstream):
+        self.kernel(storage).launch(
+            grid=(1, 1, 1),
+            block=[1, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, storage: cute.Pointer):
+        rotations = cute.make_tensor(
+            storage,
+            cute.make_layout((self.rotation_elements,), stride=(1,)),
+        )
+        offset = _trellis_rotation_offset(
+            cutlass.Int32(self.expert_idx),
+            cutlass.Int32(self.rotations_per_expert),
+            cutlass.Int64(self.intermediate_size),
+            cutlass.Int32(self.rotation_idx),
+            cutlass.Int64(self.column),
+        )
+        rotations[offset] = cutlass.Float16(1.5)
+
+
 @pytest.mark.parametrize("recipe", ["w4a8_mx", "w4a8_nvfp4", "w4a8_trellis"])
 def test_w4a8_compute_only_phase_is_rejected(recipe: str) -> None:
     with pytest.raises(ValueError, match="supports quant_recipe='nvfp4' only"):
@@ -45,6 +133,16 @@ def test_w4a8_compute_only_phase_is_rejected(recipe: str) -> None:
             (_TILE_M, _TILE_N),
             quant_recipe=recipe,
             split_phase="compute",
+        )
+
+
+def test_w6a8_separate_w13_halves_is_rejected() -> None:
+    with pytest.raises(ValueError, match="not supported with quant_recipe='w6a8_mx'"):
+        MoEDynamicKernelBackend(
+            32,
+            (_TILE_M, _TILE_N),
+            quant_recipe="w6a8_mx",
+            separate_w13_halves=True,
         )
 
 
@@ -792,6 +890,105 @@ def _run_w4a8_dynamic(
             return scatter_output, reference, _relaunch, state
         return scatter_output, reference, _relaunch
     return scatter_output, reference
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dynamic_routed_row_offsets_remain_int64_on_gpu() -> None:
+    device = require_b12x()
+    packed_stride = 256
+    packed_row = 2**31 // packed_stride + 1
+    packed_column = 24
+    num_k_tiles = 8
+    scale_atom_stride = num_k_tiles * 32 * 4 * 4
+    scale_atom = 2**31 // scale_atom_stride + 1
+    scale_row = scale_atom * 128 + 37
+    scale_k_tile = 3
+    scale_inner_k = 2
+
+    packed_offset = packed_row * packed_stride + packed_column
+    scale_offset = (
+        scale_atom * scale_atom_stride
+        + scale_k_tile * 32 * 4 * 4
+        + (scale_row % 32) * 4 * 4
+        + (scale_row % 128 // 32) * 4
+        + scale_inner_k
+    )
+    assert packed_row > (2**31 - 1) // packed_stride
+    assert scale_atom > (2**31 - 1) // scale_atom_stride
+    assert packed_offset > 2**31 - 1
+    assert scale_offset > 2**31 - 1
+
+    storage_bytes = max(packed_offset, scale_offset) + 1
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < storage_bytes + 256 * 1024**2:
+        pytest.skip(f"large-offset probe requires {storage_bytes} contiguous bytes")
+    storage = torch.empty(storage_bytes, dtype=torch.uint8, device=device)
+    storage[packed_offset] = 0
+    storage[scale_offset] = 0
+
+    storage_ptr = make_ptr(
+        cutlass.Uint8,
+        storage.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    stream = current_cuda_stream()
+    probe = _LargeRoutedRowOffsetProbe(
+        packed_row=packed_row,
+        scale_row=scale_row,
+    )
+    compiled = cute.compile(probe, storage_ptr, stream)
+    compiled(storage_ptr, stream)
+    torch.cuda.synchronize()
+
+    assert storage[packed_offset].item() == 0xA5
+    assert storage[scale_offset].item() == 0x5A
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_trellis_rotation_offsets_remain_int64_on_gpu() -> None:
+    device = require_b12x()
+    rotations_per_expert = 6
+    intermediate_size = 128
+    rotation_idx = 5
+    expert_idx = 2**31 // (rotations_per_expert * intermediate_size) + 1
+    column = intermediate_size - 1
+    rotation_offset = (
+        expert_idx * rotations_per_expert * intermediate_size
+        + rotation_idx * intermediate_size
+        + column
+    )
+    rotation_elements = (expert_idx + 1) * rotations_per_expert * intermediate_size
+    assert rotation_offset == rotation_elements - 1
+    assert rotation_offset > 2**31 - 1
+
+    storage_bytes = rotation_elements * torch.float16.itemsize
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < storage_bytes + 256 * 1024**2:
+        pytest.skip(f"large-offset probe requires {storage_bytes} contiguous bytes")
+    rotations = torch.empty(rotation_elements, dtype=torch.float16, device=device)
+    rotations[rotation_offset] = 0
+
+    rotations_ptr = make_ptr(
+        cutlass.Float16,
+        rotations.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    stream = current_cuda_stream()
+    probe = _LargeTrellisRotationOffsetProbe(
+        expert_idx=expert_idx,
+        rotations_per_expert=rotations_per_expert,
+        intermediate_size=intermediate_size,
+        rotation_idx=rotation_idx,
+        column=column,
+        rotation_elements=rotation_elements,
+    )
+    compiled = cute.compile(probe, rotations_ptr, stream)
+    compiled(rotations_ptr, stream)
+    torch.cuda.synchronize()
+
+    assert rotations[rotation_offset].item() == 1.5
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -10,6 +10,9 @@ import torch
 
 import b12x.comm.pcie.pcie_allreduce as pcie_allreduce
 import b12x.comm.pcie.pcie_island_rs as pcie_island_rs
+import b12x.comm.pcie.pcie_dma as pcie_dma
+import b12x.comm.pcie.pcie_oneshot as pcie_oneshot
+import b12x.comm.pcie.pcie_twoshot as pcie_twoshot
 from b12x.comm.pcie import _hierarchical_cute
 from b12x.comm.pcie.pcie_allreduce import (
     ISLAND_RS_MAX_BYTES,
@@ -31,9 +34,16 @@ from b12x.comm.pcie.pcie_hierarchical import (
 from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 6, 8])
+@pytest.mark.parametrize("world_size", [2, 3, 4, 6, 8])
 def test_allreduce_uses_direct_path_for_peer_safe_worlds(world_size: int) -> None:
     assert _algorithm_for_world_size(world_size) == "oneshot"
+
+def test_tp3_routes_to_oneshot_and_dma_without_changing_tp4_twoshot() -> None:
+    assert _algorithm_for_world_size(3) == "oneshot"
+    assert 3 in pcie_oneshot.SUPPORTED_WORLD_SIZES
+    assert 3 in pcie_dma.SUPPORTED_WORLD_SIZES
+    assert 3 not in pcie_twoshot.SUPPORTED_WORLD_SIZES
+    assert 4 in pcie_twoshot.SUPPORTED_WORLD_SIZES
 
 
 @pytest.mark.parametrize("world_size", [12, 16])
@@ -549,7 +559,7 @@ def test_hierarchical_named_channel_surface_remains_serial() -> None:
         assert captured is runtime
 
 
-@pytest.mark.parametrize("world_size", [1, 3, 10, 14, 20])
+@pytest.mark.parametrize("world_size", [1, 10, 14, 20])
 def test_allreduce_rejects_unsupported_or_peer_unsafe_worlds(
     world_size: int,
 ) -> None:

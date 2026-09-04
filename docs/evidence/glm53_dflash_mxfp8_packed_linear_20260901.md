@@ -1,6 +1,7 @@
-# GLM-5.3 DFlash2 packed MXFP8 linear qualification
+# GLM-5.3 DFlash2 packed MXFP8 linear evidence
 
-Status: **qualified** for the configuration recorded below.
+Status: **serving-performance evidence only** for the configuration recorded
+below. This record does not qualify candidate correctness.
 
 ## Operation under test
 
@@ -118,18 +119,22 @@ was 80.1429400631 verifier steps/s. The reported ratio is
 throughput by **4.55%**. This result is scoped to the configuration and hardware
 recorded above.
 
-The three independently measured B12X execution changes are not additive. A
-server containing this change, parallel M8 route packing, and PCIe/MHC
-dependent-launch support measured 81.2987080029 verifier steps/s, or 6.06%
-above the same baseline.
+No combined-stack performance result is retained here. The historical
+combined-stack timing was not accompanied by an independent command, target
+revision, worktree, artifact identity, physical GPU identity and mode,
+correctness state, or raw samples, so it cannot support a performance claim.
 
-## Correctness gate
+## Correctness evidence limitation
 
-The candidate source passed all 15 tests in `tests/gemm/test_mxfp8_linear.py` on
-an RTX PRO 6000 Blackwell GPU. The suite covers quantized-reference parity,
-unaligned output widths, K-dimension padding, CUDA graph capture, the
-no-scale-padding-initialization contract, and prequantized MXFP8 graph replay.
-The exact command was:
+The recorded correctness command mounted
+`/root/vllm/worktrees/b12x-mxfp8-packed-linear-direct-quant-20260901`, not the
+candidate worktree identified above. No commit or tree hash for that mounted
+worktree, compiled-artifact identity, or physical GPU UUID and mode was
+retained. Its result therefore cannot be attributed to candidate revision
+`86a4283add23b3fd139ed05f7dd9a43a8b799432`, and this report retains no
+candidate correctness verdict.
+
+The historical command was:
 
 ```bash
 docker run --rm --gpus '"device=1"' --ipc=host --shm-size=8g \

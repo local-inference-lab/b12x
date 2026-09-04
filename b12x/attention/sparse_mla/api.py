@@ -136,6 +136,7 @@ def bind(
         selected_indices=selected_indices,
         cache_seqlens_int32=cache_lengths,
         nsa_cache_seqlens_int32=selected_lengths,
+        kv_cache=kv_cache,
     )
     return Binding(
         plan=plan,

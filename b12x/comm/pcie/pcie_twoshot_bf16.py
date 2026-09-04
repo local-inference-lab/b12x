@@ -352,6 +352,9 @@ class PCIeTwoShotBF16:
         device_index = self._device_index()
         with torch.cuda.device(self.device):
             for operation in dict.fromkeys(requested):
+                if operation == "all_reduce":
+                    # Served by the dedicated pull all-reduce launcher below.
+                    continue
                 for slot_bias in (0, 1):
                     get_twoshot_bf16_launcher(
                         operation,

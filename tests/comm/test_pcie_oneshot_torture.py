@@ -17,12 +17,8 @@ pytestmark = pytest.mark.skipif(
     reason="set B12X_RUN_PCIE_ONESHOT_TORTURE=1 to run PCIe oneshot CUDA torture tests",
 )
 
-TORTURE_EAGER_ITERS = int(
-    os.getenv("B12X_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256")
-)
-TORTURE_GRAPH_REPLAYS = int(
-    os.getenv("B12X_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256")
-)
+TORTURE_EAGER_ITERS = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_EAGER_ITERS", "256"))
+TORTURE_GRAPH_REPLAYS = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_GRAPH_REPLAYS", "256"))
 TORTURE_MULTISTREAM_ITERS = int(
     os.getenv("B12X_PCIE_ONESHOT_TORTURE_MULTISTREAM_ITERS", "256")
 )
@@ -214,13 +210,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_pcie_oneshot_eager_graph_and_multistream_torture():
+def _run_configured_world_size() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     available = torch.cuda.device_count()
     requested = int(os.getenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "2"))
-    if requested not in (2, 4, 6, 8, 10):
-        pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
+    if requested not in (2, 3, 4, 6, 8, 10):
+        pytest.skip("PCIe oneshot only supports world sizes 2, 3, 4, 6, 8, and 10")
     if available < requested:
         pytest.skip(f"need {requested} CUDA devices, found {available}")
     mp.spawn(_worker, args=(requested, _free_port()), nprocs=requested, join=True)
+
+
+def test_pcie_oneshot_eager_graph_and_multistream_torture() -> None:
+    _run_configured_world_size()
+
+
+def test_pcie_oneshot_eager_graph_and_multistream_torture_tp3(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_PCIE_ONESHOT_TORTURE_WORLD_SIZE", "3")
+    _run_configured_world_size()

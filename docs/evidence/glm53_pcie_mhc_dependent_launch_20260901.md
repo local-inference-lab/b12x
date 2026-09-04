@@ -1,6 +1,8 @@
-# GLM-5.3 PCIe and MHC dependent-launch qualification
+# GLM-5.3 PCIe and MHC dependent-launch evidence
 
-Status: **qualified** for the configuration recorded below.
+Status: **serving-performance and liveness evidence only** for the
+configuration recorded below. This record does not qualify numerical
+correctness or CUDA graph-replay safety for the enabled PCIe/MHC path.
 
 ## Operation under test
 
@@ -118,22 +120,30 @@ was 80.0737058564 verifier steps/s. The reported ratio is
 throughput by **4.46%**. This result is scoped to the configuration and hardware
 recorded above.
 
-The three independently measured B12X execution changes are not additive. A
-server containing this change, packed MXFP8 fill elision, and parallel M8 route
-packing measured 81.2987080029 verifier steps/s, or 6.06% above the same
-baseline.
+No combined-stack performance result is retained here. The historical
+combined-stack timing was not accompanied by an independent command, target
+revision, worktree, artifact identity, physical GPU identity and mode,
+correctness state, or raw samples, so it cannot support a performance claim.
 
-## Correctness gate and limitation
+## Observed liveness and evidence limitations
 
 The production candidate completed the five long requests above without a
-server error. The focused MHC suite was also run once with both dependent-launch
-gates disabled and once with both enabled. Both modes produced the same two
-passes and the same four strict reference-tolerance failures, including the
-same maximum errors and indices. The dependent-launch change therefore did not
-alter those results, but this evidence does not claim that the complete MHC
-suite is green.
+server error. This establishes liveness for only the recorded serving requests;
+it does not establish numerical correctness of the enabled PCIe all-reduce
+output because no enabled-versus-disabled or independent reference comparison
+was retained for the exercised collective shapes.
 
-The enabled command was:
+This record also contains no enabled-path test combining the PCIe producer with
+the MHC consumer while checking stable addresses, fixed workspace capacity, and
+zero allocations during graph replay. The historical focused MHC command
+mounted `/root/vllm/worktrees/b12x-pcie-mhc-pdl-20260901`, not the candidate
+worktree identified above, and no commit or tree hash for that mounted worktree,
+compiled-artifact identity, or physical GPU UUID and mode was retained.
+Consequently its result cannot be attributed to candidate revision
+`e884df0107a25c0a4918cd00b295f62716a75938` and is not used as qualification
+evidence.
+
+The historical enabled command was:
 
 ```bash
 docker run --rm --gpus '"device=3"' --ipc=host --shm-size=8g \
@@ -145,8 +155,7 @@ docker run --rm --gpus '"device=3"' --ipc=host --shm-size=8g \
   -lc 'unset NCCL_GRAPH_FILE; PYTHONPATH=/src /opt/venv/bin/python -m pytest -q tests/norm/test_mhc.py'
 ```
 
-The disabled run used the same command with both gate values set to zero. The
-shared failures were maximum absolute errors of `3.6239624e-05` and
-`2.4294853e-04` in MHC post values and two BF16 one-ULP differences of
-`0.0078125` in normalized activations. These failures predate and are invariant
-under the dependent-launch toggle; their tolerances were not weakened.
+The historical disabled run used the same command with both gate values set to
+zero. Because the source and hardware identities above are missing, neither
+historical focused run supports a correctness or graph-replay qualification
+claim for the candidate.

@@ -16,6 +16,8 @@ COMMON_PLAN_TOKEN_COUNTS = (
 )
 COMMON_ROUTE_PATTERNS = ("balanced", "hot", "zipf", "disjoint")
 
+GLM53_TP3_MOE_PROFILE_IDS = ("nvidia.rtx.pro.6000.blackwell",)
+
 
 def align_up(value: int, alignment: int) -> int:
     if value <= 0 or alignment <= 0:
@@ -121,10 +123,34 @@ class MoeGeometryAlias:
     tp_size: int
     global_intermediate_size: int
     logical_intermediate_sizes: tuple[int, ...]
+    # Per-rank padded kernel width shared by every rank in this TP group.
     physical_intermediate_size: int
+    # Aggregate padding across the full TP group: physical * TP - logical total.
     padding_per_tp_group: int
     native_top_k: int
     source: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class MoeProfiledPhysicalGeometry:
+    model_id: str
+    recipe_id: str
+    tp_size: int
+    physical_intermediate_size: int
+    profile_ids: tuple[str, ...]
+    source: str
+
+    def __post_init__(self) -> None:
+        if not self.model_id or not self.recipe_id or not self.source:
+            raise ValueError("profiled MoE geometry labels must be non-empty")
+        if self.tp_size <= 0 or self.physical_intermediate_size <= 0:
+            raise ValueError("profiled MoE geometry sizes must be positive")
+        if not self.profile_ids or len(self.profile_ids) != len(set(self.profile_ids)):
+            raise ValueError(
+                "profiled MoE geometry profile IDs must be non-empty and unique"
+            )
+        if any(not profile_id for profile_id in self.profile_ids):
+            raise ValueError("profiled MoE geometry profile IDs must be non-empty")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -135,6 +161,16 @@ class MoePhysicalGeometry:
     hidden_size: int
     intermediate_size: int
     aliases: tuple[MoeGeometryAlias, ...]
+    profile_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.profile_ids) != len(set(self.profile_ids)):
+            raise ValueError("MoE physical geometry profile IDs must be unique")
+        if any(not profile_id for profile_id in self.profile_ids):
+            raise ValueError("MoE physical geometry profile IDs must be non-empty")
+
+    def applies_to_profile(self, profile_id: str | None) -> bool:
+        return not self.profile_ids or profile_id in self.profile_ids
 
     @property
     def key(self) -> tuple[object, ...]:
@@ -422,6 +458,20 @@ COMMON_MOE_MODELS = (
     ),
 )
 
+PROFILED_MOE_PHYSICAL_GEOMETRIES = (
+    MoeProfiledPhysicalGeometry(
+        model_id="glm-5.3-flash",
+        recipe_id="modelopt-nvfp4",
+        tp_size=3,
+        physical_intermediate_size=704,
+        profile_ids=GLM53_TP3_MOE_PROFILE_IDS,
+        source=(
+            "GPU-measured GLM-5.3 Flash TP3 padded rank-local width on "
+            "NVIDIA RTX PRO 6000 Blackwell"
+        ),
+    ),
+)
+
 
 MOE_BENCHMARK_PRESETS = (
     MoeBenchmarkPreset(
@@ -543,6 +593,9 @@ def expand_physical_geometries(
     *,
     models: tuple[MoeModelGeometry, ...] = COMMON_MOE_MODELS,
     recipes: tuple[MoeRecipe, ...] = MOE_RECIPES,
+    profiled_geometries: tuple[MoeProfiledPhysicalGeometry, ...] = (
+        PROFILED_MOE_PHYSICAL_GEOMETRIES
+    ),
 ) -> tuple[MoePhysicalGeometry, ...]:
     """Expand models over TP and merge identical rank-local kernel geometry."""
 
@@ -583,6 +636,15 @@ def expand_physical_geometries(
                         continue
                     logical_max = max(logical_sizes)
                     physical_size = recipe.physical_intermediate_size(logical_max)
+                    if (
+                        physical_size < logical_max
+                        or physical_size % recipe.intermediate_alignment
+                    ):
+                        raise ValueError(
+                            f"model {model.model_id!r} TP{tp_size} physical "
+                            f"intermediate size {physical_size} cannot hold logical "
+                            f"size {logical_max} for recipe {recipe.recipe_id!r}"
+                        )
                     key = (
                         recipe.recipe_id,
                         model.activation,
@@ -623,6 +685,62 @@ def expand_physical_geometries(
                 ),
             )
         )
+    models_by_id = {model.model_id: model for model in models}
+    for profiled in profiled_geometries:
+        model = models_by_id.get(profiled.model_id)
+        recipe = recipes_by_id.get(profiled.recipe_id)
+        if model is None or recipe is None:
+            continue
+        if (
+            profiled.tp_size not in model.tp_sizes
+            or recipe.family_id not in model.recipe_families
+            or model.activation not in recipe.compatible_activations
+        ):
+            raise ValueError(
+                f"profiled MoE geometry {profiled.model_id!r}/"
+                f"{profiled.recipe_id!r}/TP{profiled.tp_size} is incompatible "
+                "with its model corpus entry"
+            )
+        logical_sizes = _logical_shard_sizes(
+            model.intermediate_size,
+            profiled.tp_size,
+        )
+        physical_size = profiled.physical_intermediate_size
+        if (
+            not logical_sizes
+            or physical_size < max(logical_sizes)
+            or physical_size % recipe.intermediate_alignment
+        ):
+            raise ValueError(
+                f"profiled MoE physical intermediate size {physical_size} cannot "
+                f"hold {profiled.model_id!r} TP{profiled.tp_size} for "
+                f"{profiled.recipe_id!r}"
+            )
+        geometries.append(
+            MoePhysicalGeometry(
+                recipe=recipe,
+                activation=model.activation,
+                num_experts=model.num_experts,
+                hidden_size=model.hidden_size,
+                intermediate_size=physical_size,
+                aliases=(
+                    MoeGeometryAlias(
+                        model_id=model.model_id,
+                        tp_size=profiled.tp_size,
+                        global_intermediate_size=model.intermediate_size,
+                        logical_intermediate_sizes=logical_sizes,
+                        physical_intermediate_size=physical_size,
+                        padding_per_tp_group=(
+                            physical_size * profiled.tp_size - model.intermediate_size
+                        ),
+                        native_top_k=model.native_top_k,
+                        source=profiled.source,
+                    ),
+                ),
+                profile_ids=profiled.profile_ids,
+            )
+        )
+    geometries.sort(key=lambda geometry: (geometry.key, geometry.profile_ids))
     return tuple(geometries)
 
 
@@ -688,7 +806,7 @@ def expand_sweep_cases(
 
 def corpus_manifest() -> dict[str, object]:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tp_sizes": list(COMMON_TP_SIZES),
         "top_k": list(COMMON_TOP_K),
         "decode_tokens": list(COMMON_DECODE_TOKENS),
@@ -697,6 +815,9 @@ def corpus_manifest() -> dict[str, object]:
         "recipes": [asdict(recipe) for recipe in MOE_RECIPES],
         "models": [asdict(model) for model in COMMON_MOE_MODELS],
         "benchmark_presets": [asdict(preset) for preset in MOE_BENCHMARK_PRESETS],
+        "profiled_physical_geometries": [
+            asdict(geometry) for geometry in PROFILED_MOE_PHYSICAL_GEOMETRIES
+        ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["corpus_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -704,6 +825,7 @@ def corpus_manifest() -> dict[str, object]:
 
 
 __all__ = [
+    "GLM53_TP3_MOE_PROFILE_IDS",
     "COMMON_DECODE_TOKENS",
     "COMMON_MOE_MODELS",
     "COMMON_PLAN_TOKEN_COUNTS",
@@ -713,10 +835,12 @@ __all__ = [
     "COMMON_TP_SIZES",
     "MOE_BENCHMARK_PRESETS",
     "MOE_RECIPES",
+    "PROFILED_MOE_PHYSICAL_GEOMETRIES",
     "MoeBenchmarkPreset",
     "MoeGeometryAlias",
     "MoeModelGeometry",
     "MoePhysicalGeometry",
+    "MoeProfiledPhysicalGeometry",
     "MoeRecipe",
     "MoeSweepCase",
     "align_up",

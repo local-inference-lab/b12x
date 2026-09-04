@@ -54,6 +54,7 @@ class GenerationContext:
     work_dir: Path
     source_revision: str
     settings: GenerationSettings
+    profile_id: str | None = None
 
     def checkpoint_metadata(self) -> dict[str, object]:
         return {

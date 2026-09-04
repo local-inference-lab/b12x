@@ -15,6 +15,15 @@ COMMON_CONTEXT_TOKENS = (128, 16_384, 32_768, 65_536, 131_072)
 COMMON_PAGE_SIZES = (64, 128)
 COMMON_KV_DTYPES = ("bfloat16", "float8_e4m3fn")
 GDN_STATE_INDEX_COLUMNS = tuple(range(1, 9))
+GLM53_TP3_KDA_SERVING_CASES = (
+    ("ordinary", 16, 16, 1),
+    ("mtp3", 16, 64, 4),
+    ("dflash7", 16, 128, 8),
+    ("ordinary-c8", 8, 8, 1),
+    ("mtp3-c8", 8, 32, 4),
+    ("dflash7-c8", 8, 64, 8),
+)
+GLM53_TP3_KDA_PROFILE_IDS = ("nvidia.rtx.pro.6000.blackwell",)
 QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES
 QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
 QSA_PAGE_SIZES = (16, 64)
@@ -534,6 +543,38 @@ ATTENTION_BENCHMARK_PRESETS = (
 )
 
 
+def _glm53_tp3_kda_serving_case_contract(
+    serving_mode: str,
+    max_seqs: int,
+    max_tokens: int,
+    columns: int,
+) -> dict[str, object]:
+    """Return the complete SweepCase construction contract for one TP3 shape."""
+    return {
+        "group_id": "glm-5.3-flash-kda-tp3-serving",
+        "query": {
+            "gate_activation": "sigmoid",
+            "qk_l2norm": True,
+            "key_heads": 22,
+            "value_heads": 22,
+            "state_dtype": "float32",
+            "max_seqs": max_seqs,
+            "max_tokens": max_tokens,
+            "state_index_columns": columns,
+        },
+        "scenario": "default",
+        "metadata": {
+            "decay_recipe": "kda",
+            "model_id": "glm-5.3-flash-kda-tp3",
+            "profile_ids": list(GLM53_TP3_KDA_PROFILE_IDS),
+            "query_lengths": [columns] * max_seqs,
+            "serving_mode": serving_mode,
+            "source": "GLM-5.3 Flash KDA physical-66-head TP3 geometry",
+        },
+        "label": f"glm-5.3-flash-kda-tp3-{serving_mode}",
+    }
+
+
 def gdn_cases() -> tuple[SweepCase, ...]:
     cases = []
     exercised_queries = set()
@@ -605,6 +646,13 @@ def gdn_cases() -> tuple[SweepCase, ...]:
                 label=f"{geometry.model_id}-columns{columns}-edge",
             )
         )
+    for serving_case in GLM53_TP3_KDA_SERVING_CASES:
+        cases.append(
+            SweepCase.create(
+                **_glm53_tp3_kda_serving_case_contract(*serving_case),
+            )
+        )
+
     return tuple(cases)
 
 
@@ -869,6 +917,11 @@ def _manifest_payload(component: str) -> dict[str, object]:
     }
     if component == "gdn":
         shared["geometries"] = [asdict(item) for item in GDN_GEOMETRIES]
+        shared["glm53_tp3_kda_profile_ids"] = list(GLM53_TP3_KDA_PROFILE_IDS)
+        shared["glm53_tp3_kda_serving_cases"] = [
+            _glm53_tp3_kda_serving_case_contract(*item)
+            for item in GLM53_TP3_KDA_SERVING_CASES
+        ]
     elif component == "gqa":
         shared["geometries"] = [asdict(item) for item in GQA_GEOMETRIES]
     elif component == "qsa":
@@ -877,9 +930,7 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["qsa_context_tokens"] = list(QSA_CONTEXT_TOKENS)
         shared["qsa_page_sizes"] = list(QSA_PAGE_SIZES)
         shared["qsa_position_layouts"] = [list(item) for item in QSA_POSITION_LAYOUTS]
-        shared["qsa_speculative_context_tokens"] = list(
-            QSA_SPECULATIVE_CONTEXT_TOKENS
-        )
+        shared["qsa_speculative_context_tokens"] = list(QSA_SPECULATIVE_CONTEXT_TOKENS)
     elif component == "mla":
         shared["geometries"] = [asdict(item) for item in MLA_GEOMETRIES]
     elif component == "sparse_mla":
@@ -890,7 +941,10 @@ def _manifest_payload(component: str) -> dict[str, object]:
 
 
 def attention_corpus_manifest(component: str) -> dict[str, object]:
-    payload = {"schema_version": 1, **_manifest_payload(component)}
+    payload = {
+        "schema_version": 2 if component == "gdn" else 1,
+        **_manifest_payload(component),
+    }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["corpus_sha256"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return payload
@@ -907,6 +961,8 @@ __all__ = [
     "COMMON_SEQUENCE_CAPACITIES",
     "GDN_GEOMETRIES",
     "GDN_STATE_INDEX_COLUMNS",
+    "GLM53_TP3_KDA_SERVING_CASES",
+    "GLM53_TP3_KDA_PROFILE_IDS",
     "GQA_GEOMETRIES",
     "MLA_GEOMETRIES",
     "QSA_GEOMETRIES",

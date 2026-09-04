@@ -13,6 +13,7 @@ and repeated calls (eager and graph replay) must be bitwise identical.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import os
 
 import pytest
@@ -42,6 +43,54 @@ def test_layout_covers_supported_ranks_and_scales_with_capacity() -> None:
     assert layouts[4].pack_stride > layouts[8].pack_stride
     assert layouts[2].slab_bytes > layouts[4].slab_bytes
     assert layouts[4].slab_bytes > layouts[8].slab_bytes
+
+
+def test_all_reduce_only_capture_prepares_only_pull_launchers(monkeypatch) -> None:
+    pull_launcher_requests: list[tuple[object, ...]] = []
+    collective_contracts: list[tuple[object, ...]] = []
+
+    def unexpected_generic_launcher(*_args):
+        raise AssertionError("all_reduce must not use the generic two-shot launcher")
+
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_twoshot_bf16._is_current_stream_capturing",
+        lambda _device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_twoshot_bf16.get_twoshot_bf16_launcher",
+        unexpected_generic_launcher,
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_twoshot_bf16.get_twoshot_bf16_allreduce_launcher",
+        lambda *args: pull_launcher_requests.append(args),
+    )
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_twoshot_bf16._require_collective_contract",
+        lambda **kwargs: collective_contracts.append(kwargs["contract"]),
+    )
+
+    pool = object.__new__(PCIeTwoShotBF16)
+    pool.rank = 1
+    pool.world_size = 4
+    pool.device = torch.device("cuda", 0)
+    pool.exchange_group = None
+    pool.row_elems = 16
+    pool._slot = 1
+    pool._device_slot_selection = False
+    pool._device_slot_bias = 0
+    pool._capture_context_depth = 0
+    pool._closed = False
+
+    with pool.capture(operations=("all_reduce",), threads=256):
+        assert pool._capture_context_depth == 1
+
+    assert pool._capture_context_depth == 0
+    assert pull_launcher_requests == [
+        (4, 1, True, 0, 256, 16, 0),
+        (4, 1, True, 1, 256, 16, 0),
+    ]
+    assert collective_contracts == [(("all_reduce",), 256, False, 1)]
 
 
 def _payload(seed: int, rows: int, device: torch.device) -> torch.Tensor:
@@ -94,7 +143,7 @@ def _check_graph_capture(pool: PCIeTwoShotBF16, rank: int, world: int) -> None:
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with pool.capture():
+    with pool.capture(operations=("all_reduce",)):
         with torch.cuda.stream(stream):
             for _ in range(3):
                 pool.all_reduce(static)

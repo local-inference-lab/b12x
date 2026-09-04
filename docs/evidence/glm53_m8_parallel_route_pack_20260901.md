@@ -1,6 +1,7 @@
-# GLM-5.3 M8 parallel route-pack qualification
+# GLM-5.3 M8 parallel route-pack evidence
 
-Status: **qualified** for the configuration recorded below.
+Status: **serving-performance evidence only** for the configuration recorded
+below. This record does not qualify candidate correctness.
 
 ## Operation under test
 
@@ -115,18 +116,22 @@ was 81.1014504670 verifier steps/s. The reported ratio is
 throughput by **5.80%**. This result is scoped to the configuration and hardware
 recorded above.
 
-The three independently measured B12X execution changes are not additive. A
-server containing this change, packed MXFP8 fill elision, and PCIe/MHC
-dependent-launch support measured 81.2987080029 verifier steps/s, or 6.06%
-above the same baseline.
+No combined-stack performance result is retained here. The historical
+combined-stack timing was not accompanied by an independent command, target
+revision, worktree, artifact identity, physical GPU identity and mode,
+correctness state, or raw samples, so it cannot support a performance claim.
 
-## Correctness gate
+## Correctness evidence limitation
 
-The exact GLM-5.3 M8 split route/compute CUDA graph test passed on an RTX PRO
-6000 Blackwell GPU. The test checks the NVFP4 oracle before and after live-input
-mutation, three graph replays, caller-owned output storage, zero replay
-allocations, frozen kernel resolution, and reuse of the compiled dynamic
-kernel. The exact command was:
+The recorded correctness command mounted
+`/root/vllm/worktrees/b12x-glm53-m8-route-pack-20260901`, not the candidate
+worktree identified above. No commit or tree hash for that mounted worktree,
+compiled-artifact identity, or physical GPU UUID and mode was retained. Its
+result therefore cannot be attributed to candidate revision
+`945faa62bf8748d3c39c04f89d4c1560f248d0d5`, and this report retains no
+candidate correctness verdict.
+
+The historical command was:
 
 ```bash
 docker run --rm --gpus '"device=2"' --ipc=host --shm-size=12g \

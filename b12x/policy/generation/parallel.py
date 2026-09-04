@@ -56,6 +56,7 @@ class _MeasurementTask:
     work_dir: Path
     source_revision: str
     settings: GenerationSettings
+    profile_id: str | None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -170,6 +171,7 @@ def _run_task(task: _MeasurementTask) -> _MeasurementResult:
         work_dir=task.work_dir,
         source_revision=task.source_revision,
         settings=task.settings,
+        profile_id=task.profile_id,
     )
     estimate = generator.estimate(context)
     if (
@@ -246,6 +248,7 @@ def run_parallel_measurements(
                     work_dir=context.work_dir,
                     source_revision=context.source_revision,
                     settings=context.settings,
+                    profile_id=context.profile_id,
                 ),
             )
             futures[future] = partition

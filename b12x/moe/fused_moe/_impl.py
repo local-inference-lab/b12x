@@ -6740,6 +6740,7 @@ def plan_tp_moe_execution(
         )
         split_fast_prepare = bool(
             split_route_compute
+            and _FAST_MATH_DEFAULT
             and _env_flag(_DYNAMIC_SPLIT_FAST_PREPARE_ENV, default=False)
         )
         split_task_capacity = 1
@@ -8294,7 +8295,7 @@ def _prewarm_dynamic_m8_launches(
     plan: TPMoEPlan,
     core_plan: _TPCoreWorkspacePlan,
 ) -> tuple[tuple[str, torch.dtype, object], ...]:
-    """Compile every artifact used by a planned GLM-5.3 M8 split launch."""
+    """Compile the planned GLM-5.3 M8 split artifacts and scalar-scale fallback."""
 
     config = plan.dynamic_launch_config
     if config is None or not config.split_route_compute:
@@ -8321,6 +8322,30 @@ def _prewarm_dynamic_m8_launches(
     launches: list[tuple[str, torch.dtype, object]] = []
     with torch.cuda.device(plan.device):
         for topk_ids_dtype in (torch.int32, torch.int64):
+            # Scalar NVFP4 activation scales retain the qualified fused/shared
+            # launch even when this plan otherwise selects split routing.
+            fused_shared, _ = _get_dynamic_kernel(
+                plan.weight_E,
+                8,
+                plan.k,
+                plan.n,
+                plan.num_topk,
+                plan.max_rows,
+                topk_ids_dtype=topk_ids_dtype,
+                fast_math=config.fast_math,
+                activation=plan.activation,
+                quant_mode=plan.quant_mode,
+                external_route_plan=True,
+                share_input_across_experts=True,
+                deterministic_output=False,
+                swiglu_limit=plan.swiglu_limit,
+                swiglu_alpha=plan.swiglu_alpha,
+                swiglu_beta=plan.swiglu_beta,
+                planned_tile_m=16,
+                split_phase="fused",
+                work_source_override=config.work_source,
+            )
+            launches.append(("fused_shared", topk_ids_dtype, fused_shared))
             if config.split_fast_prepare:
                 route_pack = _get_m8_route_pack_kernel(
                     topk_ids_dtype=topk_ids_dtype,
