@@ -2012,12 +2012,15 @@ def _run_glm_multitoken(
     lengths=None,
     graph_lengths=None,
     num_heads=_GLM_NUM_HEADS,
+    cache_hook=None,
 ):
     """Run the unified GLM decode with per-token lengths and return
     ``(out, expected, lengths)``. With ``graph_lengths`` the launch is captured
     into a CUDA graph at ``lengths`` and replayed after the length tensor is
     overwritten with ``graph_lengths``; the returned output and expectation then
-    correspond to ``graph_lengths``."""
+    correspond to ``graph_lengths``. ``cache_hook(kv_cache_flat, q, idx)`` may
+    edit the token-major cache in place before the kernel and the reference
+    read it."""
     from b12x.attention._shared.mla.kernel import run_unified_decode
     from b12x.attention.sparse_mla._scratch import (
         B12XSparseMLAScratchCaps,
@@ -2034,6 +2037,8 @@ def _run_glm_multitoken(
     idx = case["topk_indices"].contiguous()
     sm_scale = case["sm_scale"]
     s_kv = kv_cache_flat.shape[0]
+    if cache_hook is not None:
+        cache_hook(kv_cache_flat, q, idx)
     # The launcher addresses pages as block * page_bytes + slot * 656, so the
     # token-major reference cache is the same bytes as a (blocks, page, 656) view.
     kv_cache = kv_cache_flat.view(nblk, _GLM_PAGE, kv_cache_flat.shape[-1])
@@ -2378,3 +2383,46 @@ def test_unified_decode_glm_fastpath_bit_identical(monkeypatch, num_tokens, topk
     assert launch.LAST_DECODE_PLAN.get("glm_fastpath") is True
     assert torch.equal(base, ldsm)
     _assert_glm_rows_match_reference(ldsm, exp, lengths, label="glm_fastpath")
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_unified_decode_glm_serial_chunks_rescale_late_maximum(num_tokens) -> None:
+    """A split that walks several chunks serially must rescale its accumulators
+    when the running maximum rises in a later chunk. Each of the 64 keys of the
+    last of ten chunks is the dominant key of one pair of row-0 heads (logit
+    about 7 against a background of about 0.15); the single-split serial walk
+    must match the reference and the one-chunk-per-split walk. Without the
+    rescale the earlier chunks keep their unscaled weight and the output error
+    is close to 100 %."""
+    device = require_b12x_sparse_mla()
+    topk = 640
+    n_chunks = topk // 64
+    boost = 60.0
+
+    def dominant_keys_in_last_chunk(kv_cache_flat, q, idx):
+        rope = q[0, :, 512:].float()
+        rope = rope / rope.norm(dim=-1, keepdim=True)
+        # Heads h and h + 64 share key h; the key points along their mean.
+        pair_mean = rope.view(-1, 64, rope.shape[-1]).sum(dim=0)
+        pair_mean = boost * pair_mean / pair_mean.norm(dim=-1, keepdim=True)
+        for key in range(64):
+            slot = int(idx[0, topk - 64 + key])
+            kv_cache_flat[slot, 0, 528:656] = pair_mean[key].to(torch.bfloat16).view(torch.uint8)
+
+    lengths = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    serial, exp, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=1,
+        seed=7900 + num_tokens, lengths=lengths, cache_hook=dominant_keys_in_last_chunk,
+        partial_dtype=torch.float32,
+    )
+    per_chunk, _, _ = _run_glm_multitoken(
+        device, topk=topk, num_tokens=num_tokens, forced_num_splits=n_chunks,
+        seed=7900 + num_tokens, lengths=lengths, cache_hook=dominant_keys_in_last_chunk,
+        partial_dtype=torch.float32,
+    )
+    for label, got in (("serial", serial), ("per_chunk", per_chunk)):
+        rel = ((got - exp).norm() / exp.norm()).item()
+        assert rel < 2e-2, f"{label} rel-L2 vs reference {rel}"
+    rel = ((serial - per_chunk).norm() / exp.norm()).item()
+    assert rel < 1e-2, f"serial vs per-chunk rel-L2 {rel}"

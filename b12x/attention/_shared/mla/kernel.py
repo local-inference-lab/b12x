@@ -1113,7 +1113,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax_glm_h8_swap_ab(
                         qk,
                         p,
                         acc_nope,
@@ -1131,6 +1131,7 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         rope_tiles_per_warp=(2 if self.native_dsv4_h8 else 0),
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -1224,7 +1225,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax(
                         qk,
                         p,
                         acc_nope,
@@ -1244,6 +1245,7 @@ class UnifiedDecodeKernel:
                         num_threads=self.math_threads,
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2142,7 +2144,7 @@ class UnifiedDecodeKernel:
                         lane,
                     )
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax_glm_h8_swap_ab(
                         qk,
                         p,
                         acc_nope,
@@ -2163,6 +2165,7 @@ class UnifiedDecodeKernel:
                             2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 0
                         ),
                         barrier_threads=bt_stage,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
@@ -2287,7 +2290,7 @@ class UnifiedDecodeKernel:
                         )
 
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax(
+                    p, wr0, wr1, acc_nope, acc_rope, global_max, global_sum = s4_online_softmax(
                         qk,
                         p,
                         acc_nope,
@@ -2308,6 +2311,7 @@ class UnifiedDecodeKernel:
                         barrier_id=3,
                         n_acc_tiles=n_acc_tiles,
                         skip_unit_rescale=self.glm_fastpath,
+                        return_state=True,
                     )
                     w_pre = [
                         p[0] * wr0,
