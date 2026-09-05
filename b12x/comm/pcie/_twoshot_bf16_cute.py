@@ -666,6 +666,12 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
     barrier, every rank pulls the other ranks' reduced shards into the output.
     PCIe read volume per rank is 2P*(world - 1)/world, which is 1.5P for world
     size 4; synchronization uses two barriers.
+
+    Shards are contiguous pack ranges. ``rows_per_rank`` rows of ``row_elems``
+    form the base shard; ``remainder_packs`` (below the world size) extra packs
+    are handed one each to the lowest ranks, so a payload whose pack count is
+    not a multiple of the world size is reduced in place without wire padding.
+    Rank ``k`` owns packs ``[k*base + min(k, r), (k+1)*base + min(k+1, r))``.
     """
 
     def __init__(
@@ -714,6 +720,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         reduced_offset: Int64,
         slot_bytes: Int64,
         rows_per_rank: Int32,
+        remainder_packs: Int32,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -742,6 +749,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             reduced_offset,
             slot_bytes,
             rows_per_rank,
+            remainder_packs,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -787,6 +795,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         reduced_offset: Int64,
         slot_bytes: Int64,
         rows_per_rank: Int32,
+        remainder_packs: Int32,
     ) -> None:
         staging = (
             staging0,
@@ -815,8 +824,17 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         gdim, _, _ = cute.arch.grid_dim()
         local_rank = rank
         packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
-        shard_packs = Int64(rows_per_rank) * Int64(packs_per_row)
-        full_packs = shard_packs * Int64(self._world_size)
+        base_packs = Int64(rows_per_rank) * Int64(packs_per_row)
+        remainder = Int64(remainder_packs)
+        full_packs = base_packs * Int64(self._world_size) + remainder
+        # Balanced contiguous partition: ranks below the remainder own one
+        # extra pack. The local shard bounds are runtime scalars.
+        shard_base = Int64(local_rank) * base_packs + Int64(
+            cutlass.min(local_rank, remainder_packs)
+        )
+        shard_packs = base_packs
+        if local_rank < remainder_packs:
+            shard_packs = base_packs + Int64(1)
         threads = Int64(self._threads)
         grid_threads = Int64(gdim) * threads
         flat = Int64(bidx) * threads + Int64(tidx)
@@ -855,7 +873,6 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         self._barrier(signals, local_rank)
 
         # Pull and reduce this rank's shard from every staged peer payload.
-        shard_base = Int64(local_rank) * shard_packs
         index = flat
         while index < shard_packs:
             accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
@@ -894,9 +911,15 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                 + staging_slot_offset
                 + reduced_offset
             )
-            destination = output_address + Int64(source_rank) * shard_packs * Int64(16)
+            peer_shard_base = Int64(source_rank) * base_packs + Int64(
+                cutlass.min(source_rank, remainder_packs)
+            )
+            peer_shard_packs = base_packs
+            if source_rank < remainder_packs:
+                peer_shard_packs = base_packs + Int64(1)
+            destination = output_address + peer_shard_base * Int64(16)
             index = flat
-            while index < shard_packs:
+            while index < peer_shard_packs:
                 words = ld_global_v4_u32(peer_reduced + index * Int64(16))
                 st_global_v4_u32(
                     destination + index * Int64(16),
@@ -989,6 +1012,7 @@ def get_twoshot_bf16_allreduce_launcher(
         1,
         1,
         1,
+        0,
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
@@ -1007,10 +1031,13 @@ def get_twoshot_bf16_allreduce_launcher(
         reduced_offset: int,
         slot_bytes: int,
         rows_per_rank: int,
+        remainder_packs: int,
         grid_x: int,
     ) -> None:
         if len(staging_addresses) != 9 or len(signal_addresses) != 9:
             raise ValueError("two-shot scalar pointer ABI requires nine peer slots")
+        if not 0 <= int(remainder_packs) < world_size:
+            raise ValueError("remainder_packs must be below the world size")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
@@ -1046,6 +1073,7 @@ def get_twoshot_bf16_allreduce_launcher(
             reduced_offset,
             slot_bytes,
             rows_per_rank,
+            remainder_packs,
             grid_x,
             current_cuda_stream(),
         )

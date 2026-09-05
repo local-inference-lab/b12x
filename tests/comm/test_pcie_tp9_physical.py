@@ -80,22 +80,42 @@ def _worker(rank: int, port: int) -> None:
         max_rows=49149,
         row_elems=8,
     )
-    for rows in (8, 16, 32):
-        inp = torch.full((rows, 7168), rank + 1, dtype=torch.bfloat16, device=device)
+
+    def position_pattern(rows: int, width: int) -> torch.Tensor:
+        # Position-dependent integers keep every partial sum exact in bf16
+        # (at most 5 * 45 = 225) and expose misplaced or dropped shards,
+        # which uniform fills cannot.
+        return (
+            torch.arange(rows * width, device=device).remainder(5) + 1
+        ).to(torch.bfloat16).view(rows, width)
+
+    def check_pattern(tensor: torch.Tensor, scale: float) -> None:
+        torch.cuda.synchronize(device)
+        expected = position_pattern(*tensor.shape) * scale
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+
+    # Kimi-K3 decode payloads: 7168 wide rows (T tokens) and the 3584 wide
+    # latent projection. Their pack counts are multiples of nine only when
+    # 9 | T, so most shapes exercise the balanced (uneven) shard partition.
+    for rows, width in ((4, 7168), (8, 7168), (9, 7168), (16, 7168), (32, 7168),
+                        (4, 3584), (16, 3584)):
+        inp = position_pattern(rows, width) * (rank + 1)
         out = torch.empty_like(inp)
         assert twoshot.accepts(inp)
         twoshot.all_reduce(inp, out=out)
-        check(out, 45)
+        check_pattern(out, 45)
+    inp = position_pattern(16, 7168) * (rank + 1)
+    out = torch.empty_like(inp)
     graph = torch.cuda.CUDAGraph()
     with twoshot.capture(), torch.cuda.graph(graph):
         twoshot.all_reduce(inp, out=out)
     for iteration in range(3):
-        inp.fill_(rank + 1 + (iteration if rank == 8 else 0))
+        inp.copy_(position_pattern(16, 7168) * (rank + 1 + (iteration if rank == 8 else 0)))
         graph.replay()
-        check(out, 45 + iteration)
+        check_pattern(out, 45 + iteration)
     del graph
     twoshot.close()
-    record("twoshot_wire_tail_eager_graph_passed")
+    record("twoshot_balanced_partition_eager_graph_passed")
 
     dma = PCIeDmaAllReduce(
         exchange_group=group,

@@ -180,9 +180,12 @@ class PCIeTwoShotBF16:
         self._coordinated_close_complete = False
         self._wire_input = None
         self._wire_output = None
-        if world_size == 9:
-            # Model widths need not divide nine. These fixed owners keep wire
-            # padding allocation-free during eager launches and graph replay.
+        if world_size == 9 and row_elems != _PACK_ELEMS:
+            # Multi-pack rows cannot be split at pack granularity, so payloads
+            # whose row count does not divide nine are padded on the wire.
+            # These fixed owners keep that padding allocation-free during
+            # eager launches and graph replay. Single-pack rows use the
+            # balanced pack partition of the pull all-reduce instead.
             self._wire_input = torch.empty(
                 (max_rows, row_elems), dtype=torch.bfloat16, device=self.device
             )
@@ -355,10 +358,26 @@ class PCIeTwoShotBF16:
         numel = inp.numel()
         if numel == 0 or numel % _PACK_ELEMS != 0:
             return False
+        if self._balanced_partition:
+            # Pack-granular shards: the largest shard must fit the per-rank
+            # reduced region, and the whole payload the staged payload region.
+            packs = numel // _PACK_ELEMS
+            largest_shard = -(-packs // self.world_size)
+            return largest_shard <= self._pack_stride
         alignment = self.row_elems * self.world_size
         if self.world_size == 9:
             return _align_up(numel, alignment) <= self.max_rows * self.row_elems
         return numel % alignment == 0 and numel // self.row_elems <= self.max_rows
+
+    @property
+    def _balanced_partition(self) -> bool:
+        """True when ``all_reduce`` splits payloads at pack granularity.
+
+        Single-pack rows let the pull all-reduce hand each rank a contiguous
+        pack range whose lengths differ by at most one, so no payload needs
+        wire padding. Wider rows keep the row-aligned equal shards.
+        """
+        return self.row_elems == _PACK_ELEMS
 
     # ---- graph plumbing ---------------------------------------------------
 
@@ -448,11 +467,16 @@ class PCIeTwoShotBF16:
         rows_per_rank: int,
         threads: int,
         block_limit: int,
+        remainder_packs: int = 0,
     ) -> tuple[int, int, int]:
         threads = int(threads)
         if threads <= 0 or threads > 512 or threads % 32 != 0:
             raise ValueError("threads must be a warp-aligned value in [32, 512]")
+        if not 0 <= int(remainder_packs) < self.world_size:
+            raise ValueError("remainder_packs must be below the world size")
         shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
+        if remainder_packs:
+            shard_packs += 1
         if shard_packs > self._pack_stride:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
@@ -636,12 +660,14 @@ class PCIeTwoShotBF16:
         rows_per_rank: int,
         threads: int,
         block_limit: int,
+        remainder_packs: int = 0,
     ) -> None:
         blocks, slot, device_index = self._resolve_launch_parameters(
             "all_reduce",
             rows_per_rank=rows_per_rank,
             threads=threads,
             block_limit=block_limit,
+            remainder_packs=remainder_packs,
         )
         with torch.cuda.device(self.device):
             launcher = get_twoshot_bf16_allreduce_launcher(
@@ -662,6 +688,7 @@ class PCIeTwoShotBF16:
                 self._reduced_offset,
                 self._slot_bytes,
                 rows_per_rank,
+                remainder_packs,
                 blocks,
             )
 
@@ -677,8 +704,6 @@ class PCIeTwoShotBF16:
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
         logical_numel = inp.numel()
-        wire_numel = _align_up(logical_numel, self.row_elems * self.world_size)
-        rows = wire_numel // self.row_elems
         with _device_guard(self.device):
             if out is None:
                 if _is_current_stream_capturing(self.device):
@@ -693,6 +718,19 @@ class PCIeTwoShotBF16:
                 name="output",
             )
             _require_disjoint(out, inp, source_name="input")
+            if self._balanced_partition:
+                packs = logical_numel // _PACK_ELEMS
+                self._launch_pull_all_reduce(
+                    inp.view(-1),
+                    out.view(-1),
+                    rows_per_rank=packs // self.world_size,
+                    remainder_packs=packs % self.world_size,
+                    threads=threads,
+                    block_limit=block_limit,
+                )
+                return out
+            wire_numel = _align_up(logical_numel, self.row_elems * self.world_size)
+            rows = wire_numel // self.row_elems
             padded = wire_numel != logical_numel
             if padded:
                 assert self._wire_input is not None and self._wire_output is not None
