@@ -1336,14 +1336,6 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                if route_active > Int32(0):
-                    out_acc0 = (
-                        out_acc0
-                        + bsf_f0
-                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                        * scale_lane
-                    )
-
                 u_packed1 = (
                     ld_global_nc_u32(
                         w2_base_addr
@@ -1398,6 +1390,16 @@ class MoEMicroKernelBackend:
                         self._scale_byte_to_f32(bsf_byte1)
                         if w_valid > Int32(0)
                         else Float32(0.0)
+                    )
+                # Issue both independent row loads before consuming either
+                # value. This preserves each row's accumulation order while
+                # exposing sibling-row memory-level parallelism.
+                if route_active > Int32(0):
+                    out_acc0 = (
+                        out_acc0
+                        + bsf_f0
+                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                        * scale_lane
                     )
                 if route_active > Int32(0):
                     out_acc1 = (
