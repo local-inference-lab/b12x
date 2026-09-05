@@ -5,6 +5,7 @@ import gc
 import pytest
 import torch
 
+from b12x.policy import GDN_ATTENTION, PolicyContext, PolicyMode
 from b12x.sequence import gdn_decode as gdn
 
 from ..conftest import require_b12x as require_sm120
@@ -25,6 +26,32 @@ def _randn(
     )
 
 
+def test_kda_plan_materializes_typed_recurrent_block_v() -> None:
+    from b12x.sequence.gdn_decode._impl import Caps, _materialize_plan
+
+    caps = Caps(
+        device="cuda:0",
+        max_tokens=128,
+        max_seqs=32,
+        max_state_slots=129,
+        key_heads=16,
+        value_heads=16,
+        state_index_columns=4,
+        state_dtype=torch.float32,
+        gate_activation="sigmoid",
+    )
+    config = gdn.GdnConfig(backend="triton", recurrent_block_v=16)
+
+    planned = _materialize_plan(
+        caps,
+        config=config,
+        policy_resolution=None,
+    )
+
+    assert planned.config is config
+    assert planned.recurrent_block_v == 16
+
+
 def _make_case(
     *,
     device: torch.device,
@@ -38,6 +65,7 @@ def _make_case(
     null_state_index: int | None = None,
     metadata_validation: str = "transactional",
     noncontiguous_beta: bool = False,
+    recurrent_block_v: int | None = None,
 ) -> gdn.KdaBinding:
     max_seqs = len(query_lengths)
     live_tokens = sum(query_lengths)
@@ -57,7 +85,19 @@ def _make_case(
         null_state_index=null_state_index,
         kda_metadata_validation=metadata_validation,
     )
-    plan = gdn.plan(caps)
+    policy = None
+    if recurrent_block_v is not None:
+        policy = PolicyContext.for_device(
+            device,
+            mode=PolicyMode.HEURISTIC_ONLY,
+        ).with_override(
+            GDN_ATTENTION,
+            gdn.GdnConfig(
+                backend="triton",
+                recurrent_block_v=recurrent_block_v,
+            ),
+        )
+    plan = gdn.plan(caps, policy=policy)
     (scratch_spec,) = plan.scratch_specs()
     query_start_loc = torch.tensor(
         [0, *torch.tensor(query_lengths).cumsum(0).tolist()],
@@ -218,7 +258,6 @@ def test_reference_applies_per_key_lower_bounded_decay() -> None:
 
 
 def test_reference_keeps_kda_rmsnorm_in_fp32_until_final_store() -> None:
-    device = torch.device("cpu")
     core = torch.linspace(-1.3, 1.7, 128, dtype=torch.float32).to(torch.bfloat16)
     q = torch.zeros(128, dtype=torch.bfloat16)
     q[0] = 1
@@ -377,10 +416,18 @@ def test_kda_rmsnorm_kernel_avoids_intermediate_bf16_rounding() -> None:
     assert new_error < old_error
 
 
+@pytest.mark.parametrize("recurrent_block_v", [16, 32])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_packed_kda_matches_reference(state_dtype: torch.dtype) -> None:
+def test_packed_kda_matches_reference(
+    state_dtype: torch.dtype,
+    recurrent_block_v: int,
+) -> None:
     device = require_sm120()
-    binding = _make_case(device=device, state_dtype=state_dtype)
+    binding = _make_case(
+        device=device,
+        state_dtype=state_dtype,
+        recurrent_block_v=recurrent_block_v,
+    )
     state_reference = binding.recurrent_state.clone()
     expected = _reference(binding, state_reference)
 
@@ -388,6 +435,7 @@ def test_packed_kda_matches_reference(state_dtype: torch.dtype) -> None:
     torch.cuda.synchronize(device)
 
     assert actual.data_ptr() == binding.output.data_ptr()
+    assert binding.plan.recurrent_block_v == recurrent_block_v
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(
         binding.recurrent_state,
