@@ -49,11 +49,21 @@ from .pcie_twoshot import (
     TWOSHOT_REQUIRED_SMS,
     _MAX_BLOCKS,
     _SIGNAL_BYTES,
-    _pad_scalar_peer_ptrs,
 )
 
+SUPPORTED_WORLD_SIZES = (2, 4, 8, 9)
 _PACK_ELEMS = 8
 SUPPORTED_WORLD_SIZES = (4,)
+
+
+def _pad_scalar_peer_ptrs(pointers, *, rank, world_size):
+    """Retain every peer in the nine-slot BF16 launch ABI."""
+    live = tuple(int(pointer) for pointer in pointers)
+    if world_size not in SUPPORTED_WORLD_SIZES or len(live) != world_size:
+        raise ValueError("invalid BF16 two-shot peer set")
+    if not 0 <= rank < world_size:
+        raise ValueError("BF16 two-shot rank is outside its peer set")
+    return live + (live[rank],) * (9 - world_size)
 
 
 @dataclass(frozen=True)
@@ -146,11 +156,13 @@ class PCIeTwoShotBF16:
         self._staging_ptrs = tuple(
             tuple(int(pointer) for pointer in slot) for slot in staging_ptrs
         )
-        if len(self._signal_ptrs) != 8 or (
+        if len(self._signal_ptrs) != 9 or (
             len(self._staging_ptrs) != 2
-            or any(len(slot) != 8 for slot in self._staging_ptrs)
+            or any(len(slot) != 9 for slot in self._staging_ptrs)
         ):
-            raise ValueError("two-shot scalar pointer ABI requires 8 peers and 2 slots")
+            raise ValueError(
+                "two-shot scalar pointer ABI requires 9 peer slots and 2 slots"
+            )
         self._owned_buffers = list(owned_buffers)
         self._ipc = ipc
         self.max_rows = max_rows

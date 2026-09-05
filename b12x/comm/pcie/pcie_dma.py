@@ -33,7 +33,7 @@ SUPPORTED_DTYPES = {
     torch.float16: 1,
     torch.float32: 2,
 }
-SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8, 9, 10)
 FLAG_STRIDE = 128
 FLAG_SLOTS = 256
 MAX_PIECES = 8
