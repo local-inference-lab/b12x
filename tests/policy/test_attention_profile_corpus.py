@@ -355,7 +355,7 @@ def test_rtx_pro_6000_profile_covers_glm_5_3_kda_serving_capacities() -> None:
         sm_count=188,
         product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
     )
-    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell")
+    profile = EMBEDDED_REGISTRY.get("nvidia.rtx.pro.6000.blackwell.max-q")
     component = profile.component("attention.gdn")
     assert component is not None
 
