@@ -178,6 +178,15 @@ class PCIeTwoShotBF16:
         self._ipc_imports_closed = False
         self._ipc_exports_freed = False
         self._coordinated_close_complete = False
+        self._wire_input = None
+        self._wire_output = None
+        if world_size == 9:
+            # Model widths need not divide nine. These fixed owners keep wire
+            # padding allocation-free during eager launches and graph replay.
+            self._wire_input = torch.empty(
+                (max_rows, row_elems), dtype=torch.bfloat16, device=self.device
+            )
+            self._wire_output = torch.empty_like(self._wire_input)
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
         return self
 
@@ -344,9 +353,12 @@ class PCIeTwoShotBF16:
         if inp.device != self.device:
             return False
         numel = inp.numel()
-        if numel == 0 or numel % (self.row_elems * self.world_size) != 0:
+        if numel == 0 or numel % _PACK_ELEMS != 0:
             return False
-        return numel // self.row_elems <= self.max_rows
+        alignment = self.row_elems * self.world_size
+        if self.world_size == 9:
+            return _align_up(numel, alignment) <= self.max_rows * self.row_elems
+        return numel % alignment == 0 and numel // self.row_elems <= self.max_rows
 
     # ---- graph plumbing ---------------------------------------------------
 
@@ -664,8 +676,9 @@ class PCIeTwoShotBF16:
         """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
-        rows = inp.numel() // self.row_elems
-        payload = inp.view(rows, self.row_elems)
+        logical_numel = inp.numel()
+        wire_numel = _align_up(logical_numel, self.row_elems * self.world_size)
+        rows = wire_numel // self.row_elems
         with _device_guard(self.device):
             if out is None:
                 if _is_current_stream_capturing(self.device):
@@ -680,7 +693,16 @@ class PCIeTwoShotBF16:
                 name="output",
             )
             _require_disjoint(out, inp, source_name="input")
-            out_view = out.view(rows, self.row_elems)
+            padded = wire_numel != logical_numel
+            if padded:
+                assert self._wire_input is not None and self._wire_output is not None
+                payload = self._wire_input[:rows]
+                payload.view(-1)[:logical_numel].copy_(inp.view(-1))
+                payload.view(-1)[logical_numel:].zero_()
+                out_view = self._wire_output[:rows]
+            else:
+                payload = inp.view(rows, self.row_elems)
+                out_view = out.view(rows, self.row_elems)
             self._launch_pull_all_reduce(
                 payload,
                 out_view,
@@ -688,6 +710,8 @@ class PCIeTwoShotBF16:
                 threads=threads,
                 block_limit=block_limit,
             )
+            if padded:
+                out.view(-1).copy_(out_view.view(-1)[:logical_numel])
         return out
 
     # ---- teardown (mirrors pcie_twoshot) -----------------------------------
