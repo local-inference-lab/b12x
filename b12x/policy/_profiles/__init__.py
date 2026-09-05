@@ -30,11 +30,13 @@ def _load_embedded_profiles() -> None:
     }
     for profile in EMBEDDED_REGISTRY.list_profiles():
         actual = {component.component_id for component in profile.components}
-        if actual != expected:
+        heuristic = set(profile.heuristic_components)
+        accounted = actual | heuristic
+        if accounted != expected:
             raise ValueError(
                 f"embedded profile {profile.profile_id!r} component drift; "
-                f"missing={sorted(expected - actual)}, "
-                f"unknown={sorted(actual - expected)}"
+                f"missing={sorted(expected - accounted)}, "
+                f"unknown={sorted(accounted - expected)}"
             )
 
 

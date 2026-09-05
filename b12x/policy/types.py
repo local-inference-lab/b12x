@@ -451,6 +451,7 @@ class GpuProfile:
     profile_id: str
     targets: tuple[DeviceIdentity, ...]
     components: tuple[ComponentProfile, ...]
+    heuristic_components: tuple[str, ...] = ()
     metadata: FrozenMapping = FrozenMapping()
 
     def __post_init__(self) -> None:
@@ -464,6 +465,26 @@ class GpuProfile:
         if len(component_ids) != len(set(component_ids)):
             raise ValueError(
                 f"GPU profile {self.profile_id!r} has duplicate components"
+            )
+        if len(self.heuristic_components) != len(set(self.heuristic_components)):
+            raise ValueError(
+                f"GPU profile {self.profile_id!r} has duplicate heuristic components"
+            )
+        invalid_heuristic = [
+            component_id
+            for component_id in self.heuristic_components
+            if not _COMPONENT_ID_RE.fullmatch(component_id)
+        ]
+        if invalid_heuristic:
+            raise ValueError(
+                f"GPU profile {self.profile_id!r} has invalid heuristic component "
+                f"IDs {invalid_heuristic}"
+            )
+        overlap = set(component_ids) & set(self.heuristic_components)
+        if overlap:
+            raise ValueError(
+                f"GPU profile {self.profile_id!r} declares components as both "
+                f"preplanned and heuristic: {sorted(overlap)}"
             )
 
     def component(self, component_id: str) -> ComponentProfile | None:

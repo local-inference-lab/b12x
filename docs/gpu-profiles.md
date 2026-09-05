@@ -45,9 +45,12 @@ can be introduced without changing the integration sequence.
 
 `b12x.policy.list_planning_components()` is the authoritative inventory for
 every planned op. All built-in planned ops are `profiled` and own lazy
-runtime-policy and generator registrations. Package loading rejects an embedded
-profile that omits a registered component. The component schema is validated
-before a matching config is returned; invalid matching data fails closed.
+runtime-policy and generator registrations. Package loading requires every
+registered component to be accounted for by either a generated component entry
+or an explicit `heuristic_components` declaration. The latter is reserved for a
+device whose component has not been qualified and causes AUTO resolution to use
+the component heuristic. The component schema is validated before a matching
+config is returned; invalid matching data fails closed.
 
 ## Precedence and overrides
 

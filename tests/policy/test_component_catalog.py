@@ -7,6 +7,7 @@ from b12x.gemm.bf16_vocab_projection._policy import (
     Bf16VocabProjectionQuery,
 )
 from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
+from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     PlanningPolicyMode,
@@ -41,18 +42,49 @@ def test_profiled_policies_generators_and_embedded_profile_stay_in_lockstep() ->
     profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
 
     assert generator_registry.component_ids() == expected_ids
-    assert tuple(component.component_id for component in profile.components) == (
-        expected_ids
-    )
+    preplanned_ids = tuple(component.component_id for component in profile.components)
+    assert set(preplanned_ids) | set(profile.heuristic_components) == set(expected_ids)
+    assert not set(preplanned_ids) & set(profile.heuristic_components)
     for registration in registrations:
         policy = registration.load_policy()
         generator = registration.create_generator()
         component = profile.component(str(registration.component_id))
-        assert component is not None
         assert generator.component_id == policy.component_id
         assert generator.query_schema_version == policy.query_schema_version
         assert generator.config_schema_version == policy.config_schema_version
+        if component is None:
+            assert str(registration.component_id) in profile.heuristic_components
+            continue
         validate_component_profile_contract(policy, component)
+
+
+def test_unqualified_gb10_mhc_resolves_from_the_heuristic() -> None:
+    profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
+    context = PolicyContext.for_identity(profile.targets[0])
+
+    resolution = context.resolve(
+        MHC_POLICY,
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=16,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+    )
+
+    assert MHC_POLICY.component_id in profile.heuristic_components
+    assert profile.component(MHC_POLICY.component_id) is None
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.profile_id is None
+    assert resolution.config == MHC_POLICY.heuristic(
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=16,
+            hidden_size=4_096,
+            split_k=64,
+        ),
+        profile.targets[0],
+    )
 
 
 def test_qwen_flash_next_qsa_serving_shape_resolves_from_gb10_profile() -> None:

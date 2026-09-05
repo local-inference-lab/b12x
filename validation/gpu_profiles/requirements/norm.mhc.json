@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "component_id": "norm.mhc",
-  "status": "research-only",
+  "status": "implemented",
   "target": {
     "query_schema_version": 1,
     "config_schema_version": 4,
@@ -36,6 +36,7 @@
     {
       "profile_id": "nvidia.gb10.48sm",
       "status": "unsupported",
+      "resolution": "heuristic",
       "targets": [
         {
           "vendor": "nvidia",
@@ -47,11 +48,11 @@
       "artifacts": [
         {
           "path": "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz",
-          "observed_config_schema_version": 1
+          "component_entry": "omitted"
         },
         {
           "path": "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
-          "observed_config_schema_version": 2
+          "component_entry": "omitted"
         }
       ],
       "command": "./scripts/generate_gpu_profile.py --device cuda:<ordinal> --components norm.mhc --output validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz --work-dir .b12x-profile-work/nvidia.gb10.48sm --overwrite --embed"
@@ -109,14 +110,15 @@
         "unique_mxfp8_projection_weights": 10,
         "in_graph_event_timing": true,
         "minimum_graph_replay_mhc_cosine": 0.998,
-        "observed_minimum_graph_replay_mhc_cosine": 0.9981107115745544,
-        "observed_minimum_context_consumer_cosine": 0.9968606233596802,
+        "observed_minimum_graph_replay_mhc_cosine": 0.998115062713623,
+        "observed_minimum_context_consumer_cosine": 0.996882975101471,
         "baseline_margin": 0.02,
-        "baseline_margin_retentions": 9,
+        "baseline_margin_retentions": 7,
         "stable_caller_owned_addresses": true,
-        "zero_replay_allocator_counter_deltas": true
+        "zero_replay_allocator_counter_deltas": true,
+        "source_revision": "c66ad79d50265eb556b4eecddec8acda34682ee2-worktree.69eb7641c8946fc3"
       },
-      "command": "./scripts/generate_gpu_profile.py --device cuda:<ordinal> --components norm.mhc --output validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz --work-dir .b12x-profile-work/nvidia.rtx.pro.6000.blackwell-in-layer-v5-final --overwrite --embed --no-cold-l2"
+      "command": "python ./scripts/generate_gpu_profile.py --device cuda:<ordinal> --components norm.mhc --output validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz --work-dir .b12x-profile-work/nvidia.rtx.pro.6000.blackwell-in-layer-policy-v5 --overwrite --embed --no-cold-l2"
     }
   ]
 }

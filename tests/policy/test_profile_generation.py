@@ -380,6 +380,38 @@ def test_partial_artifact_merge_replaces_only_generated_components(
     }
 
 
+def test_partial_artifact_merge_qualifies_an_explicit_heuristic_component(
+    tmp_path,
+) -> None:
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    base = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("attention.gqa"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+    base["profile"]["heuristic_components"] = ["moe.decode"]
+    update = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("moe.decode"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+
+    merged = merge_profile_artifacts(base, update)
+
+    assert [
+        component["component_id"] for component in merged["profile"]["components"]
+    ] == ["attention.gqa", "moe.decode"]
+    assert "heuristic_components" not in merged["profile"]
+
+
 def test_partial_artifact_merge_preserves_base_target_aliases(tmp_path) -> None:
     context = GenerationContext(
         device=_DEVICE,

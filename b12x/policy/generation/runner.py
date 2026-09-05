@@ -174,12 +174,15 @@ def merge_profile_artifacts(
         str(component["component_id"]): component
         for component in base_profile["components"]
     }
-    components.update(
-        {
-            str(component["component_id"]): component
-            for component in update_profile["components"]
-        }
-    )
+    update_components = {
+        str(component["component_id"]): component
+        for component in update_profile["components"]
+    }
+    components.update(update_components)
+    heuristic_components = (
+        set(base_profile.get("heuristic_components", ()))
+        | set(update_profile.get("heuristic_components", ()))
+    ) - set(update_components)
     metadata = dict(base_profile.get("metadata", {}))
     metadata.update(update_profile.get("metadata", {}))
     merged_profile: dict[str, object] = {
@@ -187,6 +190,8 @@ def merge_profile_artifacts(
         "targets": list(base_profile["targets"]),
         "components": [components[key] for key in sorted(components)],
     }
+    if heuristic_components:
+        merged_profile["heuristic_components"] = sorted(heuristic_components)
     if metadata:
         merged_profile["metadata"] = metadata
     profile_from_dict(merged_profile)

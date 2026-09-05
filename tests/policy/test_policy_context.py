@@ -406,9 +406,10 @@ def test_equal_priority_overlapping_rules_are_rejected() -> None:
 def test_embedded_gb10_profile_is_component_scoped() -> None:
     profile = EMBEDDED_REGISTRY.get("nvidia.gb10.48sm")
 
-    assert [component.component_id for component in profile.components] == [
-        str(item.component_id) for item in list_profiled_components()
-    ]
+    expected = {str(item.component_id) for item in list_profiled_components()}
+    preplanned = {component.component_id for component in profile.components}
+    assert preplanned | set(profile.heuristic_components) == expected
+    assert not preplanned & set(profile.heuristic_components)
     assert profile.targets[0] == DeviceIdentity(
         vendor="nvidia",
         compute_capability=(12, 1),

@@ -533,7 +533,7 @@ def test_mhc_profile_regeneration_manifest_tracks_every_artifact() -> None:
     )
 
     assert manifest["component_id"] == "norm.mhc"
-    assert manifest["status"] == "research-only"
+    assert manifest["status"] == "implemented"
     assert manifest["target"] == {
         "query_schema_version": 1,
         "config_schema_version": 4,
@@ -549,16 +549,6 @@ def test_mhc_profile_regeneration_manifest_tracks_every_artifact() -> None:
         "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz",
         "validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz",
     }
-    assert {
-        artifact["path"]: artifact["observed_config_schema_version"]
-        for profile in manifest["profiles"]
-        for artifact in profile["artifacts"]
-    } == {
-        "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz": 2,
-        "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz": 4,
-        "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz": 1,
-        "validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz": 4,
-    }
     assert {profile["profile_id"]: profile["status"] for profile in manifest["profiles"]} == {
         "nvidia.gb10.48sm": "unsupported",
         "nvidia.rtx.pro.6000.blackwell": "qualified",
@@ -567,22 +557,23 @@ def test_mhc_profile_regeneration_manifest_tracks_every_artifact() -> None:
         for artifact in profile["artifacts"]:
             payload = json.loads(gzip.decompress(Path(artifact["path"]).read_bytes()))
             profile_payload = payload.get("profile", payload)
-            component = next(
-                item
-                for item in profile_payload["components"]
-                if item["component_id"] == manifest["component_id"]
-            )
-            assert (
-                component["config_schema_version"]
-                == artifact["observed_config_schema_version"]
-            )
+            components = {
+                item["component_id"]: item for item in profile_payload["components"]
+            }
             if profile["status"] == "qualified":
+                component = components[manifest["component_id"]]
+                assert component["config_schema_version"] == artifact[
+                    "observed_config_schema_version"
+                ]
                 assert component["config_schema_version"] == manifest["target"][
                     "config_schema_version"
                 ]
             else:
-                assert component["config_schema_version"] < manifest["target"][
-                    "config_schema_version"
+                assert profile["resolution"] == "heuristic"
+                assert artifact["component_entry"] == "omitted"
+                assert manifest["component_id"] not in components
+                assert manifest["component_id"] in profile_payload[
+                    "heuristic_components"
                 ]
 
 

@@ -392,18 +392,34 @@ def test_qwen_dense_inspection_is_fully_preplanned_on_gb10(
     }
 
 
+def _assert_gb10_sources_match_qualification(payload: dict[str, object]) -> None:
+    selections = payload["selections"]
+    heuristic = [
+        selection for selection in selections if selection["source"] == "heuristic"
+    ]
+    assert [selection["component"] for selection in heuristic] == ["norm.mhc"]
+    assert all(
+        selection["source"] == "preplanned"
+        for selection in selections
+        if selection["component"] != "norm.mhc"
+    )
+
+
 @pytest.mark.parametrize("model", ("glm-5.2", "glm-5.3", "glm-5.3-flash"))
 @pytest.mark.parametrize("tp_size", (1, 2, 4, 8))
-def test_glm_inspection_is_fully_preplanned_on_gb10(
+def test_glm_inspection_matches_gb10_component_qualification(
     model: str,
     tp_size: int,
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
     assert payload["profile_id"] == "nvidia.gb10.48sm"
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    if model == "glm-5.3-flash":
+        _assert_gb10_sources_match_qualification(payload)
+    else:
+        assert {selection["source"] for selection in payload["selections"]} == {
+            "preplanned"
+        }
 
 
 @pytest.mark.parametrize(
@@ -434,6 +450,9 @@ def test_every_canonical_model_is_fully_preplanned_at_its_benchmark_tp(
 ) -> None:
     payload = inspect_model_policy(model, tp_size=tp_size, device="gb10")
 
-    assert {selection["source"] for selection in payload["selections"]} == {
-        "preplanned"
-    }
+    if model == "glm-5.3-flash":
+        _assert_gb10_sources_match_qualification(payload)
+    else:
+        assert {selection["source"] for selection in payload["selections"]} == {
+            "preplanned"
+        }

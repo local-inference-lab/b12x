@@ -10,7 +10,6 @@ from b12x.norm.mhc._policy import MHC_POLICY, MhcConfig, MhcQuery
 from b12x.policy import (
     MHC,
     DeviceIdentity,
-    InvalidPreplannedPolicyError,
     PolicyContext,
     PolicyMode,
     PolicySource,
@@ -86,7 +85,7 @@ def test_rtx_6000_profile_resolves_measured_medium_prefill_geometry() -> None:
     assert resolution.config.projection_k_splits == 4
 
 
-def test_gb10_mhc_profile_requires_regeneration() -> None:
+def test_gb10_mhc_profile_uses_the_explicit_heuristic_fallback() -> None:
     device = DeviceIdentity(
         vendor="nvidia",
         product_name="nvidia gb10",
@@ -94,16 +93,18 @@ def test_gb10_mhc_profile_requires_regeneration() -> None:
         sm_count=48,
     )
 
-    with pytest.raises(InvalidPreplannedPolicyError, match="config schema mismatch"):
-        PolicyContext.for_identity(device).resolve(
-            MHC_POLICY,
-            MhcQuery(
-                dtype="bfloat16",
-                max_tokens=3_072,
-                hidden_size=4_096,
-                split_k=64,
-            ),
-        )
+    query = MhcQuery(
+        dtype="bfloat16",
+        max_tokens=3_072,
+        hidden_size=4_096,
+        split_k=64,
+    )
+
+    resolution = PolicyContext.for_identity(device).resolve(MHC_POLICY, query)
+
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.profile_id is None
+    assert resolution.config == MHC_POLICY.heuristic(query, device)
 
 
 @pytest.mark.parametrize(
