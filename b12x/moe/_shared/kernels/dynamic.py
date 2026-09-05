@@ -6436,6 +6436,17 @@ class MoEDynamicKernelBackend:
 
                     if cutlass.const_expr((not self.swap_ab) and (not self.is_w4a8)):
                         # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
+                        if cutlass.const_expr(not self.w4a4_fc1_fused):
+                            # Sub-128 FC2 re-partitions A/SFA for its intermediate
+                            # at offset zero. Refresh the generic FC1 aliases on
+                            # every task/slice so the gate MMA consumes the same
+                            # fragments that the restored routed-input copies
+                            # write. The fused path owns separate single-slot
+                            # fragments and must retain those allocations.
+                            tCrA_fc1_cur = tCrA
+                            crA_fc1_cur = crA
+                            tCrSFA_fc1_cur = tCrSFA
+                            crSFA_fc1_cur = crSFA
                         fz_crSFA = cute.filter_zeros(crSFA)
                         fz_crSFB = cute.filter_zeros(crSFB)
                         fz_crSFA_fc1_cur = fz_crSFA
