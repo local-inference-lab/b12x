@@ -85,6 +85,7 @@ class _TwoShotBf16Launch:
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -93,6 +94,7 @@ class _TwoShotBf16Launch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         pack_stride: Int64,
@@ -111,6 +113,7 @@ class _TwoShotBf16Launch:
             staging5,
             staging6,
             staging7,
+            staging8,
             signal0,
             signal1,
             signal2,
@@ -119,6 +122,7 @@ class _TwoShotBf16Launch:
             signal5,
             signal6,
             signal7,
+            signal8,
             output,
             rank,
             pack_stride,
@@ -162,9 +166,12 @@ class _TwoShotBf16Launch:
                     address = Int64(pointers[5].toint())
             else:
                 address = Int64(pointers[6].toint())
-                if cutlass.const_expr(self._world_size == 8):
+                if cutlass.const_expr(self._world_size >= 8):
                     if index == Int32(7):
                         address = Int64(pointers[7].toint())
+        if cutlass.const_expr(self._world_size == 9):
+            if index == Int32(8):
+                address = Int64(pointers[8].toint())
         return address
 
     @cute.jit
@@ -268,6 +275,7 @@ class _TwoShotBf16Launch:
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -276,6 +284,7 @@ class _TwoShotBf16Launch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         pack_stride: Int64,
@@ -291,6 +300,7 @@ class _TwoShotBf16Launch:
             staging5,
             staging6,
             staging7,
+            staging8,
         )
         signals = (
             signal0,
@@ -301,6 +311,7 @@ class _TwoShotBf16Launch:
             signal5,
             signal6,
             signal7,
+            signal8,
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -514,7 +525,7 @@ def get_twoshot_bf16_launcher(
         device_index,
     )
     del device_index  # part of the process-local cache key
-    if world_size not in (2, 4, 8):
+    if world_size not in (2, 4, 8, 9):
         raise ValueError(f"unsupported world size {world_size}")
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank {rank} is outside world size {world_size}")
@@ -555,7 +566,7 @@ def get_twoshot_bf16_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            for _ in range(8)
+            for _ in range(9)
         ),
         *(
             make_ptr(
@@ -564,7 +575,7 @@ def get_twoshot_bf16_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=4,
             )
-            for _ in range(8)
+            for _ in range(9)
         ),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         0,
@@ -575,7 +586,7 @@ def get_twoshot_bf16_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot_bf16.{operation}",
-            1,
+            2,
             cache_key,
         ),
     )
@@ -591,8 +602,8 @@ def get_twoshot_bf16_launcher(
         rows_per_rank: int,
         grid_x: int,
     ) -> None:
-        if len(staging_addresses) != 8 or len(signal_addresses) != 8:
-            raise ValueError("two-shot scalar pointer ABI requires eight peers")
+        if len(staging_addresses) != 9 or len(signal_addresses) != 9:
+            raise ValueError("two-shot scalar pointer ABI requires nine peer slots")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
@@ -682,6 +693,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -690,6 +702,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         reduced_offset: Int64,
@@ -708,6 +721,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             staging5,
             staging6,
             staging7,
+            staging8,
             signal0,
             signal1,
             signal2,
@@ -716,6 +730,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             signal5,
             signal6,
             signal7,
+            signal8,
             output,
             rank,
             reduced_offset,
@@ -751,6 +766,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -759,6 +775,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         reduced_offset: Int64,
@@ -774,6 +791,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             staging5,
             staging6,
             staging7,
+            staging8,
         )
         signals = (
             signal0,
@@ -784,6 +802,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             signal5,
             signal6,
             signal7,
+            signal8,
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -905,7 +924,7 @@ def get_twoshot_bf16_allreduce_launcher(
         device_index,
     )
     del device_index
-    if world_size not in (2, 4, 8):
+    if world_size not in (2, 4, 8, 9):
         raise ValueError(f"unsupported world size {world_size}")
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank {rank} is outside world size {world_size}")
@@ -945,7 +964,7 @@ def get_twoshot_bf16_allreduce_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            for _ in range(8)
+            for _ in range(9)
         ),
         *(
             make_ptr(
@@ -954,7 +973,7 @@ def get_twoshot_bf16_allreduce_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=4,
             )
-            for _ in range(8)
+            for _ in range(9)
         ),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         0,
@@ -965,7 +984,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            1,
+            2,
             cache_key,
         ),
     )
@@ -981,8 +1000,8 @@ def get_twoshot_bf16_allreduce_launcher(
         rows_per_rank: int,
         grid_x: int,
     ) -> None:
-        if len(staging_addresses) != 8 or len(signal_addresses) != 8:
-            raise ValueError("two-shot scalar pointer ABI requires eight peers")
+        if len(staging_addresses) != 9 or len(signal_addresses) != 9:
+            raise ValueError("two-shot scalar pointer ABI requires nine peer slots")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
