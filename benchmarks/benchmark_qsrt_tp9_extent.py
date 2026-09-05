@@ -28,17 +28,32 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--block-m", type=int, default=8, choices=(8, 32, 48, 64))
+    parser.add_argument(
+        "--m-values",
+        default="1,2,4,8,16,1536",
+        help="comma-separated token counts; values above --max-tokens are skipped",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="TP9 rank whose extent is loaded (default: first rank with 256 channels)",
+    )
     args = parser.parse_args()
     torch.cuda.set_device(0)
     torch.manual_seed(71903)
     metadata = read_qsrt_atom_v2_layer_metadata(
         args.model / f"qsrt-layer-{args.layer:05d}.safetensors", layer=args.layer
     )
-    rank = next(
-        r
-        for r in range(9)
-        if plan_qsrt_tp9_rank(args.layer, r).intermediate_channels == 256
-    )
+    if args.rank is None:
+        rank = next(
+            r
+            for r in range(9)
+            if plan_qsrt_tp9_rank(args.layer, r).intermediate_channels == 256
+        )
+    else:
+        rank = args.rank
+    m_values = tuple(int(value) for value in args.m_values.split(","))
     runtimes = {}
     for width in (384, 256):
         before = torch.cuda.memory_allocated()
@@ -95,7 +110,7 @@ def main():
         )
     expert_map = torch.arange(896, dtype=torch.int32, device="cuda")
     records = []
-    for m in (value for value in (1, 2, 4, 8, 16, 1536) if value <= args.max_tokens):
+    for m in (value for value in m_values if value <= args.max_tokens):
         x = (torch.randn((m, 3584), device="cuda") * 0.1).to(torch.bfloat16)
         ids = torch.stack(
             [torch.randperm(896, device="cuda")[:16] for _ in range(m)]
