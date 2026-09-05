@@ -1089,6 +1089,163 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("m", "route_ids_dtype"),
+    [
+        (1, torch.int32),
+        (2, torch.int32),
+        (4, torch.int32),
+        (8, torch.int32),
+        (1, torch.int64),
+    ],
+)
+def test_w4a16_e8m0_native_micro_ignores_inactive_routes_during_graph_replay(
+    m: int,
+    route_ids_dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native small-M execution must not address weights for inactive routes."""
+    import b12x.moe._shared.kernels.w4a16.kernel as w4a16_kernel
+
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_DIRECT", "1")
+    direct_launches = 0
+    real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
+
+    def spy_direct_launch(*args, **kwargs) -> None:
+        nonlocal direct_launches
+        direct_launches += 1
+        real_direct_launch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        w4a16_kernel,
+        "_w4a16_small_m_direct_launch_flat",
+        spy_direct_launch,
+    )
+    experts, hidden_size, intermediate_size = 4, 128, 192
+    topk, activation = 2, "situ"
+    rows = 2 * intermediate_size
+    torch.manual_seed(20260817 + m)
+    w13 = torch.randint(
+        0,
+        256,
+        (experts, rows, hidden_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_scale = _pattern_e8m0((experts, rows, hidden_size // 32))
+    w2_scale = _pattern_e8m0((experts, hidden_size, intermediate_size // 32), offset=1)
+    global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
+    prepared = prepare_w4a16_e8m0_native_weights(
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        activation=activation,
+        params_dtype=torch.bfloat16,
+        w13_layout="w31",
+    )
+    buffers = make_w4a16_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    fc2_n_chunks = ((intermediate_size // 2) + 127) // 128
+    intermediate_cache2 = torch.zeros(
+        2 * m * fc2_n_chunks * 128 * topk,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    inputs = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    topk_ids = torch.randint(
+        0, experts, (m, topk), dtype=route_ids_dtype, device="cuda"
+    )
+    topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
+
+    def launch() -> torch.Tensor:
+        return run_w4a16_moe(
+            inputs,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+        )
+
+    valid_eager = launch().clone()
+    torch.cuda.synchronize()
+    assert direct_launches == 1
+    assert bool(torch.isfinite(valid_eager).all().item())
+    assert bool((valid_eager.abs().sum(dim=1) > 0).all().item())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = launch()
+    assert direct_launches == 2
+
+    inactive_ids = topk_ids.clone()
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    inactive_ids[-1] = torch.tensor(
+        [-1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
+    if m > 1:
+        inactive_ids[0, 0] = -1
+    topk_ids.copy_(inactive_ids)
+    original_weights = topk_weights.clone()
+    active = (inactive_ids >= 0) & (inactive_ids < experts)
+    reference_ids = torch.where(active, inactive_ids, torch.zeros_like(inactive_ids))
+    reference_weights = torch.where(
+        active, topk_weights, torch.zeros_like(topk_weights)
+    )
+    expected = moe_reference_w4a16_fp4_e8m0_k32(
+        inputs,
+        w13,
+        w13_scale,
+        global_scale,
+        w2,
+        w2_scale,
+        global_scale,
+        reference_ids,
+        reference_weights,
+        experts,
+        hidden_size,
+        intermediate_size,
+        activation=activation,
+        w13_layout="w31",
+    )
+
+    eager = launch().clone()
+    torch.cuda.synchronize()
+    _assert_matches_oracle(eager, expected, activation=activation)
+    torch.testing.assert_close(eager[-1], torch.zeros_like(eager[-1]), rtol=0, atol=0)
+
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+    torch.testing.assert_close(topk_ids, inactive_ids, rtol=0, atol=0)
+    torch.testing.assert_close(topk_weights, original_weights, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_e8m0_native_aligned_generic_fc1_uses_k32_scale_stride() -> None:
     """K/32 scales keep their native expert stride in aligned generic FC1."""
     experts, hidden_size, intermediate_size = 8, 512, 128
@@ -3260,6 +3417,78 @@ def test_w4a16_fc2_only_consumes_contiguous_bf16_and_native_mxfp4() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+@pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
+def test_w4a16_fc2_only_zeroes_invalid_routes_at_runtime_m3(
+    intermediate_size: int,
+    route_ids_dtype: torch.dtype,
+) -> None:
+    experts, hidden_size, routes = 2, 128, 3
+    w2 = torch.empty(
+        (experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2[0].fill_(0x11)
+    w2[1].fill_(0x22)
+    scales = torch.full(
+        (experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    intermediate = torch.ones(
+        (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
+    )
+    invalid_upper = 1 << 32 if route_ids_dtype == torch.int64 else experts
+    route_ids = torch.tensor(
+        [0, -1, invalid_upper], dtype=route_ids_dtype, device="cuda"
+    )
+    route_weights = torch.tensor([0.25, 0.5, 1.0], dtype=torch.float32, device="cuda")
+    original_ids = route_ids.clone()
+    original_weights = route_weights.clone()
+
+    prepared = prepare_w4a16_fc2_e8m0(w2, scales)
+    actual = run_w4a16_fc2_e8m0(
+        intermediate,
+        prepared,
+        route_ids,
+        route_weights,
+    )
+    expected_values = torch.tensor(
+        [intermediate_size / 8.0, 0.0, 0.0],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected = expected_values[:, None].expand_as(actual)
+
+    assert bool(torch.isfinite(actual).all().item())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, original_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
+
+    graph_output = torch.empty_like(actual)
+    prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=route_ids_dtype)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run_w4a16_fc2_e8m0(
+            intermediate,
+            prepared,
+            route_ids,
+            route_weights,
+            output=graph_output,
+        )
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured is graph_output
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, original_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     experts, hidden_size, intermediate_size, routes = 5, 128, 256, 7
     w2 = torch.empty(
@@ -3278,15 +3507,11 @@ def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     intermediate = torch.ones(
         (routes, intermediate_size), dtype=torch.bfloat16, device="cuda"
     )
-    route_ids = torch.tensor(
-        [0, 1, 2, 3, 4, 0, 2], dtype=torch.int32, device="cuda"
-    )
+    route_ids = torch.tensor([0, 1, 0, 1, 0, 1, 0], dtype=torch.int32, device="cuda")
     route_weights = torch.linspace(
         0.125, 0.875, routes, dtype=torch.float32, device="cuda"
     )
-    output = torch.empty(
-        (routes, hidden_size), dtype=torch.bfloat16, device="cuda"
-    )
+    output = torch.empty((routes, hidden_size), dtype=torch.bfloat16, device="cuda")
 
     prepared = prepare_w4a16_fc2_e8m0(w2, scales)
     prewarm_w4a16_fc2_e8m0(prepared, route_ids_dtype=torch.int32)
@@ -3304,14 +3529,46 @@ def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = torch.empty_like(output)
+    valid_values = (
+        256.0
+        * route_weights
+        * torch.where(
+            route_ids == 0,
+            torch.tensor(0.5, device="cuda"),
+            torch.tensor(1.0, device="cuda"),
+        )
+    )
+    valid_expected = valid_values.to(torch.bfloat16)[:, None].expand_as(output)
+    torch.testing.assert_close(captured, valid_expected, rtol=0, atol=0)
+
+    invalid_ids = torch.tensor(
+        [0, -1, 1, experts, 0, -9, 1], dtype=torch.int32, device="cuda"
+    )
+    route_ids.copy_(invalid_ids)
+    original_weights = route_weights.clone()
+    invalid_values = torch.tensor(
+        [16.0, 0.0, 96.0, 0.0, 80.0, 0.0, 224.0],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    invalid_expected = invalid_values[:, None].expand_as(output)
+
+    eager = torch.empty_like(output)
     run_w4a16_fc2_e8m0(
         intermediate,
         prepared,
         route_ids,
         route_weights,
-        output=expected,
+        output=eager,
     )
     torch.cuda.synchronize()
+    torch.testing.assert_close(eager, invalid_expected, rtol=0, atol=0)
+
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
     assert captured is output
-    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    assert bool(torch.isfinite(captured).all().item())
+    torch.testing.assert_close(captured, invalid_expected, rtol=0, atol=0)
+    torch.testing.assert_close(route_ids, invalid_ids, rtol=0, atol=0)
+    torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
