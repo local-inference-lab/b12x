@@ -51,9 +51,11 @@ from .pcie_twoshot import (
     _SIGNAL_BYTES,
 )
 
+# Topologies with retained qualification evidence: TP4 (GLM-5.3 DCP4,
+# docs/evidence/pcie_twoshot_bf16_sm120.md) and the Kimi-K3 TP8/TP9 PCIe rings
+# (tests/comm/test_pcie_tp9_physical.py, nine RTX PRO 6000).
 SUPPORTED_WORLD_SIZES = (2, 4, 8, 9)
 _PACK_ELEMS = 8
-SUPPORTED_WORLD_SIZES = (4,)
 
 
 def _pad_scalar_peer_ptrs(pointers, *, rank, world_size):
@@ -78,7 +80,7 @@ class _TwoShotBf16Layout:
 def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
+            f"PCIeTwoShotBF16 supports world sizes {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
     if max_rows <= 0 or max_rows % world_size != 0:
         raise ValueError("max_rows must be positive and divisible by world size")
@@ -127,7 +129,7 @@ def _require_disjoint(
 
 
 class PCIeTwoShotBF16:
-    """Serialized single-rounding BF16 collective runtime for world size 4."""
+    """Serialized single-rounding BF16 collective runtime (world sizes 2/4/8/9)."""
 
     def __init__(self, *args, **kwargs) -> None:
         raise RuntimeError("use PCIeTwoShotBF16.from_exchange_group()")
@@ -217,7 +219,7 @@ class PCIeTwoShotBF16:
             normalized_row_elems = int(row_elems)
             if world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(
-                    f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
+                    f"PCIeTwoShotBF16 supports world sizes {SUPPORTED_WORLD_SIZES}, got {world_size}"
                 )
             if device_obj.type != "cuda":
                 raise ValueError("PCIe twoshot requires a CUDA device")
@@ -367,9 +369,16 @@ class PCIeTwoShotBF16:
         if self._balanced_partition:
             # Pack-granular shards: the largest shard must fit the per-rank
             # reduced region, and the whole payload the staged payload region.
+            # The region size follows the layout of the configured capacity
+            # (a runtime built without a slab derives it the same way).
+            pack_stride = getattr(self, "_pack_stride", None)
+            if pack_stride is None:
+                pack_stride = _make_layout(
+                    self.max_rows, self.row_elems, self.world_size
+                ).pack_stride
             packs = numel // _PACK_ELEMS
             largest_shard = -(-packs // self.world_size)
-            return largest_shard <= self._pack_stride
+            return largest_shard <= pack_stride
         alignment = self.row_elems * self.world_size
         if self.world_size == 9:
             return _align_up(numel, alignment) <= self.max_rows * self.row_elems
