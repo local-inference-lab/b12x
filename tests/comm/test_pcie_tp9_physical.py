@@ -183,7 +183,10 @@ def _worker(rank: int, port: int) -> None:
         dma.all_reduce(inp, out=out)
         check(out, 45 + iteration)
         check(retained, 45)
-    assert dma._replay_entries, "DMA graph replay must include the wire-tail copies"
+    if hasattr(dma, "_replay_entries"):
+        # The serving lineage caches wire-tail copies for graph replay; master
+        # replays the ring without host patching and keeps no such table.
+        assert dma._replay_entries, "DMA graph replay must include the wire-tail copies"
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         dma.all_reduce(inp, out=out)
