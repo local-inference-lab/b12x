@@ -115,17 +115,19 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         median, p90 = _time(nccl_call, device, args.iters, args.warmup)
         emit("nccl", rows, width, "eager", median, p90)
 
-    # B12X one-shot pool (all-peer pull).
-    pool = PCIeOneshotAllReducePool.from_process_group(
-        process_group=group,
-        device=device,
-        max_input_bytes=max(rows * width * 2 for rows, width in shapes),
-        max_concurrent_channels=2,
-    )
-    pool.prepare_channels(("eager", "graph"))
+    # B12X one-shot pool (all-peer pull). Every independently replayable
+    # graph needs its own logical channel and the pool's resident-CTA budget
+    # bounds concurrent channels, so each shape gets a fresh two-channel pool.
     for rows, width in shapes:
         inp = _pattern(rows, width, rank, device)
         out = torch.empty_like(inp)
+        pool = PCIeOneshotAllReducePool.from_process_group(
+            process_group=group,
+            device=device,
+            max_input_bytes=rows * width * 2,
+            max_concurrent_channels=2,
+        )
+        pool.prepare_channels(("eager", "graph"))
         # Acceptance is a deterministic function of the shape, so a rejection
         # happens on every rank before any peer traffic.
         try:
@@ -134,6 +136,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             if rank == 0:
                 print(json.dumps({"path": "oneshot", "rows": rows, "width": width,
                                   "skipped": repr(error)[:200]}), flush=True)
+            pool.close()
             continue
         verify(out, rows, width, "oneshot")
         median, p90 = _time(
@@ -154,7 +157,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         median, p90 = _time(graph.replay, device, args.iters, args.warmup)
         emit("oneshot", rows, width, "graph", median, p90)
         del graph
-    pool.close()
+        pool.close()
 
     # B12X BF16 two-shot (pull reduce-scatter + pull all-gather).
     twoshot = PCIeTwoShotBF16.from_exchange_group(
@@ -184,6 +187,69 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         verify(out, rows, width, "twoshot-graph")
         median, p90 = _time(graph.replay, device, args.iters, args.warmup)
         emit("twoshot", rows, width, "graph", median, p90)
+        del graph
+    # Fused push all-reduce: one launch built on posted PCIe writes.
+    pushed = PCIeTwoShotBF16.from_exchange_group(
+        exchange_group=group,
+        device=device,
+        max_rows=args.twoshot_max_rows,
+        row_elems=args.twoshot_row_elems,
+    )
+    pushed.all_reduce_mode = "push"
+    for rows, width in shapes:
+        inp = _pattern(rows, width, rank, device)
+        out = torch.empty_like(inp)
+        if not pushed.accepts(inp):
+            continue
+        pushed.all_reduce(inp, out=out)
+        verify(out, rows, width, "twoshot-push-fused")
+        median, p90 = _time(
+            lambda: pushed.all_reduce(inp, out=out), device, args.iters, args.warmup
+        )
+        emit("twoshot-push-fused", rows, width, "eager", median, p90)
+        graph = torch.cuda.CUDAGraph()
+        with pushed.capture(), torch.cuda.graph(graph):
+            pushed.all_reduce(inp, out=out)
+        graph.replay()
+        verify(out, rows, width, "twoshot-push-fused-graph")
+        median, p90 = _time(graph.replay, device, args.iters, args.warmup)
+        emit("twoshot-push-fused", rows, width, "graph", median, p90)
+        del graph
+    pushed.close()
+
+    # Push-based reduce-scatter followed by push-based all-gather (two
+    # launches, posted PCIe writes instead of remote reads). Rows are padded
+    # to a multiple of the world size, which is the row contract of the
+    # push kernels; the reference only covers the unpadded prefix.
+    for rows, width in shapes:
+        packs = rows * width // 8
+        padded_rows = -(-packs // world) * world
+        payload = torch.zeros(padded_rows, 8, dtype=torch.bfloat16, device=device)
+        payload.view(-1)[: rows * width].copy_(_pattern(rows, width, rank, device).view(-1))
+        shard = torch.empty(padded_rows // world, 8, dtype=torch.bfloat16, device=device)
+        out = torch.empty_like(payload)
+
+        def push_call():
+            twoshot.reduce_scatter(payload, out=shard)
+            twoshot.all_gather(shard, out=out)
+
+        try:
+            push_call()
+        except Exception as error:
+            if rank == 0:
+                print(json.dumps({"path": "twoshot-push", "rows": rows, "width": width,
+                                  "skipped": repr(error)[:200]}), flush=True)
+            continue
+        verify(out.view(-1)[: rows * width].view(rows, width), rows, width, "twoshot-push")
+        median, p90 = _time(push_call, device, args.iters, args.warmup)
+        emit("twoshot-push", rows, width, "eager", median, p90)
+        graph = torch.cuda.CUDAGraph()
+        with twoshot.capture(), torch.cuda.graph(graph):
+            push_call()
+        graph.replay()
+        verify(out.view(-1)[: rows * width].view(rows, width), rows, width, "twoshot-push-graph")
+        median, p90 = _time(graph.replay, device, args.iters, args.warmup)
+        emit("twoshot-push", rows, width, "graph", median, p90)
         del graph
     twoshot.close()
 
