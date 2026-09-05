@@ -10,6 +10,12 @@ import triton.language as tl
 
 
 @triton.jit
+def _clear_state_errors_kernel(state_errors, rows, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(state_errors + offsets, 0, mask=offsets < rows)
+
+
+@triton.jit
 def _round_fp32_to_bf16(value):
     """Round FP32 to BF16 and widen without permitting arithmetic fusion."""
     bits = value.to(tl.uint32, bitcast=True)
@@ -1391,6 +1397,18 @@ def launch_validate_rows(
     )
 
 
+def launch_clear_state_errors(state_errors: torch.Tensor) -> None:
+    """Initialize status rows when the caller guarantees valid metadata."""
+    rows = int(state_errors.shape[0])
+    block = min(256, triton.next_power_of_2(rows))
+    _clear_state_errors_kernel[(triton.cdiv(rows, block),)](
+        state_errors,
+        rows,
+        BLOCK=block,
+        num_warps=1,
+    )
+
+
 def launch_validate_page_tables(
     *,
     request_ids: torch.Tensor,
@@ -1938,6 +1956,7 @@ def launch_poison_failed_rows(
 
 
 __all__ = [
+    "launch_clear_state_errors",
     "launch_validate_rows",
     "launch_validate_page_tables",
     "launch_validate_shared_pool_ownership",

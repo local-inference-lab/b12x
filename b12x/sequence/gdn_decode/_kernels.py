@@ -434,6 +434,7 @@ def _make_qwen_binding(
     qk_l2norm: bool,
     null_state_index: int | None,
     duplicate_table_size: int,
+    validate_metadata: bool,
 ):
     from ._impl import Binding, Caps, _materialize_plan
 
@@ -452,6 +453,7 @@ def _make_qwen_binding(
         gate_activation="sigmoid" if sigmoid_gate else "silu",
         qk_l2norm=qk_l2norm,
         null_state_index=null_state_index,
+        qwen_metadata_validation=("transactional" if validate_metadata else "trusted"),
     )
     launch_plan = _materialize_plan(caps, policy_resolution=None)
     if launch_plan.duplicate_table_size != duplicate_table_size:
@@ -609,6 +611,7 @@ def _launch_gdn_decode(
             qk_l2norm=qk_l2norm,
             null_state_index=(null_state_index if has_null_state_index else None),
             duplicate_table_size=duplicate_table_size,
+            validate_metadata=validate_metadata,
         )
         from ._cute_kernels import run_packed_recurrent_qwen
 

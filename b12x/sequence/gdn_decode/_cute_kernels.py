@@ -401,6 +401,7 @@ class _PackedRecurrentQwenKernel:
         qk_l2norm: bool,
         null_state_index: int | None,
         state_type: type[cutlass.Numeric],
+        validate_metadata: bool,
     ) -> None:
         self.max_seqs = int(max_seqs)
         self.state_index_columns = int(state_index_columns)
@@ -424,6 +425,7 @@ class _PackedRecurrentQwenKernel:
             0 if null_state_index is None else int(null_state_index)
         )
         self.state_type = state_type
+        self.validate_metadata = bool(validate_metadata)
 
     @cute.jit
     def __call__(
@@ -1076,10 +1078,10 @@ class _PackedRecurrentQwenKernel:
         lane, _, _ = cute.arch.thread_idx()
         work_block = Int32(work_block)
 
-        # CuTe kernels cannot use dynamic early returns. Nesting the work under
-        # the validation flag preserves the transaction boundary: nonzero
-        # error_code launches perform no state or output access.
-        if error_code[Int32(0)].to(Int32) == Int32(0):
+        error = Int32(0)
+        if cutlass.const_expr(self.validate_metadata):
+            error = error_code[Int32(0)].to(Int32)
+        if error == Int32(0):
             live_seqs = num_seqs[Int32(0)].to(Int32)
             bounded_seqs = cutlass.max(
                 Int32(0), cutlass.min(live_seqs, Int32(self.max_seqs))
@@ -1301,6 +1303,7 @@ def _binding_key(binding: Binding) -> tuple[object, ...]:
         binding.state_indices.dtype,
         binding.A_log.dtype,
         binding.dt_bias.dtype,
+        caps.qwen_metadata_validation,
     )
 
 
@@ -1323,6 +1326,7 @@ def _compile(binding: Binding) -> tuple[tuple[object, ...], Callable[[Binding, f
         qk_l2norm=caps.qk_l2norm,
         null_state_index=caps.null_state_index,
         state_type=state_type,
+        validate_metadata=caps.qwen_metadata_validation == "transactional",
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
