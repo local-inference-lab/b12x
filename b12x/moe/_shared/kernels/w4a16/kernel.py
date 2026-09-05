@@ -11229,6 +11229,315 @@ def _resolve_exl3_hadamard_128(hadamard_128):
     return hadamard_128
 
 
+@torch.library.custom_op(
+    "b12x::trellis_hadamard_128",
+    mutates_args=("destination",),
+)
+def _trellis_hadamard_128_op(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    left_scale: torch.Tensor,
+    right_scale: torch.Tensor,
+    has_left_scale: bool,
+    has_right_scale: bool,
+    scale: float,
+) -> None:
+    """Expose the EXL3 rotation extension as a TorchDynamo-visible operator."""
+    hadamard_128 = _resolve_exl3_hadamard_128(None)
+    hadamard_128(
+        source,
+        destination,
+        left_scale if has_left_scale else None,
+        right_scale if has_right_scale else None,
+        scale,
+    )
+
+
+@_trellis_hadamard_128_op.register_fake
+def _trellis_hadamard_128_fake(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    left_scale: torch.Tensor,
+    right_scale: torch.Tensor,
+    has_left_scale: bool,
+    has_right_scale: bool,
+    scale: float,
+) -> None:
+    del (
+        source,
+        destination,
+        left_scale,
+        right_scale,
+        has_left_scale,
+        has_right_scale,
+        scale,
+    )
+
+
+def _run_exl3_hadamard_128(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    left_scale: torch.Tensor | None,
+    right_scale: torch.Tensor | None,
+    scale: float,
+    hadamard_128,
+) -> None:
+    """Run EXL3 H128 eagerly or through its registered compiled operator."""
+    if torch.compiler.is_compiling():
+        if hadamard_128 is not None:
+            raise RuntimeError(
+                "compiled Trellis execution requires the registered EXL3 H128 "
+                "operator"
+            )
+        _trellis_hadamard_128_op(
+            source,
+            destination,
+            source if left_scale is None else left_scale,
+            source if right_scale is None else right_scale,
+            left_scale is not None,
+            right_scale is not None,
+            scale,
+        )
+        return
+    resolved = _resolve_exl3_hadamard_128(hadamard_128)
+    resolved(source, destination, left_scale, right_scale, scale)
+
+
+def _trellis256_dense_gemm_flat(
+    rotated_compute: torch.Tensor,
+    trellis: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    c_tmp: torch.Tensor | None,
+    gemm_output: torch.Tensor,
+    trellis_bits: int,
+    trellis_codebook: str,
+    trellis_pair_kind: str,
+    trellis_rate_axis: str,
+    moe_block_size: int,
+    force_tile_k: int,
+    force_tile_n: int,
+) -> None:
+    """Launch one dense Trellis GEMM from flattened tensor arguments."""
+    m, size_k = (int(value) for value in rotated_compute.shape)
+    size_n = int(gemm_output.shape[1])
+    compute_dtype = rotated_compute.dtype
+    element_dtype = "fp16" if compute_dtype == torch.float16 else "bf16"
+    cutlass_dtype = (
+        cutlass.Float16 if compute_dtype == torch.float16 else cutlass.BFloat16
+    )
+    props = torch.cuda.get_device_properties(rotated_compute.device)
+    sms = int(props.multi_processor_count)
+    max_shared_mem = int(
+        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
+    )
+    if force_tile_k <= 0:
+        if moe_block_size == 64:
+            moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
+                size_m=m,
+                size_k=size_k,
+                size_n=size_n,
+                sms=sms,
+            )
+        else:
+            tile_k, tile_n = _trellis256_dense_tile_config(size_k, size_n)
+    else:
+        tile_k, tile_n = force_tile_k, force_tile_n
+    if moe_block_size not in _ALLOWED_ROUTED_SIZES:
+        raise ValueError(f"unsupported Trellis dense moe_block_size={moe_block_size}")
+    route_blocks = (m + moe_block_size - 1) // moe_block_size
+    route_slots = route_blocks * moe_block_size
+    launch = _compile_w4a16_gemm_launch(
+        size_m=m,
+        size_n=size_n,
+        size_k=size_k,
+        num_experts=1,
+        top_k=1,
+        mul_topk_weights=False,
+        moe_block_size=moe_block_size,
+        max_m_blocks=route_blocks,
+        element_dtype=element_dtype,
+        packed_route_indices=None,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        device=rotated_compute.device,
+        c_tmp=c_tmp,
+        weight_layout="trellis_t256",
+        scale_format="e4m3_k32",
+        w13_layout="packed",
+        trellis_bits=trellis_bits,
+        trellis_codebook=trellis_codebook,
+        trellis_pair_kind=trellis_pair_kind or None,
+        trellis_rate_axis=trellis_rate_axis or None,
+        dense_route_fast_path=True,
+        route_slots=route_slots,
+        force_tile_config=(tile_k, tile_n),
+    )
+    dummy_i32 = workspace[:1]
+    n_tiles = size_n // tile_n
+    grid_x = min(
+        sms * int(launch.kernel.blocks_per_sm),
+        max(route_blocks * n_tiles, 1),
+    )
+    launch.kernel.compiled(
+        make_ptr(
+            cutlass_dtype,
+            rotated_compute.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass_dtype,
+            rotated_compute.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        trellis,
+        make_ptr(
+            cutlass_dtype,
+            gemm_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        scale.view(torch.uint8).view(torch.int32).view(-1),
+        global_scale,
+        dummy_i32,
+        dummy_i32,
+        dummy_i32,
+        global_scale,
+        launch.c_tmp,
+        workspace,
+        dummy_i32
+        if trellis_codebook == MCG
+        else _trellis256_execution_lut(rotated_compute.device, trellis_codebook),
+        m,
+        grid_x,
+        current_cuda_stream(),
+    )
+
+
+@torch.library.custom_op(
+    "b12x::trellis256_dense_gemm",
+    mutates_args=("workspace", "c_tmp", "gemm_output"),
+)
+def _trellis256_dense_gemm_op(
+    rotated_compute: torch.Tensor,
+    trellis: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    c_tmp: torch.Tensor,
+    gemm_output: torch.Tensor,
+    trellis_bits: int,
+    trellis_codebook: str,
+    trellis_pair_kind: str,
+    trellis_rate_axis: str,
+    moe_block_size: int,
+    force_tile_k: int,
+    force_tile_n: int,
+) -> None:
+    for name, tensor in (
+        ("rotated_compute", rotated_compute),
+        ("c_tmp", c_tmp),
+        ("gemm_output", gemm_output),
+    ):
+        if int(tensor.data_ptr()) % 16 != 0:
+            raise ValueError(f"{name} must be at least 16-byte aligned")
+    _trellis256_dense_gemm_flat(
+        rotated_compute,
+        trellis,
+        scale,
+        global_scale,
+        workspace,
+        c_tmp,
+        gemm_output,
+        trellis_bits,
+        trellis_codebook,
+        trellis_pair_kind,
+        trellis_rate_axis,
+        moe_block_size,
+        force_tile_k,
+        force_tile_n,
+    )
+
+
+@_trellis256_dense_gemm_op.register_fake
+def _trellis256_dense_gemm_fake(
+    rotated_compute: torch.Tensor,
+    trellis: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    c_tmp: torch.Tensor,
+    gemm_output: torch.Tensor,
+    trellis_bits: int,
+    trellis_codebook: str,
+    trellis_pair_kind: str,
+    trellis_rate_axis: str,
+    moe_block_size: int,
+    force_tile_k: int,
+    force_tile_n: int,
+) -> None:
+    del (
+        rotated_compute,
+        trellis,
+        scale,
+        global_scale,
+        workspace,
+        c_tmp,
+        gemm_output,
+        trellis_bits,
+        trellis_codebook,
+        trellis_pair_kind,
+        trellis_rate_axis,
+        moe_block_size,
+        force_tile_k,
+        force_tile_n,
+    )
+
+
+def _run_trellis256_dense_gemm(
+    rotated_compute: torch.Tensor,
+    prepared_dense,
+    c_tmp: torch.Tensor | None,
+    gemm_output: torch.Tensor,
+    *,
+    moe_block_size: int,
+    force_tile_config: tuple[int, int] | None,
+) -> None:
+    """Dispatch the dense GEMM through an opaque operator while compiling."""
+    force_tile_k, force_tile_n = (
+        (0, 0)
+        if force_tile_config is None
+        else (int(force_tile_config[0]), int(force_tile_config[1]))
+    )
+    arguments = (
+        rotated_compute,
+        prepared_dense.trellis,
+        prepared_dense.scale,
+        prepared_dense.global_scale,
+        prepared_dense.workspace,
+        c_tmp,
+        gemm_output,
+        int(prepared_dense.trellis_bits),
+        str(prepared_dense.trellis_codebook),
+        str(prepared_dense.trellis_pair_kind or ""),
+        str(prepared_dense.trellis_rate_axis or ""),
+        int(moe_block_size),
+        force_tile_k,
+        force_tile_n,
+    )
+    if torch.compiler.is_compiling():
+        if c_tmp is None:
+            raise RuntimeError(
+                "compiled Trellis execution requires caller-owned GEMM scratch"
+            )
+        _trellis256_dense_gemm_op(*arguments)
+        return
+    _trellis256_dense_gemm_flat(*arguments)
+
+
 def _trellis_dense_buffer(
     name: str,
     buffer: torch.Tensor | None,
@@ -11238,6 +11547,11 @@ def _trellis_dense_buffer(
     device: torch.device,
 ) -> torch.Tensor:
     """Validate caller-owned dense scratch or allocate it before capture."""
+    compiling = torch.compiler.is_compiling()
+    if compiling and buffer is None:
+        raise RuntimeError(
+            f"compiled Trellis execution requires caller-owned {name} storage"
+        )
     if buffer is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -11245,12 +11559,22 @@ def _trellis_dense_buffer(
                 "provide caller-owned storage"
             )
         return torch.empty(shape, dtype=dtype, device=device)
+    # FakeTensor tracing preserves static metadata, but the row extent is
+    # symbolic and the storage pointer is unavailable. Kernel-facing pointers
+    # are checked inside the opaque GEMM operator before it launches.
     if (
-        tuple(buffer.shape) != shape
+        buffer.ndim != 2
+        or int(buffer.shape[1]) != int(shape[1])
         or buffer.dtype != dtype
         or buffer.device != device
         or not buffer.is_contiguous()
-        or int(buffer.data_ptr()) % 16 != 0
+        or (
+            not compiling
+            and (
+                int(buffer.shape[0]) != int(shape[0])
+                or int(buffer.data_ptr()) % 16 != 0
+            )
+        )
     ):
         raise ValueError(
             f"{name} must be contiguous, 16-byte-aligned {dtype} with shape "
@@ -11283,6 +11607,11 @@ def _run_trellis256_dense_current_device(
     Outer rotations follow EXL3 order exactly: fp16 ``suh`` multiply before the
     input H128, and fp16 ``svh`` multiply after the output H128.
     """
+    if stream is not None:
+        raise ValueError(
+            "dense Trellis execution follows the current Torch stream and does "
+            "not accept a raw driver stream"
+        )
     if getattr(prepared_dense, "weight_layout", None) != "trellis_t256":
         raise ValueError("run_trellis256_dense requires prepared trellis_t256 weights")
     if int(getattr(prepared_dense, "num_experts", 0)) != 1:
@@ -11310,17 +11639,15 @@ def _run_trellis256_dense_current_device(
             "prepared dense weight must select fp16 or bf16 compute, got "
             f"{compute_dtype}"
         )
-    element_dtype = "fp16" if compute_dtype == torch.float16 else "bf16"
-    cutlass_dtype = (
-        cutlass.Float16 if compute_dtype == torch.float16 else cutlass.BFloat16
-    )
-    if x.ndim != 2 or int(x.shape[0]) <= 0:
+    compiling = torch.compiler.is_compiling()
+    if x.ndim != 2 or (not compiling and int(x.shape[0]) <= 0):
         raise ValueError(f"x must be a non-empty rank-2 tensor, got {tuple(x.shape)}")
     if x.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"x must be fp16 or bf16, got {x.dtype}")
     if not x.is_cuda or not x.is_contiguous():
         raise ValueError("x must be a contiguous CUDA tensor")
-    m, size_k = (int(v) for v in x.shape)
+    m = x.shape[0] if compiling else int(x.shape[0])
+    size_k = int(x.shape[1])
     size_n = int(prepared_dense.out_features)
     if size_k != int(prepared_dense.in_features):
         raise ValueError(
@@ -11335,10 +11662,10 @@ def _run_trellis256_dense_current_device(
         dtype=x.dtype,
         device=x.device,
     )
-    if c_tmp is not None and int(c_tmp.data_ptr()) % 16 != 0:
+    # FakeTensor tracing cannot expose a storage pointer. The opaque GEMM
+    # operator checks the real c_tmp pointer immediately before kernel launch.
+    if c_tmp is not None and not compiling and int(c_tmp.data_ptr()) % 16 != 0:
         raise ValueError("c_tmp must be at least 16-byte aligned")
-
-    hadamard_128 = _resolve_exl3_hadamard_128(hadamard_128)
 
     gemm_output = _trellis_dense_buffer(
         "gemm_output",
@@ -11366,7 +11693,14 @@ def _run_trellis256_dense_current_device(
         dtype=torch.float16,
         device=x.device,
     )
-    hadamard_128(x_f16, rotated_f16, prepared_dense.suh, None, 1.0)
+    _run_exl3_hadamard_128(
+        x_f16,
+        rotated_f16,
+        prepared_dense.suh,
+        None,
+        1.0,
+        hadamard_128,
+    )
     if compute_dtype == torch.float16:
         rotated_compute = rotated_f16
     else:
@@ -11379,97 +11713,13 @@ def _run_trellis256_dense_current_device(
         )
         rotated_compute.copy_(rotated_f16)
 
-    props = torch.cuda.get_device_properties(x.device)
-    sms = int(props.multi_processor_count)
-    max_shared_mem = int(
-        getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
-    )
-    moe_block_size = int(_moe_block_size)
-    if _force_tile_config is None and moe_block_size == 64:
-        moe_block_size, (tile_k, tile_n) = _trellis256_dense_launch_geometry(
-            size_m=m,
-            size_k=size_k,
-            size_n=size_n,
-            sms=sms,
-        )
-    else:
-        tile_k, tile_n = (
-            _trellis256_dense_tile_config(size_k, size_n)
-            if _force_tile_config is None
-            else (int(_force_tile_config[0]), int(_force_tile_config[1]))
-        )
-    if moe_block_size not in _ALLOWED_ROUTED_SIZES:
-        raise ValueError(f"unsupported Trellis dense moe_block_size={moe_block_size}")
-    route_blocks = (m + moe_block_size - 1) // moe_block_size
-    route_slots = route_blocks * moe_block_size
-    launch = _compile_w4a16_gemm_launch(
-        size_m=m,
-        size_n=size_n,
-        size_k=size_k,
-        num_experts=1,
-        top_k=1,
-        mul_topk_weights=False,
-        moe_block_size=moe_block_size,
-        max_m_blocks=route_blocks,
-        element_dtype=element_dtype,
-        packed_route_indices=None,
-        sms=sms,
-        max_shared_mem=max_shared_mem,
-        device=x.device,
-        c_tmp=c_tmp,
-        weight_layout="trellis_t256",
-        scale_format="e4m3_k32",
-        w13_layout="packed",
-        trellis_bits=trellis_bits,
-        trellis_codebook=trellis_codebook,
-        trellis_pair_kind=trellis_pair_kind,
-        trellis_rate_axis=trellis_rate_axis,
-        dense_route_fast_path=True,
-        route_slots=route_slots,
-        force_tile_config=(tile_k, tile_n),
-    )
-    dummy_i32 = prepared_dense.workspace[:1]
-    stream = current_cuda_stream() if stream is None else stream
-    n_tiles = size_n // tile_n
-    grid_x = min(
-        sms * int(launch.kernel.blocks_per_sm),
-        max(route_blocks * n_tiles, 1),
-    )
-    launch.kernel.compiled(
-        make_ptr(
-            cutlass_dtype,
-            rotated_compute.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass_dtype,
-            rotated_compute.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        prepared_dense.trellis,
-        make_ptr(
-            cutlass_dtype,
-            gemm_output.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        prepared_dense.scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared_dense.global_scale,
-        dummy_i32,
-        dummy_i32,
-        dummy_i32,
-        prepared_dense.global_scale,
-        launch.c_tmp,
-        prepared_dense.workspace,
-        # MCG kernels never dereference the LUT ABI slot.
-        dummy_i32
-        if trellis_codebook == "mcg"
-        else _trellis256_execution_lut(x.device, trellis_codebook),
-        m,
-        grid_x,
-        stream,
+    _run_trellis256_dense_gemm(
+        rotated_compute,
+        prepared_dense,
+        c_tmp,
+        gemm_output,
+        moe_block_size=int(_moe_block_size),
+        force_tile_config=_force_tile_config,
     )
 
     if compute_dtype == torch.float16:
@@ -11485,7 +11735,14 @@ def _run_trellis256_dense_current_device(
         gemm_output_f16.copy_(gemm_output)
         gemm_f16 = gemm_output_f16
     if output.dtype == torch.float16:
-        hadamard_128(gemm_f16, output, None, prepared_dense.svh, 1.0)
+        _run_exl3_hadamard_128(
+            gemm_f16,
+            output,
+            None,
+            prepared_dense.svh,
+            1.0,
+            hadamard_128,
+        )
     else:
         output_f16 = _trellis_dense_buffer(
             "output_f16",
@@ -11494,7 +11751,14 @@ def _run_trellis256_dense_current_device(
             dtype=torch.float16,
             device=x.device,
         )
-        hadamard_128(gemm_f16, output_f16, None, prepared_dense.svh, 1.0)
+        _run_exl3_hadamard_128(
+            gemm_f16,
+            output_f16,
+            None,
+            prepared_dense.svh,
+            1.0,
+            hadamard_128,
+        )
         output.copy_(output_f16)
     return output
 
