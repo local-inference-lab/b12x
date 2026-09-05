@@ -1160,65 +1160,76 @@ def _b12x_mhc_post_pre_impl(
                 norm_eps=float(norm_eps),
             )
 
-        prefill_min_tokens = int(
-            os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
-        )
         if planned_config is not None:
-            tf32_enabled = planned_config.backend == "tf32_tma"
-            tf32_override = os.environ.get("B12X_MHC_PREFILL_TF32_MMA")
-            if tf32_override is None:
-                tf32_override = os.environ.get("B12X_MHC_PREFILL_BF16_MMA")
-            if tf32_override is not None:
-                tf32_enabled = tf32_override != "0"
-            use_prefill_tf32_mma = norm_weight is not None and tf32_enabled
+            use_prefill_tf32_mma = (
+                norm_weight is not None and planned_config.backend == "tf32_tma"
+            )
+            use_prefill_bf16_mma = False
+            use_prefill_block_m = (
+                norm_weight is not None
+                and planned_config.backend == "native"
+                and planned_config.native_post_pre_backend == "prefill_block_m"
+            )
+            use_prefill_compact = False
+            prefill_block_m_size = planned_config.prefill_block_m
+            prefill_tile_n = planned_config.prefill_tile_n
+            decode_source_splits = (
+                planned_config.decode_source_splits
+                if planned_config.backend == "native"
+                and planned_config.native_post_pre_backend == "decode"
+                else 0
+            )
         else:
+            prefill_min_tokens = int(
+                os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
+            )
             use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
                 norm_weight=norm_weight,
                 policy_m=policy_m,
             )
-        use_prefill_bf16_mma = (
-            _use_mhc_prefill_bf16_project(
-                norm_weight=norm_weight,
-                policy_m=policy_m,
-                fn_bf16=fn_bf16,
+            use_prefill_bf16_mma = (
+                _use_mhc_prefill_bf16_project(
+                    norm_weight=norm_weight,
+                    policy_m=policy_m,
+                    fn_bf16=fn_bf16,
+                )
+                and not use_prefill_tf32_mma
             )
-            and not use_prefill_tf32_mma
-        )
-        use_prefill_block_m = (
-            not use_prefill_tf32_mma
-            and not use_prefill_bf16_mma
-            and norm_weight is not None
-            and policy_m >= prefill_min_tokens
-            and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
-        )
-        prefill_block_m_size = int(
-            os.environ.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2")
-        )
-        prefill_tile_n_default = 12 if hidden_size == 7168 else 24
-        prefill_tile_n = int(
-            os.environ.get(
-                "B12X_MHC_PREFILL_TILE_N", str(prefill_tile_n_default)
+            use_prefill_block_m = (
+                not use_prefill_tf32_mma
+                and not use_prefill_bf16_mma
+                and norm_weight is not None
+                and policy_m >= prefill_min_tokens
+                and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
             )
-        )
-        use_prefill_compact = (
-            not use_prefill_tf32_mma
-            and not use_prefill_bf16_mma
-            and not use_prefill_block_m
-            and norm_weight is not None
-            and policy_m >= prefill_min_tokens
-            and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
-        )
-        decode_source_splits = 0
-        if not (
-            use_prefill_tf32_mma
-            or use_prefill_bf16_mma
-            or use_prefill_block_m
-            or use_prefill_compact
-        ):
-            decode_source_splits, _ = _selected_post_pre_decode_split_n(
-                num_tokens=tokens,
-                hidden_size=hidden_size,
+            prefill_block_m_size = int(
+                os.environ.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2")
             )
+            prefill_tile_n_default = 12 if hidden_size == 7168 else 24
+            prefill_tile_n = int(
+                os.environ.get(
+                    "B12X_MHC_PREFILL_TILE_N", str(prefill_tile_n_default)
+                )
+            )
+            use_prefill_compact = (
+                not use_prefill_tf32_mma
+                and not use_prefill_bf16_mma
+                and not use_prefill_block_m
+                and norm_weight is not None
+                and policy_m >= prefill_min_tokens
+                and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
+            )
+            decode_source_splits = 0
+            if not (
+                use_prefill_tf32_mma
+                or use_prefill_bf16_mma
+                or use_prefill_block_m
+                or use_prefill_compact
+            ):
+                decode_source_splits, _ = _selected_post_pre_decode_split_n(
+                    num_tokens=tokens,
+                    hidden_size=hidden_size,
+                )
         if use_prefill_tf32_mma:
             run_mhc_post_pre_prefill_gram(
                 x=x,
@@ -1282,6 +1293,7 @@ def _b12x_mhc_post_pre_impl(
                 partials=partials,
                 out=residual_out,
                 compute_gram=norm_weight is not None,
+                config=planned_config,
             )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -1312,6 +1324,16 @@ def _b12x_mhc_post_pre_impl(
                 else 1
             ),
             active_source_splits=decode_source_splits,
+            decode_finalize_threads=(
+                planned_config.decode_finalize_threads
+                if planned_config is not None
+                else None
+            ),
+            decode_finalize_ctas=(
+                planned_config.decode_finalize_ctas
+                if planned_config is not None
+                else None
+            ),
         )
         return residual_out, post_out, comb_out, y_out
 

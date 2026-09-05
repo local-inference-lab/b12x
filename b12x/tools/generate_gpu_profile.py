@@ -297,6 +297,14 @@ def _detect_devices(device_specs: tuple[str, ...]) -> tuple[DetectedDevice, ...]
     return detected_devices
 
 
+def _bind_inline_generation_device(detected: DetectedDevice) -> None:
+    if detected.ordinal is None:
+        raise ValueError("inline profile generation requires a resolved CUDA device")
+    import torch
+
+    torch.cuda.set_device(detected.ordinal)
+
+
 def _render_estimates(
     console: Console,
     generators: tuple[ComponentGenerator, ...],
@@ -429,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     detected = detected_devices[0]
     if detected.identity is None or detected.ordinal is None:
         raise RuntimeError("validated CUDA device lost its identity")
+    if len(detected_devices) == 1:
+        _bind_inline_generation_device(detected)
     profile_id = args.profile_id or _profile_id_for_device(detected.identity)
     work_dir = (args.work_dir or Path(".b12x-profile-work") / profile_id).resolve()
     output, embedded_output = _profile_output_paths(

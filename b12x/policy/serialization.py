@@ -276,10 +276,16 @@ def profile_from_dict(value: object) -> GpuProfile:
         value,
         name="profile",
         required=frozenset({"components", "profile_id", "targets"}),
-        optional=frozenset({"metadata"}),
+        optional=frozenset({"heuristic_components", "metadata"}),
     )
     targets = _sequence(data["targets"], name="profile.targets")
     components = _sequence(data["components"], name="profile.components")
+    heuristic_components = _sequence(
+        data.get("heuristic_components", ()),
+        name="profile.heuristic_components",
+    )
+    if any(not isinstance(component_id, str) for component_id in heuristic_components):
+        raise TypeError("profile.heuristic_components entries must be strings")
     metadata = data.get("metadata", {})
     if not isinstance(metadata, Mapping):
         raise TypeError("profile.metadata must be an object")
@@ -292,6 +298,7 @@ def profile_from_dict(value: object) -> GpuProfile:
             _component(component, index=index)
             for index, component in enumerate(components)
         ),
+        heuristic_components=tuple(heuristic_components),
         metadata=FrozenMapping(metadata),
     )
 

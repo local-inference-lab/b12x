@@ -67,9 +67,11 @@ integrator-facing sequence and `b12x/policy/` for the contracts.
   unconditional `leaf`, scalar `exact`, or disjoint inclusive `range` nodes,
   each with an optional default. The tree determines dispatch coverage;
   `coverage`, `evidence`, and `source_revision` are audit metadata only.
-- The embedded registry is immutable and must contain exactly the component set
-  registered in the catalog. Provider IDs and schema versions must match their
-  runtime policies. Keep package-embedded profiles compact and validated.
+- The embedded registry is immutable and must account for exactly the component
+  set registered in the catalog. A component is accounted for by either one
+  preplanned entry or an explicit `heuristic_components` declaration for an
+  unqualified device. Provider IDs and schema versions must match their runtime
+  policies. Keep package-embedded profiles compact and validated.
   Generator checkpoints, full evidence artifacts, probes, and service A/B logs
   are local working data unless a reviewed change explicitly requires them; do
   not leave large untracked validation directories in the repository.

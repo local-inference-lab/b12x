@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post, b12x_mhc_post_pre, b12x_mhc_pre
+from b12x.norm.mhc._impl import (
+    B12XMHCScratchCaps,
+    b12x_mhc_post,
+    b12x_mhc_post_pre,
+    b12x_mhc_pre,
+    plan_mhc_scratch,
+)
+from b12x.norm.mhc._policy import MHC_POLICY, MhcConfig, MhcQuery
+from b12x.policy import MHC, PolicyContext, PolicyMode
 
 from tests._reference.helpers import require_b12x
 
@@ -79,15 +89,23 @@ def _make_mhc_binding(
     device: torch.device,
     split_k: int = 64,
     expected_m: int | None = None,
+    config: MhcConfig | None = None,
 ):
     max_tokens = max(tokens, expected_m or tokens)
+    policy = None
+    if config is not None:
+        policy = PolicyContext.for_device(
+            device,
+            mode=PolicyMode.HEURISTIC_ONLY,
+        ).with_override(MHC, config)
     plan = plan_mhc_scratch(
         B12XMHCScratchCaps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
             split_k=split_k,
-        )
+        ),
+        policy=policy,
     )
     scratch = tuple(
         torch.empty(shape, dtype=dtype, device=device)
@@ -101,6 +119,28 @@ def _make_mhc_binding(
         post=torch.empty((tokens, 4), dtype=torch.float32, device=device),
         comb=torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
         out=torch.empty((tokens, 4, hidden_size), dtype=torch.bfloat16, device=device),
+    )
+
+
+def _planned_mhc_config(
+    *,
+    hidden_size: int,
+    split_k: int,
+    schedule: str,
+) -> MhcConfig:
+    anchor_tokens = {
+        "native_decode": 1,
+        "native_prefill_block_m": 96,
+        "tf32_tma": 384,
+    }[schedule]
+    return MHC_POLICY.heuristic(
+        MhcQuery(
+            dtype="bfloat16",
+            max_tokens=anchor_tokens,
+            hidden_size=hidden_size,
+            split_k=split_k,
+        ),
+        None,
     )
 
 
@@ -461,46 +501,30 @@ def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> No
 
 
 @pytest.mark.parametrize(
-    ("hidden_size", "split_k", "prefill_mode"),
+    ("hidden_size", "split_k", "schedule"),
     [
-        (4096, 64, "compact"),
-        (4096, 64, "block"),
-        (4096, 64, "bf16_tma"),
-        (4096, 64, "bf16_vector"),
+        (4096, 64, "native_decode"),
+        (4096, 64, "native_prefill_block_m"),
         (4096, 64, "tf32_tma"),
-        (7168, 112, "compact"),
-        (7168, 112, "block"),
-        (7168, 112, "bf16_tma"),
-        (7168, 112, "bf16_vector"),
+        (7168, 112, "native_decode"),
+        (7168, 112, "native_prefill_block_m"),
         (7168, 112, "tf32_tma"),
     ],
     ids=lambda value: str(value),
 )
-def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
+def test_b12x_mhc_planned_post_pre_expected_m_matches_reference(
     hidden_size: int,
     split_k: int,
-    prefill_mode: str,
-    monkeypatch: pytest.MonkeyPatch,
+    schedule: str,
 ) -> None:
     device = require_b12x()
     tokens = 33
     expected_m = 384
-    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
-    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
-    monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "0")
-    monkeypatch.setenv("B12X_MHC_PREFILL_COMPACT", "1")
-    if prefill_mode == "block":
-        monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "1")
-    elif prefill_mode == "bf16_tma":
-        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
-        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "1")
-    elif prefill_mode == "bf16_vector":
-        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
-        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "0")
-    elif prefill_mode == "tf32_tma":
-        monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "1")
-    elif prefill_mode != "compact":
-        raise AssertionError(f"unknown prefill mode {prefill_mode}")
+    config = _planned_mhc_config(
+        hidden_size=hidden_size,
+        split_k=split_k,
+        schedule=schedule,
+    )
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
         hidden_size=hidden_size,
@@ -513,7 +537,9 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
         split_k=split_k,
         device=device,
         expected_m=expected_m,
+        config=config,
     )
+    assert binding.plan.config == config
     norm_gen = torch.Generator(device="cpu")
     norm_gen.manual_seed(91_470 + hidden_size)
     norm_weight = (
@@ -522,15 +548,6 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
         .to(torch.bfloat16)
         .contiguous()
     )
-    fn_bf16 = (
-        fn.to(torch.bfloat16).contiguous()
-        if prefill_mode.startswith("bf16_")
-        else None
-    )
-    # The BF16 projection branches intentionally consume the caller-supplied
-    # quantized function matrix.  Their oracle must model that contract rather
-    # than compare against the original FP32 matrix.
-    oracle_fn = fn if fn_bf16 is None else fn_bf16.float()
     _, prev_post, prev_comb = _mhc_pre_reference(
         residual,
         fn,
@@ -559,7 +576,6 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
             binding=binding,
             norm_weight=norm_weight,
             norm_eps=1e-6,
-            fn_bf16=fn_bf16,
         )
 
     outputs = run()
@@ -576,7 +592,7 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
     residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
     y_raw_ref, post_ref, comb_ref = _mhc_pre_reference(
         residual_ref,
-        oracle_fn,
+        fn,
         scale,
         bias,
         rms_eps=1e-6,
@@ -617,7 +633,7 @@ def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
     residual_ref_live = _mhc_post_reference(x, residual, prev_post, prev_comb)
     y_raw_ref_live, post_ref_live, comb_ref_live = _mhc_pre_reference(
         residual_ref_live,
-        oracle_fn,
+        fn,
         scale,
         bias,
         rms_eps=1e-6,
@@ -759,7 +775,6 @@ def test_b12x_mhc_pro_hidden_match_reference() -> None:
         (4096, 64, "fused"),
         (4096, 64, "post"),
         (4096, 64, "pre"),
-        (7168, 112, "split"),
         (7168, 112, "fused"),
         (7168, 112, "post"),
         (7168, 112, "pre"),
@@ -769,7 +784,6 @@ def test_b12x_mhc_pro_hidden_match_reference() -> None:
         "h4096-fused",
         "h4096-post",
         "h4096-pre",
-        "h7168-split",
         "h7168-fused",
         "h7168-post",
         "h7168-pre",
@@ -779,13 +793,19 @@ def test_b12x_mhc_decode_specialization_live_graph_oracle(
     hidden_size: int,
     split_k: int,
     decode_mode: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = require_b12x()
-    monkeypatch.setenv(
-        "B12X_MHC_DECODE_SPLITS", "4" if decode_mode == "split" else "0"
+    decode_config = _planned_mhc_config(
+        hidden_size=hidden_size,
+        split_k=split_k,
+        schedule="native_decode",
     )
-    monkeypatch.setenv("B12X_MHC_DECODE_TILE_N", "6")
+    if decode_mode == "split":
+        decode_config = replace(
+            decode_config,
+            decode_source_splits=4,
+            decode_tile_n=6,
+        )
     tokens = 1
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -894,7 +914,9 @@ def test_b12x_mhc_decode_specialization_live_graph_oracle(
             hidden_size=hidden_size,
             split_k=split_k,
             device=device,
+            config=decode_config,
         )
+        assert binding.plan.config == decode_config
 
         def run_pre() -> tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
@@ -919,7 +941,9 @@ def test_b12x_mhc_decode_specialization_live_graph_oracle(
             hidden_size=hidden_size,
             split_k=split_k,
             device=device,
+            config=decode_config,
         )
+        assert binding.plan.config == decode_config
 
         def run_post_pre() -> tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor

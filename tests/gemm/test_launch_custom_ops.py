@@ -11,6 +11,15 @@ def test_mhc_projection_cache_key_uses_planned_geometry_not_live_rows() -> None:
 
     config = MhcConfig(
         backend="tf32_tma",
+        native_post_pre_backend="decode",
+        decode_source_splits=0,
+        decode_tile_n=0,
+        decode_bf16x2=False,
+        decode_partials_per_cta=4,
+        decode_finalize_threads=0,
+        decode_finalize_ctas=1,
+        prefill_block_m=0,
+        prefill_tile_n=0,
         projection_tile_m=64,
         projection_tile_n=24,
         projection_tile_k=64,
@@ -178,6 +187,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             None,
+            None,
         )
         torch.ops.b12x.dense_gemm_launch(
             a,
@@ -213,6 +223,7 @@ def test_dense_gemm_launch_has_fake_dispatch() -> None:
             False,
             False,
             123,
+            None,
         )
 
 
@@ -244,6 +255,10 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             partials,
             out,
             True,
+            0,
+            0,
+            False,
+            4,
         )
         torch.ops.b12x.mhc_finalize_gram_launch(
             residual,
@@ -262,6 +277,8 @@ def test_mhc_launch_ops_have_fake_dispatch() -> None:
             False,
             1,
             0,
+            0,
+            1,
         )
         torch.ops.b12x.mhc_prefill_tf32_project_launch(
             torch.empty((2, 4, 4096), dtype=torch.bfloat16),

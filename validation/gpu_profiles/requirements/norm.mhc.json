@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "component_id": "norm.mhc",
+  "status": "implemented",
+  "target": {
+    "query_schema_version": 1,
+    "config_schema_version": 4,
+    "candidate_contract_version": 5
+  },
+  "qualification": {
+    "schedules": [
+      "native_decode_unsplit",
+      "native_decode_source_split_4",
+      "native_decode_source_split_8",
+      "native_decode_bf16x2",
+      "native_decode_partial_grouping",
+      "native_decode_finalize_single_cta",
+      "native_prefill_block_m",
+      "tf32_tma"
+    ],
+    "requirements": [
+      "production_plan_and_binding_path",
+      "independent_numerical_oracle",
+      "finite_nonzero_outputs",
+      "two_captured_decoder_layers",
+      "four_recurrent_post_pre_boundaries",
+      "unique_mxfp8_projection_weights",
+      "in_graph_event_timing",
+      "graph_replay_mhc_cosine",
+      "stable_caller_owned_addresses",
+      "zero_replay_allocator_counter_deltas",
+      "balanced_candidate_ordering"
+    ]
+  },
+  "profiles": [
+    {
+      "profile_id": "nvidia.gb10.48sm",
+      "status": "unsupported",
+      "resolution": "heuristic",
+      "targets": [
+        {
+          "vendor": "nvidia",
+          "product_name": "nvidia gb10",
+          "compute_capability": [12, 1],
+          "sm_count": 48
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz",
+          "component_entry": "omitted"
+        },
+        {
+          "path": "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
+          "component_entry": "omitted"
+        }
+      ],
+      "command": "./scripts/generate_gpu_profile.py --device cuda:<ordinal> --components norm.mhc --output validation/gpu_profiles/generated/nvidia.gb10.48sm.json.gz --work-dir .b12x-profile-work/nvidia.gb10.48sm --overwrite --embed"
+    },
+    {
+      "profile_id": "nvidia.rtx.pro.6000.blackwell",
+      "status": "qualified",
+      "targets": [
+        {
+          "vendor": "nvidia",
+          "product_name": "nvidia rtx pro 6000 blackwell max-q workstation edition",
+          "compute_capability": [12, 0],
+          "sm_count": 188
+        },
+        {
+          "vendor": "nvidia",
+          "product_name": "nvidia rtx pro 6000 blackwell workstation edition",
+          "compute_capability": [12, 0],
+          "sm_count": 188
+        },
+        {
+          "vendor": "nvidia",
+          "product_name": "nvidia rtx pro 6000 blackwell server edition",
+          "compute_capability": [12, 0],
+          "sm_count": 188
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz",
+          "observed_config_schema_version": 4
+        },
+        {
+          "path": "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz",
+          "observed_config_schema_version": 4
+        }
+      ],
+      "qualification_evidence": {
+        "candidate_race_cases": 48,
+        "gpu_measurement_cases": 68,
+        "candidate_measurements": 497,
+        "profile_cases": 68,
+        "single_candidate_qualification_cases": 20,
+        "minimum_cosine_threshold": 0.998,
+        "observed_minimum_cosines": {
+          "output": 0.9999998807907104,
+          "y": 0.9999995231628418,
+          "post": 0.9999998807907104,
+          "comb": 0.9999998211860657
+        },
+        "timing_context": "two_decoder_layers",
+        "context_transformer_layers": 2,
+        "context_mhc_boundaries": 4,
+        "context_projection_pairs": 5,
+        "unique_mxfp8_projection_weights": 10,
+        "in_graph_event_timing": true,
+        "minimum_graph_replay_mhc_cosine": 0.998,
+        "observed_minimum_graph_replay_mhc_cosine": 0.998115062713623,
+        "observed_minimum_context_consumer_cosine": 0.996882975101471,
+        "baseline_margin": 0.02,
+        "baseline_margin_retentions": 7,
+        "stable_caller_owned_addresses": true,
+        "zero_replay_allocator_counter_deltas": true,
+        "source_revision": "c66ad79d50265eb556b4eecddec8acda34682ee2-worktree.69eb7641c8946fc3"
+      },
+      "command": "python ./scripts/generate_gpu_profile.py --device cuda:<ordinal> --components norm.mhc --output validation/gpu_profiles/generated/nvidia.rtx.pro.6000.blackwell.json.gz --work-dir .b12x-profile-work/nvidia.rtx.pro.6000.blackwell-in-layer-policy-v5 --overwrite --embed --no-cold-l2"
+    }
+  ]
+}

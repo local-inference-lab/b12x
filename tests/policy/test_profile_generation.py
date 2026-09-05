@@ -33,6 +33,7 @@ from b12x.policy.generation.runner import (
     write_artifact_atomic,
 )
 from b12x.tools.generate_gpu_profile import (
+    _bind_inline_generation_device,
     _is_generated_profile_data,
     _parse_devices,
     _parse_partition_shard,
@@ -121,6 +122,17 @@ def test_default_profile_id_reuses_embedded_multi_target_profile() -> None:
     assert {
         _profile_id_for_device(target) for target in profile.targets
     } == {profile.profile_id}
+
+
+def test_inline_generation_binds_the_requested_cuda_device(monkeypatch) -> None:
+    selected = []
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+
+    _bind_inline_generation_device(
+        SimpleNamespace(identity=_DEVICE, ordinal=7)
+    )
+
+    assert selected == [7]
 
 
 def test_parallel_worker_reports_ready_after_initialization(monkeypatch) -> None:
@@ -366,6 +378,38 @@ def test_partial_artifact_merge_replaces_only_generated_components(
         "attention.gqa",
         "moe.decode",
     }
+
+
+def test_partial_artifact_merge_qualifies_an_explicit_heuristic_component(
+    tmp_path,
+) -> None:
+    context = GenerationContext(
+        device=_DEVICE,
+        device_ordinal=0,
+        work_dir=tmp_path,
+        source_revision="abc123",
+        settings=GenerationSettings(),
+    )
+    base = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("attention.gqa"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+    base["profile"]["heuristic_components"] = ["moe.decode"]
+    update = generate_profile_artifact(
+        profile_id="nvidia.synthetic.48sm",
+        generators=(_Generator("moe.decode"),),
+        context=context,
+        progress=NullProgressReporter(),
+    )
+
+    merged = merge_profile_artifacts(base, update)
+
+    assert [
+        component["component_id"] for component in merged["profile"]["components"]
+    ] == ["attention.gqa", "moe.decode"]
+    assert "heuristic_components" not in merged["profile"]
 
 
 def test_partial_artifact_merge_preserves_base_target_aliases(tmp_path) -> None:

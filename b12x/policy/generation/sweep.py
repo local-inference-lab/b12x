@@ -221,8 +221,12 @@ class DiscreteSweepGenerator:
         candidate_contract_version: int = 1,
         nearest_range_bounds: Mapping[str, tuple[int, int]] | None = None,
         candidate_tie_breaker: Callable[[SweepCandidate], int | str] | None = None,
+        baseline_margin: float = 0.0,
     ) -> None:
         self.component_id = component_id
+        self._baseline_margin = float(baseline_margin)
+        if not 0.0 <= self._baseline_margin < 1.0:
+            raise ValueError("baseline_margin must be in [0, 1)")
         self.query_schema_version = int(query_schema_version)
         self.config_schema_version = int(config_schema_version)
         self._query_fields = tuple(query_fields)
@@ -250,6 +254,15 @@ class DiscreteSweepGenerator:
             raise ValueError("candidate_contract_version must be positive")
         if not frozenset(self._nearest_range_bounds) <= self._range_fields:
             raise ValueError("nearest range fields must also be range_fields")
+
+    def baseline_config(
+        self,
+        case: SweepCase,
+        context: GenerationContext,
+    ) -> Mapping[str, object] | None:
+        """Return the built-in plan retained within ``baseline_margin``."""
+        del case, context
+        return None
 
     def estimate(self, context: GenerationContext) -> WorkEstimate:
         del context
@@ -555,6 +568,7 @@ class DiscreteSweepGenerator:
         )
         records: list[DecisionRecord] = []
         winner_counts: dict[str, int] = defaultdict(int)
+        baseline_margin_retentions = 0
         for grouped in grouped_results.values():
             by_candidate: dict[str, list[SweepMeasurement]] = defaultdict(list)
             for _case, measurements in grouped:
@@ -581,7 +595,7 @@ class DiscreteSweepGenerator:
                     "no candidate passed every scenario for query "
                     f"{grouped[0][0].query.to_dict()}"
                 )
-            _, winner = min(
+            best_score, winner = min(
                 robust,
                 key=lambda item: (
                     item[0],
@@ -592,6 +606,20 @@ class DiscreteSweepGenerator:
                     ),
                 ),
             )
+            if self._baseline_margin:
+                baseline = self.baseline_config(grouped[0][0], context)
+                if baseline is not None:
+                    baseline_config = dict(baseline)
+                    for score, candidate in robust:
+                        if candidate.config.to_dict() != baseline_config:
+                            continue
+                        if (
+                            candidate != winner
+                            and best_score >= score * (1.0 - self._baseline_margin)
+                        ):
+                            winner = candidate
+                            baseline_margin_retentions += 1
+                        break
             records.append(
                 DecisionRecord(
                     query=grouped[0][0].query,
@@ -621,6 +649,8 @@ class DiscreteSweepGenerator:
                 "profile_cases": len(measured),
                 "candidate_race_cases": race_cases,
                 "single_candidate_qualification_cases": qualification_cases,
+                "baseline_margin": self._baseline_margin,
+                "baseline_margin_retentions": baseline_margin_retentions,
             },
             completed_work_units=self.estimate(context).work_units,
         )
