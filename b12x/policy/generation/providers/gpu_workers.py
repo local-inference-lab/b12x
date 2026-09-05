@@ -394,6 +394,14 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
         return self._CANDIDATES[str(case.metadata.get("decay_recipe", "gdn"))]
 
+    def _measure_candidate_pass(
+        self,
+        case: SweepCase,
+        candidate: SweepCandidate,
+    ) -> SweepMeasurement:
+        """Measure one candidate for one balanced-order pass."""
+        return self.measure(case, (candidate,))[0]
+
     def measure(
         self,
         case: SweepCase,
@@ -409,10 +417,46 @@ class _GdnSession(AbstractContextManager["_GdnSession"]):
         ):
             raise ValueError("GDN worker received an unknown candidate set")
         if len(candidates) > 1:
-            measurements = []
+            measured: dict[str, list[SweepMeasurement]] = {
+                candidate.candidate_id: [] for candidate in candidates
+            }
+            for order in (candidates, tuple(reversed(candidates))):
+                for candidate in order:
+                    measurement = self._measure_candidate_pass(case, candidate)
+                    measured[candidate.candidate_id].append(measurement)
+
+            aggregated = []
             for candidate in candidates:
-                measurements.extend(self.measure(case, (candidate,)))
-            return tuple(measurements)
+                passes = measured[candidate.candidate_id]
+                latencies = tuple(
+                    measurement.latency_us
+                    for measurement in passes
+                    if measurement.latency_us is not None
+                )
+                reference = passes[0]
+                metrics = reference.metrics.to_dict()
+                metrics["balanced_pass_latencies_us"] = latencies
+                aggregated.append(
+                    SweepMeasurement(
+                        candidate=candidate,
+                        latency_us=(
+                            statistics.median(latencies)
+                            if len(latencies) == len(passes)
+                            else None
+                        ),
+                        correct=all(measurement.correct for measurement in passes),
+                        metrics=metrics,
+                        error=next(
+                            (
+                                measurement.error
+                                for measurement in passes
+                                if measurement.error is not None
+                            ),
+                            None,
+                        ),
+                    )
+                )
+            return tuple(aggregated)
         settings = self._context.settings
         device = torch.device("cuda", self._context.device_ordinal)
         with torch.cuda.device(self._context.device_ordinal):
