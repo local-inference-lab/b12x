@@ -72,11 +72,7 @@ class _FixedGdnSession(AbstractContextManager["_FixedGdnSession"]):
         return None
 
     def candidates(self, _case):
-        return (
-            SweepCandidate.create(
-                {"backend": "triton", "recurrent_block_v": 32}
-            ),
-        )
+        return (SweepCandidate.create({"backend": "triton", "recurrent_block_v": 32}),)
 
     def measure(self, _case, candidates):
         return (
@@ -422,11 +418,16 @@ def test_generated_gdn_profile_covers_dense_and_sparse_capacity_ranges(
         source_revision="test",
         settings=GenerationSettings(),
     )
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
     result = generator.generate(
         context,
         progress=NullProgressReporter(),
-        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+        checkpoints=checkpoints,
     )
+    for case in cases:
+        checkpoint = checkpoints.load("attention.gdn", case.case_id)
+        assert checkpoint is not None
+        assert checkpoint["candidate_contract_version"] == 2
     profile = profile_from_dict(
         {
             "profile_id": "synthetic",
@@ -490,14 +491,12 @@ def test_gdn_benchmark_factory_accepts_grouped_capacity_cases() -> None:
 
 
 def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
-    case = next(
-        case
-        for case in gdn_cases()
-        if case.metadata["decay_recipe"] == "kda"
-    )
+    case = next(case for case in gdn_cases() if case.metadata["decay_recipe"] == "kda")
     session = GdnBenchmarkFactory()(case.group_id, (case,), object())
 
-    assert tuple(candidate.config.to_dict() for candidate in session.candidates(case)) == (
+    assert tuple(
+        candidate.config.to_dict() for candidate in session.candidates(case)
+    ) == (
         {"backend": "triton", "recurrent_block_v": 16},
         {"backend": "triton", "recurrent_block_v": 32},
     )
@@ -505,11 +504,7 @@ def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
 
 def test_gdn_benchmark_balances_candidate_measurement_order(monkeypatch) -> None:
     """KDA tuning alternates the leading candidate and aggregates each arm."""
-    case = next(
-        case
-        for case in gdn_cases()
-        if case.metadata["decay_recipe"] == "kda"
-    )
+    case = next(case for case in gdn_cases() if case.metadata["decay_recipe"] == "kda")
     session = GdnBenchmarkFactory()(case.group_id, (case,), object())
     candidates = session.candidates(case)
     observed: list[int] = []
