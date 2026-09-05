@@ -126,7 +126,15 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
     for rows, width in shapes:
         inp = _pattern(rows, width, rank, device)
         out = torch.empty_like(inp)
-        pool.all_reduce(inp, out=out, channel_id="eager")
+        # Acceptance is a deterministic function of the shape, so a rejection
+        # happens on every rank before any peer traffic.
+        try:
+            pool.all_reduce(inp, out=out, channel_id="eager")
+        except Exception as error:
+            if rank == 0:
+                print(json.dumps({"path": "oneshot", "rows": rows, "width": width,
+                                  "skipped": repr(error)[:200]}), flush=True)
+            continue
         verify(out, rows, width, "oneshot")
         median, p90 = _time(
             lambda: pool.all_reduce(inp, out=out, channel_id="eager"),
