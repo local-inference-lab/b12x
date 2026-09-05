@@ -36,7 +36,8 @@ def runtime():
         pytest.skip(
             "RoCE all-reduce needs an integrated GPU with an active RDMA device"
         )
-    if not dist.is_initialized():
+    owns_group = not dist.is_initialized()
+    if owns_group:
         # A short timeout turns a rank that failed early into an error on every
         # rank instead of a silent hang in the next collective.
         dist.init_process_group("nccl", timeout=timedelta(seconds=60))
@@ -52,6 +53,8 @@ def runtime():
     yield rt
     rt.close()
     dist.barrier()
+    if owns_group:
+        dist.destroy_process_group()
 
 
 def _tolerance(dtype: torch.dtype, world: int) -> tuple[float, float]:
@@ -398,12 +401,14 @@ def test_adapter_path_graph_replay(runtime):
     dist.barrier()
 
 
-def _fresh_runtime(spin_limit: int):
+def _fresh_runtime(spin_limit: int, timeout_ms: int = 1000):
     """A runtime of its own with a short spin limit, for fault injection."""
     from b12x.comm import roce
 
     previous = os.environ.get("B12X_ROCE_SPIN_LIMIT")
+    previous_timeout = os.environ.get("B12X_ROCE_TIMEOUT_MS")
     os.environ["B12X_ROCE_SPIN_LIMIT"] = str(spin_limit)
+    os.environ["B12X_ROCE_TIMEOUT_MS"] = str(timeout_ms)
     try:
         rt = roce.AllReduce.from_exchange_group(
             exchange_group=dist.group.WORLD,
@@ -415,8 +420,82 @@ def _fresh_runtime(spin_limit: int):
             del os.environ["B12X_ROCE_SPIN_LIMIT"]
         else:
             os.environ["B12X_ROCE_SPIN_LIMIT"] = previous
+        if previous_timeout is None:
+            del os.environ["B12X_ROCE_TIMEOUT_MS"]
+        else:
+            os.environ["B12X_ROCE_TIMEOUT_MS"] = previous_timeout
     rt.prepare((torch.bfloat16,))
     return rt
+
+
+@pytest.mark.parametrize("kind", ["reduce", "gather"])
+def test_one_rank_stale_flag_graph_replay(runtime, kind):
+    """Only rank 0 misses a flag; other ranks finish, then converge to failure.
+
+    The real proxy still exchanges payloads. Rank 0 captures a flag address
+    backed by a separate pinned region, so one peer flag can remain stale
+    regardless of NIC writes. A huge poll budget forces the time deadline to
+    be the failure path. The test launcher must also have a process deadline.
+    """
+    rank, world = dist.get_rank(), dist.get_world_size()
+    rt = _fresh_runtime(0xFFFFFFFF, timeout_ms=200)
+    inp = torch.full((4096,), rank + 1, dtype=torch.bfloat16, device=rt.device)
+    out = torch.full(
+        (4096 * (world if kind == "gather" else 1),),
+        -17,
+        dtype=inp.dtype,
+        device=rt.device,
+    )
+    # Every rank has completed kernel compilation before any operation starts.
+    torch.cuda.synchronize()
+    dist.barrier()
+    flags = None
+    if rank == 0:
+        flags = torch.ones(
+            world * rt._layout.slots * len(rt.hca_names) * rt._layout.flag_stride // 4,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        missing = ((world - 1) * rt._layout.slots + 1) * len(rt.hca_names)
+        flags[missing * rt._layout.flag_stride // 4] = 0
+        rt._flag_base = flags.data_ptr()
+    stream = torch.cuda.Stream(device=rt.device)
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), rt.capture(stream=stream):
+        if kind == "reduce":
+            rt.all_reduce(inp, out=out)
+        else:
+            rt.all_gather(inp, out=out)
+    torch.cuda.synchronize()
+    dist.barrier()
+    started = time.monotonic()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert time.monotonic() - started < 5, "asymmetric replay exceeded deadline"
+    if rank == 0:
+        with pytest.raises(RuntimeError, match="poisoned"):
+            rt.check_health()
+        assert rt.stats()["epoch"] == 0
+        assert rt.stats()["error_peer"] == world - 1
+        assert torch.all(out == -17)
+    else:
+        rt.check_health()
+        assert rt.stats()["epoch"] == 1
+        if kind == "reduce":
+            assert torch.all(out == world * (world + 1) // 2)
+        else:
+            expected = torch.arange(
+                1, world + 1, device=rt.device, dtype=inp.dtype
+            ).repeat_interleave(inp.numel())
+            assert torch.equal(out, expected)
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        rt.check_health()
+    rt.close()
+    dist.barrier()
 
 
 def test_fail_stop_on_timeout_eager(runtime):

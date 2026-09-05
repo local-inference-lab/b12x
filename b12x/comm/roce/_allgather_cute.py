@@ -30,6 +30,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 
 from ._cute_intrinsics import (
     atomic_add_relaxed_gpu_u32,
+    cta_any_nonzero,
     fence_sc_gpu,
     fence_sc_sys,
     ld_global_v4_u32,
@@ -88,6 +89,7 @@ class _RoceAllGatherLaunch:
         tail_counter_ptr: Int64,
         poison_ptr: Int64,
         spin_limit: Uint32,
+        timeout_ns: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -108,6 +110,7 @@ class _RoceAllGatherLaunch:
             tail_counter_ptr,
             poison_ptr,
             spin_limit,
+            timeout_ns,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -133,6 +136,7 @@ class _RoceAllGatherLaunch:
         tail_counter_ptr: Int64,
         poison_ptr: Int64,
         spin_limit: Uint32,
+        timeout_ns: Int64,
     ) -> None:
         """Device kernel: stage, doorbell, wait for peer flags, strided copy, advance the epoch."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -150,10 +154,9 @@ class _RoceAllGatherLaunch:
 
         # A recorded timeout poisons the runtime: later launches do nothing so
         # the host sees the failure without waiting another spin limit per op.
-        # The device poison word (fourth counter) is written by the same waiting
-        # threads that write the host error word and only ever goes from 0 to
-        # the failed sequence, so a cheap GPU-scope load is enough here.
-        poisoned = ld_relaxed_gpu_u32(poison_ptr)
+        # Another CTA can publish poison while this CTA starts. Vote before
+        # branching so every thread agrees whether to enter the CTA barriers.
+        poisoned = cta_any_nonzero(ld_relaxed_gpu_u32(poison_ptr))
         if poisoned == Uint32(0):
             # 1. stage the local shard into the pinned send slot
             stage_index = index
@@ -193,7 +196,9 @@ class _RoceAllGatherLaunch:
                         * Int64(self._hca_count)
                         + Int64(hca)
                     ) * Int64(self._flag_stride)
-                    timed_out = spin_until_eq_acquire_sys(flag_addr, seq, spin_limit)
+                    timed_out = spin_until_eq_acquire_sys(
+                        flag_addr, seq, spin_limit, timeout_ns
+                    )
                     if timed_out != Uint32(0):
                         st_relaxed_sys_u32(ctrl_base + Int64(12), Uint32(peer))
                         st_relaxed_sys_u32(ctrl_base + Int64(24), Uint32(hca))
@@ -323,9 +328,10 @@ def get_launcher(
         16,
         16,
         1,
+        20_000_000_000,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 3, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.allgather", 4, cache_key),
     )
 
     def run(
@@ -344,6 +350,7 @@ def get_launcher(
         tail_counter_address: int,
         poison_address: int,
         spin_limit: int,
+        timeout_ns: int,
         grid_x: int,
     ) -> None:
         """Launch the compiled kernel with runtime scalar arguments."""
@@ -367,6 +374,7 @@ def get_launcher(
             int(tail_counter_address),
             int(poison_address),
             int(spin_limit),
+            int(timeout_ns),
             int(grid_x),
             current_cuda_stream(),
         )

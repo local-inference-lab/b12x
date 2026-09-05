@@ -87,10 +87,10 @@ gather paths stage the shard contiguously and only the reader is strided, so
 ranks may take different paths for the same collective.
 
 **Configuration is checked at setup.** Every rank publishes its API version,
-proxy ABI, HCA count, slot geometry, size limits, spin limit and launch geometry
+proxy ABI, HCA count, slot geometry, size limits, spin/time limits and launch geometry
 in the setup exchange; any difference fails construction on every rank.
 
-**Failures are fail-stop, never a fallback.** A wait that exceeds the spin limit
+**Failures are fail-stop, never a fallback.** A wait that exceeds either budget
 records the sequence and the missing peer in the control record; the kernel
 skips its data phase and does not advance the epoch, so every later launch on
 that rank is a no-op. `check_health` raises from then on, before any further
@@ -100,12 +100,26 @@ to the host every step), so no extra synchronization is added and the step's
 output never leaves the worker. Inside the step, kernels after the failed
 collective do consume its output, inside a worker that is about to exit. Ranks
 converge without a supervisor: a rank that stops posting starves its peers'
-next wait, so each peer times out and poisons itself within one spin limit,
+next wait, so each peer times out and poisons itself within one wait budget,
 including the asymmetric case where one rank received every flag and advanced
-while another timed out. Choose the spin limit as the failure-detection latency
-(`B12X_ROCE_SPIN_LIMIT`, about a microsecond per poll; the default 20M is about
-half a minute); it must exceed the longest legitimate rank skew, which for
-tensor-parallel decode is milliseconds.
+while another timed out. `B12X_ROCE_TIMEOUT_MS` sets an independent elapsed-time
+budget per peer wait (default 20,000 ms), measured using the GPU's 64-bit
+nanosecond timer. `B12X_ROCE_SPIN_LIMIT` remains an additional poll budget
+(default 20M; positive uint32). Poll latency depends on memory contention and
+must not be converted to seconds using a fixed assumed cost. The first limit
+reached ends the wait. Choose the time budget to exceed legitimate rank skew.
+This bounds a running peer-poll loop, not a GPU/driver that stops executing.
+
+Each CTA votes on the device poison word before entering the collective's
+barriers: another CTA can publish a timeout while threads are starting, and
+all threads in a block must agree whether to participate.
+
+`tests/comm/test_roce_wait_gpu.py` injects stale flags directly into pinned
+memory and exercises the real all-reduce/all-gather kernels without a NIC.
+It covers graph replay, subsequent poisoned no-ops, unsigned sequence values,
+and oversubscribed grids. Each case has a parent-process deadline in addition
+to the device wait deadline. The multi-node tests remain the transport and
+asymmetric failure acceptance gate.
 
 **Streams.** Collectives on different streams are ordered with an event
 recorded under the admission lock, so they execute in launch order; inside a

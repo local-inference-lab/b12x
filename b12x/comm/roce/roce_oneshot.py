@@ -46,9 +46,10 @@ DEFAULT_MAX_GATHER_BYTES = 16 * 1024 * 1024
 DEFAULT_THREADS = 512
 DEFAULT_BLOCKS = 8
 DEFAULT_GID_INDEX = 3
-# Polls of a peer flag before the kernel gives up (each poll is a system-scope
-# load of host memory, roughly a microsecond): about 20 s.
+# Independent poll and elapsed-time budgets: system-memory poll latency varies
+# with contention, so a poll count is not a reliable time bound.
 DEFAULT_SPIN_LIMIT = 20_000_000
+DEFAULT_TIMEOUT_MS = 20_000
 _SLOT_ALIGNMENT = 4096
 _DTYPE_NAMES = {
     torch.float16: "float16",
@@ -235,6 +236,12 @@ class RoceOneshotAllReduce:
         self._counter_classes = self._blocks.bit_length()
         self.gid_index = default_gid_index() if gid_index is None else int(gid_index)
         self.spin_limit = _env_int("B12X_ROCE_SPIN_LIMIT", default=DEFAULT_SPIN_LIMIT)
+        self.timeout_ms = _env_int("B12X_ROCE_TIMEOUT_MS", default=DEFAULT_TIMEOUT_MS)
+        if not 1 <= self.spin_limit <= 0xFFFFFFFF:
+            raise ValueError("B12X_ROCE_SPIN_LIMIT must fit a positive uint32")
+        if not 1 <= self.timeout_ms <= (2**63 - 1) // 1_000_000:
+            raise ValueError("B12X_ROCE_TIMEOUT_MS must fit positive int64 nanoseconds")
+        self._timeout_ns = self.timeout_ms * 1_000_000
         names = tuple(hca_names) if hca_names else discover_hcas(self.gid_index)
         if not names:
             raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
@@ -314,6 +321,7 @@ class RoceOneshotAllReduce:
             "max_size": self.max_size,
             "max_gather_bytes": self.max_gather_bytes,
             "spin_limit": self.spin_limit,
+            "timeout_ms": self.timeout_ms,
             "threads": self._threads,
             "blocks": self._blocks,
         }
@@ -582,6 +590,7 @@ class RoceOneshotAllReduce:
                     tail_counter,
                     self._poison_address,
                     self.spin_limit,
+                    self._timeout_ns,
                     grid_blocks,
                 )
                 if dst is not out:
@@ -843,6 +852,7 @@ class RoceOneshotAllReduce:
             tail_counter,
             self._poison_address,
             self.spin_limit,
+            self._timeout_ns,
             self._blocks,
         )
         if not capturing:
@@ -885,6 +895,7 @@ class RoceOneshotAllReduce:
             "error_hca": int(self._ctrl_words[6].item()),
             "ctrl_seq": int(self._ctrl_words[0].item()),
             "spin_limit": self.spin_limit,
+            "timeout_ms": self.timeout_ms,
             "stripe_hcas": list(range(len(self.hca_names))),
         }
         if self._proxy is not None:

@@ -17,7 +17,9 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
-def _asm(result_type, operands, text, constraints, *, side_effects=True, loc=None, ip=None):
+def _asm(
+    result_type, operands, text, constraints, *, side_effects=True, loc=None, ip=None
+):
     """Emit one inline PTX statement through the CuTe DSL and return its result."""
     return llvm.inline_asm(
         result_type,
@@ -63,12 +65,17 @@ def ld_relaxed_sys_u32(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def atomic_add_relaxed_gpu_u32(addr: Int64, value: Uint32, *, loc=None, ip=None) -> Uint32:
+def atomic_add_relaxed_gpu_u32(
+    addr: Int64, value: Uint32, *, loc=None, ip=None
+) -> Uint32:
     """GPU-scope relaxed atomic add; returns the prior value."""
     return Uint32(
         _asm(
             T.i32(),
-            [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(value).ir_value(loc=loc, ip=ip)],
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
             "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
             "=r,l,r",
             loc=loc,
@@ -116,13 +123,46 @@ def fence_sc_gpu(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def cta_any_nonzero(value: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Synchronize the entire CTA and return a block-uniform nonzero vote.
+
+    All threads must call this outside divergent control flow. In particular,
+    a mutable poison word must not independently gate each thread's barriers.
+    """
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Uint32(value).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred failed, any_failed;
+                setp.ne.u32 failed, $1, 0;
+                bar.red.or.pred any_failed, 0, failed;
+                selp.u32 $0, 1, 0, any_failed;
+            }
+            """,
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def spin_until_eq_acquire_sys(
-    addr: Int64, expected: Uint32, limit: Uint32, *, loc=None, ip=None
+    addr: Int64,
+    expected: Uint32,
+    limit: Uint32,
+    timeout_ns: Int64,
+    *,
+    loc=None,
+    ip=None,
 ) -> Uint32:
     """Spin until the word at ``addr`` equals ``expected`` (system scope).
 
-    Returns 0 on success and 1 after ``limit`` polls without a match, so a
-    dead peer or proxy surfaces as an error instead of a hung kernel.
+    Returns 0 on success and 1 after either ``limit`` unsuccessful polls or
+    ``timeout_ns`` elapsed GPU nanoseconds. A poll count alone cannot bound
+    latency when system-memory loads slow down under contention.
     """
     return Uint32(
         _asm(
@@ -131,25 +171,35 @@ def spin_until_eq_acquire_sys(
                 Int64(addr).ir_value(loc=loc, ip=ip),
                 Uint32(expected).ir_value(loc=loc, ip=ip),
                 Uint32(limit).ir_value(loc=loc, ip=ip),
+                Int64(timeout_ns).ir_value(loc=loc, ip=ip),
             ],
             """
             {
                 .reg .pred pending, expired;
                 .reg .b32 seen, polls;
+                .reg .b64 started, now, elapsed;
                 mov.u32 polls, 0;
-                mov.u32 $0, 0;
+                mov.u64 started, %globaltimer;
             roce_wait:
                 ld.acquire.sys.global.u32 seen, [$1];
                 setp.ne.u32 pending, seen, $2;
-                @!pending bra roce_done;
+                @!pending bra roce_success;
                 add.u32 polls, polls, 1;
                 setp.ge.u32 expired, polls, $3;
+                @expired bra roce_timeout;
+                mov.u64 now, %globaltimer;
+                sub.u64 elapsed, now, started;
+                setp.ge.u64 expired, elapsed, $4;
                 @!expired bra roce_wait;
+            roce_timeout:
                 mov.u32 $0, 1;
+                bra roce_done;
+            roce_success:
+                mov.u32 $0, 0;
             roce_done:
             }
             """,
-            "=r,l,r,r",
+            "=r,l,r,r,l",
             loc=loc,
             ip=ip,
         )
@@ -170,12 +220,15 @@ def ld_relaxed_sys_v4_u32(
         ip=ip,
     )
     return tuple(
-        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4)
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
     )
 
 
 @dsl_user_op
-def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+def ld_global_v4_u32(
+    addr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
     """Plain global 16-byte load as four 32-bit words."""
     result = _asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
@@ -186,7 +239,8 @@ def ld_global_v4_u32(addr: Int64, *, loc=None, ip=None) -> Tuple[Uint32, Uint32,
         ip=ip,
     )
     return tuple(
-        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip)) for i in range(4)
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
     )
 
 
@@ -299,7 +353,10 @@ def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint
     return Uint32(
         _asm(
             T.i32(),
-            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(lo).ir_value(loc=loc, ip=ip),
+                Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
             """
             {
                 .reg .b16 blo, bhi;
@@ -322,7 +379,10 @@ def pack_f32x2_to_f16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint3
     return Uint32(
         _asm(
             T.i32(),
-            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(lo).ir_value(loc=loc, ip=ip),
+                Float32(hi).ir_value(loc=loc, ip=ip),
+            ],
             "cvt.rn.f16x2.f32 $0, $2, $1;",
             "=r,f,f",
             side_effects=False,
