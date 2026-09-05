@@ -503,6 +503,38 @@ def test_gdn_benchmark_factory_races_kda_recurrent_value_tiles() -> None:
     )
 
 
+def test_gdn_benchmark_balances_candidate_measurement_order(monkeypatch) -> None:
+    """KDA tuning alternates the leading candidate and aggregates each arm."""
+    case = next(
+        case
+        for case in gdn_cases()
+        if case.metadata["decay_recipe"] == "kda"
+    )
+    session = GdnBenchmarkFactory()(case.group_id, (case,), object())
+    candidates = session.candidates(case)
+    observed: list[int] = []
+
+    def measure_one(_case, candidate):
+        tile = int(candidate.config["recurrent_block_v"])
+        observed.append(tile)
+        return SweepMeasurement(
+            candidate=candidate,
+            latency_us=float(tile),
+            correct=True,
+            metrics={"tile": tile},
+        )
+
+    monkeypatch.setattr(session, "_measure_candidate_pass", measure_one)
+    measured = session.measure(case, candidates)
+
+    assert observed == [16, 32, 32, 16]
+    assert [measurement.latency_us for measurement in measured] == [16.0, 32.0]
+    assert all(
+        len(measurement.metrics["balanced_pass_latencies_us"]) == 2
+        for measurement in measured
+    )
+
+
 def test_attention_corpus_manifests_are_content_addressed() -> None:
     for component in ("gdn", "gqa", "mla", "qsa", "sparse_mla"):
         manifest = attention_corpus_manifest(component)
