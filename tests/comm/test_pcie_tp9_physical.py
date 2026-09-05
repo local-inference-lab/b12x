@@ -74,13 +74,6 @@ def _worker(rank: int, port: int) -> None:
     pool.close()
     record("oneshot_eager_graph_passed")
 
-    twoshot = PCIeTwoShotBF16.from_exchange_group(
-        exchange_group=group,
-        device=device,
-        max_rows=49149,
-        row_elems=8,
-    )
-
     def position_pattern(rows: int, width: int) -> torch.Tensor:
         # Position-dependent integers keep every partial sum exact in bf16
         # (at most 5 * 45 = 225) and expose misplaced or dropped shards,
@@ -97,25 +90,36 @@ def _worker(rank: int, port: int) -> None:
     # Kimi-K3 decode payloads: 7168 wide rows (T tokens) and the 3584 wide
     # latent projection. Their pack counts are multiples of nine only when
     # 9 | T, so most shapes exercise the balanced (uneven) shard partition.
-    for rows, width in ((4, 7168), (8, 7168), (9, 7168), (16, 7168), (32, 7168),
-                        (4, 3584), (16, 3584)):
-        inp = position_pattern(rows, width) * (rank + 1)
+    # The pull (remote read) and push (posted write) kernels share it.
+    for mode in ("pull", "push"):
+        twoshot = PCIeTwoShotBF16.from_exchange_group(
+            exchange_group=group,
+            device=device,
+            max_rows=49149,
+            row_elems=8,
+        )
+        twoshot.all_reduce_mode = mode
+        for rows, width in ((4, 7168), (8, 7168), (9, 7168), (16, 7168), (32, 7168),
+                            (4, 3584), (16, 3584)):
+            inp = position_pattern(rows, width) * (rank + 1)
+            out = torch.empty_like(inp)
+            assert twoshot.accepts(inp)
+            twoshot.all_reduce(inp, out=out)
+            check_pattern(out, 45)
+        inp = position_pattern(16, 7168) * (rank + 1)
         out = torch.empty_like(inp)
-        assert twoshot.accepts(inp)
-        twoshot.all_reduce(inp, out=out)
-        check_pattern(out, 45)
-    inp = position_pattern(16, 7168) * (rank + 1)
-    out = torch.empty_like(inp)
-    graph = torch.cuda.CUDAGraph()
-    with twoshot.capture(), torch.cuda.graph(graph):
-        twoshot.all_reduce(inp, out=out)
-    for iteration in range(3):
-        inp.copy_(position_pattern(16, 7168) * (rank + 1 + (iteration if rank == 8 else 0)))
-        graph.replay()
-        check_pattern(out, 45 + iteration)
-    del graph
-    twoshot.close()
-    record("twoshot_balanced_partition_eager_graph_passed")
+        graph = torch.cuda.CUDAGraph()
+        with twoshot.capture(), torch.cuda.graph(graph):
+            twoshot.all_reduce(inp, out=out)
+        for iteration in range(3):
+            inp.copy_(
+                position_pattern(16, 7168) * (rank + 1 + (iteration if rank == 8 else 0))
+            )
+            graph.replay()
+            check_pattern(out, 45 + iteration)
+        del graph
+        twoshot.close()
+        record(f"twoshot_{mode}_balanced_partition_eager_graph_passed")
 
     dma = PCIeDmaAllReduce(
         exchange_group=group,

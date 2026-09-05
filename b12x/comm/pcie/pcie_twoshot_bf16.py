@@ -88,10 +88,13 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
     packs_per_row = row_elems // _PACK_ELEMS
     pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
     payload_bytes = world_size * pack_stride * 16
-    # The pull all-reduce keeps one reduced shard (pack_stride packs) per slot
-    # after the full staged payload.
+    # After the staged payload each slot keeps a reduced region with one
+    # shard per source rank: the pull all-reduce publishes its own shard in
+    # the first entry, the push all-reduce receives every peer's shard.
     reduced_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
-    slot_bytes = _align_up(reduced_offset + pack_stride * 16, IPC_SLAB_ALIGNMENT)
+    slot_bytes = _align_up(
+        reduced_offset + world_size * pack_stride * 16, IPC_SLAB_ALIGNMENT
+    )
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
     return _TwoShotBf16Layout(
         signal_bytes=signal_bytes,
@@ -191,6 +194,9 @@ class PCIeTwoShotBF16:
             )
             self._wire_output = torch.empty_like(self._wire_input)
         self._closed_ipc_import_indices: set[tuple[int, int]] = set()
+        # "pull": remote reads (the original single-launch kernel);
+        # "push": posted remote writes. Same partition and reduction order.
+        self.all_reduce_mode = "pull"
         return self
 
     @classmethod
@@ -420,6 +426,7 @@ class PCIeTwoShotBF16:
                     threads,
                     self.row_elems,
                     device_index,
+                    self.all_reduce_mode,
                 )
 
     @contextmanager
@@ -507,6 +514,7 @@ class PCIeTwoShotBF16:
                     threads,
                     self.row_elems,
                     device_index,
+                    self.all_reduce_mode,
                 )
             else:
                 prepared = is_twoshot_bf16_launcher_prepared(
@@ -678,6 +686,7 @@ class PCIeTwoShotBF16:
                 threads,
                 self.row_elems,
                 device_index,
+                self.all_reduce_mode,
             )
             launcher(
                 payload.data_ptr(),
@@ -690,6 +699,7 @@ class PCIeTwoShotBF16:
                 rows_per_rank,
                 remainder_packs,
                 blocks,
+                pack_stride=self._pack_stride,
             )
 
     def all_reduce(
@@ -700,7 +710,11 @@ class PCIeTwoShotBF16:
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
-        """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
+        """FP32-accumulating BF16 all-reduce with one BF16 rounding.
+
+        ``all_reduce_mode`` selects remote reads (``pull``) or posted remote
+        writes (``push``); both give bit-identical results.
+        """
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
         logical_numel = inp.numel()
