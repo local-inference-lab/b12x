@@ -28,6 +28,16 @@ only the B12X source range shown below:
 | Reference | `b85d9e88fcdc1ae8c0dfef2ab907e357f7b53331` | `42f0cc48b605af343e6427829e9c208459e25037` | Packed MXFP8 fill elision, without M8 route/compute specialization |
 | Specialized | `f5274e4c369b8252612c5c66118686a3a8e5f234` | `134dfa06eb2b6d3994aeddab4666bbb7bf3e2a92` | Reference behavior plus the M8 route/compute specialization and its safety checks |
 
+Both benchmark arms used vLLM ref
+`build/jovian-judgement-community-r13-performance-20260901` at commit
+`75b0286720f5d8d9fdd8bc3f1c3849cb3751ec8f`, source tree
+`fb69743d8e6b05528d06a94a746326183699ddb9`, and installed package tree
+`a1ec669685da5cf01e0c8d5a307ad30aa47761fb`. The durable benchmark artifacts
+are `r13-component-mxfp8-fill-nospec-c1-c8-ctx0.json` for the reference and
+`r13-component-m8-nospec-c1-c8-ctx0.json` for the specialization. The source
+and package identities are recorded by
+`glm53-jovian-judgement-community-20260901-r13.source.lock`.
+
 The pull-request representation of the specialized source ends at
 `83a10936753e2f9aeec2bdb416dc026f7e2caba5`. Commit
 `13bbc002f0d4cc1e4ce8b929ff61e2341bdcd880` adds immutable plan metadata and
@@ -39,7 +49,13 @@ The implementation commit retains `MadeBy561 <madeby561@gmail.com>` as author.
 Both performance arms used physical GPUs 4, 5, 6, and 7 on one host:
 
 - four NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs;
+- GPU UUIDs `GPU-8800cf0c-1ba5-7136-d796-2a91f9e9586e`,
+  `GPU-4a0aa20b-8e36-2e05-4efb-8befbf1181d4`,
+  `GPU-1a0323f7-8113-a1e1-c68b-f23fecf77171`, and
+  `GPU-0027fc86-3322-ce2a-856c-f49eb61eb63e` at PCI buses `43:00.0`,
+  `44:00.0`, `63:00.0`, and `64:00.0`, respectively;
 - PCIe Gen5 x16 links;
+- default compute mode, persistence mode enabled, and a 600 W power limit;
 - tensor parallelism 4 and decode-context parallelism 1;
 - a +6000 MHz memory-clock offset in both isolated performance arms;
 - full decode CUDA graphs;
@@ -84,6 +100,11 @@ included. Change is `(specialized / reference - 1) * 100`.
 
 The specialization is throughput-neutral at concurrency one and improves the
 eight-request production path by 4.95% under the declared configuration.
+Both artifacts completed with zero request errors. The throughput workload is
+not a semantic output oracle; implementation correctness is established by the
+exact-shape tests described below. Those tests passed for the specialized arm,
+while the reference arm retained the previously qualified unspecialized
+dynamic path.
 
 ## Plan-time compilation correctness
 
