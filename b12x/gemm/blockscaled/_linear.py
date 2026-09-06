@@ -559,7 +559,9 @@ def _packed_mxfp8_op(
     # the GEMM, so initializing fresh scale storage first only adds two CUDA
     # fills per projection. Keep the public allocating quantizer's initialized
     # padding contract unchanged; use the private immediate-consumer path here.
-    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(source_for_quant)
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(
+        source_for_quant, expected_m=expected_m,
+    )
     return dense_gemm(
         (x_q.values.reshape(tokens, padded_in_features, 1), x_q.scale_mma),
         (
