@@ -971,6 +971,7 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
         max_normalized_rmse=0.03,
         replay_count=3,
         require_bit_exact_replay=False,
+        assert_no_replay_allocations=True,
     )
     expected_counts = torch.bincount(
         changed.topk_ids[changed.topk_ids >= 0].to(torch.int64),
@@ -982,9 +983,11 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
 
 
 @pytest.mark.parametrize("layout", ["vector", "scalar", "strided"])
+@pytest.mark.parametrize("work_source", ["materialized_queue", "persistent_grid"])
 def test_standard_moe_dynamic_scale_graph_reads_canonical_owner_updates(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
+    work_source: str,
 ) -> None:
     from b12x.moe.fused_moe import run
 
@@ -992,7 +995,7 @@ def test_standard_moe_dynamic_scale_graph_reads_canonical_owner_updates(
     _reset_dispatch_environment(monkeypatch)
     monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
     monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
-    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "persistent_grid")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", work_source)
     geometry = dict(num_experts=32, hidden_size=512, intermediate_size=128)
     weights = _make_nvfp4_weights(device, seed=241, **geometry)
     if layout == "vector":
