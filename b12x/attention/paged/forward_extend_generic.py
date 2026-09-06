@@ -63,6 +63,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
 )
 
+from ._selected_forward_config import SELECTION_WIDTH
 from .traits import PagedForwardTraits
 
 
@@ -3226,6 +3227,7 @@ class PagedForwardKernel:
         page_size: int,
         key_strides: tuple[int, int, int],
         value_strides: tuple[int, int, int],
+        selection_width: int = SELECTION_WIDTH,
     ):
         """Build the selected-position ABI of the paged forward engine.
 
@@ -3233,6 +3235,7 @@ class PagedForwardKernel:
         the same BF16 query, paged BF16/FP8 cache, tensor-core QK/PV, and online
         softmax contract while replacing contiguous K-tile traversal with an
         explicit logical-position row resolver.
+        ``selection_width`` is planned column capacity, not a live token count.
         """
         from ._selected_forward import _SelectedPositionPagedForwardKernel
 
@@ -3245,6 +3248,7 @@ class PagedForwardKernel:
             page_size=page_size,
             key_strides=key_strides,
             value_strides=value_strides,
+            selection_width=selection_width,
         )
 
     def __init__(
