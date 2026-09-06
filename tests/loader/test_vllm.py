@@ -341,3 +341,59 @@ def test_dspark_markov_embedding_reads_checkpoint_into_weight_storage(
         assert owns_tensor(head.markov_w1.weight)
         assert not owns_tensor(result)
     torch.testing.assert_close(result.cpu(), expected[[0, 17, 127]])
+
+
+def test_glm_mtp_projection_loads_from_main_shard_without_sharing_runtime_buffers(
+    tmp_path, monkeypatch
+):
+    """MTP's plain Linear is a weight; its index buffers and outputs are not."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.models.glm5next.nvidia import mtp
+
+    class Decoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.topk_indices_buffer = kwargs["topk_indices_buffer"]
+            self.pool_topk_indices_buffer = kwargs["pool_topk_indices_buffer"]
+
+    monkeypatch.setattr(mtp, "Glm5NextDecoderLayer", Decoder)
+    monkeypatch.setattr(mtp, "SharedHead", lambda **kwargs: torch.nn.Identity())
+    config = SimpleNamespace(
+        hidden_size=8, rms_norm_eps=1e-6, index_topk=16, index_kpool=4
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        quant_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+    )
+    name = "model.language_model.layers.45.eh_proj.weight"
+    expected = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+    path = tmp_path / "model-00001-of-00001.safetensors"
+    save_file(
+        {name: expected, "model.language_model.layers.0.weight": torch.ones(8)}, path
+    )
+    with (
+        set_current_vllm_config(VllmConfig()),
+        weight_pool(allocation="pinned_wc") as allocator,
+        DirectWeightSession() as session,
+        weight_transfer(session, allocator=allocator),
+        torch.device("cuda"),
+    ):
+        layer = mtp.Glm5NextMultiTokenPredictorLayer(vllm_config, "model.layers.45")
+        source = dict(
+            session.weights([path], prefixes=("model.language_model.layers.45.",))
+        )
+        assert set(source) == {name}
+        default_weight_loader(layer.eh_proj.weight, source[name])
+        session.flush()
+        result = layer.eh_proj(torch.ones(1, 16))
+        assert owns_tensor(layer.eh_proj.weight)
+        assert not owns_tensor(layer.mtp_block.topk_indices_buffer)
+        assert not owns_tensor(layer.mtp_block.pool_topk_indices_buffer)
+        assert not owns_tensor(result)
+    torch.testing.assert_close(layer.eh_proj.weight.cpu(), expected)
+    torch.testing.assert_close(result.cpu(), expected.sum(dim=1).unsqueeze(0))

@@ -402,12 +402,15 @@ def quantize_mxfp8_rows_cute(
     scale_mma: torch.Tensor,
     *,
     value_order: str = "linear",
+    expected_m: int | None = None,
 ) -> None:
     """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
 
     ``trellis_native_mma`` applies the fixed within-K32 byte permutation used
     by direct native-trellis E4M3 B fragments.  It changes neither values nor
     scale groups and avoids a separate activation transpose kernel.
+
+    expected_m fixes the row bound used for lane-layout specialization.
     """
 
     if source.dtype not in (torch.bfloat16, torch.float16):
@@ -417,12 +420,10 @@ def quantize_mxfp8_rows_cute(
     if source.ndim != 2 or not source.is_contiguous():
         raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
     threads = _THREADS
+    planned_rows = int(source.shape[0]) if expected_m is None else expected_m
     if value_order == "trellis_native_mma":
         subgroup_width = 8
-    elif int(source.shape[0]) <= 8:
-        # Cooperative K32 reductions avoid 32 serial element operations per
-        # thread in decode. Values, scales and physical write coverage are
-        # identical to the scalar lane path.
+    elif planned_rows <= 8:
         subgroup_width = 8
         threads = 128
     else:
