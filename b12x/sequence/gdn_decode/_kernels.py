@@ -17,7 +17,8 @@ _VALIDATION_BLOCK = 256
         "state_index_columns",
         "stride_indices_request",
         "stride_indices_column",
-    ]
+    ],
+    do_not_specialize_on_alignment=["state_indices"],
 )
 def _validate_bounded_packed_metadata_kernel(
     query_start_loc,
@@ -29,8 +30,8 @@ def _validate_bounded_packed_metadata_kernel(
     token_capacity,
     sequence_capacity,
     state_index_columns,
-    stride_indices_request,
-    stride_indices_column,
+    stride_indices_request: tl.int64,
+    stride_indices_column: tl.int64,
     MAX_STATE_SLOTS: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
     NULL_STATE_INDEX: tl.constexpr,
@@ -179,7 +180,8 @@ def _validate_packed_metadata_kernel(
         "state_index_columns",
         "stride_indices_request",
         "stride_indices_column",
-    ]
+    ],
+    do_not_specialize_on_alignment=["state_indices"],
 )
 def _validate_active_state_slots_kernel(
     query_start_loc,
@@ -190,8 +192,8 @@ def _validate_active_state_slots_kernel(
     error_code,
     sequence_capacity,
     state_index_columns,
-    stride_indices_request,
-    stride_indices_column,
+    stride_indices_request: tl.int64,
+    stride_indices_column: tl.int64,
     MAX_STATE_SLOTS: tl.constexpr,
     TABLE_SIZE: tl.constexpr,
     HAS_NULL_STATE_INDEX: tl.constexpr,
@@ -440,7 +442,16 @@ def _packed_sequential_kda_decode_kernel(
             )
 
 
-@triton.jit(do_not_specialize=["token_capacity"])
+@triton.jit(
+    do_not_specialize=[
+        "token_capacity",
+        "stride_output_token",
+        "stride_output_head",
+        "stride_z_token",
+        "stride_z_head",
+    ],
+    do_not_specialize_on_alignment=["output", "z"],
+)
 def _gated_rmsnorm_kernel(
     output,
     z,
@@ -449,10 +460,10 @@ def _gated_rmsnorm_kernel(
     error_code,
     eps,
     token_capacity,
-    stride_output_token: tl.constexpr,
-    stride_output_head: tl.constexpr,
-    stride_z_token: tl.constexpr,
-    stride_z_head: tl.constexpr,
+    stride_output_token: tl.int64,
+    stride_output_head: tl.int64,
+    stride_z_token: tl.int64,
+    stride_z_head: tl.int64,
     VALUE_HEADS: tl.constexpr,
     VALUE_HEAD_DIM: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,

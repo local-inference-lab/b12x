@@ -222,8 +222,10 @@ def test_live_strided_views_are_correct_and_graph_replay_safe() -> None:
     assert torch.count_nonzero(state_index_storage[:, -2:] != -1) == 0
 
 
+@pytest.mark.parametrize("max_seqs", (4, 16))
 def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
     monkeypatch,
+    max_seqs: int,
 ) -> None:
     from b12x._lib.runtime_control import (
         freeze_kernel_resolution,
@@ -232,7 +234,9 @@ def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
     from b12x.sequence.gdn_decode import _kernels
 
     device = require_sm120()
-    full_binding, tensors = _make_case(device=device, query_lengths=(4, 4))
+    full_binding, tensors = _make_case(
+        device=device, query_lengths=(4, 4), max_seqs=max_seqs
+    )
     initial_state = full_binding.recurrent_state.clone()
     gdn.run(full_binding)
 
@@ -240,6 +244,7 @@ def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
         pytest.fail("Bound capacities must reuse warmed planned kernels")
 
     for kernel in (
+        _kernels._validate_bounded_packed_metadata_kernel,
         _kernels._reset_validation_kernel,
         _kernels._validate_packed_metadata_kernel,
         _kernels._validate_active_state_slots_kernel,
@@ -249,11 +254,41 @@ def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
 
     freeze_kernel_resolution("Qwen GDN bounded-view replay qualification")
     try:
-        for rows, requests, columns in ((1, 1, 1), (4, 1, 4), (8, 2, 4)):
+        for rows, requests, columns in ((1, 1, 1), (4, 1, 4), (8, 2, 4), (2, 1, 2)):
             live = dict(tensors)
             for name in ("mixed_qkv", "a", "b", "z", "output"):
-                live[name] = tensors[name][:rows]
-            live["state_indices"] = tensors["state_indices"][:requests, :columns]
+                source = tensors[name][:rows]
+                width = source[0].numel()
+                if rows == 2 and name in ("z", "output"):
+                    # Cross the signed 32-bit element-offset boundary.
+                    stride = (1 << 31) + 128
+                    storage = torch.empty(
+                        stride + width, dtype=source.dtype, device=device
+                    )
+                    live[name] = storage.as_strided(source.shape, (stride, 128, 1))
+                else:
+                    storage = torch.full(
+                        (rows, width + rows + 1),
+                        31.0,
+                        dtype=source.dtype,
+                        device=device,
+                    )
+                    live[name] = storage[:, 1 : width + 1].view(source.shape)
+                live[name].copy_(source)
+            if rows == 2:
+                stride = (1 << 31) + 8
+                index_storage = torch.empty(
+                    stride + 1, dtype=torch.int32, device=device
+                )
+                live["state_indices"] = index_storage.as_strided(
+                    (requests, columns), (stride * columns, stride)
+                )
+            else:
+                index_storage = torch.empty(
+                    (requests, 2 * columns + 3), dtype=torch.int32, device=device
+                )
+                live["state_indices"] = index_storage[:, 1 : 2 * columns + 1 : 2]
+            live["state_indices"].copy_(tensors["state_indices"][:requests, :columns])
             live["query_start_loc"] = tensors["query_start_loc"][: requests + 1]
             live["num_accepted_tokens"] = tensors["num_accepted_tokens"][:requests]
             live["query_start_loc"].copy_(
@@ -272,8 +307,12 @@ def test_bounded_views_reuse_planned_kernels_and_validate_bound_counts(
             binding.recurrent_state.copy_(initial_state)
             expected_state = initial_state.clone()
             expected = _reference(binding, expected_state)
+            addresses = tuple(live[name].data_ptr() for name in live)
+            allocated = torch.cuda.memory_allocated(device)
             graph.replay()
             torch.cuda.synchronize(device)
+            assert allocated == torch.cuda.memory_allocated(device)
+            assert addresses == tuple(live[name].data_ptr() for name in live)
             torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
             torch.testing.assert_close(
                 binding.recurrent_state, expected_state, rtol=1e-5, atol=2e-5
