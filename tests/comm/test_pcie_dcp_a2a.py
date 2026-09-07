@@ -784,7 +784,7 @@ def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
     world_size: int,
 ) -> None:
     runtime = _make_kimi_runtime(world_size)
-    compiled: list[tuple[int, int, int, bool, bool]] = []
+    compiled: list[tuple[int, int, int, bool, bool, bool]] = []
     monkeypatch.setattr(
         "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
         lambda device: False,
@@ -800,7 +800,8 @@ def test_kimi_pair_topk_graph_prewarm_uses_runtime_world_size(
 
     runtime.prepare_graph_all_gather_pair_kimi_topk()
 
-    assert compiled == [(world_size, 0, 512, True, True)]
+    # The pull transport is the default; the trailing flag is the transport.
+    assert compiled == [(world_size, 0, 512, True, True, False)]
     runtime.close()
 
 
@@ -1845,3 +1846,240 @@ def test_push_staging_layout_reassembles_every_peer_row(world_size: int, batch: 
             assert torch.equal(per_source[source], partials[source][:, heads])
             assert torch.equal(per_source_lse[source], lses[source][:, heads])
         assert torch.equal(gathers[rank], torch.cat(queries, dim=1))
+
+
+def test_pair_wrappers_forward_the_push_flag_to_both_launcher_variants(
+    monkeypatch,
+) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    compiled = []
+    launched = []
+
+    def fake_compile(*args):
+        compiled.append(args)
+        return lambda *launch_args: launched.append(launch_args)
+
+    monkeypatch.setattr(kernels, "_get_compiled_all_gather_pair", fake_compile)
+    kernels.all_gather_pair(
+        world_size=2,
+        rank=0,
+        threads=512,
+        local_first_ptr=16,
+        local_second_ptr=16,
+        output_first_ptr=16,
+        output_second_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        batch=1,
+        first_row_bytes=32,
+        second_row_bytes=16,
+        device_slot_selection=False,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    kernels.all_gather_pair_kimi_topk(
+        world_size=2,
+        rank=0,
+        local_down_ptr=16,
+        local_router_ptr=16,
+        correction_bias_ptr=16,
+        output_down_ptr=16,
+        topk_weights_ptr=16,
+        topk_ids_ptr=16,
+        staging_ptrs=(16, 32),
+        signal_ptrs=(16, 32),
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    # The eager pair launch also warms the graph (device slot selection)
+    # variant of the same transport; the fused Kimi variant is graph-only.
+    assert compiled == [
+        (2, 0, 512, False, False, True),
+        (2, 0, 512, True, False, True),
+        (2, 0, 512, True, True, True),
+    ]
+    assert len(launched) == 2
+
+
+def test_pair_launcher_key_and_compile_spec_carry_the_transport() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    assert kernels._pair_launcher_key(2, 0, 512, True, False) == (
+        2, 0, 512, True, False, False,
+    )
+    assert kernels._pair_launcher_key(2, 0, 512, True, True, True)[-1] is True
+    assert kernels.is_all_gather_pair_prepared(2, 0, 512, True, False, True) is False
+    source = inspect.getsource(kernels._get_compiled_all_gather_pair)
+    labels = source.split("labels=(", maxsplit=1)[1]
+    assert '"push",' in labels.split(")", maxsplit=1)[0]
+    # The spec version moved past the transport-less layouts.
+    spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
+    assert "            2,\n            key," in spec
+
+
+def test_push_pair_kernel_writes_rows_to_peers_and_copies_out_locally() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    write_phase, read_phase = source.split("block_pair_barrier(", maxsplit=1)
+    push_write = write_phase.split("if cutlass.const_expr(self._push):", 1)[1]
+    push_write = push_write.split("else:", 1)[0]
+    # A rank's combined row (first packs, then second packs) goes to the row
+    # slot of this rank: rows are ordered by batch index, then source rank.
+    assert "+ Int64(self._rank)" in push_write
+    assert "* Int64(combined_packs)" in push_write
+    assert "if pack >= first_packs:" in push_write
+    # One local load per pack, one posted store per peer, into the epoch slot.
+    assert push_write.count("ld_global_v4_u32(") == 1
+    assert push_write.count("st_global_v4_u32(") == 1
+    assert push_write.index("ld_global_v4_u32(") < push_write.index(
+        "for destination_index in cutlass.range_constexpr("
+    )
+    assert "Int64(staging[destination].toint())" in push_write
+    assert "+ slot_offset" in push_write
+    assert "local_stage" not in push_write
+
+    barrier_args = read_phase.split(")", maxsplit=1)[0]
+    assert "acquire=self._push," in barrier_args
+    push_reads = [
+        segment.split("else:", 1)[0]
+        for segment in read_phase.split("if cutlass.const_expr(self._push):")[1:]
+    ]
+    # First rows, second rows, and the fused Kimi router-row pull.
+    assert len(push_reads) == 3
+    for segment in push_reads:
+        assert "if source_rank != Int32(self._rank):" in segment
+        assert "local_stage" in segment
+        assert "staging[source]" not in segment
+    assert "+ Int64(first_packs)" in push_reads[1]
+    assert "+ Int64(first_packs)" in push_reads[2]
+    assert "+ Int64(first_packs)" not in push_reads[0]
+
+
+def _emulate_pair_push_staging(
+    world_size: int, batch: int, first_packs: int, second_packs: int
+):
+    """Model the paired gather's push addressing on the host.
+
+    A writer stores its combined row (``first_packs`` packs of the first
+    tensor, then ``second_packs`` packs of the second) at row slot
+    ``batch_index * world_size + rank`` of every peer's staging; a reader
+    takes its own rows from its inputs and every other rank's rows from that
+    slot of its own staging. Returns the per-rank inputs and the gathered
+    outputs both readers produce.
+    """
+
+    combined = first_packs + second_packs
+    generator = torch.Generator().manual_seed(11)
+    firsts = [
+        torch.randint(0, 1 << 16, (batch, first_packs * 8), generator=generator, dtype=torch.int32)
+        .to(torch.int16)
+        for _ in range(world_size)
+    ]
+    seconds = [
+        torch.randint(0, 1 << 16, (batch, second_packs * 8), generator=generator, dtype=torch.int32)
+        .to(torch.int16)
+        for _ in range(world_size)
+    ]
+    staging = [
+        torch.zeros(batch * world_size * combined, 8, dtype=torch.int16)
+        for _ in range(world_size)
+    ]
+    for rank in range(world_size):
+        for batch_index in range(batch):
+            for pack in range(combined):
+                if pack < first_packs:
+                    values = firsts[rank][batch_index, pack * 8 : pack * 8 + 8]
+                else:
+                    offset = (pack - first_packs) * 8
+                    values = seconds[rank][batch_index, offset : offset + 8]
+                slot = (batch_index * world_size + rank) * combined + pack
+                for destination in range(world_size):
+                    if destination != rank:
+                        staging[destination][slot] = values
+    gathered_first = []
+    gathered_second = []
+    for rank in range(world_size):
+        out_first = torch.empty(batch, world_size * first_packs * 8, dtype=torch.int16)
+        out_second = torch.empty(batch, world_size * second_packs * 8, dtype=torch.int16)
+        for batch_index in range(batch):
+            for source in range(world_size):
+                for pack in range(first_packs):
+                    column = (source * first_packs + pack) * 8
+                    if source == rank:
+                        values = firsts[rank][batch_index, pack * 8 : pack * 8 + 8]
+                    else:
+                        slot = (batch_index * world_size + source) * combined + pack
+                        values = staging[rank][slot]
+                    out_first[batch_index, column : column + 8] = values
+                for pack in range(second_packs):
+                    column = (source * second_packs + pack) * 8
+                    if source == rank:
+                        values = seconds[rank][batch_index, pack * 8 : pack * 8 + 8]
+                    else:
+                        slot = (
+                            (batch_index * world_size + source) * combined
+                            + first_packs
+                            + pack
+                        )
+                        values = staging[rank][slot]
+                    out_second[batch_index, column : column + 8] = values
+        gathered_first.append(out_first)
+        gathered_second.append(out_second)
+    return firsts, seconds, gathered_first, gathered_second
+
+
+@pytest.mark.parametrize("world_size,batch", [(2, 1), (4, 3), (9, 4), (9, 8)])
+def test_pair_push_staging_layout_reassembles_every_peer_row(
+    world_size: int, batch: int
+) -> None:
+    # Kimi-K3 TP9 decode rows: 400 bf16 latent columns (50 packs) and 104
+    # fp32 router columns (26 packs).
+    firsts, seconds, gathered_first, gathered_second = _emulate_pair_push_staging(
+        world_size, batch, 50, 26
+    )
+    expected_first = torch.cat(firsts, dim=1)
+    expected_second = torch.cat(seconds, dim=1)
+    for rank in range(world_size):
+        assert torch.equal(gathered_first[rank], expected_first)
+        assert torch.equal(gathered_second[rank], expected_second)
+
+
+def test_push_transport_reaches_pair_prepare_and_capture_checks(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_pair",
+        lambda *args: calls.append(args),
+    )
+    runtime.prepare_graph_all_gather_pair(threads=512)
+    runtime.prepare_graph_all_gather_pair_kimi_topk()
+    assert calls == [(2, 0, 512, True, False, True), (2, 0, 512, True, True, True)]
+
+    lookups = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: True,
+    )
+    monkeypatch.setattr(
+        kernels,
+        "is_all_gather_pair_prepared",
+        lambda *args: lookups.append(args) or False,
+    )
+    # 16 bf16 + 8 fp32 columns = 64 bytes, the fake runtime's query row.
+    first = torch.zeros(1, 16, dtype=torch.bfloat16)
+    second = torch.zeros(1, 8, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="cold PCIe DCP paired gather"):
+        runtime.all_gather_pair(first, second, threads=512)
+    assert lookups == [(2, 0, 512, True, False, True)]

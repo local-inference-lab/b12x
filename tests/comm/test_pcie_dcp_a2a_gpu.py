@@ -33,6 +33,11 @@ HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
 MAX_BATCH = 64
 TEST_BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
+# Paired projection gather rows: a bf16 row and an fp32 row whose bytes sum to
+# the query head dimension the channel is laid out for (512 + 64 = 576 B).
+PAIR_FIRST_WIDTH = 256
+PAIR_SECOND_WIDTH = 16
+PAIR_BATCHES = (1, 2, 4, 8, 16, 64)
 
 
 def _free_port() -> int:
@@ -105,6 +110,123 @@ def _reference(
         torch.stack([item[1] for item in inputs]),
         rank,
     )
+
+
+def _rank_pair(
+    step: int,
+    source_rank: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(30000 * step + source_rank)
+    first = torch.randn(
+        batch, PAIR_FIRST_WIDTH, generator=generator, dtype=torch.float32
+    ).to(device=device, dtype=torch.bfloat16)
+    second = torch.randn(
+        batch, PAIR_SECOND_WIDTH, generator=generator, dtype=torch.float32
+    ).to(device=device)
+    return first, second
+
+
+def _expected_pair(
+    step: int,
+    world_size: int,
+    batch: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = [_rank_pair(step, source, batch, device) for source in range(world_size)]
+    return (
+        torch.cat([row[0] for row in rows], dim=1),
+        torch.cat([row[1] for row in rows], dim=1),
+    )
+
+
+def _check_pair_eager(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Paired projection gather (latent + router rows) against torch.cat."""
+    for step, batch in enumerate(PAIR_BATCHES, start=300):
+        first, second = _rank_pair(step, rank, batch, device)
+        out_first, out_second = pool.all_gather_pair(
+            first, second, channel_id="eager:dcp"
+        )
+        torch.cuda.synchronize(device)
+        expected_first, expected_second = _expected_pair(step, world_size, batch, device)
+        assert torch.equal(out_first, expected_first), f"pair first rows batch {batch}"
+        assert torch.equal(out_second, expected_second), f"pair second rows batch {batch}"
+
+
+def _check_pair_graph(
+    pool: PCIeDCPA2APool,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Paired projection gather captured once and replayed with new inputs.
+
+    The capture alternates the two staging slots across layers; every replay
+    rewrites the captured inputs and checks the gathered rows of every layer.
+    """
+    layers = 3
+    batch = 4
+    stream = torch.cuda.Stream(device=device)
+    firsts = [
+        torch.empty(batch, PAIR_FIRST_WIDTH, dtype=torch.bfloat16, device=device)
+        for _ in range(layers)
+    ]
+    seconds = [
+        torch.empty(batch, PAIR_SECOND_WIDTH, dtype=torch.float32, device=device)
+        for _ in range(layers)
+    ]
+    out_firsts = [
+        torch.empty(
+            batch, world_size * PAIR_FIRST_WIDTH, dtype=torch.bfloat16, device=device
+        )
+        for _ in range(layers)
+    ]
+    out_seconds = [
+        torch.empty(
+            batch, world_size * PAIR_SECOND_WIDTH, dtype=torch.float32, device=device
+        )
+        for _ in range(layers)
+    ]
+    pool.prepare_graph_all_gather_pair(stream=stream, channel_id="graph:pair")
+    graph = torch.cuda.CUDAGraph()
+    with pool.capture(stream, channel_id="graph:pair") as graph_channel, torch.cuda.graph(
+        graph, stream=stream
+    ):
+        for layer in range(layers):
+            graph_channel.all_gather_pair(
+                firsts[layer], seconds[layer], out_firsts[layer], out_seconds[layer]
+            )
+    stream.synchronize()
+    for replay in range(4):
+        for layer in range(layers):
+            step = 4000 + 10 * replay + layer
+            first, second = _rank_pair(step, rank, batch, device)
+            firsts[layer].copy_(first)
+            seconds[layer].copy_(second)
+        torch.cuda.synchronize(device)
+        dist.barrier()
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        for layer in range(layers):
+            step = 4000 + 10 * replay + layer
+            expected_first, expected_second = _expected_pair(
+                step, world_size, batch, device
+            )
+            assert torch.equal(out_firsts[layer], expected_first), (
+                f"pair graph first rows replay {replay} layer {layer}"
+            )
+            assert torch.equal(out_seconds[layer], expected_second), (
+                f"pair graph second rows replay {replay} layer {layer}"
+            )
+    del graph
+    torch.cuda.synchronize(device)
 
 
 def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
@@ -835,6 +957,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _stage(rank, "eager")
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
+        _stage(rank, "pair_eager")
+        _check_pair_eager(pool, rank, world_size, device)
+        dist.barrier()
         _stage(rank, "eager_adjacency")
         _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
@@ -845,6 +970,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             print("A2A GPU gate: graph replay", flush=True)
         _stage(rank, "graph")
         _check_graph(pool, rank, world_size, device)
+        dist.barrier()
+        _stage(rank, "pair_graph")
+        _check_pair_graph(pool, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)

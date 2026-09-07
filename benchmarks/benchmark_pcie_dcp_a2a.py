@@ -24,6 +24,13 @@ TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
 HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_HEAD_DIM", "512"))
 QUERY_HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
 MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "8"))
+# Paired projection gather (the Kimi-K3 decode router/latent exchange): each
+# rank contributes its latent shard (bf16) and its router-logit shard (fp32)
+# of the model widths below, padded to eight columns like the serving
+# projections; ``B12X_PCIE_DCP_A2A_PROJ_PAIR=0`` skips it.
+PROJ_PAIR = os.getenv("B12X_PCIE_DCP_A2A_PROJ_PAIR", "1") != "0"
+PROJ_LATENT_WIDTH = int(os.getenv("B12X_PCIE_DCP_A2A_PROJ_LATENT", "3584"))
+PROJ_ROUTER_WIDTH = int(os.getenv("B12X_PCIE_DCP_A2A_PROJ_ROUTER", "896"))
 GEOMETRY_OVERRIDE_ENVS = (
     "B12X_PCIE_DCP_THREADS",
     "B12X_PCIE_DCP_BLOCK_LIMIT",
@@ -123,6 +130,95 @@ def _latency_samples(
 ) -> tuple[float, list[float]]:
     samples = [_measure(graph, device) for _ in range(3)]
     return statistics.median(samples), samples
+
+
+def _shard_width(width: int, world_size: int) -> int:
+    """Per-rank projection width, the ceiling shard rounded up to eight."""
+    shard = -(-width // world_size)
+    return -(-shard // 8) * 8
+
+
+def _rank_pair(
+    source_rank: int,
+    batch: int,
+    world_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(70000 + source_rank)
+    first = torch.randn(
+        batch, _shard_width(PROJ_LATENT_WIDTH, world_size), generator=generator
+    ).to(device=device, dtype=torch.bfloat16)
+    second = torch.randn(
+        batch, _shard_width(PROJ_ROUTER_WIDTH, world_size), generator=generator
+    ).to(device=device)
+    return first, second
+
+
+def _benchmark_projection_pair(
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    batches: tuple[int, ...],
+) -> None:
+    """Time the paired projection gather on its own channel pool.
+
+    Prints one ``proj_pair`` line per batch: the graph-replay latency of one
+    gather of ``batch`` latent + router rows at the served decode geometry
+    (512 threads, one block) under the transport selected by
+    ``B12X_PCIE_DCP_A2A_TRANSPORT``, after checking the gathered rows against
+    ``torch.cat`` of every rank's inputs.
+    """
+    first_width = _shard_width(PROJ_LATENT_WIDTH, world_size)
+    second_width = _shard_width(PROJ_ROUTER_WIDTH, world_size)
+    row_bytes = first_width * 2 + second_width * 4
+    pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=MAX_BATCH,
+        total_heads=world_size,
+        head_dim=row_bytes,
+        query_head_dim=row_bytes,
+    )
+    try:
+        channel_ids = tuple(f"benchmark-proj-pair:{batch}" for batch in batches)
+        pool.prepare_channels(channel_ids)
+        pool.prepare_graph_all_gather_pair(threads=512, channel_id=channel_ids[0])
+        if rank == 0:
+            print(
+                "proj_pair_header,world_size,batch,first_bytes,second_bytes,"
+                "correctness,proj_pair_us,proj_pair_samples_us,ratio_direction"
+            )
+        for batch in batches:
+            first, second = _rank_pair(rank, batch, world_size, device)
+            out_first = torch.empty(
+                batch, world_size * first_width, dtype=torch.bfloat16, device=device
+            )
+            out_second = torch.empty(
+                batch, world_size * second_width, dtype=torch.float32, device=device
+            )
+            graph = _capture(
+                lambda: pool.all_gather_pair(first, second, out_first, out_second, threads=512),
+                pool,
+                f"benchmark-proj-pair:{batch}",
+            )
+            graph.replay()
+            torch.cuda.synchronize(device)
+            expected = [_rank_pair(source, batch, world_size, device) for source in range(world_size)]
+            _assert_gather_exact(out_first, torch.cat([row[0] for row in expected], dim=1))
+            _assert_gather_exact(out_second, torch.cat([row[1] for row in expected], dim=1))
+            pair_us, samples = _latency_samples(graph, device)
+            if rank == 0:
+                raw = "|".join(f"{value:.3f}" for value in samples)
+                print(
+                    f"proj_pair,{world_size},{batch},{first_width * 2},"
+                    f"{second_width * 4},pass,{pair_us:.3f},{raw},"
+                    "lower_latency_is_better",
+                    flush=True,
+                )
+            del graph
+            torch.cuda.synchronize(device)
+    finally:
+        pool.close()
 
 
 def _rank_inputs(
@@ -410,6 +506,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     )
                 del reduce_graph, gather_graph, pair_graph
                 torch.cuda.synchronize(device)
+        if PROJ_PAIR:
+            pool.close()
+            pool = None
+            _benchmark_projection_pair(rank, world_size, device, batches)
     finally:
         if pool is not None:
             pool.close()

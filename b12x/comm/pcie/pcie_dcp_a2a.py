@@ -17,6 +17,15 @@ Staging transport (``B12X_PCIE_DCP_A2A_TRANSPORT``, read once per runtime):
     fused multiply-adds in the same order), so both transports produce the
     same bits.  All ranks must select the same transport; the channel layout
     contract checks it collectively.
+
+The transport applies to the head gather, the LSE reduce-scatter and the
+paired projection gather (``all_gather_pair`` and its fused Kimi top-k
+variant).  Under ``push`` the paired gather stores a rank's combined row
+(first packs, then second packs) at row slot ``batch * world_size + rank``
+of every peer's staging, so a slot holds ``batch * world_size`` combined
+rows; that is within the capacity the layout reserves for
+``max_batch_size * total_heads`` query rows, because ``total_heads`` is a
+multiple of ``world_size`` and a paired row equals ``query_head_dim`` bytes.
 """
 
 from __future__ import annotations
@@ -903,6 +912,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                self.push_transport,
             )
 
     def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
@@ -926,6 +936,7 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
+                self.push_transport,
             )
 
     def prepare_graph_kimi_topk16(self, *, threads: int = 256) -> None:
@@ -1361,6 +1372,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                self.push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "
@@ -1418,6 +1430,7 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
+                push=self.push_transport,
             )
 
     def all_gather_pair_kimi_topk(
@@ -1515,6 +1528,7 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
+                self.push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP Kimi CUDA graph capture is not allowed; "
@@ -1570,6 +1584,7 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
+                push=self.push_transport,
             )
 
     def kimi_topk16(
