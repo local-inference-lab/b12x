@@ -1292,6 +1292,8 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         batch: Int32,
         first_packs: Int32,
         second_packs: Int32,
+        output_first_packs: Int32,
+        output_second_packs: Int32,
         slot_delta_256b: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -1337,6 +1339,8 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             batch,
             first_packs,
             second_packs,
+            output_first_packs,
+            output_second_packs,
             slot_delta_256b,
         ).launch(
             grid=(1, 1, 1),
@@ -1391,6 +1395,8 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         batch: Int32,
         first_packs: Int32,
         second_packs: Int32,
+        output_first_packs: Int32,
+        output_second_packs: Int32,
         slot_delta_256b: Int32,
     ) -> None:
         staging = (
@@ -1541,13 +1547,18 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             acquire=self._push,
         )
 
-        first_output_packs = batch * Int32(self._world_size) * first_packs
+        # An output row holds every rank's packs in rank order; a caller may
+        # clip it to a logical width (a multiple of 16 bytes) so the trailing
+        # padding packs of the last rank are not written and the outputs are
+        # row-major at that width.  The source of a kept pack is unchanged.
+        first_row_packs = Int32(self._world_size) * first_packs
+        if output_first_packs > Int32(0):
+            first_row_packs = output_first_packs
+        first_output_packs = batch * first_row_packs
         linear = Int32(tidx)
         while linear < first_output_packs:
-            batch_index = linear // (Int32(self._world_size) * first_packs)
-            row_pack = linear - (
-                batch_index * Int32(self._world_size) * first_packs
-            )
+            batch_index = linear // first_row_packs
+            row_pack = linear - batch_index * first_row_packs
             source_rank = row_pack // first_packs
             pack = row_pack - source_rank * first_packs
             # Default to this rank's own slice so the address is always
@@ -1611,17 +1622,14 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             linear += Int32(self._threads)
 
         if cutlass.const_expr(not self._kimi_topk):
-            second_output_packs = (
-                batch * Int32(self._world_size) * second_packs
-            )
+            second_row_packs = Int32(self._world_size) * second_packs
+            if output_second_packs > Int32(0):
+                second_row_packs = output_second_packs
+            second_output_packs = batch * second_row_packs
             linear = Int32(tidx)
             while linear < second_output_packs:
-                batch_index = linear // (
-                    Int32(self._world_size) * second_packs
-                )
-                row_pack = linear - (
-                    batch_index * Int32(self._world_size) * second_packs
-                )
+                batch_index = linear // second_row_packs
+                row_pack = linear - batch_index * second_row_packs
                 source_rank = row_pack // second_packs
                 pack = row_pack - source_rank * second_packs
                 source_address = Int64(
@@ -2531,6 +2539,8 @@ def _get_compiled_all_gather_pair(
         1,
         1,
         1,
+        0,
+        0,
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
@@ -2539,7 +2549,7 @@ def _get_compiled_all_gather_pair(
                 if kimi_topk
                 else "comm.pcie.dcp_a2a.all_gather_pair"
             ),
-            2,
+            3,
             key,
             labels=(
                 "world_size",
@@ -2565,6 +2575,8 @@ def _get_compiled_all_gather_pair(
         first_packs: int,
         second_packs: int,
         slot_delta_256b: int,
+        output_first_packs: int = 0,
+        output_second_packs: int = 0,
     ) -> None:
         stages = _pad_ptrs(staging_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
@@ -2584,6 +2596,8 @@ def _get_compiled_all_gather_pair(
             int(batch),
             int(first_packs),
             int(second_packs),
+            int(output_first_packs),
+            int(output_second_packs),
             int(slot_delta_256b),
             current_cuda_stream(),
         )
@@ -2777,9 +2791,30 @@ def all_gather_pair(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     push: bool = False,
+    output_first_row_bytes: int = 0,
+    output_second_row_bytes: int = 0,
 ) -> None:
+    """Launch the paired gather.
+
+    ``output_first_row_bytes`` / ``output_second_row_bytes`` (0 = every
+    rank's packs) clip each output row to a logical width: a multiple of 16
+    bytes, at most ``world_size`` times the rank row, so the last rank's
+    trailing padding packs are not written.
+    """
     if first_row_bytes % 16 or second_row_bytes % 16:
         raise ValueError("paired DCP rows must be multiples of 16 bytes")
+    for row_bytes, output_bytes, name in (
+        (first_row_bytes, output_first_row_bytes, "first"),
+        (second_row_bytes, output_second_row_bytes, "second"),
+    ):
+        if output_bytes < 0 or output_bytes % 16:
+            raise ValueError(
+                f"paired DCP {name} output rows must be multiples of 16 bytes"
+            )
+        if output_bytes > row_bytes * world_size:
+            raise ValueError(
+                f"paired DCP {name} output row exceeds the gathered width"
+            )
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_all_gather_pair(
         world_size,
@@ -2806,6 +2841,8 @@ def all_gather_pair(
         first_row_bytes // 16,
         second_row_bytes // 16,
         slot_delta_256b,
+        output_first_row_bytes // 16,
+        output_second_row_bytes // 16,
     )
 
 

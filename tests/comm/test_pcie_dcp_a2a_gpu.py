@@ -157,6 +157,20 @@ def _check_pair_eager(
         expected_first, expected_second = _expected_pair(step, world_size, batch, device)
         assert torch.equal(out_first, expected_first), f"pair first rows batch {batch}"
         assert torch.equal(out_second, expected_second), f"pair second rows batch {batch}"
+    # Caller-owned outputs clipped to a logical width (the last rank's tail
+    # packs dropped): 8 bf16 columns and 4 fp32 columns fewer than the full
+    # gathered rows, both 16-byte multiples.
+    for step, batch in enumerate((1, 4, 8), start=400):
+        first, second = _rank_pair(step, rank, batch, device)
+        first_width = world_size * PAIR_FIRST_WIDTH - 8
+        second_width = world_size * PAIR_SECOND_WIDTH - 4
+        out_first = torch.full((batch, first_width), 7.0, dtype=torch.bfloat16, device=device)
+        out_second = torch.full((batch, second_width), 7.0, dtype=torch.float32, device=device)
+        pool.all_gather_pair(first, second, out_first, out_second, channel_id="eager:dcp")
+        torch.cuda.synchronize(device)
+        expected_first, expected_second = _expected_pair(step, world_size, batch, device)
+        assert torch.equal(out_first, expected_first[:, :first_width]), f"clipped first rows batch {batch}"
+        assert torch.equal(out_second, expected_second[:, :second_width]), f"clipped second rows batch {batch}"
 
 
 def _check_pair_graph(

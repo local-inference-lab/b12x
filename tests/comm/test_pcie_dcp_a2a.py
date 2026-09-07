@@ -1914,9 +1914,9 @@ def test_pair_launcher_key_and_compile_spec_carry_the_transport() -> None:
     source = inspect.getsource(kernels._get_compiled_all_gather_pair)
     labels = source.split("labels=(", maxsplit=1)[1]
     assert '"push",' in labels.split(")", maxsplit=1)[0]
-    # The spec version moved past the transport-less layouts.
+    # The spec version moved past the transport-less, unclipped layouts.
     spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
-    assert "            2,\n            key," in spec
+    assert "            3,\n            key," in spec
 
 
 def test_push_pair_kernel_writes_rows_to_peers_and_copies_out_locally() -> None:
@@ -2107,4 +2107,96 @@ def test_kimi_topk_select_env_and_prepared_key(monkeypatch) -> None:
     spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
     assert '"comm.pcie.dcp_a2a.kimi_topk16",\n            2,' in spec
     assert 'labels=("threads", "select")' in spec
+
+
+def test_pair_wrapper_forwards_clipped_output_rows(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    launched = []
+    monkeypatch.setattr(
+        kernels,
+        "_get_compiled_all_gather_pair",
+        lambda *args: (lambda *launch_args: launched.append(launch_args)),
+    )
+    common = dict(
+        world_size=9,
+        rank=0,
+        threads=512,
+        local_first_ptr=16,
+        local_second_ptr=16,
+        output_first_ptr=16,
+        output_second_ptr=16,
+        staging_ptrs=tuple(range(16, 16 + 9 * 16, 16)),
+        signal_ptrs=tuple(range(16, 16 + 9 * 16, 16)),
+        batch=4,
+        first_row_bytes=800,
+        second_row_bytes=416,
+        device_slot_selection=True,
+        slot_delta_bytes=256,
+        push=True,
+    )
+    # Kimi-K3 TP9 decode: 400 bf16 latent columns and 104 fp32 router columns
+    # per rank, clipped to the logical 3584 (7168 B) and 896 (3584 B).
+    kernels.all_gather_pair(**common, output_first_row_bytes=7168, output_second_row_bytes=3584)
+    assert launched[-1][-6:] == (4, 50, 26, 1, 448, 224)
+    kernels.all_gather_pair(**common)
+    assert launched[-1][-6:] == (4, 50, 26, 1, 0, 0)
+    with pytest.raises(ValueError, match="multiples of 16 bytes"):
+        kernels.all_gather_pair(**common, output_first_row_bytes=7160)
+    with pytest.raises(ValueError, match="exceeds the gathered width"):
+        kernels.all_gather_pair(**common, output_second_row_bytes=416 * 9 + 16)
+
+
+def test_pair_kernel_clips_output_rows_to_the_logical_width() -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    source = inspect.getsource(kernels._AllGatherPairLaunch.kernel)
+    read_phase = source.split("block_pair_barrier(", maxsplit=1)[1]
+    for prefix in ("first", "second"):
+        assert f"{prefix}_row_packs = Int32(self._world_size) * {prefix}_packs" in read_phase
+        assert f"if output_{prefix}_packs > Int32(0):" in read_phase
+        assert f"{prefix}_row_packs = output_{prefix}_packs" in read_phase
+        assert f"{prefix}_output_packs = batch * {prefix}_row_packs" in read_phase
+        assert f"batch_index = linear // {prefix}_row_packs" in read_phase
+        assert f"source_rank = row_pack // {prefix}_packs" in read_phase
+
+
+def test_runtime_accepts_logical_width_pair_outputs() -> None:
+    from b12x.comm.pcie.pcie_dcp_a2a import _clipped_row_bytes
+
+    runtime = _make_runtime()
+    launches = []
+    # The fake runtime's launch copies full-width rows; record the call instead.
+    runtime._launch_all_gather_pair = lambda *args, **kwargs: launches.append((args, kwargs))
+    first = torch.zeros(2, 16, dtype=torch.bfloat16)
+    second = torch.zeros(2, 8, dtype=torch.float32)
+    out_first = torch.empty(2, 24, dtype=torch.bfloat16)   # 32 of 32 columns clipped to 24
+    out_second = torch.empty(2, 12, dtype=torch.float32)   # 16 of 16 columns clipped to 12
+    got_first, got_second = runtime.all_gather_pair(first, second, out_first, out_second)
+    assert got_first is out_first and got_second is out_second
+    assert len(launches) == 1 and launches[0][0][2] is out_first
+    assert _clipped_row_bytes(out_first, 32) == 48
+    assert _clipped_row_bytes(out_second, 16) == 48
+    assert _clipped_row_bytes(torch.empty(2, 32, dtype=torch.bfloat16), 32) == 0
+    with pytest.raises(ValueError, match="narrower 16-byte-aligned row"):
+        runtime.all_gather_pair(first, second, torch.empty(2, 20, dtype=torch.bfloat16), None)
+    with pytest.raises(ValueError, match="narrower 16-byte-aligned row"):
+        runtime.all_gather_pair(first, second, torch.empty(2, 40, dtype=torch.bfloat16), None)
+    runtime.close()
+
+
+@pytest.mark.parametrize("world_size,batch", [(9, 4)])
+def test_pair_push_staging_layout_clipped_rows(world_size: int, batch: int) -> None:
+    firsts, seconds, gathered_first, gathered_second = _emulate_pair_push_staging(
+        world_size, batch, 50, 26
+    )
+    # Clipping the reassembled rows to the logical widths keeps the leading
+    # columns of every rank in order and drops only the last rank's tail.
+    first_logical = 3584
+    second_logical = 896 * 2  # int16 pairs stand in for fp32 words
+    expected_first = torch.cat(firsts, dim=1)[:, :first_logical]
+    expected_second = torch.cat(seconds, dim=1)[:, :second_logical]
+    for rank in range(world_size):
+        assert torch.equal(gathered_first[rank][:, :first_logical], expected_first)
+        assert torch.equal(gathered_second[rank][:, :second_logical], expected_second)
 

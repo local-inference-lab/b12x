@@ -235,6 +235,15 @@ class _StagingLayout:
     slab_bytes: int
 
 
+def _clipped_row_bytes(output: torch.Tensor, full_columns: int) -> int:
+    """Row bytes of a caller-owned gather output narrower than the full
+    gathered width (0 when it holds the full width)."""
+    columns = int(output.shape[1])
+    if columns >= full_columns:
+        return 0
+    return columns * output.element_size()
+
+
 def _staging_layout(
     *,
     signal_bytes: int,
@@ -1355,9 +1364,19 @@ class PCIeDCPA2A:
         ):
             if output.device != self.device or output.dtype != source.dtype:
                 raise ValueError(f"{name} output device and dtype must match input")
-            if output.shape != expected:
+            # A caller-owned output may hold the logical row (the gathered
+            # width without the last rank's trailing padding): a narrower
+            # row-major tensor whose row is a multiple of 16 bytes.
+            if (
+                output.ndim != 2
+                or int(output.shape[0]) != expected[0]
+                or int(output.shape[1]) > expected[1]
+                or (int(output.shape[1]) * output.element_size()) % 16
+                or int(output.shape[1]) <= 0
+            ):
                 raise ValueError(
-                    f"{name} output shape must be {expected}, got {tuple(output.shape)}"
+                    f"{name} output shape must be {expected} or a narrower "
+                    f"16-byte-aligned row, got {tuple(output.shape)}"
                 )
             if not output.is_contiguous():
                 raise ValueError(f"{name} output must be contiguous")
@@ -1431,6 +1450,12 @@ class PCIeDCPA2A:
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
                 push=self.push_transport,
+                output_first_row_bytes=_clipped_row_bytes(
+                    out_first, int(local_first.shape[1]) * self.world_size
+                ),
+                output_second_row_bytes=_clipped_row_bytes(
+                    out_second, int(local_second.shape[1]) * self.world_size
+                ),
             )
 
     def all_gather_pair_kimi_topk(
