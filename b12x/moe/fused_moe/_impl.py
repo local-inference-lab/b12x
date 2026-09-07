@@ -1271,6 +1271,20 @@ class _TPRouteWorkspace:
     topk_weights: torch.Tensor
 
 
+def _rotation_output_dtype() -> torch.dtype:
+    """Dtype of the full-rotation route-sum output (b12x kernel host setting).
+
+    fp32 by default; B12X_W4A16_TOPK_SUM_OUTPUT=bf16/fp16 makes the top-k
+    sum kernel round once in its store, and every buffer and check of the
+    full-rotation output follows the same setting.
+    """
+    from b12x.moe._shared.kernels.w4a16.host import (
+        w4a16_topk_sum_rotation_output_torch_dtype,
+    )
+
+    return w4a16_topk_sum_rotation_output_torch_dtype()
+
+
 @dataclass(frozen=True)
 class _TensorAllocSpec:
     name: str
@@ -3090,7 +3104,7 @@ def _build_tp_moe_fp4_binding_from_views(
         if output is None:
             output = tensors["full_rotation_output"][:m]
         elif (
-            output.dtype != torch.float32
+            output.dtype != _rotation_output_dtype()
             or output.device != a.device
             or output.ndim != 2
             or tuple(output.shape)
@@ -3568,7 +3582,7 @@ def _plan_core_workspace(
                     _TensorAllocSpec(
                         "full_rotation_output",
                         (max_tokens, int(k)),
-                        torch.float32,
+                        _rotation_output_dtype(),
                     ),
                     _TensorAllocSpec(
                         "rotation_a_gate",
@@ -8802,12 +8816,12 @@ def build_tp_moe_fp4_binding(
             scale_format = _w4a16_scale_format_for_source(source_format)
         if workspace.full_rotation:
             if workspace.full_rotation_output is None:
-                raise RuntimeError("Trellis workspace is missing its FP32 output")
+                raise RuntimeError("Trellis workspace is missing its route-sum output")
             if output is None:
                 common_kwargs["output"] = workspace.full_rotation_output[:m]
             else:
                 if (
-                    output.dtype != torch.float32
+                    output.dtype != _rotation_output_dtype()
                     or output.device != a.device
                     or output.ndim != 2
                     or tuple(output.shape)
@@ -8818,8 +8832,9 @@ def build_tp_moe_fp4_binding(
                     or not output.is_contiguous()
                 ):
                     raise ValueError(
-                        "full-rotation Trellis output must be a contiguous FP32 "
-                        "live or capacity buffer on the input device"
+                        "full-rotation Trellis output must be a contiguous "
+                        f"{_rotation_output_dtype()} live or capacity buffer on "
+                        "the input device"
                     )
                 common_kwargs["output"] = output[:m]
             if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -11880,7 +11895,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "the W4A16 weight plan did not materialize its required representation"
             )
         full_rotation = getattr(prepared, "weight_layout", "") == "trellis3_t256"
-        output_dtype = torch.float32 if full_rotation else a.dtype
+        output_dtype = _rotation_output_dtype() if full_rotation else a.dtype
         if output is None:
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError(
