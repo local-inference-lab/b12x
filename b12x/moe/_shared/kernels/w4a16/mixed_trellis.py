@@ -1832,6 +1832,8 @@ def compile_mixed_trellis(
         int(size_m),
         int(max_m_blocks),
     )
+    # The mixed launch owns fp32 route-sum buffers and types their pointers
+    # as fp32 at launch, independent of B12X_W4A16_TOPK_SUM_OUTPUT.
     topk_sum = compile_w4a16_topk_sum(
         m=size_m,
         topk=top_k,
@@ -1843,6 +1845,7 @@ def compile_mixed_trellis(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
+        output_dtype="fp32",
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -2099,6 +2102,8 @@ def compile_mixed_trellis3(
         int(size_m),
         int(max_m_blocks),
     )
+    # The mixed launch owns fp32 route-sum buffers and types their pointers
+    # as fp32 at launch, independent of B12X_W4A16_TOPK_SUM_OUTPUT.
     topk_sum = compile_w4a16_topk_sum(
         m=size_m,
         topk=top_k,
@@ -2110,6 +2115,7 @@ def compile_mixed_trellis3(
         route_ids_dtype=route_ids_dtype,
         use_expert_map=True,
         broadcast_svh=broadcast_svh,
+        output_dtype="fp32",
     )
     cached = _CACHE3.get(cache_key)
     if cached is not None:
