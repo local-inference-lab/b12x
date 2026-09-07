@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -49,7 +50,7 @@ _GRAPH_ARRIVED_INDEX = _SELF_COUNTER_WORDS + 2
 _PREPARED_LSE_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_GATHER_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_PAIR_LAUNCHERS: set[tuple[object, ...]] = set()
-_PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
+_PREPARED_KIMI_TOPK_LAUNCHERS: set[tuple[int, str]] = set()
 
 
 @dsl_user_op
@@ -1889,11 +1890,38 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 )
 
 
+KIMI_TOPK_SELECTS = ("register", "scan")
+
+
+def kimi_topk_select() -> str:
+    """Return the batched top-16 selection algorithm.
+
+    ``B12X_PCIE_KIMI_TOPK_SELECT`` picks ``register`` (default: four warps
+    hold the 896 packed keys in registers, eight per lane, and sixteen
+    warp-max rounds plus one merge of the 64 survivors pick the experts) or
+    ``scan`` (sixteen rounds of a block-wide shared-memory scan with two
+    block barriers each).  Both orders are the same total order on packed
+    (score, expert) keys and produce identical expert ids and weights.
+    """
+    value = os.environ.get("B12X_PCIE_KIMI_TOPK_SELECT", "register").strip().lower()
+    if value not in KIMI_TOPK_SELECTS:
+        raise ValueError(
+            "B12X_PCIE_KIMI_TOPK_SELECT must be one of "
+            f"{KIMI_TOPK_SELECTS}, got {value!r}"
+        )
+    return value
+
+
 class _KimiTopK16Launch:
     """Select Kimi-K3's 16 routed experts in one CTA per token."""
 
-    def __init__(self, threads: int) -> None:
+    def __init__(self, threads: int, select: str = "register") -> None:
         self._threads = int(threads)
+        if select not in KIMI_TOPK_SELECTS:
+            raise ValueError(f"unknown Kimi top-16 selection {select!r}")
+        if select == "register" and self._threads < 128:
+            raise ValueError("register selection needs at least four warps")
+        self._select = str(select)
 
     @cute.jit
     def __call__(
@@ -1945,6 +1973,10 @@ class _KimiTopK16Launch:
             warp_keys: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Uint64, 16], 16
             ]
+            # The 64 survivors of the register selection's warp rounds.
+            reduce_keys: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint64, 64], 16
+            ]
 
         storage = smem_alloc.allocate(SharedStorage)
         selection_scores = storage.selection_scores.get_tensor(
@@ -1958,6 +1990,9 @@ class _KimiTopK16Launch:
         )
         warp_keys = storage.warp_keys.get_tensor(
             cute.make_layout((16,), stride=(1,))
+        )
+        reduce_keys = storage.reduce_keys.get_tensor(
+            cute.make_layout((64,), stride=(1,))
         )
 
         row_offset = Int64(bidx) * Int64(896)
@@ -1990,42 +2025,114 @@ class _KimiTopK16Launch:
             expert += Int32(self._threads)
         cute.arch.sync_threads()
 
-        # Each round reduces one candidate per thread, then merges the warp
-        # winners. The selected key is invalidated in shared memory before the
-        # following round. Packed keys preserve lower-ID tie-breaking.
         lane = Int32(tidx) % Int32(32)
         warp = Int32(tidx) // Int32(32)
         selected_ids = cute.make_rmem_tensor((16,), Int32)
         selected_weights = cute.make_rmem_tensor((16,), Float32)
-        for selected in cutlass.range_constexpr(16):
-            thread_key = cutlass.Uint64(0)
-            candidate = Int32(tidx)
-            while candidate < Int32(896):
-                candidate_key = cutlass.Uint64(0)
-                if active_experts[candidate] != Int32(0):
-                    candidate_key = _kimi_pack_key(
-                        selection_scores[candidate], candidate
+        if cutlass.const_expr(self._select == "register"):
+            # Two-level top-16 over packed (score, expert) keys, the
+            # selection of the fused pair+top-k kernel: four warps each hold
+            # 256 candidates in registers (eight per lane, ids 896..1023 as
+            # -inf keys that no real key loses to), pop their sixteen best in
+            # warp-max rounds, and warp 0 merges the 64 survivors.  A round
+            # costs one warp reduction; there is no block barrier per round
+            # and no shared-memory scan.
+            lane_key = cutlass.Uint64(0)
+            keys = cute.make_rmem_tensor((8,), cutlass.Uint64)
+            if warp < Int32(4):
+                for item in cutlass.range_constexpr(8):
+                    expert_id = warp * Int32(256) + Int32(item * 32) + lane
+                    value = Float32(_KIMI_NEG_INF)
+                    if expert_id < Int32(896):
+                        value = selection_scores[expert_id]
+                    keys[item] = _kimi_pack_key(value, expert_id)
+                _kimi_sort_desc(keys, 8)
+                previous = cutlass.Uint64(0)
+                for selected in cutlass.range_constexpr(16):
+                    if cutlass.const_expr(selected > 0):
+                        # Hold the head before the shift overwrites it, so
+                        # every element selects on the same condition.
+                        head = keys[0]
+                        tail_key = _kimi_pack_key(
+                            Float32(_KIMI_NEG_INF), _kimi_key_expert(keys[7])
+                        )
+                        for item in cutlass.range_constexpr(7):
+                            keys[item] = _select_if_eq_u64(
+                                previous, head, keys[item + 1], keys[item]
+                            )
+                        keys[7] = _select_if_eq_u64(
+                            previous, head, tail_key, keys[7]
+                        )
+                    previous = _kimi_warp_max_key(keys[0])
+                    lane_key = _select_if_eq_u64(
+                        cutlass.Uint64(lane),
+                        cutlass.Uint64(selected),
+                        previous,
+                        lane_key,
                     )
-                thread_key = cutlass.max(thread_key, candidate_key)
-                candidate += Int32(self._threads)
-            warp_key = _kimi_warp_max_key(thread_key)
-            if lane == Int32(0):
-                warp_keys[warp] = warp_key
+                if lane < Int32(16):
+                    reduce_keys[warp * Int32(16) + lane] = lane_key
             cute.arch.sync_threads()
-            if Int32(tidx) == Int32(0):
-                selected_key = warp_keys[0]
-                for source_warp in cutlass.range_constexpr(
-                    1, self._threads // 32
-                ):
-                    selected_key = cutlass.max(
-                        selected_key, warp_keys[source_warp]
-                    )
-                final_expert = _kimi_key_expert(selected_key)
-                selected_ids[selected] = final_expert
-                selected_weights[selected] = unbiased_scores[final_expert]
-                active_experts[final_expert] = Int32(0)
-            cute.arch.sync_threads()
+            if warp == Int32(0):
+                merge_keys = cute.make_rmem_tensor((2,), cutlass.Uint64)
+                for item in cutlass.range_constexpr(2):
+                    merge_keys[item] = reduce_keys[Int32(item * 32) + lane]
+                _kimi_sort_desc(merge_keys, 2)
+                previous = cutlass.Uint64(0)
+                for selected in cutlass.range_constexpr(16):
+                    if cutlass.const_expr(selected > 0):
+                        head = merge_keys[0]
+                        tail_key = _kimi_pack_key(
+                            Float32(_KIMI_NEG_INF),
+                            _kimi_key_expert(merge_keys[1]),
+                        )
+                        merge_keys[0] = _select_if_eq_u64(
+                            previous, head, merge_keys[1], merge_keys[0]
+                        )
+                        merge_keys[1] = _select_if_eq_u64(
+                            previous, head, tail_key, merge_keys[1]
+                        )
+                    previous = _kimi_warp_max_key(merge_keys[0])
+                    # The reduction broadcasts, so every lane agrees here.
+                    final_expert = _kimi_key_expert(previous)
+                    selected_ids[selected] = final_expert
+                    selected_weights[selected] = unbiased_scores[final_expert]
+        else:
+            # Each round reduces one candidate per thread, then merges the
+            # warp winners. The selected key is invalidated in shared memory
+            # before the following round. Packed keys preserve lower-ID
+            # tie-breaking.
+            for selected in cutlass.range_constexpr(16):
+                thread_key = cutlass.Uint64(0)
+                candidate = Int32(tidx)
+                while candidate < Int32(896):
+                    candidate_key = cutlass.Uint64(0)
+                    if active_experts[candidate] != Int32(0):
+                        candidate_key = _kimi_pack_key(
+                            selection_scores[candidate], candidate
+                        )
+                    thread_key = cutlass.max(thread_key, candidate_key)
+                    candidate += Int32(self._threads)
+                warp_key = _kimi_warp_max_key(thread_key)
+                if lane == Int32(0):
+                    warp_keys[warp] = warp_key
+                cute.arch.sync_threads()
+                if Int32(tidx) == Int32(0):
+                    selected_key = warp_keys[0]
+                    for source_warp in cutlass.range_constexpr(
+                        1, self._threads // 32
+                    ):
+                        selected_key = cutlass.max(
+                            selected_key, warp_keys[source_warp]
+                        )
+                    final_expert = _kimi_key_expert(selected_key)
+                    selected_ids[selected] = final_expert
+                    selected_weights[selected] = unbiased_scores[final_expert]
+                    active_experts[final_expert] = Int32(0)
+                cute.arch.sync_threads()
 
+        # The normalization is the served arithmetic: a sequential fp32 sum
+        # of the sixteen weights in selection order and one division.
         weight_sum = Float32(0.0)
         if Int32(tidx) == Int32(0):
             for selected in cutlass.range_constexpr(16):
@@ -2485,20 +2592,24 @@ def _get_compiled_all_gather_pair(
     return run
 
 
-def is_kimi_topk16_prepared(threads: int = 256) -> bool:
-    return int(threads) in _PREPARED_KIMI_TOPK_LAUNCHERS
+def is_kimi_topk16_prepared(threads: int = 256, select: str | None = None) -> bool:
+    if select is None:
+        select = kimi_topk_select()
+    return (int(threads), str(select)) in _PREPARED_KIMI_TOPK_LAUNCHERS
 
 
 @functools.cache
-def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
+def _get_compiled_kimi_topk16(threads: int = 256, select: str | None = None) -> Callable:
     normalized_threads = int(threads)
     if normalized_threads not in (128, 256, 512):
         raise ValueError("Kimi top-16 threads must be 128, 256, or 512")
-    launch = _KimiTopK16Launch(normalized_threads)
+    if select is None:
+        select = kimi_topk_select()
+    launch = _KimiTopK16Launch(normalized_threads, select)
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
-        cache_key=(normalized_threads,),
+        cache_key=(normalized_threads, select),
     )
     p_f32 = _f32_ptr(16)
     p_i32 = _i32_ptr(16)
@@ -2512,9 +2623,9 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.kimi_topk16",
-            1,
-            (normalized_threads,),
-            labels=("threads",),
+            2,
+            (normalized_threads, select),
+            labels=("threads", "select"),
         ),
     )
 
@@ -2534,7 +2645,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
             current_cuda_stream(),
         )
 
-    _PREPARED_KIMI_TOPK_LAUNCHERS.add(normalized_threads)
+    _PREPARED_KIMI_TOPK_LAUNCHERS.add((normalized_threads, select))
     return run
 
 
@@ -2751,8 +2862,9 @@ def kimi_topk16(
     output_ids_ptr: int,
     rows: int,
     threads: int = 256,
+    select: str | None = None,
 ) -> None:
-    _get_compiled_kimi_topk16(threads)(
+    _get_compiled_kimi_topk16(threads, select)(
         router_logits_ptr,
         correction_bias_ptr,
         output_weights_ptr,

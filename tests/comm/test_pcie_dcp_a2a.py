@@ -2083,3 +2083,28 @@ def test_push_transport_reaches_pair_prepare_and_capture_checks(monkeypatch) -> 
     with pytest.raises(RuntimeError, match="cold PCIe DCP paired gather"):
         runtime.all_gather_pair(first, second, threads=512)
     assert lookups == [(2, 0, 512, True, False, True)]
+
+
+def test_kimi_topk_select_env_and_prepared_key(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv("B12X_PCIE_KIMI_TOPK_SELECT", raising=False)
+    assert kernels.kimi_topk_select() == "register"
+    monkeypatch.setenv("B12X_PCIE_KIMI_TOPK_SELECT", " Scan ")
+    assert kernels.kimi_topk_select() == "scan"
+    monkeypatch.setenv("B12X_PCIE_KIMI_TOPK_SELECT", "bitonic")
+    with pytest.raises(ValueError, match="B12X_PCIE_KIMI_TOPK_SELECT"):
+        kernels.kimi_topk_select()
+    monkeypatch.delenv("B12X_PCIE_KIMI_TOPK_SELECT", raising=False)
+    # The prepared set is keyed by (threads, selection); nothing compiled here.
+    assert kernels.is_kimi_topk16_prepared(256) is False
+    assert kernels.is_kimi_topk16_prepared(256, "scan") is False
+    with pytest.raises(ValueError, match="unknown Kimi top-16 selection"):
+        kernels._KimiTopK16Launch(256, "bitonic")
+    with pytest.raises(ValueError, match="at least four warps"):
+        kernels._KimiTopK16Launch(64, "register")
+    source = inspect.getsource(kernels._get_compiled_kimi_topk16)
+    spec = source.split("compile_spec=KernelCompileSpec.from_key(", 1)[1]
+    assert '"comm.pcie.dcp_a2a.kimi_topk16",\n            2,' in spec
+    assert 'labels=("threads", "select")' in spec
+
