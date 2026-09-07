@@ -33,7 +33,7 @@ from ._cute_intrinsics import (
     atomic_add_global_u32,
     f32_as_u32,
     graph_epoch_arrive,
-    graph_epoch_arrive_serialized,
+    plain_graph_epoch_arrive,
     ld_global_f32,
     ld_relaxed_gpu_u32,
     ld_relaxed_sys_global_v4_u32,
@@ -57,11 +57,14 @@ _FLAG_STRIDE = 32
 _SELF_COUNTER_BYTES = _MAX_BLOCKS * _MAX_RANKS * 4
 _PEER_SLOT_BYTES = _MAX_BLOCKS * _MAX_RANKS * _FLAG_STRIDE * 4
 _PEER_COUNTER_BYTES = 2 * _PEER_SLOT_BYTES
-# Words one and two of the first padded peer-flag record are unused by the
-# native barrier layout.  Graph-only slot state lives there without changing
-# the signal allocation or any eager address.
+# Words one through four of the first padded peer-flag record are unused by
+# the barrier layout. Graph slot counters live there without changing signal
+# allocation; plain peer-push has a separate lifetime from pull and fused ops.
 _GRAPH_EPOCH_OFFSET = _SELF_COUNTER_BYTES + 4
 _GRAPH_ARRIVED_OFFSET = _SELF_COUNTER_BYTES + 8
+_PLAIN_GRAPH_EPOCH_OFFSET = _SELF_COUNTER_BYTES + 12
+_PLAIN_GRAPH_ARRIVED_OFFSET = _SELF_COUNTER_BYTES + 16
+_PLAIN_GRAPH_LAST_EPOCH = 0xFFFFFFFD
 _RMS_ARRIVE_OFFSET = _SELF_COUNTER_BYTES + _PEER_COUNTER_BYTES
 _RMS_GEN_OFFSET = 150_016
 _RMS_PARTIAL_OFFSET = 150_272
@@ -214,6 +217,7 @@ class _OneshotLaunch(_PackedMath):
         output_ptr: cute.Pointer,
         size_packs: Int32,
         plain_region_packs: Int64,
+        plain_capacity_packs: Int64,
         plain_local_slot0: Int64,
         plain_peer_slot0: Int64,
         plain_local_slot1: Int64,
@@ -228,6 +232,7 @@ class _OneshotLaunch(_PackedMath):
             output_ptr,
             size_packs,
             plain_region_packs,
+            plain_capacity_packs,
             plain_local_slot0,
             plain_peer_slot0,
             plain_local_slot1,
@@ -286,6 +291,7 @@ class _OneshotLaunch(_PackedMath):
         output_ptr: cute.Pointer,
         size_packs: Int32,
         plain_region_packs: Int64,
+        plain_capacity_packs: Int64,
         plain_local_slot0: Int64,
         plain_peer_slot0: Int64,
         plain_local_slot1: Int64,
@@ -299,25 +305,25 @@ class _OneshotLaunch(_PackedMath):
         generation = Uint32(0)
         slot = Uint32(0)
         if cutlass.const_expr(self._device_slot_selection):
-            generation = ld_relaxed_gpu_u32(
-                Int64(signal_ptrs[self._rank]) + Int64(_GRAPH_EPOCH_OFFSET)
-            )
-            # The existing block/peer barrier below proves every thread has
-            # consumed this load before any CTA can post its tail arrival.
+            if cutlass.const_expr(self._transport == "pull"):
+                generation = ld_relaxed_gpu_u32(
+                    Int64(signal_ptrs[self._rank]) + Int64(_GRAPH_EPOCH_OFFSET)
+                )
+            else:
+                generation = ld_relaxed_gpu_u32(
+                    Int64(signal_ptrs[self._rank]) + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
+                )
             slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
             if cutlass.const_expr(self._transport == "pull"):
                 peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
-
-            if cutlass.const_expr(self._transport != "pull"):
-                # Every CTA retains this invocation's slot before the final
-                # arrival advances the graph-local epoch. Same-stream launch
-                # ordering and alternating slots prevent premature reuse.
+            else:
+                # All threads retain the epoch before the final CTA advances it.
                 cute.arch.sync_threads()
                 if Int32(tidx) == Int32(0):
                     self_signal = Int64(signal_ptrs[self._rank])
-                    graph_epoch_arrive_serialized(
-                        self_signal + Int64(_GRAPH_EPOCH_OFFSET),
-                        self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
+                    plain_graph_epoch_arrive(
+                        self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET),
+                        self_signal + Int64(_PLAIN_GRAPH_ARRIVED_OFFSET),
                         Uint32(gdim),
                     )
 
@@ -370,14 +376,9 @@ class _OneshotLaunch(_PackedMath):
                 peer_scratch_base = plain_peer_slot1
             peer_write_base = peer_scratch_base + plain_region_packs * Int64(16)
             local_poll_base = local_scratch_base + plain_region_packs * Int64(16)
-            # Generation zero is the initialized scratch value. Starting at
-            # two and retaining published records gives every alternating slot
-            # a different expected value. For generation g, the immediately
-            # preceding record in the same slot is g while this invocation
-            # expects g + 2, including modulo-uint32 wraparound. Collective
-            # lockstep prevents a record from an entire 2^32-generation cycle
-            # remaining in a slot: a missed publication blocks that generation
-            # before either rank can advance its graph-local epoch.
+            # Wire tags zero and one are reserved. Before the epoch restarts,
+            # both ranks drain and clear the full incoming capacity, including
+            # records not touched by this shape.
             expected_generation = generation + Uint32(2)
 
             if cutlass.const_expr(self._transport == "tp2_remote_push"):
@@ -463,6 +464,23 @@ class _OneshotLaunch(_PackedMath):
                     packed_sum[3],
                 )
                 index += stride
+
+            if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
+                # Matching CTAs finish reading before either rank clears records.
+                self._multi_gpu_barrier(signal_ptrs)
+                clear_index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
+                while clear_index < plain_capacity_packs:
+                    for clear_slot in cutlass.range_constexpr(2):
+                        clear_base = plain_local_slot0
+                        if cutlass.const_expr(clear_slot == 1):
+                            clear_base = plain_local_slot1
+                        line = clear_base + plain_region_packs * Int64(16) + clear_index * Int64(32)
+                        st_global_v4_u32(line, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                        st_global_v4_u32(line + Int64(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    clear_index += Int64(stride)
+                # The peer cannot publish another epoch until its receiver's
+                # matching CTA has completed the clear with system visibility.
+                self._multi_gpu_barrier(signal_ptrs)
 
 
 class _FusedOneshotLaunch(_PackedMath):
@@ -1244,8 +1262,9 @@ def get_oneshot_launcher(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 3, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 4, cache_key),
     )
 
     def run(
@@ -1255,6 +1274,7 @@ def get_oneshot_launcher(
         output_address: int,
         size_packs: int,
         plain_region_packs: int,
+        plain_capacity_packs: int,
         plain_local_slot0: int,
         plain_peer_slot0: int,
         plain_local_slot1: int,
@@ -1288,6 +1308,7 @@ def get_oneshot_launcher(
             ),
             int(size_packs),
             int(plain_region_packs),
+            int(plain_capacity_packs),
             int(plain_local_slot0),
             int(plain_peer_slot0),
             int(plain_local_slot1),

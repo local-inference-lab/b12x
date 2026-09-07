@@ -287,12 +287,38 @@ def main() -> None:
     results = []
     try:
         for rows in row_counts:
-            b12x = _benchmark_b12x(
-                pool, rows, args.hidden_size, dtype, rank, args, device
-            )
-            dist.barrier()
-            nccl = _benchmark_nccl(rows, args.hidden_size, dtype, rank, args, device)
-            dist.barrier()
+            measurements = {"b12x": [], "nccl": []}
+            groups = (args.samples // 2, args.samples - args.samples // 2)
+            for group, count in enumerate(groups):
+                if count == 0:
+                    continue
+                group_args = argparse.Namespace(**vars(args))
+                group_args.samples = count
+                order = ("nccl", "b12x") if group == 0 else ("b12x", "nccl")
+                for backend in order:
+                    if backend == "b12x":
+                        result = _benchmark_b12x(
+                            pool, rows, args.hidden_size, dtype, rank, group_args, device,
+                        )
+                    else:
+                        result = _benchmark_nccl(
+                            rows, args.hidden_size, dtype, rank, group_args, device,
+                        )
+                    measurements[backend].append(result)
+                    dist.barrier()
+            combined = {}
+            for backend, batches in measurements.items():
+                samples = [
+                    sample for batch in batches
+                    for sample in batch["samples_slowest_rank_us"]
+                ]
+                combined[backend] = {
+                    **batches[0],
+                    "correct": all(batch["correct"] for batch in batches),
+                    "samples_slowest_rank_us": samples,
+                    **_distribution(samples),
+                }
+            b12x, nccl = combined["b12x"], combined["nccl"]
             if not b12x["correct"] or not nccl["correct"]:
                 raise RuntimeError(f"all-reduce oracle failed for rows={rows}")
             results.append(
@@ -348,7 +374,8 @@ def main() -> None:
             "cuda_version": torch.version.cuda,
             "nccl_version": torch.cuda.nccl.version(),
             "dtype": args.dtype,
-            "warmup_replays": args.warmup,
+            "warmup_replays_per_group": args.warmup,
+            "measurement_order": [["nccl", "b12x"], ["b12x", "nccl"]],
             "timed_replays": args.samples,
             "devices": devices,
             "nvidia_smi_inventory": _nvidia_smi_inventory(),

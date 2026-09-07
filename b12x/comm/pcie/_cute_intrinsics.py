@@ -541,6 +541,52 @@ def graph_epoch_arrive_serialized(
 
 
 @dsl_user_op
+def plain_graph_epoch_arrive(
+    epoch_addr: Int64,
+    arrived_addr: Int64,
+    blocks: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Advance a plain peer-push epoch, reserving wire tags zero and one.
+
+    The final epoch's kernel drains peers and clears both incoming slots before
+    returning. Pull and fused collectives use separate counters.
+    """
+
+    llvm.inline_asm(
+        None,
+        [
+            Int64(epoch_addr).ir_value(loc=loc, ip=ip),
+            Int64(arrived_addr).ir_value(loc=loc, ip=ip),
+            Uint32(blocks).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred not_last, rollover;
+            .reg .b32 prior, last, generation, next_generation;
+            sub.u32 last, $2, 1;
+            atom.relaxed.gpu.global.inc.u32 prior, [$1], last;
+            setp.ne.u32 not_last, prior, last;
+            @not_last bra plain_epoch_arrive_done;
+            ld.relaxed.gpu.global.u32 generation, [$0];
+            setp.eq.u32 rollover, generation, 0xfffffffd;
+            add.u32 next_generation, generation, 1;
+            selp.u32 next_generation, 0, next_generation, rollover;
+            st.global.u32 [$0], next_generation;
+        plain_epoch_arrive_done:
+        }
+        """,
+        "l,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+@dsl_user_op
 def threadfence_gpu(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,

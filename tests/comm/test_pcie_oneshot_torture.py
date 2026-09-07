@@ -15,8 +15,8 @@ from b12x.comm.pcie.pcie_oneshot import (
     _tp2_plain_remote_push_enabled,
 )
 from b12x.comm.pcie._oneshot_cute import (
-    _GRAPH_ARRIVED_OFFSET,
-    _GRAPH_EPOCH_OFFSET,
+    _PLAIN_GRAPH_ARRIVED_OFFSET,
+    _PLAIN_GRAPH_EPOCH_OFFSET,
 )
 
 
@@ -456,7 +456,7 @@ def _run_tp2_graph_generation_wrap(
     stream.synchronize()
 
     backend_state = graph_channel._ext._state(graph_channel._ptr)
-    start_generation = 0xFFFFFFFE
+    start_generation = 0xFFFFFFFC
     selected_slot = (start_generation + backend_state.slot_bias) & 1
     size_packs = source.numel() * source.element_size() // 16
     record_words = size_packs * 8
@@ -481,10 +481,10 @@ def _run_tp2_graph_generation_wrap(
         )
 
     control = (ctypes.c_uint32 * 2)(start_generation, 0)
-    assert _GRAPH_ARRIVED_OFFSET == _GRAPH_EPOCH_OFFSET + 4
+    assert _PLAIN_GRAPH_ARRIVED_OFFSET == _PLAIN_GRAPH_EPOCH_OFFSET + 4
     _copy_host_to_device(
         graph_channel,
-        graph_channel.signal_ptrs[rank] + _GRAPH_EPOCH_OFFSET,
+        graph_channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
         control,
         stream,
     )
@@ -509,7 +509,7 @@ def _run_tp2_graph_generation_wrap(
     assert (
         _read_local_u32(
             graph_channel,
-            graph_channel.signal_ptrs[rank] + _GRAPH_EPOCH_OFFSET,
+            graph_channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
             stream,
         )
         == 2
@@ -607,3 +607,107 @@ def test_tp2_graph_peer_push_preserves_payload_bits(monkeypatch: pytest.MonkeyPa
         pytest.skip("TP2 graph peer-push requires two CUDA devices")
     monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
     mp.spawn(_graph_payload_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+def _shape_growth_wrap_worker(
+    rank: int, world_size: int, port: int, dtype_name: str, retained_tag: int,
+) -> None:
+    import b12x
+
+    os.environ["B12X_PCIE_TP2_PLAIN_REMOTE_PUSH"] = "1"
+    os.environ["B12X_PCIE_TP2_REMOTE_PUSH"] = "1" if retained_tag else "0"
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank, world_size=world_size,
+    )
+    capacity_bytes = 4 * 4096 * 2
+    pool = PCIeOneshotAllReducePool(
+        rank=rank, world_size=world_size, device=device,
+        exchange_group=dist.group.WORLD, eager_buffer_bytes=capacity_bytes,
+        max_size=capacity_bytes, rank_data_bytes=capacity_bytes, single_channel=True,
+    )
+    stream = torch.cuda.Stream(device=device)
+    graphs, inputs, outputs = [], [], []
+    try:
+        for rows in (1, 4):
+            source = torch.full(
+                (rows, 4096), float(rank + 1), device=device,
+                dtype=getattr(torch, dtype_name),
+            )
+            output = torch.empty_like(source)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with pool.capture(stream) as channel:
+                with torch.cuda.stream(stream):
+                    channel.prepare_graph_all_reduce(source)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    channel.all_reduce(source, out=output)
+            stream.synchronize()
+            graphs.append(graph)
+            inputs.append(source)
+            outputs.append(output)
+
+        state = channel._ext._state(channel._ptr)
+        records = (ctypes.c_uint32 * (capacity_bytes // 16 * 8))()
+        for record in range(capacity_bytes // 16):
+            for lane in (1, 3, 5, 7):
+                records[record * 8 + lane] = retained_tag
+        for slot in range(2):
+            _copy_host_to_device(
+                channel,
+                channel._eager_ptrs[slot][rank] + state.plain_remote_push_region_packs * 16,
+                records, stream,
+            )
+        control = (ctypes.c_uint32 * 2)(0xFFFFFFFC, 0)
+        _copy_host_to_device(
+            channel, channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+            control, stream,
+        )
+        stream.synchronize()
+        dist.barrier()
+        b12x.freeze_kernel_resolution("TP2 shape growth across epoch rollover")
+        try:
+            with torch.cuda.stream(stream):
+                graphs[0].replay()
+                graphs[0].replay()
+            stream.synchronize()
+            assert torch.all(outputs[0] == 3)
+            assert _read_local_u32(
+                channel, channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET, stream,
+            ) == 0
+            dist.barrier()
+            address = outputs[1].data_ptr()
+            allocated = torch.cuda.memory_allocated(device)
+            with torch.cuda.stream(stream):
+                # Force the receiver to observe stale tail records before its
+                # peer publishes the larger shape after rollover.
+                if rank == 1:
+                    torch.cuda._sleep(20_000_000)
+                graphs[1].replay()
+            stream.synchronize()
+            assert outputs[1].data_ptr() == address
+            assert torch.cuda.memory_allocated(device) == allocated
+            mismatches = int((outputs[1] != 3).sum().item())
+            results = [None] * world_size
+            dist.all_gather_object(results, mismatches)
+            assert results == [0, 0], results
+        finally:
+            b12x.unfreeze_kernel_resolution()
+    finally:
+        for graph in graphs:
+            graph.reset()
+        pool.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("retained_tag", [0, 2])
+def test_tp2_graph_rollover_clears_unused_shape_capacity(dtype_name, retained_tag):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("TP2 graph peer-push requires two CUDA devices")
+    mp.spawn(
+        _shape_growth_wrap_worker,
+        args=(2, _free_port(), dtype_name, retained_tag), nprocs=2, join=True,
+    )

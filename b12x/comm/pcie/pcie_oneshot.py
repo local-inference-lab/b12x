@@ -1837,6 +1837,7 @@ class _CuTeOneshotBackend:
             )
             device_index = self._device_index(inp.device)
             plain_region_packs = 0
+            plain_capacity_packs = 0
             plain_slot_ptrs = (0, 0, 0, 0)
         else:
             transport = plan.transport
@@ -1845,6 +1846,7 @@ class _CuTeOneshotBackend:
             size_packs = plan.size_packs
             device_index = plan.device_index
             plain_region_packs = plan.remote_push_region_packs
+            plain_capacity_packs = int(plan.eager_buffer_bytes or 0) // 16
             plain_slot_ptrs = plan.remote_push_slot_ptrs
         prospective_device_selection = state.device_slot_selection or (
             capturing and state.eager_tables is not None
@@ -1903,6 +1905,7 @@ class _CuTeOneshotBackend:
                 out.data_ptr(),
                 size_packs,
                 plain_region_packs,
+                plain_capacity_packs,
                 *plain_slot_ptrs,
                 blocks,
             )
@@ -2899,7 +2902,7 @@ class PCIeOneshotAllReduce:
 
         ``should_allreduce`` defines functional support. This method adds the
         latency policy used by callers with an NCCL fallback. Prepared TP2 CUDA
-        graph channels extend the caller's generic band through 64 contiguous
+        graph channels extend the caller's generic band through 64 storage-dense
         FP16/BF16 rows of width 4096. Every other shape and execution mode uses
         the caller-supplied size policy.
         """
