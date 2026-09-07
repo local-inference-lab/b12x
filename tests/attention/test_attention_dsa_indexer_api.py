@@ -1616,12 +1616,14 @@ def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
     gather_table.masked_fill_(~live_mask, -1)
     lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
     output_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    output_values = torch.full((rows, topk), 12345.0, dtype=torch.float32, device=device)
 
     run_row_topk(
         row_logits=row_logits,
         lengths=lengths,
         topk=topk,
         output_indices=output_indices,
+        output_values=output_values,
         output_gather_table=gather_table,
         write_values=False,
     )
@@ -1636,14 +1638,28 @@ def test_row_topk_padded_overflow_is_unique_and_graph_safe() -> None:
                 lengths=lengths,
                 topk=topk,
                 output_indices=output_indices,
+                output_values=output_values,
                 output_gather_table=gather_table,
                 write_values=False,
             )
     finally:
         unfreeze_kernel_resolution()
+    pointers = (
+        row_logits.data_ptr(), output_values.data_ptr(), output_indices.data_ptr(),
+    )
+    output_indices.fill_(-2)
+    torch.cuda.synchronize(device)
+    before = torch.cuda.memory_stats(device)
     for _ in range(8):
         graph.replay()
     torch.cuda.synchronize(device)
+    after = torch.cuda.memory_stats(device)
+    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+        assert before[key] == after[key]
+    assert pointers == (
+        row_logits.data_ptr(), output_values.data_ptr(), output_indices.data_ptr(),
+    )
+    assert bool((output_values == 12345.0).all())
 
     logical = output_indices.to(torch.int64)
     valid = logical >= 0

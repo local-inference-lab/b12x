@@ -99,6 +99,7 @@ def _build_scene(
     kth_score = torch.topk(ref_logits, topk, dim=1).values[:, -1]
     return {
         "seq_len": seq_len,
+        "page_start": _PAGE_START,
         "topk": topk,
         "width_blocks": width_blocks,
         "q_fp8": q_fp8,
@@ -117,6 +118,8 @@ def _run_indexer(
     *,
     supertile_k: int,
     output_physical_slots: bool,
+    route: str = "packed_contiguous",
+    graph_replay: bool = False,
 ) -> torch.Tensor:
     monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", str(supertile_k))
     seqlens = scene["seqlens"]
@@ -132,7 +135,7 @@ def _run_indexer(
         seqlens=seqlens,
         supertile_k=supertile_k,
         shared_page_table=True,
-        route="packed_contiguous",
+        route=route,
         output_physical_slots=output_physical_slots,
     )
     prepare_paged_indexer_metadata(
@@ -146,17 +149,50 @@ def _run_indexer(
         (_ROWS, topk), dtype=torch.int32, device=scene["q_fp8"].device
     )
     clear_indexer_caches()
-    index_topk_fp8(
-        q_fp8=scene["q_fp8"],
-        weights=scene["weights"].unsqueeze(-1),
-        index_k_cache=scene["index_k_cache"],
-        topk=topk,
-        expected_num_q_heads=_NUM_HEADS,
-        binding=binding,
-        out_indices=selected,
-        supertile_k=supertile_k,
-    )
-    torch.cuda.synchronize(scene["q_fp8"].device)
+    def run():
+        return index_topk_fp8(
+            q_fp8=scene["q_fp8"],
+            weights=scene["weights"].unsqueeze(-1),
+            index_k_cache=scene["index_k_cache"],
+            topk=topk,
+            expected_num_q_heads=_NUM_HEADS,
+            binding=binding,
+            out_indices=selected,
+            supertile_k=supertile_k,
+        )
+
+    run()
+    device = scene["q_fp8"].device
+    torch.cuda.synchronize(device)
+    if graph_replay:
+        from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+        freeze_kernel_resolution("paged top-k high-page-ID replay")
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            pointers = (scene["index_k_cache"].data_ptr(), selected.data_ptr())
+            for _ in range(2):
+                scene["weights"].neg_()
+                scene["ref_logits"].neg_()
+                scene["kth_score"] = torch.topk(
+                    scene["ref_logits"], topk, dim=1,
+                ).values[:, -1]
+                selected.fill_(-2)
+                torch.cuda.synchronize(device)
+                before = torch.cuda.memory_stats(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                after = torch.cuda.memory_stats(device)
+                for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                    assert before[key] == after[key]
+                assert pointers == (scene["index_k_cache"].data_ptr(), selected.data_ptr())
+                _assert_selects_true_topk(
+                    scene, selected, output_physical_slots=output_physical_slots,
+                )
+        finally:
+            unfreeze_kernel_resolution()
     return selected
 
 
@@ -166,8 +202,8 @@ def _assert_selects_true_topk(
     seq_len = scene["seq_len"]
     topk = int(scene["topk"])
     if output_physical_slots:
-        # Physical slot -> logical (contiguous page table starting at _PAGE_START).
-        raw_logical = selected.long() - _PAGE_START * _PAGE
+        # The scene maps consecutive physical pages to logical token positions.
+        raw_logical = selected.long() - int(scene["page_start"]) * _PAGE
     else:
         # Logical output is already request-relative.
         raw_logical = selected.long()
@@ -311,3 +347,32 @@ def test_paged_prefill_topk_width_does_not_recompile(monkeypatch) -> None:
     )
     _assert_selects_true_topk(scene_narrow, selected_narrow, output_physical_slots=True)
     _assert_selects_true_topk(scene_wide, selected_wide, output_physical_slots=True)
+
+
+@pytest.mark.parametrize("output_physical_slots", (False, True))
+def test_paged_topk_512_high_page_ids_graph_replay(
+    monkeypatch, output_physical_slots: bool,
+) -> None:
+    """Read live packed cache pages past the signed 32-bit byte-offset limit."""
+    device = torch.device("cuda")
+    scene = _build_scene(device, 8192, "monotonic", topk=512)
+    packed = scene["index_k_cache"]
+    page_stride = packed.stride(0) * packed.element_size()
+    page_start = (1 << 31) // page_stride + 1
+    live_pages = scene["width_blocks"]
+    pool = torch.empty(
+        (page_start + live_pages, packed.shape[1]), dtype=packed.dtype, device=device,
+    )
+    pool[page_start:].copy_(packed[_PAGE_START : _PAGE_START + live_pages])
+    scene["index_k_cache"] = pool
+    scene["shared_page_table"].add_(page_start - _PAGE_START)
+    scene["page_start"] = page_start
+    assert page_start * page_stride > (1 << 31)
+    assert (page_start + live_pages) * _PAGE < torch.iinfo(torch.int32).max
+    # Relocating identical packed pages preserves the small scene's score oracle.
+    selected = _run_indexer(
+        monkeypatch, scene, supertile_k=4096,
+        output_physical_slots=output_physical_slots, route="paged_tiled",
+        graph_replay=True,
+    )
+    _assert_selects_true_topk(scene, selected, output_physical_slots=output_physical_slots)
