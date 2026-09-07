@@ -16,7 +16,7 @@ def align_up(value: int, alignment: int) -> int:
 
 
 def dtype_nbytes(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    return int(dtype.itemsize)
 
 
 def shape_numel(shape: tuple[int, ...]) -> int:

@@ -1,6 +1,6 @@
 # b12x
 
-`b12x` is an SM120/SM121 CuTe DSL kernel library for local LLM inference.
+`b12x` is an SM120/SM121 CuTe DSL and Triton kernel library for local LLM inference.
 It specifically targets DGX Spark, RTX Spark and the Blackwell-based RTX
 cards (RTX 6000 Pro, RTX 5090).
 
@@ -16,14 +16,14 @@ pip install b12x
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl == 4.6.0`), so there is no build step — kernels are
+(`nvidia-cutlass-dsl == 4.6.2`), so there is no build step — kernels are
 JIT-compiled on first use and cached.
 
 ## What's in here
 
-Every kernel is one op at `b12x.<group>.<op>` (17 total; `list_ops()`
-enumerates them). The op owns its `plan`/`bind`/`run` facade in `api.py`; the
-kernel guts sit in `_impl.py`/`_kernel.py`; cross-op lowering lives in
+Every kernel is one op at `b12x.<group>.<op>`; `list_ops()` enumerates the
+complete set. The op owns its `plan`/`bind`/`run` facade in `api.py`; the
+kernel guts sit in `_impl.py`/`_kernel*.py`; cross-op lowering lives in
 `<group>/_shared/` and the universal compile/scratch spine in `b12x/_lib/`.
 
 **`gemm`** — `gemm.blockscaled` is the common dense interface for raw
@@ -39,7 +39,9 @@ projection (`gemm.mla_query_projection`) and grouped WO projection
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
 `attention.compressed_sparse_mla` (top-k / compressed-page MLA — distinct
 contracts, kept separate on purpose), `attention.dsa_indexer` (the DSA/MSA quantize →
-score → select pipeline), and `attention.varlen` (contiguous batched/varlen).
+score → select pipeline), `attention.qsa` (group-selected exact sparse GQA
+decode over caller-populated, read-only main BF16 K/V), and `attention.varlen`
+(contiguous batched/varlen).
 
 **`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
 path, a unified dynamic path (persistent grid, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4`),
@@ -48,9 +50,19 @@ math), with SiLU/ReLU2/SwiGLU-OAI activations; plus `moe.ep_moe` (expert
 parallel).
 
 **the rest** — `norm.mhc` (fused RMSNorm + hyper-connection residual),
-`quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
-collectives). `b12x` owns planning, scratch layout, and policy, so
-serving stacks only supply metadata and capacity limits.
+`norm.hyperconnection` (learned multi-stream residual primitives),
+`sequence.{ple_hash,ple_embedding,ple}` (prime-hashed embedding IDs, fused
+quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
+recurrent decode),
+`sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
+`quantization.{nvfp4,mxfp8}` (row quantizers), `comm.roce` (RoCEnante: one-shot
+RDMA all-reduce/all-gather for multi-node DGX Spark TP, see `docs/rocenante.md`),
+and `comm.pcie` (IPC-backed PCIe
+collectives). The Qwen3.8-Flash-Next QSA, HyperConnection, PLE, GDN decode,
+and MTP feedback Triton implementations are correctness references and are
+not throughput-qualified production kernels.
+`b12x` owns planning, scratch layout, and policy, so serving stacks only supply
+metadata and capacity limits.
 
 ## Using it
 

@@ -14,6 +14,8 @@ Supported (MG) shapes:
   * DSV4 dual-cache (extra/indexed tokens): topk==128, heads % 8 == 0,
     pbs_extra in {2, 64} (BF16-QK), using the same head partitioning.
   * GLM_NSA: topk in {512, 1024, 2048}
+  * GLM_NEXT: topk in {512, 1024, 2048, 2051, 2112}; 2112 is an
+    alignment-only container whose per-row ``topk_length`` remains 2051.
 Anything else (other topk, unsupported heads, GLM dual, etc.) raises ValueError.
 DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 """
@@ -21,6 +23,7 @@ DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import torch
 
@@ -28,8 +31,9 @@ from .traits import (
     ComputeMode,
     ModelType,
     ScaleFormat,
-    infer_model_type,
-    make_unified_traits,
+    UnifiedMLATraits,
+    is_glm_model_type,
+    resolve_unplanned_traits,
 )
 
 # DSV4 compressed contract head dim (q_nope 448 + q_rope 64).
@@ -51,14 +55,14 @@ def _cache_block_stride_bytes(
         COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     )
 
-    if model_type == ModelType.GLM_NSA:
+    if is_glm_model_type(model_type):
         # GLM-family per-token contiguous record: 656B (ARBITRARY_FP32) or
         # 432B (NVFP4_E4M3). ``record_bytes`` comes from traits.kv_gmem_stride.
         rec = int(record_bytes) if record_bytes is not None else _GLM_KV_GMEM_STRIDE
         expected = int(page_size) * rec
     else:
         expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    if model_type == ModelType.GLM_NSA and cache.is_contiguous():
+    if is_glm_model_type(model_type) and cache.is_contiguous():
         return expected
     # The runtime page stride is part of the packed/padded cache contract.
     if cache.ndim >= 2:
@@ -96,6 +100,30 @@ def _mg_head_partitions(heads: int, hpb: int = 16) -> tuple[tuple[int, int, int]
     return tuple(parts)
 
 
+_TOPK_CONTAINERS = (512, 1024, 2048)
+_TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
+
+
+def _topk_container(model_type: int, topk: int) -> int:
+    """Return the DSV4 MG container width for a runtime top-k row.
+
+    GLM sparse-MLA plans require the caller-owned index row to match the planned
+    width. Live valid counts are runtime metadata, so the dispatcher must not
+    replace a bound GLM row with an allocating padded tensor. Unsupported GLM
+    widths remain unchanged here and fail the model-specific dispatch gate.
+    DSV4 accepts the padded fixed-container representation and is the model
+    family that requires sub-container widening.
+    """
+    if model_type != ModelType.DSV4:
+        return topk
+    if topk in _TOPK_EXACT:
+        return topk
+    for container in _TOPK_CONTAINERS:
+        if topk < container:
+            return container
+    return topk
+
+
 def run_unified_prefill(
     *,
     q: torch.Tensor,
@@ -115,9 +143,11 @@ def run_unified_prefill(
     stride_extra_kv_block: int | None = None,
     workspace=None,
     scale_format: int | None = None,
+    model_type: int | None = None,
     latent_scale: float = 1.0,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    traits_override: UnifiedMLATraits | None = None,
 ):
     """Unified SM120 sparse-MLA single-pass prefill -> BF16 O + base-2 LSE.
 
@@ -125,8 +155,9 @@ def run_unified_prefill(
     FlashInfer-shaped multi-group (MG) prefill kernel (``run_unified_prefill_mg``).
     Unsupported shapes HARD-FAIL (raise-not-fallback); there is no decode-reuse path.
 
-    Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE) AND GLM_NSA
-    (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope) through the SAME kernel
+    Routes DSV4 (q_head_dim==512, UE8M0 footer, V_HAS_ROPE), GLM_NSA
+    (q_head_dim==576, ARBITRARY_FP32 inline scales, V==nope), and explicit
+    GLM_NEXT (q_head_dim==512, ARBITRARY_FP32 inline scales, no RoPE) through the SAME kernel
     via the traits const_expr branches (model_type/scale_format/v_has_rope/
     nt_per_warp_xv), exactly like the decode launcher. DSV4 additionally supports a
     DUAL-CACHE union (extra_kv_cache / extra_indices / extra_topk_length /
@@ -135,10 +166,12 @@ def run_unified_prefill(
     chunks). The extra cache is DSV4-only (GLM has no extra section -> RAISE).
 
     Args:
-      q:            (T, heads, D_QK) bf16. D_QK 512 (DSV4) or 576 (GLM_NSA).
+      q:            (T, heads, D_QK) bf16. D_QK 512 (DSV4/explicit GLM_NEXT)
+                    or 576 (GLM_NSA).
       kv_cache:     flat uint8 MAIN KV cache (reshaped to 1-D).
       topk_indices: (T, topk) int32 flat slot ids (-1 = invalid sentinel).
-      sm_scale:     softmax scale (typically D_QK**-0.5).
+      sm_scale:     caller-owned physical softmax scale. GLM_NEXT uses
+                    256**-0.5 even though its absorbed query width is 512.
       page_block_size: tokens per MAIN KV block (64 for DSV4/GLM).
       topk_length:  optional (T,) int32 per-token MAIN valid length; entries past it
                     are masked. Defaults to full ``topk`` for every token.
@@ -164,8 +197,9 @@ def run_unified_prefill(
         # Genuinely-unsupported contract -> error like upstream (infer_model_type
         # ICHECKs d_qk in {512, 576}). NOT a legacy fallback.
         raise ValueError(
-            f"SM120 sparse MLA prefill supports DSV4 (q_head_dim=512) or GLM_NSA "
-            f"(q_head_dim=576); got q_head_dim={q_head_dim}"
+            "SM120 sparse MLA prefill supports q_head_dim=512 (DSV4 or "
+            "explicit GLM_NEXT) or q_head_dim=576 (GLM_NSA); "
+            f"got q_head_dim={q_head_dim}"
         )
 
     num_tokens, heads, _ = q.shape
@@ -178,38 +212,24 @@ def run_unified_prefill(
             f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
         )
 
-    model_type, compute_mode, inferred_scale_format = infer_model_type(
-        q_head_dim, kv_cache.dtype
-    )
-    if scale_format is None:
-        scale_format = inferred_scale_format
+    if traits_override is not None:
+        traits = traits_override
+        model_type = int(traits.model_type)
+        compute_mode = int(traits.compute_mode)
+        scale_format = int(traits.scale_format)
     else:
-        scale_format = int(scale_format)
-        if q_head_dim == _GLM_HEAD_DIM and scale_format == ScaleFormat.NVFP4_E4M3:
-            # NVFP4 GLM-family prefill runs the BF16-QK MG arm (native E2M1
-            # dequant + BF16 MMA); FP8 compute would misread the 432B record.
-            compute_mode = ComputeMode.BF16
-        elif scale_format != inferred_scale_format:
-            raise ValueError(
-                "SM120 sparse MLA prefill scale_format does not match q_head_dim: "
-                f"q_head_dim={q_head_dim}, inferred={int(inferred_scale_format)}, "
-                f"override={int(scale_format)}"
-            )
-    # FAIL-CLOSED: the per-token fp32 latent scale lives at bytes [292, 296) of
-    # the NVFP4 fp8-rope 368-byte record ONLY (fp8_rope agreement is enforced
-    # by make_unified_traits and the MG record-width validation).
-    if latent_scale_per_token and scale_format != ScaleFormat.NVFP4_E4M3:
-        raise ValueError(
-            "SM120 sparse MLA prefill latent_scale_per_token requires "
-            f"ScaleFormat.NVFP4_E4M3; got scale_format={int(scale_format)}"
+        traits = resolve_unplanned_traits(
+            q_head_dim,
+            kv_cache.dtype,
+            int(kv_cache.shape[-1]),
+            model_type=model_type,
+            scale_format=scale_format,
+            fp8_rope=fp8_rope,
+            latent_scale_per_token=bool(latent_scale_per_token),
         )
-    traits = make_unified_traits(
-        model_type,
-        compute_mode,
-        scale_format,
-        fp8_rope=fp8_rope,
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
+        model_type = int(traits.model_type)
+        compute_mode = int(traits.compute_mode)
+        scale_format = int(traits.scale_format)
     d_v = int(traits.d_v)
 
     # ── DSV4 dual-cache: validate the extra trio (all-or-none) and that it is DSV4. ──
@@ -242,6 +262,17 @@ def run_unified_prefill(
         topk_length = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
     else:
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
+
+    container = _topk_container(model_type, topk)
+    if container != topk:
+        # DSV4 short sequences can clamp runtime top-k below index_topk (for
+        # example, 192 for a 192-token prefill). Its MG kernels take fixed
+        # containers, so widen the row with the invalid sentinel while retaining
+        # the per-token valid length.
+        topk_indices = torch.nn.functional.pad(
+            topk_indices, (0, container - topk), value=-1
+        )
+        topk = container
 
     if stride_kv_block is None:
         stride_kv_block = _cache_block_stride_bytes(
@@ -296,7 +327,8 @@ def run_unified_prefill(
                 model_type=model_type,
                 scale_format=scale_format,
                 fp8_rope=bool(traits.fp8_rope),
-                latent_scale_per_token=bool(latent_scale_per_token),
+                latent_scale_per_token=bool(traits.latent_scale_per_token),
+                traits_override=replace(traits, compute_mode=compute_mode),
             )
             if extra_kv_cache is not None:
                 kwargs.update(
@@ -348,13 +380,16 @@ def run_unified_prefill(
     _mg_glm = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
-    if _mg_glm and topk in (512, 1024, 2048):
+    glm_topk_supported = topk in (512, 1024, 2048) or (
+        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    )
+    if _mg_glm and glm_topk_supported:
         return _run_partitioned_mg(
             compute_mode=ComputeMode.FP8,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.ARBITRARY_FP32,
         )
     # ── NVFP4 (E2M1 + E4M3 group-16, GLM-family) MG gate ───────────────────────
@@ -364,13 +399,16 @@ def run_unified_prefill(
     _mg_nvfp4 = (
         _mg_enabled
         and not has_extra
-        and model_type == ModelType.GLM_NSA
+        and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
-    if _mg_nvfp4 and topk in (128, 512, 1024, 2048):
+    nvfp4_topk_supported = topk in (128, 512, 1024, 2048) or (
+        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    )
+    if _mg_nvfp4 and nvfp4_topk_supported:
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
-            model_type=ModelType.GLM_NSA,
+            model_type=model_type,
             scale_format=ScaleFormat.NVFP4_E4M3,
         )
     _mg_base = (
@@ -427,7 +465,9 @@ def run_unified_prefill(
         "DSV4 single-cache topk in {512, 1024, 2048} (FP8) or 128 "
         "(BF16-QK, heads%8==0); "
         "DSV4 dual-cache topk==128 with heads%8==0 and pbs_extra in {2, 64}; "
-        "GLM_NSA topk in {512, 1024, 2048}; "
-        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}. "
+        "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
+        "{512, 1024, 2048, 2051, 2112}; "
+        "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}; "
+        "GLM_NEXT NVFP4 additionally topk in {2051, 2112}. "
         "No decode-reuse fallback."
     )

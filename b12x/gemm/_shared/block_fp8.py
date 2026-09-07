@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import logging
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -10,16 +10,22 @@ from typing import Iterable, Sequence
 
 import torch
 
-from b12x._lib.utils import cuda_stream_to_int
 from b12x._lib.dense_gemm import (
     dense_gemm,
     dense_gemm_fused_quant_a,
 )
+from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
-    MXFP8Rows,
     MXFP8_SCALE_K_TILE,
     MXFP8_SCALE_ROW_TILE,
     MXFP8_SCALE_VEC_SIZE,
+    MXFP8Rows,
     _check_gpu_tensor,
     _check_mxfp8_k,
     _check_mxfp8_rows_storage,
@@ -28,12 +34,11 @@ from b12x.gemm._shared.wo_mxfp8 import (
     mxfp8_rows_from_bases,
     pack_fp8_block_scaled_weight_mxfp8,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
+from b12x.gemm.block_fp8_linear._policy import (
+    BLOCK_FP8_LINEAR_POLICY,
+    BlockFp8LinearQuery,
 )
-from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+from b12x.policy import PolicyContext, get_auto_policy
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -65,10 +70,10 @@ class BlockFP8LinearBinding:
     x_q: MXFP8Rows
     output: torch.Tensor
     bias: torch.Tensor | None = None
-    # DeepGEMM-style regime hint forwarded to dense_gemm (decode vs prefill tile).
-    # None keeps the M-independent default; set it at bind time so the warmed
-    # kernel matches the regime this binding serves.
+    # Fixed row bound forwarded to dense_gemm for decode/prefill specialization.
+    # Plan.bind defaults it to scratch capacity; an explicit value takes precedence.
     expected_m: int | None = None
+    mma_tiler_mn: tuple[int, int] | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self, stream=stream)
@@ -99,6 +104,8 @@ class BlockFP8LinearScratchCaps:
 class BlockFP8LinearScratchPlan:
     caps: BlockFP8LinearScratchCaps
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    mma_tiler_mn: tuple[int, int]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -152,7 +159,8 @@ class BlockFP8LinearScratchPlan:
             x_q=x_q,
             output=output,
             bias=bias,
-            expected_m=expected_m,
+            expected_m=self.caps.max_tokens if expected_m is None else expected_m,
+            mma_tiler_mn=self.mma_tiler_mn,
         )
 
 
@@ -304,8 +312,8 @@ def _block_fp8_linear_x_q_from_scratch(
         shape=layout.x_scale_mma_physical_shape,
         dtype=torch.uint8,
     )
-    x_scale_rows_u8.fill_(127)
-    x_scale_mma_u8.fill_(127)
+    # Quantization overwrites every scale contributing to a logical output row.
+    # Leave M128 padding unspecified to avoid two CUDA fills when binding scratch.
     x_scale_mma = x_scale_mma_u8.view(torch.float8_e8m0fnu).permute(
         3,
         4,
@@ -360,6 +368,7 @@ def build_block_fp8_linear_binding(
     output: torch.Tensor,
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
+    mma_tiler_mn: tuple[int, int] | None = None,
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -385,18 +394,37 @@ def build_block_fp8_linear_binding(
         output=output,
         bias=bias,
         expected_m=expected_m,
+        mma_tiler_mn=mma_tiler_mn,
     )
 
 
 def plan_block_fp8_linear_scratch(
     caps: BlockFP8LinearScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
 ) -> BlockFP8LinearScratchPlan:
+    if not isinstance(caps, BlockFP8LinearScratchCaps):
+        raise TypeError("caps must be BlockFP8LinearScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        BLOCK_FP8_LINEAR_POLICY,
+        BlockFp8LinearQuery(
+            max_tokens=caps.max_tokens,
+            in_features=caps.in_features,
+            out_features=caps.out_features,
+            output_dtype=str(caps.output_dtype).removeprefix("torch."),
+        ),
+    )
     layout = _block_fp8_linear_scratch_layout(
         tokens=caps.max_tokens,
         in_features=caps.in_features,
         out_features=caps.out_features,
         output_dtype=caps.output_dtype,
     )
+    config = resolution.config
     return BlockFP8LinearScratchPlan(
         caps=caps,
         _scratch_specs=(
@@ -406,6 +434,8 @@ def plan_block_fp8_linear_scratch(
                 device=caps.device,
             ),
         ),
+        mma_tiler_mn=(config.tile_m, config.tile_n),
+        policy_resolution=resolution,
     )
 
 
@@ -452,6 +482,8 @@ def _run_block_fp8_quant_kernel(
     out_scale_mma: torch.Tensor,
     tokens: int,
     in_features: int,
+    *,
+    expected_m: int | None = None,
 ) -> None:
     del tokens, in_features
     quantize_mxfp8_rows_cute(
@@ -459,6 +491,7 @@ def _run_block_fp8_quant_kernel(
         out_values,
         out_scale_rows,
         out_scale_mma,
+        expected_m=expected_m,
     )
 
 
@@ -543,6 +576,47 @@ def quantize_block_fp8_linear_input_mxfp8(
     return out
 
 
+def _quantize_block_fp8_linear_input_for_immediate_gemm(
+    source_tk: torch.Tensor,
+    *,
+    expected_m: int | None = None,
+) -> MXFP8Rows:
+    """Quantize into fresh storage whose physical padding stays unspecified.
+
+    This private path is used only inside the opaque fused linear op, where the
+    quantized rows are consumed immediately by dense GEMM and never escape to a
+    caller.  It preserves the initialized-padding semantics of the public
+    ``quantize_block_fp8_linear_input_mxfp8`` allocation API.
+    """
+
+    tokens, in_features = source_tk.shape
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens,
+        in_features,
+        num_groups=1,
+        device=source_tk.device,
+        initialize_scales=False,
+    )
+    out = mxfp8_rows_from_bases(
+        values_base,
+        scale_rows_base,
+        scale_physical_base,
+        tokens,
+        in_features,
+        num_groups=1,
+    )
+    _run_block_fp8_quant_kernel(
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        in_features,
+        expected_m=expected_m,
+    )
+    return out
+
+
 @torch.library.custom_op(
     "b12x::block_fp8_linear_mxfp8_fused",
     mutates_args=(),
@@ -564,7 +638,8 @@ def _block_fp8_linear_mxfp8_fused_op(
     # shapes). The weight views passed in are static-shaped, so they don't hit
     # that path. Returns a contiguous [tokens, out_features] base.
     tokens = int(source_2d.shape[0])
-    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+    planned_tokens = expected_m if expected_m > 0 else tokens
+    if planned_tokens <= 8 and source_2d.dtype == torch.bfloat16:
         return dense_gemm_fused_quant_a(
             source_2d,
             weight_values.reshape(out_features, in_features, 1),
@@ -573,7 +648,9 @@ def _block_fp8_linear_mxfp8_fused_op(
             sfb_k_replicated=True,
             stream=stream_int,
         )[:, :, 0]
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(
+        source_2d, expected_m=None if expected_m == 0 else expected_m
+    )
     return dense_gemm(
         (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
         (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
@@ -619,11 +696,12 @@ def block_fp8_linear_mxfp8(
 ) -> torch.Tensor:
     """Run a serialized block-FP8 linear through the native b12x MXFP8 GEMM.
 
-    expected_m forwards a DeepGEMM-style regime hint to dense_gemm (decode vs
-    prefill tile); None keeps the M-independent default. When a binding is given
-    its stored expected_m is used.
+    expected_m is the fixed row bound used for decode/prefill specialization.
+    A binding owns this value; Plan.bind defaults it to scratch capacity while
+    preserving an explicit expected_m supplied by the caller.
     """
 
+    mma_tiler_mn = None
     if binding is not None:
         extras = [
             name
@@ -645,6 +723,7 @@ def block_fp8_linear_mxfp8(
         output_storage = binding.output
         bias = binding.bias
         expected_m = binding.expected_m
+        mma_tiler_mn = binding.mma_tiler_mn
     else:
         x_q_storage = None
         output_storage = None
@@ -699,7 +778,8 @@ def block_fp8_linear_mxfp8(
     assert x_q_storage is not None
     assert output_storage is not None
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
-    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+    planned_tokens = expected_m if expected_m is not None else tokens
+    if planned_tokens <= 8 and source_2d.dtype == torch.bfloat16:
         output = dense_gemm_fused_quant_a(
             source_2d,
             packed_weight.weight.values.reshape(
@@ -710,13 +790,20 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.scale_mma,
             out=output_storage,
             expected_m=expected_m,
+            mma_tiler_mn=mma_tiler_mn,
             sfb_k_replicated=True,
             stream=stream,
         )[:, :, 0]
         if bias is not None:
             output += bias
         return output.view(*source.shape[:-1], packed_weight.out_features)
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
+    if tokens <= 0:
+        raise ValueError("tokens must be positive")
+    x_q = x_q_storage
+    _run_block_fp8_quant_kernel(
+        source_2d, x_q.values, x_q.scale_rows, x_q.scale_mma,
+        tokens, in_features, expected_m=expected_m,
+    )
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
         (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),
@@ -734,6 +821,7 @@ def block_fp8_linear_mxfp8(
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         out=output_storage,
         expected_m=expected_m,
+        mma_tiler_mn=mma_tiler_mn,
         sfb_k_replicated=True,
         stream=stream,
     )[:, :, 0]
@@ -814,6 +902,9 @@ def prewarm_block_fp8_linear_mxfp8(
                 expected_m=expected_m,
             )
             block_fp8_linear_mxfp8(binding=binding, stream=stream)
+            block_fp8_linear_mxfp8(
+                source, packed_weight, expected_m=expected_m, stream=stream
+            )
         torch.cuda.synchronize(device)
 
 

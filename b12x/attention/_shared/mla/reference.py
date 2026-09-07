@@ -15,6 +15,7 @@ _MLA_ROPE_DIM = 64
 _MLA_GROUP_SIZE = 128
 _MLA_SCALE_BYTES = (_MLA_NOPE_DIM // _MLA_GROUP_SIZE) * 4
 _MLA_PACKED_DIM = 656
+_MLA_NO_ROPE_PACKED_DIM = _MLA_NOPE_DIM + _MLA_SCALE_BYTES
 
 
 def _as_2d_cache(x: torch.Tensor, expected_dim: int, name: str) -> torch.Tensor:
@@ -33,11 +34,11 @@ def _as_2d_cache(x: torch.Tensor, expected_dim: int, name: str) -> torch.Tensor:
 
 def pack_mla_kv_cache_reference(
     k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_rope: torch.Tensor | None = None,
     *,
     group_size: int = _MLA_GROUP_SIZE,
 ) -> torch.Tensor:
-    """Pack MLA KV cache into the FP8+scale+rope byte layout used by NSA."""
+    """Pack a GLM MLA latent record, optionally including its BF16 RoPE lane."""
 
     if group_size != _MLA_GROUP_SIZE:
         raise ValueError(
@@ -45,14 +46,16 @@ def pack_mla_kv_cache_reference(
         )
 
     k_nope_2d = _as_2d_cache(k_nope, _MLA_NOPE_DIM, "k_nope")
-    k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
-    if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
-        raise ValueError("k_nope and k_rope must have the same token count")
-    if k_rope_2d.dtype != torch.bfloat16:
-        raise ValueError(
-            "k_rope must have dtype torch.bfloat16 because the packed MLA layout "
-            f"stores raw BF16 rope bytes, got {k_rope_2d.dtype}"
-        )
+    k_rope_2d = None
+    if k_rope is not None:
+        k_rope_2d = _as_2d_cache(k_rope, _MLA_ROPE_DIM, "k_rope")
+        if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
+            raise ValueError("k_nope and k_rope must have the same token count")
+        if k_rope_2d.dtype != torch.bfloat16:
+            raise ValueError(
+                "k_rope must have dtype torch.bfloat16 because the packed MLA layout "
+                f"stores raw BF16 rope bytes, got {k_rope_2d.dtype}"
+            )
 
     quant_bytes: list[torch.Tensor] = []
     scale_bytes: list[torch.Tensor] = []
@@ -65,13 +68,14 @@ def pack_mla_kv_cache_reference(
         quant_bytes.append(quant.view(torch.uint8).reshape(block.shape[0], group_size))
         scale_bytes.append(scale.view(torch.uint8).reshape(block.shape[0], 4))
 
-    rope_bytes = k_rope_2d.view(torch.uint8).reshape(
-        k_rope_2d.shape[0], _MLA_ROPE_DIM * 2
-    )
-    packed = torch.cat(
-        [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1), rope_bytes],
-        dim=1,
-    )
+    fields = [torch.cat(quant_bytes, dim=1), torch.cat(scale_bytes, dim=1)]
+    if k_rope_2d is not None:
+        fields.append(
+            k_rope_2d.view(torch.uint8).reshape(
+                k_rope_2d.shape[0], _MLA_ROPE_DIM * 2
+            )
+        )
+    packed = torch.cat(fields, dim=1)
     return packed.unsqueeze(1).contiguous()
 
 
@@ -87,7 +91,21 @@ def unpack_mla_kv_cache_reference(
             f"Only group_size={_MLA_GROUP_SIZE} is supported in the reference."
         )
 
-    packed = _as_2d_cache(kv_cache, _MLA_PACKED_DIM, "kv_cache").view(torch.uint8)
+    if kv_cache.ndim == 3:
+        if kv_cache.shape[1] != 1:
+            raise ValueError(
+                f"kv_cache middle dimension must be 1, got {tuple(kv_cache.shape)}"
+            )
+        kv_cache = kv_cache[:, 0, :]
+    if kv_cache.ndim != 2 or int(kv_cache.shape[1]) not in (
+        _MLA_NO_ROPE_PACKED_DIM,
+        _MLA_PACKED_DIM,
+    ):
+        raise ValueError(
+            "kv_cache must be rank-2 or rank-3 with record width 528 or 656, "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    packed = kv_cache.contiguous().view(torch.uint8)
     num_tokens = packed.shape[0]
     num_groups = _MLA_NOPE_DIM // group_size
 
@@ -95,11 +113,12 @@ def unpack_mla_kv_cache_reference(
     nope_q = nope_q.reshape(num_tokens, _MLA_NOPE_DIM).to(torch.float32)
     scales = packed[:, _MLA_NOPE_DIM : _MLA_NOPE_DIM + num_groups * 4].contiguous()
     scales = scales.view(torch.float32).reshape(num_tokens, num_groups)
-    rope = packed[:, _MLA_NOPE_DIM + num_groups * 4 :].contiguous().view(torch.bfloat16)
-    rope = rope.reshape(num_tokens, _MLA_ROPE_DIM).to(torch.float32)
-
     nope = nope_q.reshape(num_tokens, num_groups, group_size) * scales.unsqueeze(-1)
     nope = nope.reshape(num_tokens, _MLA_NOPE_DIM)
+    if int(packed.shape[1]) == _MLA_NO_ROPE_PACKED_DIM:
+        return nope.unsqueeze(1).contiguous()
+    rope = packed[:, _MLA_NOPE_DIM + num_groups * 4 :].contiguous().view(torch.bfloat16)
+    rope = rope.reshape(num_tokens, _MLA_ROPE_DIM).to(torch.float32)
     return torch.cat([nope, rope], dim=1).unsqueeze(1).contiguous()
 
 

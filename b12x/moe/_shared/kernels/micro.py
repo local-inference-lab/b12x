@@ -398,6 +398,7 @@ class MoEMicroKernelBackend:
         w4a16_mode: bool = False,
         a8_mx_mode: bool = False,
         scale_format: str = "e4m3_k16",
+        e4m3_scale_layout: str = "packed",
         e8m0_scale_layout: str = "packed",
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
@@ -420,6 +421,8 @@ class MoEMicroKernelBackend:
             raise ValueError(
                 f"unsupported micro e8m0_scale_layout {e8m0_scale_layout!r}"
             )
+        if e4m3_scale_layout not in {"packed", "modelopt"}:
+            raise ValueError(f"unsupported micro e4m3_scale_layout {e4m3_scale_layout!r}")
         swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
         swiglu_alpha = normalize_swiglu_alpha_for_activation(activation, swiglu_alpha)
         swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
@@ -439,8 +442,7 @@ class MoEMicroKernelBackend:
                 )
         elif trellis_bits is not None or trellis_coupled:
             raise ValueError(
-                "trellis_bits/trellis_coupled require weight_layout "
-                "'trellis_t256'"
+                "trellis_bits/trellis_coupled require weight_layout 'trellis_t256'"
             )
         self.scale_format = scale_format
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
@@ -465,6 +467,7 @@ class MoEMicroKernelBackend:
         self.dynamic_down_scale = dynamic_down_scale
         self.compile_time_phase = int(compile_time_phase)
         self.w4a16_mode = w4a16_mode
+        self.w4a16_packed_scales = w4a16_mode and e4m3_scale_layout == "packed"
         # a8_mx: quantize-dequantize activations through E4M3 with per-32
         # UE8M0 block scales (no global scale) so decode numerics track the
         # w4a8 prefill recipe. Same f16 dot-product math and weights.
@@ -493,6 +496,7 @@ class MoEMicroKernelBackend:
             self.dynamic_down_scale,
             self.compile_time_phase,
             self.w4a16_mode,
+            self.w4a16_packed_scales,
             self.a8_mx_mode,
             self.weight_layout,
             self.trellis_bits,
@@ -549,11 +553,39 @@ class MoEMicroKernelBackend:
         return fp4_dot4_sum_f32acc(u_packed, x0, x1, x2, x3)
 
     @cute.jit
+    def _fc2_route(
+        self,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        eid_addr: Int32,
+        route_expert_limit: Int32,
+    ) -> Tuple[Int32, Float32, Int32]:
+        """Resolve an FC2 route without addressing absent expert tensors.
+
+        Fused launches compile with the exact resident expert count. The
+        FC2-only endpoint compiles against a capacity bucket, so it uses the
+        caller's actual tensor extent instead. Route IDs are checked at source
+        width before conversion to the 32-bit address arithmetic type.
+        """
+        raw_expert = Int64(topk_ids[eid_addr])
+        expert_limit = Int64(self._cfg.weight_E)
+        if cutlass.const_expr(self.compile_time_phase == 2):
+            expert_limit = Int64(route_expert_limit)
+        expert = Int32(0)
+        weight = Float32(0.0)
+        route_active = Int32(0)
+        if raw_expert >= Int64(0) and raw_expert < expert_limit:
+            expert = Int32(raw_expert)
+            weight = Float32(topk_weights[eid_addr])
+            route_active = Int32(1)
+        return expert, weight, route_active
+
+    @cute.jit
     def _scale_byte_to_f32(self, byte: Uint32) -> Float32:
         """Decode one block-scale byte to f32 (E8M0 in MXFP4 mode, else E4M3)."""
         if cutlass.const_expr(self.scale_format_e8m0_k32):
             return cvt_e8m0_to_f32(byte)
-        if cutlass.const_expr(self.w4a16_mode):
+        if cutlass.const_expr(self.w4a16_packed_scales):
             return cvt_w4a16_packed_e4m3_scale_to_f32(byte)
         return cvt_e4m3_to_f32_via_f16(byte)
 
@@ -779,9 +811,8 @@ class MoEMicroKernelBackend:
         if self.w4a16_mode and m == 1 and n <= 2048:
             # The 4-output-rows/warp retile only helps the k_segments==8 aligned
             # gated path (its activation reg-hoist + dual-dot assume 4 rows).
-            # The packed-scale GLM k_segments==12 path is scale-load limited; one
-            # row/warp keeps those strided packed scale loads out of the inner
-            # row loop without retaining the old native scale grid.
+            # K=6144 retains twelve K16 segments per lane; use one output row
+            # per warp to keep that working set bounded.
             rows_per_warp_div = 2
             if cfg.k_segments_aligned and cfg.k_segments == 8 and self.is_gated:
                 rows_per_warp_div = 4
@@ -807,9 +838,18 @@ class MoEMicroKernelBackend:
             # divide n into whole 16-value blocks: floor(n/32) silently made
             # i_chunk non-integral at shapes such as n=144 (four 36-value
             # chunks), so FC1 wrote only 128 of 144 logical values.
+            rows_per_chunk = _BLOCK_SIZE * 2
+            if (
+                not self.w4a16_packed_scales
+                and not self.scale_format_e8m0_k32
+                and self.is_gated
+                and cfg.k_segments_aligned
+                and cfg.k_segments == 12
+            ):
+                rows_per_chunk = _BLOCK_SIZE
             num_fc1_chunks = max(
                 num_fc1_chunks,
-                (n + (_BLOCK_SIZE * 2) - 1) // (_BLOCK_SIZE * 2),
+                (n + rows_per_chunk - 1) // rows_per_chunk,
             )
             while n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0:
                 num_fc1_chunks += 1
@@ -922,6 +962,18 @@ class MoEMicroKernelBackend:
         cute.arch.sync_threads()
 
     @cute.jit
+    def _resolve_route_expert(self, route_eid: Int64) -> Tuple[Int32, Int32]:
+        """Return an in-range expert id and an integer active-route predicate."""
+
+        cfg = self._cfg
+        eid = Int32(0)
+        route_active = Int32(0)
+        if route_eid >= Int64(0) and route_eid < Int64(cfg.weight_E):
+            eid = Int32(route_eid)
+            route_active = Int32(1)
+        return eid, route_active
+
+    @cute.jit
     def _m1_fc2_rowpair_narrow(
         self,
         fc2_task: Int32,
@@ -933,6 +985,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -945,13 +998,11 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
-        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
-            # Native ModelOpt rows contain exactly n/8 packed u32 values.
+        if cutlass.const_expr(cfg.n % 64 != 0):
+            # Source-native rows contain exactly n/8 packed u32 values.
             # w2_sf_cols is padded to four scale columns, so its control-block
             # count overstates the physical W2/packed-scale extent when n is a
-            # multiple of 16 but not 64 (for example, n=144). Keep the existing
-            # predicate byte-for-byte for the aligned production shapes, and
-            # gate odd-shape loads against the logical packed row instead.
+            # multiple of 16 but not 64 (for example, n=144).
             w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
@@ -959,14 +1010,15 @@ class MoEMicroKernelBackend:
         out_acc1 = Float32(0.0)
         k_col0 = Int32(0)
         k_col1 = Int32(0)
-        if cutlass.const_expr(self.w4a16_mode):
+        if cutlass.const_expr(self.w4a16_packed_scales):
             k_col0 = self._packed_e4m3_scale_col(k_row0)
             k_col1 = self._packed_e4m3_scale_col(k_row1)
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1048,7 +1100,7 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            elif cutlass.const_expr(self.w4a16_mode):
+            elif cutlass.const_expr(self.w4a16_packed_scales):
                 kb16_i = lane >> Int32(1)
                 bsf_f0 = (
                     self._ld_e4m3_packed_scale_col(
@@ -1079,12 +1131,13 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            out_acc0 = (
-                out_acc0
-                + bsf_f0
-                * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc0 = (
+                    out_acc0
+                    + bsf_f0
+                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
             u_packed1 = (
                 ld_global_nc_u32(
@@ -1109,7 +1162,7 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            elif cutlass.const_expr(self.w4a16_mode):
+            elif cutlass.const_expr(self.w4a16_packed_scales):
                 kb16_i = lane >> Int32(1)
                 bsf_f1 = (
                     self._ld_e4m3_packed_scale_col(
@@ -1140,12 +1193,13 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            out_acc1 = (
-                out_acc1
-                + bsf_f1
-                * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc1 = (
+                    out_acc1
+                    + bsf_f1
+                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
         sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
@@ -1165,6 +1219,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1184,14 +1239,15 @@ class MoEMicroKernelBackend:
         out_acc1 = Float32(0.0)
         k_col0 = Int32(0)
         k_col1 = Int32(0)
-        if cutlass.const_expr(self.w4a16_mode):
+        if cutlass.const_expr(self.w4a16_packed_scales):
             k_col0 = self._packed_e4m3_scale_col(k_row0)
             k_col1 = self._packed_e4m3_scale_col(k_row1)
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1219,7 +1275,7 @@ class MoEMicroKernelBackend:
                 kk_off = Int32(kk) * n_u32_per_expert + chunk_base
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                if cutlass.const_expr(cfg.n % 64 != 0):
                     packed_u32 = Int32(nc * 32) + lane
                     w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
                 # If the last 256-value chunk overhangs logical n, lanes past
@@ -1227,15 +1283,7 @@ class MoEMicroKernelBackend:
                 # The padded scale grid can look full at widths such as n=496,
                 # so its control-block count is not a valid activation bound.
                 # The weight is zero there, but 0 * NaN still poisons the sum.
-                # Preserve the legacy predicate for non-W4A16 modes and emit
-                # no extra work for 256-aligned native ModelOpt shapes.
-                if cutlass.const_expr(
-                    (self.w4a16_mode and cfg.n % 256 != 0)
-                    or (
-                        (not self.w4a16_mode)
-                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
-                    )
-                ):
+                if cutlass.const_expr(cfg.n % 256 != 0):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -1287,7 +1335,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f0 = (
                         self._ld_e4m3_packed_scale_col(
@@ -1318,13 +1366,6 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc0 = (
-                    out_acc0
-                    + bsf_f0
-                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
-
                 u_packed1 = (
                     ld_global_nc_u32(
                         w2_base_addr
@@ -1349,7 +1390,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f1 = (
                         self._ld_e4m3_packed_scale_col(
@@ -1380,12 +1421,23 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc1 = (
-                    out_acc1
-                    + bsf_f1
-                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
+                # Issue both independent row loads before consuming either
+                # value. This preserves each row's accumulation order while
+                # exposing sibling-row memory-level parallelism.
+                if route_active > Int32(0):
+                    out_acc0 = (
+                        out_acc0
+                        + bsf_f0
+                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
+                if route_active > Int32(0):
+                    out_acc1 = (
+                        out_acc1
+                        + bsf_f1
+                        * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
         sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
@@ -1405,6 +1457,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1423,6 +1476,8 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
+        if cutlass.const_expr(cfg.n % 64 != 0):
+            w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
         out_acc0 = Float32(0.0)
@@ -1445,8 +1500,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1467,10 +1523,52 @@ class MoEMicroKernelBackend:
                 # rows.  The fused body instead consumes FC1's internal
                 # pair-swizzled layout, where the four adjacent BF16 pairs are
                 # split across four 32-word bands.
-                xh0 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(0)])
-                xh1 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(1)])
-                xh2 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(2)])
-                xh3 = Uint32(intermediate[kk_off + lane * Int32(4) + Int32(3)])
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + lane * Int32(4) + Int32(0)])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + lane * Int32(4) + Int32(1)])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + lane * Int32(4) + Int32(2)])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + lane * Int32(4) + Int32(3)])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+            elif cutlass.const_expr(cfg.n < 256):
+                # FC1 writes only n/8 lanes in each padded 32-lane plane.
+                # Mask the rest before the dot so stale NaN scratch cannot
+                # contaminate a zero-weight lane through 0*NaN.
+                inter_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
+                xh0 = (
+                    Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh1 = (
+                    Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh2 = (
+                    Uint32(intermediate[kk_off + Int32(2 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
+                xh3 = (
+                    Uint32(intermediate[kk_off + Int32(3 * 32) + lane])
+                    if inter_valid > Int32(0)
+                    else Uint32(0)
+                )
             else:
                 xh0 = Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                 xh1 = Uint32(intermediate[kk_off + Int32(1 * 32) + lane])
@@ -1504,12 +1602,13 @@ class MoEMicroKernelBackend:
                 if w_valid > Int32(0)
                 else Float32(0.0)
             )
-            out_acc0 = (
-                out_acc0
-                + bsf_f0
-                * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc0 = (
+                    out_acc0
+                    + bsf_f0
+                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
             u_packed1 = (
                 ld_global_nc_u32(
@@ -1538,12 +1637,13 @@ class MoEMicroKernelBackend:
                 if w_valid > Int32(0)
                 else Float32(0.0)
             )
-            out_acc1 = (
-                out_acc1
-                + bsf_f1
-                * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc1 = (
+                    out_acc1
+                    + bsf_f1
+                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
             u_packed2 = (
                 ld_global_nc_u32(
@@ -1572,12 +1672,13 @@ class MoEMicroKernelBackend:
                 if w_valid > Int32(0)
                 else Float32(0.0)
             )
-            out_acc2 = (
-                out_acc2
-                + bsf_f2
-                * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc2 = (
+                    out_acc2
+                    + bsf_f2
+                    * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
             u_packed3 = (
                 ld_global_nc_u32(
@@ -1606,12 +1707,13 @@ class MoEMicroKernelBackend:
                 if w_valid > Int32(0)
                 else Float32(0.0)
             )
-            out_acc3 = (
-                out_acc3
-                + bsf_f3
-                * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc3 = (
+                    out_acc3
+                    + bsf_f3
+                    * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
         sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
@@ -1636,6 +1738,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1652,7 +1755,7 @@ class MoEMicroKernelBackend:
         num_cb = sf_cols >> Int32(2)
         lane_cb = lane >> Int32(3)
         w_valid = Int32(1) if lane_cb < num_cb else Int32(0)
-        if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+        if cutlass.const_expr(cfg.n % 64 != 0):
             w_valid = Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
         lane_mode_c = (lane >> Int32(1)) & Int32(3)
         bsf_byte_shift = lane_mode_c * Int32(8)
@@ -1660,7 +1763,7 @@ class MoEMicroKernelBackend:
         out_acc1 = Float32(0.0)
         k_col0 = Int32(0)
         k_col1 = Int32(0)
-        if cutlass.const_expr(self.w4a16_mode):
+        if cutlass.const_expr(self.w4a16_packed_scales):
             k_col0 = self._packed_e4m3_scale_col(k_row0)
             k_col1 = self._packed_e4m3_scale_col(k_row1)
 
@@ -1673,8 +1776,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1752,7 +1856,7 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            elif cutlass.const_expr(self.w4a16_mode):
+            elif cutlass.const_expr(self.w4a16_packed_scales):
                 kb16_i = lane >> Int32(1)
                 bsf_f0 = (
                     self._ld_e4m3_packed_scale_col(
@@ -1783,12 +1887,13 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            out_acc0 = (
-                out_acc0
-                + bsf_f0
-                * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc0 = (
+                    out_acc0
+                    + bsf_f0
+                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
             u_packed1 = (
                 ld_global_nc_u32(
@@ -1813,7 +1918,7 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            elif cutlass.const_expr(self.w4a16_mode):
+            elif cutlass.const_expr(self.w4a16_packed_scales):
                 kb16_i = lane >> Int32(1)
                 bsf_f1 = (
                     self._ld_e4m3_packed_scale_col(
@@ -1844,12 +1949,13 @@ class MoEMicroKernelBackend:
                     if w_valid > Int32(0)
                     else Float32(0.0)
                 )
-            out_acc1 = (
-                out_acc1
-                + bsf_f1
-                * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
-                * scale_lane
-            )
+            if route_active > Int32(0):
+                out_acc1 = (
+                    out_acc1
+                    + bsf_f1
+                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                    * scale_lane
+                )
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
         sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
@@ -1870,6 +1976,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
@@ -1898,7 +2005,7 @@ class MoEMicroKernelBackend:
         k_col1 = Int32(0)
         k_col2 = Int32(0)
         k_col3 = Int32(0)
-        if cutlass.const_expr(self.w4a16_mode):
+        if cutlass.const_expr(self.w4a16_packed_scales):
             k_col0 = self._packed_e4m3_scale_col(k_row0)
             k_col1 = self._packed_e4m3_scale_col(k_row1)
             k_col2 = self._packed_e4m3_scale_col(k_row2)
@@ -1919,8 +2026,9 @@ class MoEMicroKernelBackend:
 
         for kk in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(kk)
-            eid = Int32(topk_ids[eid_addr])
-            router_w = topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -1940,13 +2048,13 @@ class MoEMicroKernelBackend:
                 chunk_base = Int32(nc) * Int32(128)
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                if cutlass.const_expr(cfg.n % 64 != 0):
                     packed_u32 = Int32(nc * 32) + lane
                     w_valid = Int32(1) if packed_u32 < Int32(cfg.n // 8) else Int32(0)
                 if cutlass.const_expr(nc + 1 < cfg.fc2_n_chunks):
                     next_cb_idx = Int32(nc + 1) * Int32(4) + lane_cb
                     next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
-                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    if cutlass.const_expr(cfg.n % 64 != 0):
                         next_packed_u32 = Int32((nc + 1) * 32) + lane
                         next_w_valid = (
                             Int32(1)
@@ -1985,14 +2093,15 @@ class MoEMicroKernelBackend:
                         )
                 elif cutlass.const_expr(kk + 1 < cfg.num_topk):
                     next_eid_addr = t * Int32(cfg.num_topk) + Int32(kk + 1)
-                    next_eid = Int32(topk_ids[next_eid_addr])
+                    next_route_eid = Int64(topk_ids[next_eid_addr])
+                    next_eid, _ = self._resolve_route_expert(next_route_eid)
                     next_ebase_w = Int64(next_eid) * Int64(cfg.k_dim * cfg.n_half)
                     next_ebase_sf = Int64(next_eid) * Int64(
                         cfg.w2_sf_rows * cfg.w2_sf_cols
                     )
                     next_cb_idx = lane_cb
                     next_w_valid = Int32(1) if next_cb_idx < num_cb else Int32(0)
-                    if cutlass.const_expr(self.w4a16_mode and cfg.n % 64 != 0):
+                    if cutlass.const_expr(cfg.n % 64 != 0):
                         next_w_valid = (
                             Int32(1) if lane < Int32(cfg.n // 8) else Int32(0)
                         )
@@ -2063,13 +2172,7 @@ class MoEMicroKernelBackend:
                 kk_off = token_inter_base + Int32(kk) * n_u32_per_expert + chunk_base
                 # See _m1_fc2_rowpair_wide: logical n, not the padded scale
                 # grid, determines whether the native intermediate tail is live.
-                if cutlass.const_expr(
-                    (self.w4a16_mode and cfg.n % 256 != 0)
-                    or (
-                        (not self.w4a16_mode)
-                        and (cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4
-                    )
-                ):
+                if cutlass.const_expr(cfg.n % 256 != 0):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
                         if w_valid > Int32(0)
@@ -2121,7 +2224,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f0 = (
                         self._ld_e4m3_packed_scale_col(
@@ -2152,12 +2255,13 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc0 = (
-                    out_acc0
-                    + bsf_f0
-                    * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
+                if route_active > Int32(0):
+                    out_acc0 = (
+                        out_acc0
+                        + bsf_f0
+                        * self._fp4_dot4_for_math(u_packed0, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
 
                 u_packed1 = (
                     ld_global_nc_u32(
@@ -2183,7 +2287,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f1 = (
                         self._ld_e4m3_packed_scale_col(
@@ -2214,12 +2318,13 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc1 = (
-                    out_acc1
-                    + bsf_f1
-                    * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
+                if route_active > Int32(0):
+                    out_acc1 = (
+                        out_acc1
+                        + bsf_f1
+                        * self._fp4_dot4_for_math(u_packed1, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
 
                 u_packed2 = (
                     ld_global_nc_u32(
@@ -2245,7 +2350,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f2 = (
                         self._ld_e4m3_packed_scale_col(
@@ -2276,12 +2381,13 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc2 = (
-                    out_acc2
-                    + bsf_f2
-                    * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
+                if route_active > Int32(0):
+                    out_acc2 = (
+                        out_acc2
+                        + bsf_f2
+                        * self._fp4_dot4_for_math(u_packed2, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
 
                 u_packed3 = (
                     ld_global_nc_u32(
@@ -2307,7 +2413,7 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                elif cutlass.const_expr(self.w4a16_mode):
+                elif cutlass.const_expr(self.w4a16_packed_scales):
                     kb16_i = (chunk_base + lane * Int32(4)) >> Int32(3)
                     bsf_f3 = (
                         self._ld_e4m3_packed_scale_col(
@@ -2338,12 +2444,13 @@ class MoEMicroKernelBackend:
                         if w_valid > Int32(0)
                         else Float32(0.0)
                     )
-                out_acc3 = (
-                    out_acc3
-                    + bsf_f3
-                    * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3)
-                    * scale_lane
-                )
+                if route_active > Int32(0):
+                    out_acc3 = (
+                        out_acc3
+                        + bsf_f3
+                        * self._fp4_dot4_for_math(u_packed3, xh0, xh1, xh2, xh3)
+                        * scale_lane
+                    )
 
         sum_warp0 = cute.arch.warp_reduction_sum(out_acc0)
         sum_warp1 = cute.arch.warp_reduction_sum(out_acc1)
@@ -2357,9 +2464,7 @@ class MoEMicroKernelBackend:
             scatter_output[out_base + k_row3] = BFloat16(sum_warp3)
 
     @cute.jit
-    def _trellis_gated_value(
-        self, gate: Float32, up: Float32
-    ) -> Float32:
+    def _trellis_gated_value(self, gate: Float32, up: Float32) -> Float32:
         sigmoid = cute.arch.rcp_approx(Float32(1.0) + cute.math.exp(-gate))
         if cutlass.const_expr(self.is_situ):
             beta = Float32(SITU_DEFAULT_BETA)
@@ -2393,6 +2498,7 @@ class MoEMicroKernelBackend:
         barrier_epoch: cute.Tensor,
         trellis_lut: cute.Tensor,
         trellis_rotations: cute.Tensor,
+        route_expert_limit: Int32,
         m_val: Int32,
     ):
         cfg = self._cfg
@@ -2412,6 +2518,7 @@ class MoEMicroKernelBackend:
                 intermediate,
                 topk_ids,
                 topk_weights,
+                route_expert_limit,
                 scatter_output,
                 trellis_lut,
             )
@@ -2479,14 +2586,14 @@ class MoEMicroKernelBackend:
             buf_idx = Int32(0)
             # Pre-loop: quantize first task into buf[0]
             if fc1_task < fc1_task_count:
-                route_idx_0 = fc1_task // Int32(
-                    cfg.fc1_chunks * self.trellis_ksplit
-                )
+                route_idx_0 = fc1_task // Int32(cfg.fc1_chunks * self.trellis_ksplit)
                 t0 = route_idx_0 // Int32(cfg.num_topk)
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
+                route_eid_0 = Int64(topk_ids[eid_addr_0])
+                eid_0, _ = self._resolve_route_expert(route_eid_0)
+                gs_fc1_0 = input_gs[eid_0]
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2568,7 +2675,8 @@ class MoEMicroKernelBackend:
             i_chunk_off = chunk_idx * Int32(cfg.i_chunk)
 
             eid_addr = t * Int32(cfg.num_topk) + k_idx
-            eid = Int32(topk_ids[eid_addr])
+            route_eid = Int64(topk_ids[eid_addr])
+            eid, route_active = self._resolve_route_expert(route_eid)
             if cutlass.const_expr(
                 self.w4a16_mode
                 and (not self.is_gated)
@@ -2588,9 +2696,7 @@ class MoEMicroKernelBackend:
                     alpha_fc1 = alpha_fc1 * gs_fc1
 
             # ---- Input quantization ----
-            if cutlass.const_expr(
-                cfg.k_segments != 2 or self.weight_layout_trellis256
-            ):
+            if cutlass.const_expr(cfg.k_segments != 2 or self.weight_layout_trellis256):
                 need_quant = Int32(1)
                 if cutlass.const_expr(self.share_input_across_experts):
                     need_quant = Int32(1) if t != prev_t else Int32(0)
@@ -2670,9 +2776,7 @@ class MoEMicroKernelBackend:
                 tr_tu = 8 * tr_bits
                 tr_k16_cnt = cfg.k_dim // 16
                 tr_n16_cnt = cfg.n // 16
-                tr_span = (
-                    tr_k16_cnt + self.trellis_ksplit - 1
-                ) // self.trellis_ksplit
+                tr_span = (tr_k16_cnt + self.trellis_ksplit - 1) // self.trellis_ksplit
                 tr_k16_half = (tr_span + 1) // 2
                 tr_eu = tr_k16_cnt * tr_n16_cnt * tr_tu
                 tr_row_stride = tr_n16_cnt * tr_tu
@@ -2682,10 +2786,7 @@ class MoEMicroKernelBackend:
                 tr_r = lane & Int32(3)
                 tr_ia, tr_ib, tr_s2 = _w4a8_trellis_lane_geom(lane, tr_bits)
                 tr_lut_addr = trellis_lut_smem_addr
-                tr_base_g = (
-                    Int64(eid) * Int64(tr_eu)
-                    + Int64(tr_n16g) * Int64(tr_tu)
-                )
+                tr_base_g = Int64(eid) * Int64(tr_eu) + Int64(tr_n16g) * Int64(tr_tu)
                 tr_base_u = tr_base_g + Int64(cfg.weight_E) * Int64(tr_eu)
                 pg_lo = Float32(0.0)
                 pg_hi = Float32(0.0)
@@ -2694,9 +2795,7 @@ class MoEMicroKernelBackend:
                 tr_k16_hi = tr_split * Int32(tr_span) + Int32(tr_span)
                 if tr_k16_hi > Int32(tr_k16_cnt):
                     tr_k16_hi = Int32(tr_k16_cnt)
-                tr_k16 = tr_split * Int32(tr_span) + tr_khalf * Int32(
-                    tr_k16_half
-                )
+                tr_k16 = tr_split * Int32(tr_span) + tr_khalf * Int32(tr_k16_half)
                 tr_k16_end = tr_k16 + Int32(tr_k16_half)
                 if tr_k16_end > tr_k16_hi:
                     tr_k16_end = tr_k16_hi
@@ -2704,12 +2803,8 @@ class MoEMicroKernelBackend:
                     # Issue both projections' ring words and the shared
                     # activation pairs up front so the two decodes overlap.
                     tr_xb = tr_k16 * Int32(8) + tr_k16 // Int32(8)
-                    tr_off_g = (
-                        tr_base_g + Int64(tr_k16) * Int64(tr_row_stride)
-                    )
-                    tr_off_u = (
-                        tr_base_u + Int64(tr_k16) * Int64(tr_row_stride)
-                    )
+                    tr_off_g = tr_base_g + Int64(tr_k16) * Int64(tr_row_stride)
+                    tr_off_u = tr_base_u + Int64(tr_k16) * Int64(tr_row_stride)
                     ga = ld_global_nc_u32(
                         w1_base_addr + ((tr_off_g + Int64(tr_ia)) << Int64(2))
                     )
@@ -2729,9 +2824,7 @@ class MoEMicroKernelBackend:
                     win_b = Uint32(merged >> Int64(tr_s2 + Int32(4 * tr_bits)))
                     merged_u = (Int64(ua) << Int64(32)) | Int64(ub)
                     win_ua = Uint32(merged_u >> Int64(tr_s2))
-                    win_ub = Uint32(
-                        merged_u >> Int64(tr_s2 + Int32(4 * tr_bits))
-                    )
+                    win_ub = Uint32(merged_u >> Int64(tr_s2 + Int32(4 * tr_bits)))
                     g_lo, g_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
                         win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
                     )
@@ -2760,9 +2853,7 @@ class MoEMicroKernelBackend:
                 pu_lo += Float32(cute.arch.shuffle_sync_bfly(pu_lo, offset=2))
                 pu_hi += Float32(cute.arch.shuffle_sync_bfly(pu_hi, offset=1))
                 pu_hi += Float32(cute.arch.shuffle_sync_bfly(pu_hi, offset=2))
-                tr_n0 = (
-                    Int32(2) * (lane >> Int32(3)) + ((lane >> Int32(2)) & Int32(1))
-                )
+                tr_n0 = Int32(2) * (lane >> Int32(3)) + ((lane >> Int32(2)) & Int32(1))
                 tr_row_lo = tr_n16_local * Int32(16) + tr_n0
                 tr_row_hi = tr_row_lo + Int32(8)
                 tr_leader = (lane & Int32(3)) == Int32(0)
@@ -2852,19 +2943,11 @@ class MoEMicroKernelBackend:
                         trellis_red[tr_row_hi] = alpha_fc1 * (
                             trellis_red[tr_row_hi] + pg_hi
                         )
-                        trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = (
-                            alpha_fc1
-                            * (
-                                trellis_red[Int32(cfg.i_chunk) + tr_row_lo]
-                                + pu_lo
-                            )
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_lo] = alpha_fc1 * (
+                            trellis_red[Int32(cfg.i_chunk) + tr_row_lo] + pu_lo
                         )
-                        trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = (
-                            alpha_fc1
-                            * (
-                                trellis_red[Int32(cfg.i_chunk) + tr_row_hi]
-                                + pu_hi
-                            )
+                        trellis_red[Int32(cfg.i_chunk) + tr_row_hi] = alpha_fc1 * (
+                            trellis_red[Int32(cfg.i_chunk) + tr_row_hi] + pu_hi
                         )
                     cute.arch.sync_threads()
                 if tr_final > Int32(0) and warp_id == Int32(0):
@@ -2901,28 +2984,13 @@ class MoEMicroKernelBackend:
                             p1 = Float32(trellis_red[tr_src + Int32(1)])
                             p2 = Float32(trellis_red[tr_src + Int32(2)])
                             p3 = Float32(trellis_red[tr_src + Int32(3)])
-                            h0, h1, h2, h3 = _w4a8_had128_quad(
-                                p0, p1, p2, p3, lane
-                            )
-                            tr_scale = (
-                                tr_rot6
-                                + tr_slot * tr_isz
-                                + i_chunk_off
-                                + tr_ci
-                            )
+                            h0, h1, h2, h3 = _w4a8_had128_quad(p0, p1, p2, p3, lane)
+                            tr_scale = tr_rot6 + tr_slot * tr_isz + i_chunk_off + tr_ci
                             h0 = h0 * Float32(trellis_rotations[tr_scale])
-                            h1 = h1 * Float32(
-                                trellis_rotations[tr_scale + Int32(1)]
-                            )
-                            h2 = h2 * Float32(
-                                trellis_rotations[tr_scale + Int32(2)]
-                            )
-                            h3 = h3 * Float32(
-                                trellis_rotations[tr_scale + Int32(3)]
-                            )
-                            h0, h1, h2, h3 = _w4a8_had128_quad(
-                                h0, h1, h2, h3, lane
-                            )
+                            h1 = h1 * Float32(trellis_rotations[tr_scale + Int32(1)])
+                            h2 = h2 * Float32(trellis_rotations[tr_scale + Int32(2)])
+                            h3 = h3 * Float32(trellis_rotations[tr_scale + Int32(3)])
+                            h0, h1, h2, h3 = _w4a8_had128_quad(h0, h1, h2, h3, lane)
                             tr_sign = (
                                 tr_rot6
                                 + Int32(3) * tr_isz
@@ -2932,15 +3000,9 @@ class MoEMicroKernelBackend:
                                 + lane * Int32(4)
                             )
                             h0 = h0 * Float32(trellis_rotations[tr_sign])
-                            h1 = h1 * Float32(
-                                trellis_rotations[tr_sign + Int32(1)]
-                            )
-                            h2 = h2 * Float32(
-                                trellis_rotations[tr_sign + Int32(2)]
-                            )
-                            h3 = h3 * Float32(
-                                trellis_rotations[tr_sign + Int32(3)]
-                            )
+                            h1 = h1 * Float32(trellis_rotations[tr_sign + Int32(1)])
+                            h2 = h2 * Float32(trellis_rotations[tr_sign + Int32(2)])
+                            h3 = h3 * Float32(trellis_rotations[tr_sign + Int32(3)])
                             s0 = self._trellis_gated_value(h0, h1)
                             s1 = self._trellis_gated_value(h2, h3)
                             if cutlass.const_expr(_pb == 0):
@@ -2976,95 +3038,53 @@ class MoEMicroKernelBackend:
                         v1 = v1 * Float32(trellis_rotations[tr_ub + Int32(1)])
                         v2 = v2 * Float32(trellis_rotations[tr_ub + Int32(2)])
                         v3 = v3 * Float32(trellis_rotations[tr_ub + Int32(3)])
-                        v0, v1, v2, v3 = _w4a8_had128_quad(
-                            v0, v1, v2, v3, lane
-                        )
+                        v0, v1, v2, v3 = _w4a8_had128_quad(v0, v1, v2, v3, lane)
                         tr_dn = tr_rot6 + Int32(2) * tr_isz + tr_col
                         v0 = v0 * Float32(trellis_rotations[tr_dn])
                         v1 = v1 * Float32(trellis_rotations[tr_dn + Int32(1)])
                         v2 = v2 * Float32(trellis_rotations[tr_dn + Int32(2)])
                         v3 = v3 * Float32(trellis_rotations[tr_dn + Int32(3)])
-                        o0, o1, o2, o3 = _w4a8_had128_quad(
-                            v0, v1, v2, v3, lane
-                        )
+                        o0, o1, o2, o3 = _w4a8_had128_quad(v0, v1, v2, v3, lane)
                     else:
                         tr_rot = eid * (Int32(3) * tr_isz) + tr_col
                         bg0 = Float32(trellis_red[lane * Int32(4)])
                         bg1 = Float32(trellis_red[lane * Int32(4) + Int32(1)])
                         bg2 = Float32(trellis_red[lane * Int32(4) + Int32(2)])
                         bg3 = Float32(trellis_red[lane * Int32(4) + Int32(3)])
-                        bu0 = Float32(
-                            trellis_red[Int32(cfg.i_chunk) + lane * Int32(4)]
-                        )
+                        bu0 = Float32(trellis_red[Int32(cfg.i_chunk) + lane * Int32(4)])
                         bu1 = Float32(
-                            trellis_red[
-                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(1)
-                            ]
+                            trellis_red[Int32(cfg.i_chunk) + lane * Int32(4) + Int32(1)]
                         )
                         bu2 = Float32(
-                            trellis_red[
-                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(2)
-                            ]
+                            trellis_red[Int32(cfg.i_chunk) + lane * Int32(4) + Int32(2)]
                         )
                         bu3 = Float32(
-                            trellis_red[
-                                Int32(cfg.i_chunk) + lane * Int32(4) + Int32(3)
-                            ]
+                            trellis_red[Int32(cfg.i_chunk) + lane * Int32(4) + Int32(3)]
                         )
-                        hg0, hg1, hg2, hg3 = _w4a8_had128_quad(
-                            bg0, bg1, bg2, bg3, lane
-                        )
-                        hu0, hu1, hu2, hu3 = _w4a8_had128_quad(
-                            bu0, bu1, bu2, bu3, lane
-                        )
+                        hg0, hg1, hg2, hg3 = _w4a8_had128_quad(bg0, bg1, bg2, bg3, lane)
+                        hu0, hu1, hu2, hu3 = _w4a8_had128_quad(bu0, bu1, bu2, bu3, lane)
                         rg0 = Float32(trellis_rotations[tr_rot])
                         rg1 = Float32(trellis_rotations[tr_rot + Int32(1)])
                         rg2 = Float32(trellis_rotations[tr_rot + Int32(2)])
                         rg3 = Float32(trellis_rotations[tr_rot + Int32(3)])
                         ru0 = Float32(trellis_rotations[tr_rot + tr_isz])
-                        ru1 = Float32(
-                            trellis_rotations[tr_rot + tr_isz + Int32(1)]
-                        )
-                        ru2 = Float32(
-                            trellis_rotations[tr_rot + tr_isz + Int32(2)]
-                        )
-                        ru3 = Float32(
-                            trellis_rotations[tr_rot + tr_isz + Int32(3)]
-                        )
-                        sd0 = Float32(
-                            trellis_rotations[tr_rot + Int32(2) * tr_isz]
-                        )
+                        ru1 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(1)])
+                        ru2 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(2)])
+                        ru3 = Float32(trellis_rotations[tr_rot + tr_isz + Int32(3)])
+                        sd0 = Float32(trellis_rotations[tr_rot + Int32(2) * tr_isz])
                         sd1 = Float32(
-                            trellis_rotations[
-                                tr_rot + Int32(2) * tr_isz + Int32(1)
-                            ]
+                            trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(1)]
                         )
                         sd2 = Float32(
-                            trellis_rotations[
-                                tr_rot + Int32(2) * tr_isz + Int32(2)
-                            ]
+                            trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(2)]
                         )
                         sd3 = Float32(
-                            trellis_rotations[
-                                tr_rot + Int32(2) * tr_isz + Int32(3)
-                            ]
+                            trellis_rotations[tr_rot + Int32(2) * tr_isz + Int32(3)]
                         )
-                        a0 = (
-                            self._trellis_gated_value(hg0 * rg0, hu0 * ru0)
-                            * sd0
-                        )
-                        a1 = (
-                            self._trellis_gated_value(hg1 * rg1, hu1 * ru1)
-                            * sd1
-                        )
-                        a2 = (
-                            self._trellis_gated_value(hg2 * rg2, hu2 * ru2)
-                            * sd2
-                        )
-                        a3 = (
-                            self._trellis_gated_value(hg3 * rg3, hu3 * ru3)
-                            * sd3
-                        )
+                        a0 = self._trellis_gated_value(hg0 * rg0, hu0 * ru0) * sd0
+                        a1 = self._trellis_gated_value(hg1 * rg1, hu1 * ru1) * sd1
+                        a2 = self._trellis_gated_value(hg2 * rg2, hu2 * ru2) * sd2
+                        a3 = self._trellis_gated_value(hg3 * rg3, hu3 * ru3) * sd3
                         o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
                     # Per-32 UE8M0 amax across the octet owning each block.
                     blk_peak = fmax_f32(
@@ -3073,9 +3093,7 @@ class MoEMicroKernelBackend:
                     )
                     for _st in cutlass.range_constexpr(3):
                         peer = Float32(
-                            cute.arch.shuffle_sync_bfly(
-                                blk_peak, offset=1 << _st
-                            )
+                            cute.arch.shuffle_sync_bfly(blk_peak, offset=1 << _st)
                         )
                         blk_peak = fmax_f32(blk_peak, peer)
                     scale32, inv32 = mx_scale_from_amax32(blk_peak)
@@ -3106,7 +3124,9 @@ class MoEMicroKernelBackend:
                 lane_seg_base = lane * Int32(cfg.k_segments)
                 lane_pad_base = lane_seg_base // Int32(8)
                 xh_base_t = (
-                    xh_buf_base + lane_seg_base * Int32(_BLOCK_SIZE // 2) + lane_pad_base
+                    xh_buf_base
+                    + lane_seg_base * Int32(_BLOCK_SIZE // 2)
+                    + lane_pad_base
                 )
 
                 # The FC1 activation lives in smem with a lane-segmented, padded
@@ -3222,7 +3242,7 @@ class MoEMicroKernelBackend:
                         scale_row_u = row_u
                         scale_row_g = row_g
                         if cutlass.const_expr(
-                            self.w4a16_mode and (not self.w13_gate_first)
+                            self.w4a16_packed_scales and (not self.w13_gate_first)
                         ):
                             # Main W4A16 scales are packed in kernel-native gate/up
                             # order. ModelOpt "w13" weights remain up/gate, so only
@@ -3239,11 +3259,11 @@ class MoEMicroKernelBackend:
                         )
                         scale_row_g = row_g
                     scale_col_g = Int32(0)
-                    if cutlass.const_expr(self.w4a16_mode):
+                    if cutlass.const_expr(self.w4a16_packed_scales):
                         scale_col_g = self._packed_e4m3_scale_col(scale_row_g)
                     if cutlass.const_expr(self.is_gated):
                         scale_col_u = Int32(0)
-                        if cutlass.const_expr(self.w4a16_mode):
+                        if cutlass.const_expr(self.w4a16_packed_scales):
                             scale_col_u = self._packed_e4m3_scale_col(scale_row_u)
                     gate_byte_addr = (
                         w1_base_addr
@@ -3253,9 +3273,13 @@ class MoEMicroKernelBackend:
                     )
                     col_blk_off = Int64(lane) * Int64((cfg.k_segments // 4) * 512)
 
-                    if cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 8):
+                    if cutlass.const_expr(
+                        cfg.k_segments_aligned and cfg.k_segments == 8
+                    ):
                         if cutlass.const_expr(self.is_gated):
-                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
+                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(
+                                up_byte_addr
+                            )
                             uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(
                                 up_byte_addr + Int64(16)
                             )
@@ -3309,7 +3333,7 @@ class MoEMicroKernelBackend:
                                 sf_u5 = u_k2
                                 sf_u6 = u_k3
                                 sf_u7 = u_k3
-                            elif cutlass.const_expr(self.w4a16_mode):
+                            elif cutlass.const_expr(self.w4a16_packed_scales):
                                 k16_u = lane * Int32(cfg.k_segments)
                                 sf_u0 = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
@@ -3433,7 +3457,7 @@ class MoEMicroKernelBackend:
                             sf_g5 = g_k2
                             sf_g6 = g_k3
                             sf_g7 = g_k3
-                        elif cutlass.const_expr(self.w4a16_mode):
+                        elif cutlass.const_expr(self.w4a16_packed_scales):
                             k16_g = lane * Int32(cfg.k_segments)
                             sf_g0 = self._ld_e4m3_packed_scale_col(
                                 w1s_base_addr,
@@ -3671,7 +3695,9 @@ class MoEMicroKernelBackend:
                                 + sf_g6 * dot_g6
                                 + sf_g7 * dot_g7
                             )
-                    elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 6):
+                    elif cutlass.const_expr(
+                        cfg.k_segments_aligned and cfg.k_segments == 6
+                    ):
                         xh_off0 = Int32(0)
                         xh_off1 = Int32(8) + (
                             (lane_seg_base + Int32(1)) // Int32(8) - lane_pad_base
@@ -3693,7 +3719,9 @@ class MoEMicroKernelBackend:
                         scale_lane_mod = lane_seg_base % Int32(4)
 
                         if cutlass.const_expr(self.is_gated):
-                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
+                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(
+                                up_byte_addr
+                            )
                             uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(
                                 up_byte_addr + Int64(16)
                             )
@@ -3740,7 +3768,7 @@ class MoEMicroKernelBackend:
                                 sf_u3 = u_k1
                                 sf_u4 = u_k2
                                 sf_u5 = u_k2
-                            elif cutlass.const_expr(self.w4a16_mode):
+                            elif cutlass.const_expr(self.w4a16_packed_scales):
                                 sf_u0 = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
                                     ebase_sf_packed_e4m3,
@@ -3785,7 +3813,10 @@ class MoEMicroKernelBackend:
                                 )
                             else:
                                 sf_word_u_a = ld_global_nc_u32(
-                                    w1s_base_addr + ebase_sf + bsf_base_u + scale_pair_off
+                                    w1s_base_addr
+                                    + ebase_sf
+                                    + bsf_base_u
+                                    + scale_pair_off
                                 )
                                 sf_word_u_b = ld_global_nc_u32(
                                     w1s_base_addr
@@ -3880,7 +3911,7 @@ class MoEMicroKernelBackend:
                             sf_g3 = g_k1
                             sf_g4 = g_k2
                             sf_g5 = g_k2
-                        elif cutlass.const_expr(self.w4a16_mode):
+                        elif cutlass.const_expr(self.w4a16_packed_scales):
                             sf_g0 = self._ld_e4m3_packed_scale_col(
                                 w1s_base_addr,
                                 ebase_sf_packed_e4m3,
@@ -3935,7 +3966,9 @@ class MoEMicroKernelBackend:
                                 + Int64(512)
                             )
                             if scale_lane_mod == Int32(0):
-                                sf_g0 = self._scale_byte_to_f32(sf_word_g_a & Uint32(0xFF))
+                                sf_g0 = self._scale_byte_to_f32(
+                                    sf_word_g_a & Uint32(0xFF)
+                                )
                                 sf_g1 = self._scale_byte_to_f32(
                                     (sf_word_g_a >> Uint32(8)) & Uint32(0xFF)
                                 )
@@ -3945,7 +3978,9 @@ class MoEMicroKernelBackend:
                                 sf_g3 = self._scale_byte_to_f32(
                                     (sf_word_g_a >> Uint32(24)) & Uint32(0xFF)
                                 )
-                                sf_g4 = self._scale_byte_to_f32(sf_word_g_b & Uint32(0xFF))
+                                sf_g4 = self._scale_byte_to_f32(
+                                    sf_word_g_b & Uint32(0xFF)
+                                )
                                 sf_g5 = self._scale_byte_to_f32(
                                     (sf_word_g_b >> Uint32(8)) & Uint32(0xFF)
                                 )
@@ -3956,7 +3991,9 @@ class MoEMicroKernelBackend:
                                 sf_g1 = self._scale_byte_to_f32(
                                     (sf_word_g_a >> Uint32(24)) & Uint32(0xFF)
                                 )
-                                sf_g2 = self._scale_byte_to_f32(sf_word_g_b & Uint32(0xFF))
+                                sf_g2 = self._scale_byte_to_f32(
+                                    sf_word_g_b & Uint32(0xFF)
+                                )
                                 sf_g3 = self._scale_byte_to_f32(
                                     (sf_word_g_b >> Uint32(8)) & Uint32(0xFF)
                                 )
@@ -4068,7 +4105,9 @@ class MoEMicroKernelBackend:
                         )
 
                         if cutlass.const_expr(self.is_gated):
-                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
+                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(
+                                up_byte_addr
+                            )
                             uw_b0, uw_b1, uw_b2, uw_b3 = ld_global_nc_v4_u32(
                                 up_byte_addr + Int64(16)
                             )
@@ -4148,7 +4187,7 @@ class MoEMicroKernelBackend:
                                 sf_u9 = u_k4
                                 sf_u10 = u_k5
                                 sf_u11 = u_k5
-                            elif cutlass.const_expr(self.w4a16_mode):
+                            elif cutlass.const_expr(self.w4a16_packed_scales):
                                 k16_u = lane * Int32(cfg.k_segments)
                                 sf_u0 = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
@@ -4246,8 +4285,10 @@ class MoEMicroKernelBackend:
                                 sf_u4, sf_u5, sf_u6, sf_u7 = self._scale_word_to_f32x4(
                                     ld_global_nc_u32(bsf_addr_u_b)
                                 )
-                                sf_u8, sf_u9, sf_u10, sf_u11 = self._scale_word_to_f32x4(
-                                    ld_global_nc_u32(bsf_addr_u_c)
+                                sf_u8, sf_u9, sf_u10, sf_u11 = (
+                                    self._scale_word_to_f32x4(
+                                        ld_global_nc_u32(bsf_addr_u_c)
+                                    )
                                 )
 
                         gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr)
@@ -4330,7 +4371,7 @@ class MoEMicroKernelBackend:
                             sf_g9 = g_k4
                             sf_g10 = g_k5
                             sf_g11 = g_k5
-                        elif cutlass.const_expr(self.w4a16_mode):
+                        elif cutlass.const_expr(self.w4a16_packed_scales):
                             k16_g = lane * Int32(cfg.k_segments)
                             sf_g0 = self._ld_e4m3_packed_scale_col(
                                 w1s_base_addr,
@@ -4515,10 +4556,20 @@ class MoEMicroKernelBackend:
                                 uw_e2, uw_e3, gw_e2, gw_e3, smem_xh, xh_base_t + xh_off9
                             )
                             dot_u10, dot_g10 = self._block_dot_hfma2_pair_for_math(
-                                uw_f0, uw_f1, gw_f0, gw_f1, smem_xh, xh_base_t + xh_off10
+                                uw_f0,
+                                uw_f1,
+                                gw_f0,
+                                gw_f1,
+                                smem_xh,
+                                xh_base_t + xh_off10,
                             )
                             dot_u11, dot_g11 = self._block_dot_hfma2_pair_for_math(
-                                uw_f2, uw_f3, gw_f2, gw_f3, smem_xh, xh_base_t + xh_off11
+                                uw_f2,
+                                uw_f3,
+                                gw_f2,
+                                gw_f3,
+                                smem_xh,
+                                xh_base_t + xh_off11,
                             )
                             partial_up = (
                                 sf_u0 * dot_u0
@@ -4548,9 +4599,13 @@ class MoEMicroKernelBackend:
                                 + sf_g10 * dot_g10
                                 + sf_g11 * dot_g11
                             )
-                    elif cutlass.const_expr(cfg.k_segments_aligned and cfg.k_segments == 2):
+                    elif cutlass.const_expr(
+                        cfg.k_segments_aligned and cfg.k_segments == 2
+                    ):
                         if cutlass.const_expr(self.is_gated):
-                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(up_byte_addr)
+                            uw_a0, uw_a1, uw_a2, uw_a3 = ld_global_nc_v4_u32(
+                                up_byte_addr
+                            )
                         gw_a0, gw_a1, gw_a2, gw_a3 = ld_global_nc_v4_u32(gate_byte_addr)
 
                         col_blk_off_2 = Int64(lane // Int32(2)) * Int64(512)
@@ -4568,7 +4623,7 @@ class MoEMicroKernelBackend:
                                     Int32(cfg.k_dim // 32),
                                 )
                                 sf_u1 = sf_u0
-                            elif cutlass.const_expr(self.w4a16_mode):
+                            elif cutlass.const_expr(self.w4a16_packed_scales):
                                 k16_u = lane * Int32(2)
                                 sf_u0 = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
@@ -4586,7 +4641,10 @@ class MoEMicroKernelBackend:
                                 )
                             else:
                                 sf_word_u = ld_global_nc_u32(
-                                    w1s_base_addr + ebase_sf + bsf_base_u + col_blk_off_2
+                                    w1s_base_addr
+                                    + ebase_sf
+                                    + bsf_base_u
+                                    + col_blk_off_2
                                 )
                                 sf_u0 = self._scale_byte_to_f32(
                                     (sf_word_u >> sf_shift0) & Uint32(0xFF)
@@ -4604,7 +4662,7 @@ class MoEMicroKernelBackend:
                                 Int32(cfg.k_dim // 32),
                             )
                             sf_g1 = sf_g0
-                        elif cutlass.const_expr(self.w4a16_mode):
+                        elif cutlass.const_expr(self.w4a16_packed_scales):
                             k16_g = lane * Int32(2)
                             sf_g0 = self._ld_e4m3_packed_scale_col(
                                 w1s_base_addr,
@@ -4633,8 +4691,12 @@ class MoEMicroKernelBackend:
 
                         seg_blk0 = lane * Int32(2)
                         seg_blk1 = seg_blk0 + Int32(1)
-                        xh_base0 = xh_buf_base + seg_blk0 * Int32(8) + seg_blk0 // Int32(8)
-                        xh_base1 = xh_buf_base + seg_blk1 * Int32(8) + seg_blk1 // Int32(8)
+                        xh_base0 = (
+                            xh_buf_base + seg_blk0 * Int32(8) + seg_blk0 // Int32(8)
+                        )
+                        xh_base1 = (
+                            xh_buf_base + seg_blk1 * Int32(8) + seg_blk1 // Int32(8)
+                        )
 
                         if cutlass.const_expr(not self.is_gated):
                             dot_g0 = self._block_dot_hfma2_for_math(
@@ -4674,9 +4736,9 @@ class MoEMicroKernelBackend:
                         if lane >= Int32(16):
                             if lane < Int32(24):
                                 tail_seg_count = Int32(5)
-                                lane_seg_base_tail = Int32(96) + (lane - Int32(16)) * Int32(
-                                    5
-                                )
+                                lane_seg_base_tail = Int32(96) + (
+                                    lane - Int32(16)
+                                ) * Int32(5)
                             else:
                                 tail_seg_count = Int32(4)
                                 lane_seg_base_tail = Int32(136) + (
@@ -4690,25 +4752,32 @@ class MoEMicroKernelBackend:
                         )
                         xh_off0 = Int32(0)
                         xh_off1 = Int32(8) + (
-                            (lane_seg_base_tail + Int32(1)) // Int32(8) - lane_pad_base_tail
+                            (lane_seg_base_tail + Int32(1)) // Int32(8)
+                            - lane_pad_base_tail
                         )
                         xh_off2 = Int32(16) + (
-                            (lane_seg_base_tail + Int32(2)) // Int32(8) - lane_pad_base_tail
+                            (lane_seg_base_tail + Int32(2)) // Int32(8)
+                            - lane_pad_base_tail
                         )
                         xh_off3 = Int32(24) + (
-                            (lane_seg_base_tail + Int32(3)) // Int32(8) - lane_pad_base_tail
+                            (lane_seg_base_tail + Int32(3)) // Int32(8)
+                            - lane_pad_base_tail
                         )
                         xh_off4 = Int32(32) + (
-                            (lane_seg_base_tail + Int32(4)) // Int32(8) - lane_pad_base_tail
+                            (lane_seg_base_tail + Int32(4)) // Int32(8)
+                            - lane_pad_base_tail
                         )
                         xh_off5 = Int32(40) + (
-                            (lane_seg_base_tail + Int32(5)) // Int32(8) - lane_pad_base_tail
+                            (lane_seg_base_tail + Int32(5)) // Int32(8)
+                            - lane_pad_base_tail
                         )
 
                         gate_row_addr_u6 = (
                             w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half)
                         )
-                        lane_byte_base = Int64(lane_seg_base_tail) * Int64(_BLOCK_SIZE // 2)
+                        lane_byte_base = Int64(lane_seg_base_tail) * Int64(
+                            _BLOCK_SIZE // 2
+                        )
                         gw_a0 = Uint32(0)
                         gw_a1 = Uint32(0)
                         gw_a2 = Uint32(0)
@@ -4762,7 +4831,9 @@ class MoEMicroKernelBackend:
                                 gate_row_addr_u6 + lane_byte_base + Int64(32)
                             )
 
-                        scale_pair_off = Int64(lane_seg_base_tail // Int32(4)) * Int64(512)
+                        scale_pair_off = Int64(lane_seg_base_tail // Int32(4)) * Int64(
+                            512
+                        )
                         scale_lane_mod = lane_seg_base_tail % Int32(4)
                         sf_g0 = Float32(0.0)
                         sf_g1 = Float32(0.0)
@@ -4770,7 +4841,7 @@ class MoEMicroKernelBackend:
                         sf_g3 = Float32(0.0)
                         sf_g4 = Float32(0.0)
                         sf_g5 = Float32(0.0)
-                        if cutlass.const_expr(self.w4a16_mode):
+                        if cutlass.const_expr(self.w4a16_packed_scales):
                             sf_g0 = (
                                 self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
@@ -5002,7 +5073,7 @@ class MoEMicroKernelBackend:
                                         Int32(e8m0_w1_n_cols),
                                         Int32(cfg.k_dim // 32),
                                     )
-                                elif cutlass.const_expr(self.w4a16_mode):
+                                elif cutlass.const_expr(self.w4a16_packed_scales):
                                     sf_g = self._ld_e4m3_packed_scale_col(
                                         w1s_base_addr,
                                         ebase_sf_packed_e4m3,
@@ -5012,7 +5083,10 @@ class MoEMicroKernelBackend:
                                     )
                                 else:
                                     sf_word_g = ld_global_nc_u32(
-                                        w1s_base_addr + ebase_sf + bsf_base_g + sf_group_off
+                                        w1s_base_addr
+                                        + ebase_sf
+                                        + bsf_base_g
+                                        + sf_group_off
                                     )
                                     sf_g = self._scale_byte_to_f32(
                                         (sf_word_g >> sf_shift) & Uint32(0xFF)
@@ -5032,7 +5106,7 @@ class MoEMicroKernelBackend:
                                             Int32(e8m0_w1_n_cols),
                                             Int32(cfg.k_dim // 32),
                                         )
-                                    elif cutlass.const_expr(self.w4a16_mode):
+                                    elif cutlass.const_expr(self.w4a16_packed_scales):
                                         sf_u = self._ld_e4m3_packed_scale_col(
                                             w1s_base_addr,
                                             ebase_sf_packed_e4m3,
@@ -5068,7 +5142,9 @@ class MoEMicroKernelBackend:
                                     )
                         else:
                             gate_row_addr = (
-                                w1_base_addr + ebase_w + Int64(row_g) * Int64(cfg.k_half)
+                                w1_base_addr
+                                + ebase_w
+                                + Int64(row_g) * Int64(cfg.k_half)
                             )
                             if cutlass.const_expr(self.is_gated):
                                 up_row_addr = (
@@ -5083,7 +5159,9 @@ class MoEMicroKernelBackend:
                                     if scale_col < Int32(cfg.k_blocks)
                                     else Int32(0)
                                 )
-                                seg_byte_off = Int64(scale_col) * Int64(_BLOCK_SIZE // 2)
+                                seg_byte_off = Int64(scale_col) * Int64(
+                                    _BLOCK_SIZE // 2
+                                )
                                 sf_group_off = Int64(scale_col // Int32(4)) * Int64(512)
                                 sf_shift = Uint32((scale_col % Int32(4)) * Int32(8))
                                 xh_base = (
@@ -5091,7 +5169,9 @@ class MoEMicroKernelBackend:
                                     + scale_col * Int32(_BLOCK_SIZE // 2)
                                     + scale_col // Int32(8)
                                 )
-                                xh_base = xh_base if valid_seg > Int32(0) else xh_buf_base
+                                xh_base = (
+                                    xh_base if valid_seg > Int32(0) else xh_buf_base
+                                )
 
                                 gw0 = (
                                     ld_global_nc_u32(gate_row_addr + seg_byte_off)
@@ -5118,7 +5198,7 @@ class MoEMicroKernelBackend:
                                         if valid_seg > Int32(0)
                                         else Float32(0.0)
                                     )
-                                elif cutlass.const_expr(self.w4a16_mode):
+                                elif cutlass.const_expr(self.w4a16_packed_scales):
                                     sf_g = (
                                         self._ld_e4m3_packed_scale_col(
                                             w1s_base_addr,
@@ -5175,7 +5255,7 @@ class MoEMicroKernelBackend:
                                             if valid_seg > Int32(0)
                                             else Float32(0.0)
                                         )
-                                    elif cutlass.const_expr(self.w4a16_mode):
+                                    elif cutlass.const_expr(self.w4a16_packed_scales):
                                         sf_u = (
                                             self._ld_e4m3_packed_scale_col(
                                                 w1s_base_addr,
@@ -5226,28 +5306,31 @@ class MoEMicroKernelBackend:
                     if cutlass.const_expr(self.is_gated):
                         up_red = cute.arch.warp_reduction_sum(partial_up) * alpha_fc1
                     if lane == Int32(0):
-                        if cutlass.const_expr(self.is_gated):
-                            if cutlass.const_expr(self.has_swiglu_limit):
-                                limit = Float32(self.swiglu_limit)
-                                neg_limit = Float32(-self.swiglu_limit)
-                                if gate_red > limit:
-                                    gate_red = limit
-                                if up_red > limit:
-                                    up_red = limit
-                                if up_red < neg_limit:
-                                    up_red = neg_limit
-                            sigmoid_arg = gate_red
-                            up_term = up_red
-                            if cutlass.const_expr(self.is_swigluoai):
-                                sigmoid_arg = Float32(self.swiglu_alpha) * gate_red
-                                up_term = up_red + Float32(self.swiglu_beta)
-                            sigmoid = Float32(1.0) / (
-                                Float32(1.0) + cute.math.exp(-sigmoid_arg, fastmath=False)
-                            )
-                            activated = sigmoid * gate_red * up_term
-                        else:
-                            relu_val = fmax_f32(gate_red, Float32(0.0))
-                            activated = relu_val * relu_val
+                        activated = Float32(0.0)
+                        if route_active > Int32(0):
+                            if cutlass.const_expr(self.is_gated):
+                                if cutlass.const_expr(self.has_swiglu_limit):
+                                    limit = Float32(self.swiglu_limit)
+                                    neg_limit = Float32(-self.swiglu_limit)
+                                    if gate_red > limit:
+                                        gate_red = limit
+                                    if up_red > limit:
+                                        up_red = limit
+                                    if up_red < neg_limit:
+                                        up_red = neg_limit
+                                sigmoid_arg = gate_red
+                                up_term = up_red
+                                if cutlass.const_expr(self.is_swigluoai):
+                                    sigmoid_arg = Float32(self.swiglu_alpha) * gate_red
+                                    up_term = up_red + Float32(self.swiglu_beta)
+                                sigmoid = Float32(1.0) / (
+                                    Float32(1.0)
+                                    + cute.math.exp(-sigmoid_arg, fastmath=False)
+                                )
+                                activated = sigmoid * gate_red * up_term
+                            else:
+                                relu_val = fmax_f32(gate_red, Float32(0.0))
+                                activated = relu_val * relu_val
                         smem_int[i_local] = Float32(BFloat16(activated))
 
                 # Look-ahead: quantize next task into other buffer (k_segments==2 only)
@@ -5266,11 +5349,15 @@ class MoEMicroKernelBackend:
                         next_eid_addr = t_next * Int32(cfg.num_topk) + (
                             next_route - t_next * Int32(cfg.num_topk)
                         )
-                        gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
+                        next_route_eid = Int64(topk_ids[next_eid_addr])
+                        next_eid, _ = self._resolve_route_expert(next_route_eid)
+                        gs_fc1_next = input_gs[next_eid]
                         next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                         in_blk = tidx
                         while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
-                            x_base = t_next * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
+                            x_base = t_next * Int32(cfg.k_dim) + in_blk * Int32(
+                                _BLOCK_SIZE
+                            )
                             pad_off = in_blk // Int32(8)
                             phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
                             if cutlass.const_expr(self.w4a16_mode):
@@ -5295,7 +5382,9 @@ class MoEMicroKernelBackend:
                                 for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
                                     v0 = Float32(a_input[x_base + Int32(i * 2)])
                                     v1 = Float32(a_input[x_base + Int32(i * 2 + 1)])
-                                    f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
+                                    f0, f1 = quant_dequant_e4m3_2(
+                                        v0, v1, inv32, scale32
+                                    )
                                     smem_xh[next_buf_base + phys_base + Int32(i)] = (
                                         pack_f32x2_to_f16x2(f0, f1)
                                     )
@@ -5313,7 +5402,9 @@ class MoEMicroKernelBackend:
                                 q_scale = nvfp4_scale_from_amax(blk_peak, gs_fc1_next)
                                 if q_scale > Float32(_FP8_E4M3_MAX):
                                     q_scale = Float32(_FP8_E4M3_MAX)
-                                sf_val = self._scale_byte_to_f32(cvt_f32_to_e4m3(q_scale))
+                                sf_val = self._scale_byte_to_f32(
+                                    cvt_f32_to_e4m3(q_scale)
+                                )
                                 eff_scale = Float32(0.0)
                                 if gs_fc1_next != Float32(0.0):
                                     eff_scale = sf_val / gs_fc1_next
@@ -5369,9 +5460,9 @@ class MoEMicroKernelBackend:
                         # Per-32 UE8M0 + E4M3 quantize-dequant of the FC2 input
                         # (self-ranging: no global scale, no dynamic rescale).
                         blk_peak = Float32(0.0)
-                        pair_delta = (Int32(1) - Int32(2) * (mid_blk & Int32(1))) * Int32(
-                            _BLOCK_SIZE
-                        )
+                        pair_delta = (
+                            Int32(1) - Int32(2) * (mid_blk & Int32(1))
+                        ) * Int32(_BLOCK_SIZE)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE):
                             v = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i)]
                             w = smem_int[
@@ -5382,7 +5473,9 @@ class MoEMicroKernelBackend:
                         scale32, inv32 = mx_scale_from_amax32(blk_peak)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
                             v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
-                            v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
+                            v1 = smem_int[
+                                mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)
+                            ]
                             f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
                             # The combined nvfp4 FC2 alpha is 1/(gs_fc2 * gs_w2);
                             # a8_mx quantizes without the global scale, so fold it
@@ -5408,7 +5501,9 @@ class MoEMicroKernelBackend:
                     if cutlass.const_expr(self.w4a16_mode):
                         for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
                             v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
-                            v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
+                            v1 = smem_int[
+                                mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)
+                            ]
                             half_base = chunk_idx * Int32(
                                 cfg.i_chunk // 2
                             ) + mid_blk * Int32(_BLOCK_SIZE // 2)
@@ -5423,7 +5518,9 @@ class MoEMicroKernelBackend:
                                 + (h_i // Int32(4))
                             )
                             intermediate[packed_idx] = pack_f32x2_to_f16x2(v0, v1)
-                    if cutlass.const_expr((not self.w4a16_mode) and (not self.a8_mx_mode)):
+                    if cutlass.const_expr(
+                        (not self.w4a16_mode) and (not self.a8_mx_mode)
+                    ):
                         blk_peak = Float32(0.0)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE):
                             v = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i)]
@@ -5443,7 +5540,9 @@ class MoEMicroKernelBackend:
                             eff_scale = Float32(1e-30)
                         for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
                             v0 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2)]
-                            v1 = smem_int[mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)]
+                            v1 = smem_int[
+                                mid_blk * Int32(_BLOCK_SIZE) + Int32(i * 2 + 1)
+                            ]
                             f0, f1 = quant_dequant_2(v0, v1, sf_val, eff_scale)
                             f0 = f0 * fc2_rescale
                             f1 = f1 * fc2_rescale
@@ -5500,6 +5599,7 @@ class MoEMicroKernelBackend:
             intermediate,
             topk_ids,
             topk_weights,
+            route_expert_limit,
             scatter_output,
             trellis_lut,
         )
@@ -5556,18 +5656,14 @@ class MoEMicroKernelBackend:
             while kk < Int32(cfg.num_topk):
                 eid_addr = t * Int32(cfg.num_topk) + kk
                 eid = Int32(topk_ids[eid_addr])
-                scale_lane = Float32(w2_alphas[eid]) * Float32(
-                    topk_weights[eid_addr]
-                )
+                scale_lane = Float32(w2_alphas[eid]) * Float32(topk_weights[eid_addr])
                 base_e = Int64(eid) * Int64(tr_eu2) + Int64(tile) * Int64(tr_tu)
                 x_base = t * Int32(cfg.inter_u32) + kk * Int32(cfg.n // 2)
                 p_lo = Float32(0.0)
                 p_hi = Float32(0.0)
                 w16 = warp_id
                 while w16 < Int32(tr_k16i):
-                    x01 = Uint32(
-                        intermediate[x_base + w16 * Int32(8) + tr_r]
-                    )
+                    x01 = Uint32(intermediate[x_base + w16 * Int32(8) + tr_r])
                     x89 = Uint32(
                         intermediate[x_base + w16 * Int32(8) + tr_r + Int32(4)]
                     )
@@ -5580,9 +5676,7 @@ class MoEMicroKernelBackend:
                     )
                     merged = (Int64(wa) << Int64(32)) | Int64(wb)
                     win_a = Uint32(merged >> Int64(tr_s2))
-                    win_b = Uint32(
-                        merged >> Int64(tr_s2 + Int32(4 * tr_bits))
-                    )
+                    win_b = Uint32(merged >> Int64(tr_s2 + Int32(4 * tr_bits)))
                     d_lo, d_hi = packed_decode_sqg_xor_cheb_t12_to_e4m3x8(
                         win_a, win_b, tr_lut_addr, tr_bits, t12_in_shared=True
                     )
@@ -5600,9 +5694,7 @@ class MoEMicroKernelBackend:
             acc_lo += Float32(cute.arch.shuffle_sync_bfly(acc_lo, offset=2))
             acc_hi += Float32(cute.arch.shuffle_sync_bfly(acc_hi, offset=1))
             acc_hi += Float32(cute.arch.shuffle_sync_bfly(acc_hi, offset=2))
-            tr_n0 = (
-                Int32(2) * (lane >> Int32(3)) + ((lane >> Int32(2)) & Int32(1))
-            )
+            tr_n0 = Int32(2) * (lane >> Int32(3)) + ((lane >> Int32(2)) & Int32(1))
             if (lane & Int32(3)) == Int32(0):
                 red[warp_id * Int32(16) + tr_n0] = acc_lo
                 red[warp_id * Int32(16) + tr_n0 + Int32(8)] = acc_hi
@@ -5611,9 +5703,9 @@ class MoEMicroKernelBackend:
                 total = Float32(0.0)
                 for _w in cutlass.range_constexpr(_NUM_WARPS):
                     total += Float32(red[Int32(_w * 16) + lane])
-                scatter_output[
-                    t * Int32(cfg.k_dim) + tile * Int32(16) + lane
-                ] = BFloat16(total)
+                scatter_output[t * Int32(cfg.k_dim) + tile * Int32(16) + lane] = (
+                    BFloat16(total)
+                )
             cute.arch.sync_threads()
             fc2_task += Int32(gdim_x)
 
@@ -5631,6 +5723,7 @@ class MoEMicroKernelBackend:
         intermediate: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
         trellis_lut: cute.Tensor,
     ):
@@ -5674,6 +5767,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     else:
@@ -5687,6 +5781,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
             else:
@@ -5703,6 +5798,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     else:
@@ -5716,6 +5812,7 @@ class MoEMicroKernelBackend:
                             w2_alphas,
                             topk_ids,
                             topk_weights,
+                            route_expert_limit,
                             scatter_output,
                         )
                     fc2_task += Int32(gdim_x)
@@ -5740,6 +5837,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 elif cutlass.const_expr(cfg.fc2_n_chunks > 1):
@@ -5753,6 +5851,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 else:
@@ -5766,6 +5865,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 fc2_task += Int32(gdim_x)
@@ -5788,6 +5888,7 @@ class MoEMicroKernelBackend:
         out_ptr: cute.Pointer,
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
+        route_expert_limit: Int32,
         m_val: Int32,
         grid_x: Int32,
         stream,
@@ -5804,7 +5905,7 @@ class MoEMicroKernelBackend:
                 w1s_ptr,
                 cute.make_layout(Int64(cfg.weight_E * (cfg.k_dim // 32) * cfg.two_n)),
             )
-        elif cutlass.const_expr(self.w4a16_mode):
+        elif cutlass.const_expr(self.w4a16_packed_scales):
             w1_scales = cute.make_tensor(
                 w1s_ptr,
                 cute.make_layout(Int64(cfg.weight_E * (cfg.k_dim // 16) * cfg.two_n)),
@@ -5830,7 +5931,7 @@ class MoEMicroKernelBackend:
                 w2s_ptr,
                 cute.make_layout(Int64(cfg.weight_E * (cfg.n // 32) * cfg.k_dim)),
             )
-        elif cutlass.const_expr(self.w4a16_mode):
+        elif cutlass.const_expr(self.w4a16_packed_scales):
             w2_scales = cute.make_tensor(
                 w2s_ptr,
                 cute.make_layout(Int64(cfg.weight_E * (cfg.n // 16) * cfg.k_dim)),
@@ -5868,9 +5969,7 @@ class MoEMicroKernelBackend:
             barrier_count,
             barrier_epoch,
             (
-                cute.make_tensor(
-                    trellis_lut_ptr, cute.make_layout(Int32(4096))
-                )
+                cute.make_tensor(trellis_lut_ptr, cute.make_layout(Int32(4096)))
                 if cutlass.const_expr(trellis_lut_ptr is not None)
                 else barrier_count
             ),
@@ -5878,16 +5977,13 @@ class MoEMicroKernelBackend:
                 cute.make_tensor(
                     trellis_rot_ptr,
                     cute.make_layout(
-                        Int32(
-                            cfg.weight_E
-                            * (6 if self.trellis_coupled else 3)
-                            * cfg.n
-                        )
+                        Int32(cfg.weight_E * (6 if self.trellis_coupled else 3) * cfg.n)
                     ),
                 )
                 if cutlass.const_expr(trellis_rot_ptr is not None)
                 else barrier_count
             ),
+            route_expert_limit,
             m_val,
         ).launch(
             grid=(grid_x, Int32(1), Int32(1)),
@@ -5950,6 +6046,7 @@ class MoEMicroKernelBackend:
             ptr(cutlass.BFloat16, out),
             barrier_count,
             barrier_epoch,
+            Int32(w1_alphas.numel()),
             Int32(m),
             Int32(grid_x),
             stream,

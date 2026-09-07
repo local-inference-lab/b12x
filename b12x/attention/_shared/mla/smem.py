@@ -58,7 +58,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 
-from .traits import ScaleFormat, UnifiedMLATraits
+from .traits import ModelType, ScaleFormat, UnifiedMLATraits
 
 
 # SM120 dynamic-smem opt-in carveout cap: (100-1)*1024 (see cutlass
@@ -213,7 +213,12 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_rope_off = off
     # DSV4's 64-bf16 rows otherwise repeat every 128 bytes and alias banks
     # across heads during the native H8/H16 scalar Q-RoPE loads.
-    q_rope_stride = d_rope + (8 if traits.has_extra_cache else 0)
+    # CUTLASS typed shared storage cannot expose a zero-length MemRange. The
+    # GLM_NEXT recipe has d_rope==0, so reserve one unused padded row while all
+    # RoPE math and IO remain const-expr-elided by d_rope.
+    q_rope_stride = (
+        d_rope + (8 if traits.has_extra_cache else 0) if d_rope else 8
+    )
     q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
@@ -258,8 +263,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
 
     # --- Double-buffered KV rope (bf16) linear entry*D_ROPE + d. ---
     kv_rope_off = off
-    kv_rope_stride = d_rope
-    kv_rope_buf_bytes = bi * d_rope * 2
+    kv_rope_stride = d_rope if d_rope else 1
+    kv_rope_buf_bytes = bi * kv_rope_stride * 2
     off = kv_rope_off + kv_rope_buf_bytes * bufs
 
     # --- P6 mbarrier pair placeholder (16B aligned; reserved, unused in P5). ---
@@ -285,7 +290,14 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     w_fp8_off = off
     w_fp8_stride = bi + _W_FP8_PAD
     w_fp8_buf_bytes = hpb * w_fp8_stride
-    w_fp8_bufs = _W_FP8_BUF_COUNT
+    # GLM_NEXT has no RoPE stage and sits well under the carveout, so it can
+    # afford separate HIGH and LOW W buffers per V-group parity: the two-pass
+    # PV then stages both passes behind one barrier per V group.
+    w_fp8_bufs = (
+        2 * _W_FP8_BUF_COUNT
+        if traits.model_type == ModelType.GLM_NEXT
+        else _W_FP8_BUF_COUNT
+    )
     off = w_fp8_off + w_fp8_buf_bytes * w_fp8_bufs
 
     # --- staged raw-token-index validity buffer (incl -1 sentinel), int32. ---
@@ -549,11 +561,17 @@ def _run_module_asserts() -> None:
     glm = _assert_model(ModelType.GLM_NSA, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.ARBITRARY_FP32)
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
+    glm_next = _assert_model(
+        ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
     assert 80 * 1024 <= dsv4 <= 96 * 1024, f"DSV4 smem {dsv4}B outside ~92KB band"
     assert 88 * 1024 <= glm <= SM120_SMEM_CARVEOUT_BYTES, (
         f"GLM smem {glm}B outside ~96KB band"
+    )
+    assert 80 * 1024 <= glm_next <= SM120_SMEM_CARVEOUT_BYTES, (
+        f"GLM_NEXT smem {glm_next}B outside the expected band"
     )
 
 

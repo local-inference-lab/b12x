@@ -482,6 +482,41 @@ def test_w4a8_mx_tp6_prefill_scratch_uses_repacked_n128_extent(
     )
 
 
+def test_nvfp4_mid_atom_gate_boundary_caps_dynamic_tile_m(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (32, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        256,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (64, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        80 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="relu2",
+    ) == (128, 128)
+    assert tp_moe_impl._select_dynamic_tile_mn(
+        96 * 512,
+        192,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+    ) == (128, 128)
+
+
 def test_w4a16_scratch_plan_uses_route_pack_capacity_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1040,6 +1075,56 @@ def test_tp_moe_fp4_binding_rehydrates_micro_workspace_view(
     assert isinstance(calls["workspace"], tp_moe_impl.TPMicroWorkspace)
     assert calls["workspace"].active_expert_count is binding.active_expert_count
     assert calls["workspace"].micro_intermediate is binding.micro_intermediate
+
+
+@pytest.mark.parametrize("layout", ["vector", "scalar", "strided", "float64"])
+def test_dynamic_scale_binding_maps_views_and_refresh_observes_live_values(
+    monkeypatch: pytest.MonkeyPatch, layout: str,
+) -> None:
+    plan = plan_tp_moe_scratch(_caps(max_tokens=400, route_num_experts=0))
+    scratch = _scratch_for_plan(plan)
+    tensors = _runtime_tensors(m=400)
+    for name in ("a1_gscale", "a2_gscale"):
+        if layout == "scalar":
+            tensors[name] = torch.ones(1)
+        elif layout == "strided":
+            tensors[name] = torch.ones(16)[::2]
+        elif layout == "float64":
+            tensors[name] = tensors[name].double()
+    experts = _experts(tensors, plan.caps.weight_plan)
+    output = torch.empty_like(tensors["a"])
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("binding must not copy scale data")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "copy_", reject_copy)
+        binding = plan.bind(
+            scratch=scratch, **_binding_args(tensors, experts), output=output,
+        )
+    workspace = SimpleNamespace(
+        input_gs=binding.input_gs, down_input_scale=binding.down_input_scale,
+        weight_E=8, input_gs_src_ptr=0, down_input_scale_src_ptr=0,
+    )
+    assert (binding.input_gs.data_ptr() == experts.a1_gscale.data_ptr()) == (
+        layout == "vector"
+    )
+    for factor in (2, 3):
+        experts.a1_gscale.mul_(factor)
+        experts.a2_gscale.mul_(factor + 1)
+        with monkeypatch.context() as guard:
+            if layout == "vector":
+                guard.setattr(torch.Tensor, "copy_", reject_copy)
+            tp_moe_impl._refresh_dynamic_workspace_scales(
+                workspace, experts.a1_gscale, experts.a2_gscale,
+                input_scales_static=False,
+            )
+        torch.testing.assert_close(
+            binding.input_gs, experts.a1_gscale.expand(8).float(),
+        )
+        torch.testing.assert_close(
+            binding.down_input_scale, experts.a2_gscale.expand(8).float(),
+        )
 
 
 def test_tp_moe_fp4_binding_rehydrates_dynamic_workspace_view(

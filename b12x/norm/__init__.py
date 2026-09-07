@@ -1,5 +1,6 @@
 """Norm/residual ops for b12x.
 
+- ``hyperconnection``: learned low-rank multi-stream residual mixing.
 - ``mhc``: fused RMSNorm + hyper-connection residual mixing + projection
   (DeepSeek-style mHC), pre/post/post-pre phases.
 """
@@ -9,7 +10,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("mhc",)
+_OP_MODULES = ("hyperconnection", "mhc")
 
 
 def __getattr__(name: str) -> Any:

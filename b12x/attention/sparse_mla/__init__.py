@@ -1,26 +1,33 @@
-"""Sparse MLA decode/extend for SM12x (DeepSeek-V3.2 DSV4, GLM NSA).
+"""Sparse MLA decode/extend for SM12x (DeepSeek-V3.2 DSV4, GLM NSA/Next).
 
 Multi-head latent attention over top-k-selected KV tokens from a paged
-cache (DSV4: head_dim 576 = 512 nope + 64 rope, v_head_dim 512), FP8-e4m3
+cache (DSV4: head_dim 512 = 448 nope + 64 rope, v_head_dim 512), FP8-e4m3
 or BF16 compute, split-KV decode with on-device merge; a single-pass decode
 path is selected automatically on SM121. Selection indices typically come
 from ``attention.dsa_indexer``.
 
-Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
-``run_decode`` / ``run_extend`` (capture safe).
+Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run``
+(capture safe). The plan's ``mode`` selects decode or extend; execution does not
+accept a second route selector.
 
 Example:
     from b12x.attention import sparse_mla
 
     plan    = sparse_mla.plan(sparse_mla.Caps(device="cuda", num_q_heads=16,
-                                              max_q_rows=64, max_width=2048))
+                                              max_q_rows=64, max_width=2048,
+                                              softmax_scale=512**-0.5))
     spec    = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = sparse_mla.bind(plan, scratch=scratch, q=q,
-                              selected_indices=topk_idx,
-                              cache_seqlens_int32=lens,
-                              nsa_cache_seqlens_int32=active)
-    out = sparse_mla.run_decode(binding=binding, kv_cache=kv, sm_scale=scale)
+    binding = sparse_mla.bind(plan, scratch=scratch, q=q, kv_cache=kv,
+                              selected_indices=topk_idx, cache_lengths=lens,
+                              selected_lengths=active)
+    out = sparse_mla.run(binding)
+
+GLM Next uses an explicit recipe identity because its absorbed 512-wide query
+collides with DSV4 by shape. Plan with ``model_type=ModelType.GLM_NEXT`` and
+use a 528-byte cache record: 512 E4M3 latent bytes followed by four FP32
+group-128 scales, with no RoPE suffix. Its physical attention scale remains
+``256**-0.5``.
 """
 
 from __future__ import annotations
@@ -35,20 +42,28 @@ META = OpMeta(
     api_style="planned",
     entry_points=(
         "Caps",
+        "ModelType",
         "Plan",
+        "SparseMlaConfig",
+        "SparseMlaQuery",
         "Binding",
         "Scratch",
         "DecodeMetadata",
         "ExtendMetadata",
         "plan",
         "bind",
-        "run_decode",
-        "run_extend",
+        "run",
+        "compile_glm_next_mla_cache_writer",
+        "concat_and_cache_glm_next_mla",
+        "concat_and_cache_glm_next_mla_fp8",
+        "concat_and_cache_glm_next_mla_nvfp4",
+        "concat_and_cache_nvfp4_mla_fp8_rope",
+        "expand_pooled_topk_to_physical_slots",
         "is_supported",
         "clear_caches",
     ),
     dtypes=("bf16", "fp8_e4m3"),
-    recipes=("dsv4", "glm_nsa"),
+    recipes=("dsv4", "glm_nsa", "glm_next"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -68,14 +83,22 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Caps,
         DecodeMetadata,
         ExtendMetadata,
+        ModelType,
         Plan,
         Scratch,
+        SparseMlaConfig,
+        SparseMlaQuery,
         bind,
         clear_caches,
+        compile_glm_next_mla_cache_writer,
+        concat_and_cache_glm_next_mla,
+        concat_and_cache_glm_next_mla_fp8,
+        concat_and_cache_glm_next_mla_nvfp4,
+        concat_and_cache_nvfp4_mla_fp8_rope,
+        expand_pooled_topk_to_physical_slots,
         is_supported,
         plan,
-        run_decode,
-        run_extend,
+        run,
     )
 
 install_lazy_api(globals(), META)

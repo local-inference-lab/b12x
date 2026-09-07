@@ -530,5 +530,17 @@ def _run_module_asserts() -> None:
         )
         get_prefill_mg_shared_storage_cls(glm, mg_n_hg=nhg)
 
+    glm_next = make_unified_traits(
+        ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )
+    for nhg in (1, 2):
+        gl = make_smem_layout_mg(glm_next, mg_n_hg=nhg)
+        assert gl.kv_smem_stride == 528
+        assert gl.kv_sc_buf_bytes == 0
+        assert gl.kv_rope_buf_bytes == 0
+        assert gl.q_rope_stride == 8  # Dummy aliased storage; no RoPE math runs.
+        assert gl.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+        get_prefill_mg_shared_storage_cls(glm_next, mg_n_hg=nhg)
+
 
 _run_module_asserts()

@@ -1,8 +1,9 @@
 """b12x — consumer-Blackwell (SM120/SM121) kernels.
 
-CuTe-DSL kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention (paged,
-dense/sparse/compressed MLA, DSA indexing), quantization, mHC residual, and PCIe
-collectives, ported from the b12x project.  One grammar everywhere:
+CuTe-DSL and Triton kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention
+(paged, dense/sparse/compressed MLA, DSA indexing, and QSA decode),
+quantization, multi-stream residual mixing, recurrent/sequence features, and
+PCIe collectives. One grammar everywhere:
 
 - ops live at ``b12x.<group>.<op>`` and declare themselves via ``META``;
 - planned ops share the lifecycle ``Caps -> plan() -> bind() ->
@@ -44,9 +45,12 @@ _OPS: tuple[str, ...] = (
     "attention.sparse_mla",
     "attention.compressed_sparse_mla",
     "attention.dsa_indexer",
+    "attention.qsa",
     "attention.varlen",
     "comm.pcie",
+    "comm.roce",
     "gemm.bf16_gemv",
+    "gemm.bf16_vocab_projection",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
     "gemm.bmm",
@@ -57,9 +61,16 @@ _OPS: tuple[str, ...] = (
     "gemm.wo_projection",
     "moe.fused_moe",
     "moe.ep_moe",
+    "norm.hyperconnection",
     "norm.mhc",
     "quantization.mxfp8",
     "quantization.nvfp4",
+    "sequence.ple_hash",
+    "sequence.ple_embedding",
+    "sequence.ple",
+    "sequence.gdn_decode",
+    "sequence.kda_prefill",
+    "sequence.mtp_feedback",
 )
 
 # A group-level function cannot share its name with an imported child module.
@@ -72,7 +83,15 @@ _CACHE_CLEAR_OVERRIDES: dict[str, str] = {
     "gemm.bmm": "clear_bmm_caches",
 }
 
-_GROUPS = ("attention", "comm", "gemm", "moe", "norm", "quantization")
+_GROUPS = (
+    "attention",
+    "comm",
+    "gemm",
+    "moe",
+    "norm",
+    "quantization",
+    "sequence",
+)
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
     # public name -> (module, attribute)
     "ScratchBufferSpec": ("._lib.scratch", "ScratchBufferSpec"),
