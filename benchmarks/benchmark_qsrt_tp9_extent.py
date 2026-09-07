@@ -187,6 +187,15 @@ def main():
         help="TP9 rank whose extent is loaded (default: first rank with 256 channels)",
     )
     parser.add_argument(
+        "--widths",
+        default="384,256",
+        help=(
+            "comma-separated runtime intermediate widths to build; a width "
+            "must contain the rank's extent (384-channel extents accept 384 "
+            "only, 256-channel extents accept 384 zero-padded and 256 compact)"
+        ),
+    )
+    parser.add_argument(
         "--routing",
         default="uniform",
         help=(
@@ -258,7 +267,8 @@ def main():
             raise ValueError("--routing must be 'uniform' or 'zipf:<s>'")
         zipf_exponent = float(value)
     runtimes = {}
-    for width in (384, 256):
+    widths = tuple(int(value) for value in args.widths.split(","))
+    for width in widths:
         before = torch.cuda.memory_allocated()
         weight_plan = fused_moe.plan_weights(
             quant_modes="w4a16",
