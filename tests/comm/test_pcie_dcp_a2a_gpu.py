@@ -208,8 +208,9 @@ def _check_pair_graph(
         for _ in range(layers)
     ]
     # The eager paired checks already prepared the graph (device-slot) variant
-    # of the launcher; `capture` prepares the new logical channel collectively.
-    pool.prepare_graph_all_gather_pair(stream=stream, channel_id="eager:dcp")
+    # of the launcher (channels are stream-affine, so no prepare call on an
+    # existing channel here); `capture` prepares the new logical channel
+    # collectively on this stream.
     graph = torch.cuda.CUDAGraph()
     with pool.capture(stream, channel_id="graph:pair") as graph_channel, torch.cuda.graph(
         graph, stream=stream
