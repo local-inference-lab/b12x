@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import torch
 
-HEAD_DIM = 256
-SELECTION_WIDTH = 2051
+from ..paged._selected_forward_config import (
+    HEAD_DIM,
+    MAX_SPLITS as NUM_SPLITS,
+    SELECTION_WIDTH,
+)
+
 BLOCK_N = 16
-NUM_SPLITS = 64
+MAX_SPLIT_ROWS = 64
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
@@ -44,7 +48,7 @@ def is_qwen_geometry(
         and int(kv_heads) > 0
         and int(q_heads) % int(kv_heads) == 0
         and int(head_dim) == HEAD_DIM
-        and int(selection_width) == SELECTION_WIDTH
+        and int(selection_width) >= SELECTION_WIDTH
         and int(block_n) == BLOCK_N
         and splits > 0
         and splits <= NUM_SPLITS
@@ -142,6 +146,7 @@ def is_candidate(
 __all__ = [
     "BLOCK_N",
     "HEAD_DIM",
+    "MAX_SPLIT_ROWS",
     "NUM_SPLITS",
     "SELECTION_WIDTH",
     "is_candidate",

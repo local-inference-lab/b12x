@@ -149,6 +149,7 @@ _W4A8_CONVERT_SCRATCH_MB_DEFAULT = 64
 # these views keep the historical local names.
 _FP4_SOURCE_FORMATS = {name: name for name in _EXECUTION_SOURCE_FORMATS}
 _TRELLIS_SOURCE_FORMATS = frozenset(_EXECUTION_TRELLIS_SOURCE_FORMATS)
+_PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE = 48
 _W4A16_SCALE_FORMATS = {
     "e4m3_k16": "e4m3_k16",
     "e4m3_k32": "e4m3_k32",
@@ -1429,8 +1430,6 @@ def _w4a16_weight_layout_for_source(
     source_format = _normalize_fp4_source_format(source_format)
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
-    if source_format == "modelopt_nvfp4":
-        return "modelopt"
     if (
         source_format == "fp4_e8m0_k32"
         and intermediate_size is not None
@@ -1945,7 +1944,7 @@ def _dynamic_external_route_plan_supported(
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
         and dynamic_route_mode == "grouped"
         and not deterministic_output
-        and _dynamic_work_source() == _DYNAMIC_WORK_SOURCE_DEFAULT
+        and _dynamic_work_source() in {_DYNAMIC_WORK_SOURCE_DEFAULT, "persistent_grid"}
     )
 
 
@@ -2379,6 +2378,11 @@ def _w4a8_mx_micro_preferred(
 
 
 def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
+    if (
+        query.quant_mode == "w4a8_nvfp4"
+        and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
+    ):
+        return False
     if query.quant_mode == "w4a8_mx":
         return _w4a8_mx_micro_supported(
             num_tokens=query.num_tokens,
@@ -2432,9 +2436,11 @@ def _heuristic_dynamic_route_mode(
 
 
 def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
-    weight_layout = _w4a16_weight_layout_for_source(
-        query.source_format,
-        intermediate_size=query.intermediate_size,
+    weight_layout = (
+        "modelopt" if query.quant_mode == "nvfp4_auto"
+        else _w4a16_weight_layout_for_source(
+            query.source_format, intermediate_size=query.intermediate_size,
+        )
     )
     if weight_layout == "trellis_t256":
         return False
@@ -2516,6 +2522,18 @@ def _heuristic_moe_decode_config(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> MoeDecodeConfig:
+    if query.quant_mode == "nvfp4_auto":
+        if (
+            device is not None
+            and device.compute_capability in ((12, 0), (12, 1))
+            and 1 <= query.num_tokens <= 8
+            and _w4a16_direct_routing_supported(query)
+        ):
+            return MoeDecodeConfig(
+                backend="w4a16", route_planner="internal",
+                max_active_clusters=None, w4a16_route_mode="direct",
+            )
+        return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
         return MoeDecodeConfig(
             backend="w4a16",
@@ -2681,6 +2699,15 @@ def _refresh_dynamic_workspace_scales(
 ) -> None:
     a1_src_ptr = a1_gscale.data_ptr()
     a2_src_ptr = a2_gscale.data_ptr()
+    # Canonical per-expert vectors can be consumed directly. Their owner stays
+    # alive through the binding, and live value updates need no staging copy.
+    if (
+        workspace.input_gs.data_ptr() == a1_src_ptr
+        and workspace.down_input_scale.data_ptr() == a2_src_ptr
+    ):
+        workspace.input_gs_src_ptr = a1_src_ptr
+        workspace.down_input_scale_src_ptr = a2_src_ptr
+        return
     if (
         force
         or not input_scales_static
@@ -2989,8 +3016,23 @@ def _build_tp_moe_fp4_binding_from_views(
     if plan.implementation == "dynamic":
         if plan.dynamic_physical_tiles is None or plan.dynamic_task_capacity is None:
             raise RuntimeError("dynamic TP MoE binding plan is missing capacities")
-        tensors["input_gs"].copy_(experts.a1_gscale.expand(plan.weight_E))
-        tensors["down_input_scale"].copy_(experts.a2_gscale.expand(plan.weight_E))
+        direct_scales = all(
+            scale.dtype == torch.float32
+            and scale.device == a.device
+            and scale.numel() == plan.weight_E
+            and scale.is_contiguous()
+            for scale in (experts.a1_gscale, experts.a2_gscale)
+        )
+        # Bind maps views only. Scalar/strided scales are expanded into the
+        # caller's scratch by the run-time refresh before their consumer.
+        input_gs = (
+            experts.a1_gscale.view(plan.weight_E)
+            if direct_scales else tensors["input_gs"]
+        )
+        down_input_scale = (
+            experts.a2_gscale.view(plan.weight_E)
+            if direct_scales else tensors["down_input_scale"]
+        )
         view_kwargs = _packed_input_binding_views(
             packed_input=tensors["packed_input"],
             packed_input_scale=tensors["packed_input_scale"],
@@ -3016,8 +3058,8 @@ def _build_tp_moe_fp4_binding_from_views(
             materialized_intermediate=tensors["materialized_intermediate"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
-            input_gs=tensors["input_gs"],
-            down_input_scale=tensors["down_input_scale"],
+            input_gs=input_gs,
+            down_input_scale=down_input_scale,
             pair_head=tensors["pair_head"],
             producers_done_count=tensors["producers_done_count"],
             all_work_published=tensors["all_work_published"],
@@ -3175,6 +3217,13 @@ def _plan_core_workspace(
                 int(w4a16_block_size_m)
                 if w4a16_block_size_m is not None
                 else select_route_block_size_m(token_capacity, topk, route_E)
+            )
+            # Projection-mixed MCG always includes a K5 tier. Its fixed
+            # 128x128 tile exceeds the SM120/SM121 opt-in shared-memory limit
+            # at a 64-row route block, while the 48-row specialization fits.
+            block_size_m = min(
+                block_size_m,
+                _PROJECTION_MIXED_TRELLIS_MAX_ROUTE_BLOCK_SIZE,
             )
             route_slots_capacity = max_packed_route_slots(
                 routed_capacity,
@@ -9454,6 +9503,7 @@ def _get_micro_kernel(
         dummy(cutlass.BFloat16),  # out_ptr
         barrier_fake,  # barrier_count
         barrier_fake,  # barrier_epoch
+        Int32(weight_E),  # route_expert_limit
         Int32(compile_m),  # m_val
         Int32(1),  # grid_x
         current_cuda_stream(),  # stream
