@@ -34,7 +34,9 @@ from .pcie_oneshot import (
     DEFAULT_MAX_SIZE,
     DEFAULT_RANK_DATA_BYTES,
     SUPPORTED_WORLD_SIZES as ONESHOT_WORLD_SIZES,
+    TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES,
     PCIeOneshotAllReducePool,
+    _tp2_plain_remote_push_enabled,
 )
 
 
@@ -59,17 +61,18 @@ def _algorithm_override() -> str:
 
 
 def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -> int:
-    """Largest all-reduce this runtime expects to win at, for this world size.
+    """Return the capacity recommendation while preserving larger caller limits.
 
-    Callers that force the equal-quarter implementation advertise its complete
-    qualified capacity. Automatic consumers retain their existing limit
-    because a CUDA-graph caller without explicit output storage cannot use the
-    equal-quarter implementation for large messages and may otherwise replace
-    a faster fallback collective with hierarchical all-reduce.
+    Enabled TP2 graph peer-push needs at least 512 KiB. Callers must still use
+    shape and execution-mode routing before selecting it over NCCL. Forced
+    island reduce-scatter advertises its full supported capacity; other modes
+    retain the caller's default.
     """
 
     if world_size in ISLAND_RS_WORLD_SIZES and _algorithm_override() == "island_rs":
         return max(default, ISLAND_RS_MAX_BYTES)
+    if world_size == 2 and _tp2_plain_remote_push_enabled():
+        return max(default, TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES)
     return default
 
 

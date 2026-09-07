@@ -29,7 +29,9 @@ def _cache_dir() -> Path:
     override = os.getenv("B12X_ROCE_CACHE_DIR")
     if override:
         return Path(override)
-    root = os.getenv("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    root = os.getenv("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
     return Path(root) / "b12x" / "roce"
 
 
@@ -118,11 +120,11 @@ def load() -> ctypes.CDLL:
         lib.roce_error.argtypes = [p]
         lib.roce_stat.restype = u64
         lib.roce_stat.argtypes = [p, ctypes.c_int]
-        lib.roce_peer_hca.restype = ctypes.c_int
-        lib.roce_peer_hca.argtypes = [p, ctypes.c_int]
+        lib.roce_hca_stat.restype = u64
+        lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 2:
+        if lib.roce_abi_version() != 3:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
@@ -191,7 +193,9 @@ class Proxy:
             len(err),
         )
         if not self._ctx:
-            raise RuntimeError(f"RoCE proxy setup failed: {err.value.decode(errors='replace')}")
+            raise RuntimeError(
+                f"RoCE proxy setup failed: {err.value.decode(errors='replace')}"
+            )
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.hca_names = tuple(hca_names)
@@ -232,17 +236,21 @@ class Proxy:
         raw = self._lib.roce_error(self._ctx)
         return raw.decode(errors="replace") if raw else ""
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | list[int]]:
         """Counters: ops posted, RDMA writes completed, last posted sequence."""
         return {
             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),
+            "writes_completed_per_hca": [
+                int(self._lib.roce_hca_stat(self._ctx, hca, 0))
+                for hca in range(len(self.hca_names))
+            ],
+            "bytes_posted_per_hca": [
+                int(self._lib.roce_hca_stat(self._ctx, hca, 1))
+                for hca in range(len(self.hca_names))
+            ],
         }
-
-    def peer_hca(self, peer: int) -> int:
-        """Index of the HCA that carries traffic to ``peer``."""
-        return int(self._lib.roce_peer_hca(self._ctx, int(peer)))
 
     def close(self) -> None:
         """Stop the thread and release the RDMA resources."""
