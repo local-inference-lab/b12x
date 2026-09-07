@@ -380,18 +380,25 @@ def main():
                 samples.sort()
                 timings[width] = samples[len(samples) // 2]
             del graph
-        reference = outputs[384]
-        difference = outputs[256] - reference
+        # The widest built width is the reference; the compact width (when
+        # built) is compared against it. A single-width run (a 384-channel
+        # extent) records its own finiteness and norm only.
+        reference_width = max(outputs)
+        reference = outputs[reference_width]
+        compact_width = min(outputs)
+        compact = outputs[compact_width]
+        difference = compact - reference
         record = {
             "m": m,
             "routing": routing_source,
-            "finite": bool(torch.isfinite(outputs[256]).all().item()),
+            "widths": sorted(outputs),
+            "finite": bool(torch.isfinite(compact).all().item()),
             "reference_norm": float(reference.norm().item()),
             "max_abs_error": float(difference.abs().max().item()),
             "relative_l2": float((difference.norm() / reference.norm()).item()),
             "cosine": float(
                 torch.nn.functional.cosine_similarity(
-                    outputs[256].flatten(), reference.flatten(), dim=0
+                    compact.flatten(), reference.flatten(), dim=0
                 ).item()
             ),
             "graph_eager_exact": True,
