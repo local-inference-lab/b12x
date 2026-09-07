@@ -248,3 +248,33 @@ def test_mm_uses_quantizer_without_scale_padding_initialization(monkeypatch) -> 
     torch.testing.assert_close(
         actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
     )
+
+
+def test_fused_quant_a_shape_list_routes_past_the_n_cap(monkeypatch) -> None:
+    """A listed KxN shape takes the fused path above the N cap; others do not."""
+    from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
+
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    monkeypatch.setenv(
+        "B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", " 1536x7168, 7168X4608 ,"
+    )
+    use = mxfp8_kernel._use_fused_quant_a
+    assert use(4, torch.bfloat16, 1536, 1536, 7168)
+    assert use(8, torch.bfloat16, 7168, 7168, 4608)
+    assert use(4, torch.bfloat16, 7168, 7168, 2112)
+    assert not use(4, torch.bfloat16, 1408, 1408, 7168)
+    assert not use(9, torch.bfloat16, 1536, 1536, 7168)
+    assert not use(4, torch.float16, 1536, 1536, 7168)
+    assert not use(4, torch.bfloat16, 1536, 1664, 7168)
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", "1536x7168x2")
+    with pytest.raises(ValueError, match="KxN"):
+        use(4, torch.bfloat16, 1536, 1536, 7168)
+
+
+def test_fused_quant_a_shape_list_defaults_to_empty(monkeypatch) -> None:
+    from b12x.gemm.mxfp8_linear import _kernel as mxfp8_kernel
+
+    monkeypatch.delenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", raising=False)
+    monkeypatch.setenv("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096")
+    assert mxfp8_kernel._fused_quant_a_shapes() == frozenset()
+    assert not mxfp8_kernel._use_fused_quant_a(4, torch.bfloat16, 1536, 1536, 7168)

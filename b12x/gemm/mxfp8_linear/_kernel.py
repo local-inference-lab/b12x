@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 
@@ -107,6 +108,40 @@ def _fused_quant_a_max_n() -> int:
     return int(os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N", "4096"))
 
 
+@functools.lru_cache(maxsize=8)
+def _parse_fused_quant_a_shapes(raw: str) -> frozenset[tuple[int, int]]:
+    shapes: set[tuple[int, int]] = set()
+    for entry in raw.split(","):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        k_text, sep, n_text = entry.partition("x")
+        if not sep or not k_text.strip().isdigit() or not n_text.strip().isdigit():
+            raise ValueError(
+                "B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES entries must be KxN "
+                f"(input features x output features), got {entry!r}"
+            )
+        shapes.add((int(k_text), int(n_text)))
+    return frozenset(shapes)
+
+
+def _fused_quant_a_shapes() -> frozenset[tuple[int, int]]:
+    """Shapes routed through the in-CTA activation quantization past the N cap.
+
+    B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES lists ``KxN`` entries (input
+    features x output features, comma-separated; empty by default). A listed
+    shape takes the fused path whenever the small-M, unpadded-K and 64-wide-N
+    conditions hold, regardless of B12X_MXFP8_LINEAR_FUSED_QUANT_A_MAX_N. The
+    N cap is a rule of thumb for the split-K trade-off; for a narrow K the
+    fused GEMM streams little weight per CTA and can beat the separate
+    quantizer plus split-K GEMM at an N above the cap, so the serving
+    configuration lists the shapes that measured faster.
+    """
+    return _parse_fused_quant_a_shapes(
+        os.environ.get("B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES", "")
+    )
+
+
 def _use_fused_quant_a(
     tokens: int,
     dtype: torch.dtype,
@@ -121,15 +156,20 @@ def _use_fused_quant_a(
     path only drops the two scale-buffer fills and the quantization kernel.
     K padding is left to the separate path (the padded source would need its
     own copy), and so is any N that is not a whole number of 64-wide output
-    tiles: the fused kernel has no N tail handling.
+    tiles: the fused kernel has no N tail handling. Above the N cap the shape
+    must be listed in B12X_MXFP8_LINEAR_FUSED_QUANT_A_SHAPES.
     """
-    return (
+    if not (
         tokens <= _FUSED_QUANT_A_MAX_TOKENS
         and dtype == torch.bfloat16
         and int(in_features) == int(padded_in_features)
         and int(out_features) % 64 == 0
-        and 0 < int(out_features) <= _fused_quant_a_max_n()
-    )
+        and int(out_features) > 0
+    ):
+        return False
+    if int(out_features) <= _fused_quant_a_max_n():
+        return True
+    return (int(in_features), int(out_features)) in _fused_quant_a_shapes()
 
 
 def is_mxfp8_linear_supported() -> tuple[bool, str | None]:
