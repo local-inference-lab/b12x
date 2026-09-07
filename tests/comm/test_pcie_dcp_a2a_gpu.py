@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import socket
+import sys
 import time
 
 import pytest
@@ -979,9 +980,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _stage(rank, "eager")
         _check_eager(pool, rank, world_size, device)
         dist.barrier()
-        _stage(rank, "pair_eager")
-        _check_pair_eager(pool, rank, world_size, device)
-        dist.barrier()
         _stage(rank, "eager_adjacency")
         _check_eager_adjacency(pool, rank, world_size, device)
         dist.barrier()
@@ -993,13 +991,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _stage(rank, "graph")
         _check_graph(pool, rank, world_size, device)
         dist.barrier()
-        _stage(rank, "pair_graph")
-        _check_pair_graph(pool, rank, world_size, device)
-        dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)
         _stage(rank, "queued_mixed_grid_graph")
         _check_queued_mixed_grid_graph(pool, rank, world_size, device)
+        dist.barrier()
+        # The paired projection gather runs after the head/LSE checks so a
+        # failure in either family is attributable to it alone.
+        _stage(rank, "pair_eager")
+        _check_pair_eager(pool, rank, world_size, device)
+        dist.barrier()
+        _stage(rank, "pair_graph")
+        _check_pair_graph(pool, rank, world_size, device)
         _stage(rank, "complete")
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
@@ -1007,6 +1010,21 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         if os.getenv("B12X_PCIE_DCP_TEST_TEARDOWN_RETRY", "0") == "1":
             _check_teardown_retry(pool, rank, device)
             closed = True
+    except BaseException as exc:  # noqa: BLE001
+        # A rank that raises must fail loudly and at once: its teardown
+        # collectives would otherwise pair with the other ranks' next
+        # collectives and every rank hangs until the NCCL timeout, hiding
+        # the exception. Print the traceback and end the process.
+        import traceback
+
+        print(
+            json.dumps({"stage": "exception", "rank": rank, "error": repr(exc)[:400]}),
+            flush=True,
+        )
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(3)
     finally:
         if not closed:
             pool.close()
