@@ -648,15 +648,25 @@ def _check_graph(
         for value in (11.0, 12.0):
             odd_input.fill_(value)
             channel.all_gather_heads(odd_input, odd_output)
+    # Under the push transport the sampled word is written by a peer, and a
+    # peer's next launch pushes into the other slot before its barrier, so
+    # every rank must have finished a launch before any rank samples or
+    # launches again; the rank barrier after each sample closes that window.
+    stream.synchronize()
+    dist.barrier()
     snapshots = [_local_staging_words(channel, stream)]
+    dist.barrier()
     for value in (1.0, 2.0):
         with torch.cuda.stream(stream):
             odd_input.fill_(value)
             odd_graph.replay()
+        stream.synchronize()
+        dist.barrier()
         snapshots.append(_local_staging_words(channel, stream))
         torch.testing.assert_close(
             odd_output, torch.full_like(odd_output, value), rtol=0, atol=0
         )
+        dist.barrier()
 
     changed_slots = [
         {
