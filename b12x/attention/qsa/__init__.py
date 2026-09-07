@@ -97,6 +97,7 @@ META = OpMeta(
     entry_points=(
         "CacheRequirements",
         "Caps",
+        "DraftSelectionState",
         "Plan",
         "Binding",
         "QsaConfig",
@@ -136,6 +137,7 @@ if TYPE_CHECKING:
         Binding,
         CacheRequirements,
         Caps,
+        DraftSelectionState,
         Plan,
         QsaConfig,
         QsaQuery,
