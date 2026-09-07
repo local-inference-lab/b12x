@@ -157,6 +157,7 @@ def _check_pair_eager(
         expected_first, expected_second = _expected_pair(step, world_size, batch, device)
         assert torch.equal(out_first, expected_first), f"pair first rows batch {batch}"
         assert torch.equal(out_second, expected_second), f"pair second rows batch {batch}"
+        _stage(rank, f"pair_eager_batch{batch}_ok")
     # Caller-owned outputs clipped to a logical width (the last rank's tail
     # packs dropped): 8 bf16 columns and 4 fp32 columns fewer than the full
     # gathered rows, both 16-byte multiples.
@@ -171,6 +172,7 @@ def _check_pair_eager(
         expected_first, expected_second = _expected_pair(step, world_size, batch, device)
         assert torch.equal(out_first, expected_first[:, :first_width]), f"clipped first rows batch {batch}"
         assert torch.equal(out_second, expected_second[:, :second_width]), f"clipped second rows batch {batch}"
+        _stage(rank, f"pair_eager_clipped_batch{batch}_ok")
 
 
 def _check_pair_graph(
@@ -212,6 +214,7 @@ def _check_pair_graph(
     # existing channel here); `capture` prepares the new logical channel
     # collectively on this stream.
     graph = torch.cuda.CUDAGraph()
+    _stage(rank, "pair_graph_capture")
     with pool.capture(stream, channel_id="graph:pair") as graph_channel, torch.cuda.graph(
         graph, stream=stream
     ):
@@ -220,6 +223,7 @@ def _check_pair_graph(
                 firsts[layer], seconds[layer], out_firsts[layer], out_seconds[layer]
             )
     stream.synchronize()
+    _stage(rank, "pair_graph_captured")
     for replay in range(4):
         for layer in range(layers):
             step = 4000 + 10 * replay + layer
@@ -242,6 +246,7 @@ def _check_pair_graph(
             assert torch.equal(out_seconds[layer], expected_second), (
                 f"pair graph second rows replay {replay} layer {layer}"
             )
+        _stage(rank, f"pair_graph_replay{replay}_ok")
     del graph
     torch.cuda.synchronize(device)
 
