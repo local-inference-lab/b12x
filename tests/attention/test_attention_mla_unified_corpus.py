@@ -18,7 +18,7 @@ from b12x.attention._shared.mla.reference import (
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
 )
-from b12x.attention._shared.mla.traits import ScaleFormat
+from b12x.attention._shared.mla.traits import ComputeMode, ScaleFormat
 from b12x._lib.intrinsics import pack_grouped_fp4_values
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
@@ -713,8 +713,10 @@ class _MGPrefillServingCase:
 _MG_PREFILL_SERVING_CASES = (
     _MGPrefillServingCase("dsv4", "fp8", 16, 512, 1),
     _MGPrefillServingCase("dsv4", "fp8", 32, 512, 2),
-    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 512, 1),
-    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 512, 2),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 16, 128, 1),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 32, 128, 2),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 16, 512, 1),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 32, 512, 2),
     _MGPrefillServingCase("dsv4-dual", "fp8", 16, 1024, 1),
     _MGPrefillServingCase("dsv4-dual", "fp8", 32, 1024, 2),
     _MGPrefillServingCase("dsv4-dual", "fp8", 16, 2048, 1),
@@ -799,14 +801,13 @@ def _assert_prefill_boundary_heads(
     ids=lambda case: case.test_id,
 )
 def test_unified_prefill_mg_specialization_live_graph_oracle(
-    case: _MGPrefillServingCase,
+    case: _MGPrefillServingCase, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Validate each typed-SMEM MG group-count/compute arm under live replay.
 
-    These fourteen nodes compile the single-cache and dual-cache production
-    specializations: DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each
-    with ``mg_n_hg`` 1 and 2. DSV4 BF16 uses two 64-candidate tiles; every
-    512-wide main section uses eight.
+    Cases cover single-cache and dual-cache DSV4 FP8 and BF16-QK, GLM FP8,
+    and GLM NVFP4/BF16 with one and two head groups. DSV4 dual-cache windows
+    of 128 and 512 use BF16-QK; widths 1024 and 2048 use FP8-QK.
     """
     device = require_b12x()
     rows = 2
@@ -910,10 +911,19 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             _install_nvfp4_glm_scenario(inputs_nvfp4, scenario)
 
     assert case.heads == case.n_hg * 16
-    expected_compute = (
-        "bf16" if case.topk == 128 or case.family == "glm-nvfp4" else "fp8"
-    )
-    assert case.compute == expected_compute
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+
+    original_run_mg = prefill_mg.run_unified_prefill_mg
+    launched_modes = []
+    expected_compute = ComputeMode.BF16 if case.compute == "bf16" else ComputeMode.FP8
+
+    def checked_run_mg(**kwargs):
+        assert kwargs["compute_mode"] == expected_compute
+        assert kwargs["traits_override"].compute_mode == expected_compute
+        launched_modes.append(kwargs["compute_mode"])
+        return original_run_mg(**kwargs)
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", checked_run_mg)
     assert not torch.equal(q_scenarios[0], q_scenarios[1])
     assert not torch.equal(index_scenarios[0], index_scenarios[1])
     assert not torch.equal(length_scenarios[0], length_scenarios[1])
@@ -994,6 +1004,7 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
 
     install(0)
     warm_output, warm_lse = launch()
+    assert launched_modes == [expected_compute]
     torch.cuda.synchronize(device)
     assert warm_output.data_ptr() == output.data_ptr()
     assert warm_lse.data_ptr() == lse_base2.data_ptr()

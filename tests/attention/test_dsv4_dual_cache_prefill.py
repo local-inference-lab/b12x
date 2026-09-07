@@ -1,4 +1,4 @@
-"""FP8 dual-cache prefill through the public compressed-MLA serving API."""
+"""BF16/FP8 dual-cache prefill through the public compressed-MLA serving API."""
 
 from __future__ import annotations
 
@@ -48,11 +48,12 @@ def _relocate_pages(cache, scenarios, page_size):
     "high_main,high_extra,extra_page_size,heads",
     [(True, False, 64, 16), (False, True, 2, 32), (True, True, 64, 40)],
 )
-def test_dual_cache_fp8_high_pages_public_graph(
-    high_main: bool, high_extra: bool, extra_page_size: int, heads: int,
+@pytest.mark.parametrize("main_width", [512, 1024])
+def test_dual_cache_high_pages_public_graph(
+    high_main: bool, high_extra: bool, extra_page_size: int, heads: int, main_width: int,
 ) -> None:
     device = require_b12x()
-    rows, main_width, extra_width = 2, 512, 64
+    rows, extra_width = 2, 64
     inputs = _make_inputs(
         rows=rows, heads=heads, main_width=main_width, extra_width=extra_width,
         extra_page_size=extra_page_size, per_token=True, device=device,
@@ -95,7 +96,7 @@ def test_dual_cache_fp8_high_pages_public_graph(
 
     _install_scenario(inputs, 0)
     run()
-    freeze_kernel_resolution("DSV4 FP8 dual-cache high-page prefill")
+    freeze_kernel_resolution("DSV4 dual-cache high-page prefill")
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
