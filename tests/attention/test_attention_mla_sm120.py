@@ -1186,14 +1186,15 @@ def test_unified_prefill_dual_cache_80_heads_split_tail_matches_extra_ref() -> N
 @torch.inference_mode()
 @pytest.mark.parametrize("num_heads", [16, 32])
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("pbs_extra", [2, 64])
 def test_unified_prefill_dual_cache_fp8_matches_extra_ref(
-    num_heads: int, topk: int
+    num_heads: int, topk: int, pbs_extra: int
 ) -> None:
     """FP8 DSV4 dual-cache prefill must use the extra cache for K-RoPE too."""
     device = require_b12x_sparse_mla()
     from b12x.attention._shared.mla.kernel import run_unified_prefill
 
-    extra_topk, pbs_extra = 128, 2
+    extra_topk = 128
     main_blocks = (topk + _DSV4_PAGE - 1) // _DSV4_PAGE
     case = dsv4_extra_ref.make_dsv4_extra_decode_case(
         num_heads=num_heads,
