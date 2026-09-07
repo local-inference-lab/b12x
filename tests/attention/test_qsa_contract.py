@@ -3820,6 +3820,16 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         max_speculative_tokens=3,
         kv_dtype=kv_dtype,
     )
+    if high_page:
+        pool_bytes = (
+            2
+            * caps.num_main_cache_pages
+            * caps.main_page_size
+            * caps.kv_heads
+            * caps.head_dim
+            * caps.kv_dtype.itemsize
+        )
+        _require_free_cuda_bytes(device, pool_bytes + 2**29)
     binding = _allocate_binding(caps)
     state = _draft_selection_state(binding)
     binding = _rebind(binding, draft_selection=state)
