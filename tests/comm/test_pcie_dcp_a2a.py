@@ -2200,3 +2200,46 @@ def test_pair_push_staging_layout_clipped_rows(world_size: int, batch: int) -> N
         assert torch.equal(gathered_first[rank][:, :first_logical], expected_first)
         assert torch.equal(gathered_second[rank][:, :second_logical], expected_second)
 
+
+def test_pair_transport_override_env(monkeypatch) -> None:
+    from b12x.comm.pcie import pcie_dcp_a2a as module
+
+    monkeypatch.delenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", raising=False)
+    assert module.a2a_pair_transport("pull") == "pull"
+    assert module.a2a_pair_transport("push") == "push"
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    runtime = _make_runtime()
+    assert runtime.push_transport and runtime.pair_push_transport
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", " Pull ")
+    assert module.a2a_pair_transport("push") == "pull"
+    assert runtime.push_transport and not runtime.pair_push_transport
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "copy_engine")
+    with pytest.raises(ValueError, match="B12X_PCIE_DCP_A2A_PAIR_TRANSPORT"):
+        module.a2a_pair_transport("push")
+    runtime.close()
+
+
+def test_pair_transport_override_reaches_pair_prepare(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_TRANSPORT", "push")
+    monkeypatch.setenv("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "pull")
+    runtime = _make_runtime()
+    calls = []
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: False,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        kernels, "_get_compiled_all_gather_pair", lambda *args: calls.append(args)
+    )
+    monkeypatch.setattr(
+        kernels, "_get_compiled_all_gather_heads", lambda *args: calls.append(args)
+    )
+    runtime.prepare_graph_all_gather_pair(threads=512)
+    runtime.prepare_graph_all_gather_heads(threads=256)
+    # The pair prepares with pull while the head gather keeps push.
+    assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True)]
+    runtime.close()
+

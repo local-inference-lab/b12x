@@ -91,6 +91,26 @@ def _env_int(name: str, fallback: int) -> int:
 A2A_TRANSPORTS = ("pull", "push")
 
 
+def a2a_pair_transport(default: str) -> str:
+    """Return the paired projection gather's transport.
+
+    ``B12X_PCIE_DCP_A2A_PAIR_TRANSPORT`` (``pull`` or ``push``) overrides the
+    runtime transport for ``all_gather_pair`` and its fused Kimi top-k
+    variant only; unset or empty inherits ``default`` (the runtime's
+    transport). Every rank must select the same value; the channel layout
+    contract checks it collectively.
+    """
+    value = os.environ.get("B12X_PCIE_DCP_A2A_PAIR_TRANSPORT", "").strip().lower()
+    if not value:
+        return default
+    if value not in A2A_TRANSPORTS:
+        raise ValueError(
+            "B12X_PCIE_DCP_A2A_PAIR_TRANSPORT must be one of "
+            f"{A2A_TRANSPORTS} or empty, got {value!r}"
+        )
+    return value
+
+
 def a2a_transport() -> str:
     """Return the staging transport selected by ``B12X_PCIE_DCP_A2A_TRANSPORT``."""
 
@@ -732,6 +752,7 @@ class PCIeDCPA2A:
                 int(query_head_dim),
                 layout,
                 a2a_transport(),
+                a2a_pair_transport(a2a_transport()),
             ),
         )
         slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -835,6 +856,11 @@ class PCIeDCPA2A:
     def push_transport(self) -> bool:
         return self._transport == "push"
 
+    @property
+    def pair_push_transport(self) -> bool:
+        """Transport of the paired projection gather (see ``a2a_pair_transport``)."""
+        return a2a_pair_transport(self._transport) == "push"
+
     def _resolve_launch_config(
         self,
         *,
@@ -921,7 +947,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
-                self.push_transport,
+                self.pair_push_transport,
             )
 
     def prepare_graph_all_gather_pair_kimi_topk(self) -> None:
@@ -945,7 +971,7 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
-                self.push_transport,
+                self.pair_push_transport,
             )
 
     def prepare_graph_kimi_topk16(self, *, threads: int = 256) -> None:
@@ -1391,7 +1417,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
-                self.push_transport,
+                self.pair_push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "
@@ -1449,7 +1475,7 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
-                push=self.push_transport,
+                push=self.pair_push_transport,
                 output_first_row_bytes=_clipped_row_bytes(
                     out_first, int(local_first.shape[1]) * self.world_size
                 ),
@@ -1553,7 +1579,7 @@ class PCIeDCPA2A:
                 512,
                 True,
                 True,
-                self.push_transport,
+                self.pair_push_transport,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP Kimi CUDA graph capture is not allowed; "
@@ -1609,7 +1635,7 @@ class PCIeDCPA2A:
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
                 ),
-                push=self.push_transport,
+                push=self.pair_push_transport,
             )
 
     def kimi_topk16(
