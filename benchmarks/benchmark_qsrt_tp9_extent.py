@@ -217,6 +217,9 @@ def main():
     # The checkpoint reader lives in the vLLM fork; the routing helpers above
     # stay importable without it.
     from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.w4a16.host import (
+        w4a16_topk_sum_rotation_output_torch_dtype,
+    )
     from b12x.moe._shared.qsrt_sharding import plan_qsrt_tp9_rank
     from vllm.model_executor.layers.quantization.kquant_qsrt_atoms_v2 import (
         open_qsrt_atom_v2_extent,
@@ -312,8 +315,13 @@ def main():
         )
         spec = plan.scratch_specs()[0]
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        # The full-rotation route-sum buffer follows the kernel host's store
+        # element (fp32 by default, bf16/fp16 with B12X_W4A16_TOPK_SUM_OUTPUT),
+        # as the serving runtime allocates it.
         output = torch.empty(
-            (args.max_tokens, HIDDEN), dtype=torch.float32, device="cuda"
+            (args.max_tokens, HIDDEN),
+            dtype=w4a16_topk_sum_rotation_output_torch_dtype(),
+            device="cuda",
         )
         runtimes[width] = (weights, plan, scratch, output, weight_bytes)
         print(

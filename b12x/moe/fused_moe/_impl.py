@@ -3115,8 +3115,9 @@ def _build_tp_moe_fp4_binding_from_views(
             or not output.is_contiguous()
         ):
             raise ValueError(
-                "full-rotation Trellis output must be a contiguous FP32 live "
-                "or capacity buffer on the input device"
+                "full-rotation Trellis output must be a contiguous "
+                f"{_rotation_output_dtype()} live or capacity buffer on the "
+                f"input device (B12X_W4A16_TOPK_SUM_OUTPUT), got {output.dtype}"
             )
         output = output[:m]
         # The persistent fused kernel uses this scratch for grid-barrier state.
