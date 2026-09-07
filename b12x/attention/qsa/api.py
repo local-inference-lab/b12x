@@ -6,6 +6,8 @@ from ._contract import (
     Binding,
     CacheRequirements,
     Caps,
+    DraftSelectionPlan,
+    DraftSelectionReuse,
     DraftSelectionState,
     Plan,
     bind,
@@ -20,6 +22,8 @@ from ._policy import QsaConfig, QsaQuery
 __all__ = [
     "CacheRequirements",
     "Caps",
+    "DraftSelectionPlan",
+    "DraftSelectionReuse",
     "DraftSelectionState",
     "Plan",
     "Binding",

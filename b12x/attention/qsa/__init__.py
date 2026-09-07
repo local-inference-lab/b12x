@@ -82,6 +82,50 @@ selected order, followed by the causally visible incomplete-group tail.
 The selected-position reader supports widths of at least 2051. Width is a
 planned specialization; changing live rows preserves the warmed callable
 within each split or direct reader regime.
+
+Draft layers may bind persistent selection anchors for reuse within one MTP
+round. B12X describes the layout; the caller allocates the storage::
+
+    anchor_plan = plan.draft_selection_plan()
+    anchor_storage = {
+        spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in anchor_plan.storage_specs()
+    }
+    anchors = anchor_plan.bind(storage=anchor_storage)
+    anchors.reset()
+    binding = qsa.bind(plan, **buffers, draft_selection=anchors)
+
+``buffers`` includes the caller allocations required by ``plan.scratch_specs``
+and the ordinary cache, output, and selected-position buffers. Temporary
+anchor-gather and causal-tail buffers are included in that scratch contract.
+Binding creates views without allocating or initializing tensor storage.
+Prewarm preserves anchors and allocates only its synthetic warmup inputs.
+
+An ordinary ``qsa.run(binding, **inputs)`` records an independent copy of the
+selection, logical positions, error mask, and valid row count. Subsequent draft
+steps supply a caller-owned int32/int64 vector mapping batch request IDs to
+accepted rows of that recording::
+
+    output = qsa.run(
+        binding, query=query, request_ids=request_ids,
+        query_positions=query_positions,
+        reuse=qsa.DraftSelectionReuse(source_rows=accepted_rows),
+    )
+
+Reuse requires one query per request and omits selector inputs and
+``index_ready``. It preserves anchors and selector caches, appends the causal
+suffix bounded by ``max_speculative_tokens``, and poisons invalid active rows.
+The caller must reset at round boundaries and request recycling, and map each
+request to an anchor from the same request, model layer, and round. Bounds and
+causal positions are checked; request identity and round provenance are not.
+Returned anchor views are for inspection; ``reset`` and ``run`` own mutations.
+
+Capacity variants of a layer's plan may share anchors when device, selection
+width, and cache/request assignment match. Pass ``max_source_rows`` to
+``draft_selection_plan`` to cover the largest recording plan. Each plan reports
+its own scratch requirements. Order resets, recordings, map writes, and reuse
+on the calling stream or join them with caller-owned events; keep all storage
+alive through graph replay and do not overlap operations sharing mutable state.
 """
 
 from __future__ import annotations
@@ -97,6 +141,8 @@ META = OpMeta(
     entry_points=(
         "CacheRequirements",
         "Caps",
+        "DraftSelectionPlan",
+        "DraftSelectionReuse",
         "DraftSelectionState",
         "Plan",
         "Binding",
@@ -137,6 +183,8 @@ if TYPE_CHECKING:
         Binding,
         CacheRequirements,
         Caps,
+        DraftSelectionPlan,
+        DraftSelectionReuse,
         DraftSelectionState,
         Plan,
         QsaConfig,

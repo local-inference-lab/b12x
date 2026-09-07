@@ -27,56 +27,94 @@ def _validate_fake(mutable, inputs) -> None:
     return None
 
 
-@triton.jit(do_not_specialize=["rows"])
+@triton.jit(do_not_specialize=["rows", "enabled"])
 def _record_kernel(
     positions,
     errors,
     saved_positions,
     saved_errors,
     saved_rows,
+    selection,
+    saved_selection,
     rows,
+    enabled,
+    WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    active = row < rows
+    row = tl.program_id(0).to(tl.int64)
+    column = tl.arange(0, BLOCK)
+    active = (row < rows) & (enabled != 0)
     tl.store(saved_positions + row, tl.load(positions + row, active, other=-1), active)
     tl.store(saved_errors + row, tl.load(errors + row, active, other=0), active)
+    offset = row * tl.full((), WIDTH, tl.int64) + column
+    value = tl.load(selection + offset, active & (column < WIDTH), other=-1)
+    tl.store(saved_selection + offset, value, active & (column < WIDTH))
     if tl.program_id(0) == 0:
-        tl.store(saved_rows, rows)
+        tl.store(saved_rows, rows, enabled != 0)
+
+
+@torch.library.custom_op("b12x::qsa_reset_draft_anchors", mutates_args=("storage",))
+def reset_anchors(storage: torch.Tensor, count_offset: int) -> None:
+    from ._contract import _scratch_view
+
+    _scratch_view(
+        storage, offset_bytes=count_offset, shape=(1,), dtype=torch.int32
+    ).zero_()
+
+
+@reset_anchors.register_fake
+def _reset_fake(storage, count_offset) -> None:
+    return None
 
 
 @torch.library.custom_op(
     "b12x::qsa_record_draft_anchors",
-    mutates_args=("saved_positions", "saved_errors", "saved_rows"),
+    mutates_args=("storage",),
 )
 def record_anchors(
     positions: torch.Tensor,
     scratch: torch.Tensor,
     errors_offset: int,
-    saved_positions: torch.Tensor,
-    saved_errors: torch.Tensor,
-    saved_rows: torch.Tensor,
+    selection: torch.Tensor,
+    storage: torch.Tensor,
+    source_capacity: int,
+    width: int,
+    enabled: bool,
 ) -> None:
-    from ._contract import _scratch_view
+    from ._contract import DraftSelectionPlan, _scratch_view
 
+    state = DraftSelectionPlan(storage.device, source_capacity, width).bind(
+        storage=storage
+    )
     rows = int(positions.shape[0])
     errors = _scratch_view(
         scratch, offset_bytes=errors_offset, shape=(rows,), dtype=torch.int32
     )
-    _record_kernel[(triton.cdiv(rows, 128),)](
+    _record_kernel[(rows,)](
         positions,
         errors,
-        saved_positions,
-        saved_errors,
-        saved_rows,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+        selection,
+        state.selected_positions,
         rows,
-        BLOCK=128,
+        int(enabled),
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
     )
 
 
 @record_anchors.register_fake
 def _record_fake(
-    positions, scratch, errors_offset, saved_positions, saved_errors, saved_rows
+    positions,
+    scratch,
+    errors_offset,
+    selection,
+    storage,
+    source_capacity,
+    width,
+    enabled,
 ) -> None:
     return None
 
@@ -135,36 +173,51 @@ def _prepare_kernel(
     tl.store(errors + row, tl.where(active, source_error | tl.where(valid, 0, 1), 0))
 
 
-@torch.library.custom_op(
-    "b12x::qsa_prepare_draft_selection", mutates_args=("selected", "errors")
-)
+@torch.library.custom_op("b12x::qsa_prepare_draft_selection", mutates_args=("scratch",))
 def prepare_selection(
-    source_positions: torch.Tensor,
-    source_errors: torch.Tensor,
-    source_selection: torch.Tensor,
+    storage: torch.Tensor,
+    source_capacity: int,
+    width: int,
     source_rows: torch.Tensor,
-    num_source_rows: torch.Tensor,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
-    selected: torch.Tensor,
-    errors: torch.Tensor,
+    scratch: torch.Tensor,
+    selected_offset: int,
+    errors_offset: int,
+    max_requests: int,
+    tail: int,
 ) -> None:
+    from ._contract import DraftSelectionPlan, _scratch_view
+
+    state = DraftSelectionPlan(storage.device, source_capacity, width).bind(
+        storage=storage
+    )
+    selected = _scratch_view(
+        scratch,
+        offset_bytes=selected_offset,
+        shape=(max_requests, width + tail),
+        dtype=torch.int32,
+    )
+    errors = _scratch_view(
+        scratch,
+        offset_bytes=errors_offset,
+        shape=(max_requests,),
+        dtype=torch.int32,
+    )
     rows = int(query_positions.shape[0])
-    width = int(source_selection.shape[1])
-    tail = int(selected.shape[1]) - width
     _prepare_kernel[(rows,)](
-        source_positions,
-        source_errors,
-        source_selection,
+        state.logical_positions,
+        state.errors,
+        state.selected_positions,
         source_rows,
-        num_source_rows,
+        state.num_source_rows,
         request_ids,
         query_positions,
         selected,
         errors,
         rows,
-        int(source_selection.shape[0]),
-        int(source_rows.shape[0]),
+        source_capacity,
+        max_requests,
         WIDTH=width,
         TAIL=tail,
         BLOCK=triton.next_power_of_2(width + tail),
@@ -174,14 +227,16 @@ def prepare_selection(
 
 @prepare_selection.register_fake
 def _prepare_fake(
-    source_positions,
-    source_errors,
-    source_selection,
+    storage,
+    source_capacity,
+    width,
     source_rows,
-    num_source_rows,
     request_ids,
     query_positions,
-    selected,
-    errors,
+    scratch,
+    selected_offset,
+    errors_offset,
+    max_requests,
+    tail,
 ) -> None:
     return None

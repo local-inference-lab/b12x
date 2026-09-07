@@ -3764,24 +3764,14 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
 
 
 def _draft_selection_state(binding):
-    caps = binding.plan.caps
-    device = caps.device
-    return qsa.DraftSelectionState(
-        selected_positions=binding.selected_positions,
-        logical_positions=torch.full(
-            (caps.max_q_rows,), -1, dtype=torch.int64, device=device
-        ),
-        errors=torch.zeros(caps.max_q_rows, dtype=torch.int32, device=device),
-        source_rows=torch.full((caps.max_batch,), -1, dtype=torch.int64, device=device),
-        num_source_rows=torch.zeros(1, dtype=torch.int32, device=device),
-        work_positions=torch.full(
-            (caps.max_batch, caps.selection_width + caps.max_speculative_tokens),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        ),
-        work_errors=torch.zeros(caps.max_batch, dtype=torch.int32, device=device),
-    )
+    storage_plan = binding.plan.draft_selection_plan()
+    storage = {
+        spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in storage_plan.storage_specs()
+    }
+    state = storage_plan.bind(storage=storage)
+    state.reset()
+    return state
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -3850,12 +3840,26 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         not high_page and kv_dtype == torch.bfloat16 and request_dtype == torch.int64
     )
     if compiled:
-        torch.compile(lambda: qsa.run(binding, **initial), fullgraph=True)()
+
+        def record_round():
+            state.reset()
+            return qsa.run(binding, **initial)
+
+        torch.compile(record_round, fullgraph=True)()
     else:
         qsa.run(binding, **initial)
     assert state.num_source_rows.item() == 16
     torch.testing.assert_close(state.logical_positions, initial["query_positions"])
-    state.source_rows.copy_(torch.tensor([3, 7, 11, 15], device=device))
+    assert torch.equal(state.selected_positions, binding.selected_positions)
+    if compiled:
+        reuse_plan = qsa.plan(replace(caps, max_q_rows=4))
+        binding = _rebind(
+            replace(binding, plan=reuse_plan),
+            selected_positions=binding.selected_positions[:4],
+            output=binding.output[:4],
+            draft_selection=state,
+        )
+    source_rows = torch.tensor([3, 7, 11, 15], dtype=request_dtype, device=device)
     state.errors[7] = 512
     query = initial["query"][:4].clone()
     requests = torch.tensor([2, 0, -1, 1], device=device, dtype=request_dtype)
@@ -3880,8 +3884,8 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         for t in (
             binding.output,
             binding.scratch,
-            state.work_positions,
-            state.work_errors,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
         )
     )
 
@@ -3891,7 +3895,7 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
             query=query[:rows],
             request_ids=requests[:rows],
             query_positions=positions[:rows],
-            reuse_draft_selection=True,
+            reuse=qsa.DraftSelectionReuse(source_rows),
         )
 
     if compiled:
@@ -3919,19 +3923,23 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
                     assert torch.all(result[2] == 0)
                 if rows == 4:
                     assert torch.isnan(result[3]).all()
-                assert state.work_positions[0, caps.selection_width :].tolist() == (
-                    [4, 5, -1] if tail_end == 5 else [4, -1, -1]
-                )
+                assert binding._draft_work_positions[
+                    0, caps.selection_width :
+                ].tolist() == ([4, 5, -1] if tail_end == 5 else [4, -1, -1])
             positions[0] = 7
             graph.replay()
             assert torch.isnan(result[0]).all()
             positions[0] = 4
             # A row outside the last ordinary run must not reuse older state.
-            state.source_rows[2] = 16
+            source_rows[2] = 16
             graph.replay()
             assert torch.isnan(result[0]).all()
-            state.source_rows[2] = 11
+            source_rows[2] = 11
             state.num_source_rows.fill_(11)
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            state.num_source_rows.fill_(16)
+            state.reset()
             graph.replay()
             assert torch.isnan(result[0]).all()
             state.num_source_rows.fill_(16)
@@ -3948,13 +3956,14 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         for t in (
             binding.output,
             binding.scratch,
-            state.work_positions,
-            state.work_errors,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
         )
     )
 
 
-def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch):
+@pytest.mark.parametrize("draft", [False, True])
+def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch, draft):
     """Fresh bindings may not construct synchronization resources inside capture."""
     device = require_sm120()
     binding = _allocate_binding(
@@ -3965,6 +3974,7 @@ def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch):
             index_heads=4,
             index_head_dim=128,
             index_rotary_dim=64,
+            max_speculative_tokens=3 if draft else 0,
         )
     )
     stream = torch.cuda.Stream(device=device)
@@ -3978,7 +3988,10 @@ def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch):
     binding.main_v_cache.fill_(3)
     binding.raw_k_ring.zero_()
     binding.compressed_k_cache.zero_()
-    warmed = _rebind(binding, selection_stream=stream, selection_done=done)
+    state = _draft_selection_state(binding) if draft else None
+    warmed = _rebind(
+        binding, selection_stream=stream, selection_done=done, draft_selection=state
+    )
     qsa.prewarm(warmed)
     before_event = torch.cuda.Event
 
@@ -3989,7 +4002,17 @@ def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch):
     monkeypatch.setattr(before_event, "__new__", forbid_event)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        rebound = _rebind(binding, selection_stream=stream, selection_done=done)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        capture_state = state.plan.bind(storage=state._storage) if state else None
+        rebound = _rebind(
+            binding,
+            selection_stream=stream,
+            selection_done=done,
+            draft_selection=capture_state,
+        )
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        if capture_state is not None:
+            capture_state.reset()
         assert rebound is not warmed
         assert rebound._selection_done is done
         ready.record()
@@ -4039,3 +4062,89 @@ def test_qsa_run_stream_resources_use_plan_device() -> None:
         assert torch.cuda.current_device() == other
     assert torch.all(result == 2)
     assert binding.state_errors[0] == 0
+
+
+def test_qsa_draft_storage_binding_is_caller_owned_and_preserves_contents():
+    device = require_sm120()
+    caps = _caps(
+        device,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+    )
+    binding = _allocate_binding(caps)
+    storage_plan = binding.plan.draft_selection_plan(max_source_rows=8)
+    (spec,) = storage_plan.storage_specs()
+    storage = torch.full(spec.shape, 37, dtype=spec.dtype, device=spec.device)
+    expected = storage.clone()
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state = storage_plan.bind(storage=storage)
+    rebound = _rebind(binding, draft_selection=state)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert torch.equal(storage, expected)
+    assert rebound.draft_selection is state
+    assert state.selected_positions.shape == (8, caps.selection_width)
+    for tensor in (
+        state.selected_positions,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+    ):
+        assert tensor.untyped_storage().data_ptr() == storage.data_ptr()
+    for tensor in (rebound._draft_work_positions, rebound._draft_work_errors):
+        assert tensor.untyped_storage().data_ptr() == binding.scratch.data_ptr()
+    with pytest.raises(ValueError, match="requires"):
+        storage_plan.bind(storage=storage[:1])
+    with pytest.raises(ValueError, match="cover planned query rows"):
+        binding.plan.draft_selection_plan(max_source_rows=1)
+    for aliased_storage in (binding.main_k_cache.view(torch.uint8), binding.scratch):
+        with pytest.raises(ValueError, match="overlap"):
+            _rebind(binding, draft_selection=storage_plan.bind(storage=aliased_storage))
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state.reset()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert state.num_source_rows.item() == 0
+
+
+def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            max_speculative_tokens=3,
+        )
+    )
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    common = {
+        name: dynamic[name] for name in ("query", "request_ids", "query_positions")
+    }
+    with pytest.raises(TypeError, match="DraftSelectionReuse"):
+        qsa.run(binding, **common, reuse=True)
+    with pytest.raises(ValueError, match="shape"):
+        qsa.run(
+            binding,
+            **common,
+            reuse=qsa.DraftSelectionReuse(
+                dynamic["request_ids"][:1],
+            ),
+        )
+    source_rows = torch.zeros(
+        binding.plan.caps.max_batch, dtype=torch.int64, device=device
+    )
+    with pytest.raises(ValueError, match="does not accept selector inputs"):
+        qsa.run(binding, **dynamic, reuse=qsa.DraftSelectionReuse(source_rows))
+    aliased_rows = binding.scratch[: 8 * binding.plan.caps.max_batch].view(torch.int64)
+    with pytest.raises(ValueError, match="overlap"):
+        qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
+    assert state.num_source_rows.item() == 0
