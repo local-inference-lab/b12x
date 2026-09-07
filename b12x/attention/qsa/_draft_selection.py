@@ -7,6 +7,26 @@ import triton
 import triton.language as tl
 
 
+@torch.library.custom_op("b12x::qsa_validate_draft_buffers", mutates_args=("mutable",))
+def validate_buffers(mutable: list[torch.Tensor], inputs: list[torch.Tensor]) -> None:
+    """Check addresses before writes, outside Dynamo's symbolic tracing.
+
+    The mutation annotation orders validation before consumers of these buffers.
+    The check launches no GPU work and does not change buffer contents.
+    """
+    from ._contract import _require_mutation_alias_contract
+
+    _require_mutation_alias_contract(
+        mutable=tuple((f"draft buffer {i}", t) for i, t in enumerate(mutable)),
+        read_only=tuple((f"draft input {i}", t) for i, t in enumerate(inputs)),
+    )
+
+
+@validate_buffers.register_fake
+def _validate_fake(mutable, inputs) -> None:
+    return None
+
+
 @triton.jit(do_not_specialize=["rows"])
 def _record_kernel(
     positions,
@@ -31,12 +51,18 @@ def _record_kernel(
 )
 def record_anchors(
     positions: torch.Tensor,
-    errors: torch.Tensor,
+    scratch: torch.Tensor,
+    errors_offset: int,
     saved_positions: torch.Tensor,
     saved_errors: torch.Tensor,
     saved_rows: torch.Tensor,
 ) -> None:
+    from ._contract import _scratch_view
+
     rows = int(positions.shape[0])
+    errors = _scratch_view(
+        scratch, offset_bytes=errors_offset, shape=(rows,), dtype=torch.int32
+    )
     _record_kernel[(triton.cdiv(rows, 128),)](
         positions,
         errors,
@@ -49,7 +75,9 @@ def record_anchors(
 
 
 @record_anchors.register_fake
-def _record_fake(positions, errors, saved_positions, saved_errors, saved_rows) -> None:
+def _record_fake(
+    positions, scratch, errors_offset, saved_positions, saved_errors, saved_rows
+) -> None:
     return None
 
 

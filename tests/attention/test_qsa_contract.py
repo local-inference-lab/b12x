@@ -3836,7 +3836,13 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
         positions=tuple(i % 4 for i in range(16)),
         request_ids=tuple(i // 4 for i in range(16)),
     )
-    qsa.run(binding, **initial)
+    compiled = (
+        not high_page and kv_dtype == torch.bfloat16 and request_dtype == torch.int64
+    )
+    if compiled:
+        torch.compile(lambda: qsa.run(binding, **initial), fullgraph=True)()
+    else:
+        qsa.run(binding, **initial)
     assert state.num_source_rows.item() == 16
     torch.testing.assert_close(state.logical_positions, initial["query_positions"])
     state.source_rows.copy_(torch.tensor([3, 7, 11, 15], device=device))
@@ -3878,6 +3884,8 @@ def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
             reuse_draft_selection=True,
         )
 
+    if compiled:
+        invoke = torch.compile(invoke, fullgraph=True)
     for rows in (1, 3, 4):
         invoke(rows)
     freeze_kernel_resolution("QSA draft reuse must retain prewarmed reader capacity")

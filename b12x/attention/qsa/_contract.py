@@ -2907,21 +2907,12 @@ def run(
                 dtype=dtype,
                 contiguous=True,
             )
-        _require_mutation_alias_contract(
-            mutable=(
-                ("scratch", binding.scratch),
-                ("output", binding.output),
-                ("draft work_positions", state.work_positions),
-                ("draft work_errors", state.work_errors),
-            ),
-            read_only=(
-                ("query", query),
-                ("request_ids", request_ids),
-                ("query_positions", query_positions),
-            ),
-        )
-        from ._draft_selection import prepare_selection
+        from ._draft_selection import prepare_selection, validate_buffers
 
+        validate_buffers(
+            [binding.scratch, binding.output, state.work_positions, state.work_errors],
+            [query, request_ids, query_positions],
+        )
         prepare_selection(
             state.logical_positions,
             state.errors,
@@ -2967,14 +2958,17 @@ def run(
         is_prefilling=is_prefilling,
     )
     if binding.draft_selection is not None:
+        from ._draft_selection import validate_buffers
+
         state = binding.draft_selection
-        _require_mutation_alias_contract(
-            mutable=(
-                ("draft logical_positions", state.logical_positions),
-                ("draft errors", state.errors),
-                ("draft num_source_rows", state.num_source_rows),
-            ),
-            read_only=tuple(inputs.items()),
+        validate_buffers(
+            [
+                state.logical_positions,
+                state.errors,
+                state.num_source_rows,
+                binding.selected_positions,
+            ],
+            list(inputs.values()),
         )
     stream = binding.selection_stream
     if stream is None:
@@ -3014,7 +3008,8 @@ def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
         state = binding.draft_selection
         record_anchors(
             positions,
-            binding.state_errors,
+            binding.scratch,
+            binding.plan._layout.state_errors_offset_bytes,
             state.logical_positions,
             state.errors,
             state.num_source_rows,
