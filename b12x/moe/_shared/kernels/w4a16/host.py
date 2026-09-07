@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 
 from b12x._lib.env import env_flag
@@ -32,6 +34,39 @@ def prefill_fused_sum_enabled() -> bool:
     when bitwise-identical route accumulation order is required.
     """
     return env_flag("W4A16_PREFILL_FUSED_SUM")
+
+
+_TOPK_SUM_OUTPUT_DTYPES = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+
+def w4a16_topk_sum_rotation_output_dtype() -> str:
+    """Output element of the full-rotation W4A16 top-k route sum.
+
+    ``B12X_W4A16_TOPK_SUM_OUTPUT`` selects ``fp32`` (default: the kernel stores
+    the fp32 route sum and the caller rounds it to the model dtype in a
+    separate cast), ``bf16`` or ``fp16`` (the kernel rounds the same fp32 value
+    once, to nearest even, in its store, so the bytes equal the separate
+    cast's and the cast launch disappears). The setting is read when the
+    kernel is compiled (prewarm included), when the output scratch is
+    allocated and when a launch checks its output tensor, so one process uses
+    one variant. The plain (non-rotation) sum always stores the element dtype.
+    """
+    raw = os.environ.get("B12X_W4A16_TOPK_SUM_OUTPUT", "fp32").strip().lower()
+    if raw not in _TOPK_SUM_OUTPUT_DTYPES:
+        raise ValueError(
+            "B12X_W4A16_TOPK_SUM_OUTPUT must be fp32, bf16 or fp16, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
+def w4a16_topk_sum_rotation_output_torch_dtype() -> torch.dtype:
+    """Torch dtype of the full-rotation top-k sum output (see the setting)."""
+    return _TOPK_SUM_OUTPUT_DTYPES[w4a16_topk_sum_rotation_output_dtype()]
 
 
 def prefill_fused_sum_eligible(
@@ -479,7 +514,9 @@ def make_w4a16_packed_buffers(
         ),
         output=torch.empty(
             (m, prepared.hidden_size),
-            dtype=torch.float32 if full_rotation else dtype,
+            dtype=w4a16_topk_sum_rotation_output_torch_dtype()
+            if full_rotation
+            else dtype,
             device=device,
         ),
         prefill_sum_accum=(
