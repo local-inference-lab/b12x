@@ -1,0 +1,11 @@
+{
+  "schema": "b12x.kda-prefill.public-evidence-package.v1",
+  "component_revision": "70fe41974ef4b18f61caaa2579c81cdc05d1265f",
+  "serving_revision": "abb715f132bdccb592a34b2596a3d3a8d757ffbc",
+  "files": {
+    "component-checks.json": "b632ab944de952219f4bc56b01d4940e27e209f25bfd2dff1aa7ffbe4a43fb91",
+    "evidence.json": "20f4bab99a7c8bcd1ac564d8f62aca3c4628da014458be48829ba7ea65d7091b",
+    "README.md": "115e3d3a2edbec3b2ab197b823b743771476f36cf23c747d204b518314534678",
+    "report.md": "063a667f62b9b5da1de115ba2f55eeb1ac4f92ea08f52c3e2a8f09ba636ec3e8"
+  }
+}

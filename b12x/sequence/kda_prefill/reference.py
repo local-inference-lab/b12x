@@ -51,17 +51,21 @@ def recurrent_kda(
     lower_bound: float,
     initial_state: torch.Tensor,
     checkpoint_offset: int = -1,
+    checkpoint_offsets: tuple[int, ...] | None = None,
     scale: float | None = None,
     eps: float = 1e-6,
     qk_l2norm: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | dict[int, torch.Tensor] | None]:
     """Run the fp32 token recurrence for one sequence.
 
     ``q, k, v, raw_g`` are ``[T, heads, 128]``, ``raw_beta`` is ``[T, heads]``,
     ``initial_state`` is ``[heads, 128, 128]`` in ``[value_dim, key_dim]``
     order. Returns the bf16 output ``[T, heads, 128]``, the fp32 final state in
     the same orientation, and the state after ``checkpoint_offset`` tokens
-    (``None`` unless ``0 <= checkpoint_offset <= T``).
+    (``None`` unless ``0 <= checkpoint_offset <= T``). With explicit plural
+    ``checkpoint_offsets``, the third result is an offset-to-state mapping
+    captured by that same recurrence. Without plural offsets, the third result
+    is a single checkpoint tensor or None.
     """
     tokens = int(q.shape[0])
     heads = int(q.shape[1])
@@ -76,18 +80,25 @@ def recurrent_kda(
     output = torch.empty(
         (tokens, heads, KDA_HEAD_DIM), dtype=torch.bfloat16, device=q.device
     )
+    checkpoints = {}
+    requested = (checkpoint_offset,) if checkpoint_offsets is None else checkpoint_offsets
     checkpoint = None
     if checkpoint_offset == 0:
         checkpoint = state.transpose(-1, -2).contiguous()
+    if checkpoint_offsets is not None and 0 in requested:
+        checkpoints[0] = state.transpose(-1, -2).contiguous().clone()
     for t in range(tokens):
         state = state * torch.exp(log_decay[t])[:, :, None]
         k_t = kf[t]
         delta = vf[t] - torch.einsum("hk,hkv->hv", k_t, state)
         state = state + (beta[t][:, None] * k_t)[:, :, None] * delta[:, None, :]
         output[t] = torch.einsum("hk,hkv->hv", qf[t], state).to(torch.bfloat16)
-        if t + 1 == checkpoint_offset:
-            checkpoint = state.transpose(-1, -2).contiguous()
-    return output, state.transpose(-1, -2).contiguous(), checkpoint
+        if t + 1 in requested:
+            saved = state.transpose(-1, -2).contiguous().clone()
+            checkpoints[t + 1] = saved
+            if t + 1 == checkpoint_offset:
+                checkpoint = saved
+    return output, state.transpose(-1, -2).contiguous(), (checkpoint if checkpoint_offsets is None else checkpoints)
 
 
 def _validate_packed(
@@ -104,8 +115,16 @@ def _validate_packed(
     state_slots: int,
     chunk: int,
     null_state_index: int | None,
+    max_checkpoints: int = 1,
 ) -> list[tuple[int, int]]:
     """Raise on every condition the device validator flags; return spans."""
+    if max_checkpoints != 1:
+        from .metadata import validate_metadata
+        return validate_metadata(cu_seqlens=cu_seqlens, initial_state_indices=initial_state_indices,
+            final_state_indices=final_state_indices, checkpoint_state_indices=checkpoint_state_indices,
+            checkpoint_offsets=checkpoint_offsets, num_seqs=num_seqs, num_tokens=num_tokens,
+            token_capacity=token_capacity, seq_capacity=seq_capacity, state_slots=state_slots,
+            chunk=chunk, null_state_index=null_state_index, max_checkpoints=max_checkpoints)
     if num_seqs < 0 or num_seqs > seq_capacity:
         raise ValueError(f"num_seqs={num_seqs} exceeds capacity {seq_capacity}")
     if num_tokens < 0 or num_tokens > token_capacity:
@@ -183,6 +202,7 @@ def prefill_kda(
     qk_l2norm: bool = True,
     null_state_index: int | None = None,
     chunk: int = 16,
+    max_checkpoints: int = 1,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the fp32 recurrence for a packed batch over a state pool.
@@ -215,6 +235,7 @@ def prefill_kda(
         state_slots=int(recurrent_state.shape[0]),
         chunk=chunk,
         null_state_index=null_state_index,
+        max_checkpoints=max_checkpoints,
     )
     if output is None:
         output = torch.zeros(
@@ -227,8 +248,8 @@ def prefill_kda(
     for request, (start, end) in enumerate(spans):
         initial = int(initial_state_indices[request])
         final = int(final_state_indices[request])
-        checkpoint_slot = int(checkpoint_state_indices[request])
-        offset = int(checkpoint_offsets[request])
+        slots = [int(checkpoint_state_indices[request])] if max_checkpoints == 1 else [int(x) for x in checkpoint_state_indices[request]]
+        offsets = [int(checkpoint_offsets[request])] if max_checkpoints == 1 else [int(x) for x in checkpoint_offsets[request]]
         if is_null(initial):
             state = torch.zeros(
                 (heads, KDA_HEAD_DIM, KDA_HEAD_DIM), dtype=torch.float32, device=q.device
@@ -245,14 +266,15 @@ def prefill_kda(
             dt_bias,
             lower_bound=lower_bound_value,
             initial_state=state,
-            checkpoint_offset=offset if offset > 0 else -1,
+            checkpoint_offsets=tuple(offset for offset in offsets if offset > 0),
             scale=scale,
             eps=eps,
             qk_l2norm=qk_l2norm,
         )
         output[start:end] = out
-        if checkpoint is not None and not is_null(checkpoint_slot):
-            recurrent_state[checkpoint_slot].copy_(checkpoint.to(recurrent_state.dtype))
+        for checkpoint_slot, offset in zip(slots, offsets, strict=True):
+            if offset in checkpoint and not is_null(checkpoint_slot):
+                recurrent_state[checkpoint_slot].copy_(checkpoint[offset].to(recurrent_state.dtype))
         if not is_null(final):
             recurrent_state[final].copy_(final_state.to(recurrent_state.dtype))
     return output
@@ -277,7 +299,7 @@ class MirrorTrace:
 
     k1: dict[tuple[int, int], dict[str, torch.Tensor]] = field(default_factory=dict)
     k2: dict[tuple[int, int], dict[str, torch.Tensor]] = field(default_factory=dict)
-    checkpoints: dict[int, torch.Tensor] = field(default_factory=dict)
+    checkpoints: dict[int | tuple[int, int], torch.Tensor] = field(default_factory=dict)
 
 
 def _neumann_inverse(lower: torch.Tensor, chunk: int) -> torch.Tensor:
@@ -432,6 +454,7 @@ def prefill_kda_chunk_mirror(
     qk_l2norm: bool = True,
     null_state_index: int | None = None,
     chunk: int = 16,
+    max_checkpoints: int = 1,
     policy: MirrorPolicy | None = None,
     trace: bool = False,
     output: torch.Tensor | None = None,
@@ -466,6 +489,7 @@ def prefill_kda_chunk_mirror(
         state_slots=int(recurrent_state.shape[0]),
         chunk=chunk,
         null_state_index=null_state_index,
+        max_checkpoints=max_checkpoints,
     )
     if output is None:
         output = torch.zeros(
@@ -487,8 +511,8 @@ def prefill_kda_chunk_mirror(
         for request, (start, end) in enumerate(spans):
             initial = int(initial_state_indices[request])
             final = int(final_state_indices[request])
-            checkpoint_slot = int(checkpoint_state_indices[request])
-            offset = int(checkpoint_offsets[request])
+            slots = [int(checkpoint_state_indices[request])] if max_checkpoints == 1 else [int(x) for x in checkpoint_state_indices[request]]
+            offsets = [int(checkpoint_offsets[request])] if max_checkpoints == 1 else [int(x) for x in checkpoint_offsets[request]]
             if is_null(initial):
                 state = torch.zeros(
                     (heads, KDA_HEAD_DIM, KDA_HEAD_DIM),
@@ -528,11 +552,13 @@ def prefill_kda_chunk_mirror(
                 if trace:
                     record.k1[(request, local)] = prep
                     record.k2[(request, local)] = step
-                if offset > 0 and (local + 1) * chunk == offset:
-                    if trace:
-                        record.checkpoints[request] = state.clone()
-                    if not is_null(checkpoint_slot):
-                        recurrent_state[checkpoint_slot].copy_(state.to(recurrent_state.dtype))
+                for checkpoint_index, (checkpoint_slot, offset) in enumerate(zip(slots, offsets, strict=True)):
+                    if offset > 0 and (local + 1) * chunk == offset:
+                        if trace:
+                            key = request if max_checkpoints == 1 else (request, checkpoint_index)
+                            record.checkpoints[key] = state.clone()
+                        if not is_null(checkpoint_slot):
+                            recurrent_state[checkpoint_slot].copy_(state.to(recurrent_state.dtype))
             if not is_null(final):
                 recurrent_state[final].copy_(state.to(recurrent_state.dtype))
     finally:

@@ -53,6 +53,7 @@ class Caps:
     state_dtype: torch.dtype = torch.float32
     qk_l2norm: bool = True
     checkpoint_export: bool = False
+    max_checkpoints: int = 1
     null_state_index: int | None = None
     metadata_validation: MetadataValidation = "transactional"
     chunk_tokens: int = 16
@@ -79,6 +80,10 @@ class Caps:
             raise ValueError("metadata_validation must be 'transactional' or 'trusted'")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
+        if type(self.max_checkpoints) is not int or self.max_checkpoints not in (1, 2, 4):
+            raise ValueError("max_checkpoints must be 1, 2 or 4")
+        if self.max_checkpoints > 1 and (not self.checkpoint_export or self.metadata_validation != "transactional"):
+            raise ValueError("multiple checkpoints require checkpoint_export and transactional validation")
         if self.null_state_index is not None:
             null = int(self.null_state_index)
             if null < 0 or null >= self.max_state_slots:
@@ -199,6 +204,7 @@ def _query(caps: Caps) -> KdaPrefillQuery:
         state_dtype=str(caps.state_dtype).removeprefix("torch."),
         qk_l2norm=caps.qk_l2norm,
         checkpoint_export=caps.checkpoint_export,
+        max_checkpoints=caps.max_checkpoints,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
     )
@@ -220,7 +226,7 @@ def _materialize_plan(
     window_tiles = max(1, min(int(window_tiles), tiles))
     max_windows = -(-tiles // window_tiles)
     ring_records = 2 * window_tiles * heads
-    duplicate_table_size = _next_power_of_two(4 * caps.max_seqs)
+    duplicate_table_size = _next_power_of_two(2 * (1 + caps.max_checkpoints) * caps.max_seqs)
     regions = (
         ("error_code", 1, torch.int32),
         ("duplicate_slots", duplicate_table_size, torch.int32),
@@ -342,11 +348,10 @@ def bind(
     )
     require_tensor("cu_seqlens", cu_seqlens, shape=(seq_capacity + 1,), device=device, dtypes=(torch.int32,))
     index_dtypes = (torch.int32, torch.int64)
-    for name, tensor in (
-        ("initial_state_indices", initial_state_indices),
-        ("checkpoint_state_indices", checkpoint_state_indices),
-    ):
-        require_tensor(name, tensor, shape=(seq_capacity,), device=device, dtypes=index_dtypes)
+    require_tensor(
+        "initial_state_indices", initial_state_indices,
+        shape=(seq_capacity,), device=device, dtypes=index_dtypes,
+    )
     require_tensor(
         "final_state_indices",
         final_state_indices,
@@ -357,10 +362,13 @@ def bind(
     )
     if final_state_indices.stride(0) <= 0:
         raise ValueError("final_state_indices must have a positive stride")
+    checkpoint_shape = (seq_capacity,) if caps.max_checkpoints == 1 else (seq_capacity, caps.max_checkpoints)
+    require_tensor("checkpoint_state_indices", checkpoint_state_indices, shape=checkpoint_shape,
+                   device=device, dtypes=index_dtypes)
     if not (initial_state_indices.dtype == final_state_indices.dtype == checkpoint_state_indices.dtype):
         raise TypeError("state index tensors must share one dtype")
     require_tensor(
-        "checkpoint_offsets", checkpoint_offsets, shape=(seq_capacity,), device=device, dtypes=(torch.int32,)
+        "checkpoint_offsets", checkpoint_offsets, shape=checkpoint_shape, device=device, dtypes=(torch.int32,)
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         require_tensor(name, tensor, shape=(1,), device=device, dtypes=(torch.int32,))

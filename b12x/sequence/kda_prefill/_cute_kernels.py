@@ -294,6 +294,7 @@ class _PrologueKernel:
         flag_count: int,
         max_state_slots: int,
         validate: bool,
+        max_checkpoints: int,
         null_state_index: int | None,
         index_type: type[cutlass.Numeric],
     ) -> None:
@@ -305,6 +306,7 @@ class _PrologueKernel:
         self.flag_count = int(flag_count)
         self.max_state_slots = int(max_state_slots)
         self.validate = bool(validate)
+        self.max_checkpoints = int(max_checkpoints)
         self.has_null = null_state_index is not None
         self.null_state_index = 0 if null_state_index is None else int(null_state_index)
         self.index_type = index_type
@@ -542,8 +544,6 @@ class _PrologueKernel:
                         flags[1] = Int32(1)
                     initial = Int64(initial_indices[seq])
                     final = Int64(final_indices[seq.to(Int64) * final_stride])
-                    checkpoint = Int64(checkpoint_indices[seq])
-                    offset = checkpoint_offsets[seq].to(Int32)
                     slot_limit = Int64(self.max_state_slots)
                     if not self._is_null(initial):
                         if (initial < Int64(0)) | (initial >= slot_limit):
@@ -553,16 +553,28 @@ class _PrologueKernel:
                             flags[2] = Int32(1)
                         elif self._insert(table, final) != Int32(0):
                             flags[0] = Int32(1)
-                    if offset > length:
-                        flags[3] = Int32(1)
-                    if (offset > Int32(0)) & ((offset % Int32(_CHUNK)) != Int32(0)):
-                        flags[3] = Int32(1)
-                    if offset > Int32(0):
-                        if not self._is_null(checkpoint):
-                            if (checkpoint < Int64(0)) | (checkpoint >= slot_limit):
-                                flags[2] = Int32(1)
-                            elif self._insert(table, checkpoint) != Int32(0):
-                                flags[0] = Int32(1)
+                    for cp in cutlass.range_constexpr(self.max_checkpoints):
+                        cp_index = seq * Int32(self.max_checkpoints) + Int32(cp)
+                        checkpoint = Int64(checkpoint_indices[cp_index])
+                        offset = checkpoint_offsets[cp_index].to(Int32)
+                        if offset > length:
+                            flags[3] = Int32(1)
+                        if (offset > Int32(0)) & ((offset % Int32(_CHUNK)) != Int32(0)):
+                            flags[3] = Int32(1)
+                        if offset > Int32(0):
+                            if not self._is_null(checkpoint):
+                                if (checkpoint < Int64(0)) | (checkpoint >= slot_limit):
+                                    flags[2] = Int32(1)
+                                elif self._insert(table, checkpoint) != Int32(0):
+                                    flags[0] = Int32(1)
+                                if cutlass.const_expr(cp > 0):
+                                    for previous in cutlass.range_constexpr(cp):
+                                        previous_index = seq * Int32(self.max_checkpoints) + Int32(previous)
+                                        previous_slot = Int64(checkpoint_indices[previous_index])
+                                        previous_offset = checkpoint_offsets[previous_index].to(Int32)
+                                        if not self._is_null(previous_slot):
+                                            if previous_offset == offset:
+                                                flags[3] = Int32(1)
                 cute.arch.atomic_add(hist.iterator + count, Int32(1))
             counts[seq] = count
             seq += Int32(_PROLOGUE_THREADS)
@@ -1053,6 +1065,7 @@ class _RecurrenceKernel:
         k_split: int,
         stages: int,
         checkpoint_export: bool,
+        max_checkpoints: int,
         null_state_index: int | None,
         index_type: type[cutlass.Numeric],
     ) -> None:
@@ -1076,6 +1089,7 @@ class _RecurrenceKernel:
         self.kb_steps = self.cols // 16
         self.nb_blocks = self.cols // 8
         self.checkpoint_export = bool(checkpoint_export)
+        self.max_checkpoints = int(max_checkpoints)
         self.has_null = null_state_index is not None
         self.null_state_index = 0 if null_state_index is None else int(null_state_index)
         self.index_type = index_type
@@ -1505,8 +1519,6 @@ class _RecurrenceKernel:
                 if has_tiles:
                     initial = Int64(initial_indices[seq])
                     final = Int64(final_indices[seq.to(Int64) * final_stride])
-                    checkpoint = Int64(checkpoint_indices[seq])
-                    offset = checkpoint_offsets[seq].to(Int32)
                     for nb in cutlass.range_constexpr(self.nb_blocks):
                         acc[nb, 0] = Float32(0.0)
                         acc[nb, 1] = Float32(0.0)
@@ -1740,12 +1752,16 @@ class _RecurrenceKernel:
                             count += Int32(1)
 
                             if cutlass.const_expr(self.checkpoint_export):
-                                if (offset > Int32(0)) & ((local + Int32(1)) * Int32(_CHUNK) == offset):
-                                    if not self._is_null(checkpoint):
-                                        self._store_state(
-                                            recurrent_state, acc, checkpoint * slot_stride + head_base,
-                                            row0, row1, col_base, tid,
-                                        )
+                                for cp in cutlass.range_constexpr(self.max_checkpoints):
+                                    cp_index = seq * Int32(self.max_checkpoints) + Int32(cp)
+                                    checkpoint = Int64(checkpoint_indices[cp_index])
+                                    offset = checkpoint_offsets[cp_index].to(Int32)
+                                    if (offset > Int32(0)) & ((local + Int32(1)) * Int32(_CHUNK) == offset):
+                                        if not self._is_null(checkpoint):
+                                            self._store_state(
+                                                recurrent_state, acc, checkpoint * slot_stride + head_base,
+                                                row0, row1, col_base, tid,
+                                            )
                         # Final state, or the running state for the next window.
                         if not self._is_null(final):
                             self._store_state(
@@ -1795,6 +1811,7 @@ def _recurrence_key(binding: Binding) -> tuple[object, ...]:
         plan.k_split,
         plan.stages,
         caps.checkpoint_export,
+        caps.max_checkpoints,
         caps.null_state_index,
         binding.initial_state_indices.dtype,
     )
@@ -1816,6 +1833,7 @@ def _compile_recurrence(binding: Binding) -> tuple[tuple[object, ...], Callable[
         k_split=binding.plan.k_split,
         stages=binding.plan.stages,
         checkpoint_export=caps.checkpoint_export,
+        max_checkpoints=caps.max_checkpoints,
         null_state_index=caps.null_state_index,
         index_type=index_type,
     )
@@ -1844,7 +1862,7 @@ def _compile_recurrence(binding: Binding) -> tuple[tuple[object, ...], Callable[
         Int32(1),
         Int32(0),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.recurrence", 8, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.recurrence", 9, key),
     )
 
     def launch(active: Binding, window: int) -> None:
@@ -1907,6 +1925,7 @@ def _prologue_key(binding: Binding) -> tuple[object, ...]:
         2 * binding.plan.window_tiles * caps.heads,
         caps.max_state_slots,
         caps.metadata_validation,
+        caps.max_checkpoints,
         caps.null_state_index,
         binding.initial_state_indices.dtype,
     )
@@ -1928,6 +1947,7 @@ def _compile_prologue(binding: Binding) -> tuple[tuple[object, ...], Callable[..
         flag_count=2 * binding.plan.window_tiles * caps.heads,
         max_state_slots=caps.max_state_slots,
         validate=caps.metadata_validation == "transactional",
+        max_checkpoints=caps.max_checkpoints,
         null_state_index=caps.null_state_index,
         index_type=index_type,
     )
@@ -1955,7 +1975,7 @@ def _compile_prologue(binding: Binding) -> tuple[tuple[object, ...], Callable[..
         Int32(1),
         Int32(1),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.prologue", 5, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.kda_prefill.prologue", 6, key),
     )
 
     def launch(active: Binding, launched_tiles: int) -> None:

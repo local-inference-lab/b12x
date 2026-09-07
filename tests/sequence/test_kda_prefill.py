@@ -351,7 +351,7 @@ def make_binding(
         return out
 
     def pad_seqs(t: torch.Tensor, extra: int = 0) -> torch.Tensor:
-        out = torch.zeros(max_seqs + extra, dtype=t.dtype, device=device)
+        out = torch.zeros((max_seqs + extra, *t.shape[1:]), dtype=t.dtype, device=device)
         out[: t.shape[0]] = t
         return out
 

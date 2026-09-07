@@ -1,0 +1,31 @@
+{
+  "schema": "b12x.kda-prefill.bounded-correctness.v1",
+  "base_revision": "06b4de7c723e6f166d65abf5909c5b7d0f8acc68",
+  "component_revision": "70fe41974ef4b18f61caaa2579c81cdc05d1265f",
+  "serving_composition_revision": "abb715f132bdccb592a34b2596a3d3a8d757ffbc",
+  "image_digest": "sha256:52b207e716a285c16e5e1b14ec2a41f6208b9450c617e7d1cde5a507ea879d7f",
+  "gpu": {
+    "passed": 12,
+    "failed": 0,
+    "skipped_selected": 0,
+    "selection": "tests/sequence/test_kda_prefill_two_checkpoints_gpu.py -k four_checkpoint",
+    "large_pool_enabled": true,
+    "coverage": [
+      "H1/H16 independent FP32 recurrence oracle",
+      "separate and in-place final state",
+      "H16 8192 tokens with states at 4096,6144,7168,7680",
+      "frozen graph replay with changing live counts and offsets",
+      "invalid fourth-slot aliases, nonadjacent offsets and bounds",
+      "H16 high pool addresses beyond signed 32-bit element offsets"
+    ],
+    "source_log_sha256": "766e4f526f87e2b83e05e45b300870c045591c800d5a34bc1a2bcfba3338fbed"
+  },
+  "cpu": {
+    "passed": 41,
+    "failed": 0,
+    "selection": "tests/sequence/test_kda_prefill_two_checkpoints_cpu.py",
+    "source_log_sha256": "1aca8fea89d6d21712311751d0f8ebfa846493328f7bb392791b2377347cf008"
+  },
+  "scope": "bounded component correctness; no standalone component throughput or measured policy-profile claim",
+  "policy_dependency": "KDA catalog/offline-provider and measured profile integration remains unresolved; no embedded KDA profile is claimed."
+}

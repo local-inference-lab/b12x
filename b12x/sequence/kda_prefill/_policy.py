@@ -6,13 +6,20 @@ from dataclasses import dataclass
 
 from b12x.policy import ComponentPolicy
 from b12x.policy.components import KDA_PREFILL
-from b12x.policy.types import FrozenMapping
+from b12x.policy.types import DeviceIdentity, FrozenMapping
 
 BACKEND = "cutedsl"
 V_SPLIT_CHOICES = (16, 32, 64, 128)
 K_SPLIT_CHOICES = (1, 2, 4)
 STAGE_CHOICES = (2, 3, 4)
 CHUNK_TOKENS = 16
+
+# Multi-checkpoint device eligibility is checked once by the component policy.
+# This identity restricts planning; it is not a measured GPU profile.
+_MULTI_CHECKPOINT_TARGET = DeviceIdentity(
+    vendor="nvidia", product_name="NVIDIA GB10",
+    compute_capability=(12, 1), sm_count=48,
+)
 
 
 class WorkspaceRecord:
@@ -65,6 +72,7 @@ class KdaPrefillQuery:
     checkpoint_export: bool
     max_tokens: int
     max_seqs: int
+    max_checkpoints: int = 1
 
     def profile_fields(self) -> dict[str, object]:
         return {
@@ -76,6 +84,7 @@ class KdaPrefillQuery:
             "checkpoint_export": bool(self.checkpoint_export),
             "max_tokens": int(self.max_tokens),
             "max_seqs": int(self.max_seqs),
+            "max_checkpoints": int(self.max_checkpoints),
         }
 
 
@@ -144,7 +153,16 @@ def _heuristic(query: KdaPrefillQuery, device) -> KdaPrefillConfig:
 
 
 def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
-    del device
+    if type(query.max_checkpoints) is not int or query.max_checkpoints not in (1, 2, 4):
+        raise ValueError("max_checkpoints must be 1, 2 or 4")
+    if query.max_checkpoints > 1:
+        if not query.checkpoint_export:
+            raise ValueError("multiple checkpoints require checkpoint_export")
+        if device != _MULTI_CHECKPOINT_TARGET:
+            raise ValueError(
+                "multi-checkpoint KDA prefill supports only NVIDIA GB10 "
+                "(SM121, 48 SMs); use max_checkpoints=1 on other devices"
+            )
     if config.backend != BACKEND:
         raise ValueError(f"unsupported {KDA_PREFILL} backend {config.backend!r}")
     if config.v_split not in V_SPLIT_CHOICES:
@@ -177,7 +195,7 @@ def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
 
 KDA_PREFILL_POLICY = ComponentPolicy(
     component_id=KDA_PREFILL,
-    query_schema_version=1,
+    query_schema_version=3,
     config_schema_version=1,
     query_fields=frozenset(
         {
@@ -189,6 +207,7 @@ KDA_PREFILL_POLICY = ComponentPolicy(
             "checkpoint_export",
             "max_tokens",
             "max_seqs",
+            "max_checkpoints",
         }
     ),
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
