@@ -18,7 +18,7 @@ from b12x.attention._shared.mla.reference import (
     pack_mla_kv_cache_reference,
     sparse_mla_reference,
 )
-from b12x.attention._shared.mla.traits import ScaleFormat
+from b12x.attention._shared.mla.traits import ComputeMode, ScaleFormat
 from b12x._lib.intrinsics import pack_grouped_fp4_values
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
@@ -62,11 +62,13 @@ class _UnifiedInputs:
     extra_index_scenarios: tuple[torch.Tensor, torch.Tensor] | None
     extra_lengths: torch.Tensor | None
     extra_length_scenarios: tuple[torch.Tensor, torch.Tensor] | None
+    extra_page_size: int | None
 
 
 def _make_cache(
     *,
     tokens: int,
+    page_size: int = _PAGE_SIZE,
     device: torch.device,
     generator: torch.Generator,
 ) -> torch.Tensor:
@@ -83,7 +85,7 @@ def _make_cache(
     return pack_compressed_sparse_mla_kv_cache_reference(
         k_nope,
         k_rope,
-        page_size=_PAGE_SIZE,
+        page_size=page_size,
     )
 
 
@@ -93,6 +95,7 @@ def _make_inputs(
     heads: int,
     main_width: int,
     extra_width: int,
+    extra_page_size: int = _PAGE_SIZE,
     per_token: bool,
     device: torch.device,
 ) -> _UnifiedInputs:
@@ -142,9 +145,10 @@ def _make_inputs(
     extra_lengths: torch.Tensor | None = None
     extra_length_scenarios: tuple[torch.Tensor, torch.Tensor] | None = None
     if extra_width:
-        extra_tokens = max(extra_width, _PAGE_SIZE)
+        extra_tokens = max(extra_width, extra_page_size)
         extra_cache = _make_cache(
             tokens=extra_tokens,
+            page_size=extra_page_size,
             device=device,
             generator=generator,
         )
@@ -183,6 +187,7 @@ def _make_inputs(
         extra_index_scenarios=extra_index_scenarios,
         extra_lengths=extra_lengths,
         extra_length_scenarios=extra_length_scenarios,
+        extra_page_size=extra_page_size if extra_width else None,
     )
 
 
@@ -238,7 +243,7 @@ def _reference(
         ),
         extra_topk_lengths=extra_lengths,
         swa_page_size=_PAGE_SIZE,
-        extra_page_size=_PAGE_SIZE if inputs.extra_cache is not None else None,
+        extra_page_size=inputs.extra_page_size,
         return_lse=True,
     )
     assert isinstance(result, tuple)
@@ -337,7 +342,7 @@ def test_unified_decode_entrypoint_live_graph_oracle(entrypoint: str) -> None:
             indexed_k_cache=inputs.extra_cache,
             indexed_indices=inputs.extra_indices,
             indexed_topk_lengths=inputs.extra_lengths,
-            indexed_page_size=_PAGE_SIZE if has_extra else None,
+            indexed_page_size=inputs.extra_page_size,
             forced_num_splits=1,
             out=output,
         )
@@ -410,7 +415,7 @@ def test_unified_prefill_entrypoint_live_graph_oracle(entrypoint: str) -> None:
             extra_kv_cache=inputs.extra_cache,
             extra_indices=inputs.extra_indices,
             extra_topk_length=inputs.extra_lengths,
-            extra_page_block_size=_PAGE_SIZE if has_extra else None,
+            extra_page_block_size=inputs.extra_page_size,
         )
 
     _install_scenario(inputs, 0)
@@ -708,6 +713,14 @@ class _MGPrefillServingCase:
 _MG_PREFILL_SERVING_CASES = (
     _MGPrefillServingCase("dsv4", "fp8", 16, 512, 1),
     _MGPrefillServingCase("dsv4", "fp8", 32, 512, 2),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 16, 128, 1),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 32, 128, 2),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 16, 512, 1),
+    _MGPrefillServingCase("dsv4-dual", "bf16", 32, 512, 2),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 1024, 1),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 1024, 2),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 16, 2048, 1),
+    _MGPrefillServingCase("dsv4-dual", "fp8", 32, 2048, 2),
     _MGPrefillServingCase("dsv4", "bf16", 16, 128, 1),
     _MGPrefillServingCase("dsv4", "bf16", 32, 128, 2),
     _MGPrefillServingCase("glm", "fp8", 16, 512, 1),
@@ -788,23 +801,25 @@ def _assert_prefill_boundary_heads(
     ids=lambda case: case.test_id,
 )
 def test_unified_prefill_mg_specialization_live_graph_oracle(
-    case: _MGPrefillServingCase,
+    case: _MGPrefillServingCase, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Validate each typed-SMEM MG group-count/compute arm under live replay.
 
-    These eight nodes compile the exact production single-cache specializations:
-    DSV4 FP8 and BF16-QK, GLM FP8, and GLM NVFP4/BF16, each with ``mg_n_hg`` 1
-    and 2.  DSV4 BF16 uses two 64-candidate tiles; every 512-wide case uses eight.
+    Cases cover single-cache and dual-cache DSV4 FP8 and BF16-QK, GLM FP8,
+    and GLM NVFP4/BF16 with one and two head groups. DSV4 dual-cache windows
+    of 128 and 512 use BF16-QK; widths 1024 and 2048 use FP8-QK.
     """
     device = require_b12x()
     rows = 2
 
-    if case.family == "dsv4":
+    has_extra = case.family == "dsv4-dual"
+    if case.family in ("dsv4", "dsv4-dual"):
         inputs = _make_inputs(
             rows=rows,
             heads=case.heads,
             main_width=case.topk,
-            extra_width=0,
+            extra_width=64 if has_extra else 0,
+            extra_page_size=2 if has_extra else _PAGE_SIZE,
             per_token=True,
             device=device,
         )
@@ -813,6 +828,16 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             inputs.main_index_scenarios,
             inputs.main_length_scenarios,
         )
+        if has_extra:
+            assert inputs.extra_cache is not None
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            assert inputs.extra_index_scenarios is not None
+            assert inputs.extra_length_scenarios is not None
+            _poison_inactive_topk_tails(
+                inputs.extra_index_scenarios,
+                inputs.extra_length_scenarios,
+            )
         expected = tuple(_reference(inputs, scenario) for scenario in range(2))
         index_scenarios = inputs.main_index_scenarios
         length_scenarios = inputs.main_length_scenarios
@@ -886,10 +911,19 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             _install_nvfp4_glm_scenario(inputs_nvfp4, scenario)
 
     assert case.heads == case.n_hg * 16
-    expected_compute = (
-        "bf16" if case.topk == 128 or case.family == "glm-nvfp4" else "fp8"
-    )
-    assert case.compute == expected_compute
+    import b12x.attention._shared.mla.prefill_mg as prefill_mg
+
+    original_run_mg = prefill_mg.run_unified_prefill_mg
+    launched_modes = []
+    expected_compute = ComputeMode.BF16 if case.compute == "bf16" else ComputeMode.FP8
+
+    def checked_run_mg(**kwargs):
+        assert kwargs["compute_mode"] == expected_compute
+        assert kwargs["traits_override"].compute_mode == expected_compute
+        launched_modes.append(kwargs["compute_mode"])
+        return original_run_mg(**kwargs)
+
+    monkeypatch.setattr(prefill_mg, "run_unified_prefill_mg", checked_run_mg)
     assert not torch.equal(q_scenarios[0], q_scenarios[1])
     assert not torch.equal(index_scenarios[0], index_scenarios[1])
     assert not torch.equal(length_scenarios[0], length_scenarios[1])
@@ -929,10 +963,22 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
         "lse": lse_base2,
         "workspace": fixed_workspace,
     }
+    if has_extra:
+        assert case.family == "dsv4-dual"
+        assert inputs.extra_cache is not None
+        assert inputs.extra_indices is not None
+        assert inputs.extra_lengths is not None
+        stable_tensors.update(
+            {
+                "extra_cache": inputs.extra_cache,
+                "extra_indices": inputs.extra_indices,
+                "extra_lengths": inputs.extra_lengths,
+            }
+        )
     stable_ptrs = {name: tensor.data_ptr() for name, tensor in stable_tensors.items()}
 
     def launch() -> tuple[torch.Tensor, torch.Tensor]:
-        return run_unified_prefill(
+        kwargs = dict(
             q=live_q,
             kv_cache=kv_cache,
             topk_indices=live_indices,
@@ -944,9 +990,21 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             workspace=fixed_workspace,
             scale_format=scale_format,
         )
+        if has_extra:
+            assert inputs.extra_cache is not None
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            kwargs.update(
+                extra_kv_cache=inputs.extra_cache,
+                extra_indices=inputs.extra_indices,
+                extra_topk_length=inputs.extra_lengths,
+                extra_page_block_size=inputs.extra_page_size,
+            )
+        return run_unified_prefill(**kwargs)
 
     install(0)
     warm_output, warm_lse = launch()
+    assert launched_modes == [expected_compute]
     torch.cuda.synchronize(device)
     assert warm_output.data_ptr() == output.data_ptr()
     assert warm_lse.data_ptr() == lse_base2.data_ptr()
@@ -967,6 +1025,18 @@ def test_unified_prefill_mg_specialization_live_graph_oracle(
             expected_lengths=length_scenarios[scenario],
             topk=case.topk,
         )
+        if has_extra:
+            assert inputs.extra_indices is not None
+            assert inputs.extra_lengths is not None
+            assert inputs.extra_index_scenarios is not None
+            assert inputs.extra_length_scenarios is not None
+            _assert_live_topk_contract(
+                live_indices=inputs.extra_indices,
+                live_lengths=inputs.extra_lengths,
+                expected_indices=inputs.extra_index_scenarios[scenario],
+                expected_lengths=inputs.extra_length_scenarios[scenario],
+                topk=64,
+            )
         assert {
             name: tensor.data_ptr() for name, tensor in stable_tensors.items()
         } == stable_ptrs
