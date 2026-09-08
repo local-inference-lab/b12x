@@ -472,6 +472,15 @@ class _TwoShotLaunch:
         rows_per_rank: Int32,
         row_elems: Int32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         staging = (
             staging0,
             staging1,

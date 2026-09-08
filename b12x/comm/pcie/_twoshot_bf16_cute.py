@@ -291,6 +291,15 @@ class _TwoShotBf16Launch:
         slot_bytes: Int64,
         rows_per_rank: Int32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         staging = (
             staging0,
             staging1,
@@ -791,6 +800,15 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         rows_per_rank: Int32,
         remainder_packs: Int32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         staging = (
             staging0,
             staging1,
@@ -1037,6 +1055,15 @@ class _TwoShotPushAllReduceLaunch(_TwoShotPullAllReduceLaunch):
         rows_per_rank: Int32,
         remainder_packs: Int32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         staging = (
             staging0,
             staging1,

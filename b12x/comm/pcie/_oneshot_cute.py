@@ -234,6 +234,15 @@ class _OneshotLaunch(_PackedMath):
         output_ptr: cute.Pointer,
         size_packs: Int32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -722,6 +731,15 @@ class _FusedOneshotLaunch(_PackedMath):
         shard_packs: Int64,
         epsilon: Float32,
     ) -> None:
+        # Programmatic dependent launch: a kernel launched behind this one
+        # with the programmatic-stream-serialization attribute may start now.
+        # Its own griddepcontrol.wait still orders its reads of this
+        # kernel's output after this grid completes, so results are
+        # unchanged; kernels launched without the attribute serialize as
+        # before. First statement on purpose: the trigger must precede the
+        # peer barriers so a dependent's weight staging or prologue overlaps
+        # the fabric round trips.
+        cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
