@@ -30,7 +30,7 @@ claim. Hardware residual dequantization is disabled in these comparisons.
 
 The candidate's `b12x/attention/_shared/mla/` and
 `b12x/attention/sparse_mla/` source trees are identical to PR #311 revision
-`0edbaef99ffa6f03588e0ca46b4bd65a143ca3fb`. Importantly, this includes the S4
+`0edbaef99ffa6f03588e0ca46b4bd65a143ca3fb`. This includes the S4
 return-state fix; the intermediate fast-path revision `242d6ca` is not a valid
 comparison or deployment candidate.
 

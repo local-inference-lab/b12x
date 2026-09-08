@@ -27,9 +27,6 @@
         "B12X_MLA_SM120_BALANCED_WAVES": null
       },
       "gpu_before": {
-        "captured_unix_ns": 1788849738317632334,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -38,7 +35,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -383,9 +379,6 @@
         }
       ],
       "gpu_after": {
-        "captured_unix_ns": 1788849739901792632,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -394,7 +387,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -425,9 +417,6 @@
         "B12X_MLA_SM120_BALANCED_WAVES": null
       },
       "gpu_before": {
-        "captured_unix_ns": 1788849742616985533,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -436,7 +425,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -781,9 +769,6 @@
         }
       ],
       "gpu_after": {
-        "captured_unix_ns": 1788849744163494016,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -792,7 +777,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -823,9 +807,6 @@
         "B12X_MLA_SM120_BALANCED_WAVES": null
       },
       "gpu_before": {
-        "captured_unix_ns": 1788849746830259090,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -834,7 +815,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -1179,9 +1159,6 @@
         }
       ],
       "gpu_after": {
-        "captured_unix_ns": 1788849748355490692,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -1190,7 +1167,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -1221,9 +1197,6 @@
         "B12X_MLA_SM120_BALANCED_WAVES": null
       },
       "gpu_before": {
-        "captured_unix_ns": 1788849751037818067,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -1232,7 +1205,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
@@ -1577,9 +1549,6 @@
         }
       ],
       "gpu_after": {
-        "captured_unix_ns": 1788849752557634878,
-        "torch_uuid": "acc5c7ea-929e-d962-951d-08846cdb4a6d",
-        "nvidia_smi_uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
         "command": [
           "nvidia-smi",
           "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
@@ -1588,7 +1557,6 @@
         "available": true,
         "fields": {
           "index": "0",
-          "uuid": "GPU-acc5c7ea-929e-d962-951d-08846cdb4a6d",
           "pstate": "P1",
           "persistence_mode": "Disabled",
           "compute_mode": "Default",
