@@ -1,0 +1,3844 @@
+{
+  "schema_version": 1,
+  "status": "qualified numerical cases; research-only performance",
+  "measurement_date": "2026-09-08",
+  "timing_eligible": false,
+  "b12x_runtime_revision": "0bf9f177b237",
+  "vllm_model_reader_revision": "fa6ea71c01fdaef3a664d083a536cee00a848b1d",
+  "benchmark_revision": "36873045ae52f1acde5980d88fd380af8d4ad4d7",
+  "publication_base_revision": "ab269462fcfceedb4a18acd9ed7b3920b68182e4",
+  "container_image_id": "sha256:bb9843ca63fe61b258077a3231a4136f143f942e259676225446df030afda767",
+  "conditions": {
+    "model": "Kimi-K3 native QSRT K2",
+    "layer": 1,
+    "routing": "seeded uniform",
+    "seed": 71903,
+    "block_m": 8,
+    "m_values": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "time_iters": 100,
+    "torch_device_index": 0,
+    "physical_gpu_index": 4
+  },
+  "precision_contract": "Identical source atoms, scales, coupled rotations, and routing in both thread-count arms; BF16 output.",
+  "limitations": [
+    "Three of four replay intervals show model service activity. Rank-0/512 shows none, but its 256-thread baseline overlaps service. All timing samples are ineligible for thread-count performance decisions.",
+    "Single expert extent per run; no full-model or TP9 collective qualification.",
+    "Within a single-width run, zero reference error compares the output to itself. Cross-thread output digests and eager/graph equality are the meaningful numerical controls.",
+    "Raw requests, routing tensors, model payloads, profiler traces, GPU UUIDs, and local paths are not included."
+  ],
+  "runs": [
+    {
+      "tp9_rank": 0,
+      "width": 384,
+      "threads": 256,
+      "environment": {
+        "B12X_W4A16_M8_CTA_THREADS": "256",
+        "B12X_W4A16_SMALL_M_SPLITK": "1",
+        "B12X_W4A16_STABLE_ROUTE_PACK": "1",
+        "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": "1",
+        "B12X_W4A16_PREFILL_FUSED_SUM": "1",
+        "B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN": "funnel",
+        "B12X_W4A16_CROSS_TILE_PREFETCH": "1",
+        "B12X_W4A16_TOKEN_MAJOR_ROTATION": "1",
+        "B12X_W4A16_TOPK_SUM_OUTPUT": "bf16"
+      },
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "torch": "2.13.0",
+      "gpu_before": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2550",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "226.60",
+          "power.limit": "325.00",
+          "temperature.gpu": "74"
+        }
+      },
+      "gpu_after": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2602",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000004",
+          "power.draw": "100.94",
+          "power.limit": "325.00",
+          "temperature.gpu": "69"
+        }
+      },
+      "runtime_weight_bytes": {
+        "384": 928994816
+      },
+      "timing_eligible": false,
+      "server_activity": {
+        "assessment": "service_overlap",
+        "before": {
+          "vllm:num_requests_running": 1.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 18935.0,
+          "vllm:request_success_total": 23.0
+        },
+        "after": {
+          "vllm:num_requests_running": 0.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 19246.0,
+          "vllm:request_success_total": 24.0
+        },
+        "changes": {
+          "vllm:generation_tokens_total": 311.0,
+          "vllm:request_success_total": 1.0,
+          "vllm:num_requests_running": -1.0
+        }
+      },
+      "source_record_sha256": "1bb7d9c8f70959c940accaf6c0a0dd9988e1afa02803eae6d48379c89219a914",
+      "records": [
+        {
+          "m": 1,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.11646139621734619,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 1,
+            "routes": 16,
+            "rows_per_expert": {
+              "mean": 0.02,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 880
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 16,
+                "padded_slots": 128,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 16,
+                "padded_slots": 512,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 16,
+                "padded_slots": 768,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 16,
+                "padded_slots": 1024,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 16,
+                "padded_slots": 1536,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 16,
+                "padded_slots": 2048,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "4096572815171ad2"
+          },
+          "topk_ids_sha256": "c64732d0d7db8676",
+          "unqualified_graph_replay_us": {
+            "384": 46.0
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              50.81599950790405,
+              45.75999826192856,
+              46.81599885225296,
+              45.504000037908554,
+              45.823998749256134,
+              46.49600014090538,
+              45.632001012563705,
+              45.951999723911285,
+              46.431999653577805,
+              46.431999653577805,
+              46.84799909591675,
+              45.791998505592346,
+              45.9199994802475,
+              45.85599899291992,
+              46.52800038456917,
+              47.00800031423569,
+              45.85599899291992,
+              45.56800052523613,
+              45.951999723911285,
+              45.85599899291992,
+              46.94399982690811,
+              45.69600149989128,
+              45.88799923658371,
+              45.75999826192856,
+              45.88799923658371,
+              46.20800167322159,
+              46.78399860858917,
+              45.632001012563705,
+              45.9199994802475,
+              45.85599899291992,
+              46.112000942230225,
+              46.879999339580536,
+              46.04800045490265,
+              45.471999794244766,
+              46.04800045490265,
+              46.879999339580536,
+              46.720001846551895,
+              45.88799923658371,
+              46.911999583244324,
+              46.04800045490265,
+              46.01600021123886,
+              47.13600128889084,
+              46.01600021123886,
+              46.20800167322159,
+              46.04800045490265,
+              45.823998749256134,
+              45.98399996757507,
+              45.152001082897186,
+              46.46399989724159,
+              46.560000628232956,
+              46.01600021123886,
+              46.1760014295578,
+              45.3759990632534,
+              46.46399989724159,
+              46.751998364925385,
+              46.01600021123886,
+              45.823998749256134,
+              47.00800031423569,
+              46.01600021123886,
+              45.951999723911285,
+              45.88799923658371,
+              45.9199994802475,
+              45.791998505592346,
+              46.65600135922432,
+              45.951999723911285,
+              45.72800174355507,
+              45.75999826192856,
+              46.112000942230225,
+              45.53600028157234,
+              46.33599892258644,
+              45.9199994802475,
+              45.951999723911285,
+              45.951999723911285,
+              47.93599992990494,
+              45.823998749256134,
+              46.01600021123886,
+              45.72800174355507,
+              46.39999940991402,
+              46.01600021123886,
+              46.720001846551895,
+              45.98399996757507,
+              45.823998749256134,
+              46.01600021123886,
+              45.24800181388855,
+              46.81599885225296,
+              45.69600149989128,
+              45.98399996757507,
+              46.04800045490265,
+              46.112000942230225,
+              45.343998819589615,
+              45.9199994802475,
+              46.04800045490265,
+              45.9199994802475,
+              45.823998749256134,
+              46.14400118589401,
+              47.07200080156326,
+              46.04800045490265,
+              45.98399996757507,
+              45.98399996757507,
+              46.04800045490265
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 2,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.20334067940711975,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 2,
+            "routes": 32,
+            "rows_per_expert": {
+              "mean": 0.04,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 864
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 32,
+                "padded_slots": 256,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 32,
+                "padded_slots": 1024,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 32,
+                "padded_slots": 1536,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 32,
+                "padded_slots": 2048,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 32,
+                "padded_slots": 3072,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 32,
+                "padded_slots": 4096,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "2a22fb5b1615b222"
+          },
+          "topk_ids_sha256": "a9195b67bd8f3e3f",
+          "unqualified_graph_replay_us": {
+            "384": 64.7
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              69.98399645090103,
+              64.70400094985962,
+              64.54399973154068,
+              65.60000032186508,
+              65.08799642324448,
+              66.17599725723267,
+              65.0240033864975,
+              64.15999680757523,
+              65.88800251483917,
+              64.25599753856659,
+              64.96000289916992,
+              64.4799992442131,
+              64.28799778223038,
+              65.92000275850296,
+              65.18399715423584,
+              64.4799992442131,
+              64.41599875688553,
+              64.41599875688553,
+              66.3359984755516,
+              65.63200056552887,
+              64.25599753856659,
+              64.35199826955795,
+              64.28799778223038,
+              66.65600091218948,
+              64.4799992442131,
+              64.31999802589417,
+              66.30399823188782,
+              64.4799992442131,
+              66.49599969387054,
+              66.72000139951706,
+              66.43199920654297,
+              65.0240033864975,
+              64.54399973154068,
+              64.41599875688553,
+              64.25599753856659,
+              64.38399851322174,
+              64.54399973154068,
+              64.25599753856659,
+              64.2239972949028,
+              64.41599875688553,
+              65.15199691057205,
+              66.17599725723267,
+              66.39999896287918,
+              66.880002617836,
+              66.20799750089645,
+              66.65600091218948,
+              66.20799750089645,
+              64.51199948787689,
+              64.31999802589417,
+              64.89600241184235,
+              64.31999802589417,
+              65.76000154018402,
+              64.25599753856659,
+              64.28799778223038,
+              64.31999802589417,
+              64.2239972949028,
+              65.95200300216675,
+              64.28799778223038,
+              64.99200314283371,
+              66.39999896287918,
+              66.39999896287918,
+              66.65600091218948,
+              64.38399851322174,
+              65.21599739789963,
+              64.35199826955795,
+              64.99200314283371,
+              64.19199705123901,
+              64.86400216817856,
+              65.11999666690826,
+              66.14399701356888,
+              64.57599997520447,
+              66.3679987192154,
+              66.49599969387054,
+              66.27199798822403,
+              65.08799642324448,
+              65.11999666690826,
+              66.23999774456024,
+              66.3359984755516,
+              65.11999666690826,
+              64.41599875688553,
+              64.41599875688553,
+              64.31999802589417,
+              64.35199826955795,
+              64.89600241184235,
+              64.44799900054932,
+              64.44799900054932,
+              66.27199798822403,
+              66.43199920654297,
+              65.08799642324448,
+              64.25599753856659,
+              64.38399851322174,
+              64.4799992442131,
+              64.2239972949028,
+              63.968002796173096,
+              64.28799778223038,
+              64.15999680757523,
+              64.25599753856659,
+              64.25599753856659,
+              64.2239972949028,
+              65.47199934720993
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 4,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.2445097416639328,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 4,
+            "routes": 64,
+            "rows_per_expert": {
+              "mean": 0.07,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 2,
+              "empty_experts": 834
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 62,
+                "padded_slots": 496,
+                "padding_fraction": 6.75,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 62,
+                "padded_slots": 1984,
+                "padding_fraction": 30.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 62,
+                "padded_slots": 2976,
+                "padding_fraction": 45.5,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 62,
+                "padded_slots": 3968,
+                "padding_fraction": 61.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 62,
+                "padded_slots": 5952,
+                "padding_fraction": 92.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 62,
+                "padded_slots": 7936,
+                "padding_fraction": 123.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "launch_attestation": {
+            "384": [
+              {
+                "symbol_sha256": "e074adfa69afa10fbefe10dd54268c9ec7f86902b72f6e9aaa4321897fc816d9",
+                "grid": [
+                  188,
+                  1,
+                  1
+                ],
+                "block": [
+                  256,
+                  1,
+                  1
+                ],
+                "registers_per_thread": 121,
+                "shared_memory_bytes": 101376
+              }
+            ]
+          },
+          "output_sha256": {
+            "384": "107804e1118ca588"
+          },
+          "topk_ids_sha256": "3f9e19f37bd72133",
+          "unqualified_graph_replay_us": {
+            "384": 113.5
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              115.29599875211716,
+              114.3679991364479,
+              113.92000317573547,
+              114.30399864912033,
+              113.27999830245972,
+              114.14399743080139,
+              113.76000195741653,
+              113.37599903345108,
+              114.3999993801117,
+              114.14399743080139,
+              113.50400000810623,
+              113.6000007390976,
+              113.69600147008896,
+              113.37599903345108,
+              112.19199746847153,
+              113.47199976444244,
+              113.50400000810623,
+              113.40799927711487,
+              113.56800049543381,
+              113.37599903345108,
+              113.47199976444244,
+              113.6000007390976,
+              113.34399878978729,
+              113.47199976444244,
+              113.3119985461235,
+              113.50400000810623,
+              113.50400000810623,
+              113.53600025177002,
+              113.56800049543381,
+              113.53600025177002,
+              112.19199746847153,
+              113.6000007390976,
+              113.40799927711487,
+              113.47199976444244,
+              113.56800049543381,
+              114.27199840545654,
+              113.53600025177002,
+              113.47199976444244,
+              114.07999694347382,
+              113.47199976444244,
+              113.37599903345108,
+              113.47199976444244,
+              113.53600025177002,
+              113.6000007390976,
+              113.56800049543381,
+              113.53600025177002,
+              113.24799805879593,
+              113.24799805879593,
+              113.53600025177002,
+              113.47199976444244,
+              113.43999952077866,
+              113.66400122642517,
+              113.53600025177002,
+              113.43999952077866,
+              114.17599767446518,
+              113.53600025177002,
+              112.76800185441971,
+              113.66400122642517,
+              113.27999830245972,
+              113.6000007390976,
+              111.58400028944016,
+              112.60800063610077,
+              114.07999694347382,
+              113.50400000810623,
+              113.56800049543381,
+              113.43999952077866,
+              113.56800049543381,
+              113.40799927711487,
+              113.63200098276138,
+              113.50400000810623,
+              113.3119985461235,
+              113.34399878978729,
+              112.86400258541107,
+              113.63200098276138,
+              113.63200098276138,
+              113.6000007390976,
+              113.53600025177002,
+              112.15999722480774,
+              113.3119985461235,
+              113.53600025177002,
+              114.20799791812897,
+              113.69600147008896,
+              113.66400122642517,
+              114.84800279140472,
+              113.69600147008896,
+              113.6000007390976,
+              113.3119985461235,
+              113.6000007390976,
+              113.40799927711487,
+              113.66400122642517,
+              113.56800049543381,
+              113.50400000810623,
+              113.63200098276138,
+              113.37599903345108,
+              113.3119985461235,
+              111.55200004577637,
+              113.6000007390976,
+              113.53600025177002,
+              113.6000007390976,
+              113.6000007390976
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 8,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.3594430387020111,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 8,
+            "routes": 128,
+            "rows_per_expert": {
+              "mean": 0.14,
+              "p50": 0.0,
+              "p90": 1.0,
+              "max": 2,
+              "empty_experts": 778
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 118,
+                "padded_slots": 944,
+                "padding_fraction": 6.375,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 118,
+                "padded_slots": 3776,
+                "padding_fraction": 28.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 118,
+                "padded_slots": 5664,
+                "padding_fraction": 43.25,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 118,
+                "padded_slots": 7552,
+                "padding_fraction": 58.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 118,
+                "padded_slots": 11328,
+                "padding_fraction": 87.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 118,
+                "padded_slots": 15104,
+                "padding_fraction": 117.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "929dc887de1703f9"
+          },
+          "topk_ids_sha256": "382c4ddc5abb04a7",
+          "unqualified_graph_replay_us": {
+            "384": 212.9
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              216.86400473117828,
+              212.5760018825531,
+              212.8320038318634,
+              212.5760018825531,
+              215.68000316619873,
+              213.15200626850128,
+              213.21600675582886,
+              212.44800090789795,
+              214.56000208854675,
+              213.56800198554993,
+              213.18399906158447,
+              212.38400042057037,
+              212.70400285720825,
+              215.45599400997162,
+              214.6880030632019,
+              212.2880071401596,
+              212.8320038318634,
+              212.76800334453583,
+              215.36000072956085,
+              214.6880030632019,
+              212.67199516296387,
+              214.88000452518463,
+              216.89599752426147,
+              212.67199516296387,
+              213.21600675582886,
+              211.93599700927734,
+              213.8880044221878,
+              213.34399282932281,
+              214.4639939069748,
+              212.8320038318634,
+              214.91199731826782,
+              214.9440050125122,
+              212.6079946756363,
+              214.62400257587433,
+              212.92799711227417,
+              212.79999613761902,
+              214.9440050125122,
+              212.70400285720825,
+              212.8639966249466,
+              212.79999613761902,
+              214.56000208854675,
+              211.16800606250763,
+              212.79999613761902,
+              215.87200462818146,
+              212.8320038318634,
+              215.80800414085388,
+              214.56000208854675,
+              212.6079946756363,
+              212.99199759960175,
+              211.93599700927734,
+              213.21600675582886,
+              212.79999613761902,
+              212.8639966249466,
+              214.75200355052948,
+              216.99200570583344,
+              212.44800090789795,
+              212.76800334453583,
+              215.00800549983978,
+              212.99199759960175,
+              212.09600567817688,
+              212.8639966249466,
+              212.89600431919098,
+              212.8639966249466,
+              215.7759964466095,
+              212.79999613761902,
+              212.6079946756363,
+              212.89600431919098,
+              212.64000236988068,
+              217.72800385951996,
+              212.89600431919098,
+              212.0320051908493,
+              212.70400285720825,
+              216.51199460029602,
+              212.8639966249466,
+              212.92799711227417,
+              213.02400529384613,
+              212.79999613761902,
+              215.32799303531647,
+              214.91199731826782,
+              212.5760018825531,
+              212.89600431919098,
+              213.6320024728775,
+              212.96000480651855,
+              212.73599565029144,
+              212.8639966249466,
+              212.76800334453583,
+              216.8000042438507,
+              214.6880030632019,
+              214.78399634361267,
+              212.79999613761902,
+              212.70400285720825,
+              213.53599429130554,
+              212.96000480651855,
+              212.54399418830872,
+              212.51200139522552,
+              214.7199958562851,
+              214.49600160121918,
+              214.9759978055954,
+              212.96000480651855,
+              212.47999370098114
+            ]
+          },
+          "timing_eligible": false
+        }
+      ]
+    },
+    {
+      "tp9_rank": 0,
+      "width": 384,
+      "threads": 512,
+      "environment": {
+        "B12X_W4A16_M8_CTA_THREADS": "512",
+        "B12X_W4A16_SMALL_M_SPLITK": "1",
+        "B12X_W4A16_STABLE_ROUTE_PACK": "1",
+        "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": "1",
+        "B12X_W4A16_PREFILL_FUSED_SUM": "1",
+        "B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN": "funnel",
+        "B12X_W4A16_CROSS_TILE_PREFETCH": "1",
+        "B12X_W4A16_TOKEN_MAJOR_ROTATION": "1",
+        "B12X_W4A16_TOPK_SUM_OUTPUT": "bf16"
+      },
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "torch": "2.13.0",
+      "gpu_before": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2602",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "89.33",
+          "power.limit": "325.00",
+          "temperature.gpu": "67"
+        }
+      },
+      "gpu_after": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2595",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "99.82",
+          "power.limit": "325.00",
+          "temperature.gpu": "66"
+        }
+      },
+      "runtime_weight_bytes": {
+        "384": 928994816
+      },
+      "timing_eligible": false,
+      "server_activity": {
+        "assessment": "no_activity_observed",
+        "before": {
+          "vllm:num_requests_running": 0.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 19246.0,
+          "vllm:request_success_total": 24.0
+        },
+        "after": {
+          "vllm:num_requests_running": 0.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 19246.0,
+          "vllm:request_success_total": 24.0
+        },
+        "changes": {}
+      },
+      "source_record_sha256": "c20ffa7d586fa09a9e298955d8c1f14dc2a2b0214fe2d015eedad00e1186f3a7",
+      "records": [
+        {
+          "m": 1,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.11646139621734619,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 1,
+            "routes": 16,
+            "rows_per_expert": {
+              "mean": 0.02,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 880
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 16,
+                "padded_slots": 128,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 16,
+                "padded_slots": 512,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 16,
+                "padded_slots": 768,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 16,
+                "padded_slots": 1024,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 16,
+                "padded_slots": 1536,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 16,
+                "padded_slots": 2048,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "4096572815171ad2"
+          },
+          "topk_ids_sha256": "c64732d0d7db8676",
+          "unqualified_graph_replay_us": {
+            "384": 48.1
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              53.44000086188316,
+              47.00800031423569,
+              47.00800031423569,
+              46.431999653577805,
+              46.592000871896744,
+              46.592000871896744,
+              46.560000628232956,
+              47.93599992990494,
+              48.00000041723251,
+              47.93599992990494,
+              48.09600114822388,
+              48.00000041723251,
+              48.09600114822388,
+              48.128001391887665,
+              48.19199815392494,
+              47.55200073122978,
+              46.1760014295578,
+              46.14400118589401,
+              48.25599864125252,
+              48.06400090456009,
+              48.25599864125252,
+              48.128001391887665,
+              47.74399846792221,
+              48.31999912858009,
+              48.22399839758873,
+              48.00000041723251,
+              46.911999583244324,
+              47.93599992990494,
+              48.06400090456009,
+              48.128001391887665,
+              48.25599864125252,
+              48.35199937224388,
+              48.06400090456009,
+              47.839999198913574,
+              48.06400090456009,
+              48.0320006608963,
+              48.22399839758873,
+              46.20800167322159,
+              48.19199815392494,
+              46.720001846551895,
+              48.16000163555145,
+              47.74399846792221,
+              47.32799902558327,
+              48.06400090456009,
+              48.16000163555145,
+              48.22399839758873,
+              48.16000163555145,
+              48.22399839758873,
+              48.35199937224388,
+              47.807998955249786,
+              48.128001391887665,
+              48.19199815392494,
+              48.31999912858009,
+              46.46399989724159,
+              48.06400090456009,
+              46.751998364925385,
+              48.00000041723251,
+              48.16000163555145,
+              47.29599878191948,
+              48.22399839758873,
+              48.19199815392494,
+              48.22399839758873,
+              46.49600014090538,
+              47.58400097489357,
+              48.25599864125252,
+              47.74399846792221,
+              48.06400090456009,
+              48.16000163555145,
+              48.09600114822388,
+              48.25599864125252,
+              48.287998884916306,
+              48.16000163555145,
+              48.09600114822388,
+              47.55200073122978,
+              47.42399975657463,
+              47.93599992990494,
+              48.22399839758873,
+              46.560000628232956,
+              48.31999912858009,
+              48.128001391887665,
+              48.19199815392494,
+              48.22399839758873,
+              48.25599864125252,
+              48.128001391887665,
+              48.16000163555145,
+              48.128001391887665,
+              48.128001391887665,
+              48.19199815392494,
+              46.30399867892265,
+              48.19199815392494,
+              48.38399961590767,
+              48.09600114822388,
+              48.22399839758873,
+              48.06400090456009,
+              48.287998884916306,
+              48.48000034689903,
+              48.31999912858009,
+              48.31999912858009,
+              48.0320006608963,
+              48.22399839758873
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 2,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.20334067940711975,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 2,
+            "routes": 32,
+            "rows_per_expert": {
+              "mean": 0.04,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 864
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 32,
+                "padded_slots": 256,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 32,
+                "padded_slots": 1024,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 32,
+                "padded_slots": 1536,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 32,
+                "padded_slots": 2048,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 32,
+                "padded_slots": 3072,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 32,
+                "padded_slots": 4096,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "2a22fb5b1615b222"
+          },
+          "topk_ids_sha256": "a9195b67bd8f3e3f",
+          "unqualified_graph_replay_us": {
+            "384": 68.6
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              73.53600114583969,
+              68.4799998998642,
+              68.86400282382965,
+              68.4799998998642,
+              67.35999882221222,
+              68.9919963479042,
+              68.41599941253662,
+              68.44799965620041,
+              68.38399916887283,
+              68.4799998998642,
+              68.64000111818314,
+              67.00800359249115,
+              68.44799965620041,
+              68.35199892520905,
+              68.41599941253662,
+              68.67200136184692,
+              68.80000233650208,
+              68.57600063085556,
+              68.60800087451935,
+              68.31999868154526,
+              68.4799998998642,
+              68.60800087451935,
+              68.80000233650208,
+              68.60800087451935,
+              68.4799998998642,
+              68.12799721956253,
+              68.57600063085556,
+              68.7360018491745,
+              68.76800209283829,
+              68.7360018491745,
+              68.80000233650208,
+              68.64000111818314,
+              68.76800209283829,
+              68.4799998998642,
+              68.80000233650208,
+              68.67200136184692,
+              68.64000111818314,
+              68.70400160551071,
+              68.51200014352798,
+              68.70400160551071,
+              68.83200258016586,
+              68.60800087451935,
+              68.57600063085556,
+              68.70400160551071,
+              68.70400160551071,
+              68.7360018491745,
+              68.7360018491745,
+              68.83200258016586,
+              68.83200258016586,
+              68.60800087451935,
+              68.67200136184692,
+              68.51200014352798,
+              68.64000111818314,
+              68.51200014352798,
+              68.60800087451935,
+              68.64000111818314,
+              68.60800087451935,
+              68.54400038719177,
+              68.51200014352798,
+              68.64000111818314,
+              68.31999868154526,
+              69.15199756622314,
+              68.67200136184692,
+              69.05599683523178,
+              68.54400038719177,
+              68.57600063085556,
+              68.60800087451935,
+              68.54400038719177,
+              68.60800087451935,
+              68.76800209283829,
+              68.67200136184692,
+              68.67200136184692,
+              68.7360018491745,
+              68.70400160551071,
+              68.51200014352798,
+              68.70400160551071,
+              68.00000369548798,
+              67.07199662923813,
+              68.64000111818314,
+              68.67200136184692,
+              68.7360018491745,
+              68.51200014352798,
+              66.56000018119812,
+              68.09599697589874,
+              68.4799998998642,
+              68.64000111818314,
+              68.70400160551071,
+              68.76800209283829,
+              68.7360018491745,
+              68.35199892520905,
+              68.70400160551071,
+              68.67200136184692,
+              68.7360018491745,
+              68.51200014352798,
+              66.68800115585327,
+              68.1919977068901,
+              68.60800087451935,
+              68.60800087451935,
+              68.76800209283829,
+              68.64000111818314
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 4,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.2445097416639328,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 4,
+            "routes": 64,
+            "rows_per_expert": {
+              "mean": 0.07,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 2,
+              "empty_experts": 834
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 62,
+                "padded_slots": 496,
+                "padding_fraction": 6.75,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 62,
+                "padded_slots": 1984,
+                "padding_fraction": 30.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 62,
+                "padded_slots": 2976,
+                "padding_fraction": 45.5,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 62,
+                "padded_slots": 3968,
+                "padding_fraction": 61.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 62,
+                "padded_slots": 5952,
+                "padding_fraction": 92.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 62,
+                "padded_slots": 7936,
+                "padding_fraction": 123.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "launch_attestation": {
+            "384": [
+              {
+                "symbol_sha256": "e074adfa69afa10fbefe10dd54268c9ec7f86902b72f6e9aaa4321897fc816d9",
+                "grid": [
+                  188,
+                  1,
+                  1
+                ],
+                "block": [
+                  512,
+                  1,
+                  1
+                ],
+                "registers_per_thread": 98,
+                "shared_memory_bytes": 101376
+              }
+            ]
+          },
+          "output_sha256": {
+            "384": "107804e1118ca588"
+          },
+          "topk_ids_sha256": "3f9e19f37bd72133",
+          "unqualified_graph_replay_us": {
+            "384": 117.7
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              118.75200271606445,
+              118.23999881744385,
+              118.04799735546112,
+              117.66400188207626,
+              117.53600090742111,
+              117.66400188207626,
+              118.23999881744385,
+              118.78400295972824,
+              117.72800236940384,
+              117.66400188207626,
+              117.76000261306763,
+              117.72800236940384,
+              117.53600090742111,
+              118.72000247240067,
+              117.69600212574005,
+              117.76000261306763,
+              117.8240031003952,
+              117.40799993276596,
+              117.8240031003952,
+              117.72800236940384,
+              117.79200285673141,
+              117.5680011510849,
+              117.66400188207626,
+              116.83200299739838,
+              117.8240031003952,
+              117.53600090742111,
+              117.76000261306763,
+              118.01599711179733,
+              118.20799857378006,
+              117.53600090742111,
+              117.76000261306763,
+              117.60000139474869,
+              117.76000261306763,
+              117.63200163841248,
+              117.44000017642975,
+              117.69600212574005,
+              117.47200042009354,
+              117.76000261306763,
+              117.85600334405899,
+              117.0239970088005,
+              115.74400216341019,
+              117.63200163841248,
+              117.91999638080597,
+              117.98399686813354,
+              119.52000111341476,
+              117.79200285673141,
+              117.85600334405899,
+              117.63200163841248,
+              116.35199934244156,
+              116.60800129175186,
+              117.85600334405899,
+              117.76000261306763,
+              117.44000017642975,
+              117.72800236940384,
+              117.69600212574005,
+              116.73600226640701,
+              117.85600334405899,
+              117.79200285673141,
+              117.50400066375732,
+              118.27199906110764,
+              117.72800236940384,
+              117.85600334405899,
+              117.50400066375732,
+              117.76000261306763,
+              119.03999745845795,
+              116.06399714946747,
+              117.0559972524643,
+              117.47200042009354,
+              117.3119992017746,
+              117.98399686813354,
+              118.68800222873688,
+              117.0239970088005,
+              117.8240031003952,
+              117.8240031003952,
+              117.69600212574005,
+              117.63200163841248,
+              117.88800358772278,
+              117.40799993276596,
+              117.91999638080597,
+              117.79200285673141,
+              117.72800236940384,
+              117.53600090742111,
+              117.8240031003952,
+              117.69600212574005,
+              117.76000261306763,
+              117.63200163841248,
+              117.8240031003952,
+              118.78400295972824,
+              117.76000261306763,
+              117.53600090742111,
+              117.79200285673141,
+              117.66400188207626,
+              117.50400066375732,
+              117.63200163841248,
+              117.53600090742111,
+              117.85600334405899,
+              117.69600212574005,
+              117.11999773979187,
+              117.5680011510849,
+              117.76000261306763
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 8,
+          "routing": "uniform",
+          "widths": [
+            384
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.3594430387020111,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 0.9999999403953552,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 8,
+            "routes": 128,
+            "rows_per_expert": {
+              "mean": 0.14,
+              "p50": 0.0,
+              "p90": 1.0,
+              "max": 2,
+              "empty_experts": 778
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 118,
+                "padded_slots": 944,
+                "padding_fraction": 6.375,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 118,
+                "padded_slots": 3776,
+                "padding_fraction": 28.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 118,
+                "padded_slots": 5664,
+                "padding_fraction": 43.25,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 118,
+                "padded_slots": 7552,
+                "padding_fraction": 58.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 118,
+                "padded_slots": 11328,
+                "padding_fraction": 87.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 118,
+                "padded_slots": 15104,
+                "padding_fraction": 117.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "384": "929dc887de1703f9"
+          },
+          "topk_ids_sha256": "382c4ddc5abb04a7",
+          "unqualified_graph_replay_us": {
+            "384": 220.7
+          },
+          "unqualified_graph_replay_samples_us": {
+            "384": [
+              224.83199834823608,
+              222.20799326896667,
+              221.21599316596985,
+              223.4880030155182,
+              218.75199675559998,
+              219.07199919223785,
+              218.9760059118271,
+              222.78399765491486,
+              222.91199862957,
+              219.93599832057953,
+              219.39200162887573,
+              218.62399578094482,
+              221.79199755191803,
+              220.73599696159363,
+              217.98400580883026,
+              221.343994140625,
+              221.02400660514832,
+              222.04799950122833,
+              219.55199539661407,
+              218.6560034751892,
+              218.59200298786163,
+              219.84000504016876,
+              219.61599588394165,
+              218.72000396251678,
+              218.9120054244995,
+              221.44000232219696,
+              220.2560007572174,
+              220.7999974489212,
+              219.52000260353088,
+              221.02400660514832,
+              222.84799814224243,
+              221.21599316596985,
+              221.47199511528015,
+              219.61599588394165,
+              219.00799870491028,
+              223.36000204086304,
+              220.768004655838,
+              218.9439982175827,
+              219.04000639915466,
+              221.5999960899353,
+              220.89600563049316,
+              219.61599588394165,
+              218.81599724292755,
+              221.53599560260773,
+              222.88000583648682,
+              221.0880070924759,
+              221.0559993982315,
+              219.4560021162033,
+              219.93599832057953,
+              218.9439982175827,
+              221.02400660514832,
+              220.64000368118286,
+              220.768004655838,
+              220.8320051431656,
+              219.10400688648224,
+              219.00799870491028,
+              221.40799462795258,
+              220.768004655838,
+              218.59200298786163,
+              218.62399578094482,
+              223.00800681114197,
+              220.86399793624878,
+              221.02400660514832,
+              218.49599480628967,
+              221.02400660514832,
+              221.5680032968521,
+              220.96000611782074,
+              223.77599775791168,
+              219.55199539661407,
+              219.58400309085846,
+              220.768004655838,
+              222.6880043745041,
+              218.9439982175827,
+              219.39200162887573,
+              221.53599560260773,
+              221.21599316596985,
+              223.03999960422516,
+              221.40799462795258,
+              219.7439968585968,
+              221.44000232219696,
+              219.80799734592438,
+              220.7999974489212,
+              219.52000260353088,
+              220.73599696159363,
+              220.73599696159363,
+              222.9440063238144,
+              219.64800357818604,
+              218.62399578094482,
+              220.92799842357635,
+              220.768004655838,
+              218.52800250053406,
+              218.6879962682724,
+              218.75199675559998,
+              219.90400552749634,
+              222.01600670814514,
+              218.46400201320648,
+              218.9439982175827,
+              218.78400444984436,
+              218.9120054244995,
+              223.1999933719635
+            ]
+          },
+          "timing_eligible": false
+        }
+      ]
+    },
+    {
+      "tp9_rank": 4,
+      "width": 256,
+      "threads": 256,
+      "environment": {
+        "B12X_W4A16_M8_CTA_THREADS": "256",
+        "B12X_W4A16_SMALL_M_SPLITK": "1",
+        "B12X_W4A16_STABLE_ROUTE_PACK": "1",
+        "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": "1",
+        "B12X_W4A16_PREFILL_FUSED_SUM": "1",
+        "B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN": "funnel",
+        "B12X_W4A16_CROSS_TILE_PREFETCH": "1",
+        "B12X_W4A16_TOKEN_MAJOR_ROTATION": "1",
+        "B12X_W4A16_TOPK_SUM_OUTPUT": "bf16"
+      },
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "torch": "2.13.0",
+      "gpu_before": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2550",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "241.74",
+          "power.limit": "325.00",
+          "temperature.gpu": "71"
+        }
+      },
+      "gpu_after": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2550",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "238.65",
+          "power.limit": "325.00",
+          "temperature.gpu": "72"
+        }
+      },
+      "runtime_weight_bytes": {
+        "256": 619337216
+      },
+      "timing_eligible": false,
+      "server_activity": {
+        "assessment": "service_overlap",
+        "before": {
+          "vllm:num_requests_running": 1.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 17173.0,
+          "vllm:request_success_total": 23.0
+        },
+        "after": {
+          "vllm:num_requests_running": 1.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 18148.0,
+          "vllm:request_success_total": 23.0
+        },
+        "changes": {
+          "vllm:generation_tokens_total": 975.0
+        }
+      },
+      "source_record_sha256": "ad4b60947c984a2f32aa93d298ad744cf4ad88a19f4ba966c79ef6048d740601",
+      "records": [
+        {
+          "m": 1,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.09162209182977676,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 1,
+            "routes": 16,
+            "rows_per_expert": {
+              "mean": 0.02,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 880
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 16,
+                "padded_slots": 128,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 16,
+                "padded_slots": 512,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 16,
+                "padded_slots": 768,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 16,
+                "padded_slots": 1024,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 16,
+                "padded_slots": 1536,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 16,
+                "padded_slots": 2048,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "2f37e130f40e672a"
+          },
+          "topk_ids_sha256": "c64732d0d7db8676",
+          "unqualified_graph_replay_us": {
+            "256": 46.7
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              46.78399860858917,
+              47.00800031423569,
+              46.62400111556053,
+              47.07200080156326,
+              45.184001326560974,
+              46.94399982690811,
+              46.62400111556053,
+              45.21600157022476,
+              46.911999583244324,
+              47.07200080156326,
+              46.49600014090538,
+              45.31199857592583,
+              47.200001776218414,
+              46.36799916625023,
+              46.65600135922432,
+              44.95999962091446,
+              44.704001396894455,
+              46.879999339580536,
+              46.65600135922432,
+              46.720001846551895,
+              45.21600157022476,
+              45.21600157022476,
+              45.27999833226204,
+              47.07200080156326,
+              47.32799902558327,
+              45.05600035190582,
+              46.65600135922432,
+              45.05600035190582,
+              47.29599878191948,
+              45.24800181388855,
+              46.431999653577805,
+              46.62400111556053,
+              47.07200080156326,
+              47.231998294591904,
+              46.62400111556053,
+              46.46399989724159,
+              46.879999339580536,
+              46.65600135922432,
+              46.46399989724159,
+              46.720001846551895,
+              46.592000871896744,
+              45.152001082897186,
+              47.13600128889084,
+              46.94399982690811,
+              46.65600135922432,
+              46.36799916625023,
+              46.879999339580536,
+              46.560000628232956,
+              45.08800059556961,
+              46.78399860858917,
+              46.46399989724159,
+              47.359999269247055,
+              46.78399860858917,
+              46.52800038456917,
+              46.46399989724159,
+              46.592000871896744,
+              46.560000628232956,
+              46.9760000705719,
+              46.81599885225296,
+              46.39999940991402,
+              47.29599878191948,
+              46.46399989724159,
+              46.81599885225296,
+              46.52800038456917,
+              47.231998294591904,
+              46.62400111556053,
+              47.26399853825569,
+              46.560000628232956,
+              46.62400111556053,
+              46.36799916625023,
+              46.84799909591675,
+              46.911999583244324,
+              46.65600135922432,
+              46.720001846551895,
+              47.32799902558327,
+              46.84799909591675,
+              47.00800031423569,
+              46.39999940991402,
+              47.32799902558327,
+              46.84799909591675,
+              46.560000628232956,
+              47.040000557899475,
+              46.9760000705719,
+              45.08800059556961,
+              46.39999940991402,
+              46.720001846551895,
+              45.152001082897186,
+              46.9760000705719,
+              46.62400111556053,
+              46.65600135922432,
+              45.1200008392334,
+              46.751998364925385,
+              47.29599878191948,
+              47.10400104522705,
+              44.89599913358688,
+              46.78399860858917,
+              46.65600135922432,
+              46.36799916625023,
+              45.24800181388855,
+              46.36799916625023
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 2,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.16659827530384064,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 2,
+            "routes": 32,
+            "rows_per_expert": {
+              "mean": 0.04,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 864
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 32,
+                "padded_slots": 256,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 32,
+                "padded_slots": 1024,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 32,
+                "padded_slots": 1536,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 32,
+                "padded_slots": 2048,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 32,
+                "padded_slots": 3072,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 32,
+                "padded_slots": 4096,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "bb27efbf82a3a3ee"
+          },
+          "topk_ids_sha256": "a9195b67bd8f3e3f",
+          "unqualified_graph_replay_us": {
+            "256": 59.6
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              61.08799949288368,
+              61.216000467538834,
+              59.61599946022034,
+              59.328000992536545,
+              58.62399935722351,
+              59.39200147986412,
+              59.51999872922897,
+              59.10399928689003,
+              61.055999249219894,
+              58.81600081920624,
+              59.51999872922897,
+              59.51999872922897,
+              59.20000001788139,
+              59.26400050520897,
+              59.07199904322624,
+              61.37600168585777,
+              59.328000992536545,
+              59.36000123620033,
+              61.184000223875046,
+              60.736000537872314,
+              61.055999249219894,
+              61.184000223875046,
+              59.647999703884125,
+              58.97599831223488,
+              60.80000102519989,
+              61.24800071120262,
+              59.61599946022034,
+              61.11999973654747,
+              59.61599946022034,
+              59.29600074887276,
+              59.328000992536545,
+              60.83200126886368,
+              59.58399921655655,
+              61.055999249219894,
+              59.07199904322624,
+              59.13599953055382,
+              59.07199904322624,
+              59.61599946022034,
+              59.328000992536545,
+              59.29600074887276,
+              61.02399900555611,
+              61.055999249219894,
+              59.36000123620033,
+              58.97599831223488,
+              59.487998485565186,
+              59.4559982419014,
+              59.20000001788139,
+              59.07199904322624,
+              60.95999851822853,
+              58.88000130653381,
+              61.3120011985302,
+              61.43999844789505,
+              59.328000992536545,
+              59.55199897289276,
+              61.08799949288368,
+              59.4559982419014,
+              59.039998799562454,
+              60.864001512527466,
+              60.864001512527466,
+              59.29600074887276,
+              61.28000095486641,
+              61.055999249219894,
+              61.47199869155884,
+              59.61599946022034,
+              59.007998555898666,
+              59.58399921655655,
+              61.08799949288368,
+              59.26400050520897,
+              60.70400029420853,
+              59.36000123620033,
+              59.61599946022034,
+              60.83200126886368,
+              59.007998555898666,
+              60.896001756191254,
+              59.61599946022034,
+              58.94400179386139,
+              59.58399921655655,
+              60.67200005054474,
+              61.24800071120262,
+              59.61599946022034,
+              59.20000001788139,
+              60.83200126886368,
+              58.720000088214874,
+              59.20000001788139,
+              59.10399928689003,
+              60.70400029420853,
+              59.36000123620033,
+              61.43999844789505,
+              59.36000123620033,
+              60.95999851822853,
+              59.29600074887276,
+              59.647999703884125,
+              60.80000102519989,
+              61.63199990987778,
+              60.80000102519989,
+              60.7680007815361,
+              59.26400050520897,
+              61.08799949288368,
+              60.864001512527466,
+              60.80000102519989
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 4,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.19112838804721832,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 4,
+            "routes": 64,
+            "rows_per_expert": {
+              "mean": 0.07,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 2,
+              "empty_experts": 834
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 62,
+                "padded_slots": 496,
+                "padding_fraction": 6.75,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 62,
+                "padded_slots": 1984,
+                "padding_fraction": 30.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 62,
+                "padded_slots": 2976,
+                "padding_fraction": 45.5,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 62,
+                "padded_slots": 3968,
+                "padding_fraction": 61.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 62,
+                "padded_slots": 5952,
+                "padding_fraction": 92.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 62,
+                "padded_slots": 7936,
+                "padding_fraction": 123.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "launch_attestation": {
+            "256": [
+              {
+                "symbol_sha256": "e074adfa69afa10fbefe10dd54268c9ec7f86902b72f6e9aaa4321897fc816d9",
+                "grid": [
+                  188,
+                  1,
+                  1
+                ],
+                "block": [
+                  256,
+                  1,
+                  1
+                ],
+                "registers_per_thread": 120,
+                "shared_memory_bytes": 101376
+              }
+            ]
+          },
+          "output_sha256": {
+            "256": "f36d19deec973ab3"
+          },
+          "topk_ids_sha256": "3f9e19f37bd72133",
+          "unqualified_graph_replay_us": {
+            "256": 96.2
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              98.1760025024414,
+              98.4639972448349,
+              96.47999703884125,
+              97.53599762916565,
+              95.77599912881851,
+              96.22400254011154,
+              95.551997423172,
+              95.71199864149094,
+              96.19200229644775,
+              96.3200032711029,
+              95.74399888515472,
+              96.12800180912018,
+              96.09600156545639,
+              95.93600034713745,
+              96.28800302743912,
+              95.58399766683578,
+              96.09600156545639,
+              96.3520035147667,
+              96.44799679517746,
+              97.59999811649323,
+              95.58399766683578,
+              96.09600156545639,
+              96.12800180912018,
+              96.3200032711029,
+              95.87199985980988,
+              95.93600034713745,
+              97.56799787282944,
+              95.96800059080124,
+              96.09600156545639,
+              96.38399630784988,
+              95.83999961614609,
+              96.16000205278397,
+              96.16000205278397,
+              95.93600034713745,
+              96.19200229644775,
+              95.67999839782715,
+              98.01600128412247,
+              96.38399630784988,
+              96.3520035147667,
+              96.47999703884125,
+              95.93600034713745,
+              95.551997423172,
+              96.38399630784988,
+              96.25600278377533,
+              96.09600156545639,
+              96.3200032711029,
+              96.3200032711029,
+              96.19200229644775,
+              96.28800302743912,
+              96.12800180912018,
+              96.28800302743912,
+              96.41599655151367,
+              96.41599655151367,
+              95.58399766683578,
+              95.87199985980988,
+              95.74399888515472,
+              97.72799909114838,
+              98.1760025024414,
+              98.08000177145004,
+              95.93600034713745,
+              96.22400254011154,
+              95.64799815416336,
+              95.8079993724823,
+              97.6639986038208,
+              96.22400254011154,
+              96.03200107812881,
+              97.63199836015701,
+              95.74399888515472,
+              96.38399630784988,
+              96.12800180912018,
+              95.96800059080124,
+              95.51999717950821,
+              98.08000177145004,
+              96.44799679517746,
+              98.4639972448349,
+              95.93600034713745,
+              95.74399888515472,
+              97.95200079679489,
+              97.63199836015701,
+              96.3200032711029,
+              95.96800059080124,
+              97.59999811649323,
+              95.77599912881851,
+              96.41599655151367,
+              96.16000205278397,
+              96.09600156545639,
+              95.551997423172,
+              95.61599791049957,
+              97.59999811649323,
+              96.3520035147667,
+              95.96800059080124,
+              96.09600156545639,
+              96.44799679517746,
+              97.56799787282944,
+              96.38399630784988,
+              95.74399888515472,
+              97.63199836015701,
+              95.83999961614609,
+              95.58399766683578,
+              96.25600278377533
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 8,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.2903633415699005,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 8,
+            "routes": 128,
+            "rows_per_expert": {
+              "mean": 0.14,
+              "p50": 0.0,
+              "p90": 1.0,
+              "max": 2,
+              "empty_experts": 778
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 118,
+                "padded_slots": 944,
+                "padding_fraction": 6.375,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 118,
+                "padded_slots": 3776,
+                "padding_fraction": 28.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 118,
+                "padded_slots": 5664,
+                "padding_fraction": 43.25,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 118,
+                "padded_slots": 7552,
+                "padding_fraction": 58.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 118,
+                "padded_slots": 11328,
+                "padding_fraction": 87.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 118,
+                "padded_slots": 15104,
+                "padding_fraction": 117.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "c84ec02c3ce0b164"
+          },
+          "topk_ids_sha256": "382c4ddc5abb04a7",
+          "unqualified_graph_replay_us": {
+            "256": 164.0
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              165.47200083732605,
+              165.3759926557541,
+              165.27999937534332,
+              165.3439998626709,
+              165.6000018119812,
+              163.87200355529785,
+              163.29599916934967,
+              165.72800278663635,
+              163.83999586105347,
+              165.98400473594666,
+              163.90399634838104,
+              165.92000424861908,
+              164.06400501728058,
+              163.7759953737259,
+              163.4880006313324,
+              163.7759953737259,
+              163.32800686359406,
+              165.92000424861908,
+              163.39200735092163,
+              165.21599888801575,
+              163.90399634838104,
+              165.6000018119812,
+              163.7759953737259,
+              163.455992937088,
+              163.10399770736694,
+              165.6000018119812,
+              163.42400014400482,
+              165.43999314308167,
+              163.42400014400482,
+              165.3120070695877,
+              162.04799711704254,
+              165.8560037612915,
+              165.72800278663635,
+              163.96799683570862,
+              165.66400229930878,
+              164.0319973230362,
+              163.42400014400482,
+              165.15199840068817,
+              165.8879965543747,
+              163.35999965667725,
+              165.27999937534332,
+              163.80800306797028,
+              165.27999937534332,
+              163.32800686359406,
+              163.68000209331512,
+              163.5199934244156,
+              163.96799683570862,
+              165.18400609493256,
+              165.24800658226013,
+              165.6319946050644,
+              163.35999965667725,
+              163.29599916934967,
+              163.83999586105347,
+              163.10399770736694,
+              164.06400501728058,
+              163.455992937088,
+              163.7440025806427,
+              163.55200111865997,
+              165.82399606704712,
+              163.39200735092163,
+              165.3759926557541,
+              163.80800306797028,
+              165.53600132465363,
+              163.26400637626648,
+              165.95199704170227,
+              163.32800686359406,
+              165.92000424861908,
+              163.71199488639832,
+              165.21599888801575,
+              163.5199934244156,
+              165.15199840068817,
+              164.0319973230362,
+              165.3120070695877,
+              163.71199488639832,
+              165.27999937534332,
+              165.40800034999847,
+              165.79200327396393,
+              165.8560037612915,
+              163.7759953737259,
+              165.3759926557541,
+              165.98400473594666,
+              163.83999586105347,
+              163.90399634838104,
+              165.47200083732605,
+              163.64799439907074,
+              165.6319946050644,
+              163.26400637626648,
+              163.39200735092163,
+              163.71199488639832,
+              164.000004529953,
+              165.56799411773682,
+              165.40800034999847,
+              163.96799683570862,
+              167.1999990940094,
+              164.0319973230362,
+              163.90399634838104,
+              164.000004529953,
+              165.21599888801575,
+              165.8879965543747,
+              163.7759953737259
+            ]
+          },
+          "timing_eligible": false
+        }
+      ]
+    },
+    {
+      "tp9_rank": 4,
+      "width": 256,
+      "threads": 512,
+      "environment": {
+        "B12X_W4A16_M8_CTA_THREADS": "512",
+        "B12X_W4A16_SMALL_M_SPLITK": "1",
+        "B12X_W4A16_STABLE_ROUTE_PACK": "1",
+        "B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM": "1",
+        "B12X_W4A16_PREFILL_FUSED_SUM": "1",
+        "B12X_SQG_XOR_CHEB_T12_DECODE_CHAIN": "funnel",
+        "B12X_W4A16_CROSS_TILE_PREFETCH": "1",
+        "B12X_W4A16_TOKEN_MAJOR_ROTATION": "1",
+        "B12X_W4A16_TOPK_SUM_OUTPUT": "bf16"
+      },
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "torch": "2.13.0",
+      "gpu_before": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2550",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "244.05",
+          "power.limit": "325.00",
+          "temperature.gpu": "72"
+        }
+      },
+      "gpu_after": {
+        "command": [
+          "nvidia-smi",
+          "--query-gpu=index,uuid,pstate,persistence_mode,compute_mode,clocks.current.sm,clocks.current.memory,clocks_throttle_reasons.active,power.draw,power.limit,temperature.gpu",
+          "--format=csv,noheader,nounits"
+        ],
+        "available": true,
+        "fields": {
+          "index": "0",
+          "pstate": "P1",
+          "persistence_mode": "Disabled",
+          "compute_mode": "Default",
+          "clocks.current.sm": "2550",
+          "clocks.current.memory": "16365",
+          "clocks_throttle_reasons.active": "0x0000000000000000",
+          "power.draw": "241.90",
+          "power.limit": "325.00",
+          "temperature.gpu": "73"
+        }
+      },
+      "runtime_weight_bytes": {
+        "256": 619337216
+      },
+      "timing_eligible": false,
+      "server_activity": {
+        "assessment": "service_overlap",
+        "before": {
+          "vllm:num_requests_running": 1.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 18148.0,
+          "vllm:request_success_total": 23.0
+        },
+        "after": {
+          "vllm:num_requests_running": 1.0,
+          "vllm:num_requests_waiting": 0.0,
+          "vllm:prompt_tokens_total": 942477.0,
+          "vllm:generation_tokens_total": 18930.0,
+          "vllm:request_success_total": 23.0
+        },
+        "changes": {
+          "vllm:generation_tokens_total": 782.0
+        }
+      },
+      "source_record_sha256": "d4463cfed0a128c348a383c386bbc05b09b2bc6ee5df4387013f64c5e9eea1d6",
+      "records": [
+        {
+          "m": 1,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.09162209182977676,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 1,
+            "routes": 16,
+            "rows_per_expert": {
+              "mean": 0.02,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 880
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 16,
+                "padded_slots": 128,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 16,
+                "padded_slots": 512,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 16,
+                "padded_slots": 768,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 16,
+                "padded_slots": 1024,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 16,
+                "padded_slots": 1536,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 16,
+                "padded_slots": 2048,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9821,
+                  "1": 0.0179,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "2f37e130f40e672a"
+          },
+          "topk_ids_sha256": "c64732d0d7db8676",
+          "unqualified_graph_replay_us": {
+            "256": 44.8
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              44.64000090956688,
+              44.319998472929,
+              44.51199993491173,
+              44.35199871659279,
+              44.35199871659279,
+              44.92799937725067,
+              45.184001326560974,
+              44.64000090956688,
+              45.31199857592583,
+              45.08800059556961,
+              44.89599913358688,
+              44.576000422239304,
+              45.1200008392334,
+              45.24800181388855,
+              44.89599913358688,
+              45.05600035190582,
+              44.83199864625931,
+              44.73600164055824,
+              44.64000090956688,
+              44.863998889923096,
+              44.89599913358688,
+              44.35199871659279,
+              45.1200008392334,
+              44.89599913358688,
+              44.415999203920364,
+              44.79999840259552,
+              44.79999840259552,
+              44.704001396894455,
+              45.024000108242035,
+              44.576000422239304,
+              45.21600157022476,
+              44.704001396894455,
+              44.863998889923096,
+              45.184001326560974,
+              44.95999962091446,
+              45.152001082897186,
+              44.38399896025658,
+              44.319998472929,
+              44.415999203920364,
+              44.67200115323067,
+              44.60800066590309,
+              45.05600035190582,
+              44.83199864625931,
+              44.60800066590309,
+              44.60800066590309,
+              44.47999969124794,
+              44.64000090956688,
+              44.863998889923096,
+              45.1200008392334,
+              44.44799944758415,
+              44.35199871659279,
+              45.152001082897186,
+              45.024000108242035,
+              44.47999969124794,
+              44.47999969124794,
+              44.79999840259552,
+              44.35199871659279,
+              44.60800066590309,
+              45.05600035190582,
+              45.21600157022476,
+              44.28799822926521,
+              45.31199857592583,
+              45.184001326560974,
+              45.1200008392334,
+              44.35199871659279,
+              44.67200115323067,
+              44.60800066590309,
+              45.1200008392334,
+              44.47999969124794,
+              44.92799937725067,
+              45.21600157022476,
+              44.79999840259552,
+              45.184001326560974,
+              44.319998472929,
+              45.184001326560974,
+              44.92799937725067,
+              44.92799937725067,
+              45.024000108242035,
+              44.89599913358688,
+              44.64000090956688,
+              44.67200115323067,
+              44.44799944758415,
+              44.28799822926521,
+              44.38399896025658,
+              44.35199871659279,
+              45.21600157022476,
+              45.31199857592583,
+              45.1200008392334,
+              45.184001326560974,
+              45.184001326560974,
+              44.47999969124794,
+              45.152001082897186,
+              45.024000108242035,
+              44.863998889923096,
+              44.79999840259552,
+              44.44799944758415,
+              44.95999962091446,
+              44.76799815893173,
+              44.79999840259552,
+              44.576000422239304
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 2,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.16659827530384064,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 2,
+            "routes": 32,
+            "rows_per_expert": {
+              "mean": 0.04,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 1,
+              "empty_experts": 864
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 32,
+                "padded_slots": 256,
+                "padding_fraction": 7.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 32,
+                "padded_slots": 1024,
+                "padding_fraction": 31.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 32,
+                "padded_slots": 1536,
+                "padding_fraction": 47.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 32,
+                "padded_slots": 2048,
+                "padding_fraction": 63.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 32,
+                "padded_slots": 3072,
+                "padding_fraction": 95.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 32,
+                "padded_slots": 4096,
+                "padding_fraction": 127.0,
+                "experts_needing": {
+                  "0": 0.9643,
+                  "1": 0.0357,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "bb27efbf82a3a3ee"
+          },
+          "topk_ids_sha256": "a9195b67bd8f3e3f",
+          "unqualified_graph_replay_us": {
+            "256": 61.0
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              61.43999844789505,
+              61.535999178886414,
+              61.664000153541565,
+              61.11999973654747,
+              61.11999973654747,
+              60.99199876189232,
+              61.63199990987778,
+              61.63199990987778,
+              61.3120011985302,
+              60.67200005054474,
+              60.83200126886368,
+              59.4559982419014,
+              61.11999973654747,
+              59.487998485565186,
+              60.83200126886368,
+              61.184000223875046,
+              60.67200005054474,
+              60.896001756191254,
+              61.535999178886414,
+              61.24800071120262,
+              60.864001512527466,
+              59.007998555898666,
+              61.63199990987778,
+              61.184000223875046,
+              59.328000992536545,
+              61.59999966621399,
+              61.24800071120262,
+              61.664000153541565,
+              60.67200005054474,
+              61.15199998021126,
+              60.99199876189232,
+              60.80000102519989,
+              60.95999851822853,
+              60.70400029420853,
+              61.15199998021126,
+              61.055999249219894,
+              60.80000102519989,
+              59.61599946022034,
+              61.3120011985302,
+              61.5679994225502,
+              61.47199869155884,
+              61.08799949288368,
+              61.43999844789505,
+              60.864001512527466,
+              60.80000102519989,
+              60.70400029420853,
+              58.78400057554245,
+              60.7680007815361,
+              60.95999851822853,
+              61.664000153541565,
+              60.92799827456474,
+              59.61599946022034,
+              61.40799820423126,
+              60.92799827456474,
+              60.736000537872314,
+              59.647999703884125,
+              60.70400029420853,
+              61.63199990987778,
+              60.736000537872314,
+              61.69600039720535,
+              61.3120011985302,
+              61.15199998021126,
+              61.184000223875046,
+              61.08799949288368,
+              59.55199897289276,
+              60.70400029420853,
+              59.487998485565186,
+              60.896001756191254,
+              61.664000153541565,
+              61.055999249219894,
+              60.864001512527466,
+              60.95999851822853,
+              60.67200005054474,
+              59.487998485565186,
+              61.40799820423126,
+              60.896001756191254,
+              60.896001756191254,
+              60.67200005054474,
+              61.11999973654747,
+              61.37600168585777,
+              61.5679994225502,
+              59.36000123620033,
+              60.70400029420853,
+              60.70400029420853,
+              59.61599946022034,
+              60.83200126886368,
+              61.43999844789505,
+              59.36000123620033,
+              61.184000223875046,
+              61.216000467538834,
+              61.3120011985302,
+              60.864001512527466,
+              60.864001512527466,
+              60.896001756191254,
+              60.95999851822853,
+              61.344001442193985,
+              61.216000467538834,
+              61.37600168585777,
+              61.535999178886414,
+              59.55199897289276
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 4,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.19112838804721832,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0000001192092896,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 4,
+            "routes": 64,
+            "rows_per_expert": {
+              "mean": 0.07,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 2,
+              "empty_experts": 834
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 62,
+                "padded_slots": 496,
+                "padding_fraction": 6.75,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 62,
+                "padded_slots": 1984,
+                "padding_fraction": 30.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 62,
+                "padded_slots": 2976,
+                "padding_fraction": 45.5,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 62,
+                "padded_slots": 3968,
+                "padding_fraction": 61.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 62,
+                "padded_slots": 5952,
+                "padding_fraction": 92.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 62,
+                "padded_slots": 7936,
+                "padding_fraction": 123.0,
+                "experts_needing": {
+                  "0": 0.9308,
+                  "1": 0.0692,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "launch_attestation": {
+            "256": [
+              {
+                "symbol_sha256": "e074adfa69afa10fbefe10dd54268c9ec7f86902b72f6e9aaa4321897fc816d9",
+                "grid": [
+                  188,
+                  1,
+                  1
+                ],
+                "block": [
+                  512,
+                  1,
+                  1
+                ],
+                "registers_per_thread": 100,
+                "shared_memory_bytes": 101376
+              }
+            ]
+          },
+          "output_sha256": {
+            "256": "f36d19deec973ab3"
+          },
+          "topk_ids_sha256": "3f9e19f37bd72133",
+          "unqualified_graph_replay_us": {
+            "256": 97.9
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              99.61599856615067,
+              97.59999811649323,
+              98.1760025024414,
+              98.08000177145004,
+              97.88800030946732,
+              98.30400347709656,
+              97.63199836015701,
+              98.30400347709656,
+              97.88800030946732,
+              98.2080027461052,
+              97.75999933481216,
+              98.27200323343277,
+              97.79199957847595,
+              98.55999797582626,
+              97.9200005531311,
+              98.49599748849869,
+              97.79199957847595,
+              97.9200005531311,
+              98.43199700117111,
+              97.85600006580353,
+              98.27200323343277,
+              96.16000205278397,
+              97.85600006580353,
+              98.24000298976898,
+              98.33600372076035,
+              96.00000083446503,
+              98.33600372076035,
+              98.30400347709656,
+              98.11200201511383,
+              98.30400347709656,
+              97.72799909114838,
+              97.95200079679489,
+              98.01600128412247,
+              96.47999703884125,
+              98.33600372076035,
+              98.27200323343277,
+              98.33600372076035,
+              98.39999675750732,
+              96.47999703884125,
+              97.88800030946732,
+              96.44799679517746,
+              98.30400347709656,
+              96.25600278377533,
+              97.6639986038208,
+              98.11200201511383,
+              98.39999675750732,
+              97.63199836015701,
+              96.44799679517746,
+              98.27200323343277,
+              98.11200201511383,
+              97.82399982213974,
+              98.2080027461052,
+              98.1760025024414,
+              98.49599748849869,
+              97.82399982213974,
+              96.47999703884125,
+              97.85600006580353,
+              97.56799787282944,
+              97.69599884748459,
+              98.27200323343277,
+              98.4639972448349,
+              98.33600372076035,
+              96.38399630784988,
+              98.24000298976898,
+              97.95200079679489,
+              97.59999811649323,
+              98.11200201511383,
+              96.44799679517746,
+              97.9200005531311,
+              97.88800030946732,
+              97.69599884748459,
+              98.30400347709656,
+              98.2080027461052,
+              98.2080027461052,
+              97.56799787282944,
+              97.63199836015701,
+              96.28800302743912,
+              96.41599655151367,
+              97.79199957847595,
+              97.63199836015701,
+              98.11200201511383,
+              98.49599748849869,
+              95.93600034713745,
+              97.63199836015701,
+              97.88800030946732,
+              97.85600006580353,
+              97.82399982213974,
+              97.59999811649323,
+              97.69599884748459,
+              97.6639986038208,
+              97.69599884748459,
+              98.49599748849869,
+              98.2080027461052,
+              98.04800152778625,
+              98.49599748849869,
+              96.38399630784988,
+              98.11200201511383,
+              98.01600128412247,
+              98.24000298976898,
+              97.82399982213974
+            ]
+          },
+          "timing_eligible": false
+        },
+        {
+          "m": 8,
+          "routing": "uniform",
+          "widths": [
+            256
+          ],
+          "finite": true,
+          "output_dtype": "torch.bfloat16",
+          "reference_norm": 0.2903633415699005,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "cosine": 1.0,
+          "graph_eager_exact": true,
+          "block_m": 8,
+          "routing_histogram": {
+            "tokens": 8,
+            "routes": 128,
+            "rows_per_expert": {
+              "mean": 0.14,
+              "p50": 0.0,
+              "p90": 1.0,
+              "max": 2,
+              "empty_experts": 778
+            },
+            "blocks": {
+              "8": {
+                "total_blocks": 118,
+                "padded_slots": 944,
+                "padding_fraction": 6.375,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "32": {
+                "total_blocks": 118,
+                "padded_slots": 3776,
+                "padding_fraction": 28.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "48": {
+                "total_blocks": 118,
+                "padded_slots": 5664,
+                "padding_fraction": 43.25,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "64": {
+                "total_blocks": 118,
+                "padded_slots": 7552,
+                "padding_fraction": 58.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "96": {
+                "total_blocks": 118,
+                "padded_slots": 11328,
+                "padding_fraction": 87.5,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              },
+              "128": {
+                "total_blocks": 118,
+                "padded_slots": 15104,
+                "padding_fraction": 117.0,
+                "experts_needing": {
+                  "0": 0.8683,
+                  "1": 0.1317,
+                  "2": 0.0,
+                  "3": 0.0,
+                  "4+": 0.0
+                }
+              }
+            }
+          },
+          "output_sha256": {
+            "256": "c84ec02c3ce0b164"
+          },
+          "topk_ids_sha256": "382c4ddc5abb04a7",
+          "unqualified_graph_replay_us": {
+            "256": 168.0
+          },
+          "unqualified_graph_replay_samples_us": {
+            "256": [
+              169.27999258041382,
+              167.29600727558136,
+              169.66399550437927,
+              167.9999977350235,
+              167.23200678825378,
+              167.29600727558136,
+              169.8240041732788,
+              166.01599752902985,
+              167.7439957857132,
+              167.1999990940094,
+              167.26399958133698,
+              169.21600699424744,
+              167.52000153064728,
+              168.03200542926788,
+              167.77600347995758,
+              167.1680063009262,
+              167.67999529838562,
+              167.93599724769592,
+              167.4560010433197,
+              168.03200542926788,
+              169.40799355506897,
+              167.4560010433197,
+              169.76000368595123,
+              168.03200542926788,
+              169.5999950170517,
+              167.9999977350235,
+              167.90400445461273,
+              167.39200055599213,
+              168.06399822235107,
+              167.26399958133698,
+              167.80799627304077,
+              168.19199919700623,
+              169.66399550437927,
+              167.87199676036835,
+              169.3120002746582,
+              167.29600727558136,
+              169.76000368595123,
+              167.52000153064728,
+              167.7439957857132,
+              167.87199676036835,
+              168.06399822235107,
+              167.42399334907532,
+              168.06399822235107,
+              170.04799842834473,
+              167.23200678825378,
+              169.63200271129608,
+              167.90400445461273,
+              167.4560010433197,
+              167.58400201797485,
+              168.12799870967865,
+              167.9999977350235,
+              167.1999990940094,
+              168.03200542926788,
+              167.29600727558136,
+              167.9999977350235,
+              167.35999286174774,
+              167.64800250530243,
+              167.4879938364029,
+              167.32800006866455,
+              167.29600727558136,
+              168.03200542926788,
+              167.9999977350235,
+              167.39200055599213,
+              170.04799842834473,
+              168.19199919700623,
+              169.37600076198578,
+              168.03200542926788,
+              169.66399550437927,
+              168.09600591659546,
+              167.9999977350235,
+              167.1999990940094,
+              169.98399794101715,
+              167.67999529838562,
+              166.1120057106018,
+              169.40799355506897,
+              167.64800250530243,
+              169.5680022239685,
+              170.1440066099167,
+              169.40799355506897,
+              168.12799870967865,
+              167.9680049419403,
+              169.40799355506897,
+              167.9680049419403,
+              167.4560010433197,
+              168.03200542926788,
+              169.37600076198578,
+              168.03200542926788,
+              167.1999990940094,
+              167.39200055599213,
+              168.09600591659546,
+              168.09600591659546,
+              168.03200542926788,
+              169.24799978733063,
+              165.8560037612915,
+              167.61599481105804,
+              167.4560010433197,
+              168.03200542926788,
+              165.95199704170227,
+              169.66399550437927,
+              166.1120057106018
+            ]
+          },
+          "timing_eligible": false
+        }
+      ]
+    }
+  ]
+}

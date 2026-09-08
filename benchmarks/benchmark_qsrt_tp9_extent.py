@@ -24,6 +24,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import NamedTuple
+import urllib.request
 
 import torch
 
@@ -38,6 +39,50 @@ HIDDEN = 3584
 # spans below (32), around (48, 64) and above (96, 128) the 82 rows per expert
 # that a 4,608-token chunk routes at 896 experts and top-k 16.
 _HISTOGRAM_BLOCKS = (32, 48, 64, 96, 128)
+
+
+def snapshot_server_activity(metrics_url: str | None) -> dict[str, float] | None:
+    """Read vLLM request counters when a GPU is shared with a serving process."""
+    if metrics_url is None:
+        return None
+    with urllib.request.urlopen(metrics_url, timeout=10) as response:
+        text = response.read().decode()
+    prefixes = (
+        "vllm:num_requests_running{", "vllm:num_requests_waiting{",
+        "vllm:request_success_total{", "vllm:generation_tokens_total{",
+        "vllm:prompt_tokens_total{",
+    )
+    return {
+        line.rsplit(" ", 1)[0]: float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines() if line.startswith(prefixes)
+    }
+
+
+def classify_server_activity(
+    before: dict[str, float] | None, after: dict[str, float] | None
+) -> dict:
+    """Separate observed service overlap from an unobserved or quiet endpoint."""
+    required = ("vllm:num_requests_running{", "vllm:generation_tokens_total{")
+    if before is None or after is None or any(
+        not any(key.startswith(prefix) for key in sample)
+        for sample in (before, after) for prefix in required
+    ):
+        return {"assessment": "not_observed", "timing_eligible": None}
+    busy = any(
+        value > 0
+        for sample in (before, after) for key, value in sample.items()
+        if key.startswith(("vllm:num_requests_running{", "vllm:num_requests_waiting{"))
+    )
+    changes = {
+        key: after.get(key, 0) - before.get(key, 0)
+        for key in before.keys() | after.keys()
+        if after.get(key, 0) != before.get(key, 0)
+    }
+    return {
+        "assessment": "service_overlap" if busy or changes else "no_activity_observed",
+        "timing_eligible": not busy and not changes,
+        "counter_changes": changes,
+    }
 
 
 def _uniform_topk_ids(m: int, device: torch.device) -> torch.Tensor:
@@ -170,6 +215,7 @@ def main():
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile-m4", action="store_true")
+    parser.add_argument("--server-metrics-url", help="Optional vLLM /metrics URL for detecting shared-GPU serving activity")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--block-m", type=int, default=8, choices=(8, 32, 48, 64, 96, 128))
     parser.add_argument(
@@ -272,6 +318,7 @@ def main():
         if kind != "zipf" or not value:
             raise ValueError("--routing must be 'uniform' or 'zipf:<s>'")
         zipf_exponent = float(value)
+    server_before = snapshot_server_activity(args.server_metrics_url)
     gpu_before = nvidia_smi_gpu_mode_snapshot()
     runtimes = {}
     widths = tuple(int(value) for value in args.widths.split(","))
@@ -458,6 +505,7 @@ def main():
         ).hexdigest()[:16]
         records.append(record)
         print(json.dumps(record), flush=True)
+    server_after = snapshot_server_activity(args.server_metrics_url)
     result = {
         "status": "research-only",
         "layer": args.layer,
@@ -471,6 +519,9 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "gpu_before": gpu_before,
         "gpu_after": nvidia_smi_gpu_mode_snapshot(),
+        "server_before": server_before,
+        "server_after": server_after,
+        "server_activity": classify_server_activity(server_before, server_after),
         "torch": torch.__version__,
         "runtime_weight_bytes": {str(w): values[-1] for w, values in runtimes.items()},
         "records": records,

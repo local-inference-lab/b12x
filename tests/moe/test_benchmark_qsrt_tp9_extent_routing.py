@@ -8,12 +8,30 @@ import torch
 from benchmarks.benchmark_qsrt_tp9_extent import (
     NUM_EXPERTS,
     TOP_K,
+    classify_server_activity,
     _HISTOGRAM_BLOCKS,
     _load_topk_ids,
     _routing_histogram,
     _uniform_topk_ids,
     _zipf_topk_ids,
 )
+
+
+@pytest.mark.parametrize(
+    "running,generated,expected",
+    [(0, 100, True), (1, 100, False), (0, 101, False)],
+)
+def test_activity_report_rejects_other_serving_work(running, generated, expected):
+    before = {"vllm:num_requests_running{engine=\"0\"}": 0,
+              "vllm:generation_tokens_total{engine=\"0\"}": 100}
+    after = {"vllm:num_requests_running{engine=\"0\"}": running,
+             "vllm:generation_tokens_total{engine=\"0\"}": generated}
+    assert classify_server_activity(before, after)["timing_eligible"] is expected
+
+
+def test_missing_activity_counters_do_not_assert_an_idle_gpu():
+    assert classify_server_activity(None, None)["timing_eligible"] is None
+    assert classify_server_activity({}, {})["timing_eligible"] is None
 
 
 def _expected_blocks(ids: torch.Tensor, block: int) -> int:
