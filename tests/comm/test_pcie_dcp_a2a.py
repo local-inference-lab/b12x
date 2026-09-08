@@ -263,7 +263,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_all_gather_heads,
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
         ),
     )
     for launcher, identity, version in identities:
@@ -615,6 +615,42 @@ def test_runtime_validates_and_dispatches_to_cute_plan():
     )
     runtime.close()
     assert runtime._closed
+
+
+@pytest.mark.parametrize("dtype", [
+    torch.float16, torch.bfloat16, torch.float8_e4m3fn
+])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_query_gather_preserves_caller_padding(dtype, batch):
+    runtime = _make_runtime()
+    local = torch.arange(batch * 16 * 64).remainder(97).reshape(batch, 16, 64).to(dtype)
+    storage = torch.full((batch, 40, 64), 7, dtype=dtype)
+    out = storage[:, :32]
+
+    assert PCIeDCPA2APool.supports_all_gather_heads_output(out)
+    assert runtime.all_gather_heads(local, out) is out
+    torch.testing.assert_close(
+        out.view(torch.uint8),
+        torch.cat((local, local), dim=1).view(torch.uint8),
+        rtol=0, atol=0,
+    )
+    assert torch.all(storage[:, 32:].float() == 7)
+
+
+@pytest.mark.parametrize("layout", ["overlap", "inner_stride", "unaligned"])
+def test_query_gather_rejects_unsupported_output_before_launch(layout):
+    runtime = _make_runtime()
+    local = torch.zeros(4, 16, 64, dtype=torch.bfloat16)
+    if layout == "overlap":
+        out = torch.empty(1, 32, 64, dtype=local.dtype).expand(4, -1, -1)
+    elif layout == "inner_stride":
+        out = torch.empty(4, 32, 128, dtype=local.dtype)[:, :, ::2]
+    else:
+        out = torch.empty(4 * 32 * 64 + 1, dtype=local.dtype)[1:].view(4, 32, 64)
+    assert not PCIeDCPA2APool.supports_all_gather_heads_output(out)
+    with pytest.raises(ValueError, match="aligned, non-overlapping batch rows"):
+        runtime.all_gather_heads(local, out)
+    assert not runtime.run_calls
 
 
 def test_first_capture_freezes_the_next_eager_slot_as_graph_base(monkeypatch) -> None:
@@ -1674,6 +1710,24 @@ def test_kernel_wrappers_forward_the_push_flag_to_both_launcher_variants(
     assert len(launched) == 2
 
 
+@pytest.mark.parametrize("stride_bytes", [0, 112 * 656, (1 << 35) + 16])
+def test_query_gather_launch_keeps_stride_packs_int64(monkeypatch, stride_bytes):
+    """Preserve the ABI even when the stride exceeds 2^31 sixteen-byte packs."""
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    calls = []
+    monkeypatch.setattr(kernels, "b12x_compile", lambda *a, **k: lambda *v: calls.append(v))
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(kernels, "_PREPARED_GATHER_LAUNCHERS", set())
+    factory = getattr(kernels._get_compiled_all_gather_heads, "__wrapped__",
+                      kernels._get_compiled_all_gather_heads)
+    run = factory(9, 0, 256, True)
+    run(16, 32, (16,) * 9, (32,) * 9, 4, 11, 656, 1, stride_bytes, 1, 16)
+    stride = calls[0][-4]
+    assert isinstance(stride, kernels.Int64)
+    assert int(stride) == (stride_bytes or 99 * 656) // 16
+
+
 def test_launcher_keys_and_compile_specs_carry_the_transport() -> None:
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
@@ -1748,7 +1802,7 @@ def test_push_gather_kernel_writes_output_rows_to_peers_and_copies_out_locally()
     push_read = read_phase.split("if cutlass.const_expr(self._push):", 1)[1]
     push_read = push_read.split("else:", 1)[0]
     assert "if source_rank != Int32(self._rank):" in push_read
-    assert "(local_stage + output_base * Int64(4)).toint()" in push_read
+    assert "(local_stage + staging_base * Int64(4)).toint()" in push_read
     assert "staging[source]" not in push_read
 
 
@@ -2242,4 +2296,3 @@ def test_pair_transport_override_reaches_pair_prepare(monkeypatch) -> None:
     # The pair prepares with pull while the head gather keeps push.
     assert calls == [(2, 0, 512, True, False, False), (2, 0, 256, True, True)]
     runtime.close()
-

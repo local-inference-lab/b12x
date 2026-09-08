@@ -78,6 +78,24 @@ _SIGNAL_BYTES = (
 ) * 4
 
 
+def _supports_all_gather_heads_output(out: torch.Tensor) -> bool:
+    """Accept packed heads with aligned, non-overlapping batch rows."""
+    if out.ndim != 3 or out.dtype not in SUPPORTED_GATHER_DTYPES:
+        return False
+    batch, heads, head_dim = out.shape
+    if min(batch, heads, head_dim) <= 0:
+        return False
+    element_size = out.element_size()
+    if out.data_ptr() % 16 or head_dim * element_size % 16:
+        return False
+    if out.stride(2) != 1 or (heads > 1 and out.stride(1) != head_dim):
+        return False
+    return batch == 1 or (
+        out.stride(0) >= heads * head_dim
+        and out.stride(0) * element_size % 16 == 0
+    )
+
+
 def _env_int(name: str, fallback: int) -> int:
     raw = os.getenv(name)
     if not raw:
@@ -1173,7 +1191,11 @@ class PCIeDCPA2A:
         threads: int = 256,
         block_limit: int = 16,
     ) -> torch.Tensor:
-        """Gather rank-local heads into a rank-major head dimension."""
+        """Gather rank-local heads; output batch rows may include padding.
+
+        Heads and their elements must be contiguous within each batch row.
+        Padding belongs to the caller and is not written by the collective.
+        """
         with _device_guard(self.device):
             return self._all_gather_heads_on_device(
                 local_input,
@@ -1224,8 +1246,10 @@ class PCIeDCPA2A:
             raise ValueError(
                 f"output shape must be {expected_out}, got {tuple(out.shape)}"
             )
-        if not out.is_contiguous():
-            raise ValueError("output must be contiguous")
+        if not _supports_all_gather_heads_output(out):
+            raise ValueError(
+                "output must have packed heads and aligned, non-overlapping batch rows"
+            )
         if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
             raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(
@@ -1296,6 +1320,10 @@ class PCIeDCPA2A:
                 local_heads=self.heads_per_rank,
                 head_dim=self.query_head_dim,
                 element_size=local_input.element_size(),
+                output_batch_stride_bytes=(
+                    int(out.stride(0)) * out.element_size()
+                    if out.shape[0] > 1 else 0
+                ),
                 device_slot_selection=device_slot_selection,
                 slot_delta_bytes=(
                     self._slot_bytes if slot == 0 else -self._slot_bytes
@@ -1867,6 +1895,15 @@ class PCIeDCPA2A:
 
 class PCIeDCPA2APool:
     """Create an independent DCP collective channel for each CUDA stream."""
+
+    @staticmethod
+    def supports_all_gather_heads_output(out: torch.Tensor) -> bool:
+        """Whether the gather can write this layout without an intermediate.
+
+        Shape, device and dtype must also match the channel and input.
+        This predicate only inspects tensor metadata; it launches no work.
+        """
+        return _supports_all_gather_heads_output(out)
 
     def __init__(
         self,

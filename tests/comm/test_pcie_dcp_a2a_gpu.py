@@ -332,6 +332,17 @@ def _check_eager(
                 dim=1,
             )
             torch.testing.assert_close(gathered_q, expected_q, rtol=0, atol=0)
+            if batch == 4:
+                storage = torch.full(
+                    (batch, TOTAL_HEADS + 13, QUERY_HEAD_DIM), 7,
+                    dtype=dtype, device=device,
+                )
+                padded = storage[:, :TOTAL_HEADS]
+                assert pool.all_gather_heads(
+                    local_q, out=padded, channel_id="eager:dcp"
+                ) is padded
+                torch.testing.assert_close(padded, expected_q, rtol=0, atol=0)
+                assert torch.all(storage[:, TOTAL_HEADS:] == 7)
 
             partial_output, partial_lse = _rank_inputs(step, rank, batch, dtype, device)
             guard_reduce = dtype == torch.bfloat16 and step == 2
@@ -469,6 +480,70 @@ def _check_eager_adjacency(
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+def _check_padded_query_gather(rank, world_size, device):
+    """Check raw packed queries, replay, and batch offsets beyond 2 GiB."""
+    pool = PCIeDCPA2APool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=4,
+        total_heads=TOTAL_HEADS,
+        head_dim=HEAD_DIM,
+        query_head_dim=656,
+    )
+    stream = torch.cuda.Stream(device=device)
+    pool.prepare_channels(("padded-query",))
+    channel = pool.for_stream(stream, channel_id="padded-query")
+    physical_heads = ((TOTAL_HEADS + 15) // 16) * 16
+    if physical_heads == TOTAL_HEADS:
+        physical_heads += 16
+    try:
+        for large_stride in (False, True):
+            batch = 2 if large_stride else 4
+            stride = (1 << 31) + 16 if large_stride else physical_heads * 656
+            storage = torch.empty_strided(
+                (batch, physical_heads, 656), (stride, 656, 1),
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            storage.view(torch.uint8).fill_(0xA5)
+            out = storage[:, :TOTAL_HEADS]
+            query_shape = (batch, TOTAL_HEADS // world_size, 656)
+            local = torch.empty(
+                query_shape,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            # Arbitrary bytes include FP8 NaNs because a packed query is an
+            # opaque 656-byte record, not an array of numeric FP8 values.
+            def query(source, replay):
+                generator = torch.Generator().manual_seed(5000 * replay + source)
+                return torch.randint(
+                    0, 256, query_shape, dtype=torch.uint8, generator=generator
+                ).to(device)
+
+            local.view(torch.uint8).copy_(query(rank, 0))
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                channel.all_gather_heads(local, out)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                channel.all_gather_heads(local, out)
+            for replay in range(3):
+                local.view(torch.uint8).copy_(query(rank, replay + 1))
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(stream):
+                    graph.replay()
+                stream.synchronize()
+                expected = torch.cat(
+                    [query(source, replay + 1) for source in range(world_size)], dim=1
+                )
+                torch.testing.assert_close(out.view(torch.uint8), expected, rtol=0, atol=0)
+                assert torch.all(storage[:, TOTAL_HEADS:].view(torch.uint8) == 0xA5)
+            del graph, storage, out, local
+    finally:
+        stream.synchronize()
+        pool.close()
 
 
 def _check_graph(
@@ -992,6 +1067,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.barrier()
         _stage(rank, "eager_adjacency")
         _check_eager_adjacency(pool, rank, world_size, device)
+        dist.barrier()
+        _stage(rank, "padded_query_gather")
+        _check_padded_query_gather(rank, world_size, device)
         dist.barrier()
         _stage(rank, "semantic_capture_warmup")
         _check_semantic_capture_warmup(pool, rank, world_size, device)

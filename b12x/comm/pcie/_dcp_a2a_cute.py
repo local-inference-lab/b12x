@@ -945,6 +945,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         batch: Int32,
         local_heads: Int32,
         packs_per_head: Int32,
+        output_batch_stride_packs: Int64,
         slot_delta_256b: Int32,
         grid_x: Int32,
         stream: cuda.CUstream,
@@ -987,6 +988,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             batch,
             local_heads,
             packs_per_head,
+            output_batch_stride_packs,
             slot_delta_256b,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -1035,6 +1037,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         batch: Int32,
         local_heads: Int32,
         packs_per_head: Int32,
+        output_batch_stride_packs: Int64,
         slot_delta_256b: Int32,
     ) -> None:
         staging = (
@@ -1183,7 +1186,11 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 (Int64(batch_index) * Int64(local_heads) + Int64(local_head))
                 * Int64(packs_per_head)
             )
-            output_base = Int64(row) * Int64(packs_per_head)
+            staging_base = Int64(row) * Int64(packs_per_head)
+            output_base = (
+                Int64(batch_index) * output_batch_stride_packs
+                + Int64(global_head) * Int64(packs_per_head)
+            )
             # Resolve the peer's base address first and copy once. Cloning the
             # whole pack loop into all sixteen arms of the constexpr chain
             # bloats the kernel and pays the chain on every row.
@@ -1195,7 +1202,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 # output position, so one runtime test picks the address.
                 if source_rank != Int32(self._rank):
                     source_address = Int64(
-                        (local_stage + output_base * Int64(4)).toint()
+                        (local_stage + staging_base * Int64(4)).toint()
                     )
             else:
                 for source in cutlass.range_constexpr(self._world_size):
@@ -2408,12 +2415,13 @@ def _get_compiled_all_gather_heads(
         1,
         1,
         8,
+        Int64(8),
         1,
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            13,
+            14,
             key,
             labels=(
                 "world_size",
@@ -2434,6 +2442,7 @@ def _get_compiled_all_gather_heads(
         local_heads: int,
         head_dim: int,
         element_size: int,
+        output_batch_stride_bytes: int,
         slot_delta_256b: int,
         blocks: int,
     ) -> None:
@@ -2441,6 +2450,12 @@ def _get_compiled_all_gather_heads(
         if row_bytes % 16:
             raise ValueError("DCP gather rows must be a multiple of 16 bytes")
         packs_per_head = row_bytes // 16
+        packed_batch_bytes = local_heads * world_size * row_bytes
+        output_batch_stride_bytes = output_batch_stride_bytes or packed_batch_bytes
+        if output_batch_stride_bytes % 16 or (
+            batch > 1 and output_batch_stride_bytes < packed_batch_bytes
+        ):
+            raise ValueError("DCP gather output batch rows must be aligned and disjoint")
         stages = _pad_ptrs(staging_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(
@@ -2451,6 +2466,7 @@ def _get_compiled_all_gather_heads(
             int(batch),
             int(local_heads),
             packs_per_head,
+            Int64(output_batch_stride_bytes // 16),
             int(slot_delta_256b),
             int(blocks),
             current_cuda_stream(),
@@ -2743,6 +2759,7 @@ def all_gather_heads(
     slot_delta_bytes: int,
     blocks: int,
     push: bool = False,
+    output_batch_stride_bytes: int = 0,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     launcher = _get_compiled_all_gather_heads(
@@ -2769,6 +2786,7 @@ def all_gather_heads(
         local_heads,
         head_dim,
         element_size,
+        output_batch_stride_bytes,
         slot_delta_256b,
         blocks,
     )
