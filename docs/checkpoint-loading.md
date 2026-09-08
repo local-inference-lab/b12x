@@ -28,10 +28,10 @@ VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
 The adapter uses vLLM's standard checkpoint-shard progress format and honors
-`use_tqdm_on_load` and rank-zero output. The loader always uses write-combined
-pinned storage for weights; no `allocation` option is needed or accepted.
-Write combining changes the CPU cache policy, not the ownership or direct-I/O
-contract.
+`use_tqdm_on_load` and rank-zero output. The loader always uses CUDA managed
+storage for weights; no `allocation` option is needed or accepted. Managed
+storage changes CUDA residency and coherence handling, not the ownership or
+direct-I/O contract.
 
 The adapter records destination views and submits packed native descriptors
 `(fd, offset, row_bytes, destination, operation, rows, source_stride, destination_stride)`
@@ -54,10 +54,10 @@ operating on them, including GLM's paired selector weights and scales and full
 GLM's fused FP8 indexer projection. DeepSeek V4's model, MTP, and DSpark post-load
 hooks flush queued reads before deriving packed weights and mHC broadcasts.
 
-Weight destinations use `cudaHostAllocMapped | cudaHostAllocWriteCombined` and
-are explicitly `mlock`ed. Failure to lock final storage fails the allocation.
-Alternative mappings remain available to the allocation-qualification tools,
-outside the serving configuration. The initial adapter
+Weight destinations use `cudaMallocManaged` and are explicitly `mlock`ed.
+Failure to lock final storage fails the allocation. Alternative mappings remain
+available to the allocation-qualification tools, outside the serving
+configuration. The initial adapter
 requires GPU host page tables and PyTorch's native CUDA allocator, and does
 not support vLLM sleep mode. It preserves index/prefix filtering, including
 MTP. Byte-preserving contiguous routes read into the CPU alias after synchronizing

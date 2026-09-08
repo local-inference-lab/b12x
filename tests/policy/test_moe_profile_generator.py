@@ -60,6 +60,7 @@ from b12x.policy.generation.providers.moe_gpu_worker import (
     _reset_cuda_graphs,
     _relative_norm_error,
     _trellis_weights,
+    _uniform_w4a8_mx_reference,
     _uniform_w4a16_reference,
     _w4a16_direct_path,
     _w4a16_weight_layout,
@@ -268,6 +269,72 @@ def test_uniform_w4a16_profile_fixture_has_stable_positive_projections() -> None
         rtol=0.0,
         atol=1.0e-3,
     )
+
+
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_uniform_w4a8_profile_reference_models_checkpoint_semantics(
+    monkeypatch, activation,
+) -> None:
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+    recipe = next(
+        geometry.recipe for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+    )
+    model = MoeModelGeometry(
+        model_id="oracle-test", hidden_size=256, intermediate_size=128,
+        num_experts=3, native_top_k=2, activation=activation,
+        recipe_families=(recipe.family_id,), source="test", tp_sizes=(1,),
+    )
+    (geometry,) = expand_physical_geometries(models=(model,), recipes=(recipe,))
+    monkeypatch.setattr(fused_moe, "prepare_weights", lambda *, plan, weights: weights)
+    weights = _packed_weights(geometry, device="cpu")
+    generator = torch.Generator().manual_seed(29)
+    x = _condition_benchmark_inputs(
+        geometry, torch.randn((4, 256), generator=generator),
+    )
+    # Include duplicate routes and both negative and out-of-range expert IDs.
+    topk_ids = torch.tensor([[0, 1], [2, -1], [1, 1], [3, -1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.2, 0.3], [0.4, 0.6]])
+    output = _uniform_w4a8_mx_reference(
+        geometry, x=x, topk_ids=topk_ids, topk_weights=topk_weights,
+    )
+    checkpoint = moe_reference_w4a8_mx(
+        x, weights.w13, weights.w13_block_scales.view(torch.uint8), None,
+        weights.w13_global_scales,
+        weights.w2, weights.w2_block_scales.view(torch.uint8), None,
+        weights.w2_global_scales, topk_ids, topk_weights,
+        geometry.num_experts, geometry.hidden_size, geometry.intermediate_size,
+        activation=activation, w13_layout="w13",
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output[:3]) > 0
+    assert torch.count_nonzero(output[3]) == 0
+    # The checkpoint oracle also rounds the intermediate to MXFP8; the analytic
+    # oracle admits both BF16-intermediate and MXFP8-intermediate candidates.
+    assert _cosine_similarity(output, checkpoint) >= 0.998
+    assert _relative_norm_error(output, checkpoint) <= 0.12
+
+
+def test_w4a8_profile_inputs_are_mxfp8_representable() -> None:
+    from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.recipe_id == "e8m0-w4a8"
+    )
+    generator = torch.Generator(device="cpu").manual_seed(29)
+    inputs = torch.randn(
+        (2, geometry.hidden_size),
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    conditioned = _condition_benchmark_inputs(geometry, inputs)
+
+    assert torch.equal(conditioned, quant_dequant_mxfp8_torch(conditioned))
 
 
 def test_w4a16_tuner_enumerates_distinct_kernel_routes() -> None:

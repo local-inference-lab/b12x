@@ -2728,10 +2728,8 @@ def _refresh_dynamic_workspace_scales(
 ) -> None:
     a1_src_ptr = a1_gscale.data_ptr()
     a2_src_ptr = a2_gscale.data_ptr()
-    # A binding may point the dynamic kernel directly at stable, contiguous
-    # per-expert scale tensors.  In that case a copy would only copy each source
-    # onto itself, and—inside a captured serving forward—would replay twice per
-    # layer because both bind and run materialize the same constants.
+    # Canonical per-expert vectors can be consumed directly. Their owner stays
+    # alive through the binding, and live value updates need no staging copy.
     if (
         workspace.input_gs.data_ptr() == a1_src_ptr
         and workspace.down_input_scale.data_ptr() == a2_src_ptr
@@ -3050,26 +3048,26 @@ def _build_tp_moe_fp4_binding_from_views(
         dynamic_launch_config = execution_plan.dynamic_launch_config
         if dynamic_launch_config is None:
             raise RuntimeError("dynamic TP MoE execution plan is missing launch policy")
-        direct_expert_scales = bool(
+        direct_scales = bool(
             dynamic_launch_config.direct_expert_scales
-            and experts.a1_gscale.dtype == torch.float32
-            and experts.a2_gscale.dtype == torch.float32
-            and experts.a1_gscale.numel() == plan.weight_E
-            and experts.a2_gscale.numel() == plan.weight_E
-            and experts.a1_gscale.is_contiguous()
-            and experts.a2_gscale.is_contiguous()
+            and all(
+                scale.dtype == torch.float32
+                and scale.device == a.device
+                and scale.numel() == plan.weight_E
+                and scale.is_contiguous()
+                for scale in (experts.a1_gscale, experts.a2_gscale)
+            )
         )
-        if direct_expert_scales:
-            # The immutable expert object owns these tensors for at least as
-            # long as the binding.  Their addresses are therefore graph-stable,
-            # and the kernel can consume the canonical FP32 vectors directly.
-            input_gs = experts.a1_gscale.reshape(plan.weight_E)
-            down_input_scale = experts.a2_gscale.reshape(plan.weight_E)
-        else:
-            input_gs = tensors["input_gs"]
-            down_input_scale = tensors["down_input_scale"]
-            input_gs.copy_(experts.a1_gscale.expand(plan.weight_E))
-            down_input_scale.copy_(experts.a2_gscale.expand(plan.weight_E))
+        # Bind maps views only. Scalar/strided scales are expanded into the
+        # caller's scratch by the run-time refresh before their consumer.
+        input_gs = (
+            experts.a1_gscale.view(plan.weight_E)
+            if direct_scales else tensors["input_gs"]
+        )
+        down_input_scale = (
+            experts.a2_gscale.view(plan.weight_E)
+            if direct_scales else tensors["down_input_scale"]
+        )
         view_kwargs = _packed_input_binding_views(
             packed_input=tensors["packed_input"],
             packed_input_scale=tensors["packed_input_scale"],

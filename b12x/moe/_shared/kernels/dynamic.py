@@ -2864,9 +2864,6 @@ class MoEDynamicKernelBackend:
             )
             sb_base_addr = shared_ptr_to_u32(storage.sB.data_ptr())
             sb_up_base_addr = shared_ptr_to_u32(storage.sB_up.data_ptr())
-            # Raw sA base for the FC2 requant byte-container store (the
-            # swizzled Float8 A stage; upstream nvfp4 writes through the
-            # recast tensor, whose swizzle-free view only fits the FP4 math).
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
         sSFB_up = storage.sSFB_up.get_tensor(sfb_smem_staged)
@@ -6470,6 +6467,17 @@ class MoEDynamicKernelBackend:
 
                     if cutlass.const_expr((not self.swap_ab) and (not self.is_w4a8)):
                         # Gate GEMM (inlined to avoid @cute.jit pass-by-value for acc)
+                        if cutlass.const_expr(not self.w4a4_fc1_fused):
+                            # Sub-128 FC2 re-partitions A/SFA for its intermediate
+                            # at offset zero. Refresh the generic FC1 aliases on
+                            # every task/slice so the gate MMA consumes the same
+                            # fragments that the restored routed-input copies
+                            # write. The fused path owns separate single-slot
+                            # fragments and must retain those allocations.
+                            tCrA_fc1_cur = tCrA
+                            crA_fc1_cur = crA
+                            tCrSFA_fc1_cur = tCrSFA
+                            crSFA_fc1_cur = crSFA
                         fz_crSFA = cute.filter_zeros(crSFA)
                         fz_crSFB = cute.filter_zeros(crSFB)
                         fz_crSFA_fc1_cur = fz_crSFA
@@ -6674,7 +6682,9 @@ class MoEDynamicKernelBackend:
                                 cute.copy(
                                     smem_copy_A,
                                     csA_p[None, None, k_next],
-                                    crA_fc1_cur[None, None, 0],
+                                    crA_fc1_cur[
+                                        None, None, k_next if self.is_w6a8 else 0
+                                    ],
                                 )
                                 cute.copy(
                                     smem_copy_B,
@@ -6696,7 +6706,9 @@ class MoEDynamicKernelBackend:
                                 cute.copy(
                                     smem_copy_SFA,
                                     fz_csSFA_cur[None, None, k_next],
-                                    fz_crSFA_fc1_cur[None, None, 0],
+                                    fz_crSFA_fc1_cur[
+                                        None, None, k_next if self.is_w6a8 else 0
+                                    ],
                                 )
                                 cute.copy(
                                     smem_copy_SFB,
@@ -6722,6 +6734,17 @@ class MoEDynamicKernelBackend:
                                     up_pipeline.consumer_release(up_cons_state)
                                     up_cons_state.advance()
                             if k_next > 0 and fc1_k_tile_cnt > Int32(0):
+                                if cutlass.const_expr(self.is_w6a8):
+                                    cute.copy(
+                                        smem_copy_A,
+                                        csA_p[None, None, k_next],
+                                        crA[None, None, k_next],
+                                    )
+                                    cute.copy(
+                                        smem_copy_SFA,
+                                        fz_csSFA_p[None, None, k_next],
+                                        fz_crSFA[None, None, k_next],
+                                    )
                                 cute.copy(
                                     smem_copy_B,
                                     csB_p[None, None, k_next],
@@ -6801,16 +6824,21 @@ class MoEDynamicKernelBackend:
                                                 up_acc[None, _mt, _nt],
                                             )
                             if k_next > 0 and fc1_k_tile_cnt > Int32(0):
-                                cute.copy(
-                                    smem_copy_A,
-                                    csA_p[None, None, k_next],
-                                    crA_fc1_cur[None, None, 0],
-                                )
-                                cute.copy(
-                                    smem_copy_SFA,
-                                    fz_csSFA_p[None, None, k_next],
-                                    fz_crSFA_fc1_cur[None, None, 0],
-                                )
+                                if cutlass.const_expr(not self.is_w6a8):
+                                    cute.copy(
+                                        smem_copy_A,
+                                        csA_p[None, None, k_next],
+                                        crA_fc1_cur[
+                                            None, None, k_next if self.is_w6a8 else 0
+                                        ],
+                                    )
+                                    cute.copy(
+                                        smem_copy_SFA,
+                                        fz_csSFA_p[None, None, k_next],
+                                        fz_crSFA_fc1_cur[
+                                            None, None, k_next if self.is_w6a8 else 0
+                                        ],
+                                    )
                         # Signal FC1 gate/only completion before producer warps
                         # reuse the shared A/gate buffers for the next pass.
                         self.pass_gate_barrier.arrive_unaligned()

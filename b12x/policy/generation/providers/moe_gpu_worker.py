@@ -24,6 +24,10 @@ from .moe import MoeCandidate, MoeMeasurement
 
 _MAX_RELATIVE_NORM_ERROR = 0.1
 _W4A8_MAX_RELATIVE_NORM_ERROR = 0.12
+_W4A8_PROFILE_E8M0_SCALE_BYTE = 122
+_W4A8_PROFILE_WEIGHT_SCALE = 2.0**-5
+_W4A8_PROFILE_FP4_VALUE = 0.5
+_W4A8_PROFILE_BALANCED_FP4_BYTE = 0x91
 _TUNER_OVERRIDE_ENV = (
     "B12X_DIRECT_CUTE_OPTIONS",
     "B12X_DYNAMIC_DETERMINISTIC_OUTPUT",
@@ -101,8 +105,15 @@ def _condition_benchmark_inputs(
     geometry: MoePhysicalGeometry,
     x: object,
 ):
-    """Keep uniform W4A16 fixtures out of saturated activation tails."""
+    """Condition synthetic inputs for comparable candidate arithmetic."""
 
+    if geometry.recipe.quant_mode == "w4a8_mx":
+        from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
+
+        # W4A8 profile generation compares execution kernels, not activation
+        # quantizers. Values on the MXFP8 grid give BF16-input and A8-input
+        # candidates the same logical operand before their timed region.
+        return quant_dequant_mxfp8_torch(x)
     if not (
         geometry.recipe.quant_mode == "w4a16"
         and geometry.recipe.source_format not in {"btx", "b12x_trellis"}
@@ -150,9 +161,14 @@ def _packed_weights(
     hidden = geometry.hidden_size
     intermediate = geometry.intermediate_size
     w13_rows = moe_activation_w1_rows(geometry.activation, intermediate)
+    w13_fill = (
+        _W4A8_PROFILE_BALANCED_FP4_BYTE
+        if geometry.recipe.quant_mode == "w4a8_mx"
+        else 0x11
+    )
     w13 = torch.full(
         (experts, w13_rows, hidden // 2),
-        0x11,
+        w13_fill,
         dtype=torch.uint8,
         device=device,
     )
@@ -165,7 +181,14 @@ def _packed_weights(
     scale_group = 32 if source_format == "fp4_e8m0_k32" else 16
     if source_format == "fp4_e8m0_k32":
         scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
-        scale_value = 127 if scale_dtype == torch.uint8 else 1.0
+        if geometry.recipe.quant_mode == "w4a8_mx":
+            scale_value = (
+                _W4A8_PROFILE_E8M0_SCALE_BYTE
+                if scale_dtype == torch.uint8
+                else _W4A8_PROFILE_WEIGHT_SCALE
+            )
+        else:
+            scale_value = 127 if scale_dtype == torch.uint8 else 1.0
     else:
         scale_dtype = torch.float8_e4m3fn
         scale_value = 1.0
@@ -500,6 +523,60 @@ def _uniform_w4a16_reference(
         intermediate = torch.square(torch.relu(fc1))
     down = intermediate * (0.5 * geometry.intermediate_size)
     routed = down * topk_weights.float().sum(dim=-1)
+    return routed[:, None].expand(-1, geometry.hidden_size).contiguous()
+
+
+def _uniform_w4a8_mx_reference(
+    geometry: MoePhysicalGeometry,
+    *,
+    x: object,
+    topk_ids: object,
+    topk_weights: object,
+):
+    """Independent oracle for the profile generator's uniform MXFP4 weights."""
+
+    import torch
+
+    from b12x.moe._shared.kernels.activations import is_gated_moe_activation
+    from b12x.moe._shared.kernels.reference import (
+        _apply_gated_activation,
+        _normalize_reference_swiglu_params,
+    )
+
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            geometry.activation,
+            None,
+            None,
+            None,
+        )
+    )
+    effective_weight = _W4A8_PROFILE_FP4_VALUE * _W4A8_PROFILE_WEIGHT_SCALE
+    checkpoint_input = x.float()
+    fc1 = (
+        checkpoint_input[..., 0::2].sum(dim=-1)
+        - checkpoint_input[..., 1::2].sum(dim=-1)
+    ) * effective_weight
+    if is_gated_moe_activation(activation):
+        intermediate = _apply_gated_activation(
+            fc1,
+            fc1,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+    else:
+        intermediate = torch.square(torch.relu(fc1))
+
+    down = intermediate * geometry.intermediate_size * effective_weight
+    active = (topk_ids >= 0) & (topk_ids < geometry.num_experts)
+    route_weight = torch.where(
+        active,
+        topk_weights.float(),
+        torch.zeros_like(topk_weights, dtype=torch.float32),
+    ).sum(dim=-1)
+    routed = down * route_weight
     return routed[:, None].expand(-1, geometry.hidden_size).contiguous()
 
 
@@ -1449,6 +1526,13 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             return _uniform_w4a16_reference(
                 self._geometry,
                 x=x,
+                topk_weights=topk_weights,
+            )
+        if recipe.quant_mode == "w4a8_mx":
+            return _uniform_w4a8_mx_reference(
+                self._geometry,
+                x=x,
+                topk_ids=topk_ids,
                 topk_weights=topk_weights,
             )
         if recipe.quant_mode == "w4a8_nvfp4":

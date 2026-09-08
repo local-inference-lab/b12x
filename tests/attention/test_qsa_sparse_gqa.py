@@ -15,6 +15,279 @@ from b12x.attention.qsa._contract import _target_splits
 from ..conftest import require_b12x as require_sm120
 
 
+@pytest.mark.parametrize("heads", [6, 12, 24])
+@pytest.mark.parametrize("splits", [1, 16, 32, 64])
+def test_split_merge_matches_softmax_with_empty_heads_and_changed_graph_inputs(
+    heads: int,
+    splits: int,
+) -> None:
+    from b12x.attention.paged._selected_forward import launch_sparse_gqa_merge
+
+    device = require_sm120()
+    torch.manual_seed(20260905)
+    partials = torch.randn(16, splits, heads, 256, device=device)
+    lse = torch.randn(16, splits, heads, device=device) * 8
+    lse[:, 1::3] = -torch.inf
+    lse[0, :, 0] = -torch.inf
+    output = torch.empty(16, heads, 256, dtype=torch.bfloat16, device=device)
+
+    for rows in (1, 4, 16):
+
+        def launch() -> None:
+            launch_sparse_gqa_merge(
+                partial_output=partials[:rows],
+                partial_lse=lse[:rows],
+                output=output[:rows],
+                rows=rows,
+                splits=splits,
+            )
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for _ in range(2):
+            partials.mul_(0.75)
+            lse[:, :, -1].add_(2)
+            graph.replay()
+            probabilities = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
+            expected = (partials[:rows].double() * probabilities[..., None]).sum(1)
+            torch.testing.assert_close(
+                output[:rows].double(),
+                expected,
+                rtol=4e-3,
+                atol=3e-5,
+            )
+            assert torch.count_nonzero(output[0, 0]) == 0
+            assert torch.count_nonzero(output[:rows, -1]) > 0
+
+
+@pytest.mark.parametrize("heads", [6, 12, 24])
+def test_cooperative_merge_preserves_order_bitwise_under_changed_graph_inputs(
+    monkeypatch,
+    heads: int,
+) -> None:
+    """Tiling head dimensions cannot change the split-pair reduction tree."""
+    from b12x.attention.paged import _selected_forward as implementation
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+
+    device = require_sm120()
+    torch.manual_seed(20260905)
+    geometries = ((1, 64), (4, 32), (16, 16), (4, 1), (64, 16))
+    # Each graph consumes these caller-owned contiguous buffers directly.
+    # Capturing a contiguous() adapter would also capture its staging copies.
+    buffers = {
+        (rows, splits): (
+            torch.randn(rows, splits, heads, 256, device=device),
+            torch.randn(rows, splits, heads, device=device) * 8,
+            torch.empty(rows, heads, 256, device=device, dtype=torch.bfloat16),
+        )
+        for rows, splits in geometries
+    }
+    original = implementation._SparseGqaMergeKernel
+    candidate = implementation._ShapeAdaptiveSparseGqaMergeKernel
+    graphs = {}
+    try:
+        for label, kernel in (("serial", original), ("cooperative", candidate)):
+            monkeypatch.setattr(implementation, "_MERGE_KERNEL", kernel)
+            implementation.clear_caches()
+
+            def launch(rows, splits):
+                partials, lse, output = buffers[rows, splits]
+                implementation.launch_sparse_gqa_merge(
+                    partial_output=partials,
+                    partial_lse=lse,
+                    output=output,
+                    rows=rows,
+                    splits=splits,
+                )
+
+            launch(1, 64)
+            warmed = tuple(implementation._MERGE_CACHE.items())
+            freeze_kernel_resolution("cooperative QSA merge live rows/splits")
+            for rows, splits in geometries:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    launch(rows, splits)
+                graphs[label, rows, splits] = graph
+            assert tuple(implementation._MERGE_CACHE.items()) == warmed
+            unfreeze_kernel_resolution()
+        for rows, splits in geometries:
+            partials, lse, output = buffers[rows, splits]
+            for _ in range(3):
+                partials.normal_()
+                lse.normal_()
+                lse[:, 1::3] = -torch.inf
+                lse[0, :, 0] = -torch.inf
+                pointers = tuple(t.data_ptr() for t in (partials, lse, output))
+
+                def replay(label):
+                    output.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_stats()
+                    graphs[label, rows, splits].replay()
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_stats()
+                    for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                        assert after[key] == before[key]
+                    assert tuple(t.data_ptr() for t in (partials, lse, output)) == pointers
+
+                replay("serial")
+                expected = output.clone()
+                replay("cooperative")
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                assert torch.count_nonzero(output[0, 0]) == 0
+                assert torch.count_nonzero(output[:rows, -1]) > 0
+    finally:
+        unfreeze_kernel_resolution()
+        implementation.clear_caches()
+
+
+@pytest.mark.parametrize("selection_width", [2051, 2054])
+def test_split_prewarm_matches_planned_selection_capacity(selection_width: int) -> None:
+    """Warmup must cover both ordinary selection and a three-column MTP tail."""
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.attention.paged import _selected_forward as implementation
+
+    device = require_sm120()
+    query = torch.randn(4, 6, 256, dtype=torch.bfloat16, device=device)
+    keys = torch.randn(1, 16, 1, 256, dtype=torch.bfloat16, device=device)
+    values = torch.randn_like(keys)
+    requests = torch.zeros(4, dtype=torch.int32, device=device)
+    positions = torch.full((4,), 15, dtype=torch.int64, device=device)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    selected = torch.full((4, selection_width), -1, dtype=torch.int32, device=device)
+    selected[:, :16] = torch.arange(16, device=device)
+    partials = torch.empty(4, 16, 6, 256, device=device)
+    lse = torch.empty(4, 16, 6, device=device)
+    implementation.clear_caches()
+    implementation.precompile_sparse_gqa_split(
+        query=query,
+        key_cache=keys,
+        value_cache=values,
+        request_ids=requests,
+        selection_width=selection_width,
+    )
+    freeze_kernel_resolution("planned selected-attention warmup capacity")
+    try:
+
+        def launch(rows):
+            implementation.launch_sparse_gqa_split(
+                query=query[:rows],
+                key_cache=keys,
+                value_cache=values,
+                k_descale=None,
+                v_descale=None,
+                block_table=table,
+                request_ids=requests[:rows],
+                selected_positions=selected[:rows],
+                query_positions=positions[:rows],
+                partial_output=partials[:rows],
+                partial_lse=lse[:rows],
+                softmax_scale=1 / 16,
+                splits=16,
+            )
+
+        # Compilation does not warm CUDA launch state or write caller storage.
+        launch(1)
+        for rows in (1, 4):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(rows)
+            for _ in range(2):
+                query.normal_()
+                graph.replay()
+                probability = torch.softmax(lse[:rows].double(), dim=1).nan_to_num()
+                actual = (partials[:rows].double() * probability[..., None]).sum(1)
+                scores = (
+                    torch.einsum(
+                        "rhd,nd->rhn", query[:rows].double(), keys[0, :, 0].double()
+                    )
+                    / 16
+                )
+                expected = torch.einsum(
+                    "rhn,nd->rhd", scores.softmax(-1), values[0, :, 0].double()
+                )
+                torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
+                assert torch.isfinite(actual).all()
+                assert torch.count_nonzero(actual) > 0
+    finally:
+        unfreeze_kernel_resolution()
+        implementation.clear_caches()
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("live_counts", [(1, 4), (65, 66)])
+def test_planned_selection_capacity_consumes_tail_with_frozen_graph_replay(
+    kv_dtype: torch.dtype,
+    live_counts: tuple[int, int],
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.paged import _selected_forward as implementation
+
+    device = require_sm120()
+    capacity, heads, width, splits = max(live_counts), 6, 2055, 64
+    query = torch.zeros((capacity, heads, 256), device=device, dtype=torch.bfloat16)
+    cache = torch.zeros((1, 16, 1, 256), device=device).to(kv_dtype)
+    cache[0, 0].copy_(torch.full((1, 256), 0.5, device=device).to(kv_dtype))
+    cache[0, 1].copy_(torch.full((1, 256), 1.0, device=device).to(kv_dtype))
+    selected = torch.full((capacity, width), -1, device=device, dtype=torch.int32)
+    selected[:, -1] = 0
+    block_table = torch.zeros((1, 1), device=device, dtype=torch.int32)
+    request_ids = torch.zeros(capacity, device=device, dtype=torch.int64)
+    positions = torch.ones(capacity, device=device, dtype=torch.int64)
+    output = torch.empty_like(query)
+    partials = torch.empty((capacity, splits, heads, 256), device=device)
+    lse = torch.empty((capacity, splits, heads), device=device)
+    descale = torch.ones(1, device=device) if kv_dtype == torch.float8_e4m3fn else None
+    buffers = (query, cache, selected, output, partials, lse)
+    pointers = tuple(t.data_ptr() for t in buffers)
+
+    def launch(rows):
+        return launch_sparse_paged_gqa(
+            query=query[:rows], key_cache=cache, value_cache=cache,
+            k_descale=descale, v_descale=descale, block_table=block_table,
+            request_ids=request_ids[:rows], selected_positions=selected[:rows],
+            query_positions=positions[:rows], output=output[:rows],
+            partial_output=partials[:rows], partial_lse=lse[:rows],
+            softmax_scale=1 / 16, block_n=16, splits=splits,
+        )
+
+    launch(live_counts[0])
+    warmed = tuple(implementation._KERNEL_CACHE.items())
+    warmed_merge = tuple(implementation._MERGE_CACHE.items())
+    freeze_kernel_resolution("QSA fixed selected-position capacity across live rows")
+    try:
+        for rows in live_counts:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(rows)
+            for position, value in ((0, 0.5), (1, 1.0)):
+                selected[:, -1] = position
+                output.fill_(float("nan"))
+                partials.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_stats()
+                graph.replay()
+                torch.cuda.synchronize()
+                after = torch.cuda.memory_stats()
+                for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+                    assert after[key] == before[key]
+                assert tuple(t.data_ptr() for t in buffers) == pointers
+                assert torch.all(output[:rows] == value)
+                assert tuple(implementation._KERNEL_CACHE.items()) == warmed
+                assert tuple(implementation._MERGE_CACHE.items()) == warmed_merge
+    finally:
+        unfreeze_kernel_resolution()
+
+
 def test_qsa_caps_do_not_gate_architecture_or_tensor_parallel_layout() -> None:
     values = dict(
         device="cuda:0",
