@@ -39,6 +39,28 @@ stops before device resource queries or direct-LUT allocation. Compare pairs
 0/1 at both widths and both CTA sizes under the same compiler. Shared layout
 bytes reported from source are unrounded; they are not a CUDA occupancy query.
 
+## Static compiler measurements
+
+The measurements below use source revision `1414b128`, the toolchain above,
+and profiling disabled. The four baseline CUDA `.text` sections are byte-identical
+to the archived production-contract objects. Full wrapper objects retain
+separate hashes. Artifact identities and measurements are in
+`validation/performance/kimi_k3_verify_direct_pairs_offline_20260908.json`.
+
+| Width | CTA threads | SASS instructions, baseline → pairs | Registers/thread, baseline → pairs |
+| --- | --- | --- | --- |
+| 256 | 256 | 6104 → 5976 | 120 → 121 |
+| 384 | 256 | 6128 → 6000 | 121 → 119 |
+| 256 | 512 | 4728 → 4664 | 100 → 103 |
+| 384 | 512 | 4768 → 4704 | 98 → 103 |
+
+LUT byte-load, FP8-to-FP16 conversion and HMMA counts remain unchanged within
+each pair. No local loads or stores appear. All three register increases
+remain flagged for GPU measurement; the source planner still selects one CTA
+per SM. These observations support testing the option, not enabling it by
+default. With width 384, CTA256 and pairs enabled, diagnostic instrumentation
+adds 56 static instructions and two registers; its durations require a control.
+
 ## Per-CTA phase records
 
 `B12X_W4A16_PHASE_PROFILE=1` enables diagnostic records for single-tier,
