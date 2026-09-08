@@ -1,0 +1,24 @@
+{
+  "status": "GPU primitive and collective correctness qualified; native MoE/serving performance pending",
+  "source": {
+    "b12x_revision": "2e98180e",
+    "vllm_baseline": "f9ac0209a2ed"
+  },
+  "tests": [
+    {
+      "log": "lut-gpu.log",
+      "sha256": "65014a98ebd2ba5cdc774e557289f9fdb3cf039166c0eb74ddb78eb138e55ea3",
+      "tail": "============================== 9 passed in 3.87s ==============================="
+    },
+    {
+      "log": "dcp-pull-gpu.log",
+      "sha256": "f4d8ef4c23dcf4ea006ffade78e8044d387a435d3c4f672702b282139e2da9d0",
+      "tail": "======================== 1 passed in 102.94s (0:01:42) ========================="
+    },
+    {
+      "log": "dcp-push-gpu.log",
+      "sha256": "a030fc67ac9e2a5e1fadadd52e42155948c1665d66fe31fa92c31f9d854890b5",
+      "tail": "======================== 1 passed in 103.27s (0:01:43) ========================="
+    }
+  ]
+}
