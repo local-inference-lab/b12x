@@ -1,6 +1,7 @@
 # DCP query gather output layout
 
-Status: implemented; GPU correctness and performance qualification pending.
+Status: implemented; TP9 collective GPU correctness qualified. Native serving
+integration and performance qualification remain pending.
 
 `PCIeDCPA2APool.all_gather_heads(local_input, out=out)` accepts a
 caller-owned `[batch, total_heads, head_dim]` view inside a buffer with padded
@@ -30,6 +31,9 @@ CPU coverage is in `tests/comm/test_pcie_dcp_a2a.py`: padding preservation,
 invalid layout rejection, and a launch stride exceeding 2^31 sixteen-byte
 packs. The GPU suite adds FP16/BF16 padded output and opaque 656-byte records,
 input mutation during graph replay, and a second batch row beyond 2 GiB.
+Both pull and push gates passed on nine RTX PRO 6000 GPUs with CUDA 13.3,
+Torch 2.13 and CUTLASS DSL 4.6.2. The retained log hashes and results are in
+`validation/performance/kimi_k3_verify_gpu_correctness_20260908.json`.
 
 Run the GPU gate only on an available nine-GPU host, once for each transport:
 

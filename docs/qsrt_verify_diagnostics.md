@@ -1,6 +1,7 @@
 # QSRT verify decode and phase diagnostics
 
-Status: research-only; GPU correctness and latency qualification pending.
+Status: research-only. Decoder GPU oracles are qualified; fused native-MoE,
+phase-record GPU correctness and latency qualification remain pending.
 
 Kimi-K3 verify uses four input rows, top-k 16 routes, hidden width 3584,
 and per-rank intermediate widths 256 or 384. Its native 2-bit SQG-XOR-Cheb-T12
@@ -115,7 +116,13 @@ and the record reader. The GPU oracle in
 `tests/moe/test_trellis_direct_lut_decode.py` enumerates every 16-bit state in
 each window position for 2/3/4-bit packing and both FP16/BF16 converters.
 It compares against independent CPU table indexing and the 32-bit decoder.
-Offline compilation of that oracle is not execution of the oracle.
+All nine GPU decoder cases passed, as recorded in
+`validation/performance/kimi_k3_verify_gpu_correctness_20260908.json`.
+
+`benchmarks/benchmark_qsrt_verify_variants.py` prepares one native weight extent
+and shares it between CTA256/512 and pair off/on variants. It checks mutated
+inputs and records interleaved timings, compiled objects and optional phase
+records. This harness has passed static checks but has not executed on a GPU.
 
 Before adoption, require native-payload output equality, eager and graph
 replay, fixed workspace addresses, and decode-boundary/prefill checks. Time
