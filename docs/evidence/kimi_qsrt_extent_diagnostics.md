@@ -50,7 +50,10 @@ error-message difference does not change the launch arithmetic.
 
 Use a source checkout with the same native QSRT payload available locally.
 Substitute the model path and an output filename; record the source revision,
-GPU state, and environment for each arm.
+GPU state, and environment for each arm. Apply the per-run environment from
+the JSON record. The environment must also expose the vLLM QSRT checkpoint
+reader `vllm.model_executor.layers.quantization.kquant_qsrt_atoms_v2`; the
+recorded loader revision is `fa6ea71c01fd`.
 
 ```bash
 B12X_W4A16_TOPK_SUM_OUTPUT=bf16 \
