@@ -5,7 +5,6 @@ import torch
 
 from b12x.attention.dsa_indexer._impl import clear_indexer_caches
 from b12x.attention.dsa_indexer.paged import (
-    _paged_carry_halves_are_contiguous,
     _paged_indexer_chunk_geometry,
     _plan_two_level_fold,
     index_topk_fp8,
@@ -791,6 +790,8 @@ def test_paged_index_shared_supertile_prefill_graph_matches_reference(
 
 
 def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
+    from b12x.attention.dsa_indexer.paged import _paged_carry_halves_are_contiguous
+
     device = torch.device("cpu")
     page_size = 64
     page_table_width = 1056
@@ -1183,3 +1184,89 @@ def test_index_topk_fp8_graph_unaligned_single_chunk(
         torch.sort(actual, dim=1).values,
         torch.sort(expected_raw1, dim=1).values,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("live_rows", [2, 4])
+@pytest.mark.parametrize("high_page", [False, True])
+def test_paged_index_carry_capacity_prefix_replays(
+    live_rows: int, high_page: bool
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    gen = torch.Generator(device="cpu").manual_seed(20260909)
+    capacity, heads, width, topk, supertile = 8, 32, 192, 512, 4096
+    compact = pack_paged_index_k_cache_reference(
+        (torch.randn((width * 64, 128), generator=gen) / 3).to(device)
+    )
+    cache = compact
+    first_page = 0
+    if high_page:
+        first_page = (2**31) // compact.stride(0) + 1
+        cache = torch.empty(
+            (first_page + compact.shape[0], compact.shape[1]),
+            dtype=compact.dtype,
+            device=device,
+        )
+        cache[first_page:].copy_(compact)
+        assert first_page * compact.stride(0) > 2**31
+    table = torch.arange(width, dtype=torch.int32, device=device).repeat(live_rows, 1)
+    physical_table = table + first_page
+    lengths = torch.full(
+        (live_rows,), width * 64 - 17, dtype=torch.int32, device=device
+    )
+    q = _rand_fp8_q((live_rows, heads, 128), gen=gen, device=device)
+    weights = torch.randn((live_rows, heads), generator=gen).to(device)
+    binding = _bind_paged_indexer(
+        device=device,
+        num_heads=heads,
+        rows=capacity,
+        width_blocks=width,
+        topk=topk,
+        real_page_table=physical_table,
+        seqlens=lengths,
+        supertile_k=supertile,
+    )
+    values, indices = binding.scratch.get_indexer_contiguous_candidate_buffers()
+    assert values.shape[1] == capacity
+    assert not values[:, :live_rows].is_contiguous()
+    assert values[0, :live_rows].is_contiguous()
+    assert binding.route == "paged_tiled"
+    # Integrators retain capacity storage while exposing a capture bucket view.
+    binding.scratch.indexer_contiguous_candidate_values = values[:, :live_rows]
+    binding.scratch.indexer_contiguous_candidate_indices = indices[:, :live_rows]
+    output = torch.empty((live_rows, topk), dtype=torch.int32, device=device)
+
+    def run():
+        return index_topk_fp8(
+            q_fp8=q,
+            weights=weights.unsqueeze(-1),
+            index_k_cache=cache,
+            topk=topk,
+            expected_num_q_heads=heads,
+            binding=binding,
+            out_indices=output,
+            supertile_k=supertile,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    pointer = output.data_ptr()
+    for length in (width * 64 - 17, 8192 - 37):
+        lengths.fill_(length)
+        expected = _expected_paged_index_topk(
+            q_fp8=q,
+            weights=weights,
+            index_k_cache=compact,
+            real_page_table=table,
+            seqlens=lengths,
+            topk=topk,
+        )
+        output.fill_(-1)
+        allocated = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert output.data_ptr() == pointer
+        assert torch.cuda.memory_allocated(device) == allocated
+        assert torch.equal(output.sort(dim=1).values, expected.sort(dim=1).values)
