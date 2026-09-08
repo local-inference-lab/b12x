@@ -28,6 +28,19 @@ sequential arm ordering, not a universal model-throughput claim. The balanced
 FP32 arm is **research-only for serving** and is excluded from the bit-identity
 claim. Hardware residual dequantization is disabled in these comparisons.
 
+The ranges below are the minimum and maximum per-case replay medians across
+the same six cases; the complete per-case samples remain in the JSON record.
+
+| Load implementation and heads | JSON variant | Median range, microseconds |
+| --- | --- | ---: |
+| Scalar loads, 104 heads | `base104` | 295.8–426.0 |
+| Vector loads, 104 heads | `fast104` | 194.6–286.7 |
+| Vector loads, 112 heads | `fast112` | 108.5–212.8 |
+
+The vector-104 arm isolates the head-padding comparison from the load-path
+change. The scalar-104 arm measures their combined effect. These arms must
+not be described as the same reference implementation.
+
 The candidate's `b12x/attention/_shared/mla/` and
 `b12x/attention/sparse_mla/` source trees are identical to PR #311 revision
 `0edbaef99ffa6f03588e0ca46b4bd65a143ca3fb`. This includes the S4
