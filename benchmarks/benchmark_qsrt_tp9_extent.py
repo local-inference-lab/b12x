@@ -27,6 +27,8 @@ from typing import NamedTuple
 
 import torch
 
+from benchmarks.common import nvidia_smi_gpu_mode_snapshot
+
 NUM_EXPERTS = 896
 TOP_K = 16
 HIDDEN = 3584
@@ -167,6 +169,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile-m4", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--block-m", type=int, default=8, choices=(8, 32, 48, 64, 96, 128))
     parser.add_argument(
@@ -269,6 +272,7 @@ def main():
         if kind != "zipf" or not value:
             raise ValueError("--routing must be 'uniform' or 'zipf:<s>'")
         zipf_exponent = float(value)
+    gpu_before = nvidia_smi_gpu_mode_snapshot()
     runtimes = {}
     widths = tuple(int(value) for value in args.widths.split(","))
     for width in widths:
@@ -352,6 +356,8 @@ def main():
         _print_histogram(histogram, args.block_m)
         outputs = {}
         timings: dict[int, float] = {}
+        raw_timings: dict[int, list[float]] = {}
+        launch_attestation: dict[int, list[dict]] = {}
         for width, (weights, plan, scratch, output, _) in runtimes.items():
             binding = fused_moe.bind(
                 plan,
@@ -385,8 +391,26 @@ def main():
                     end.record()
                     end.synchronize()
                     samples.append(begin.elapsed_time(end) * 1000.0)
-                samples.sort()
-                timings[width] = samples[len(samples) // 2]
+                raw_timings[width] = samples
+                ordered = sorted(samples)
+                timings[width] = ordered[len(ordered) // 2]
+            if args.profile_m4 and m == 4:
+                trace_path = args.output.with_name(args.output.stem + f"-width{width}-m4.trace.json")
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+                ) as profiler:
+                    graph.replay()
+                    torch.cuda.synchronize()
+                profiler.export_chrome_trace(str(trace_path))
+                events = json.loads(trace_path.read_text())["traceEvents"]
+                launch_attestation[width] = [
+                    {"symbol_sha256": hashlib.sha256(event["name"].encode()).hexdigest(),
+                     "grid": event["args"].get("grid"), "block": event["args"].get("block"),
+                     "registers_per_thread": event["args"].get("registers per thread"),
+                     "shared_memory_bytes": event["args"].get("shared memory")}
+                    for event in events
+                    if event.get("cat") == "kernel" and "W4A16FusedMoeKernel" in event.get("name", "")
+                ]
             del graph
         # The widest built width is the reference; the compact width (when
         # built) is compared against it. A single-width run (a 384-channel
@@ -395,18 +419,21 @@ def main():
         reference = outputs[reference_width]
         compact_width = min(outputs)
         compact = outputs[compact_width]
-        difference = compact - reference
+        reference_f32 = reference.float()
+        compact_f32 = compact.float()
+        difference = compact_f32 - reference_f32
         record = {
             "m": m,
             "routing": routing_source,
             "widths": sorted(outputs),
             "finite": bool(torch.isfinite(compact).all().item()),
-            "reference_norm": float(reference.norm().item()),
+            "output_dtype": str(compact.dtype),
+            "reference_norm": float(reference_f32.norm().item()),
             "max_abs_error": float(difference.abs().max().item()),
-            "relative_l2": float((difference.norm() / reference.norm()).item()),
+            "relative_l2": float((difference.norm() / reference_f32.norm()).item()),
             "cosine": float(
                 torch.nn.functional.cosine_similarity(
-                    compact.flatten(), reference.flatten(), dim=0
+                    compact_f32.flatten(), reference_f32.flatten(), dim=0
                 ).item()
             ),
             "graph_eager_exact": True,
@@ -415,6 +442,9 @@ def main():
         }
         if timings:
             record["graph_replay_us"] = {str(w): round(t, 1) for w, t in timings.items()}
+            record["graph_replay_samples_us"] = raw_timings
+        if launch_attestation:
+            record["launch_attestation"] = launch_attestation
         # Digests let runs with different route blocks be compared for
         # bit-identical outputs without keeping the tensors.
         record["output_sha256"] = {
@@ -439,6 +469,8 @@ def main():
             else args.routing
         ),
         "gpu": torch.cuda.get_device_name(),
+        "gpu_before": gpu_before,
+        "gpu_after": nvidia_smi_gpu_mode_snapshot(),
         "torch": torch.__version__,
         "runtime_weight_bytes": {str(w): values[-1] for w, values in runtimes.items()},
         "records": records,
