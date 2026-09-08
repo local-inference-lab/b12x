@@ -662,6 +662,100 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
+@pytest.mark.parametrize("high_page", [False, True])
+def test_compressed_prefill_reuses_lse_scratch_on_graph_replay(
+    mode: str, high_page: bool
+) -> None:
+    device = require_b12x_sparse_mla()
+    q, compact, compact_indices, lengths = _make_dsv4_compressed_case(
+        device, topk=128, seed=20260909
+    )
+    cache, indices = compact, compact_indices.clone()
+    if high_page:
+        page_bytes = compact.stride(0)
+        first_page = (2**31) // page_bytes + 1
+        cache = torch.empty(
+            (first_page + compact.shape[0], compact.shape[1]),
+            dtype=compact.dtype,
+            device=device,
+        )
+        cache[first_page:].copy_(compact)
+        indices[indices >= 0] += first_page * _DSV4_PAGE
+        assert first_page * page_bytes > 2**31
+    scratch = _make_dsv4_scratch(device, topk=128, max_chunks=8)
+    scratch.mode = mode
+
+    def run():
+        return compressed_sparse_mla_decode_forward(
+            q_all=q,
+            swa_k_cache=cache,
+            swa_indices=indices,
+            swa_topk_lengths=lengths,
+            workspace=scratch,
+            sm_scale=_DSV4_SM_SCALE,
+            swa_page_size=_DSV4_PAGE,
+            return_lse=True,
+            lse_scale="base2",
+        )
+
+    out, lse = run()
+    expected, expected_lse = compressed_sparse_mla_reference(
+        q,
+        compact,
+        compact_indices,
+        lengths,
+        sm_scale=_DSV4_SM_SCALE,
+        swa_page_size=_DSV4_PAGE,
+        return_lse=True,
+    )
+    assert lse.data_ptr() == scratch.final_lse.data_ptr()
+    torch.testing.assert_close(lse * math.log(2), expected_lse, rtol=0, atol=0.02)
+    assert torch.isfinite(out).all() and torch.count_nonzero(out) > 0
+    assert (
+        torch.nn.functional.cosine_similarity(
+            out.float().flatten(), expected.float().flatten(), dim=0
+        )
+        >= 0.999
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out, captured_lse = run()
+    pointers = captured_out.data_ptr(), captured_lse.data_ptr()
+    for live_length in (7, 31):
+        lengths.fill_(live_length)
+        expected, expected_lse = compressed_sparse_mla_reference(
+            q,
+            compact,
+            compact_indices,
+            lengths,
+            sm_scale=_DSV4_SM_SCALE,
+            swa_page_size=_DSV4_PAGE,
+            return_lse=True,
+        )
+        captured_out.fill_(float("nan"))
+        captured_lse.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_allocated(device) == allocated
+        assert (captured_out.data_ptr(), captured_lse.data_ptr()) == pointers
+        assert captured_lse.data_ptr() == scratch.final_lse.data_ptr()
+        torch.testing.assert_close(
+            captured_lse * math.log(2), expected_lse, rtol=0, atol=0.02
+        )
+        assert (
+            torch.isfinite(captured_out).all() and torch.count_nonzero(captured_out) > 0
+        )
+        assert (
+            torch.nn.functional.cosine_similarity(
+                captured_out.float().flatten(), expected.float().flatten(), dim=0
+            )
+            >= 0.999
+        )
+
+
+@torch.inference_mode()
 def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> None:
     """has_extra_cache (indexed/extra-tokens, P7c): the gate routes the DSV4
     dual-cache to SM120 and the result matches dsv4_extra_ref.dsv4_extra_decode_reference
