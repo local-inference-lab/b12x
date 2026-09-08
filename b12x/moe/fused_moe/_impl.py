@@ -97,6 +97,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from b12x.moe._shared.kernels.w4a16.host import w4a16_phase_profile_enabled
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -892,6 +893,7 @@ class TPW4A16Workspace:
     planned_scale_format: str = "e4m3_k16"
     planned_collect_activation_amax: bool = False
     planned_prefill_fused_sum_fp32: bool = False
+    planned_phase_profile: bool = False
     planned_fused_moe_launches: dict[object, object] = field(default_factory=dict)
     planned_topk_sum_launches: dict[object, object] = field(default_factory=dict)
     # Mapped direct-route launches, keyed by exact live token count. These
@@ -3326,6 +3328,7 @@ def _plan_core_workspace(
     )
     if implementation == "w4a16":
         from b12x.moe._shared.kernels.w4a16.host import (
+            w4a16_fused_workspace_elements,
             max_packed_route_slots,
             packed_gemm_scratch_elements,
             prefill_fused_sum_eligible,
@@ -3590,7 +3593,10 @@ def _plan_core_workspace(
                         (routed_capacity, int(k)),
                         torch.float16,
                     ),
-                    _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+                    _TensorAllocSpec(
+                        "kernel_workspace", (w4a16_fused_workspace_elements(sms),),
+                        torch.int32,
+                    ),
                 )
             )
             if not coupled_hadamard:
@@ -8378,6 +8384,7 @@ def _prewarm_w4a16_planned_launches(
         workspace.planned_tc_decode_launches = tc_decode_launches
         workspace.planned_scale_format = scale_format
         workspace.planned_collect_activation_amax = collect_activation_amax
+        workspace.planned_phase_profile = w4a16_phase_profile_enabled()
     if _B12X_TIMING:
         t_done = time.perf_counter()
         total_ms = (t_done - t0) * 1000.0
@@ -8500,12 +8507,24 @@ def materialize_tp_moe_arena_workspaces(
     materialize_ms = 0.0
     prewarm_ms = 0.0
     for key, (plan, core_plan, required_nbytes) in selected.items():
+        kernel_workspace_elements = next(
+            (spec.shape[0] for spec in core_plan.tensor_specs if spec.name == "kernel_workspace"),
+            0,
+        )
         existing = pool.workspaces.get(key)
         if existing is not None:
             with suppress(TypeError, ValueError):
                 _validate_workspace(existing, plan=plan)
                 if isinstance(existing, TPW4A16Workspace) and (
                     not set(core_token_counts).issubset(existing.planned_token_counts)
+                    or existing.planned_phase_profile != w4a16_phase_profile_enabled()
+                    or (
+                        kernel_workspace_elements > 0
+                        and (
+                            existing.kernel_workspace is None
+                            or existing.kernel_workspace.numel() < kernel_workspace_elements
+                        )
+                    )
                     or existing.coupled_hadamard != core_plan.coupled_hadamard
                     or existing.planned_apply_router_weight_on_input
                     != bool(apply_router_weight_on_input)

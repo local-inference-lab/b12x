@@ -71,6 +71,7 @@ from b12x._lib.intrinsics import (
     packed_decode_sqg_xor_cheb_t12_to_e4m3x2x4,
     packed_decode_sqg_xor_cheb_t12_to_e4m3x8,
     packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8,
+    packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x2x4,
     ld_global_nc_v4_u32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_f16x2,
@@ -106,6 +107,9 @@ from b12x.moe._shared.kernels.w4a16.route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
 )
 from b12x.moe._shared.kernels.w4a16.host import (
+    w4a16_fused_workspace_elements,
+    w4a16_phase_profile_enabled,
+    w4a16_phase_profile_offset,
     w4a16_topk_sum_rotation_output_dtype,
     w4a16_topk_sum_rotation_output_torch_dtype,
     _W4A16_ALLOWED_ROUTED_SIZES,
@@ -115,6 +119,11 @@ from b12x.moe._shared.kernels.w4a16.host import (
     prefill_fused_sum_eligible,
     select_route_block_size_m,
     validate_activation,
+)
+from b12x.moe._shared.kernels.w4a16.phase_profile import (
+    globaltimer as _phase_globaltimer,
+    record_row as _phase_record_row,
+    stamp as _phase_stamp,
 )
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -215,6 +224,15 @@ def _sqg_xor_cheb_t12_smem_enabled() -> bool:
     """
 
     return os.environ.get("B12X_SQG_XOR_CHEB_T12_SMEM", "1") == "1"
+
+
+def _sqg_xor_cheb_t12_direct_pairs_enabled() -> bool:
+    """Research-only pair packing for the direct shared LUT; default off.
+
+    The same eight bytes feed FP16 or BF16 fragments as four independent
+    pairs. The switch participates in the kernel cache key for A/B checks.
+    """
+    return os.environ.get("B12X_SQG_XOR_CHEB_T12_DIRECT_PAIRS", "0") == "1"
 
 
 def _w4a16_cross_tile_prefetch_enabled() -> bool:
@@ -919,6 +937,7 @@ class W4A16FusedMoeCompileResult:
     local_memory_bytes: int = -1
     cta_threads: int = -1
     shared_memory_bytes: int = -1
+    workspace_elements: int = 0
 
 
 @dataclass(frozen=True)
@@ -1260,6 +1279,8 @@ class W4A16GemmKernel:
         )
         self.sqg_xor_cheb_t12_smem = False
         self.sqg_xor_cheb_t12_direct_smem = False
+        self.sqg_xor_cheb_t12_direct_pairs = _sqg_xor_cheb_t12_direct_pairs_enabled()
+        self.phase_profile_offset = 0
         # Instruction sequence of the modal T12 window decode; both chains
         # read the same table byte per window (see
         # ``_sqg_xor_cheb_t12_decode_chain``).
@@ -1640,6 +1661,8 @@ class W4A16GemmKernel:
             self.sqg_xor_cheb_t12_smem,
             self.small_m_splitk,
             self.sqg_xor_cheb_t12_decode_chain,
+            self.sqg_xor_cheb_t12_direct_pairs,
+            self.phase_profile_offset,
             self.cross_tile_prefetch,
             self.sh_red_dealiased,
         )
@@ -4276,9 +4299,16 @@ class W4A16GemmKernel:
     ):
         lock_addr = get_ptr_as_int64(locks_i32_flat, lock_slot)
         if tid == Int32(0):
+            if cutlass.const_expr(self.phase_profile_offset != 0):
+                wait_start = _phase_globaltimer()
             state = Int32(-1)
             while state != count:
                 state = ld_global_acquire_i32(lock_addr)
+            if cutlass.const_expr(self.phase_profile_offset != 0):
+                wait_end = _phase_globaltimer()
+                record = _phase_record_row(locks_i32_flat, self.phase_profile_offset)
+                record[8] = record[8] + (wait_end - wait_start)
+                record[9] = record[9] + cutlass.Uint64(1)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -4980,6 +5010,22 @@ class W4A16GemmKernel:
                 o0, o1, o2, o3 = packed_decode_sqg_fp16_d3l_to_bfloat2x4(
                     win_a, win_b, trellis_lut_addr, int(bits)
                 )
+        elif cutlass.const_expr(
+            self.sqg_xor_cheb_t12_direct_smem and self.sqg_xor_cheb_t12_direct_pairs
+        ):
+            p01, p23, p45, p67 = packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x2x4(
+                win_a, win_b, Int32(trellis_lut_addr), int(bits)
+            )
+            if cutlass.const_expr(self.is_fp16):
+                o0 = fp8x2_e4m3_pair_to_half2(p01)
+                o1 = fp8x2_e4m3_pair_to_half2(p23)
+                o2 = fp8x2_e4m3_pair_to_half2(p45)
+                o3 = fp8x2_e4m3_pair_to_half2(p67)
+            else:
+                o0 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p01)
+                o1 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p23)
+                o2 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p45)
+                o3 = fp8x2_e4m3_pair_to_bfloat2_native_sm120(p67)
         elif cutlass.const_expr(self.sqg_xor_cheb_t12_direct_smem):
             e_lo, e_hi = packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
                 win_a,
@@ -7174,6 +7220,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         sqg_xor_cheb_t12_direct_smem: bool | None = None,
+        phase_profile: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -7553,6 +7600,18 @@ class W4A16FusedMoeKernel:
             self.fc2.sqg_xor_cheb_t12_direct_smem = self.sqg_xor_cheb_t12_direct_smem
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        self.phase_profile = bool(
+            phase_profile and full_rotation and coupled_hadamard
+            and is_gated and size_m <= 8 and direct_topk_routes
+            and not zero_fc2_output and not collect_activation_amax
+            and self.blocks_per_sm == 1
+        )
+        self.phase_profile_offset = w4a16_phase_profile_offset(self.sms)
+        self.workspace_elements = w4a16_fused_workspace_elements(
+            self.sms, profile=self.phase_profile
+        )
+        if self.phase_profile:
+            self.fc1.phase_profile_offset = self.phase_profile_offset
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -7596,6 +7655,7 @@ class W4A16FusedMoeKernel:
             self.sqg_xor_cheb_t12_direct_smem,
             self.small_m_splitk,
             self.sqg_xor_cheb_t12_decode_chain,
+            self.phase_profile,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
             self.cta_threads,
@@ -8131,6 +8191,12 @@ class W4A16FusedMoeKernel:
         # resolution inside _run_persistent_gemm.
         # The trellis LUT parameters carry the raw global address unless the
         # single-tier entry staged the T12 staircase in shared memory.
+        if cutlass.const_expr(self.phase_profile):
+            if tid == Int32(0):
+                record = _phase_record_row(locks_i32_flat, self.phase_profile_offset)
+                record[8] = cutlass.Uint64(0)
+                record[9] = cutlass.Uint64(0)
+                record[0] = _phase_globaltimer()
         fc1_phase_lut = fc1_trellis_lut_addr
         fc2_phase_lut = fc2_trellis_lut_addr
         if cutlass.const_expr(self.sqg_xor_cheb_t12_smem):
@@ -8172,7 +8238,7 @@ class W4A16FusedMoeKernel:
                     grid_x,
                     active_m,
                 )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._grid_barrier(locks_i32_flat, tid, grid_x, profile_slot=1)
         if cutlass.const_expr(
             self.tc_decode_fused_sum or self.prefill_fused_sum_fp32
         ):
@@ -8224,7 +8290,7 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._grid_barrier(locks_i32_flat, tid, grid_x, profile_slot=3)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.coupled_hadamard):
                     self._run_activation_coupled(
@@ -8290,7 +8356,7 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-        self._grid_barrier(locks_i32_flat, tid, grid_x)
+        self._grid_barrier(locks_i32_flat, tid, grid_x, profile_slot=5)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -8330,6 +8396,11 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
         )
+        if cutlass.const_expr(self.phase_profile):
+            cute.arch.sync_threads()
+            if tid == Int32(0):
+                _phase_stamp(locks_i32_flat, self.phase_profile_offset, 7)
+
     @cute.jit
     def _sqg_smem_copy(
         self,
@@ -8351,9 +8422,12 @@ class W4A16FusedMoeKernel:
         locks_i32_flat: cute.Tensor,
         tid: Int32,
         grid_x: Int32,
+        profile_slot: cutlass.Constexpr[int] = -1,
     ):
         cute.arch.sync_threads()
         if tid == Int32(0):
+            if cutlass.const_expr(self.phase_profile and profile_slot >= 0):
+                _phase_stamp(locks_i32_flat, self.phase_profile_offset, profile_slot)
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
             old_sense = ld_global_acquire_i32(sense_addr)
@@ -8366,6 +8440,8 @@ class W4A16FusedMoeKernel:
                 sense = old_sense
                 while sense == old_sense:
                     sense = ld_global_acquire_i32(sense_addr)
+            if cutlass.const_expr(self.phase_profile and profile_slot >= 0):
+                _phase_stamp(locks_i32_flat, self.phase_profile_offset, profile_slot + 1)
         cute.arch.sync_threads()
 
     @cute.jit
@@ -11249,6 +11325,7 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         cta_threads_multiplier=cta_threads_multiplier,
+        phase_profile=w4a16_phase_profile_enabled(),
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -11410,7 +11487,7 @@ def compile_w4a16_fused_moe(
     )
     locks_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (4 * 256 + 2,),
+        (max(4 * 256 + 2, kernel.workspace_elements),),
         assumed_align=16,
     )
     rot_scales_fake = make_ptr(
@@ -11540,6 +11617,7 @@ def compile_w4a16_fused_moe(
         local_memory_bytes=local_memory_bytes,
         cta_threads=kernel.cta_threads,
         shared_memory_bytes=kernel.shared_words * 4 + 16,
+        workspace_elements=kernel.workspace_elements,
     )
     _FUSED_CACHE[cache_key] = result
     return result
@@ -12293,6 +12371,10 @@ def _w4a16_fused_moe_launch_flat(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
     )
+    if workspace.numel() < fused.workspace_elements:
+        raise ValueError(
+            f"W4A16 workspace needs {fused.workspace_elements} int32 elements"
+        )
     weight_cutlass_dtype = (
         cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32
     )
@@ -14624,6 +14706,10 @@ def run_w4a16_moe(
                 f"planned={actual_fused + (int(fused_launch.max_m_blocks),)}"
             )
         fused = fused_launch
+    if prepared.workspace.numel() < fused.workspace_elements:
+        raise ValueError(
+            f"prepared W4A16 workspace needs {fused.workspace_elements} int32 elements"
+        )
     capacity_m = int(fused.size_m)
     capacity_routed_rows = capacity_m * topk
     required_cache13_elements = (

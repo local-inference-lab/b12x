@@ -7503,6 +7503,74 @@ def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x8(
 
 
 @dsl_user_op
+def packed_decode_trellis_sqg_direct_lut_smem_to_e4m3x2x4(
+    win_a,
+    win_b,
+    direct_lut_smem_addr,
+    bits: int = 3,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Read eight direct-table bytes as four independent low-16-bit pairs.
+
+    The window and byte order matches the shared-memory x8 primitive.
+    Each pair feeds one native FP8x2 conversion without first joining four
+    bytes into a 32-bit word. The caller must stage the 64 KiB rate table.
+    """
+    bits = int(bits)
+    if bits not in (2, 3, 4):
+        raise ValueError(
+            f"unsupported SQG-normal trellis bitrate {bits}; expected 2, 3, or 4"
+        )
+    extract_lines = []
+    load_lines = []
+    for index in range(8):
+        source = "$5" if index < 4 else "$4"
+        shift = (3 - (index & 3)) * bits
+        extract_lines.append(
+            f"bfe.u32 w{index}, {source}, {shift}, 16;"
+            if shift else f"and.b32 w{index}, {source}, 0xffff;"
+        )
+        load_lines.append(
+            f"add.u32 addr{index}, w{index}, $6;\n"
+            f"ld.shared.u8 w{index}, [addr{index}];"
+        )
+    pack_lines = []
+    for pair in range(4):
+        lo, hi = 2 * pair, 2 * pair + 1
+        pack_lines.extend((
+            f"shl.b32 w{hi}, w{hi}, 8;",
+            f"or.b32 ${pair}, w{lo}, w{hi};",
+        ))
+    asm = (
+        "{\n.reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;\n"
+        ".reg .b32 addr0,addr1,addr2,addr3,addr4,addr5,addr6,addr7;\n"
+        + "\n".join(extract_lines + load_lines + pack_lines)
+        + "\n}"
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+            Int32(direct_lut_smem_addr).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
+
+
+@dsl_user_op
 def packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
     win_a,
     win_b,

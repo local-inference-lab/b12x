@@ -282,6 +282,76 @@ def test_fused_kernel_accepts_block_64_with_the_modal_table(monkeypatch) -> None
     assert fused.blocks_per_sm == 1
 
 
+@pytest.mark.parametrize("sms", [1, 188, 256])
+def test_phase_profile_workspace_preserves_lock_and_counter_prefix(sms):
+    from b12x.moe._shared.kernels.w4a16.host import (
+        W4A16_PHASE_PROFILE_FIELDS,
+        w4a16_fused_workspace_elements,
+        w4a16_phase_profile_offset,
+    )
+
+    prefix = sms * 4 + 2
+    offset = w4a16_phase_profile_offset(sms)
+    assert w4a16_fused_workspace_elements(sms, profile=False) == prefix
+    assert offset >= prefix and offset % 4 == 0
+    assert w4a16_fused_workspace_elements(sms, profile=True) == (
+        offset + sms * len(W4A16_PHASE_PROFILE_FIELDS) * 2
+    )
+
+
+def test_phase_profile_reader_ignores_unused_ctas_and_rejects_stale_records():
+    import struct
+    from benchmarks.analyze_w4a16_phase_profile import summarize
+    from b12x.moe._shared.kernels.w4a16.host import (
+        w4a16_fused_workspace_elements,
+        w4a16_phase_profile_offset,
+    )
+
+    data = bytearray(w4a16_fused_workspace_elements(188, profile=True) * 4)
+    offset = w4a16_phase_profile_offset(188) * 4
+    struct.pack_into("<10Q", data, offset, 100, 110, 115, 150, 155, 160, 165, 200, 10, 2)
+    result = summarize(data, sms=188, ctas=1)
+    assert result["body_envelope_ns"] == 100
+    assert result["phase_per_cta_ns"]["fc1_including_lock_polling"]["median"] == 35
+    assert result["fc1_lock_poll_per_cta_ns"]["median"] == 10
+    with pytest.raises(ValueError, match="CTA 1 has missing"):
+        summarize(data, sms=188, ctas=2)
+    with pytest.raises(ValueError, match="workspace needs"):
+        summarize(data[:offset], sms=188, ctas=1)
+
+
+@pytest.mark.parametrize("threads", [256, 512])
+def test_decode_pair_and_profile_specializations_do_not_share_binaries(monkeypatch, threads):
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_SMEM", "1")
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_DIRECT_SMEM", "1")
+    kwargs = dict(
+        size_m=4, hidden_size=3584, intermediate_size=384, num_experts=896,
+        top_k=16, activation="situ", apply_router_weight_on_input=False,
+        zero_fc2_output=False, fc1_tile_n=128, fc1_tile_k=128,
+        fc2_tile_n=128, fc2_tile_k=128, moe_block_size=8, max_m_blocks=64,
+        element_dtype="fp16", weight_layout="trellis3_t256",
+        scale_format="e4m3_k32", w13_layout="trellis3_t256_proj", trellis_bits=2,
+        intermediate_rotation=True, full_rotation=True, coupled_hadamard=True,
+        rotation_input_dtype="bf16", broadcast_suh=True, direct_topk_routes=True,
+        cta_threads_multiplier=threads // 256,
+    )
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_DIRECT_PAIRS", "0")
+    baseline = W4A16FusedMoeKernel(**kwargs)
+    monkeypatch.setenv("B12X_SQG_XOR_CHEB_T12_DIRECT_PAIRS", "1")
+    pairs = W4A16FusedMoeKernel(**kwargs)
+    profile = W4A16FusedMoeKernel(**kwargs, phase_profile=True)
+    assert len({k.__cache_key__ for k in (baseline, pairs, profile)}) == 3
+    assert not baseline.phase_profile and not pairs.phase_profile
+    assert profile.phase_profile
+    assert profile.workspace_elements > pairs.workspace_elements
+    assert profile.fc1.phase_profile_offset >= profile.barrier_sense_off + 1
+    assert profile.fc2.phase_profile_offset == 0
+    assert all(k.fc1.is_fp16 and k.fc2.is_fp16 for k in (baseline, pairs, profile))
+    assert baseline.shared_words == pairs.shared_words == profile.shared_words
+    kwargs["size_m"] = 16
+    assert not W4A16FusedMoeKernel(**kwargs, phase_profile=True).phase_profile
+
+
 @pytest.mark.parametrize(
     ("block", "accepted"),
     [(32, True), (48, True), (64, True), (96, False)],

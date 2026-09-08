@@ -976,6 +976,30 @@ def test_w4a16_materialize_freezes_prefill_reduction_selection(
     assert workspace.prefill_sum_accum is not None
 
 
+def test_w4a16_pool_reprepares_when_phase_profile_contract_changes(monkeypatch):
+    """An existing pool must not retain launch metadata for another profile mode."""
+    prepared = []
+
+    def prewarm(workspace, *, token_counts, **_kwargs):
+        workspace.planned_token_counts = frozenset(token_counts)
+        workspace.planned_phase_profile = tp_moe_impl.w4a16_phase_profile_enabled()
+        prepared.append(workspace)
+
+    monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 120)
+    monkeypatch.setattr(tp_moe_impl, "_prewarm_w4a16_planned_launches", prewarm)
+    pool = tp_moe_impl.allocate_tp_moe_workspace_pool(frozen=True)
+    caps = _caps(
+        max_tokens=4,
+        weight_plan=_weight_plan("w4a16", w4a16_layout=PreparedWeightLayout.MMA_PACKED),
+        core_token_counts=(4,), route_num_experts=0,
+    )
+    for mode, expected_prepares in (("0", 1), ("0", 1), ("1", 2), ("1", 2), ("0", 3)):
+        monkeypatch.setenv("B12X_W4A16_PHASE_PROFILE", mode)
+        tp_moe_impl.materialize_tp_moe_arena_workspaces(pool, caps=caps)
+        assert len(prepared) == expected_prepares
+        assert prepared[-1].planned_phase_profile == (mode == "1")
+
+
 def test_w4a16_scratch_binding_carries_activation_amax_to_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

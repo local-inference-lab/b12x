@@ -27,6 +27,35 @@ _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
 
+W4A16_PHASE_PROFILE_FIELDS = (
+    "body_start_ns", "rotation_arrive_ns", "rotation_release_ns",
+    "fc1_arrive_ns", "fc1_release_ns", "activation_arrive_ns",
+    "activation_release_ns", "fc2_end_ns", "fc1_lock_wait_ns", "fc1_lock_wait_count",
+)
+
+
+def w4a16_phase_profile_enabled() -> bool:
+    """Opt in to per-CTA diagnostic records for isolated full-rotation decode.
+
+    Records describe the last launch using a workspace; they are not a
+    multi-layer trace. Set before workspace planning and kernel compilation.
+    """
+    return os.environ.get("B12X_W4A16_PHASE_PROFILE", "0") == "1"
+
+
+def w4a16_phase_profile_offset(sms: int) -> int:
+    """Int32 offset after split-K locks and grid counters, aligned to 16 bytes."""
+    return (int(sms) * 4 + 2 + 3) // 4 * 4
+
+
+def w4a16_fused_workspace_elements(sms: int, *, profile: bool | None = None) -> int:
+    if profile is None:
+        profile = w4a16_phase_profile_enabled()
+    if not profile:
+        return int(sms) * 4 + 2
+    return w4a16_phase_profile_offset(sms) + int(sms) * 2 * len(W4A16_PHASE_PROFILE_FIELDS)
+
+
 def prefill_fused_sum_enabled() -> bool:
     """Enable direct FP32 route reduction for large-M W4A16 launches.
 
