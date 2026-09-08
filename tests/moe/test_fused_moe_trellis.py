@@ -1262,8 +1262,11 @@ def test_planned_full_rotation_matches_reference_and_captures(
     relative_error = (mapped_eager - reference).norm() / reference.norm().clamp_min(
         1.0e-9
     )
+    assert torch.isfinite(mapped_eager).all()
+    assert torch.count_nonzero(mapped_eager) > 0
+    # Compute the angular metric in FP32 even when the public output is BF16.
     cosine = torch.nn.functional.cosine_similarity(
-        mapped_eager.flatten(), reference.flatten(), dim=0
+        mapped_eager.float().flatten(), reference.float().flatten(), dim=0
     )
     assert float(relative_error) <= 2.0e-2
     assert float(cosine) >= 0.999
