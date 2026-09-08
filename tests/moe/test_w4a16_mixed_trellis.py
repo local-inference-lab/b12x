@@ -1741,3 +1741,104 @@ def test_glm52_large_m_mixed_k3_k4_matches_serial() -> None:
     # mixed grid reduces them in one schedule. Normal rounding stays below
     # 1e-4; the unsafe 64x256 FC1 geometry was three orders larger (~8e-3).
     assert float(relative) < 1.0e-4
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("tier_count", [2, 3])
+def test_mixed_descriptor_high_local_experts_match_serial_and_replay(
+    tier_count: int,
+) -> None:
+    """Exercise every tier tag at local indices 255, 256 and 511 on the GPU."""
+    torch.manual_seed(20260909)
+    device = torch.device("cuda", torch.cuda.current_device())
+    count, rows, hidden = 512, 3, 128
+    tiers = tuple(
+        _prepared(
+            experts=count,
+            hidden=hidden,
+            intermediate=hidden,
+            bits=3 + i,
+            seed=730 + i,
+            device=device,
+            codebook="mcg",
+        )
+        for i in range(tier_count)
+    )
+    ids = torch.tensor(
+        [
+            [tier * count + local for tier in range(tier_count)]
+            for local in (255, 256, 511)
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    router = torch.softmax(torch.randn((rows, tier_count), device=device), dim=-1)
+    x = (torch.randn((rows, hidden), device=device) * 1e-3).bfloat16()
+    serial = torch.zeros((rows, hidden), device=device)
+    for i, tier in enumerate(tiers):
+        expert_map = torch.full(
+            (tier_count * count,), -1, dtype=torch.int32, device=device
+        )
+        expert_map[i * count : (i + 1) * count] = torch.arange(
+            count, dtype=torch.int32, device=device
+        )
+        serial.add_(_serial_tier(x, tier, router, ids, expert_map))
+    props = torch.cuda.get_device_properties(device)
+    kwargs = dict(
+        size_m=rows,
+        hidden_size=hidden,
+        intermediate_size=hidden,
+        tier0_num_experts=count,
+        tier1_num_experts=count,
+        top_k=tier_count,
+        max_m_blocks=tier_count * rows,
+        sms=int(props.multi_processor_count),
+        max_shared_mem=int(props.shared_memory_per_block_optin),
+        force_tile_config=(128, 128, 128, 128),
+        trellis_codebook="mcg",
+    )
+    if tier_count == 2:
+        launch = compile_mixed_trellis(**kwargs)
+        mapping, descriptor = build_tiered_maps(
+            tuple(range(count)), tuple(range(count, 2 * count)), device=device
+        )
+        make_buffers, bind, run = (
+            make_mixed_trellis_buffers,
+            bind_mixed_trellis,
+            run_bound_mixed_trellis,
+        )
+    else:
+        launch = compile_mixed_trellis3(
+            **kwargs, tier2_num_experts=count, route_num_experts=3 * count
+        )
+        assignments = tuple(tier for tier in range(3) for _ in range(count))
+        mapping, descriptor = build_projection_tiered_maps(
+            assignments,
+            assignments,
+            assignments,
+            tier_slots=(count,) * 3,
+            device=device,
+        )
+        make_buffers, bind, run = (
+            make_mixed_trellis3_buffers,
+            bind_mixed_trellis3,
+            run_bound_mixed_trellis3,
+        )
+    buffers = make_buffers(launch, device=device, sms=int(props.multi_processor_count))
+    binding = bind(
+        *tiers, mapping, descriptor, combine_trellis_rotations(*tiers), launch
+    )
+    eager = run(x, router, ids, binding, buffers).clone()
+    assert torch.isfinite(eager).all() and torch.count_nonzero(eager) > 0
+    assert float((eager.float() - serial).norm() / serial.norm()) < 4e-3
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(x, router, ids, binding, buffers)
+    pointer = captured.data_ptr()
+    captured.fill_(float("nan"))
+    allocated = torch.cuda.memory_allocated(device)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, eager)
+    assert captured.data_ptr() == pointer
+    assert torch.cuda.memory_allocated(device) == allocated
