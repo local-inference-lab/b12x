@@ -1134,6 +1134,7 @@ def test_full_rotation_topk16_route_parallel_sum_matches_reference(bits: int) ->
         (torch.bfloat16, "silu", 10.0),
         (torch.bfloat16, "situ", None),
         (torch.float16, "silu", None),
+        (torch.float16, "silu", 10.0),
         (torch.float16, "situ", None),
     ],
 )
@@ -1259,6 +1260,21 @@ def test_planned_full_rotation_matches_reference_and_captures(
         activation=activation,
         swiglu_limit=swiglu_limit,
     )
+    if swiglu_limit is not None:
+        unclamped = _reference_full_rotation(
+            x,
+            local_ids,
+            router_weights,
+            w13,
+            w2,
+            gate_suh,
+            up_suh,
+            intermediate_rotations,
+            down_svh,
+            activation=activation,
+        )
+        # Removing the clamps must exceed the tolerance of this oracle test.
+        assert float((reference - unclamped).norm() / reference.norm()) > 0.02
     relative_error = (mapped_eager - reference).norm() / reference.norm().clamp_min(
         1.0e-9
     )
