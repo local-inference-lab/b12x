@@ -42,6 +42,9 @@ def _heavy_tailed(
 
 def _worker(rank: int, port: int, evidence: str) -> None:
     from b12x.comm.pcie import pcie_dma
+    from b12x.comm.pcie.pcie_dma_reference import (
+        ring_all_reduce_reference as lossless_reference,
+    )
     from tests.comm.pcie_dma_emulation import (
         column_reduce_scatter_reference,
         ring_all_reduce_reference,
@@ -80,13 +83,25 @@ def _worker(rank: int, port: int, evidence: str) -> None:
     ring = pcie_dma.PCIeDmaAllReduce(
         exchange_group=group, device=device, max_bytes=MAX_BYTES
     )
+
+    def _ring_reference(inputs: list[torch.Tensor], ring) -> torch.Tensor:
+        """The ring's own arithmetic for these inputs: the served chunk
+        mapping with bf16 hops, or the row-granule mapping and fp32 hops the
+        channel was built with (B12X_PCIE_RING_GRANULE_ROWS,
+        B12X_PCIE_RING_FP32_HOPS), which change the summation order."""
+        granule = ring._granule_elems(inputs[0])
+        hops = ring._fp32_hops_for(inputs[0])
+        if not granule and not hops:
+            return ring_all_reduce_reference(inputs, WORLD)
+        return lossless_reference(inputs, WORLD, granule_elems=granule, fp32_hops=hops)
+
     ring.min_bytes = 0
     assert ring._graph_replay, "set B12X_PCIE_DMA_GRAPH_REPLAY=1"
     record("ring_ready", replay_in_place=ring._replay_in_place)
 
     # ---- item 7: in-place replay, borrowed outputs, producer chain -----------
     hidden = [_heavy_tailed(ROWS, HIDDEN, rank, seed, torch.bfloat16, device) for seed in range(3)]
-    expected = [ring_all_reduce_reference(gather_all(h), WORLD) for h in hidden]
+    expected = [_ring_reference(gather_all(h), ring) for h in hidden]
     eager = ring.all_reduce(hidden[0])
     torch.cuda.synchronize(device)
     assert torch.equal(eager, expected[0]), "eager all-reduce differs from the ring reference"
@@ -178,7 +193,7 @@ def _worker(rank: int, port: int, evidence: str) -> None:
         mismatch = torch.tensor([int((block[:, :valid] != exact).sum())], device=device)
         dist.all_reduce(mismatch, group=group)
         stats[wire] = int(mismatch.item())
-    ring_full = ring_all_reduce_reference(gathered_latent[0], WORLD)
+    ring_full = _ring_reference(gathered_latent[0], ring)
     ring_mismatch = int((ring_full != sum64[0].to(torch.bfloat16)).sum())
     counts = torch.tensor(
         [len(wire_faults.get("fp32", [])), len(wire_faults.get("bf16", []))],
