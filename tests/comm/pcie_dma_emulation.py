@@ -536,17 +536,23 @@ class EmulatedRing:
         replay_min_bytes: int = 0,
         replay_max_entries: int = 4,
         model: bool = False,
+        granule_rows: int = 0,
+        fp32_hops: int = 0,
     ) -> None:
         self.world = world
+        self.granule_rows = max(0, int(granule_rows))
+        self.fp32_hops = min(max(0, int(fp32_hops)), world - 2)
         self.model = ScheduleModel() if model else None
         self.kernels = EmulatedKernels(self.model)
         cls = pcie_dma.PCIeDmaAllReduce
         shard_capacity = pcie_dma._align_up(
             (max_bytes + world - 1) // world, pcie_dma.SCRATCH_ALIGN
         )
-        steps = 2 * (world - 1)
+        scratch_offsets, scratch_bytes = cls._scratch_layout(
+            shard_capacity, world, self.fp32_hops
+        )
         flags_bytes = pcie_dma.FLAG_SLOTS * pcie_dma.FLAG_STRIDE
-        slab_bytes = flags_bytes + steps * shard_capacity
+        slab_bytes = flags_bytes + scratch_bytes
         self.slabs = [torch.zeros(slab_bytes, dtype=torch.uint8) for _ in range(world)]
         flags_base = [int(slab.data_ptr()) for slab in self.slabs]
         scratch_base = [ptr + flags_bytes for ptr in flags_base]
@@ -570,6 +576,14 @@ class EmulatedRing:
             ring._ipc = None
             ring._closed = False
             ring.shard_capacity = shard_capacity
+            ring._granule_rows = self.granule_rows
+            ring._fp32_hops = self.fp32_hops
+            ring._scratch_offsets = scratch_offsets
+            ring._fp32_stage = (
+                torch.zeros(2 * shard_capacity, dtype=torch.uint8)
+                if self.fp32_hops
+                else None
+            )
             ring._slab = None
             ring._flags_base = list(flags_base)
             ring._scratch_base = list(scratch_base)

@@ -188,7 +188,7 @@ def test_replay_captures_on_second_sighting_in_place_and_matches_eager() -> None
         assert torch.equal(first, expected)
         assert torch.equal(second, expected)
     ring = emu.rings[0]
-    key = ("ar", inputs[0].numel(), torch.bfloat16)
+    key = ("ar", inputs[0].numel(), torch.bfloat16, 0)
     assert list(ring._replay_entries) == [key]
     entry = ring._replay_entries[key]
     assert entry.inp is entry.out, "lossless all-reduce entry is in place"
@@ -300,8 +300,8 @@ def test_eviction_guard_keeps_a_borrowed_output_until_its_consumer_reads() -> No
     inputs_b = _inputs(*shape_b, seed=8, dtype=torch.bfloat16)
     expected_a = ring_all_reduce_reference(inputs_a, WORLD)
     expected_b = ring_all_reduce_reference(inputs_b, WORLD)
-    key_a = ("ar", inputs_a[0].numel(), torch.bfloat16)
-    key_b = ("ar", inputs_b[0].numel(), torch.bfloat16)
+    key_a = ("ar", inputs_a[0].numel(), torch.bfloat16, 0)
+    key_b = ("ar", inputs_b[0].numel(), torch.bfloat16, 0)
     guard = pcie_dma.REPLAY_EVICTION_GUARD_OPS
 
     def scenario(ring, rank):
@@ -333,12 +333,14 @@ def test_replay_keys_carry_the_op_tag() -> None:
     latent = torch.empty(rows, LATENT, dtype=torch.bfloat16)
     first = torch.empty(rows, ROUTER_COLS, dtype=torch.float32)
     second = torch.empty(rows, LATENT_COLS, dtype=torch.bfloat16)
-    ring = pcie_dma.PCIeDmaAllReduce
+    # The all-reduce key is an instance method: it carries the granule size
+    # of the row-count-invariant mapping (0 for the served mapping).
+    ring = EmulatedRing(WORLD, MAX_BYTES).rings[0]
     assert ring._all_reduce_key(latent)[0] == "ar"
     assert ring._reduce_scatter_key(latent, "fp32", 399)[0] == "rs_fp32"
     assert ring._reduce_scatter_key(latent, "bf16", 399)[0] == "rs_bf16"
     assert ring._all_gather_pair_key(first, second)[0] == "ag_pair"
-    assert ring._all_reduce_key(latent)[1:] == (latent.numel(), latent.dtype)
+    assert ring._all_reduce_key(latent)[1:] == (latent.numel(), latent.dtype, 0)
     assert ring._reduce_scatter_key(latent, "fp32", 399)[1:3] == (
         latent.numel(),
         latent.dtype,
