@@ -262,3 +262,37 @@ def test_wo_projection_binding_owns_runtime_tensors(monkeypatch) -> None:
             weights,
             binding=binding,
         )
+
+
+@pytest.mark.parametrize(
+    "tokens,sm_count,dsv4,quantized,preclear",
+    [
+        (8, 48, True, False, True),
+        (9, 48, True, True, False),
+        (15, 64, True, True, False),
+        (16, 48, False, True, False),
+        (17, 48, True, False, False),
+        (9, 48, False, False, False),
+        (15, 65, True, False, False),
+        (16, 188, True, False, False),
+    ],
+)
+def test_inv_rope_route_preserves_spark_boundaries(
+    tokens, sm_count, dsv4, quantized, preclear
+):
+    """Keep the Spark-only exact-B16 and DSV4 B9–15 routes distinct."""
+    from types import SimpleNamespace
+
+    weights = SimpleNamespace(
+        groups=4, group_width=512, rank=1024, hidden=4096 if dsv4 else 2048
+    )
+    route = wo_impl._select_wo_inv_rope_route(
+        tokens=tokens,
+        sm_count=sm_count,
+        weights=weights,
+        heads_per_group=1,
+        nope_dim=448,
+        rope_dim=64,
+    )
+    assert route.quantized_intermediate is quantized
+    assert route.atomic_output_precleared is preclear

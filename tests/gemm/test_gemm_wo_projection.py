@@ -776,18 +776,26 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("tokens", (1, 16))
+@pytest.mark.parametrize(
+    "tokens,dsv4_tp2",
+    [(1, False), (16, False), (8, True), (9, True), (15, True), (16, True), (17, True)],
+)
 def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
     tokens: int,
+    dsv4_tp2: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     require_b12x()
     torch.manual_seed(31014 + tokens)
 
     groups, heads_per_group = 2, 4
     nope_dim, rope_dim = 96, 32
+    rank, hidden = 64, 128
+    if dsv4_tp2:
+        groups, heads_per_group = 4, 1
+        nope_dim, rope_dim, rank, hidden = 448, 64, 1024, 4096
     head_dim = nope_dim + rope_dim
     group_width = heads_per_group * head_dim
-    rank, hidden = 64, 128
     o = (
         torch.randn(
             (tokens, groups * heads_per_group, head_dim),
@@ -802,15 +810,11 @@ def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
     )
     cos_sin_cache[:, : rope_dim // 2] = 1
     wo_a = (
-        torch.randn(
-            (groups, rank, group_width), device="cuda", dtype=torch.bfloat16
-        )
+        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
         / group_width**0.5
     )
     wo_b = (
-        torch.randn(
-            (hidden, groups * rank), device="cuda", dtype=torch.bfloat16
-        )
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
         / (groups * rank) ** 0.5
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
@@ -835,17 +839,51 @@ def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
         rope_dim=rope_dim,
         expected_m=tokens,
     ).clone()
-    actual = wo_projection_inv_rope_mxfp8(binding=binding)
+    from b12x.gemm._shared import wo_mxfp8 as wo_impl
+
+    def forbid_route_selection(**kwargs):
+        raise AssertionError("bound execution must consume its retained route")
+
+    def run_bound():
+        with monkeypatch.context() as frozen:
+            frozen.setattr(wo_impl, "_select_wo_inv_rope_route", forbid_route_selection)
+            return wo_projection_inv_rope_mxfp8(binding=binding)
+
+    sm_count = torch.cuda.get_device_properties(o.device).multi_processor_count
+    assert binding.route.atomic_output_precleared == (tokens <= 8)
+    assert binding.route.quantized_intermediate == (
+        sm_count <= 64 and (tokens == 16 or (dsv4_tp2 and 9 <= tokens <= 15))
+    )
+    actual = run_bound()
     torch.cuda.synchronize()
     assert actual.data_ptr() == binding.output.data_ptr()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def assert_output_matches(actual, expected):
+        if dsv4_tp2 and tokens == 8:
+            # BF16 atomic split-K accumulation can change its summation order.
+            relative = (
+                actual.float() - expected.float()
+            ).norm() / expected.float().norm()
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.float().flatten(), expected.float().flatten(), dim=0
+            )
+            assert relative < 0.005
+            assert cosine > 0.99998
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    assert_output_matches(actual, expected)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = wo_projection_inv_rope_mxfp8(binding=binding)
+        captured = run_bound()
     o.copy_(torch.randn_like(o) / 4)
+    captured.fill_(float("nan"))
+    allocated = torch.cuda.memory_allocated()
     graph.replay()
     torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
     replayed = captured.clone()
     expected_replay = wo_projection_inv_rope_mxfp8(
         o,
@@ -860,7 +898,7 @@ def test_inv_rope_planned_wo_uses_bound_arena_and_replays_under_graph(
     torch.cuda.synchronize()
 
     assert captured.data_ptr() == binding.output.data_ptr()
-    torch.testing.assert_close(replayed, expected_replay, rtol=0, atol=0)
+    assert_output_matches(replayed, expected_replay)
 
 
 def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
