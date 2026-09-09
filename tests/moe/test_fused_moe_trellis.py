@@ -1200,8 +1200,7 @@ def test_planned_full_rotation_matches_reference_and_captures(
 
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    # Exercise the clamp in the clamped case; the historical tiny input never
-    # drove a reconstructed FC1 value past DeepSeek's limit.
+    # Use unit-scale input so reconstructed FC1 values exceed the configured limit.
     input_scale = 1.0 if swiglu_limit is not None else 1.0e-3
     x = (torch.randn((2, hidden), device=device) * input_scale).to(input_dtype)
     local_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
