@@ -241,8 +241,8 @@ class W4A16MixedTrellisKernel:
                 "mixed Trellis FC2 schedule factor must divide one packed "
                 f"route block: factor={fc2_factor}, maximum={expected_factor}"
             )
-        if tier0.num_experts > 256 or tier1.num_experts > 256:
-            raise ValueError("tier-local expert ids must fit in eight bits")
+        if tier0.num_experts > _MAX_TIER_EXPERTS or tier1.num_experts > _MAX_TIER_EXPERTS:
+            raise ValueError("tier-local expert ids must fit in nine bits")
         if driver.num_experts != tier0.num_experts + tier1.num_experts:
             raise ValueError("driver expert count must equal the sum of both tiers")
         self.driver = driver
@@ -404,8 +404,8 @@ class W4A16MixedTrellisKernel:
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(8)
-                local_expert = descriptor & Int32(0xFF)
+                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
+                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
                 # FC1 is bounded by the tier's FC1 slot count; FC2 by its own
                 # independent count, since per-projection membership lets the
                 # two differ. Both remain real bounds.
@@ -1003,7 +1003,7 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
             )
         tiers = (tier0, tier1, tier2)
         if any(tier.num_experts > _MAX_TIER_EXPERTS for tier in tiers):
-            raise ValueError("tier-local expert ids must fit in eight bits")
+            raise ValueError("tier-local expert ids must fit in nine bits")
         if driver.num_experts != sum(tier.num_experts for tier in tiers):
             raise ValueError("driver expert count must equal the sum of all tiers")
         self.driver = driver
@@ -1103,8 +1103,8 @@ class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
                 descriptor_row * total_experts + combined_expert
             ].to(Int32)
             if descriptor >= Int32(0):
-                tier = descriptor >> Int32(8)
-                local_expert = descriptor & Int32(0xFF)
+                tier = descriptor >> Int32(_TIER_DESCRIPTOR_BITS)
+                local_expert = descriptor & Int32(_TIER_DESCRIPTOR_MASK)
 
                 if cutlass.const_expr(is_fc1):
                     t0_in_bounds = local_expert < tier0_gate_experts
@@ -2008,7 +2008,7 @@ def compile_mixed_trellis3(
     )
     if any(value <= 0 or value > _MAX_TIER_EXPERTS for value in counts):
         raise ValueError(
-            "three-tier mixed Trellis requires each tier to contain 1..256 slots"
+            "three-tier mixed Trellis requires each tier to contain 1..512 slots"
         )
     bits = tuple(int(value) for value in (tier0_bits, tier1_bits, tier2_bits))
     if set(bits) != {3, 4, 5}:
@@ -2341,8 +2341,11 @@ def build_ordered_maps(
     )
 
 
-# One tier-local expert index is encoded in the descriptor's low 8 bits.
-_MAX_TIER_EXPERTS = 256
+# Descriptors are in-process artifacts, not checkpoint storage. Nine local
+# index bits cover a projection tier containing all 288 GLM experts.
+_TIER_DESCRIPTOR_BITS = 9
+_TIER_DESCRIPTOR_MASK = (1 << _TIER_DESCRIPTOR_BITS) - 1
+_MAX_TIER_EXPERTS = 1 << _TIER_DESCRIPTOR_BITS
 
 
 def build_tiered_maps(
@@ -2355,8 +2358,8 @@ def build_tiered_maps(
 
     tier0_ids = tuple(int(expert_id) for expert_id in tier0_global_ids)
     tier1_ids = tuple(int(expert_id) for expert_id in tier1_global_ids)
-    if len(tier0_ids) > 256 or len(tier1_ids) > 256:
-        raise ValueError("each mixed Trellis tier supports at most 256 experts")
+    if len(tier0_ids) > _MAX_TIER_EXPERTS or len(tier1_ids) > _MAX_TIER_EXPERTS:
+        raise ValueError("each mixed Trellis tier supports at most 512 experts")
     total = len(tier0_ids) + len(tier1_ids)
     if sorted((*tier0_ids, *tier1_ids)) != list(range(total)):
         raise ValueError(
@@ -2371,7 +2374,7 @@ def build_tiered_maps(
         global_to_combined_host, dtype=torch.int32, device=device
     )
     descriptor_row = torch.tensor(
-        [*range(len(tier0_ids)), *((1 << 8) | i for i in range(len(tier1_ids)))],
+        [*range(len(tier0_ids)), *((1 << _TIER_DESCRIPTOR_BITS) | i for i in range(len(tier1_ids)))],
         dtype=torch.int32,
         device=device,
     )
@@ -2404,7 +2407,7 @@ def build_projection_tiered_maps(
 
     Returns ``(global_to_combined, descriptor_map)``. ``descriptor_map`` is a
     contiguous ``int32[3 * sum(tier_slots)]`` tensor laid out as gate, up, and
-    down rows. A populated entry encodes ``(tier << 8) | tier_local_index``;
+    down rows. A populated entry encodes ``(tier << _TIER_DESCRIPTOR_BITS) | tier_local_index``;
     unused padded slots contain ``-1``.
     """
 
@@ -2418,8 +2421,8 @@ def build_projection_tiered_maps(
         raise ValueError(
             "mixed Trellis tier_slots must contain exactly two or three counts"
         )
-    if any(value < 0 or value > 256 for value in slots):
-        raise ValueError("mixed Trellis tier slots must be in [0, 256]")
+    if any(value < 0 or value > _MAX_TIER_EXPERTS for value in slots):
+        raise ValueError("mixed Trellis tier slots must be in [0, 512]")
     num_experts = len(projections[0][1])
     rows: list[int] = []
     projection_counts: list[tuple[int, ...]] = []
@@ -2438,11 +2441,11 @@ def build_projection_tiered_maps(
         for tier in tiers:
             local = counters[tier]
             counters[tier] += 1
-            if local > 0xFF:
+            if local > _TIER_DESCRIPTOR_MASK:
                 raise ValueError(
-                    f"mixed Trellis {name} tier {tier} exceeds 256 experts"
+                    f"mixed Trellis {name} tier {tier} exceeds 512 experts"
                 )
-            row.append((tier << 8) | local)
+            row.append((tier << _TIER_DESCRIPTOR_BITS) | local)
         projection_counts.append(tuple(counters))
         rows.extend(row)
     # The launch sizes the descriptor namespace as the sum of the tier slot
@@ -2505,7 +2508,7 @@ def _check_descriptor_projection_counts(
         tier_count = len(gate_counts)
         for row in rows[:2]:
             live = row[row >= 0]
-            encoded_tiers = live >> 8
+            encoded_tiers = live >> _TIER_DESCRIPTOR_BITS
             if bool((encoded_tiers >= tier_count).any()):
                 raise ValueError(
                     "mixed Trellis descriptor contains a tier outside the "
