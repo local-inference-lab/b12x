@@ -179,7 +179,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
                 ring.all_reduce(inp[half:].contiguous(), out=halves[half:])
                 torch.cuda.synchronize(device)
                 split_mismatch = int((halves != out).sum().item())
-            hops = int(name.rpartition("fp32h")[2] or 0)
+            hops = int(name.rpartition("fp32h")[2]) if "fp32h" in name else 0
             records.append(
                 {
                     "rows": rows,
