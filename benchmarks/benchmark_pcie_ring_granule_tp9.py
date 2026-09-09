@@ -136,6 +136,12 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         reference64 = sum(tensor.double() for tensor in gathered)
         outputs = {}
         graphs = {}
+        # Every graph's nodes carry the addresses of its input and output
+        # buffers, so the buffers are held here until the last replay:
+        # torch.cuda.graph() empties the caching allocator on entry, which
+        # unmaps a buffer that only a graph still references and turns the
+        # next replay of that graph into an illegal memory access.
+        graph_buffers = {}
         for name, ring in rings.items():
             out = torch.empty_like(inp)
             ring.all_reduce(inp, out=out)
@@ -147,6 +153,7 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
             with torch.cuda.graph(graph):
                 ring.all_reduce(graph_in, out=graph_out)
             graphs[name] = graph
+            graph_buffers[name] = (graph_in, graph_out)
         timings = _time_graphs(
             graphs,
             device,
@@ -156,6 +163,8 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
         )
         for name, ring in rings.items():
             out = outputs[name]
+            # The replayed graph must reproduce the eager result bit for bit.
+            graph_matches_eager = bool(torch.equal(graph_buffers[name][1], out))
             error = float(
                 (
                     (out.double() - reference64).norm()
@@ -184,9 +193,10 @@ def _worker(rank: int, port: int, args: argparse.Namespace) -> None:
                     "wire_bytes_per_rank": _wire_bytes_per_rank(inp.numel(), hops),
                     "rel_l2_vs_fp64": error,
                     "split_mismatch_elements": split_mismatch,
+                    "graph_matches_eager": graph_matches_eager,
                 }
             )
-        del graphs
+        del graphs, graph_buffers
         torch.cuda.synchronize(device)
     for ring in rings.values():
         ring.close()
