@@ -95,7 +95,10 @@ def _worker(rank: int, port: int, evidence: str) -> None:
     torch.cuda.synchronize(device)
     assert torch.equal(replayed, expected[0])
     entry = next(iter(ring._replay_entries.values()))
-    assert entry.key == ("ar", ROWS * HIDDEN, torch.bfloat16)
+    # The key carries the granule size of the row-count-invariant mapping
+    # (0 for the served mapping), so compare against the ring's own key.
+    assert entry.key == ring._all_reduce_key(hidden[0])
+    assert entry.key[:3] == ("ar", ROWS * HIDDEN, torch.bfloat16)
     assert entry.inp is entry.out
     static = ring.all_reduce_input((ROWS, HIDDEN), torch.bfloat16)
     assert static is not None and static.data_ptr() == entry.inp.data_ptr()
