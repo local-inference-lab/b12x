@@ -155,6 +155,7 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    immutable_input_scales: bool = False,
 ) -> ExpertWeights: ...
 
 
@@ -175,6 +176,7 @@ def prepare_weights(**kwargs: Any) -> PreparedExperts | ExpertWeights:
             "a2_gscale",
             "btx_layer",
             "btx_device",
+            "immutable_input_scales",
             "dummy_scale",
         }
         mixed = sorted(legacy.intersection(kwargs))

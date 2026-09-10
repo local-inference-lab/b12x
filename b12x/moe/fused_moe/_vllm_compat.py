@@ -80,6 +80,7 @@ def prepare_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    immutable_input_scales: bool = False,
 ) -> ExpertWeights:
     return prepare_b12x_fp4_moe_weights(
         plan=plan,
@@ -95,6 +96,7 @@ def prepare_weights(
         btx_layer=btx_layer,
         btx_device=btx_device,
         dummy_scale=dummy_scale,
+        immutable_input_scales=immutable_input_scales,
     )
 
 

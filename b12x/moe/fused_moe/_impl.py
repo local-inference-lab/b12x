@@ -445,6 +445,9 @@ class B12XFP4ExpertWeights:
     w2_blockscale: torch.Tensor
     w2_alphas: torch.Tensor
     representation: _PreparedWeightRepresentation | None = None
+    immutable_input_scales: bool = False
+    _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
+    _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, MoEWeightPreparationPlan):
@@ -559,6 +562,51 @@ class B12XFP4ExpertWeights:
                     "FC2 shape does not match the prepared plan: "
                     f"actual={actual_w2}, expected={expected_w2}"
                 )
+
+        if (
+            self.immutable_input_scales
+            and "nvfp4" in self.plan.quant_modes
+            and not self.a1_gscale.is_meta
+        ):
+            # Weight preparation may inspect values; binding and graph replay
+            # may not. Preserve the vector so caller-owned scratch bindings can
+            # keep reading canonical expert scales without expansion copies.
+            scales = self.a1_gscale.detach().reshape(-1)
+            if scales.numel() > 1:
+                uniform = bool(
+                    (
+                        torch.isfinite(scales)
+                        & (scales > 0)
+                        & (scales == scales[0])
+                    ).all().item()
+                )
+                object.__setattr__(self, "_uniform_a1_scale", uniform)
+                if not torch.is_inference(self.a1_gscale):
+                    object.__setattr__(
+                        self, "_a1_scale_version", self.a1_gscale._version
+                    )
+
+    def can_share_input(self, *, input_scales_static: bool) -> bool:
+        """Whether one NVFP4 input quantization can serve every routed expert.
+
+        Vector sharing requires immutable_input_scales at weight preparation:
+        values must not change while a binding or captured graph remains live.
+        Reprepare weights and recapture graphs after changing those values.
+        Versioned eager mutations invalidate the preparation-time proof;
+        inference tensors rely on the explicitly supplied static contract.
+        """
+        if self.a1_gscale.numel() == 1:
+            return True
+        if (
+            not self.immutable_input_scales
+            or not input_scales_static
+            or not self._uniform_a1_scale
+        ):
+            return False
+        return (
+            self._a1_scale_version is None
+            or self.a1_gscale._version == self._a1_scale_version
+        )
 
     @property
     def source_format(self) -> str:
@@ -5947,8 +5995,14 @@ def prepare_b12x_fp4_moe_weights(
     btx_layer: object | None = None,
     btx_device: torch.device | str | None = None,
     dummy_scale: torch.Tensor | None = None,
+    immutable_input_scales: bool = False,
 ) -> B12XFP4ExpertWeights:
-    """Transfer source tensors into the planner-selected runtime owner."""
+    """Transfer source tensors into the planner-selected runtime owner.
+
+    immutable_input_scales promises that input scale values cannot change
+    until this owner and its captured graphs are discarded. It permits a
+    preparation-time equality proof without changing mutable-scale callers.
+    """
 
     if not isinstance(plan, MoEWeightPreparationPlan):
         raise TypeError("plan must be a MoEWeightPreparationPlan")
@@ -6243,6 +6297,7 @@ def prepare_b12x_fp4_moe_weights(
         w2_blockscale=canonical_s2,
         w2_alphas=canonical_a2,
         representation=representation,
+        immutable_input_scales=immutable_input_scales,
     )
 
 
@@ -11005,7 +11060,35 @@ def _decode_dynamic_launch_policy(value: int) -> tuple[bool, bool, int, bool, in
 
 @torch.library.custom_op(
     "b12x::tp_moe_dynamic_launch",
-    mutates_args="unknown",
+    # Only caller-owned execution buffers are writable. Marking every operand
+    # mutable increments canonical weight/scale versions even though the GPU
+    # only reads them, invalidating preparation-time scale metadata.
+    mutates_args=(
+        "packed_a_view",
+        "packed_a_flat",
+        "scale_flat",
+        "materialized_intermediate",
+        "barrier_count",
+        "barrier_epoch",
+        "pair_head",
+        "producers_done_count",
+        "all_work_published",
+        "task_head",
+        "task_tail",
+        "task_ready",
+        "task_expert",
+        "task_m_tile",
+        "task_slice_begin",
+        "task_slice_count",
+        "task_valid_rows",
+        "tile_write_count",
+        "row_counts",
+        "expert_write_rows",
+        "expert_tile_base",
+        "token_map",
+        "token_weights",
+        "scatter_output",
+    ),
 )
 def _tp_moe_dynamic_launch_op(
     packed_a_view: torch.Tensor,
@@ -11784,7 +11867,13 @@ def _tp_moe_tiny_decode_launch_fake(
 
 @torch.library.custom_op(
     "b12x::tp_moe_compact_micro_launch",
-    mutates_args="unknown",
+    # Decode must not invalidate immutable scale metadata used by prefill.
+    mutates_args=(
+        "barrier_count",
+        "barrier_epoch",
+        "micro_intermediate",
+        "scatter_output",
+    ),
 )
 def _tp_moe_compact_micro_launch_op(
     barrier_count: torch.Tensor,
@@ -12580,7 +12669,10 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             planned_tile_m=planned_tile_m,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
-                (quant_mode == "nvfp4" and a1_gscale.numel() == 1)
+                (
+                    quant_mode == "nvfp4"
+                    and experts.can_share_input(input_scales_static=input_scales_static)
+                )
                 or (
                     dynamic_w4a8_prepared is not None
                     and _env_flag(
