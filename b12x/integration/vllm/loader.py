@@ -33,7 +33,7 @@ def _has_b12x_loader_support() -> bool:
     and the file-weighted Source (file_weight_filter / weight_name_prefixes).
     """
     try:
-        import vllm.model_executor.weight_transfer  # noqa: F401
+        from vllm.model_executor.weight_transfer import weight_transfer  # noqa: F401
     except ImportError:
         return False
     try:
