@@ -16,8 +16,6 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     _BAR_FORMAT,
     enable_tqdm,
-    file_source_tensor,
-    safetensors_file_sources,
 )
 
 from b12x.loader import storage_stats
@@ -25,6 +23,31 @@ from b12x.loader._checkpoint import DirectWeightSession
 from b12x.loader._pool import owns_storage, owns_tensor, weight_pool
 
 logger = init_logger("vllm.model_executor.model_loader.b12x")
+
+
+def _has_b12x_loader_support() -> bool:
+    """True when the local-inference-lab/vllm fork is present.
+
+    The b12x O_DIRECT ('b12x' load format) loader needs the fork's
+    weight_transfer harness, safetensors_file_sources/file_source_tensor,
+    and the file-weighted Source (file_weight_filter / weight_name_prefixes).
+    """
+    try:
+        import vllm.model_executor.weight_transfer  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        from vllm.model_executor.model_loader import weight_utils
+    except ImportError:
+        return False
+    source = getattr(DefaultModelLoader, "Source", None)
+    return (
+        source is not None
+        and hasattr(source, "file_weight_filter")
+        and hasattr(source, "weight_name_prefixes")
+        and hasattr(weight_utils, "file_source_tensor")
+        and hasattr(weight_utils, "safetensors_file_sources")
+    )
 
 
 class B12xModelLoader(DefaultModelLoader):
@@ -122,6 +145,10 @@ class B12xModelLoader(DefaultModelLoader):
 
     def _file_backed_weights_iterator(self, files, source, index_path):
         from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+        from vllm.model_executor.model_loader.weight_utils import (
+            file_source_tensor,
+            safetensors_file_sources,
+        )
 
         weight_map = None
         if index_path.is_file():
@@ -212,5 +239,14 @@ class B12xModelLoader(DefaultModelLoader):
 
 def register_b12x_loader():
     from vllm.model_executor.model_loader import register_model_loader
+
+    if not _has_b12x_loader_support():
+        logger.info(
+            "b12x loader requires the local-inference-lab/vllm fork "
+            "(vllm.model_executor.weight_transfer + file-backed Source); "
+            "skipping 'b12x' load-format registration on this vLLM. "
+            "The b12x_fp6 quantization plugin is unaffected."
+        )
+        return
 
     register_model_loader("b12x")(B12xModelLoader)
