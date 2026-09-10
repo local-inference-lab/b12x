@@ -1,0 +1,226 @@
+{
+  "prefill": [
+    {
+      "artifact": "reference-a1-prefill32k.json",
+      "samples": 15,
+      "median_tok_per_sec": 15842.488272674815,
+      "min_tok_per_sec": 15750.809420525038,
+      "max_tok_per_sec": 15942.084624774825,
+      "all_cold_32768_tokens": true
+    },
+    {
+      "artifact": "reference-a2-prefill32k.json",
+      "samples": 15,
+      "median_tok_per_sec": 15737.29502136873,
+      "min_tok_per_sec": 15642.192006817495,
+      "max_tok_per_sec": 15804.459540619042,
+      "all_cold_32768_tokens": true
+    },
+    {
+      "artifact": "shared-b1-prefill32k.json",
+      "samples": 15,
+      "median_tok_per_sec": 15979.29062864247,
+      "min_tok_per_sec": 15906.153855074464,
+      "max_tok_per_sec": 16085.372485841175,
+      "all_cold_32768_tokens": true
+    },
+    {
+      "artifact": "split-c1-prefill32k.json",
+      "samples": 16,
+      "median_tok_per_sec": 17152.432642285134,
+      "min_tok_per_sec": 17081.10532495188,
+      "max_tok_per_sec": 17237.77688410412,
+      "all_cold_32768_tokens": true
+    }
+  ],
+  "decode": [
+    {
+      "artifact": "reference-a1-c1.json",
+      "aggregate_tok_per_sec": 189.66428452149378,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 29.995104,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "reference-a2-c1-after-profile.json",
+      "aggregate_tok_per_sec": 176.79848880907005,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 30.000256,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "reference-a2-c1.json",
+      "aggregate_tok_per_sec": 177.01494655800334,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 29.997467,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "shared-b1-c1-repeat.json",
+      "aggregate_tok_per_sec": 189.25199143487302,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 29.997042,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "shared-b1-c1.json",
+      "aggregate_tok_per_sec": 177.09748942467598,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 30.000425,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "split-c1-c1-after-profile.json",
+      "aggregate_tok_per_sec": 190.13228452556336,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 30.000165,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "split-c1-c1-repeat.json",
+      "aggregate_tok_per_sec": 177.1060897396134,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 29.998968,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    },
+    {
+      "artifact": "split-c1-c1.json",
+      "aggregate_tok_per_sec": 177.1400476497522,
+      "concurrency": 1,
+      "context_tokens_argument": 0,
+      "measurement_seconds": 29.998863,
+      "num_errors": 0,
+      "underfilled": false,
+      "warmup_timed_out": false,
+      "loop_detected": false
+    }
+  ],
+  "lookup": [
+    {
+      "artifact": "reference-a1-lookup.json",
+      "cases": 3,
+      "exact_answers": 3,
+      "entire_prompts_computed": true,
+      "prompt_tokens": [
+        32503,
+        32518,
+        32522
+      ]
+    },
+    {
+      "artifact": "reference-a2-lookup.json",
+      "cases": 3,
+      "exact_answers": 3,
+      "entire_prompts_computed": true,
+      "prompt_tokens": [
+        32503,
+        32518,
+        32522
+      ]
+    },
+    {
+      "artifact": "shared-b1-lookup.json",
+      "cases": 3,
+      "exact_answers": 3,
+      "entire_prompts_computed": true,
+      "prompt_tokens": [
+        32503,
+        32518,
+        32522
+      ]
+    },
+    {
+      "artifact": "split-c1-lookup.json",
+      "cases": 3,
+      "exact_answers": 3,
+      "entire_prompts_computed": true,
+      "prompt_tokens": [
+        32503,
+        32518,
+        32522
+      ]
+    }
+  ],
+  "rank0_profiles": [
+    {
+      "trace": "/var/lib/docker/volumes/glm53-nvfp4-split-local-jit/_data/profiles/glm53-nvfp4-split-local-reference-a1/dp0_pp0_tp0_dcp0_ep0_rank0.1789034986248258522.pt.trace.json.gz",
+      "scope": "four instrumented prefill iterations; not unprofiled E2E latency",
+      "moe_kernels": {
+        "dynamic_monolithic_or_routing": {
+          "count": 168,
+          "duration_us": 287195.98300000007
+        }
+      },
+      "moe_kernel_total_ms": 287.19598300000007
+    },
+    {
+      "trace": "/var/lib/docker/volumes/glm53-nvfp4-split-local-jit/_data/profiles/glm53-nvfp4-split-local-reference-a2/dp0_pp0_tp0_dcp0_ep0_rank0.1789036228240026697.pt.trace.json.gz",
+      "scope": "four instrumented prefill iterations; not unprofiled E2E latency",
+      "moe_kernels": {
+        "dynamic_monolithic_or_routing": {
+          "count": 168,
+          "duration_us": 289273.8689999999
+        }
+      },
+      "moe_kernel_total_ms": 289.2738689999999
+    },
+    {
+      "trace": "/var/lib/docker/volumes/glm53-nvfp4-split-local-jit/_data/profiles/glm53-nvfp4-split-local-shared-b1/dp0_pp0_tp0_dcp0_ep0_rank0.1789035286417008550.pt.trace.json.gz",
+      "scope": "four instrumented prefill iterations; not unprofiled E2E latency",
+      "moe_kernels": {
+        "dynamic_monolithic_or_routing": {
+          "count": 168,
+          "duration_us": 273082.93899999995
+        }
+      },
+      "moe_kernel_total_ms": 273.08293899999995
+    },
+    {
+      "trace": "/var/lib/docker/volumes/glm53-nvfp4-split-local-jit/_data/profiles/glm53-nvfp4-split-local-split-c1/dp0_pp0_tp0_dcp0_ep0_rank0.1789035774188718567.pt.trace.json.gz",
+      "scope": "four instrumented prefill iterations; not unprofiled E2E latency",
+      "moe_kernels": {
+        "dynamic_monolithic_or_routing": {
+          "count": 168,
+          "duration_us": 17489.229
+        },
+        "materialized_fc1": {
+          "count": 168,
+          "duration_us": 97271.27400000002
+        },
+        "materialized_fc2": {
+          "count": 168,
+          "duration_us": 72683.85399999999
+        }
+      },
+      "moe_kernel_total_ms": 187.44435700000002
+    }
+  ]
+}
