@@ -1557,6 +1557,53 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
 
 
 @dsl_user_op
+def atomic_add_global_acq_rel_i32(
+    addr: Int64, val: Int32, *, loc=None, ip=None
+) -> Int32:
+    """Global int32 atomic add with GPU-scope acquire-release ordering.
+
+    Returns the old value. The release side orders this thread's earlier
+    global stores before the add; a thread that observes the added value and
+    then executes ``fence_acq_rel_gpu`` sees those stores. Used for
+    last-arriving-CTA reductions over partial results written by other CTAs.
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def globaltimer_ns(*, loc=None, ip=None) -> Int64:
+    """Read ``%globaltimer`` (nanoseconds, device-wide clock)."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def red_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
     """No-return global int32 add reduction (relaxed device scope)."""
     llvm.inline_asm(
@@ -1729,6 +1776,43 @@ def atomic_cas_global_i32(
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def red_or_shared_u32(addr: Int32, val: Uint32, *, loc=None, ip=None) -> None:
+    """Shared-memory 32-bit atomic OR without return (``red.shared.or.b32``)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Uint32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.shared.or.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_global_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """Plain global int32 load (``ld.global.s32``)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.s32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 

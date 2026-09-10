@@ -189,7 +189,7 @@ _SCALE_FORMATS = {
 _E8M0_K32_FP16_GLOBAL_COMPENSATION = float(2.0**7)
 _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
-_W4A16_SMALL_M_DIRECT_MAX_M = 8
+_W4A16_SMALL_M_DIRECT_MAX_M = 16
 _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
 _TC_DECODE_PACK_COLLIDING_PAIRS = 3
 _TC_DECODE_PACK_SM_COVERAGE_CAP = 64
@@ -8607,10 +8607,10 @@ def _small_m_direct_host_barrier_reset_enabled() -> bool:
 
     The micro-kernel barrier resets its arrival counter and advances its epoch
     before releasing the grid, so completed launches can safely reuse both
-    scalars.  Keep the historical host reset as the default while the
-    persistent-epoch path is evaluated independently and end-to-end.
+    scalars without host-side fills. Set the environment variable to ``1`` to
+    restore the redundant host reset for diagnostics.
     """
-    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "1") != "0"
+    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0") != "0"
 
 
 def _compile_w4a16_small_m_direct(

@@ -17,6 +17,7 @@ from b12x.moe.fused_moe._impl import (
     run_w4a16_fc2_e8m0,
 )
 from b12x.moe._shared.execution import PreparedWeightLayout
+from b12x.moe._shared.kernels.micro import MoEMicroKernelBackend
 from b12x.moe._shared.kernels.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
@@ -53,13 +54,248 @@ from tests._reference.helpers import (
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
-def test_w4a16_small_m_host_barrier_reset_kill_switch(
+def test_w4a16_small_m_host_barrier_reset_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", raising=False)
+    assert not _small_m_direct_host_barrier_reset_enabled()
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "1")
     assert _small_m_direct_host_barrier_reset_enabled()
     monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
     assert not _small_m_direct_host_barrier_reset_enabled()
+
+
+@pytest.mark.parametrize(
+    ("m", "uses_wide_fc2"),
+    ((1, False), (2, True), (8, True), (9, False), (12, True), (16, True)),
+)
+def test_w4a16_packed_scale_fc2_uses_wide_loads_for_supported_glm_shape(
+    m: int,
+    uses_wide_fc2: bool,
+) -> None:
+    """The widened FC2 loads and staged FC1 scales read the packed E4M3 layout."""
+    kernel = MoEMicroKernelBackend(
+        sf_vec_size=16,
+        mma_tiler_mn=(64, 128),
+        output_tile_count_n=1,
+        fast_math=True,
+        activation="silu",
+        share_input_across_experts=m == 1,
+        share_expert_scales=True,
+        single_token=m == 1,
+        w4a16_mode=True,
+        e4m3_scale_layout="packed",
+    )
+
+    kernel.configure(
+        m,
+        6144,
+        256,
+        8,
+        256,
+        max_active_ctas=188,
+    )
+
+    assert kernel.fc2_wide8 is uses_wide_fc2
+    assert kernel.fc1_sf_stage
+
+
+def _packed_scale_micro_kernel(
+    m: int, experts: int, topk: int
+) -> MoEMicroKernelBackend:
+    """The packed-E4M3-scale W4A16 micro kernel at the GLM decode shape
+    (K=6144, 256-value intermediate shard, gated), which selects the staged
+    FC1 scales and the 8-byte FC2 loads for ``m`` outside ``{1, 9}``."""
+    kernel = MoEMicroKernelBackend(
+        sf_vec_size=16,
+        mma_tiler_mn=(64, 128),
+        output_tile_count_n=1,
+        fast_math=True,
+        activation="silu",
+        share_input_across_experts=m == 1,
+        share_expert_scales=True,
+        single_token=m == 1,
+        w4a16_mode=True,
+        e4m3_scale_layout="packed",
+    )
+    kernel.configure(m, 6144, 256, topk, experts, max_active_ctas=188)
+    return kernel
+
+
+def _launch_packed_scale_micro(
+    kernel: MoEMicroKernelBackend,
+    *,
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    alphas: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    barrier_count: torch.Tensor,
+    barrier_epoch: torch.Tensor,
+) -> torch.Tensor:
+    from cutlass.cute.runtime import from_dlpack
+
+    m, hidden = x.shape
+    out = torch.zeros(m, hidden, dtype=torch.bfloat16, device=x.device)
+    inter = torch.zeros(kernel.inter_alloc_u32, dtype=torch.float32, device=x.device)
+    MoEMicroKernelBackend.launch(
+        kernel,
+        x=x.reshape(-1),
+        w1_fp4=w13,
+        w1_blockscale=w13_scale,
+        w1_alphas=alphas,
+        a1_gscale=alphas,
+        a2_gscale=alphas,
+        inter_fp32=inter,
+        w2_fp4=w2,
+        w2_blockscale=w2_scale,
+        w2_alphas=alphas,
+        topk_ids=topk_ids.reshape(-1).contiguous(),
+        topk_weights=topk_weights.reshape(-1).contiguous(),
+        out=out.reshape(-1),
+        barrier_count=from_dlpack(barrier_count, assumed_align=16),
+        barrier_epoch=from_dlpack(barrier_epoch, assumed_align=16),
+        m=m,
+        grid_x=kernel.grid_x,
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("m", (3, 4, 16))
+def test_w4a16_packed_scale_wide_fc2_ignores_inactive_routes(m: int) -> None:
+    """The 8-byte FC2 worker resolves routes like the other FC2 workers: a
+    route id below zero or at or beyond the resident expert count addresses
+    expert 0 and contributes nothing. A launch with such ids must equal the
+    launch that replaces them by expert 0 with a zero router weight, and a
+    token whose routes are all inactive must produce zeros.
+
+    The weights and scales are arbitrary bytes, so the outputs are
+    meaningless but deterministic; the check is the route handling, not the
+    numerics. Packed scale bytes decode to values below 2^-112 (the packed
+    format keeps the exponent for the expert alphas), so the alphas are set
+    to 2^112 to bring the outputs into a range where a contribution shows."""
+    experts, topk, hidden = 4, 2, 6144
+    device = torch.device("cuda")
+    kernel = _packed_scale_micro_kernel(m, experts, topk)
+    assert kernel.fc2_wide8
+    cfg = kernel._cfg
+    generator = torch.Generator(device="cpu").manual_seed(20260908 + m)
+
+    def bytes_(count: int, low: int, high: int) -> torch.Tensor:
+        return torch.randint(
+            low, high, (count,), dtype=torch.uint8, generator=generator
+        ).to(device)
+
+    def guarded(count: int, low: int, high: int, per_expert: int) -> torch.Tensor:
+        """``count`` bytes with one expert's worth of arbitrary bytes before
+        and after them, so a route id of -1 or ``experts`` that reached the
+        address arithmetic would read defined memory rather than fault."""
+        storage = bytes_(count + 2 * per_expert, low, high)
+        return storage[per_expert : per_expert + count]
+
+    w13 = guarded(experts * cfg.two_n * cfg.k_half, 0, 256, cfg.two_n * cfg.k_half)
+    w2 = guarded(experts * cfg.k_dim * cfg.n_half, 0, 256, cfg.k_dim * cfg.n_half)
+    # Scale bytes 0x20..0x3F: finite packed codes (no NaN pattern).
+    w13_scale = guarded(
+        experts * (cfg.k_dim // 16) * cfg.two_n,
+        0x20,
+        0x40,
+        (cfg.k_dim // 16) * cfg.two_n,
+    )
+    w2_scale = guarded(
+        experts * (cfg.n // 16) * cfg.k_dim, 0x20, 0x40, (cfg.n // 16) * cfg.k_dim
+    )
+    # NaN alphas on both sides of the resident experts: a route id that
+    # reached the FC2 alpha lookup unresolved (-1 or ``experts``) would
+    # scale its contribution by NaN and poison the output, whatever the
+    # intermediate holds.
+    alpha_storage = torch.full(
+        (experts + 8,), float("nan"), dtype=torch.float32, device=device
+    )
+    alpha_storage[4 : 4 + experts] = 2.0**112
+    alphas = alpha_storage[4 : 4 + experts]
+    x = (torch.randn(m, hidden, generator=generator) * 0.25).to(torch.bfloat16)
+    x = x.to(device)
+    topk_ids = torch.randint(0, experts, (m, topk), generator=generator).to(torch.int32)
+    topk_weights = torch.rand(m, topk, generator=generator).to(torch.float32)
+    # Token 0: one route below zero, one at the expert count. Last token: all
+    # routes inactive (id beyond the resident count).
+    topk_ids[0] = torch.tensor([-1, experts], dtype=torch.int32)
+    topk_ids[-1] = torch.tensor([experts, experts + 7], dtype=torch.int32)
+    topk_weights[0] = torch.tensor([0.5, 0.75])
+    topk_weights[-1] = torch.tensor([0.5, 0.75])
+    active = (topk_ids >= 0) & (topk_ids < experts)
+    reference_ids = torch.where(active, topk_ids, torch.zeros_like(topk_ids))
+    reference_weights = torch.where(
+        active, topk_weights, torch.zeros_like(topk_weights)
+    )
+    barrier_count = torch.zeros(m * topk + m * 16, dtype=torch.int32, device=device)
+    barrier_epoch = torch.zeros_like(barrier_count)
+    common = dict(
+        x=x,
+        w13=w13,
+        w13_scale=w13_scale,
+        w2=w2,
+        w2_scale=w2_scale,
+        alphas=alphas,
+        barrier_count=barrier_count,
+        barrier_epoch=barrier_epoch,
+    )
+
+    expected = _launch_packed_scale_micro(
+        kernel,
+        topk_ids=reference_ids.to(device),
+        topk_weights=reference_weights.to(device),
+        **common,
+    )
+    actual = _launch_packed_scale_micro(
+        kernel,
+        topk_ids=topk_ids.to(device),
+        topk_weights=topk_weights.to(device),
+        **common,
+    )
+    repeat = _launch_packed_scale_micro(
+        kernel,
+        topk_ids=topk_ids.to(device),
+        topk_weights=topk_weights.to(device),
+        **common,
+    )
+    assert bool(torch.isfinite(expected).all().item())
+    assert bool((expected[1:-1].abs().sum(dim=1) > 0).all().item())
+    assert torch.equal(actual, expected)
+    assert torch.equal(repeat, actual)
+    assert torch.count_nonzero(actual[-1]) == 0
+
+
+@pytest.mark.parametrize("m", (1, 2, 8, 16))
+def test_w4a16_direct_native_scales_keep_generic_fc1_and_fc2_loads(m: int) -> None:
+    """The direct kernel reads native ModelOpt scales, so the packed-layout
+    FC1 staging and widened FC2 loads stay compiled out."""
+    kernel = MoEMicroKernelW4A16SmallMDirect(
+        activation="silu",
+        fast_math=True,
+        share_input_across_experts=m == 1,
+        share_expert_scales=True,
+        single_token=m == 1,
+    )
+
+    kernel.configure(
+        m,
+        6144,
+        256,
+        8,
+        256,
+        max_active_ctas=188,
+    )
+
+    assert not kernel.w4a16_packed_scales
+    assert not kernel.fc1_sf_stage
+    assert not kernel.fc2_wide8
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

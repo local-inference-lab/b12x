@@ -473,7 +473,7 @@ def test_flashinfer_fp4_e8m0_k32_oracle_matches_python_oracle_on_deepseek_v4_fla
 
 
 def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
-    for batch_size in (1, 2, 4, 8):
+    for batch_size in (1, 2, 4, 8, 16):
         assert NVFP4MoEMicroKernelBackend.is_supported(
             m=batch_size,
             k=2688,
@@ -482,6 +482,13 @@ def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
             weight_E=128,
         )
 
+    assert not NVFP4MoEMicroKernelBackend.is_supported(
+        m=17,
+        k=2688,
+        n=1856,
+        num_topk=6,
+        weight_E=128,
+    )
     assert not NVFP4MoEMicroKernelBackend.is_supported(
         m=1,
         k=2720,

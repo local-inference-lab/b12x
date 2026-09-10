@@ -314,6 +314,86 @@ def test_explicit_memory_cache_hit_skips_freeze_and_disk_payload(monkeypatch):
         runtime_control.unfreeze_kernel_resolution()
 
 
+def test_fused_oneshot_capacity_variants_reuse_launchers_for_live_rows(
+    monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    oneshot = importlib.import_module("b12x.comm.pcie._oneshot_cute")
+    pcie = importlib.import_module("b12x.comm.pcie.pcie_oneshot")
+    runtime_control = importlib.import_module("b12x._lib.runtime_control")
+
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    state = pcie._CuTeOneshotState(
+        rank=0,
+        world_size=8,
+        signal_ptrs=tuple(range(8)),
+        rank_data=torch.empty(256, dtype=torch.uint8),
+        signal_table_address=0,
+        next_table_offset=128,
+        registered_tables={},
+        eager_tables=(300, 400),
+        eager_buffer_bytes=256 * 1024,
+        transport_policy=(False, False, False, False, False),
+        scatter_gather_storage=True,
+    )
+    plans = [
+        pcie._CuTeOneshotBackend._fused_launch_plan(
+            state,
+            torch.empty((rows, 6144), dtype=torch.bfloat16),
+        )
+        for rows in (3, 4, 5, 6, 8, 12, 16)
+    ]
+
+    compile_specs = []
+
+    def compile_stub(*_args, **kwargs):
+        compile_specs.append(kwargs["compile_spec"])
+        return lambda *_args: None
+
+    monkeypatch.setattr(oneshot, "b12x_compile", compile_stub)
+    monkeypatch.setattr(oneshot, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(oneshot, "make_ptr", lambda *_args, **_kwargs: object())
+    oneshot.get_fused_oneshot_launcher.cache_clear()
+    oneshot._PREPARED_FUSED_ONESHOT_LAUNCHERS.clear()
+
+    def resolve(plan):
+        variant = plan.variant
+        return oneshot.get_fused_oneshot_launcher(
+            "bfloat16",
+            8,
+            0,
+            variant.mode,
+            variant.single_cta,
+            variant.register_normalize,
+            False,
+            0,
+            variant.threads,
+            variant.reg_packs,
+            0,
+        )
+
+    try:
+        warmed = [resolve(plan) for plan in plans]
+        assert len(compile_specs) == 2
+
+        runtime_control.freeze_kernel_resolution(
+            "fused one-shot live rows must reuse capacity launchers"
+        )
+        try:
+            reused = [resolve(plan) for plan in plans]
+        finally:
+            runtime_control.unfreeze_kernel_resolution()
+
+        assert all(
+            actual is expected for actual, expected in zip(reused, warmed, strict=True)
+        )
+        assert len(compile_specs) == 2
+    finally:
+        oneshot.get_fused_oneshot_launcher.cache_clear()
+        oneshot._PREPARED_FUSED_ONESHOT_LAUNCHERS.clear()
+
+
 def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
     cute = pytest.importorskip("cutlass.cute")
     runtime_control = importlib.import_module("b12x._lib.runtime_control")

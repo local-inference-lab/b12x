@@ -3,8 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable
 import csv
 import io
+import os
+import pathlib
 import statistics
 import subprocess
+import sys
 import time
 
 import torch
@@ -37,9 +40,14 @@ _NVIDIA_SMI_GPU_MODE_FIELDS = (
 )
 
 
-def nvidia_smi_gpu_mode_snapshot() -> dict[str, object]:
-    """Capture the physical GPU's benchmark-relevant operating state."""
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+def nvidia_smi_gpu_mode_snapshot(
+    device: torch.device | int | None = None,
+) -> dict[str, object]:
+    """Capture the benchmark-relevant operating state of the physical GPU
+    behind ``device`` (the current device when ``None``)."""
+    if device is None:
+        device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
     torch_uuid = str(getattr(properties, "uuid", ""))
     target_uuid = torch_uuid if torch_uuid.startswith("GPU-") else f"GPU-{torch_uuid}"
     command = [
@@ -88,6 +96,83 @@ def nvidia_smi_gpu_mode_snapshot() -> dict[str, object]:
         "command": command,
         "available": True,
         "fields": dict(zip(_NVIDIA_SMI_GPU_MODE_FIELDS, matches[0], strict=True)),
+    }
+
+
+def source_provenance() -> dict[str, object]:
+    """Identify the b12x source a benchmark ran from.
+
+    ``worktree`` is the repository root holding this file, ``commit`` its
+    HEAD, ``branch`` the checked-out branch and ``dirty_paths`` the
+    ``git status --short`` lines; a non-empty ``dirty_paths`` means the
+    numbers do not belong to ``commit`` alone. Values read ``unknown`` when
+    git is unavailable.
+    """
+    worktree = pathlib.Path(__file__).resolve().parents[1]
+
+    def git(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=worktree,
+            )
+        except OSError:
+            return "unknown"
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+    dirty = git("status", "--short")
+    return {
+        "worktree": str(worktree),
+        "commit": git("rev-parse", "HEAD"),
+        "branch": git("branch", "--show-current"),
+        "dirty_paths": [] if dirty == "unknown" else dirty.splitlines(),
+    }
+
+
+def device_provenance(device: torch.device | int | None = None) -> dict[str, object]:
+    """Identify the physical GPU behind ``device`` (default: the current
+    device): name, UUID, compute capability, memory, the CUDA_VISIBLE_DEVICES
+    mapping, and the torch and CUDA versions the process runs."""
+    if device is None:
+        device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+    return {
+        "logical_device": torch.device(device).index
+        if isinstance(device, torch.device)
+        else int(device),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "name": properties.name,
+        "uuid": str(getattr(properties, "uuid", "unknown")),
+        "capability": list(torch.cuda.get_device_capability(device)),
+        "total_memory_bytes": int(properties.total_memory),
+        "device_count": torch.cuda.device_count(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+    }
+
+
+def benchmark_provenance(
+    argv: list[str] | None = None,
+    device: torch.device | int | None = None,
+) -> dict[str, object]:
+    """The qualification context of one benchmark process, recorded before
+    the timed work: the command (interpreter, script and arguments), the
+    source revision and worktree state, the physical GPU and its operating
+    mode (clocks, power, throttle reasons from ``nvidia-smi``) at capture
+    time. Callers append a second GPU-mode snapshot after the timed work
+    when they need to show the mode held."""
+    if argv is None:
+        argv = sys.argv[1:]
+    script = pathlib.Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+    return {
+        "command": [sys.executable, *([str(script)] if script else []), *argv],
+        "cwd": os.getcwd(),
+        "source": source_provenance(),
+        "gpu": device_provenance(device),
+        "gpu_mode_before": nvidia_smi_gpu_mode_snapshot(device),
     }
 
 

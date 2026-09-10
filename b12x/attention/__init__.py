@@ -8,6 +8,8 @@
 - ``compressed_sparse_mla``: sparse MLA directly from compressed KV pages
   (DSV4).
 - ``dsa_indexer``: the DSA index stage — quantize -> score -> select.
+- ``topk_sort``: in-place ascending sort of DSA top-k selections with
+  conversion of logical positions to physical cache slots.
 - ``qsa``: grouped-selector sparse GQA over caller-populated, read-only main
   BF16 paged K/V.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
@@ -24,6 +26,7 @@ _OP_MODULES = (
     "sparse_mla",
     "compressed_sparse_mla",
     "dsa_indexer",
+    "topk_sort",
     "qsa",
     "varlen",
 )

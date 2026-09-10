@@ -9,6 +9,9 @@
   ``blockscaled`` packed-weight calls.
 - ``mla_query_projection``: fused MXFP8 MLA query projection and assembly.
 - ``trellis_linear``: native EXL3 Trellis W4A16/direct-W4A8 dense linear.
+- ``weight_first_gemv``: BF16 decode projection (M <= 16) whose CTAs stage
+  their weight bricks in shared memory before ``griddepcontrol.wait``, for
+  launch behind a PCIe one-shot allreduce with programmatic dependent launch.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
 """
 
@@ -25,6 +28,7 @@ _OP_MODULES = (
     "tensor_fp8_linear",
     "mla_query_projection",
     "trellis_linear",
+    "weight_first_gemv",
     "wo_projection",
 )
 _FUNCTIONS = {

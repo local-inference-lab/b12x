@@ -2007,9 +2007,9 @@ _MAC_CACHE: Dict[Tuple[int, str], int] = {}  # (device_idx, impl) → max_active
 # Micro owns the tiny tail below this routed-row cutover; dynamic owns the rest.
 # The measured GLM crossover under CUDA graph replay is 64 routed rows.
 _MICRO_DYNAMIC_CUTOVER_PAIRS_DEFAULT = 64
-# Micro keeps the m tokens' activations resident in registers; 8 is the budget
-# ceiling. Micro is correct for any 1<=m<=8 (not just powers of two).
-_MICRO_MAX_TOKENS = 8
+# The direct micro-kernel stages one token's activations per FC1 task and runs
+# token-major FC2 tasks. It is correct for every token count through 16.
+_MICRO_MAX_TOKENS = 16
 # Prepared MXFP4 decode keeps the shared-input producer through M=8, while
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
 _W4A8_DECODE_MAX_ROUTED_ROWS = 64

@@ -1061,3 +1061,33 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
     assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "w4a16"
     assert resolution.config.w4a16_route_mode == route_mode
+
+
+@pytest.mark.parametrize("quant_mode", ("nvfp4_auto", "w4a16"))
+@pytest.mark.parametrize(
+    ("num_tokens", "supported"),
+    ((8, True), (9, True), (16, True), (17, False)),
+)
+def test_glm53_w4a16_direct_routing_supported_through_16_tokens(
+    quant_mode: str,
+    num_tokens: int,
+    supported: bool,
+) -> None:
+    """The direct micro kernel serves the GLM-5.3 TP8 shard through 16 tokens.
+
+    Automatic precision reads native ModelOpt scales; uniform W4A16 answers
+    through the tensor-core decode bound. Both share the 16-token boundary.
+    """
+    query = fused_moe_impl.MoeDecodeQuery(
+        quant_mode=quant_mode,
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=256,
+        top_k=8,
+        num_tokens=num_tokens,
+        routed_rows=8 * num_tokens,
+    )
+
+    assert fused_moe_impl._w4a16_direct_routing_supported(query) is supported

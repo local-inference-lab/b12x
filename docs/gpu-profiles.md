@@ -225,8 +225,9 @@ whether an integrator calls the corresponding multi-token transaction
 speculative verification.
 
 MoE measures every token count from 1 through 8 and additional anchors through
-128. Fixed-precision reduction fills the bounded 1--128 serving domain from the nearest valid
-measured anchor. It never extends micro beyond eight tokens or Triton route
+128, including the 16-token direct-micro boundary. Fixed-precision reduction
+fills the bounded 1--128 serving domain from the nearest valid measured anchor.
+It never extends micro beyond 16 tokens or Triton route
 packing beyond 256 routed rows, and it does not extrapolate outside the recorded
 domain. Profile coverage reports measured and synthesized runtime query counts
 separately.
