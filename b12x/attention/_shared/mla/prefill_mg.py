@@ -4288,7 +4288,12 @@ def run_unified_prefill_mg(
         num_extra_tiles = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         num_tiles = num_main_tiles + num_extra_tiles
         row_xor = pbs_extra == 2
-        extra_indices_t = extra_indices.contiguous()
+        extra_indices_t = (
+            extra_indices
+            if int(extra_indices.stride(0)) == 0
+            and int(extra_indices.stride(1)) == 1
+            else extra_indices.contiguous()
+        )
         if extra_topk_length is None:
             extra_len_t = torch.full(
                 (num_tokens,), extra_topk, dtype=torch.int32, device=device

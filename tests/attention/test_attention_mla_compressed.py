@@ -793,6 +793,118 @@ def test_compressed_sparse_mla_shared_core_replays_under_cuda_graph() -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("high_page", [False, True])
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_compressed_mla_row_shared_indices_replay(high_page: bool, mode: str) -> None:
+    device = require_b12x()
+    clear_mla_caches()
+    rows = 4
+    q = _make_q(rows=rows, seed=20260909, device=device)
+    swa_compact = _make_cache(
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        seed=31,
+        device=device,
+    )
+    extra_compact = _make_cache(
+        tokens=32,
+        page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+        seed=32,
+        device=device,
+    )
+    swa_reference_indices = torch.full(
+        (rows, 128), -1, dtype=torch.int32, device=device
+    )
+    swa_reference_indices[:, :16] = torch.arange(16, dtype=torch.int32, device=device)
+    extra_reference_indices = torch.full((1, 64), -1, dtype=torch.int32, device=device)
+    extra_reference_indices[:, :16] = torch.arange(16, dtype=torch.int32, device=device)
+    swa_indices = swa_reference_indices.clone()
+    extra_base = extra_reference_indices.clone()
+    swa_cache, extra_cache = swa_compact, extra_compact
+    if high_page:
+        pools = []
+        for compact, indices, page_size in (
+            (swa_compact, swa_indices, COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE),
+            (extra_compact, extra_base, COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE),
+        ):
+            first_page = (2**31) // compact.stride(0) + 1
+            pool = torch.empty(
+                (first_page + compact.shape[0], compact.shape[1]),
+                dtype=compact.dtype,
+                device=device,
+            )
+            pool[first_page:].copy_(compact)
+            indices[indices >= 0] += first_page * page_size
+            assert first_page * compact.stride(0) > 2**31
+            pools.append(pool)
+        swa_cache, extra_cache = pools
+    extra_indices = extra_base.expand(rows, -1)
+    assert extra_indices.stride() == (0, 1)
+    swa_lengths = torch.full((rows,), 11, dtype=torch.int32, device=device)
+    extra_lengths = torch.full((rows,), 7, dtype=torch.int32, device=device)
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=192,
+        max_kv_rows=rows * 192,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=extra_indices,
+        indexed_lengths=extra_lengths,
+        use_cuda_graph=True,
+    )
+    binding.scratch.mode = mode
+    assert binding.indexed_indices is extra_indices
+
+    def run():
+        return compressed_sparse_mla_decode_forward(
+            swa_k_cache=swa_cache,
+            binding=binding,
+            indexed_k_cache=extra_cache,
+            indexed_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+            sm_scale=_SM_SCALE,
+        )
+
+    def reference():
+        return compressed_sparse_mla_reference(
+            q,
+            swa_compact,
+            swa_reference_indices,
+            swa_lengths,
+            extra_k_cache=extra_compact,
+            extra_indices=extra_reference_indices.expand(rows, -1),
+            extra_topk_lengths=extra_lengths,
+            extra_page_size=COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE,
+            sm_scale=_SM_SCALE,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    pointer = captured.data_ptr()
+    for live_length in (7, 3):
+        extra_lengths.fill_(live_length)
+        captured.fill_(float("nan"))
+        expected = reference()
+        allocated = torch.cuda.memory_allocated(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_allocated(device) == allocated
+        assert captured.data_ptr() == pointer
+        assert binding.indexed_indices.data_ptr() == extra_base.data_ptr()
+        assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
+        assert (captured.float() - expected.float()).abs().max() <= 0.10
+        assert (
+            torch.nn.functional.cosine_similarity(
+                captured.float().flatten(), expected.float().flatten(), dim=0
+            )
+            >= 0.9995
+        )
+
+
+@torch.inference_mode()
 def test_compressed_sparse_mla_c128_pv_row_swizzle_replays_under_cuda_graph() -> None:
     device = require_b12x()
     clear_mla_caches()

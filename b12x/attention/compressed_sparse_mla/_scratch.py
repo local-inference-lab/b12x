@@ -597,6 +597,7 @@ def build_compressed_sparse_mla_binding(
             scratch=scratch,
             rows=rows,
             name="indexed_indices",
+            allow_row_shared=True,
         )
         indexed_width = int(indexed_indices.shape[1])
         max_indexed_width = int(
