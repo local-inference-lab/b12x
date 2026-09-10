@@ -41,13 +41,15 @@ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
     _w4a8_stage_trellis_b_tile,
     _w4a8_trellis_lane_geom,
-    _w4a8_trellis_pair_words_both,
     _w4a8_trellis_permute_k32,
 )
 from b12x.moe._shared.kernels.activations import (
     SITU,
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
+)
+from b12x.moe._shared.kernels.w4a8_mcg_decode import (
+    w4a8_trellis_pair_words_dispatch,
 )
 
 
@@ -97,6 +99,9 @@ class W4A8MaterializedPhase1Kernel:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
+        trellis_codebook: str = "none",
+        trellis_scaled: bool = False,
+        trellis_identity_boundary: bool = False,
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -128,9 +133,24 @@ class W4A8MaterializedPhase1Kernel:
         # global state table instead of hashing into a 4 KiB shared T12
         # staircase; the shared region is then not allocated.
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
+        if trellis_codebook not in {"none", "sqg-xor-cheb-t12", "mcg"}:
+            raise ValueError(f"unsupported split trellis codebook {trellis_codebook!r}")
+        self.trellis_codebook = str(trellis_codebook)
+        if trellis_scaled and not self.w4a8_trellis:
+            raise ValueError("trellis_scaled requires a trellis payload")
+        self.trellis_scaled = bool(trellis_scaled)
+        if trellis_identity_boundary and not self.w4a8_trellis:
+            raise ValueError("trellis_identity_boundary requires a trellis payload")
+        if trellis_identity_boundary and getattr(self, "trellis_coupled", False):
+            raise ValueError("identity and coupled trellis boundaries are exclusive")
+        self.trellis_identity_boundary = bool(trellis_identity_boundary)
+        if self.trellis_codebook == "mcg" and self.trellis_bits == 2:
+            raise ValueError("P8 MCG split kernels support K3/K4, not K2")
+        if self.trellis_codebook == "mcg" and self.trellis_direct_lut:
+            raise ValueError("procedural MCG does not use a direct LUT")
         if self.w4a8_trellis:
             self.trellis_lut_offset = self.shared_bytes
-            if not self.trellis_direct_lut:
+            if self.trellis_codebook != "mcg" and not self.trellis_direct_lut:
                 self.shared_words = (self.shared_bytes + 4096 + 3) // 4
 
     @cute.jit
@@ -358,6 +378,21 @@ class W4A8MaterializedPhase1Kernel:
                 self.threads_per_cta,
                 4,
             )
+            if cutlass.const_expr(self.trellis_scaled):
+                self._stage_sfb_half(
+                    w13_sfb_rp,
+                    gate_sfb_base,
+                    Int64(gate_tile_idx) * Int64(256),
+                    gate_packed_half,
+                    tid,
+                )
+                self._stage_sfb_half(
+                    w13_sfb_rp,
+                    up_sfb_base,
+                    Int64(up_tile) * Int64(256),
+                    up_packed_half,
+                    tid,
+                )
         else:
             self._stage_b_half_k64(
                 w13_rp,
@@ -567,7 +602,7 @@ class W4A8MaterializedPhase1Kernel:
                             8 * self.trellis_bits
                         )
                         g_lo0, g_lo1, g_hi0, g_hi1 = (
-                            _w4a8_trellis_pair_words_both(
+                            w4a8_trellis_pair_words_dispatch(
                                 gate_b_base,
                                 lane,
                                 tr_b0,
@@ -577,7 +612,8 @@ class W4A8MaterializedPhase1Kernel:
                                 tr_s2,
                                 self.trellis_bits,
                                 trellis_lut_addr,
-                                not self.trellis_direct_lut,
+                                not self.trellis_direct_lut
+                                and self.trellis_codebook != "mcg",
                                 self.trellis_direct_lut,
                             )
                         )
@@ -586,7 +622,7 @@ class W4A8MaterializedPhase1Kernel:
                         gate_b0[th * 2 + 1] = g_hi0
                         gate_b1[th * 2 + 1] = g_hi1
                         u_lo0, u_lo1, u_hi0, u_hi1 = (
-                            _w4a8_trellis_pair_words_both(
+                            w4a8_trellis_pair_words_dispatch(
                                 up_b_base,
                                 lane,
                                 tr_b0,
@@ -596,7 +632,8 @@ class W4A8MaterializedPhase1Kernel:
                                 tr_s2,
                                 self.trellis_bits,
                                 trellis_lut_addr,
-                                not self.trellis_direct_lut,
+                                not self.trellis_direct_lut
+                                and self.trellis_codebook != "mcg",
                                 self.trellis_direct_lut,
                             )
                         )
@@ -639,7 +676,9 @@ class W4A8MaterializedPhase1Kernel:
                     ub1 = up_b1[nt]
                     gate_sfb = Uint32(0x7F7F7F7F)
                     up_sfb = Uint32(0x7F7F7F7F)
-                    if cutlass.const_expr(not self.w4a8_trellis):
+                    if cutlass.const_expr(
+                        not self.w4a8_trellis or self.trellis_scaled
+                    ):
                         gate_sfb = (
                             ld_shared_u32(
                                 gate_sfb_base + ((n8 * Int32(8) + q) << Int32(2))
@@ -748,7 +787,9 @@ class W4A8MaterializedPhase1Kernel:
         ].to(cutlass.Float32)
         epilogue_base = smem_base
         col_base = warp_idx * Int32(32) + (c << Int32(1))
-        if cutlass.const_expr(self.w4a8_trellis):
+        if cutlass.const_expr(
+            self.w4a8_trellis and not self.trellis_identity_boundary
+        ):
             # Trellis activation boundary: raw alpha-scaled projections into
             # two shared tiles, per-row H128 + per-expert rotations + gated
             # activation + down scale + H128, then the shared requantization
@@ -957,6 +998,81 @@ class W4A8MaterializedPhase1Kernel:
                     o0, o1, o2, o3 = _w4a8_had128_quad(a0, a1, a2, a3, lane)
                     st_shared_u32(row_addr, pack_f32x2_to_bfloat2(o0, o1))
                     st_shared_u32(row_addr + Int32(4), pack_f32x2_to_bfloat2(o2, o3))
+        elif cutlass.const_expr(
+            self.w4a8_trellis and self.trellis_identity_boundary
+        ):
+            # The trellis accumulator fragments use the same shared-memory
+            # coordinate contract as the H128 boundary. Materialize both raw
+            # projections first, then pair gate/up by their natural feature
+            # coordinate before applying the ordinary activation.
+            up_tile_base = smem_base + Int32(self.tile_m * self.tile_n * 2)
+            for nt in cutlass.range_constexpr(4):
+                col = col_base + Int32(nt * 8)
+                for blk in cutlass.range_constexpr(4):
+                    gate_fragment = gate_acc[blk][nt]
+                    up_fragment = up_acc[blk][nt]
+                    row_lo = Int32(blk * 16) + q
+                    row_hi = row_lo + Int32(8)
+                    st_shared_u32(
+                        epilogue_base
+                        + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                        pack_f32x2_to_bfloat2(
+                            alpha_value * gate_fragment[0],
+                            alpha_value * gate_fragment[1],
+                        ),
+                    )
+                    st_shared_u32(
+                        epilogue_base
+                        + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                        pack_f32x2_to_bfloat2(
+                            alpha_value * gate_fragment[2],
+                            alpha_value * gate_fragment[3],
+                        ),
+                    )
+                    st_shared_u32(
+                        up_tile_base
+                        + (row_lo * Int32(self.tile_n) + col) * Int32(2),
+                        pack_f32x2_to_bfloat2(
+                            alpha_value * up_fragment[0],
+                            alpha_value * up_fragment[1],
+                        ),
+                    )
+                    st_shared_u32(
+                        up_tile_base
+                        + (row_hi * Int32(self.tile_n) + col) * Int32(2),
+                        pack_f32x2_to_bfloat2(
+                            alpha_value * up_fragment[2],
+                            alpha_value * up_fragment[3],
+                        ),
+                    )
+            cute.arch.sync_threads()
+            unit_alpha = cutlass.Float32(1.0)
+            for row_it in cutlass.range_constexpr(self.tile_m // self.num_warps):
+                row = warp_idx * Int32(self.tile_m // self.num_warps) + Int32(row_it)
+                row_addr = (
+                    epilogue_base
+                    + (row * Int32(self.tile_n) + lane * Int32(4)) * Int32(2)
+                )
+                up_addr = (
+                    up_tile_base
+                    + (row * Int32(self.tile_n) + lane * Int32(4)) * Int32(2)
+                )
+                g0 = ld_shared_bf16_to_f32(row_addr)
+                g1 = ld_shared_bf16_to_f32(row_addr + Int32(2))
+                g2 = ld_shared_bf16_to_f32(row_addr + Int32(4))
+                g3 = ld_shared_bf16_to_f32(row_addr + Int32(6))
+                u0 = ld_shared_bf16_to_f32(up_addr)
+                u1 = ld_shared_bf16_to_f32(up_addr + Int32(2))
+                u2 = ld_shared_bf16_to_f32(up_addr + Int32(4))
+                u3 = ld_shared_bf16_to_f32(up_addr + Int32(6))
+                a0 = self._activated_value(g0, u0, unit_alpha)
+                a1 = self._activated_value(g1, u1, unit_alpha)
+                a2 = self._activated_value(g2, u2, unit_alpha)
+                a3 = self._activated_value(g3, u3, unit_alpha)
+                st_shared_u32(row_addr, pack_f32x2_to_bfloat2(a0, a1))
+                st_shared_u32(
+                    row_addr + Int32(4), pack_f32x2_to_bfloat2(a2, a3)
+                )
         else:
             for nt in cutlass.range_constexpr(4):
                 col = col_base + Int32(nt * 8)
@@ -1074,7 +1190,9 @@ class W4A8MaterializedPhase1Kernel:
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
         if cutlass.const_expr(
-            self.w4a8_trellis and not self.trellis_direct_lut
+            self.w4a8_trellis
+            and self.trellis_codebook != "mcg"
+            and not self.trellis_direct_lut
         ):
             trellis_lut_u32 = cute.recast_tensor(trellis_lut, cutlass.Uint32)
             lut_copy_i = Int32(tidx)

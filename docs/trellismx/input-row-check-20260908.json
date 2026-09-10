@@ -1,0 +1,30 @@
+{
+  "scope": "live production-helper addressing regression, not full-model performance or KLD",
+  "dependency_image": "sha256:748f8cc08a0307f5dad7c65daac7410df2bf516e3eed1284c7ecb17907ffabca",
+  "device": "RTX PRO 6000 Blackwell Max-Q, CC12.0",
+  "test": "tests/moe/test_p8_input_row.py",
+  "source_sha256": {
+    "tests/moe/test_p8_input_row.py": "cd754ad2097afc2291384747c1a5dbf16c5166b412e3fd20ce48f5f4ad6ca869",
+    "b12x/moe/_shared/kernels/dynamic.py": "a4c2bf3904ef0f6a27b2c4c5b25b07fdf3c15a3b81bcab38a8ada2d5586b5c6e"
+  },
+  "command": "/opt/venv/bin/python -m pytest --confcutdir=tests/moe -p no:cacheprovider tests/moe/test_p8_input_row.py -v -rs",
+  "result": "2 passed; no skipped cases",
+  "rows": [
+    {
+      "row": 524289,
+      "payload_offset_bytes": 2147487744,
+      "scale_offset_bytes": 67108992,
+      "eager_byte_equal": true,
+      "graph_replay_byte_equal": true
+    },
+    {
+      "row": 16777217,
+      "payload_offset_bytes": 68719480832,
+      "scale_offset_bytes": 2147483776,
+      "eager_byte_equal": true,
+      "graph_replay_byte_equal": true
+    }
+  ],
+  "allocation": "Real large output planes, only last row initialized/written; one real input row broadcast with stride zero to isolate output addressing. Comparison uses the same production helper at row zero.",
+  "limitations": "Not independent mathematical oracle; not full ModelOpt loading, served performance, KLD, or qualification of the entire PR composition."
+}

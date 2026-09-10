@@ -930,6 +930,44 @@ def ldmatrix_m8n8x4_b16(
 
 
 @dsl_user_op
+def stmatrix_m8n8x4_b16(
+    smem_addr: Int32,
+    r0: Uint32,
+    r1: Uint32,
+    r2: Uint32,
+    r3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue ``stmatrix.sync.aligned.m8n8.x4.shared.b16``.
+
+    This is the inverse of :func:`ldmatrix_m8n8x4_b16` for a matching
+    lane-address layout.  The route-128 W4A16 kernel uses it to publish one
+    cooperatively decoded N16/K16 Trellis record to SMEM for reuse by every
+    M-slice warp.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(r0).ir_value(loc=loc, ip=ip),
+            Uint32(r1).ir_value(loc=loc, ip=ip),
+            Uint32(r2).ir_value(loc=loc, ip=ip),
+            Uint32(r3).ir_value(loc=loc, ip=ip),
+        ],
+        "stmatrix.sync.aligned.m8n8.x4.shared.b16 [$0], "
+        "{$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def ld_shared_u16_offset(
     smem_addr: Int32,
     byte_offset: int,

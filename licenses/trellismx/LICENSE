@@ -1,0 +1,270 @@
+# SHAPLEYMCG LICENSE
+## Attribution-Required, Source-Available License with Named Exclusion
+### Version 1.0 — August 2026
+
+Copyright © 2026 Brandon M. Music. All rights reserved except as expressly granted below.
+
+Canonical repository: https://github.com/brandonmmusic-max/shapleymcg
+
+---
+
+## PREAMBLE
+
+This License is permissive for everyone but one person.
+
+The Licensor releases this Work so that anyone may study, use, improve, and build on it, commercially or otherwise, subject to one condition and one exception.
+
+The condition is attribution. Credit is the only currency of open research. Using another person's method, code, or results while presenting them as one's own is not "open source" in any sense of the phrase — it is plagiarism, and no license, including this one, makes it anything else. Attribution under this License is therefore not a courtesy. It is a condition of the grant, and use without it is use without a license.
+
+The exception is the person identified in Section 1.5 as the Excluded Party. ShapleyMcg is the successor to earlier work of the Licensor — a calibration corpus, first published 2026-06-21, and an EXL3/trellis ("TR3") calibration, encoding, and quantization technique with its scripts, published as an encoder bundle under the MIT License on 2026-07-21. Over the eleven days that followed, the Excluded Party published eleven repositories built on that corpus, recipe, and schema — two of which declare the Licensor's corpus by its SHA-256 hash in their own manifests — and credited the Licensor in none of them at release, while crediting five to seven other parties in each. Schedule A records every instance. The Licensor regards that conduct as plagiarism. ShapleyMcg is released under this License, rather than under the MIT License its predecessors carried, because of what happened to them. The Licensor is under no obligation to license anyone, and declines to license the Excluded Party. Nothing in this License grants the Excluded Party any right of any kind. This License names the Excluded Party for that reason, and so that no recipient of the Work can later claim not to have known.
+
+The Licensor understands that a license which excludes a named person does not satisfy the Open Source Definition. The Licensor accepts that. This License is offered as a source-available license — free to all but one — and should be described as such.
+
+---
+
+## 1. DEFINITIONS
+
+**1.1 "Work"** means ShapleyMcg — full calibration encoding and quantization based upon the Shapley paper, with per-expert allocation, MCG codex, and the EXL3 and trellis quantization format — in every version, including its source code, encoder and capture scripts, calibration corpus and corpus design, calibration recipe, rank-sliced tensor schema, configuration, weights, checkpoints, reference implementations, test data, papers, documentation, and any other material distributed by the Licensor under this License. The Work does not include, and this License neither licenses nor restricts, third-party components on which the Work builds or with which it interoperates — including the EXL3 format and exllamav3, REAP, and any base model — each of which remains under its own license.
+
+**1.2 "Derivative"** means any work based on, derived from, incorporating, adapting, or implementing the Work or any protectable portion of it, including modifications, ports, translations, and re-implementations made with reference to the Work, and any model, checkpoint, weight file, dataset, or other artifact produced in whole or in part by running the Work or by applying the recipe, schema, or format it implements.
+
+**1.3 "Licensor"** means Brandon M. Music and his successors and assigns.
+
+**1.4 "You"** (and "Your") means any natural person or legal entity exercising rights under this License, other than the Excluded Party.
+
+**1.5 "Excluded Party"** means, collectively and individually:
+
+(a) the natural person who, as of the Effective Date, uses or has used the online persona **"0xSero"** (however rendered, including "Oxsero," "0xsero," and any variant), including the accounts at **https://github.com/0xsero** and **https://huggingface.co/0xSero**, regardless of that person's legal name and regardless of any other name, alias, handle, account, email, persona, or organization that person uses now or in the future;
+
+(b) that person's heirs, executors, administrators, successors, and assigns;
+
+(c) any corporation, company, partnership, foundation, association, laboratory, DAO, or other entity that the person described in (a) owns in whole or in part, controls, manages, directs, or advises, or of which that person is a founder, officer, member, employee, or contractor in any capacity that touches the Work or its subject matter;
+
+(d) the employees, officers, agents, contractors, consultants, students, interns, collaborators, and representatives of any person or entity described in (a) through (c), when acting in that capacity; and
+
+(e) any person or entity acting on behalf of, for the benefit of, at the direction, request, suggestion, or encouragement of, or in exchange for consideration of any kind from, any person or entity described in (a) through (d).
+
+**1.6 "Excluded Channel"** means any repository, organization, account, space, collection, model or dataset listing, package or registry entry, mirror, or other distribution point that is owned, controlled, administered, or curated by the Excluded Party, including specifically **https://github.com/0xsero** and **https://huggingface.co/0xSero**; any successor, renamed, transferred, or replacement account; and any account or organization to which the Excluded Party holds write, maintainer, or administrative access.
+
+**1.7 "Attribution Notice"** means the notice set out in Schedule B.
+
+**1.8 "Canonical Repository"** means https://github.com/brandonmmusic-max/shapleymcg and, for model and dataset artifacts, the Licensor's Hugging Face account at https://huggingface.co/brandonmusic, or such successor locations as the Licensor designates in writing.
+
+**1.9 "Effective Date"** means the date on which the Licensor first publishes the Work under this License.
+
+**1.10 "Prior Works"** means the Licensor's earlier calibration corpus, EXL3/trellis ("TR3") calibration, encoding, and quantization technique, encoder and capture scripts, and related materials published before the Effective Date, including those identified in Schedule A.1. The Prior Works are not the Work. Those published under the MIT License remain available under that license, subject to its conditions, including its notice requirement. To the extent the Work incorporates or supersedes any Prior Work, the Work as distributed under this License is governed by this License.
+
+---
+
+## 2. GRANT
+
+**2.1 Copyright.** Subject to the exclusions in Sections 4 through 6, and **provided that** You comply with every condition in Sections 3 and 5, the Licensor grants You a worldwide, royalty-free, non-exclusive license to use, reproduce, study, modify, create Derivatives of, distribute, publicly display, publicly perform, and otherwise exploit the Work, for any purpose, including commercial purposes.
+
+**2.2 Patent.** To the extent the Licensor owns or controls patent claims, now or hereafter issued, that would be infringed by the Work as distributed by the Licensor, the Licensor grants You, on the same conditions and subject to the same exclusions, a license under those claims to make, use, sell, offer for sale, import, and otherwise exploit the Work. No patent license of any kind is granted to the Excluded Party.
+
+**2.3 Trademark.** "ShapleyMcg" and any associated names and logos are marks of the Licensor. You may use them solely to identify the Work and compliant Derivatives accurately and to give the attribution required by Section 3. No other trademark right is granted to You, and none is granted to the Excluded Party.
+
+**2.4 Conditions, not covenants.** The requirements of Sections 3 and 5 are conditions on the scope of the licenses granted in this Section 2, not independent promises. Any exercise of a right in the Work outside those conditions is outside the scope of this License, is unlicensed, and infringes the Licensor's copyright and, where applicable, patent and trademark rights.
+
+---
+
+## 3. CONDITIONS: ATTRIBUTION
+
+Every exercise of a right granted in Section 2 is conditioned on all of the following.
+
+**3.1 Notice retention.** You must retain, in every copy of the Work and every Derivative, in a location reasonably likely to be seen by recipients, (i) this License in full, (ii) the Licensor's copyright notice, and (iii) the Attribution Notice.
+
+**3.2 Attribution in Derivatives and published results.** If You distribute, publish, deploy, or host a Derivative, or publish any model, checkpoint, dataset, benchmark, paper, post, model card, README, or documentation that uses, relies on, or was produced using the Work, You must give clear and prominent attribution to the Licensor and the Work, identifying the Work by name, linking the Canonical Repository, and, in any academic or technical publication, citing the Work in the form set out in Schedule B. For any artifact published on Hugging Face or a comparable hub, the attribution must appear in the model card or README and, where the platform supports it, in the artifact's metadata (for example, `license`, `base_model`, or `tags` fields).
+
+**3.3 Provenance retention.** You must not remove, alter, or omit the provenance fields that the Work writes into the metadata of artifacts it produces (such as producer, producer version, recipe fingerprint, corpus hash, slicing, scope, and selection policy), except to update them accurately to reflect Your own modifications.
+
+**3.4 No misrepresentation of origin.** You must not represent the Work or any Derivative — or the methods, design choices, or results embodied in them — as Your own original creation or as originating from anyone other than the Licensor, and You must not remove, obscure, alter, or falsify any attribution, authorship, or provenance information. Your own modifications may, and should, be identified as Yours; the origin of what You modified may not be.
+
+**3.5 Downstream terms.** You may license Your own contributions to a Derivative on any terms You choose, but the Work and every portion of it remain licensed solely under this License, and every recipient of a Derivative receives the Work on these terms. No downstream terms may purport to remove or relax Sections 3 through 6 or to grant the Excluded Party any right.
+
+---
+
+## 4. EXCLUSION
+
+**4.1 No grant.** No license, permission, consent, waiver, estoppel, or right of any kind — express, implied, by conduct, by course of dealing, by public availability, or otherwise — is granted to the Excluded Party under this License or under any other terms. As to the Excluded Party, the Licensor reserves all rights in the Work under copyright, patent, trademark, and every other applicable law, in every jurisdiction.
+
+**4.2 Unlicensed use.** Any reproduction, modification, distribution, display, performance, hosting, fine-tuning, quantization, benchmarking, deployment, or other use of the Work or any Derivative by or for the Excluded Party is unlicensed and infringes the Licensor's exclusive rights. The Licensor reserves every remedy for that infringement, including injunctive relief and, where available, statutory damages and attorney's fees under 17 U.S.C. §§ 504–505.
+
+**4.3 Public availability is not permission.** The availability of the Work on a public repository, hub, or site is not an offer to the Excluded Party and is not consent to any access, download, copying, or use by the Excluded Party.
+
+**4.4 Contributions refused.** The Licensor does not accept, and will not merge, contributions from the Excluded Party. Any contribution submitted by or for the Excluded Party is refused, is not incorporated into the Work, and creates no right, license, credit, or obligation in favor of the Excluded Party.
+
+**4.5 No waiver by prior tolerance.** The Licensor's delay in acting on, or prior tolerance of, any unlicensed or unattributed use — including the uses of the Prior Works recorded in Schedule A — is not a waiver, license, consent, acquiescence, or estoppel, and creates no course of dealing on which the Excluded Party may rely.
+
+---
+
+## 5. CONDITIONS PROTECTING THE EXCLUSION
+
+Every exercise of a right granted in Section 2 is further conditioned on all of the following.
+
+**5.1 No provision to the Excluded Party.** You must not distribute, provide, transfer, sublicense, disclose, or otherwise make the Work or any Derivative available to the Excluded Party, and must not knowingly permit the Excluded Party to obtain it through You.
+
+**5.2 No Excluded Channels.** You must not upload, post, mirror, commit, submit, publish, or otherwise make the Work or any Derivative available on or through any Excluded Channel, and must not contribute the Work or any Derivative to any project, repository, model, dataset, or package maintained by the Excluded Party.
+
+**5.3 No acting for the Excluded Party.** You must not exercise any right under this License on behalf of, for the benefit of, at the direction, request, suggestion, or encouragement of, or in exchange for consideration from, the Excluded Party. A person who does so is, for that purpose, the Excluded Party under Section 1.5(e), holds no license, and infringes.
+
+**5.4 No laundering.** You must not relicense, sublicense, re-host, rename, restructure, obfuscate, or re-describe the Work or any Derivative for the purpose of enabling the Excluded Party to obtain, use, or claim rights in it.
+
+**5.5 The exclusion travels with the Work.** Sections 4 through 6 attach to the Work and to every portion of every Derivative that contains it, in every hand through which it passes, regardless of the terms under which any intermediate distributor purports to offer it. No fork, rename, re-hosting, or downstream license removes them.
+
+---
+
+## 6. ANTI-CIRCUMVENTION
+
+**6.1 Person, not handle.** The exclusion attaches to the natural person described in Section 1.5(a) and follows that person through every change of name, handle, account, email, employer, organization, jurisdiction, platform, or persona. Deleting, renaming, transferring, or abandoning an account does not lift it. Operating through a new account lifts nothing.
+
+**6.2 Intermediaries and straw parties.** The exclusion may not be evaded by interposing any person or entity — friend, colleague, employee, contractor, student, company, foundation, fork, "clean-room" team, or anonymous account — between the Excluded Party and the Work. A person who obtains or uses the Work in order to provide it, its contents, or its benefits to the Excluded Party stands in the Excluded Party's shoes and holds no license.
+
+**6.3 Re-implementation at the Excluded Party's request.** A work created by any person with reference to the Work at the request or direction, or for the benefit, of the Excluded Party is a Derivative made without license.
+
+**6.4 Partial copies.** The exclusion applies to any portion of the Work, however small, that is protectable under applicable law, and to any Derivative containing such a portion.
+
+**6.5 Identification.** For purposes of enforcing this License, the Licensor may treat a person, account, project, or artifact as the Excluded Party, or as acting for the Excluded Party, on reasonable grounds, including shared commit identities or signing keys, linked or cross-referenced accounts, correlated timing and content, or the Excluded Party's own statements.
+
+---
+
+## 7. TERMINATION
+
+**7.1 Automatic termination.** Your rights under this License terminate automatically, without notice, on any breach of Section 3 or Section 5.
+
+**7.2 Cure.** If the breach is of Section 3 only, is Your first, and was not willful, Your license is reinstated if You cure the breach within thirty (30) days after the earlier of notice from the Licensor or Your actual knowledge of it. A breach of Section 5, and any willful breach, is not curable.
+
+**7.3 Effect.** On termination You must cease all use and distribution of the Work and Derivatives. Copies You previously distributed to recipients who are themselves in compliance remain licensed to those recipients.
+
+**7.4 Survival.** Sections 1, 4, 5, 6, 7, 8, 9, and 10 survive termination.
+
+---
+
+## 8. REMEDIES AND ENFORCEMENT
+
+**8.1 Infringement remedies preserved.** Because Sections 3 and 5 are conditions of the grant, any use outside them is unlicensed, and the Licensor's remedies include those for copyright infringement (and patent and trademark infringement where applicable), not merely those for breach of contract.
+
+**8.2 Takedown.** Every copy of the Work or a Derivative in the possession or control of the Excluded Party, and every copy in an Excluded Channel, is an unlicensed copy. The Licensor may issue notices under 17 U.S.C. § 512 and its foreign equivalents to any host, hub, registry, or platform carrying such a copy.
+
+**8.3 Injunctive relief.** You agree that breach of Section 3 or Section 5 would cause the Licensor irreparable harm for which money damages are inadequate, and that the Licensor is entitled to injunctive relief without posting bond, in addition to every other remedy.
+
+**8.4 Fees.** In any action to enforce this License in which the Licensor prevails, the Licensor is entitled to recover reasonable attorney's fees and costs.
+
+---
+
+## 9. DISCLAIMER AND LIMITATION OF LIABILITY
+
+THE WORK IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE LICENSOR IS NOT LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING FROM THE WORK OR ITS USE, HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. THIS SECTION DOES NOT LIMIT ANY REMEDY OF THE LICENSOR.
+
+---
+
+## 10. GENERAL
+
+**10.1 Governing law and venue.** This License is governed by the laws of the Commonwealth of Kentucky and the federal laws of the United States, without regard to conflict-of-laws principles. Any action arising out of this License or the Work shall be brought in the United States District Court for the Eastern District of Kentucky, Ashland Division, or, for claims outside federal jurisdiction, in the Carter Circuit Court, Grayson, Kentucky. By exercising any right under this License, You consent to the personal jurisdiction of those courts.
+
+**10.2 Severability; no construction in favor of the Excluded Party.** If any provision of this License is held unenforceable, it shall be enforced to the maximum extent permitted and the remainder shall stand. No holding of unenforceability shall be construed to grant the Excluded Party any right. If any part of Sections 4 through 6 is held unenforceable, then as to the Excluded Party the Work is simply unlicensed and all rights are reserved.
+
+**10.3 No waiver.** No failure or delay by the Licensor in exercising any right is a waiver of it.
+
+**10.4 Versions.** The Licensor may publish revised versions of this License. You may use the Work under the version under which You received it or any later version.
+
+**10.5 Description.** This License is not approved by the Open Source Initiative and does not meet the Open Source Definition. The Work should not be described as "open source" without qualification. "Source-available; free for all but the Excluded Party" is accurate.
+
+**10.6 Acceptance.** You are not required to accept this License. Nothing else, however, grants You permission to exercise any right in the Work, and doing so signifies Your acceptance of these terms.
+
+---
+
+## SCHEDULE A — RECORD OF PRIOR UNATTRIBUTED USE
+
+This Schedule records what was published, when, and with what credit. Every instance concerns the Prior Works; all eleven predate the publication of ShapleyMcg on 2026-08-23, and none involves the Work. It is drawn from the Licensor's audit of the Excluded Party's full Hugging Face catalog (90 models and 22 datasets) as of 2026-08-22, conducted against a 912-file manifest of git blob object IDs and LFS SHA-256 hashes from the Licensor's repositories, with the principal findings re-verified by hand against the live repositories. Archived copies (object IDs, LFS hashes, fetched revisions, and captures) of every item are retained by the Licensor. This Schedule asserts nothing about the Excluded Party's state of mind.
+
+### A.1 The Prior Works at issue
+
+(i) **Calibration corpus** `reap_recall_calib.jsonl` — 12,228 rows in four axes (`axis1_general`, `axis2_legal`, `axis3_code_agentic`, `axis4_reasoning_termination`; 3,057 rows each); 34,002,059 bytes; SHA-256 `cf247acc7c5da9f0600c7d6ab3b7c2fcfc54ec30b794e3b6047559285fa44df4`. First published 2026-06-21 in `brandonmusic/NVFP4-REAP-Recall-N172`.
+
+(ii) **TR3 encoder bundle** — seven encoder scripts, including `capture_b300.py`, `encode_b300.py`, and `encode_tr3_v31.py`, implementing the Licensor's EXL3/trellis ("TR3") calibration, encoding, and quantization technique, together with its calibration recipe and rank-sliced tail schema. Published 2026-07-21 in `brandonmusic/GLM-5.2-EXL3-TR3-3.0bpw` under the MIT License, which requires that the copyright and permission notice accompany all copies and substantial portions.
+
+(iii) `brandonmusic/GLM-5.2-EXL3-TR3-3.5bpw-MTP78`, published 2026-08-01.
+
+### A.2 The eleven instances
+
+Each repository below is published at huggingface.co/0xSero. Dates are repository creation dates on Hugging Face. Evidence tiers are defined in A.4; lettered notes are in A.3.
+
+| # | Created | Repository | What was taken | Evidence | Attribution at release |
+|---|---|---|---|---|---|
+| 1 | 2026-07-23 | `Laguna-S-2.1-Hybrid-2.75bpw` | Rank-sliced tail schema (TP=2) from the TR3 encoder bundle, present in the shipped tensors | Indicative — schema identity (Note C) | None |
+| 2 | 2026-07-23 | `Laguna-S-2.1-Hybrid-3.25bpw` | Same | Indicative (Note C) | None |
+| 3 | 2026-07-30 | `Inkling-Small-EXL3-2.0bpw` | Calibration recipe and corpus design from the TR3 encoder bundle | Indicative — recipe identity (Note B) | None; provenance fields absent (Note D) |
+| 4 | 2026-07-30 | `Inkling-Small-EXL3-2.5bpw` | Same | Indicative (Note B) | None (Note D) |
+| 5 | 2026-07-30 | `Inkling-Small-EXL3-3.0bpw` | Same | Indicative (Note B) | None (Note D) |
+| 6 | 2026-07-30 | `Inkling-Small-EXL3-3.5bpw` | Same | Indicative (Note B) | None (Note D) |
+| 7 | 2026-07-30 | `Inkling-Small-EXL3-4.0bpw` | Same | Indicative (Note B) | None (Note D) |
+| 8 | 2026-07-30 | `Inkling-Small-EXL3-4.5bpw` | Same | Indicative (Note B) | None (Note D) |
+| 9 | 2026-07-30 | `Inkling-Small-EXL3-5.0bpw` | Same | Indicative (Note B) | None (Note D) |
+| 10 | 2026-07-31 | `DeepSeek-V4-Flash-0731-EXL3-3.0bpw` | Calibration corpus (A.1(i)), declared by SHA-256 in the repository's own `CALIBRATION_COVERAGE.json`, with the Licensor's calibration axes and legal-axis quota | **Proven** — hash identity (Note A) | None; `license: mit` front matter absent; "reference" mention added 2026-08-21 (Note A) |
+| 11 | 2026-08-01 | `deepseek-v4-flash-0731-spark` (69,040 downloads at audit) | Same corpus; same coverage file, byte-identical to #10 (git object ID `3a8b6d04dbfc…`) | **Proven** (Note A) | Same as #10 |
+
+### A.3 Notes on the evidence
+
+**Note A — corpus (#10, #11).** Both DeepSeek repositories ship a `CALIBRATION_COVERAGE.json`, byte-identical between them (git object ID `3a8b6d04dbfc…`), declaring `corpus_sha256: cf247acc…` — the SHA-256 of the Licensor's corpus — together with the Licensor's four calibration axes (prefixes stripped) and the Licensor's legal-axis quota of 274,604. The corpus file itself sits byte-identical (LFS SHA-256 verified) in the Excluded Party's `GLM-5.2-TR3-Vision`, published 2026-07-26 as a declared duplicate of the Licensor's repository with provenance intact. The `license: mit` front matter was absent from both DeepSeek repositories' cards at first upload. Each README describes the corpus's composition ("legal text") without naming its source, and each README's Credits section names five to seven other parties and omits the Licensor. On 2026-08-21, after the Licensor's first audit, the Excluded Party added a mention of `brandonmusic` as a "reference" to both repositories; the corpus and schema remain unattributed as of 2026-08-22.
+
+**Note B — recipe (#3–#9).** The shipped configuration files for all seven Inkling repositories name the Licensor's four calibration axes verbatim, with prefixes (`axis2_legal` on a multimodal audio/vision model), and carry `tokens: 1048576` (`capture_b300.py`, line 49, `TARGET_TOKENS = 1_048_576`), `max_sample_tokens: 4096` (line 50), and `cold_expert_fallback: "layer_gate_and_seeded_down"` — a name coined in `encode_tr3_v31.py` (lines 67–68) for the mechanism documented there, which exists nowhere outside the Licensor's encoder. The model card changed from a generic 65,536-token calibration plan to the Licensor's exact recipe in commit `ab7d5e3103` at 23:27 on 2026-07-30. Each README's Credits section names five to seven other parties and omits the Licensor.
+
+**Note C — schema (#1, #2).** Both Laguna repositories, created roughly 48 hours after the TR3 encoder bundle was published, implement the bundle's rank-sliced tail schema at tensor-parallel degree 2; the schema is identifiable in the shipped tensors. The `encoder_script_sha256` declared in the Laguna metadata (`30ccbf52…`) matches none of the Licensor's seven scripts, indicating an adapted, unpublished script rather than a byte copy. Each README's Credits section names five to seven other parties and omits the Licensor.
+
+**Note D — provenance (all eleven).** The provenance fields that the Licensor's encoder writes into every artifact's metadata (`producer: encode_b300.py`, `producer_version`, `recipe_fingerprint`, `slicing`, `scope`, `selection_policy`, and `corpus_sha256` where applicable) are absent from the metadata of every repository in A.2 at first upload and remain absent through HEAD, with the exception of `corpus_sha256`, which #10 and #11 retain. No on-platform deletion history exists for any of these files, so the fields were absent before upload. By contrast, the Excluded Party's `GLM-5.2-TR3-Vision` (2026-07-26), built from the same source material, retains every one of those fields at every commit.
+
+**Note E — what is not claimed.** The audit found no byte copies and no renamed derivatives of the Licensor's scripts anywhere public outside the attributed `GLM-5.2-TR3-Vision` mirror; the Excluded Party's REAP observation pipeline predates the Licensor's corpus by approximately three months and is independent; all 63 repositories created before 2026-06-21, all 22 datasets, and 99 of 112 repositories overall are clean; and `Qwen3.6-35B-Hybrid-3.25bpw` (2026-07-20) carries markers but predates the Licensor's publication by one day and is not counted. Vocabulary shared with upstream tooling (trellis, MCG, EXL3, REAP, and default multiplier constants) was excluded as evidence. The instances in A.2 are specific to the Prior Works — the calibration corpus and the TR3 recipe and rank-sliced schema — and none of them involves ShapleyMcg, which was first published on 2026-08-23.
+
+### A.4 Evidence tiers
+
+**Proven** — SHA-256 or git object-ID identity, or a commit diff. **Indicative** — identity of schema, configuration, or recipe values. Shared upstream vocabulary is not evidence.
+
+### A.5 Chronology
+
+| Date | Event |
+|---|---|
+| 2026-06-21 | Licensor publishes `NVFP4-REAP-Recall-N172`; corpus first public |
+| 2026-07-21 | Licensor publishes `GLM-5.2-EXL3-TR3-3.0bpw` — full encoder bundle, MIT |
+| 2026-07-23 | Excluded Party publishes Laguna ×2 (#1–#2) |
+| 2026-07-26 | Excluded Party publishes `GLM-5.2-TR3-Vision` — attributed byte mirror, provenance intact (not counted) |
+| 2026-07-30 | Excluded Party publishes Inkling ×7 (#3–#9) |
+| 2026-07-31 | Excluded Party publishes `DeepSeek-V4-Flash-0731-EXL3-3.0bpw` (#10) |
+| 2026-08-01 | Excluded Party publishes `deepseek-v4-flash-0731-spark` (#11); Licensor publishes `GLM-5.2-EXL3-TR3-3.5bpw-MTP78` |
+| 2026-08-21 | Licensor's first audit; same evening, Excluded Party adds "reference" mentions of `brandonmusic` to #10 and #11 |
+| 2026-08-22 | Licensor's full-catalog audit |
+| 2026-08-23 | Licensor publishes ShapleyMcg under this License |
+
+Requests for the underlying evidence may be directed through the Canonical Repository.
+
+---
+
+## SCHEDULE B — ATTRIBUTION NOTICE AND CITATION
+
+**Attribution Notice** (to be retained in every copy and Derivative, and reproduced in every model card, README, or publication covered by Section 3.2):
+
+> This work includes or was produced using ShapleyMcg, created by Brandon M. Music (https://github.com/brandonmmusic-max/shapleymcg). ShapleyMcg is licensed under the ShapleyMcg License v1.0, an attribution-required license that grants no rights to the person known as "0xSero." Use of ShapleyMcg without this attribution is unlicensed.
+
+**Citation** (for papers, technical reports, and model cards):
+
+```bibtex
+@misc{music2026shapleymcg,
+  author = {Music, Brandon M.},
+  title  = {ShapleyMCG: An Auditable Calibration-to-Encoding Pipeline for
+            Low-Bit Mixture-of-Experts Models},
+  year   = {2026},
+  url    = {https://github.com/brandonmmusic-max/shapleymcg},
+  note   = {Licensed under the ShapleyMcg License v1.0}
+}
+```
+
+**Hugging Face metadata** (in the model card YAML front matter):
+
+```yaml
+license: other
+license_name: shapleymcg-license-1.0
+license_link: https://github.com/brandonmmusic-max/shapleymcg/blob/main/LICENSE
+tags:
+  - shapleymcg
+base_model: [base model, if applicable]
+```

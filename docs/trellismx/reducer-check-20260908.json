@@ -1,0 +1,124 @@
+{
+  "status": "passed",
+  "normal_cases": [
+    {
+      "tokens": 1,
+      "bitwise_equal": true,
+      "graph_replay_equal": true,
+      "timings": [
+        {
+          "arm": "A",
+          "us": 9.982399940490723
+        },
+        {
+          "arm": "B",
+          "us": 9.171839952468872
+        },
+        {
+          "arm": "B",
+          "us": 9.076799750328064
+        },
+        {
+          "arm": "A",
+          "us": 9.064639806747437
+        }
+      ]
+    },
+    {
+      "tokens": 4,
+      "bitwise_equal": true,
+      "graph_replay_equal": true,
+      "timings": [
+        {
+          "arm": "A",
+          "us": 9.401599764823914
+        },
+        {
+          "arm": "B",
+          "us": 9.040319919586182
+        },
+        {
+          "arm": "B",
+          "us": 9.105600118637085
+        },
+        {
+          "arm": "A",
+          "us": 8.97279977798462
+        }
+      ]
+    },
+    {
+      "tokens": 16,
+      "bitwise_equal": true,
+      "graph_replay_equal": true,
+      "timings": [
+        {
+          "arm": "A",
+          "us": 9.23520028591156
+        },
+        {
+          "arm": "B",
+          "us": 9.002879858016968
+        },
+        {
+          "arm": "B",
+          "us": 8.967999815940857
+        },
+        {
+          "arm": "A",
+          "us": 8.925439715385437
+        }
+      ]
+    },
+    {
+      "tokens": 128,
+      "bitwise_equal": true,
+      "graph_replay_equal": true,
+      "timings": [
+        {
+          "arm": "A",
+          "us": 9.27232027053833
+        },
+        {
+          "arm": "B",
+          "us": 9.057919979095459
+        },
+        {
+          "arm": "B",
+          "us": 8.977280259132385
+        },
+        {
+          "arm": "A",
+          "us": 8.920000195503235
+        }
+      ]
+    },
+    {
+      "tokens": 4096,
+      "bitwise_equal": true,
+      "graph_replay_equal": true,
+      "timings": [
+        {
+          "arm": "A",
+          "us": 314.1206359863281
+        },
+        {
+          "arm": "B",
+          "us": 318.65503311157227
+        },
+        {
+          "arm": "B",
+          "us": 322.9724884033203
+        },
+        {
+          "arm": "A",
+          "us": 351.26304626464844
+        }
+      ]
+    }
+  ],
+  "big_live_token_id": 65536,
+  "big_route_element_offset": 2147483648,
+  "big_offset_equal": true,
+  "timing_scope": "reduced component proxy, ABBA within one GPU preparation; cannot support production-path performance conclusions. Target-path benchmark metadata must be recorded separately before any serving-performance claim"
+}

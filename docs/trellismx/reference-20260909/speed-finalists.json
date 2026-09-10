@@ -1,0 +1,60 @@
+{
+  "rows": [
+    {
+      "test": "32K prefill",
+      "reference_tps": 8407.0,
+      "task_count_tps": 8439.0,
+      "grid_floor_tps": 8423.0
+    },
+    {
+      "test": "64K prefill",
+      "reference_tps": 8407.0,
+      "task_count_tps": 8451.0,
+      "grid_floor_tps": 8448.0
+    },
+    {
+      "test": "8K C1 decode",
+      "reference_tps": 222.09977568136074,
+      "task_count_tps": 212.0980355905954,
+      "grid_floor_tps": 214.58764219494137
+    },
+    {
+      "test": "8K C4 decode aggregate",
+      "reference_tps": 318.5604660251159,
+      "task_count_tps": 325.08289525950255,
+      "grid_floor_tps": 326.6199996107123
+    },
+    {
+      "test": "16K C1 decode",
+      "reference_tps": 216.63562581500292,
+      "task_count_tps": 208.7082457956057,
+      "grid_floor_tps": 217.29295463336013
+    },
+    {
+      "test": "16K C4 decode aggregate",
+      "reference_tps": 319.1571974583068,
+      "task_count_tps": 353.53167521115455,
+      "grid_floor_tps": 343.858669401489
+    },
+    {
+      "test": "0K C1 decode",
+      "reference_tps": 204.61097521614886,
+      "task_count_tps": 195.37194209649445,
+      "grid_floor_tps": 185.4222853129297
+    },
+    {
+      "test": "0K C4 decode aggregate",
+      "reference_tps": 327.6701656542104,
+      "task_count_tps": 333.7292481643791,
+      "grid_floor_tps": 325.10574730107106
+    }
+  ],
+  "candidate_image": "sha256:4770c8ec33705294f24887b992bf37f3c418e8c7138f73895f66f5235463dc9b",
+  "previous_candidate_image": "sha256:77729582da5c53c6ed2faf319998db9e592e2f64f16b0cea66ec298e89a18457",
+  "kv_tokens": 23562091,
+  "input_hashes": {
+    "<campaign>/tile-policy-fc1-grid-floor-speed-01/serving-analysis-01/SUMMARY.json": "5122fa95e0522cf641b4b5afd0f98fbeb2e0c641d23a01855559a134fc1d2de7",
+    "<campaign>/fc1-task-grid-combined-01/SUMMARY.json": "d1b18fb418387c25e62922af012a8eed23b2a7010674c730acb7bc9c1e4e6e23"
+  },
+  "scope": "Separate exploratory server runs; no independent replication, causal attribution or model-quality qualification."
+}

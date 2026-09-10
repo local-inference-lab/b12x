@@ -1,0 +1,30 @@
+{
+  "status": "passed",
+  "arms": [
+    {
+      "arm": "nvfp4",
+      "windows": 32,
+      "prediction_rows": 65504,
+      "true_decode_rows": 65472,
+      "all_receipt_hashes_and_masks_pass": true,
+      "all_prefix_hit_counters_zero": true,
+      "raw_logits_retired_after_scoring": true,
+      "source_runtime_audit_sha256": "4c7f99e23192faf839f8209a04b06e9f1364bd5e73b5b4c5dd0e0918740da5df",
+      "source_startup_sha256": "29f4a0e233fe36491472e9ec90f553bce0936b4a04c52f3baa3302188c3d60ab"
+    },
+    {
+      "arm": "fp8",
+      "windows": 32,
+      "prediction_rows": 65504,
+      "true_decode_rows": 65472,
+      "all_receipt_hashes_and_masks_pass": true,
+      "all_prefix_hit_counters_zero": true,
+      "raw_logits_retired_after_scoring": true,
+      "source_runtime_audit_sha256": "a0c2484be2f09cac536f891f91a5075b1ff763b25075a261313c56cd54849b3e",
+      "source_startup_sha256": "5f8e6476040325e4ea23f49c975f27874172b83c309e74d8b2650cf22da22fe9"
+    }
+  ],
+  "producing_analysis_sha256": "3c8d7fe9aef4d0c26ba6c02227e95eefdb7a71a366b1ef62013add4b803aa9e9",
+  "verifier_sha256": "1b93da7031e747ef4e1273cbad09d59154081df06dc3bae0dc99fe74eb8c2406",
+  "claim": "Receipt and score audit by the same operator; not independent replication."
+}

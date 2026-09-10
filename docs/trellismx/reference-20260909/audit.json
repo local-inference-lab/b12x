@@ -1,0 +1,30 @@
+{
+  "status": "passed",
+  "arms": [
+    {
+      "arm": "fp8",
+      "windows": 32,
+      "prediction_rows": 65504,
+      "true_decode_rows": 65472,
+      "all_receipt_hashes_and_masks_pass": true,
+      "all_prefix_hit_counters_zero": true,
+      "raw_logits_retired_after_scoring": true,
+      "source_runtime_audit_sha256": "6a3393053b83b33b41a7d49de2fab1803b1efc4843ec5862c1acd8467b993fa4",
+      "source_startup_sha256": "00ce74cfce281b627289f3322829d357467f5bc1f026677ef27cda93ed43fce3"
+    },
+    {
+      "arm": "nvfp4",
+      "windows": 32,
+      "prediction_rows": 65504,
+      "true_decode_rows": 65472,
+      "all_receipt_hashes_and_masks_pass": true,
+      "all_prefix_hit_counters_zero": true,
+      "raw_logits_retired_after_scoring": true,
+      "source_runtime_audit_sha256": "74d7d1914a55a73b5e9de196f557c658603a9501acd2fafb1e540d496b1c7185",
+      "source_startup_sha256": "cae3cb749c61cc18fd23286f41f79266e32bfdc551e0575b3515d21eb993036a"
+    }
+  ],
+  "producing_analysis_sha256": "0b9a6cb0c0f1d1b4b7784190d38e6f8fdf3dbefe5cb619be6f0dc065a742d8a3",
+  "verifier_sha256": "124494f28c018e0945349fb4479d3be9f9164cdf7ce298989de25367f4106ade",
+  "claim": "Receipt and score audit by the same operator; not independent replication."
+}

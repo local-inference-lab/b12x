@@ -1,0 +1,176 @@
+{
+  "status": "passed",
+  "baseline_b12x_commit": "36d5d55a9da264e35049b242e489ef320304919c",
+  "candidate_dynamic_sha256": "aa7ebeeb27b02281d6513441195a6722203d54418ce56ac6142088da45a3ad52",
+  "address_helper_tests": {
+    "passed": 2,
+    "rows": [
+      524289,
+      16777217
+    ],
+    "mode": "real large payload and scale allocations; exact low/high stores; graph replay; production integer helper",
+    "test_sha256": "0b4ee9fe064ff0928dddfcb114267ac6ea1addbb63ea23c5412b0c59dbfca3d5",
+    "scope_note": "Historical run before offsets.zero_() rearming was added. Payload and scales were rearmed; the offsets-output graph assertion could observe eager output. Original test and candidate source hashes are preserved. See offsets_rearmed_followup for the separate stronger rerun."
+  },
+  "cpu_contracts_passed": 23,
+  "cpu_ast": "exact transform prefix and whole-source AST modulo reviewed integer changes",
+  "normal_path": [
+    {
+      "layer": 4,
+      "bits": 4,
+      "tokens": 16,
+      "output_byte_equal": true,
+      "resource_identical": true,
+      "launches": [
+        {
+          "kernel": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<unsigned char>, std::array<char *, 1>>(int, T2, T3)",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "16",
+            "launch__registers_per_thread_allocated": "16.000000",
+            "launch__shared_mem_per_block_dynamic": "0.000000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "1.024000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsdynamicMoEDynamicKernelBackend_object_at__tensorptrbf16gmemalign16o409640961_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tens_0",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "80",
+            "launch__registers_per_thread_allocated": "80.000000",
+            "launch__shared_mem_per_block_dynamic": "43.008000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "44.032000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_h128_fc1P8H128FC1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o1509949441_tensorptri32gmemalig_1",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "173",
+            "launch__registers_per_thread_allocated": "176.000000",
+            "launch__shared_mem_per_block_dynamic": "23.552000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "24.576000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_small_mP8SmallMPhase2Kernel_object_at__tensorptri32gmemalign16o1_tensorptri32gmemalign16o754974721_tensorptri32gmemalign16o11_tensorptrf32gme_2",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "143",
+            "launch__registers_per_thread_allocated": "144.000000",
+            "launch__shared_mem_per_block_dynamic": "22.528000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "23.552000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_coupled_topkP8CoupledTopKSumKernel_object_at__tensorptrf32gmemalign16oi641_tensorptrf32gmemoi641_tensorptrbf16gmemalign16oi641__0",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "40",
+            "launch__registers_per_thread_allocated": "40.000000",
+            "launch__shared_mem_per_block_dynamic": "0.000000",
+            "launch__shared_mem_per_block_static": "2.048000",
+            "launch__shared_mem_per_block_allocated": "3.072000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        }
+      ]
+    },
+    {
+      "layer": 3,
+      "bits": 5,
+      "tokens": 16,
+      "output_byte_equal": true,
+      "resource_identical": true,
+      "launches": [
+        {
+          "kernel": "void at::vectorized_elementwise_kernel<4, at::FillFunctor<unsigned char>, std::array<char *, 1>>(int, T2, T3)",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "16",
+            "launch__registers_per_thread_allocated": "16.000000",
+            "launch__shared_mem_per_block_dynamic": "0.000000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "1.024000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsdynamicMoEDynamicKernelBackend_object_at__tensorptrbf16gmemalign16o409640961_tensorptri32gmemo1_tensorptrf32gmemo1_tensorptri8gmemalign16o1_tens_0",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "80",
+            "launch__registers_per_thread_allocated": "80.000000",
+            "launch__shared_mem_per_block_dynamic": "43.008000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "44.032000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_h128_fc1P8H128FC1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o1887436801_tensorptri32gmemalig_1",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "183",
+            "launch__registers_per_thread_allocated": "184.000000",
+            "launch__shared_mem_per_block_dynamic": "27.648000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "28.672000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_small_mP8SmallMPhase2Kernel_object_at__tensorptri32gmemalign16o1_tensorptri32gmemalign16o943718401_tensorptri32gmemalign16o11_tensorptrf32gme_2",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "165",
+            "launch__registers_per_thread_allocated": "168.000000",
+            "launch__shared_mem_per_block_dynamic": "26.624000",
+            "launch__shared_mem_per_block_static": "0.000000",
+            "launch__shared_mem_per_block_allocated": "27.648000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        },
+        {
+          "kernel": "kernel_cutlass_kernel_b12xmoe_sharedkernelsp8_coupled_topkP8CoupledTopKSumKernel_object_at__tensorptrf32gmemalign16oi641_tensorptrf32gmemoi641_tensorptrbf16gmemalign16oi641__0",
+          "baseline_and_candidate": {
+            "launch__registers_per_thread": "40",
+            "launch__registers_per_thread_allocated": "40.000000",
+            "launch__shared_mem_per_block_dynamic": "0.000000",
+            "launch__shared_mem_per_block_static": "2.048000",
+            "launch__shared_mem_per_block_allocated": "3.072000",
+            "derived__local_spilling_requests": "0",
+            "derived__shared_spilling_requests": "0"
+          }
+        }
+      ]
+    }
+  ],
+  "resource_units": "Nsight raw CSV units: registers/thread; shared memory KB (1000 bytes), spill request counts",
+  "scope": "Index-only hardening. Two real rank0 MoE layers, not full-model KLD or throughput qualification. Normal-path resources identical across five launches in each K4/K5 probe. Baseline production image remains sha256:748f8cc08a0307f5dad7c65daac7410df2bf516e3eed1284c7ecb17907ffabca; this PR patch is not promoted.",
+  "cache": "CuTe compiler package source-content fingerprint invalidates new-process binaries; fresh per-container cache directories used.",
+  "offsets_rearmed_followup": {
+    "status": "passed",
+    "passed": 2,
+    "skipped": 0,
+    "rows": [
+      524289,
+      16777217
+    ],
+    "test_sha256": "a71ea464d4d9424e964975a16ce8468f36b3d8f230c117d05c0144e43e5a4066",
+    "dynamic_sha256": "c7609ad0d7f41045a3d06cfe11828e982b54967cd789b4a4b12c28dce54f7ab5",
+    "image": "sha256:d565498edc119a376a78cd99990e7747f18cdc0b6705a95b3d62252eb1dee099",
+    "source": "B12X review checkout mounted read-only at /review; PYTHONPATH=/review:/opt/glm53-flash/vllm",
+    "command": "cd /review && /opt/venv/bin/python -m pytest --confcutdir=tests/moe -p no:cacheprovider tests/moe/test_p8_direct_input_offsets.py -q -rs",
+    "result": "..                                                                       [100%]\n2 passed in 4.10s",
+    "scope": "Fresh real large-pool probe with payload, scales and offsets rearmed before graph replay. Experimental TP2 adapter image used only as test environment; no model server or TP2 model path exercised. No new full-model KLD, throughput or normal-path resource qualification."
+  }
+}
