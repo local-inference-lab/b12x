@@ -7,6 +7,8 @@ from .api import (
 )
 from .compressed_api import (
     compressed_sparse_mla_decode_forward,
+)
+from .compressed_config import (
     compressed_sparse_mla_split_chunks_for_contract,
 )
 

@@ -165,13 +165,15 @@ def _make_compressed_binding(
     v_head_dim: int = _COMPRESSED_HEAD_DIM,
     max_chunks_per_row: int = 64,
     max_page_table_width: int | None = None,
+    num_q_heads: int = _LOCAL_Q_HEADS,
+    mode: str = "decode",
 ):
     plan = plan_compressed_sparse_mla_scratch(
         B12XCompressedSparseMLAScratchCaps(
             device=device,
             dtype=torch.bfloat16,
             kv_dtype=torch.uint8,
-            num_q_heads=_LOCAL_Q_HEADS,
+            num_q_heads=num_q_heads,
             head_dim=head_dim,
             v_head_dim=v_head_dim,
             max_width=topk,
@@ -180,6 +182,7 @@ def _make_compressed_binding(
             max_batch=rows,
             max_kv_rows=max_kv_rows,
             max_chunks_per_row=max_chunks_per_row,
+            mode=mode,
         )
     )
     (spec,) = plan.scratch_specs()
@@ -236,6 +239,103 @@ def _make_q(*, rows: int, seed: int, device: torch.device | str) -> torch.Tensor
         * 0.04
     )
     return q.to(dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("heads", [16, 32])
+@pytest.mark.parametrize(
+    "mode,large_pool",
+    [("decode", False), ("decode", True), ("extend", False), ("extend", True)],
+)
+@torch.inference_mode()
+def test_compressed_sparse_mla_ignores_nan_in_unused_page(
+    heads: int, mode: str, large_pool: bool
+) -> None:
+    """Masked candidates must not contribute unused-page NaNs to P.V."""
+    device = require_sm120()
+    rows = 1 if mode == "decode" else 17
+    page_size = 64
+    stride = 1_002_240
+    live_page = (1 << 31) // stride + 1 if large_pool else 1
+    rope = torch.zeros((8, 64), dtype=torch.bfloat16, device=device)
+    rope[:, 0] = 4
+    nope = torch.ones((8, 448), device=device)
+    compact = pack_compressed_sparse_mla_kv_cache_reference(
+        -nope, -rope, page_size=page_size
+    )
+    indexed_compact = pack_compressed_sparse_mla_kv_cache_reference(
+        nope, rope, page_size=page_size
+    )
+    page_bytes = compact.shape[1]
+    storage = torch.empty((live_page + 1) * stride, dtype=torch.uint8, device=device)
+    swa_cache = storage.as_strided((live_page + 1, page_bytes), (stride, 1))
+    indexed_cache = storage.as_strided(
+        (live_page + 1, page_bytes), (stride, 1), storage_offset=page_bytes
+    )
+    for cache, source in ((swa_cache, compact), (indexed_cache, indexed_compact)):
+        cache[0].zero_()
+        cache[live_page].copy_(source[0])
+    q = torch.zeros((rows, heads, 512), dtype=torch.bfloat16, device=device)
+    q[:, :, 448] = 16
+    swa_indices = torch.full((rows, 128), -1, dtype=torch.int32, device=device)
+    indexed_indices = torch.full((rows, 512), -1, dtype=torch.int32, device=device)
+    swa_indices[:, :8] = live_page * page_size + torch.arange(8, device=device)
+    indexed_indices[:, :3] = live_page * page_size + torch.arange(3, device=device)
+    swa_lengths = torch.arange(rows, device=device, dtype=torch.int32) % 8 + 1
+    indexed_lengths = torch.full((rows,), 3, device=device, dtype=torch.int32)
+    attn_sink = torch.zeros(heads, dtype=torch.float32, device=device)
+    binding = _make_compressed_binding(
+        device=device,
+        rows=rows,
+        topk=640,
+        max_kv_rows=rows * 640,
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths,
+        num_q_heads=heads,
+        use_cuda_graph=True,
+        mode=mode,
+    )
+
+    def run():
+        return compressed_sparse_mla_decode_forward(
+            binding=binding,
+            swa_k_cache=swa_cache,
+            swa_page_size=page_size,
+            indexed_k_cache=indexed_cache,
+            indexed_page_size=page_size,
+            attn_sink=attn_sink,
+            sm_scale=_SM_SCALE,
+        )
+
+    baseline = run().clone()
+    expected = compressed_sparse_mla_reference(
+        q,
+        compact,
+        swa_indices - live_page * page_size,
+        swa_lengths,
+        swa_page_size=page_size,
+        extra_k_cache=indexed_compact,
+        extra_indices=indexed_indices - live_page * page_size,
+        extra_topk_lengths=indexed_lengths,
+        extra_page_size=page_size,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
+    )
+    torch.testing.assert_close(
+        baseline.float(), expected.float(), atol=0.002, rtol=0.01
+    )
+    assert torch.count_nonzero(baseline).item() > 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for cache in (swa_cache, indexed_cache):
+        cache[0].fill_(255)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result, baseline, atol=0, rtol=0)
 
 
 @torch.inference_mode()
@@ -389,8 +489,8 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
             q=q,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
+            mode=mode,
         )
-        binding.scratch.mode = mode
         baseline = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
@@ -425,8 +525,8 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
+        mode="extend",
     )
-    binding.scratch.mode = "extend"
     bad_shape = torch.empty(
         (rows + 1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
         dtype=torch.bfloat16,
@@ -465,4 +565,178 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
             attn_sink=attn_sink,
             sm_scale=_SM_SCALE,
             out=non_contiguous,
+        )
+
+
+@pytest.mark.parametrize(
+    "heads,mode,large_pool",
+    [(heads, mode, False) for heads in (8, 16, 32, 64) for mode in ("decode", "extend")]
+    + [(8, mode, True) for mode in ("decode", "extend")],
+)
+@torch.inference_mode()
+def test_v41_heterogeneous_attention_replay_and_live_rows(
+    heads: int, mode: str, large_pool: bool,
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    device = require_sm120()
+    rows, width, page_size = 19, 128, 64
+    gen = torch.Generator(device=device).manual_seed(4100 + heads)
+    group_scales = torch.linspace(0.03, 0.7, 32, device=device).repeat_interleave(16)
+    swa_kv = (torch.randn((width, 512), device=device, generator=gen) * group_scales).bfloat16()
+    indexed_kv = (torch.randn((width, 512), device=device, generator=gen) * group_scales.flip(0) * 3).bfloat16()
+    swa_packed = pack_deepseek_v41_cache_reference(swa_kv, page_size=page_size, cache_kind="swa")
+    indexed_packed = pack_deepseek_v41_cache_reference(indexed_kv, page_size=page_size, cache_kind="indexed")
+    swa_cache = torch.empty((3, swa_packed.shape[1]), device=device, dtype=torch.uint8)
+    swa_cache[0].fill_(127)  # FP8 NaNs in the inactive fallback page.
+    swa_cache[1:].copy_(swa_packed)
+    indexed_pid = (2**31 // int(indexed_packed.stride(0)) + 1) if large_pool else 1
+    required_bytes = (indexed_pid + 2) * indexed_packed.shape[1]
+    if large_pool and torch.cuda.mem_get_info(device)[0] < required_bytes + 512 * 1024**2:
+        pytest.skip("insufficient free memory for mapped physical offsets beyond 2 GiB")
+    indexed_cache = torch.empty((indexed_pid + 2, indexed_packed.shape[1]), device=device, dtype=torch.uint8)
+    indexed_cache[0].fill_(127)
+    indexed_cache[indexed_pid:].copy_(indexed_packed)
+    q = (torch.randn((rows, heads, 512), device=device, generator=gen) * 0.2).bfloat16()
+    # Tail-only heads make an accidental V4 448+64 layout visibly wrong.
+    q[:, 0, :448].zero_()
+    q[:, 0, 448:].mul_(8)
+    logical = torch.arange(width, device=device, dtype=torch.int32).repeat(rows, 1)
+    swa_indices = logical + page_size
+    logical[:, 100:].fill_(-1)
+    lengths = torch.full((rows,), width, device=device, dtype=torch.int32)
+    lengths[0] = 0
+    lengths[1] = 65
+    indexed_lengths = lengths.clone()
+    table = torch.tensor([indexed_pid, indexed_pid + 1], device=device, dtype=torch.int32).expand(rows, -1)
+    plan = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(
+        device=device, num_q_heads=heads, max_q_rows=rows, max_width=2 * width,
+        swa_width=width, indexed_width=width, max_page_table_width=2,
+        swa_page_size=page_size, indexed_page_size=page_size,
+        cache_format="deepseek_v41", mode=mode,
+        max_chunks_per_row=4,
+        use_cuda_graph=True,
+    ))
+    (spec,) = plan.scratch_specs()
+    storage = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    binding = plan.bind(
+        scratch=storage, q=q, swa_indices=swa_indices, swa_lengths=lengths,
+        indexed_indices=logical, indexed_lengths=indexed_lengths, indexed_page_table=table,
+    )
+    output = torch.empty_like(q)
+
+    def run(active_binding, active_output):
+        return compressed_sparse_mla.run(
+            binding=active_binding, swa_k_cache=swa_cache, swa_page_size=page_size,
+            indexed_k_cache=indexed_cache, indexed_page_size=page_size,
+            sm_scale=_SM_SCALE, return_lse=True, lse_scale="natural", out=active_output,
+        )
+
+    def check(actual, lse, live):
+        physical = table[:live].long().gather(1, logical[:live].long().clamp_min(0) // page_size)
+        physical = (physical * page_size + logical[:live].long() % page_size).int()
+        physical.masked_fill_(logical[:live] < 0, -1)
+        expected, expected_lse = compressed_sparse_mla_reference(
+            q[:live], swa_cache, swa_indices[:live], lengths[:live],
+            extra_k_cache=indexed_cache, extra_indices=physical,
+            extra_topk_lengths=indexed_lengths[:live], swa_page_size=page_size,
+            extra_page_size=page_size, sm_scale=_SM_SCALE, return_lse=True,
+            cache_format="deepseek_v41",
+        )
+        torch.testing.assert_close(actual, expected, atol=0.035, rtol=0.035)
+        torch.testing.assert_close(lse, expected_lse, atol=0.025, rtol=0.01)
+        if live:
+            assert torch.equal(actual[0], torch.zeros_like(actual[0]))
+            assert torch.isneginf(lse[0]).all()
+
+    warm_output, warm_lse = run(binding, output)
+    check(warm_output, warm_lse, rows)
+    freeze_kernel_resolution("V4.1 live row counts and graph replay reuse planned native kernels")
+    try:
+        for live in (3, 1, 0):
+            live_binding = binding.scratch.bind(
+                q=q[:live], swa_indices=swa_indices[:live], swa_lengths=lengths[:live],
+                indexed_indices=logical[:live], indexed_lengths=indexed_lengths[:live],
+                indexed_page_table=table[:live],
+            )
+            actual, lse = run(live_binding, output[:live])
+            check(actual, lse, live)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, lse = run(binding, output)
+        pointers = output.data_ptr(), binding.scratch.final_lse.data_ptr(), binding.scratch.mapped_indices.data_ptr()
+        # Mutate both page mapping and live source lengths after capture.
+        table[0].copy_(table[0].flip(0))
+        lengths[1:].fill_(3)
+        indexed_lengths[1:].fill_(7)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        check(actual, lse, rows)
+        assert pointers == (output.data_ptr(), binding.scratch.final_lse.data_ptr(), binding.scratch.mapped_indices.data_ptr())
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@pytest.mark.parametrize("cache_format", ["deepseek_v4", "deepseek_v41"])
+@torch.inference_mode()
+def test_compressed_swa_only_convenience_matches_bound_recipe(cache_format: str) -> None:
+    from b12x.attention._shared.mla.compressed_reference import pack_deepseek_v41_cache_reference
+
+    device = require_sm120()
+    page_size, heads = 64, 8
+    q = torch.full((2, heads, 512), 0.125, device=device, dtype=torch.bfloat16)
+    kv = torch.linspace(-0.5, 0.75, 64 * 512, device=device).reshape(64, 512).bfloat16()
+    cache = (
+        pack_deepseek_v41_cache_reference(kv, page_size=page_size, cache_kind="swa")
+        if cache_format == "deepseek_v41" else
+        pack_compressed_sparse_mla_kv_cache_reference(kv[:, :448], kv[:, 448:], page_size=page_size)
+    )
+    indices = torch.arange(64, device=device, dtype=torch.int32).repeat(2, 1)
+    lengths = torch.tensor([64, 0], device=device, dtype=torch.int32)
+    result = compressed_sparse_mla.run(
+        q_all=q, swa_k_cache=cache, swa_indices=indices, swa_topk_lengths=lengths,
+        swa_page_size=page_size, cache_format=cache_format, sm_scale=_SM_SCALE,
+    )
+    expected = compressed_sparse_mla_reference(
+        q, cache, indices, lengths, swa_page_size=page_size,
+        cache_format=cache_format, sm_scale=_SM_SCALE,
+    )
+    torch.testing.assert_close(result, expected, atol=0.035, rtol=0.035)
+    plan = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(
+        device=device, num_q_heads=heads, max_q_rows=2, max_width=64,
+        swa_width=64, indexed_width=0, cache_format=cache_format,
+    ))
+    (spec,) = plan.scratch_specs()
+    binding = plan.bind(
+        scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device),
+        q=q, swa_indices=indices, swa_lengths=lengths,
+    )
+    bound_result = compressed_sparse_mla.run(
+        binding=binding, swa_k_cache=cache, swa_page_size=page_size, sm_scale=_SM_SCALE,
+    )
+    torch.testing.assert_close(bound_result, expected, atol=0.035, rtol=0.035)
+    with pytest.raises(ValueError, match="contradicts"):
+        compressed_sparse_mla.run(
+            binding=binding, swa_k_cache=cache, swa_page_size=page_size,
+            cache_format="deepseek_v4" if cache_format == "deepseek_v41" else "deepseek_v41",
+            sm_scale=_SM_SCALE,
+        )
+
+
+@pytest.mark.parametrize("cache_kind,record_bytes", [("swa", 528), ("indexed", 288)])
+def test_v41_cache_width_is_source_specific(cache_kind, record_bytes) -> None:
+    page_size = 3
+    cache = torch.empty((2, page_size * record_bytes), dtype=torch.uint8)
+    _validate_compressed_cache_layout(
+        cache, page_size=page_size, name="cache", cache_format="deepseek_v41",
+        cache_kind=cache_kind,
+    )
+    with pytest.raises(ValueError, match="page byte width"):
+        _validate_compressed_cache_layout(
+            cache, page_size=page_size, name="cache", cache_format="deepseek_v41",
+            cache_kind="indexed" if cache_kind == "swa" else "swa",
         )

@@ -18,6 +18,7 @@ class BlockFp8LinearQuery:
     in_features: int
     out_features: int
     output_dtype: str
+    weight_block_size: int = 128
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,11 +97,13 @@ def _validate(
         raise ValueError(f"unsupported output dtype {query.output_dtype!r}")
     if query.in_features % 128:
         raise ValueError("block-FP8 in_features must be a multiple of 128")
+    if query.weight_block_size not in (32, 128):
+        raise ValueError("block-FP8 weight_block_size must be 32 or 128")
 
 
 BLOCK_FP8_LINEAR_POLICY = ComponentPolicy(
     component_id=BLOCK_FP8_LINEAR,
-    query_schema_version=1,
+    query_schema_version=2,
     config_schema_version=2,
     query_fields=frozenset(BlockFp8LinearQuery.__dataclass_fields__),
     config_fields=frozenset(BlockFp8LinearConfig.__dataclass_fields__),

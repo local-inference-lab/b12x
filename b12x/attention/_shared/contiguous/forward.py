@@ -134,6 +134,8 @@ def warp_mma_gemm_rs(
     tCrB: cute.Tensor,
     tCsB: cute.Tensor,
     smem_thr_copy_B: cute.TiledCopy,
+    tCcB: Optional[cute.Tensor] = None,
+    valid_k: Optional[Int32] = None,
 ):
     tCrB_copy_view = smem_thr_copy_B.retile(tCrB)
     cute.copy(smem_thr_copy_B, tCsB[None, None, 0], tCrB_copy_view[None, None, 0])
@@ -144,6 +146,15 @@ def warp_mma_gemm_rs(
                 tCsB[None, None, k + 1],
                 tCrB_copy_view[None, None, k + 1],
             )
+        if const_expr(tCcB is not None):
+            # TMA bounds describe the whole packed allocation, not this image.
+            # Zero masked V lanes in registers: softmax P=0 does not suppress NaN
+            # (or Inf) in another sequence/tail during the PV multiply.
+            fragment = tCrB[None, None, k]
+            coordinates = tCcB[None, None, k]
+            for element in cutlass.range_constexpr(cute.size(fragment)):
+                if coordinates[element][1] >= valid_k:
+                    fragment[element] = tCrB.element_type(0.0)
         cute.gemm(tiled_mma, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
 
@@ -1111,6 +1122,10 @@ class ContiguousAttentionForwardKernel:
                 kv_consumer_state.index if const_expr(self.num_stages > 1) else 0,
             ],
             smem_thr_copy_V,
+            tCcB=thr_mma_pv.partition_B(
+                cute.make_identity_tensor((self.tile_hdimv, self.tile_n))
+            ) if const_expr(is_first_n_block) else None,
+            valid_k=seqlen.seqlen_k - n_block * self.tile_n,
         )
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()

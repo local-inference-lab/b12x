@@ -69,7 +69,7 @@ def _allocate_binding(
             caps.kv_heads,
             caps.head_dim,
         ),
-        dtype=torch.bfloat16,
+        dtype=caps.kv_dtype,
         device=device,
     )
     main_v = torch.empty_like(main_k)
@@ -151,6 +151,12 @@ def _allocate_binding(
         scratch=scratch,
         main_k_cache=main_k,
         main_v_cache=main_v,
+        k_descale=torch.ones(1, device=device)
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
+        v_descale=torch.ones(1, device=device)
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
         main_block_table=main_table,
         compressed_k_cache=compressed,
         compressed_block_table=compressed_table,
@@ -173,6 +179,8 @@ def _rebind(binding: qsa.Binding, **changes: torch.Tensor) -> qsa.Binding:
         "scratch": binding.scratch,
         "main_k_cache": binding.main_k_cache,
         "main_v_cache": binding.main_v_cache,
+        "k_descale": binding.k_descale,
+        "v_descale": binding.v_descale,
         "main_block_table": binding.main_block_table,
         "compressed_k_cache": binding.compressed_k_cache,
         "compressed_block_table": binding.compressed_block_table,
@@ -224,7 +232,7 @@ def _allocate_shared_compressed_raw_binding(
             caps.kv_heads,
             caps.head_dim,
         ),
-        dtype=torch.bfloat16,
+        dtype=caps.kv_dtype,
         device=device,
     )
     main_v = torch.empty_like(main_k)
@@ -318,6 +326,12 @@ def _allocate_shared_compressed_raw_binding(
         scratch=scratch,
         main_k_cache=main_k,
         main_v_cache=main_v,
+        k_descale=torch.ones(1, device=device)
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
+        v_descale=torch.ones(1, device=device)
+        if caps.kv_dtype == torch.float8_e4m3fn
+        else None,
         main_block_table=main_table,
         compressed_k_cache=compressed,
         compressed_block_table=compressed_table,
@@ -520,6 +534,77 @@ def test_qsa_plan_is_one_caller_owned_scratch_buffer() -> None:
     assert planned.caps.group_budget == 512
     assert planned.caps.selection_width == 2051
     assert planned.caps.max_groups == 16
+
+
+def test_qsa_large_prefill_prewarm_preserves_bound_state() -> None:
+    from b12x.attention.paged import _selected_forward as selected_impl
+    from b12x.attention.qsa._policy import QsaConfig
+    from b12x.policy import PolicyContext, QSA_ATTENTION
+
+    device = require_sm120()
+    caps = qsa.Caps(
+        device=device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=65,
+        max_seq_len=64,
+        num_main_cache_pages=4,
+        num_compressed_cache_pages=4,
+        main_page_size=16,
+        compressed_page_size=4,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_kv_heads=1,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        compress_ratio=4,
+        budget=2048,
+    )
+    policy = PolicyContext.for_device(device).with_override(
+        QSA_ATTENTION,
+        QsaConfig(
+            backend="cutedsl",
+            sparse_gqa_direct_kv_warps=1,
+        ),
+    )
+    binding = _allocate_binding(caps, plan=qsa.plan(caps, policy=policy))
+    tracked = (
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.main_block_table,
+        binding.compressed_k_cache,
+        binding.compressed_block_table,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+        binding.raw_state_slot_ids,
+    )
+    for tensor in tracked:
+        tensor.zero_()
+    before = tuple(tensor.clone() for tensor in tracked)
+
+    selected_impl.clear_caches()
+    try:
+        qsa.prewarm(binding)
+        torch.cuda.synchronize(device)
+
+        specializations = {
+            (int(key[3]), bool(key[8]), int(key[9]))
+            for key in selected_impl._KERNEL_CACHE
+        }
+        assert specializations == {
+            (32, False, 2),
+            (64, False, 2),
+            (32, True, 1),
+            (64, True, 1),
+        }
+        for actual, expected in zip(tracked, before, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        selected_impl.clear_caches()
 
 
 def test_qsa_cache_requirements_are_pure_and_describe_shared_page_layout() -> None:
@@ -731,8 +816,8 @@ def test_qsa_prefill_capacity_uses_full_row_workspace() -> None:
 
     assert decode.workspace_q_rows == 128
     assert prefill.workspace_q_rows == 4096
-    assert decode.max_split_row_product == 128 * 16
-    assert prefill.max_split_row_product == 4096 * 16
+    assert decode.max_split_row_product == 64 * 16
+    assert prefill.max_split_row_product == 64 * 16
 
 
 @pytest.mark.parametrize("rows", [1, 16, 32, 257, 513])
@@ -1856,6 +1941,320 @@ def test_qsa_invalid_packed_boundaries_fail_closed_before_state_lookup() -> None
     assert torch.all(binding.selected_positions[:4] == -1)
 
 
+@pytest.mark.parametrize("high_page", [False, True])
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+def test_qsa_cute_scores_preserve_paged_contract_under_graph_replay(
+    high_page: bool,
+    request_dtype: torch.dtype,
+) -> None:
+    """Live extents reuse compilation; recycled pages retain 64-bit addressing."""
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.attention.qsa._score_cute import (
+        launch_score_representatives as launch_cute,
+    )
+
+    device = require_sm120()
+    page_size, dim, groups = 752, 128, 65536
+    first_page = 2**31 // (page_size * dim) + 1 if high_page else 3
+    page_count = first_page + (groups + page_size - 1) // page_size
+    caps = qsa.Caps(
+        device=device,
+        max_batch=16,
+        max_raw_state_slots=16,
+        max_q_rows=16,
+        max_seq_len=groups * 4,
+        num_main_cache_pages=page_count,
+        num_compressed_cache_pages=page_count,
+        main_page_size=page_size * 4,
+        compressed_page_size=page_size,
+    )
+    torch.manual_seed(98797)
+    if high_page:
+        _require_free_cuda_bytes(
+            device, page_count * page_size * dim * torch.bfloat16.itemsize + 2**28
+        )
+    cache = torch.empty(
+        (page_count, page_size, dim), device=device, dtype=torch.bfloat16
+    )
+    cache[first_page:].normal_()
+    table = torch.arange(first_page, page_count, device=device, dtype=torch.int32)
+    table = table.flip(0).expand(16, -1).contiguous()
+    prepared = torch.randn((16, 4, dim), device=device, dtype=torch.bfloat16)
+    positions = torch.full((16,), 1023, device=device, dtype=torch.int64)
+    requests = torch.arange(16, device=device, dtype=request_dtype)
+    lengths = torch.full((16,), groups * 4, device=device, dtype=torch.int32)
+    output = torch.empty((16, groups + 512), device=device, dtype=torch.float32)
+    expected = torch.empty_like(output)
+    errors = torch.zeros(16, device=device, dtype=torch.int32)
+    counts, merges = torch.empty_like(errors), torch.empty_like(errors)
+    expected_counts, expected_merges = (
+        torch.empty_like(errors),
+        torch.empty_like(errors),
+    )
+
+    def invoke(launch, rows, offset, count, actual):
+        launch(
+            prepared_query=prepared[:rows],
+            query_positions=positions[:rows],
+            request_ids=requests[:rows],
+            sequence_lengths=lengths,
+            compressed_cache=cache,
+            compressed_block_table=table,
+            state_errors=errors[:rows],
+            scores=(output if actual else expected)[:rows],
+            eligible_counts=(counts if actual else expected_counts)[:rows],
+            merge_lengths=(merges if actual else expected_merges)[:rows],
+            group_offset=offset,
+            group_count=count,
+            caps=caps,
+        )
+
+    invoke(launch_cute, 16, 0, groups, True)
+    freeze_kernel_resolution("QSA score rows and chunks are runtime quantities")
+    try:
+        for rows, offset, count in ((1, 0, 65), (4, 0, groups), (16, 32768, 32768)):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                invoke(launch_cute, rows, offset, count, True)
+            for position in (1023, groups * 4 - 1):
+                positions.fill_(position)
+                if rows > 1:
+                    requests[rows - 1] = -1
+                errors.zero_()
+                output.fill_(123.0)
+                expected.fill_(123.0)
+                graph.replay()
+                invoke(launch_score_representatives, rows, offset, count, False)
+                torch.cuda.synchronize()
+                assert torch.equal(counts[:rows], expected_counts[:rows])
+                assert torch.equal(merges[:rows], expected_merges[:rows])
+                assert not errors.any()
+                torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+                assert torch.isfinite(output[0, : min(count, 256)]).any()
+                requests.copy_(torch.arange(16, device=device, dtype=request_dtype))
+    finally:
+        unfreeze_kernel_resolution()
+    if high_page:
+        assert first_page * cache.stride(0) > 2**31
+
+
+@pytest.mark.parametrize("heads,dim", [(1, 16), (4, 128), (8, 256), (9, 128)])
+@pytest.mark.parametrize("odd_alignment", [False, True])
+def test_qsa_cute_scores_preserve_strides_masks_and_page_errors(
+    heads: int,
+    dim: int,
+    odd_alignment: bool,
+) -> None:
+    from b12x.attention.qsa._score_cute import (
+        launch_score_representatives as launch_cute,
+    )
+
+    device = require_sm120()
+    pages, page, groups, rows = 5, 16, 65, 3
+    caps = qsa.Caps(
+        device=device,
+        max_batch=2,
+        max_raw_state_slots=2,
+        max_q_rows=rows,
+        max_seq_len=groups * 4,
+        num_main_cache_pages=pages,
+        num_compressed_cache_pages=pages,
+        main_page_size=page * 4,
+        compressed_page_size=page,
+        index_heads=heads,
+        index_head_dim=dim,
+        index_rotary_dim=min(dim, 64),
+    )
+    torch.manual_seed(98901)
+    padding = int(odd_alignment)
+    storage = torch.empty(
+        1 + pages * page * (dim + padding),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    cache = storage.as_strided(
+        (pages, page, dim),
+        (page * (dim + padding), dim + padding, 1),
+        storage_offset=padding,
+    )
+    cache.normal_()
+    query_storage = torch.randn(
+        1 + rows * heads * dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query = query_storage[padding : padding + rows * heads * dim].view(rows, heads, dim)
+    table = torch.arange(pages, device=device, dtype=torch.int32).flip(0)
+    table = table.expand(2, -1).contiguous()
+    positions = torch.full((rows,), 259, device=device, dtype=torch.int64)
+    requests = torch.tensor([0, 1, -1], device=device, dtype=torch.int32)
+    lengths = torch.tensor([260, 260], device=device, dtype=torch.int32)
+    errors = torch.zeros(rows, device=device, dtype=torch.int32)
+    scores = torch.empty((rows, groups), device=device)
+    counts, merges = torch.empty_like(errors), torch.empty_like(errors)
+    kwargs = dict(
+        prepared_query=query,
+        query_positions=positions,
+        request_ids=requests,
+        sequence_lengths=lengths,
+        compressed_cache=cache,
+        compressed_block_table=table,
+        state_errors=errors,
+        scores=scores,
+        eligible_counts=counts,
+        merge_lengths=merges,
+        group_offset=0,
+        group_count=groups,
+        caps=caps,
+    )
+    launch_score_representatives(**kwargs)
+    expected = scores.clone()
+    launch_cute(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_cute(**kwargs)
+    scores.fill_(123)
+    graph.replay()
+    torch.testing.assert_close(scores, expected, rtol=1e-5, atol=1e-5)
+    assert not errors.any()
+    assert counts.tolist() == merges.tolist() == [groups, groups, 0]
+    assert torch.isneginf(scores[-1]).all()
+    expected_order = torch.argsort(expected, descending=True, stable=True)
+    assert torch.equal(
+        torch.argsort(scores, descending=True, stable=True), expected_order
+    )
+
+    # A one-page chunk isolates the declared missing/out-of-range-page error.
+    kwargs["group_count"] = page
+    for physical_page in (-1, pages):
+        table[0, 0] = physical_page
+        errors.zero_()
+        scores.fill_(123)
+        launch_cute(**kwargs)
+        assert errors.tolist() == [512, 0, 0]
+        assert torch.isneginf(scores[0, :page]).all()
+        torch.testing.assert_close(
+            scores[1, :page],
+            expected[1, :page],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert torch.all(scores[:, page:] == 123)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("keys_kind", ["random", "zero_ties", "ordered_ties"])
+def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
+    monkeypatch,
+    keys_kind: str,
+    overlap: bool,
+) -> None:
+    """Score replacement preserves the complete state/selection/read transaction."""
+    import b12x.attention.qsa._kernels as kernel_module
+    import b12x.attention.qsa._score_cute as cute_module
+
+    device = require_sm120()
+    monkeypatch.setattr(
+        qsa_contract, "_SCORE_WORKSPACE_LIMIT_BYTES", 4 * (512 + 256) * 4
+    )
+    caps = qsa.Caps(
+        device=device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=4,
+        max_seq_len=4096,
+        num_main_cache_pages=64,
+        num_compressed_cache_pages=64,
+        main_page_size=64,
+        compressed_page_size=16,
+    )
+    torch.manual_seed(98903)
+    binding = _allocate_binding(caps)
+    binding = _rebind(
+        binding,
+        selection_stream=torch.cuda.Stream(device=device) if overlap else None,
+    )
+    ready = torch.cuda.Event() if overlap else None
+
+    def invoke():
+        if ready is not None:
+            ready.record()
+        return qsa.run(binding, **dynamic, index_ready=ready)
+
+    assert binding.plan.num_score_chunks == 4
+    binding.main_k_cache.normal_()
+    binding.main_v_cache.normal_()
+    binding.main_block_table[0].copy_(torch.arange(64, device=device))
+    binding.compressed_block_table[0].copy_(torch.arange(64, device=device))
+    binding.raw_k_ring.zero_()
+    binding.compressed_k_cache.normal_()
+    if keys_kind == "zero_ties":
+        binding.compressed_k_cache.zero_()
+    elif keys_kind == "ordered_ties":
+        amplitude = (torch.arange(caps.max_groups, device=device) * 37 % 101).to(
+            torch.bfloat16
+        )
+        binding.compressed_k_cache.copy_(
+            amplitude[:, None]
+            .expand(-1, caps.index_head_dim)
+            .reshape_as(binding.compressed_k_cache)
+        )
+    dynamic = _dynamic_inputs(
+        binding, positions=(4094, -1, -1, -1), request_ids=(0, -1, -1, -1)
+    )
+    if keys_kind != "random":
+        dynamic["index_query"].fill_(1)
+    state_names = (
+        "compressed_k_cache",
+        "raw_k_ring",
+        "raw_logical_positions",
+        "raw_rope_positions",
+        "raw_interval_start_positions",
+    )
+    initial = {name: getattr(binding, name).clone() for name in state_names}
+
+    def reset():
+        for name, value in initial.items():
+            getattr(binding, name).copy_(value)
+        binding.scratch.fill_(173)
+        binding.output.fill_(23)
+
+    scalar_launch = kernel_module.launch_score_representatives
+    cute_launch = cute_module.launch_score_representatives
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel_module, "launch_score_representatives", scalar_launch)
+        patch.setattr(cute_module, "launch_score_representatives", scalar_launch)
+        reset()
+        expected_output = invoke().clone()
+        expected_positions = binding.selected_positions.clone()
+        expected_state = {name: getattr(binding, name).clone() for name in state_names}
+    assert not binding.state_errors.any()
+    assert torch.isfinite(expected_output[0]).all()
+    assert expected_output[0].abs().max() > 0
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel_module, "launch_score_representatives", cute_launch)
+        patch.setattr(cute_module, "launch_score_representatives", cute_launch)
+        reset()
+        invoke()
+        reset()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = invoke()
+        for _ in range(3):
+            reset()
+            graph.replay()
+            assert not binding.state_errors.any()
+            assert torch.equal(binding.selected_positions, expected_positions)
+            torch.testing.assert_close(
+                actual, expected_output, rtol=0, atol=0, equal_nan=True
+            )
+            for name, value in expected_state.items():
+                assert torch.equal(getattr(binding, name), value)
+
+
 def test_qsa_paged_representative_scores_match_fp32_reference() -> None:
     device = require_sm120()
     caps = _caps(device)
@@ -2249,7 +2648,10 @@ def test_qsa_raw_state_slot_addressing_crosses_signed_int32_products() -> None:
         torch.cuda.empty_cache()
 
 
-def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode() -> None:
+@pytest.mark.parametrize("budget", [2048, 8192])
+def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode(
+    budget: int,
+) -> None:
     device = require_sm120()
     caps = _caps(
         device,
@@ -2270,6 +2672,7 @@ def test_qsa_checkpoint_geometry_executes_integrated_interleaved_mrope_decode() 
         position_axes=3,
         mrope_sections=(11, 11, 10),
         mrope_interleaved=True,
+        budget=budget,
     )
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
@@ -2446,6 +2849,232 @@ def test_qsa_tp4_geometry_matches_reference_under_cuda_graph_replay() -> None:
     assert torch.count_nonzero(binding.state_errors[:3]) == 0
     assert torch.equal(binding.main_k_cache, main_k_before)
     assert torch.equal(binding.main_v_cache, main_v_before)
+
+
+@pytest.mark.parametrize(
+    "rows,shared_pool,kv_dtype,high_page",
+    [
+        (rows, shared, torch.bfloat16, False)
+        for rows in (1, 4, 16)
+        for shared in (False, True)
+    ]
+    + [(rows, False, torch.float8_e4m3fn, False) for rows in (1, 4, 16)]
+    + [
+        (4, True, torch.float8_e4m3fn, False),
+        (4, False, torch.float8_e4m3fn, True),
+    ],
+)
+@pytest.mark.parametrize("direct_views", [False, True])
+def test_qsa_run_streams_match_combined_across_graph_replay(
+    rows: int,
+    shared_pool: bool,
+    kv_dtype: torch.dtype,
+    high_page: bool,
+    direct_views: bool,
+) -> None:
+    """One run owns the selection fork/join without changing the transaction."""
+    device = require_sm120()
+    first_page = (2**31 // (3008 * 2 * 256) + 1) if high_page else 8
+    caps = _caps(
+        device,
+        max_batch=4,
+        max_raw_state_slots=4,
+        max_q_rows=16,
+        max_seq_len=3008,
+        main_page_size=3008,
+        compressed_page_size=752,
+        num_main_cache_pages=first_page + 4,
+        num_compressed_cache_pages=12,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+        kv_dtype=kv_dtype,
+    )
+    allocate = (
+        _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
+    )
+    if high_page:
+        pool_bytes = (
+            4
+            * caps.num_main_cache_pages
+            * caps.main_page_size
+            * caps.kv_heads
+            * caps.head_dim
+            * caps.kv_dtype.itemsize
+        )
+        projection_width = (caps.index_heads + 1) * caps.index_head_dim
+        projection_bytes = (
+            ((rows - 1) * (2**31 + projection_width) + projection_width)
+            * torch.bfloat16.itemsize
+            if direct_views
+            else 0
+        )
+        _require_free_cuda_bytes(device, pool_bytes + projection_bytes + 2**29)
+    reference = allocate(caps)
+    candidate = allocate(caps)
+    live_reqs = max(1, rows // 4)
+    for request in range(live_reqs):
+        page = first_page + request
+        reference.main_k_cache[page].copy_(
+            torch.randn(
+                reference.main_k_cache.shape[1:],
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        )
+        reference.main_v_cache[page].copy_(
+            torch.randn(
+                reference.main_v_cache.shape[1:],
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        )
+        candidate.main_k_cache[page].copy_(reference.main_k_cache[page])
+        candidate.main_v_cache[page].copy_(reference.main_v_cache[page])
+        for binding in (reference, candidate):
+            binding.main_block_table[request, 0] = page
+            binding.compressed_block_table[request, 0] = 8 + request
+    for binding in (reference, candidate):
+        binding.raw_k_ring.zero_()
+        binding.compressed_k_cache[8:].zero_()
+    positions = tuple(row % 4 for row in range(rows))
+    requests = tuple(row // 4 for row in range(rows))
+    dynamic = _dynamic_inputs(reference, positions=positions, request_ids=requests)
+    candidate.raw_interval_start_positions.copy_(reference.raw_interval_start_positions)
+    names = (
+        "compressed_k_cache",
+        "raw_k_ring",
+        "raw_logical_positions",
+        "raw_rope_positions",
+        "raw_interval_start_positions",
+    )
+    # Include initialized and unused storage so unexpected writes are observable.
+    for name in names:
+        getattr(candidate, name).copy_(getattr(reference, name))
+    initial = {name: getattr(reference, name).clone() for name in names}
+
+    def reset(binding):
+        for name, value in initial.items():
+            getattr(binding, name).copy_(value)
+        binding.output.fill_(23)
+        binding.scratch.fill_(173)
+
+    select_args = {name: value for name, value in dynamic.items() if name != "query"}
+    if direct_views:
+        query_width = caps.index_heads * caps.index_head_dim
+        projection_width = query_width + caps.index_head_dim
+        projection = torch.empty_strided(
+            (rows, projection_width),
+            (2**31 + projection_width if high_page else projection_width, 1),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        index_query = projection[:, :query_width].view(
+            rows, caps.index_heads, caps.index_head_dim
+        )
+        raw_index_key = projection[:, query_width:]
+        select_args.update(index_query=index_query, raw_index_key=raw_index_key)
+        candidate = _rebind(candidate, output=candidate.output[:rows])
+
+    def update_projection():
+        if direct_views:
+            index_query.copy_(dynamic["index_query"])
+            raw_index_key.copy_(dynamic["raw_index_key"])
+
+    update_projection()
+    attention_args = {
+        name: dynamic[name] for name in ("query", "request_ids", "query_positions")
+    }
+    projected_query = dynamic["query"].clone()
+    attention_args["query"] = projected_query
+    selector_stream = torch.cuda.Stream(device=device)
+    candidate = _rebind(candidate, selection_stream=selector_stream)
+    ready = torch.cuda.Event()
+
+    def stream_call():
+        ready.record()
+        projected_query.copy_(dynamic["query"])
+        return qsa.run(
+            candidate,
+            **attention_args,
+            **{
+                name: value
+                for name, value in select_args.items()
+                if name not in attention_args
+            },
+            index_ready=ready,
+        )
+
+    reset(reference)
+    qsa.run(reference, **dynamic)
+    reset(candidate)
+    stream_call()
+    reset(candidate)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = stream_call()
+    for _ in range(3):
+        dynamic["query"].normal_()
+        dynamic["index_query"].normal_()
+        dynamic["raw_index_key"].normal_()
+        update_projection()
+        reset(reference)
+        qsa.run(reference, **dynamic)
+        reset(candidate)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(result, reference.output[:rows], rtol=0, atol=0)
+        assert torch.equal(
+            candidate.selected_positions[:rows], reference.selected_positions[:rows]
+        )
+        assert torch.count_nonzero(candidate.state_errors[:rows]) == 0
+        for name in names:
+            torch.testing.assert_close(
+                getattr(candidate, name),
+                getattr(reference, name),
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+            )
+
+    dynamic["num_accepted_tokens"][0] = 0
+    reset(reference)
+    qsa.run(reference, **dynamic)
+    reset(candidate)
+    graph.replay()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(
+        result, reference.output[:rows], rtol=0, atol=0, equal_nan=True
+    )
+    assert torch.isnan(result[: min(rows, 4)]).all()
+    assert torch.equal(candidate.state_errors[:rows], reference.state_errors[:rows])
+    for name in names:
+        torch.testing.assert_close(
+            getattr(candidate, name),
+            getattr(reference, name),
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+
+def test_qsa_rejects_insufficient_live_output_before_mutation() -> None:
+    caps = _caps(
+        max_q_rows=4, q_heads=24, head_dim=256, index_heads=4, index_head_dim=128
+    )
+    binding = _allocate_binding(caps)
+    binding = _rebind(binding, output=binding.output[:1])
+    dynamic = _dynamic_inputs(binding, positions=(0, 1), request_ids=(0, 0))
+    binding.scratch.fill_(173)
+    binding.output.fill_(23)
+    with pytest.raises(ValueError, match="output capacity"):
+        qsa.run(binding, **dynamic)
+    assert torch.all(binding.scratch == 173)
+    assert torch.all(binding.output == 23)
 
 
 def test_qsa_prefill_handoff_completes_the_trailing_open_group() -> None:
@@ -2732,7 +3361,7 @@ def test_qsa_decode_full_path_matches_exact_gqa_and_keeps_main_cache_read_only()
     None
 ):
     device = require_sm120()
-    caps = _caps(device)
+    caps = _caps(device, q_heads=24, head_dim=256, index_head_dim=128)
     binding = _allocate_binding(caps)
     binding.main_block_table.copy_(
         torch.arange(caps.main_table_width, dtype=torch.int32, device=device)
@@ -2786,3 +3415,736 @@ def test_qsa_decode_full_path_matches_exact_gqa_and_keeps_main_cache_read_only()
         torch.arange(4, dtype=torch.int32, device=device),
     )
     assert torch.all(binding.selected_positions[0, 4:] == -1)
+
+
+def test_qsa_score_uses_tensor_device_and_stream() -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.qsa import _score_cute as implementation
+
+    device = require_sm120()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two explicitly assigned CUDA devices")
+    device = torch.device("cuda", torch.cuda.current_device())
+    other = (device.index + 1) % torch.cuda.device_count()
+    caps = _caps(device, q_heads=24, head_dim=256, index_heads=4, index_head_dim=128)
+    query = torch.ones(1, 4, 128, dtype=torch.bfloat16, device=device)
+    cache = torch.ones(4, 8, 128, dtype=torch.bfloat16, device=device)
+    output = torch.empty(1, 16, device=device)
+    errors = torch.zeros(1, dtype=torch.int32, device=device)
+    kwargs = dict(
+        prepared_query=query,
+        query_positions=torch.full((1,), 63, dtype=torch.int64, device=device),
+        request_ids=torch.zeros(1, dtype=torch.int32, device=device),
+        sequence_lengths=torch.full((1,), 64, dtype=torch.int32, device=device),
+        compressed_cache=cache,
+        compressed_block_table=torch.arange(4, dtype=torch.int32, device=device).view(
+            1, 4
+        ),
+        state_errors=errors,
+        scores=output,
+        eligible_counts=torch.empty_like(errors),
+        merge_lengths=torch.empty_like(errors),
+        group_offset=0,
+        group_count=16,
+        caps=caps,
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    implementation._CACHE.clear()
+    with torch.cuda.stream(stream), torch.cuda.device(other):
+        implementation.launch_score_representatives(**kwargs)
+        assert torch.cuda.current_device() == other
+    stream.synchronize()
+    warmed = tuple(implementation._CACHE.items())
+    freeze_kernel_resolution(
+        "QSA scorer retains tensor device under ambient device changes"
+    )
+    try:
+        with torch.cuda.stream(stream), torch.cuda.device(other):
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.cuda.device(device),
+                torch.cuda.graph(graph, stream=stream),
+                torch.cuda.device(other),
+            ):
+                implementation.launch_score_representatives(**kwargs)
+            for value in (2, 3):
+                with torch.cuda.device(device):
+                    cache.fill_(value)
+                    output.fill_(float("nan"))
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 4 * 128**0.5 * value)
+                )
+        assert tuple(implementation._CACHE.items()) == warmed
+        assert not errors.any()
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("budget", [2048, 8192])
+@pytest.mark.parametrize("output_rows", [4, 66])
+def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
+    overlap: bool,
+    budget: int,
+    output_rows: int,
+) -> None:
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_q_rows=128,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+        budget=budget,
+    )
+    binding = _allocate_binding(caps)
+    binding = _rebind(
+        binding,
+        output=binding.output[:output_rows],
+        selection_stream=torch.cuda.Stream(device=device) if overlap else None,
+    )
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(1)
+    binding.main_block_table[:, 0] = 0
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    persistent = (
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.compressed_k_cache,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+    )
+    saved = [t.clone() for t in persistent]
+    qsa.prewarm(binding)
+    for tensor, expected in zip(persistent, saved, strict=True):
+        assert torch.equal(tensor, expected)
+    with pytest.raises(ValueError, match="output capacity"):
+        qsa.prewarm(binding, rows=output_rows + 1)
+    ready = torch.cuda.Event() if overlap else None
+    buffers = (binding.scratch, binding.output, binding.selected_positions)
+    pointers = tuple(t.data_ptr() for t in buffers)
+    completion_event = binding._selection_done
+    freeze_kernel_resolution("QSA run uses prewarmed capacity across live rows")
+    try:
+        for dtype in (torch.int32, torch.int64):
+            for rows in sorted({1, min(4, output_rows), output_rows}):
+                dynamic = _dynamic_inputs(
+                    binding,
+                    positions=(0,) + (-1,) * (rows - 1),
+                    request_ids=(0,) + (-1,) * (rows - 1),
+                )
+                dynamic["request_ids"] = dynamic["request_ids"].to(dtype)
+
+                def invoke():
+                    if ready is not None:
+                        ready.record()
+                    return qsa.run(binding, **dynamic, index_ready=ready)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    result = invoke()
+                for value in (1, 2):
+                    binding.raw_interval_start_positions.fill_(-1)
+                    binding.main_v_cache.fill_(value)
+                    binding.output.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_stats()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    after = torch.cuda.memory_stats()
+                    for key in (
+                        "allocation.all.allocated",
+                        "allocated_bytes.all.allocated",
+                    ):
+                        assert after[key] == before[key]
+                    assert torch.all(result[0] == value)
+                    assert torch.all(result[1:] == 0)
+                    assert binding.state_errors[0] == 0
+                    assert tuple(t.data_ptr() for t in buffers) == pointers
+                    assert binding._selection_done is completion_event
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("shared_pool", [False, True])
+def test_qsa_run_streams_fullgraph_preserves_state_and_alias_checks(
+    overlap: bool,
+    shared_pool: bool,
+) -> None:
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+    )
+    allocate = (
+        _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
+    )
+    binding = allocate(caps)
+    binding = _rebind(
+        binding,
+        selection_stream=torch.cuda.Stream(device=device) if overlap else None,
+    )
+    binding.main_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(2)
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    ready = torch.cuda.Event() if overlap else None
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    qsa.prewarm(binding)
+    if ready is not None:
+        ready.record()
+
+    def invoke(query):
+        if ready is not None:
+            ready.record()
+        return qsa.run(binding, **{**dynamic, "query": query}, index_ready=ready)
+
+    compiled = torch.compile(invoke, fullgraph=True)
+    for launch in (invoke, compiled):
+        for value in (2, 3):
+            binding.raw_interval_start_positions.fill_(-1)
+            binding.main_v_cache.fill_(value)
+            result = launch(dynamic["query"])
+            assert torch.all(result == value)
+            assert result.data_ptr() == binding.output.data_ptr()
+            assert binding.state_errors[0] == 0
+        binding.raw_interval_start_positions.fill_(-1)
+        before = binding.raw_interval_start_positions.clone()
+        with pytest.raises(ValueError, match="output.*query"):
+            launch(binding.output)
+        assert torch.equal(binding.raw_interval_start_positions, before)
+    binding.raw_interval_start_positions.fill_(-1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = compiled(dynamic["query"])
+    for value in (4, 5):
+        binding.raw_interval_start_positions.fill_(-1)
+        binding.main_v_cache.fill_(value)
+        graph.replay()
+        assert torch.all(result == value)
+
+
+def test_qsa_run_stream_options_validate_before_mutation() -> None:
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+        )
+    )
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    binding.scratch.fill_(173)
+    binding.output.fill_(23)
+    ready = torch.cuda.Event()
+    with pytest.raises(ValueError, match="requires a binding"):
+        qsa.run(binding, **dynamic, index_ready=ready)
+    binding = _rebind(binding, selection_stream=torch.cuda.Stream(device=device))
+    with pytest.raises(ValueError, match="requires an index_ready"):
+        qsa.run(binding, **dynamic)
+    with pytest.raises(ValueError, match="must be recorded"):
+        qsa.run(binding, **dynamic, index_ready=ready)
+    ready.record()
+    with pytest.raises(TypeError, match="query must be a tensor"):
+        qsa.run(binding, **{**dynamic, "query": None}, index_ready=ready)
+    assert torch.all(binding.scratch == 173)
+    assert torch.all(binding.output == 23)
+    assert not hasattr(qsa, "select")
+    assert not hasattr(qsa, "run_selected")
+
+
+@torch.library.custom_op(
+    "b12x_tests::qsa_delayed_producer",
+    mutates_args=("query", "value_cache"),
+)
+def _qsa_delayed_producer(query: torch.Tensor, value_cache: torch.Tensor) -> None:
+    # Model an opaque cache writer; Torch functionalization must not defer writes.
+    torch.cuda._sleep(100_000_000)
+    query.zero_()
+    value_cache.fill_(2)
+
+
+@_qsa_delayed_producer.register_fake
+def _qsa_delayed_producer_fake(query: torch.Tensor, value_cache: torch.Tensor) -> None:
+    return None
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention(
+    monkeypatch,
+    compiled: bool,
+) -> None:
+    """A delayed producer proves stream ordering; this is not a speed benchmark."""
+    device = require_sm120()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+    )
+    binding = _allocate_binding(caps)
+    binding = _rebind(binding, selection_stream=torch.cuda.Stream(device=device))
+    binding.main_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.zero_()
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    ready = torch.cuda.Event()
+    started = torch.cuda.Event(enable_timing=True, external=True)
+    selected = torch.cuda.Event(enable_timing=True, external=True)
+    produced = torch.cuda.Event(enable_timing=True, external=True)
+    original = qsa_contract._qsa_decode_impl
+
+    def observe(*args, **kwargs):
+        original(*args, **kwargs)
+        if args[0] is None:
+            selected.record()
+
+    monkeypatch.setattr(qsa_contract, "_qsa_decode_impl", observe)
+    qsa.prewarm(binding)
+    ready.record()
+
+    def invoke():
+        started.record()
+        ready.record()
+        _qsa_delayed_producer(dynamic["query"], binding.main_v_cache)
+        produced.record()
+        return qsa.run(binding, **dynamic, index_ready=ready)
+
+    launch = torch.compile(invoke, fullgraph=True) if compiled else invoke
+    launch()
+    torch.cuda.synchronize()
+    for graph_mode in (False, True):
+        binding.raw_interval_start_positions.fill_(-1)
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = launch()
+        for _ in range(2):
+            binding.raw_interval_start_positions.fill_(-1)
+            dynamic["query"].fill_(float("nan"))
+            binding.main_v_cache.fill_(float("nan"))
+            if graph_mode:
+                graph.replay()
+            else:
+                result = launch()
+            torch.cuda.synchronize()
+            assert torch.all(result == 2)
+            assert binding.state_errors[0] == 0
+            assert 0 <= started.elapsed_time(selected) < started.elapsed_time(produced)
+
+
+def _draft_selection_state(binding):
+    storage_plan = binding.plan.draft_selection_plan()
+    storage = {
+        spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in storage_plan.storage_specs()
+    }
+    state = storage_plan.bind(storage=storage)
+    state.reset()
+    return state
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("high_page", [False, True])
+def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
+    kv_dtype,
+    request_dtype,
+    high_page,
+    monkeypatch,
+):
+    """Accepted-row mapping, causal tails and errors survive changed-input replay."""
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+
+    device = require_sm120()
+    first_page = 2**31 // (3008 * 2 * 256) + 1 if high_page else 0
+    caps = _caps(
+        device,
+        max_batch=4,
+        max_raw_state_slots=4,
+        max_q_rows=16,
+        max_seq_len=3008,
+        main_page_size=3008,
+        compressed_page_size=752,
+        num_main_cache_pages=first_page + 4,
+        num_compressed_cache_pages=4,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+        kv_dtype=kv_dtype,
+    )
+    if high_page:
+        pool_bytes = (
+            2
+            * caps.num_main_cache_pages
+            * caps.main_page_size
+            * caps.kv_heads
+            * caps.head_dim
+            * caps.kv_dtype.itemsize
+        )
+        _require_free_cuda_bytes(device, pool_bytes + 2**29)
+    binding = _allocate_binding(caps)
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    for request in range(4):
+        page = first_page + request
+        binding.main_block_table[request, 0] = page
+        binding.compressed_block_table[request, 0] = request
+        binding.main_k_cache[page].zero_()
+        binding.main_v_cache[page].fill_(request + 1)
+    binding.raw_k_ring.zero_()
+    binding.compressed_k_cache.zero_()
+    initial = _dynamic_inputs(
+        binding,
+        positions=tuple(i % 4 for i in range(16)),
+        request_ids=tuple(i // 4 for i in range(16)),
+    )
+    compiled = (
+        not high_page and kv_dtype == torch.bfloat16 and request_dtype == torch.int64
+    )
+    if compiled:
+
+        def record_round():
+            state.reset()
+            return qsa.run(binding, **initial)
+
+        torch.compile(record_round, fullgraph=True)()
+    else:
+        qsa.run(binding, **initial)
+    assert state.num_source_rows.item() == 16
+    torch.testing.assert_close(state.logical_positions, initial["query_positions"])
+    assert torch.equal(state.selected_positions, binding.selected_positions)
+    if compiled:
+        reuse_plan = qsa.plan(replace(caps, max_q_rows=4))
+        binding = _rebind(
+            replace(binding, plan=reuse_plan),
+            selected_positions=binding.selected_positions[:4],
+            output=binding.output[:4],
+            draft_selection=state,
+        )
+    source_rows = torch.tensor([3, 7, 11, 15], dtype=request_dtype, device=device)
+    state.errors[7] = 512
+    query = initial["query"][:4].clone()
+    requests = torch.tensor([2, 0, -1, 1], device=device, dtype=request_dtype)
+    positions = torch.tensor([4, 5, -1, 4], device=device, dtype=torch.int64)
+    persistent = (
+        binding.compressed_k_cache,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+        state.selected_positions,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+    )
+    snapshots = [t.clone() for t in persistent]
+    qsa.prewarm(binding)
+    for tensor, expected in zip(persistent, snapshots, strict=True):
+        assert torch.equal(tensor, expected)
+    pointers = tuple(
+        t.data_ptr()
+        for t in (
+            binding.output,
+            binding.scratch,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
+        )
+    )
+
+    def invoke(rows=4):
+        return qsa.run(
+            binding,
+            query=query[:rows],
+            request_ids=requests[:rows],
+            query_positions=positions[:rows],
+            reuse=qsa.DraftSelectionReuse(source_rows),
+        )
+
+    if compiled:
+        invoke = torch.compile(invoke, fullgraph=True)
+    for rows in (1, 3, 4):
+        invoke(rows)
+    freeze_kernel_resolution("QSA draft reuse must retain prewarmed reader capacity")
+    try:
+        for rows in (1, 3, 4):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = invoke(rows)
+            for tail_end in (5, 4):
+                positions[0] = tail_end
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                assert torch.all(result[0] == 3)
+                if rows >= 3:
+                    assert torch.all(result[1] == 1)
+                    assert torch.all(result[2] == 0)
+                if rows == 4:
+                    assert torch.isnan(result[3]).all()
+                assert binding._draft_work_positions[
+                    0, caps.selection_width :
+                ].tolist() == ([4, 5, -1] if tail_end == 5 else [4, -1, -1])
+            positions[0] = 7
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            positions[0] = 4
+            # A row outside the last ordinary run must not reuse older state.
+            source_rows[2] = 16
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            source_rows[2] = 11
+            state.num_source_rows.fill_(11)
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            state.num_source_rows.fill_(16)
+            state.reset()
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            state.num_source_rows.fill_(16)
+            requests[0] = caps.max_batch
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            requests[0] = 2
+    finally:
+        unfreeze_kernel_resolution()
+    for tensor, expected in zip(persistent, snapshots, strict=True):
+        assert torch.equal(tensor, expected)
+    assert pointers == tuple(
+        t.data_ptr()
+        for t in (
+            binding.output,
+            binding.scratch,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
+        )
+    )
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch, draft):
+    """Fresh bindings may not construct synchronization resources inside capture."""
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            max_speculative_tokens=3 if draft else 0,
+        )
+    )
+    stream = torch.cuda.Stream(device=device)
+    done = torch.cuda.Event()
+    done.record(stream)
+    ready = torch.cuda.Event()
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    binding.main_block_table[0, 0] = 0
+    binding.compressed_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(3)
+    binding.raw_k_ring.zero_()
+    binding.compressed_k_cache.zero_()
+    state = _draft_selection_state(binding) if draft else None
+    warmed = _rebind(
+        binding, selection_stream=stream, selection_done=done, draft_selection=state
+    )
+    qsa.prewarm(warmed)
+    before_event = torch.cuda.Event
+
+    def forbid_event(*args, **kwargs):
+        raise AssertionError("fresh QSA binding allocated a CUDA event")
+
+    # Keep isinstance checks valid while failing any attempted construction.
+    monkeypatch.setattr(before_event, "__new__", forbid_event)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        capture_state = state.plan.bind(storage=state._storage) if state else None
+        rebound = _rebind(
+            binding,
+            selection_stream=stream,
+            selection_done=done,
+            draft_selection=capture_state,
+        )
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        if capture_state is not None:
+            capture_state.reset()
+        assert rebound is not warmed
+        assert rebound._selection_done is done
+        ready.record()
+        result = qsa.run(rebound, **dynamic, index_ready=ready)
+    graph.replay()
+    assert torch.all(result == 3)
+
+
+def test_qsa_run_stream_resources_use_plan_device() -> None:
+    device = require_sm120()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two explicitly assigned CUDA devices")
+    device = torch.device("cuda", torch.cuda.current_device())
+    other = (device.index + 1) % torch.cuda.device_count()
+    caps = _caps(
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+    )
+    binding = _allocate_binding(caps)
+    binding.main_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(2)
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    with torch.cuda.device(other):
+        wrong_stream = torch.cuda.Stream()
+        wrong_ready = torch.cuda.Event()
+        wrong_ready.record()
+    with pytest.raises(ValueError, match="selection_stream must match"):
+        _rebind(binding, selection_stream=wrong_stream)
+    binding = _rebind(binding, selection_stream=torch.cuda.Stream(device=device))
+    with pytest.raises(ValueError, match="index_ready must be recorded on"):
+        qsa.run(binding, **dynamic, index_ready=wrong_ready)
+    with torch.cuda.device(other):
+        qsa.prewarm(binding)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(device))
+        result = qsa.run(binding, **dynamic, index_ready=ready)
+        assert torch.cuda.current_device() == other
+    assert torch.all(result == 2)
+    assert binding.state_errors[0] == 0
+
+
+def test_qsa_draft_storage_binding_is_caller_owned_and_preserves_contents():
+    device = require_sm120()
+    caps = _caps(
+        device,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+    )
+    binding = _allocate_binding(caps)
+    storage_plan = binding.plan.draft_selection_plan(max_source_rows=8)
+    (spec,) = storage_plan.storage_specs()
+    storage = torch.full(spec.shape, 37, dtype=spec.dtype, device=spec.device)
+    expected = storage.clone()
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state = storage_plan.bind(storage=storage)
+    rebound = _rebind(binding, draft_selection=state)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert torch.equal(storage, expected)
+    assert rebound.draft_selection is state
+    assert state.selected_positions.shape == (8, caps.selection_width)
+    for tensor in (
+        state.selected_positions,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+    ):
+        assert tensor.untyped_storage().data_ptr() == storage.data_ptr()
+    for tensor in (rebound._draft_work_positions, rebound._draft_work_errors):
+        assert tensor.untyped_storage().data_ptr() == binding.scratch.data_ptr()
+    with pytest.raises(ValueError, match="requires"):
+        storage_plan.bind(storage=storage[:1])
+    with pytest.raises(ValueError, match="cover planned query rows"):
+        binding.plan.draft_selection_plan(max_source_rows=1)
+    for aliased_storage in (binding.main_k_cache.view(torch.uint8), binding.scratch):
+        with pytest.raises(ValueError, match="overlap"):
+            _rebind(binding, draft_selection=storage_plan.bind(storage=aliased_storage))
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state.reset()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert state.num_source_rows.item() == 0
+
+
+def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            max_speculative_tokens=3,
+        )
+    )
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    common = {
+        name: dynamic[name] for name in ("query", "request_ids", "query_positions")
+    }
+    with pytest.raises(TypeError, match="DraftSelectionReuse"):
+        qsa.run(binding, **common, reuse=True)
+    with pytest.raises(ValueError, match="shape"):
+        qsa.run(
+            binding,
+            **common,
+            reuse=qsa.DraftSelectionReuse(
+                dynamic["request_ids"][:1],
+            ),
+        )
+    source_rows = torch.zeros(
+        binding.plan.caps.max_batch, dtype=torch.int64, device=device
+    )
+    with pytest.raises(ValueError, match="does not accept selector inputs"):
+        qsa.run(binding, **dynamic, reuse=qsa.DraftSelectionReuse(source_rows))
+    aliased_rows = binding.scratch[: 8 * binding.plan.caps.max_batch].view(torch.int64)
+    with pytest.raises(ValueError, match="overlap"):
+        qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
+    assert state.num_source_rows.item() == 0

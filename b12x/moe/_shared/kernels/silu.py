@@ -95,6 +95,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
+        numerical_recipe: str = "default",
     ):
         super().__init__(
             sf_vec_size,
@@ -120,6 +121,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
+            numerical_recipe=numerical_recipe,
         )
 
 

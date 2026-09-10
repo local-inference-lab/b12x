@@ -10,7 +10,6 @@ from b12x.moe.fused_moe._impl import (
     B12XFP4ExpertWeights,
     B12XTopKRouting,
     TPMoEFP4Binding,
-    b12x_moe_fp4,
     b12x_route_experts_fast,
     b12x_sparse_moe_fp4,
     build_tp_moe_route_binding,
@@ -193,9 +192,16 @@ def test_route_experts_fast_from_gate_weight_renormalizes() -> None:
     torch.testing.assert_close(routing.flat_weights, routing.topk_weights.view(-1))
 
 
-def test_route_experts_fast_without_renormalize_returns_topk_logits() -> None:
-    hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    router_logits = torch.tensor([[0.5, 3.0, -4.0]], dtype=torch.float32)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+    ],
+)
+def test_route_experts_fast_without_renormalize_returns_topk_logits(device: str) -> None:
+    hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.float32, device=device)
+    router_logits = torch.tensor([[0.5, 3.0, -4.0]], dtype=torch.float32, device=device)
 
     binding = build_tp_moe_route_binding(
         hidden_states=hidden_states,
@@ -208,7 +214,7 @@ def test_route_experts_fast_without_renormalize_returns_topk_logits() -> None:
     assert routing.topk_ids.tolist() == [[1, 0]]
     torch.testing.assert_close(
         routing.topk_weights,
-        torch.tensor([[3.0, 0.5]], dtype=torch.float32),
+        torch.tensor([[3.0, 0.5]], dtype=torch.float32, device=device),
     )
 
 
@@ -233,6 +239,143 @@ def test_route_experts_fast_applies_gate_bias() -> None:
 
     assert routing.topk_ids.tolist() == [[0]]
     torch.testing.assert_close(routing.router_logits, torch.tensor([[5.0, 1.0]]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_experts,top_k", [(384, 6), (128, 3)])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_sqrtsoftplus_routing_mixed_modality_unbiased_weights(
+    num_experts: int, top_k: int, renormalize: bool
+) -> None:
+    from b12x.moe import fused_moe
+
+    # Both modalities share logits, but disjoint correction peaks select
+    # different experts; neither peak is allowed to contaminate the weights.
+    logits = torch.linspace(-8.0, 8.0, num_experts, device="cuda").repeat(4, 1)
+    text_bias = torch.zeros(num_experts, device="cuda")
+    text_bias[:top_k] = 10.0
+    image_bias = torch.zeros_like(text_bias)
+    image_bias[num_experts // 2 : num_experts // 2 + top_k] = 10.0
+    image_mask = torch.tensor([False, True, True, False], device="cuda")
+    scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    selection = scores + torch.where(image_mask[:, None], image_bias, text_bias)
+    expected_ids = selection.topk(top_k, dim=-1).indices
+    expected_weights = scores.gather(1, expected_ids)
+    if renormalize:
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+    expected_weights *= 1.5
+    assert not torch.equal(expected_ids[0], scores[0].topk(top_k).indices)
+    assert not torch.equal(expected_ids[0], expected_ids[1])
+
+    routing = fused_moe.route(
+        binding=fused_moe.bind_route(
+            hidden_states=torch.empty(4, 1, device="cuda"),
+            router_logits=logits,
+            top_k=top_k,
+            renormalize=renormalize,
+            score_func="sqrtsoftplus",
+            correction_bias=text_bias,
+            image_correction_bias=image_bias,
+            image_mask=image_mask,
+            routed_scaling_factor=1.5,
+        )
+    )
+    torch.testing.assert_close(routing.topk_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(routing.topk_weights, expected_weights, rtol=2e-6, atol=1e-7)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sqrtsoftplus_top1_and_extreme_logits() -> None:
+    from b12x.moe.fused_moe import route_topk
+
+    logits = torch.tensor(
+        [[-80.0, -25.0, 0.0, 25.0, 80.0, 1000.0]], device="cuda"
+    )
+    # Force selection across softplus's tiny-value, transition, and linear regions.
+    for expert in range(6):
+        bias = torch.zeros(6, device="cuda")
+        bias[expert] = 100.0
+        selected_logits = torch.empty(1, 1, device="cuda")
+        ids = torch.empty(1, 1, dtype=torch.int32, device="cuda")
+        weights = torch.empty_like(selected_logits)
+        route_topk(
+            logits, selected_logits, ids, weights,
+            renormalize=True,
+            score_func="sqrtsoftplus",
+            correction_bias=bias,
+            routed_scaling_factor=1.5,
+        )
+        expected = torch.nn.functional.softplus(logits[:, expert : expert + 1]).sqrt() * 1.5
+        torch.testing.assert_close(ids, torch.full_like(ids, expert))
+        torch.testing.assert_close(selected_logits, logits[:, expert : expert + 1])
+        torch.testing.assert_close(weights, expected, rtol=2e-6, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("score_func", ["softmax", "sqrtsoftplus"])
+def test_route_topk_ties_exclude_padded_and_selected_lanes(score_func: str) -> None:
+    from b12x.moe.fused_moe import route_topk
+
+    # A 384-expert row is padded to 512. Real scores tie at -inf for the legacy
+    # route and zero for sqrtsoftplus; padding must never win either selection.
+    logits = torch.full((2, 384), -float("inf"), device="cuda")
+    selected_logits = torch.empty(2, 6, device="cuda")
+    ids = torch.empty(2, 6, dtype=torch.int32, device="cuda")
+    weights = torch.empty_like(selected_logits)
+    route_topk(
+        logits, selected_logits, ids, weights,
+        renormalize=score_func == "sqrtsoftplus",
+        score_func=score_func,
+        routed_scaling_factor=1.5,
+    )
+    expected_ids = torch.arange(383, 377, -1, dtype=torch.int32, device="cuda").expand(2, -1)
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(selected_logits, logits[:, :6])
+    expected_weights = torch.zeros_like(weights) if score_func == "sqrtsoftplus" else logits[:, :6]
+    torch.testing.assert_close(weights, expected_weights)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sqrtsoftplus_routing_graph_replays_modality_and_strided_outputs() -> None:
+    from b12x.moe.fused_moe import route_topk
+
+    logits = torch.linspace(-6.0, 6.0, 384, device="cuda").repeat(7, 1)
+    text_bias = torch.zeros(384, device="cuda")
+    text_bias[:6] = 10.0
+    image_bias = text_bias.flip(0)
+    image_mask = torch.zeros(7, dtype=torch.bool, device="cuda")
+    # Distinct row strides are valid caller-owned scratch layouts.
+    selected_logits = torch.empty(7, 9, device="cuda")[:, :6]
+    ids = torch.empty(7, 8, dtype=torch.int32, device="cuda")[:, :6]
+    weights = torch.empty(7, 10, device="cuda")[:, :6]
+
+    def launch(rows: int) -> None:
+        route_topk(
+            logits[:rows], selected_logits[:rows], ids[:rows], weights[:rows],
+            renormalize=True,
+            score_func="sqrtsoftplus",
+            correction_bias=text_bias,
+            image_correction_bias=image_bias,
+            image_mask=image_mask[:rows],
+            routed_scaling_factor=1.5,
+        )
+
+    launch(1)
+    launch(7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(7)
+    image_mask[1::2] = True
+    logits.add_(0.25)
+    graph.replay()
+    scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    selection = scores + torch.where(image_mask[:, None], image_bias, text_bias)
+    expected_ids = selection.topk(6, dim=-1).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights = expected_weights / (expected_weights.sum(-1, keepdim=True) + 1e-20) * 1.5
+    torch.testing.assert_close(ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(selected_logits, logits.gather(1, expected_ids))
+    torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=1e-7)
 
 
 def test_sparse_moe_fp4_accepts_precomputed_router_logits() -> None:
@@ -340,31 +483,23 @@ def test_sparse_moe_fp4_forwards_prepared_contract_and_launch_options() -> None:
     assert captured["swiglu_beta"] == 0.25
 
 
-def test_fp4_expert_weights_default_to_modelopt_nvfp4_source_format() -> None:
-    experts = _make_experts(hidden_size=4)
-
-    assert experts.source_format == "modelopt_nvfp4"
 
 
 def test_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:
-    hidden_states = torch.randn(2, 4)
-    experts = _make_experts(hidden_size=4, source_format="compressed_tensors")
-    routing = B12XTopKRouting(
-        topk_weights=torch.ones(2, 1, dtype=torch.float32),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int64),
-    )
-    binding = _make_fp4_binding(
-        hidden_states,
-        experts,
-        routing,
-        quant_mode="nvfp4",
-    )
-    with pytest.raises(ValueError) as exc_info:
-        b12x_moe_fp4(binding=binding)
+    from b12x.moe import fused_moe
 
-    message = str(exc_info.value)
-    assert "source_format='compressed_tensors'" in message
-    assert "quant_mode='nvfp4'" in message
+    # Reject the incompatible numerical recipe before constructing execution
+    # buffers; an incomplete hand-built run binding tests a different error.
+    with pytest.raises(ValueError):
+        fused_moe.plan_weights(
+            quant_modes="nvfp4",
+            source_format="compressed_tensors",
+            activation="silu",
+            params_dtype=torch.bfloat16,
+            num_experts=4,
+            hidden_size=256,
+            intermediate_size=128,
+        )
 
 
 def test_sparse_moe_fp4_rejects_compressed_tensors_with_nvfp4() -> None:

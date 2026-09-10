@@ -153,6 +153,9 @@ def clear_indexer_caches() -> None:
     clear_tiled_topk_kernel_cache()
     clear_persistent_topk2048_kernel_cache()
     _cached_width_cap_tensor.cache_clear()
+    from .mxfp4 import _compile as compile_mxfp4
+
+    compile_mxfp4.cache_clear()
 
 
 def uses_paged_mqa_schedule(

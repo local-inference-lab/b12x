@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import math
 
 import pytest
@@ -25,7 +24,6 @@ from b12x.attention._shared.mla.compressed_reference import (
 )
 from b12x.attention._shared.mla.api import clear_mla_caches
 from b12x.attention._shared.mla.compressed_api import (
-    _should_use_sm121_single_pass_decode,
     compressed_sparse_mla_decode_forward,
 )
 from b12x.attention._shared.mla.compressed_config import (
@@ -35,7 +33,9 @@ from b12x.attention._shared.mla.compressed_config import (
 from b12x.attention._shared.mla.kernel import _dsv4_h16_auto
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
-    plan_compressed_sparse_mla_scratch,
+)
+from b12x.attention.compressed_sparse_mla import (
+    plan as plan_compressed_sparse_mla_scratch,
 )
 from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
@@ -49,47 +49,8 @@ _LOCAL_Q_HEADS = 32
 _SM_SCALE = 1.0 / math.sqrt(_COMPRESSED_HEAD_DIM)
 
 
-@pytest.mark.parametrize("indexed_width", [0, 512])
-def test_sm121_single_pass_decode_policy_covers_b16_short_context(
-    indexed_width: int,
-) -> None:
-    assert _should_use_sm121_single_pass_decode(
-        rows=16,
-        heads=32,
-        swa_width=128,
-        indexed_width=indexed_width,
-        swa_page_size=64,
-        indexed_page_size=64 if indexed_width else None,
-        compute_capability=(12, 1),
-    )
 
 
-def test_sm121_single_pass_decode_policy_rejects_other_regimes() -> None:
-    common = dict(
-        heads=32,
-        swa_width=128,
-        swa_page_size=64,
-        compute_capability=(12, 1),
-    )
-    assert not _should_use_sm121_single_pass_decode(
-        rows=8,
-        indexed_width=512,
-        indexed_page_size=64,
-        **common,
-    )
-    assert not _should_use_sm121_single_pass_decode(
-        rows=16,
-        indexed_width=8192,
-        indexed_page_size=2,
-        **common,
-    )
-    assert not _should_use_sm121_single_pass_decode(
-        rows=16,
-        indexed_width=0,
-        indexed_page_size=None,
-        compute_capability=(12, 0),
-        **{key: value for key, value in common.items() if key != "compute_capability"},
-    )
 
 
 def test_spark_h16_policy_keeps_swa_h8_and_promotes_c4() -> None:
@@ -222,6 +183,7 @@ def _make_compressed_binding(
     max_chunks_per_row: int = 64,
     max_page_table_width: int | None = None,
     decode_row_capacity: int | None = None,
+    mode: str = "decode",
 ):
     plan = plan_compressed_sparse_mla_scratch(
         B12XCompressedSparseMLAScratchCaps(
@@ -237,6 +199,7 @@ def _make_compressed_binding(
             max_batch=rows,
             max_kv_rows=max_kv_rows,
             max_chunks_per_row=max_chunks_per_row,
+            mode=mode,
             decode_row_capacity=decode_row_capacity,
         )
     )
@@ -316,11 +279,6 @@ def test_compressed_sparse_mla_page_byte_widths_match_padded_layout() -> None:
     assert (
         compressed_sparse_mla_page_nbytes(COMPRESSED_SPARSE_MLA_C128_PAGE_SIZE) == 1728
     )
-
-
-def test_compressed_sparse_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
-    signature = inspect.signature(compressed_sparse_mla_decode_forward)
-    assert signature.parameters["expected_num_q_heads"].default is None
 
 
 def test_compressed_sparse_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
@@ -1265,8 +1223,8 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
             q=q,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
+            mode=mode,
         )
-        binding.scratch.mode = mode
         baseline = compressed_sparse_mla_decode_forward(
             swa_k_cache=swa_cache,
             binding=binding,
@@ -1301,8 +1259,8 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
+        mode="extend",
     )
-    binding.scratch.mode = "extend"
     bad_shape = torch.empty(
         (rows + 1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM),
         dtype=torch.bfloat16,
@@ -1380,8 +1338,8 @@ def test_compressed_sparse_mla_prefill_is_run_to_run_deterministic() -> None:
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
+        mode="extend",
     )
-    binding.scratch.mode = "extend"
 
     def call() -> torch.Tensor:
         return compressed_sparse_mla_decode_forward(

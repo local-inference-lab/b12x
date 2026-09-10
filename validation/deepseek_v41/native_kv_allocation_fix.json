@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "status": "verified_full_context_configuration_and_native_serving",
+  "target": {
+    "gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "tensor_parallel_size": 4,
+    "gpu_memory_utilization": 0.95,
+    "max_model_len": "auto",
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 4,
+    "speculation": "dspark",
+    "draft_tokens": 5,
+    "engram_table_memory": "disk",
+    "load_format": "safetensors",
+    "script_capacity_changes": false
+  },
+  "cause": [
+    "The b12x adapter exposed the MXFP4 indexer default 64-state kernel page as allocator block coverage (64*ratio tokens), splitting it from main-KV logical blocks of 256 tokens.",
+    "The mixed-opaque-MLA dispatch selected a fork-specific weighted GLM grouping path capped at eight groups.",
+    "A 20-layer SWA group then set a 337920-byte common slot, separately charged even for 4352-byte index pages."
+  ],
+  "upstream_comparison": {
+    "model_pr": "https://github.com/vllm-project/vllm/pull/56214",
+    "reference_revision": "e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba",
+    "attention_source": "https://raw.githubusercontent.com/vllm-project/vllm/e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba/vllm/models/deepseek_v4_1/attention.py",
+    "compressor_source": "https://raw.githubusercontent.com/vllm-project/vllm/e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba/vllm/models/deepseek_v4_1/compressor.py",
+    "finding": "Upstream keeps main/index logical block coverage aligned and uses a bounded private compressor ring. Its worker also uses a common block pool; the pool itself is not the fork-only divergence.",
+    "fork_weighted_group_commits": [
+      "71aebed01e",
+      "a0bcd2bd060cc9a81977c95901037ada993c1d74"
+    ]
+  },
+  "repair": [
+    "Expose existing native MXFP4 page-size support through public dsa_indexer.Caps; FP8 retains its existing 64-state requirement.",
+    "Pack main-KV and index-K components for the same 256-token logical block; both writer and scorer use 128/256 stored-state pages for ratio2/ratio1.",
+    "Remove the V4.1 mixed-opaque dispatch to GLM weighted grouping and use the existing model-derived packed grouping path, preserving distinct SWA retention contracts.",
+    "Use the upstream-style request-owned compressor ring sized for drafts, bonus and predecessor; mask older prefill writes to avoid concurrent ring-wrap races.",
+    "Keep global block IDs, existing pool allocation, scheduler/runner block tables, zeroing, copy and connector ABIs unchanged."
+  ],
+  "hand_selected_group_count": false,
+  "before": {
+    "required_bytes_at_1m": 12030289920,
+    "required_gib_at_1m": 11.204080581665039,
+    "pool_block_bytes": 337920,
+    "auto_fit_max_model_len": 692736
+  },
+  "after": {
+    "groups": [
+      {
+        "layer_count": 8,
+        "block_tokens": 256,
+        "page_bytes": 227840
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 2,
+        "block_tokens": 32,
+        "page_bytes": 33792
+      },
+      {
+        "layer_count": 2,
+        "block_tokens": 32,
+        "page_bytes": 33792
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 32,
+        "page_bytes": 50688
+      },
+      {
+        "layer_count": 3,
+        "block_tokens": 8,
+        "page_bytes": 98304
+      }
+    ],
+    "pool_block_bytes": 227840,
+    "required_bytes_at_1m": 1825454080,
+    "required_gib_at_1m": 1.7000865936279297,
+    "native_global_bytes_per_token": 890
+  },
+  "allocation_probe": {
+    "python": "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+    "cwd": "/home/luke/projects/vllm-hh-rebase",
+    "code": "from types import SimpleNamespace\nimport torch\nfrom vllm.config import CacheConfig\nfrom vllm.models.deepseek_v4_1.attention import DeepseekV4Attention, _Cache\nfrom vllm.models.deepseek_v4_1.compressor import CompressorStateCache\nfrom vllm.v1.core.kv_cache_utils import get_kv_cache_groups, _max_memory_usage_bytes_from_groups, _get_kv_cache_bytes_per_block\nfrom vllm.v1.kv_cache_interface import KVCacheLayout\ncache = CacheConfig(block_size=256)\ncache.kv_cache_layout = 'BLHNC'\ncfg=SimpleNamespace(cache_config=cache, kv_transfer_config=None, speculative_config=None, compilation_config=SimpleNamespace(static_forward_context={}), scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False, max_num_batched_tokens=4096, max_num_seqs=4), max_in_flight_tokens=8192, model_config=SimpleNamespace(max_model_len=1048576), parallel_config=SimpleNamespace(decode_context_parallel_size=1, prefill_context_parallel_size=1))\nspecs={}\nfor layer in range(43):\n    name=f'model.layers.{layer}.self_attn'\n    swa=_Cache(cfg, name+'.swa_cache', kind='swa', window=128, draft=layer>=40)\n    specs[swa.prefix]=swa.get_kv_cache_spec(cfg)\n    if layer in (2,8,14,20):\n        ratio=1 if layer==20 else 2\n        specs[name]=DeepseekV4Attention.get_kv_cache_spec(SimpleNamespace(is_kv_source=True,compress_ratio=ratio),cfg)\n        index=_Cache(cfg,name+'.indexer.k_cache',kind='index',ratio=ratio)\n        specs[index.prefix]=index.get_kv_cache_spec(cfg)\n        if ratio==2:\n            state=CompressorStateCache(cfg,name+'.compressor.state_cache')\n            specs[state.prefix]=state.get_kv_cache_spec(cfg)\ngroups=get_kv_cache_groups(cfg,specs)\nrequired=_max_memory_usage_bytes_from_groups(cfg,groups)\nimport json\nprint(json.dumps({'groups':[{'layer_count':len(g.layer_names),'block_tokens':g.kv_cache_spec.block_size,'page_bytes':g.kv_cache_spec.page_size_bytes} for g in groups],'pool_block_bytes':_get_kv_cache_bytes_per_block(groups),'required_bytes_at_1m':required,'required_gib_at_1m':required/2**30,'native_global_bytes_per_token':890}))\n",
+    "returncode": 0
+  },
+  "regressions": [
+    {
+      "cwd": "/home/luke/projects/vllm-hh-rebase",
+      "cuda_visible_devices": "0",
+      "command": ".venv/bin/python -m pytest -xq tests/v1/core/test_contiguous_kv_packing.py tests/v1/core/test_kv_cache_utils.py tests/v1/core/test_single_type_kv_cache_manager.py tests/v1/core/test_swa_inflight_window_free.py tests/v1/core/test_deferred_block_free.py",
+      "passed": 152,
+      "elapsed_s": 61.18
+    },
+    {
+      "cwd": "/home/luke/projects/vllm-hh-rebase",
+      "cuda_visible_devices": "",
+      "command": ".venv/bin/python -m pytest -xq tests/v1/core/test_prefix_caching.py",
+      "passed": 128,
+      "elapsed_s": 43.76
+    },
+    {
+      "cwd": "/home/luke/projects/vllm-hh-rebase",
+      "cuda_visible_devices": "0",
+      "command": ".venv/bin/python -m pytest -xq tests/models/test_deepseek_v4_1_compressor.py tests/v1/attention/test_b12x_v41_workspace.py",
+      "passed": 7,
+      "elapsed_s": 13.81,
+      "coverage": "Native rejection boundaries, request reorder/PAD/null, ring wrap, graph replay, high compressor pool offsets beyond Int32 element addressing, shared workspace lifetimes."
+    },
+    {
+      "cwd": "/home/luke/projects/flashinfer-b12x-migration",
+      "cuda_visible_devices": "1",
+      "command": "/home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/b12x/attention/test_dsa_indexer_mxfp4.py",
+      "passed": 8,
+      "elapsed_s": 5.11,
+      "coverage": "Exact quantization and score oracles, 64/128/256-state pages, high byte offsets beyond Int32, frozen live counts and graph replay."
+    }
+  ],
+  "pre_fix_regression": {
+    "test": "test_v41_full_context_packs_shared_global_cache_without_page_inflation",
+    "observed_required_bytes": 12030289920,
+    "failed_before_repair": true,
+    "passed_after_repair": true
+  },
+  "serving": {
+    "supervised_name": "ds41-serve-startup",
+    "api_pid": 646211,
+    "command": "DRY_RUN=0 /usr/bin/bash ./serve-ds41-flash.sh",
+    "cwd": "/home/luke/projects/vllm-hh-rebase",
+    "endpoint": "http://127.0.0.1:8000",
+    "ready": true,
+    "left_running": true,
+    "model_load_gib_per_rank": 76.22,
+    "profile_graph_gib_per_rank": 3.97,
+    "final_capture_gib_per_rank": 4.08,
+    "available_kv_gib_per_rank": 7.66,
+    "advertised_max_model_len": 1048576,
+    "reported_kv_token_capacity": 4721994,
+    "reported_full_context_concurrency": 4.5,
+    "capacity_metric_is_not_concurrent_generation_qualification": true,
+    "http_successes": 8,
+    "http_errors": 0,
+    "arithmetic_checks": 7,
+    "largest_prompt_tokens": 65550,
+    "sustained_decode_tokens": 90,
+    "prefix_hit_tokens": 76288,
+    "draft_rounds": 45,
+    "draft_tokens": 225,
+    "accepted_draft_tokens": 59,
+    "raw_evidence": "native_kv_serving_smoke.json",
+    "settings_overridden_for_smoke": false
+  },
+  "gpu_residency": {
+    "per_gpu_mib": {
+      "total": 97887,
+      "used": 92973,
+      "free": 4319
+    },
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "qualification_limits": [
+    "Full 1M context was initialized and admitted by startup accounting; largest actual HTTP prompt was 65550 tokens, not 1M.",
+    "Four concurrent HTTP requests were exercised, not four simultaneous full-1M prompts.",
+    "No throughput/latency speedup claim; recorded HTTP wall times are smoke observations."
+  ],
+  "cleanup": {
+    "launcher_change": "Corrected a stale comment claiming 97%; executable settings unchanged.",
+    "docs_updated": true,
+    "new_throwaway_script_files": false,
+    "formatter": "ruff==0.12.8",
+    "syntax_and_undefined_names": "passed E9,F63,F7,F82"
+  },
+  "source_sha256": {
+    "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/attention/dsa_indexer/api.py": "9a0ffdc17f738f0087f9bb3b0baa4c8090d284bbcc2efeee1e6a45f81e2dd9b1",
+    "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/attention/dsa_indexer/__init__.py": "2c008ee6b1ef863f00c0125c885ab4c45d24e59834dd2ef34e703089ed0cde36",
+    "/home/luke/projects/flashinfer-b12x-migration/tests/b12x/attention/test_dsa_indexer_mxfp4.py": "de4cd6904d1a7d99df167ad3441aa8bc625dafcdb6657158346c4543c9f23a55",
+    "/home/luke/projects/flashinfer-b12x-migration/docs/b12x/README.md": "3b34cd89d6941c87c874fdfe312820e96c27fc171151ac0d2b1a0dd513131fec",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/attention.py": "7134f502d95a4e2f8343da183f84dd35dd647bab14fcc2fbf6069fb74e191c8f",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/compressor.py": "c765f2c7ee12a3f850768b5630e6a982d616fc0fe296ad8d7b44692f55060662",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/sparse_mla.py": "49a3ea57ca1b5a10c01d684581aaf6ffb0fd1964556924d813a3e3750aa9e00f",
+    "/home/luke/projects/vllm-hh-rebase/vllm/v1/core/kv_cache_utils.py": "f013f33bc6e4c708f2f2ab70c015575ba61ee3aff1ce9a60713065444bc3780a",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/core/test_contiguous_kv_packing.py": "5e788c6429d89d303b057e68ec2e778eefd028b1cc511776c33e3fd4ab1c1bfc",
+    "/home/luke/projects/vllm-hh-rebase/tests/models/test_deepseek_v4_1_compressor.py": "0efd5e983365c48c279ae883ca8a7ab9ddaff674c3545802b59fb57b07d04aa8",
+    "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh": "d982d3919b374e7b4ee0164358aa704b6c53b337930a459d5e5b319d692d922a"
+  }
+}

@@ -122,6 +122,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 ):
                     _assert_close(retained, retained_ref, world_size)
 
+        if ring.wire_mode == "bf16":
+            ring.prepare_eager_replay(torch.bfloat16)
+            # Capacity is fixed while live prefixes shrink/grow. Later calls
+            # must not overwrite retained outputs through private graph buffers.
+            for iteration, requested_rows in enumerate((512, 8, 256, 64), 1):
+                rows = valid_rows(requested_rows)
+                inp = _make_input(rows, hidden, torch.bfloat16, device, rank, iteration)
+                ref = _reference(inp)
+                out = ring.all_reduce(inp)
+                torch.cuda.synchronize(device)
+                _assert_close(out, ref, world_size)
+                retained_outputs.append(out)
+                retained_refs.append(ref)
+                for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
+                    _assert_close(retained, retained_ref, world_size)
+
         # Captured callers provide stable output storage explicitly.
         rows = valid_rows(256)
         dtype = torch.bfloat16

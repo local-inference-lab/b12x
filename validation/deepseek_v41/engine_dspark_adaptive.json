@@ -1,0 +1,35 @@
+{
+  "dtype": "bfloat16",
+  "tensor_parallel_size": 8,
+  "enable_expert_parallel": true,
+  "max_model_len": 32768,
+  "max_num_batched_tokens": 1024,
+  "max_num_seqs": 4,
+  "gpu_memory_utilization": 0.85,
+  "block_size": 256,
+  "load_format": "safetensors",
+  "safetensors_load_strategy": "lazy",
+  "enforce_eager": false,
+  "enable_prefix_caching": true,
+  "generation_config": "vllm",
+  "limit_mm_per_prompt": {
+    "image": 2
+  },
+  "engram_config": {
+    "cpu_offload": false
+  },
+  "kernel_config": {
+    "moe_backend": "b12x",
+    "linear_backend": "b12x"
+  },
+  "speculative_config": {
+    "method": "dspark",
+    "num_speculative_tokens": 5,
+    "draft_tensor_parallel_size": 8,
+    "attention_backend": "B12X_MLA_SPARSE_DSV41",
+    "draft_sample_method": "greedy",
+    "rejection_sample_method": "standard",
+    "enable_adaptive_verification": true
+  },
+  "disable_log_stats": false
+}

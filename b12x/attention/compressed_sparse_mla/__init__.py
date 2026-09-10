@@ -1,12 +1,21 @@
-"""Compressed sparse MLA for DeepSeek V4 on SM12x.
+"""Compressed sparse MLA for DeepSeek V4 and V4.1 on SM12x.
 
 Decode directly from compressed KV pages: a sliding-window cache plus an
 indexed (top-k-selected) cache, fused-merged into the caller's output.
-Head dim is fixed to 512 (448 NoPE + 64 RoPE). Single-pass decode on SM121.
+Head dim is fixed to 512. V4 uses 448 NoPE + 64 BF16 RoPE; V4.1
+quantizes all 512 coordinates with independent SWA FP8 and indexed FP4 scales.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run``
 (capture safe). ``split_chunks_for_contract`` exposes the fixed
 split-planning contract integrations preplan against.
+
+``Caps(cache_format="deepseek_v41")`` selects SWA E4M3 + UE8M0/group32
+(528 bytes/token) and indexed E2M1 + E4M3/group16 (288 bytes/token).
+The default ``deepseek_v4`` recipe is unchanged. ``page_nbytes`` sizes either
+recipe; ``write_cache`` and ``compile_cache_writer`` encode V4.1 records.
+``indexed_page_table`` maps logical indexed slots at run time into planned
+scratch, with checked 64-bit page products. Bound calls inherit their recipe;
+unbound ``run`` is an allocating convenience outside graph capture only.
 
 Example:
     from b12x.attention import compressed_sparse_mla
@@ -41,11 +50,14 @@ META = OpMeta(
         "bind",
         "run",
         "split_chunks_for_contract",
+        "page_nbytes",
+        "write_cache",
+        "compile_cache_writer",
         "is_supported",
         "clear_caches",
     ),
     dtypes=("bf16", "fp8_e4m3"),
-    recipes=("dsv4",),
+    recipes=("dsv4", "dsv41"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -69,10 +81,13 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         SparseMlaQuery,
         bind,
         clear_caches,
+        compile_cache_writer,
         is_supported,
         plan,
+        page_nbytes,
         run,
         split_chunks_for_contract,
+        write_cache,
     )
 
 install_lazy_api(globals(), META)

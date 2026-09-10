@@ -9,7 +9,6 @@ import b12x.attention.dsa_indexer._impl as indexer_impl
 import b12x.attention._shared.mla.api as sparse_mla_impl
 import b12x.attention._shared.mla.compressed_api as compressed_sparse_mla_impl
 import b12x.attention._shared.mla.kernel as compressed_sparse_mla_kernel
-import b12x.attention.dsa_indexer.paged as paged_indexer_impl
 from b12x.attention._shared.mla.compressed_reference import (
     COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     compressed_sparse_mla_page_nbytes,
@@ -32,9 +31,10 @@ from b12x.attention.dsa_indexer.scratch import (
 )
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLABinding,
-    B12XCompressedSparseMLAScratch,
     B12XCompressedSparseMLAScratchCaps,
-    plan_compressed_sparse_mla_scratch,
+)
+from b12x.attention.compressed_sparse_mla import (
+    plan as plan_compressed_sparse_mla_scratch,
 )
 from b12x.attention.sparse_mla._scratch import (
     B12XSparseMLABinding,
@@ -98,37 +98,37 @@ def test_compressed_sparse_mla_scratch_plan_exposes_one_opaque_scratch_spec() ->
     assert plan.layout.nbytes == specs[0].nbytes
 
 
-def test_compressed_sparse_mla_scratch_binding_uses_component_scratch() -> None:
+@pytest.mark.parametrize("cache_format", ["deepseek_v4", "deepseek_v41"])
+def test_compressed_sparse_mla_bind_is_views_only(monkeypatch, cache_format) -> None:
     plan = plan_compressed_sparse_mla_scratch(
         B12XCompressedSparseMLAScratchCaps(
-            device="cpu",
-            num_q_heads=2,
-            max_q_rows=4,
-            max_width=8,
-            max_page_table_width=16,
+            device="cpu", num_q_heads=8, max_q_rows=4, max_width=8,
+            swa_width=4, indexed_width=4, max_page_table_width=2,
+            cache_format=cache_format,
         )
     )
     (spec,) = plan.scratch_specs()
-    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    q = torch.empty((4, 2, 512), dtype=torch.bfloat16)
-    swa_indices = torch.empty((4, 8), dtype=torch.int32)
-    swa_lengths = torch.empty((4,), dtype=torch.int32)
+    scratch = torch.full(spec.shape, 165, dtype=spec.dtype, device=spec.device)
+    q = torch.empty((4, 8, 512), dtype=torch.bfloat16)
+    indices = torch.zeros((4, 4), dtype=torch.int32)
+    lengths = torch.ones((4,), dtype=torch.int32)
+    page_table = torch.ones((1, 2), dtype=torch.int32).expand(4, -1)
 
-    binding = plan.bind(
-        scratch=scratch,
-        q=q,
-        swa_indices=swa_indices,
-        swa_lengths=swa_lengths,
-    )
+    def reject_allocation(*args, **kwargs):
+        raise AssertionError("bind must not allocate tensor storage")
 
-    assert isinstance(binding.scratch, B12XCompressedSparseMLAScratch)
-    assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
-    assert binding.scratch.tmp_output is not None
-    assert binding.scratch.tmp_lse is not None
-    assert binding.scratch.output_buffer is not None
-    assert binding.scratch.kv_chunk_size_ptr is not None
-    assert binding.scratch.num_chunks_ptr is not None
-    assert not hasattr(binding.scratch, "indexer_k_tma_desc_ptrs")
+    with monkeypatch.context() as guarded:
+        guarded.setattr(torch, "empty", reject_allocation)
+        guarded.setattr(torch, "zeros", reject_allocation)
+        guarded.setattr(torch, "full", reject_allocation)
+        binding = plan.bind(
+            scratch=scratch, q=q, swa_indices=indices, swa_lengths=lengths,
+            indexed_indices=indices, indexed_lengths=lengths, indexed_page_table=page_table,
+        )
+    assert torch.all(scratch == 165)
+    # Mutation through the consumer-visible final LSE is within caller storage.
+    binding.scratch.final_lse.zero_()
+    assert torch.count_nonzero(scratch != 165).item() == 4 * 8 * 4
 
 
 def test_indexer_paged_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
@@ -260,7 +260,12 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
     props = type(
         "Props",
         (),
-        {"major": 12, "minor": minor, "multi_processor_count": sm_count},
+        {
+            "major": 12,
+            "minor": minor,
+            "multi_processor_count": sm_count,
+            "name": "test SM12x device",
+        },
     )()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
 
@@ -531,6 +536,7 @@ def test_indexer_contiguous_scratch_bind_does_not_call_workspace_factory(
 def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,
@@ -554,6 +560,7 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_sparse_mla_scratch_can_expose_head_major_output(mode: str) -> None:
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device="cpu",
         num_q_heads=8,
         max_q_rows=6,
@@ -591,6 +598,7 @@ def test_sparse_mla_scratch_bind_does_not_call_workspace_factory(
 ) -> None:
     plan = plan_sparse_mla_scratch(
         B12XSparseMLAScratchCaps(
+            softmax_scale=1.0,
             device="cpu",
             num_q_heads=2,
             max_q_rows=4,

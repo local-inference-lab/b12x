@@ -11,6 +11,7 @@
 - ``qsa``: grouped-selector sparse GQA over caller-populated, read-only main
   BF16 paged K/V.
 - ``varlen``: contiguous batched/varlen attention (reduced-assurance tier).
+- ``mla_compress``: nonoverlapping CSA latent pooling before index-key projection.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ _OP_MODULES = (
     "dsa_indexer",
     "qsa",
     "varlen",
+    "mla_compress",
 )
 
 

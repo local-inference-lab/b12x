@@ -303,6 +303,91 @@ def gather_compressed_sparse_mla_kv_cache_reference(
     return full, full
 
 
+def pack_deepseek_v41_cache_reference(
+    kv: torch.Tensor, *, page_size: int, cache_kind: str
+) -> torch.Tensor:
+    """Independent V4.1 record encoder, including RN-even E2M1 signed zero."""
+    if kv.ndim != 2 or kv.shape[1] != 512:
+        raise ValueError("V4.1 kv must have shape [tokens, 512]")
+    if page_size <= 0 or cache_kind not in ("swa", "indexed"):
+        raise ValueError("V4.1 requires a positive page_size and swa/indexed cache_kind")
+    tokens = int(kv.shape[0])
+    group_size = 32 if cache_kind == "swa" else 16
+    grouped = kv.float().reshape(tokens, 512 // group_size, group_size)
+    maximum = grouped.abs().amax(dim=-1)
+    if cache_kind == "swa":
+        scales = _float_to_ue8m0_scale(maximum.clamp_min(1e-4))
+        normalized = grouped / ue8m0_to_float(scales).unsqueeze(-1)
+        payload = normalized.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+        payload = payload.reshape(tokens, 512)
+    else:
+        scales_fp8 = (maximum.clamp_min(6 * 2**-9) / 6.0).clamp(max=448).to(torch.float8_e4m3fn)
+        scale_f32 = scales_fp8.float().unsqueeze(-1)
+        normalized = grouped * scale_f32.reciprocal()
+        magnitude = normalized.abs().contiguous()
+        boundaries = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+            dtype=torch.float32, device=kv.device,
+        )
+        codes = torch.bucketize(magnitude, boundaries)
+        midpoint = boundaries[codes.clamp(max=6)]
+        codes += ((codes < 7) & (magnitude == midpoint) & ((codes & 1) != 0)).to(codes.dtype)
+        codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+        codes = codes.reshape(tokens, 512)
+        payload = codes[:, 0::2] | (codes[:, 1::2] << 4)
+        scales = scales_fp8.view(torch.uint8)
+    records = torch.cat((payload, scales), dim=-1)
+    record_bytes = 528 if cache_kind == "swa" else 288
+    cache = torch.zeros(
+        ((tokens + page_size - 1) // page_size, page_size * record_bytes),
+        dtype=torch.uint8, device=kv.device,
+    )
+    cache.view(-1, record_bytes)[:tokens].copy_(records)
+    return cache
+
+
+def _decode_deepseek_v41_records(records: torch.Tensor, *, cache_kind: str) -> torch.Tensor:
+    if cache_kind == "swa":
+        payload = records[..., :512].contiguous().view(torch.float8_e4m3fn).float()
+        scales = ue8m0_to_float(records[..., 512:])
+        return (payload.reshape(-1, 16, 32) * scales.reshape(-1, 16, 1)).reshape(-1, 512)
+    if cache_kind != "indexed":
+        raise ValueError("cache_kind must be swa or indexed")
+    packed = records[..., :256]
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(-1, 512)
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=records.device)
+    payload = lut[(codes & 7).long()]
+    payload = torch.where((codes & 8) != 0, -payload, payload)
+    scales = records[..., 256:].contiguous().view(torch.float8_e4m3fn).float()
+    return (payload.reshape(-1, 32, 16) * scales.reshape(-1, 32, 1)).reshape(-1, 512)
+
+
+def unpack_deepseek_v41_cache_reference(
+    cache: torch.Tensor, *, page_size: int, cache_kind: str
+) -> torch.Tensor:
+    """Decode every V4.1 record to FP32 without using the production reader."""
+    record_bytes = 528 if cache_kind == "swa" else 288
+    if cache.ndim != 2 or cache.shape[1] != page_size * record_bytes:
+        raise ValueError("invalid V4.1 page byte width")
+    return _decode_deepseek_v41_records(
+        cache.view(torch.uint8).reshape(-1, record_bytes), cache_kind=cache_kind
+    )
+
+
+def _gather_cache_reference(
+    cache: torch.Tensor, indices: torch.Tensor, *, page_size: int,
+    cache_format: str, cache_kind: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cache_format == "deepseek_v4":
+        return gather_compressed_sparse_mla_kv_cache_reference(cache, indices, page_size=page_size)
+    record_bytes = 528 if cache_kind == "swa" else 288
+    slots = indices.long()
+    columns = (slots % page_size)[:, None] * record_bytes + torch.arange(record_bytes, device=cache.device)
+    records = cache.view(torch.uint8)[(slots // page_size)[:, None], columns]
+    values = _decode_deepseek_v41_records(records, cache_kind=cache_kind)
+    return values, values
+
+
 def compressed_sparse_mla_reference(
     q: torch.Tensor,
     swa_k_cache: torch.Tensor,
@@ -317,6 +402,7 @@ def compressed_sparse_mla_reference(
     swa_page_size: int = COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     extra_page_size: int | None = None,
     return_lse: bool = False,
+    cache_format: str = "deepseek_v4",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference sparse MLA attention over SWA plus optional C4/C128 stream."""
 
@@ -329,7 +415,10 @@ def compressed_sparse_mla_reference(
         raise ValueError(
             f"swa_topk_lengths must have shape [{rows}], got {tuple(swa_topk_lengths.shape)}"
         )
-    _validate_flat_cache(swa_k_cache, page_size=swa_page_size)
+    if cache_format not in ("deepseek_v4", "deepseek_v41"):
+        raise ValueError("unsupported compressed MLA reference cache_format")
+    if cache_format == "deepseek_v4":
+        _validate_flat_cache(swa_k_cache, page_size=swa_page_size)
 
     has_extra = (
         extra_k_cache is not None
@@ -352,7 +441,8 @@ def compressed_sparse_mla_reference(
             raise ValueError(
                 f"extra_topk_lengths must have shape [{rows}], got {tuple(extra_topk_lengths.shape)}"
             )
-        _validate_flat_cache(extra_k_cache, page_size=extra_page_size)
+        if cache_format == "deepseek_v4":
+            _validate_flat_cache(extra_k_cache, page_size=extra_page_size)
     else:
         extra_indices_2d = None
 
@@ -386,10 +476,12 @@ def compressed_sparse_mla_reference(
             if extra_len:
                 assert extra_k_cache is not None
                 assert extra_page_size is not None
-                extra_k, extra_v = gather_compressed_sparse_mla_kv_cache_reference(
+                extra_k, extra_v = _gather_cache_reference(
                     extra_k_cache,
                     extra_indices_2d[row, :extra_len],
                     page_size=extra_page_size,
+                    cache_format=cache_format,
+                    cache_kind="indexed",
                 )
             else:
                 extra_k = torch.empty(
@@ -408,8 +500,9 @@ def compressed_sparse_mla_reference(
             extra_v = extra_k
 
         if swa_len:
-            swa_k, swa_v = gather_compressed_sparse_mla_kv_cache_reference(
-                swa_k_cache, swa_indices_2d[row, :swa_len], page_size=swa_page_size
+            swa_k, swa_v = _gather_cache_reference(
+                swa_k_cache, swa_indices_2d[row, :swa_len], page_size=swa_page_size,
+                cache_format=cache_format, cache_kind="swa",
             )
         else:
             swa_k = torch.empty(

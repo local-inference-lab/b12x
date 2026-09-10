@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "backend_layout": "BLHNC",
+  "circular_state_content_bytes": 4104,
+  "circular_page_size_padded": 4112,
+  "environment_override_required": false,
+  "cpu_allocator_tests": 14,
+  "native_graph_capture_qualified": false
+}

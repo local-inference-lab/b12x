@@ -1,0 +1,382 @@
+{
+  "schema_version": 1,
+  "status": "qualified_measurement",
+  "target": {
+    "tensor_parallel_size": 4,
+    "cuda_visible_devices": "0,1,2,3",
+    "engram_storage": "SSD via io_uring",
+    "performance_priority": "interactive latency",
+    "tp8_testing_authorized": false
+  },
+  "input": "tp4_ssd_interactive.json",
+  "source_manifest": "source_manifest.json",
+  "profiler_enabled": false,
+  "quality_cases": [
+    {
+      "batch": "arithmetic",
+      "repeat": 0,
+      "case": "arithmetic",
+      "passed": true
+    },
+    {
+      "batch": "python",
+      "repeat": 0,
+      "case": "python",
+      "passed": true
+    },
+    {
+      "batch": "chinese",
+      "repeat": 0,
+      "case": "chinese",
+      "passed": true
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 0,
+      "case": "midturn_system",
+      "passed": true
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 0,
+      "case": "tool_request",
+      "passed": true
+    },
+    {
+      "batch": "two_images",
+      "repeat": 0,
+      "case": "two_images",
+      "passed": true
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 0,
+      "case": "hierarchical_context",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "arithmetic",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "python",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "chinese",
+      "passed": true
+    },
+    {
+      "batch": "arithmetic",
+      "repeat": 1,
+      "case": "arithmetic",
+      "passed": true
+    },
+    {
+      "batch": "python",
+      "repeat": 1,
+      "case": "python",
+      "passed": true
+    },
+    {
+      "batch": "chinese",
+      "repeat": 1,
+      "case": "chinese",
+      "passed": true
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 1,
+      "case": "midturn_system",
+      "passed": true
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 1,
+      "case": "tool_request",
+      "passed": true
+    },
+    {
+      "batch": "two_images",
+      "repeat": 1,
+      "case": "two_images",
+      "passed": true
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 1,
+      "case": "hierarchical_context",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "arithmetic",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "python",
+      "passed": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "chinese",
+      "passed": true
+    }
+  ],
+  "rows": [
+    {
+      "batch": "arithmetic",
+      "case": "arithmetic",
+      "repeat": 0,
+      "tokens": 2,
+      "ttft_ms": 53.04718017578125,
+      "decode_ms_per_token": 26.019209006335586,
+      "batch_elapsed_ms": 79.19441303238273
+    },
+    {
+      "batch": "python",
+      "case": "python",
+      "repeat": 0,
+      "tokens": 14,
+      "ttft_ms": 61.2483024597168,
+      "decode_ms_per_token": 7.9892496936596356,
+      "batch_elapsed_ms": 165.4728520079516
+    },
+    {
+      "batch": "chinese",
+      "case": "chinese",
+      "repeat": 0,
+      "tokens": 8,
+      "ttft_ms": 58.879852294921875,
+      "decode_ms_per_token": 7.48721428681165,
+      "batch_elapsed_ms": 111.35880398796871
+    },
+    {
+      "batch": "midturn_system",
+      "case": "midturn_system",
+      "repeat": 0,
+      "tokens": 21,
+      "ttft_ms": 73.42219352722168,
+      "decode_ms_per_token": 12.036425300175324,
+      "batch_elapsed_ms": 314.25668101292104
+    },
+    {
+      "batch": "tool_request",
+      "case": "tool_request",
+      "repeat": 0,
+      "tokens": 48,
+      "ttft_ms": 389.0352249145508,
+      "decode_ms_per_token": 5.082253339462616,
+      "batch_elapsed_ms": 627.9559200047515
+    },
+    {
+      "batch": "two_images",
+      "case": "two_images",
+      "repeat": 0,
+      "tokens": 55,
+      "ttft_ms": 1090.8782482147217,
+      "decode_ms_per_token": 8.729770889557484,
+      "batch_elapsed_ms": 1562.0938829961233
+    },
+    {
+      "batch": "hierarchical_context",
+      "case": "hierarchical_context",
+      "repeat": 0,
+      "tokens": 2,
+      "ttft_ms": 13433.587789535522,
+      "decode_ms_per_token": 26.58420999068767,
+      "batch_elapsed_ms": 13460.223586007487
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "arithmetic",
+      "repeat": 0,
+      "tokens": 2,
+      "ttft_ms": 293.29848289489746,
+      "decode_ms_per_token": 50.95741001423448,
+      "batch_elapsed_ms": 431.23648897744715
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "python",
+      "repeat": 0,
+      "tokens": 14,
+      "ttft_ms": 293.0035591125488,
+      "decode_ms_per_token": 10.618833690666808,
+      "batch_elapsed_ms": 431.23648897744715
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "chinese",
+      "repeat": 0,
+      "tokens": 6,
+      "ttft_ms": 292.9093837738037,
+      "decode_ms_per_token": 10.191482002846897,
+      "batch_elapsed_ms": 431.23648897744715
+    },
+    {
+      "batch": "arithmetic",
+      "case": "arithmetic",
+      "repeat": 1,
+      "tokens": 2,
+      "ttft_ms": 48.29692840576172,
+      "decode_ms_per_token": 25.882807036396116,
+      "batch_elapsed_ms": 74.51474602567032
+    },
+    {
+      "batch": "python",
+      "case": "python",
+      "repeat": 1,
+      "tokens": 14,
+      "ttft_ms": 57.05904960632324,
+      "decode_ms_per_token": 7.987167690701496,
+      "batch_elapsed_ms": 160.92401096830145
+    },
+    {
+      "batch": "chinese",
+      "case": "chinese",
+      "repeat": 1,
+      "tokens": 8,
+      "ttft_ms": 52.77585983276367,
+      "decode_ms_per_token": 7.463315285609236,
+      "batch_elapsed_ms": 105.19599699182436
+    },
+    {
+      "batch": "midturn_system",
+      "case": "midturn_system",
+      "repeat": 1,
+      "tokens": 21,
+      "ttft_ms": 71.136474609375,
+      "decode_ms_per_token": 7.9908102517947555,
+      "batch_elapsed_ms": 230.94623401993886
+    },
+    {
+      "batch": "tool_request",
+      "case": "tool_request",
+      "repeat": 1,
+      "tokens": 48,
+      "ttft_ms": 274.55782890319824,
+      "decode_ms_per_token": 4.586156553024069,
+      "batch_elapsed_ms": 490.0549959857017
+    },
+    {
+      "batch": "two_images",
+      "case": "two_images",
+      "repeat": 1,
+      "tokens": 68,
+      "ttft_ms": 314.79525566101074,
+      "decode_ms_per_token": 7.978040059514122,
+      "batch_elapsed_ms": 849.428019952029
+    },
+    {
+      "batch": "hierarchical_context",
+      "case": "hierarchical_context",
+      "repeat": 1,
+      "tokens": 2,
+      "ttft_ms": 55.10854721069336,
+      "decode_ms_per_token": 25.724816019646823,
+      "batch_elapsed_ms": 80.91794699430466
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "arithmetic",
+      "repeat": 1,
+      "tokens": 2,
+      "ttft_ms": 289.7200584411621,
+      "decode_ms_per_token": 55.87098398245871,
+      "batch_elapsed_ms": 431.7445179913193
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "python",
+      "repeat": 1,
+      "tokens": 14,
+      "ttft_ms": 289.5047664642334,
+      "decode_ms_per_token": 10.941219847434414,
+      "batch_elapsed_ms": 431.7445179913193
+    },
+    {
+      "batch": "mixed_text_batch",
+      "case": "chinese",
+      "repeat": 1,
+      "tokens": 6,
+      "ttft_ms": 289.43824768066406,
+      "decode_ms_per_token": 11.174196796491742,
+      "batch_elapsed_ms": 431.7445179913193
+    }
+  ],
+  "definitions": {
+    "ttft_ms": "RequestMetrics.first_token_latency *1000",
+    "decode_ms_per_token": "(last_token_ts-first_token_ts)*1000/(num_generation_tokens-1); terminal tokens included"
+  },
+  "limitations": [
+    "Two repetitions of the recorded suite, not a statistical throughput guarantee.",
+    "Repeat1 follows the same requests and may benefit from prefix caching.",
+    "No comparison or claimed speedup against TP8 or differing-output-length runs."
+  ],
+  "raw_output": "artifact://425",
+  "gpu_samples": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/tp4_gpu_profile.csv",
+  "process_samples": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/tp4_gpu_processes.csv",
+  "observed_gpu_processes": {
+    "3184570": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP1_EP1"
+    ],
+    "3184571": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP2_EP2"
+    ],
+    "3184572": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP3_EP3"
+    ],
+    "3184569": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP0_EP0"
+    ],
+    "3321871": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP1_EP1"
+    ],
+    "3321876": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP2_EP2"
+    ],
+    "3321870": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP0_EP0"
+    ],
+    "3321877": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP3_EP3"
+    ],
+    "3406289": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP3_EP3"
+    ],
+    "3406287": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP1_EP1"
+    ],
+    "3406288": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP2_EP2"
+    ],
+    "3406286": [
+      "VLLM::Worker",
+      "VLLM::Worker_TP0_EP0"
+    ]
+  },
+  "unexpected_gpu_processes": {},
+  "process_isolation": "Every recorded process belonged to the three known TP4 attempts; no external GPU process was observed."
+}

@@ -1,0 +1,826 @@
+{
+  "schema_version": 1,
+  "accounting": "Recorded qualification/diagnostic invocations, including failed attempts and reruns; research reads excluded.",
+  "maximum": 1000,
+  "completed": 130,
+  "attempts": [
+    {
+      "number": 1,
+      "attempt": "editable_install_and_compatibility",
+      "exit_status": 0,
+      "observed_result": "13 tests and import identity passed"
+    },
+    {
+      "number": 2,
+      "attempt": "block_fp8_initial",
+      "exit_status": 1,
+      "observed_result": "4 cases passed; cancellation-sensitive ULP oracle failed"
+    },
+    {
+      "number": 3,
+      "attempt": "lagged_mhc_initial",
+      "exit_status": 1,
+      "observed_result": "CuTe unstable branch variable"
+    },
+    {
+      "number": 4,
+      "attempt": "routing_initial",
+      "exit_status": 2,
+      "observed_result": "Blocked by expert custom-op 65-argument schema"
+    },
+    {
+      "number": 5,
+      "attempt": "v41_cache_writers",
+      "exit_status": 0,
+      "observed_result": "10 passed"
+    },
+    {
+      "number": 6,
+      "attempt": "v41_compressed_attention",
+      "exit_status": 0,
+      "observed_result": "14 passed"
+    },
+    {
+      "number": 7,
+      "attempt": "v41_experts_initial",
+      "exit_status": 1,
+      "observed_result": "Custom-op schema exceeded pinned 64-argument limit"
+    },
+    {
+      "number": 8,
+      "attempt": "engram_gate_and_ordinary_norm",
+      "exit_status": 0,
+      "observed_result": "5 passed"
+    },
+    {
+      "number": 9,
+      "attempt": "mxfp4_indexer",
+      "exit_status": 0,
+      "observed_result": "4 passed"
+    },
+    {
+      "number": 10,
+      "attempt": "published_reference_gpu_probe_initial",
+      "exit_status": 1,
+      "observed_result": "Probe omitted required default BF16 dtype"
+    },
+    {
+      "number": 11,
+      "attempt": "lagged_mhc_after_reduction_fix",
+      "exit_status": 1,
+      "observed_result": "6 passed; TF32 projection precision mismatch"
+    },
+    {
+      "number": 12,
+      "attempt": "experts_after_schema_fix",
+      "exit_status": 1,
+      "observed_result": "Minimal oracle passed; 4 production-geometry outputs rejected"
+    },
+    {
+      "number": 13,
+      "attempt": "routing_after_schema_fix",
+      "exit_status": 0,
+      "observed_result": "10 passed"
+    },
+    {
+      "number": 14,
+      "attempt": "block_fp8_operand_diagnostic",
+      "exit_status": 0,
+      "observed_result": "All operand/scale bytes exact; 4 near-zero accumulation-order differences"
+    },
+    {
+      "number": 15,
+      "attempt": "published_reference_gpu_probe_corrected",
+      "exit_status": 0,
+      "observed_result": "FP8 GEMM, FP4 GEMM, sparse attention passed"
+    },
+    {
+      "number": 16,
+      "attempt": "csa2_compression",
+      "exit_status": 0,
+      "observed_result": "5 passed"
+    },
+    {
+      "number": 17,
+      "attempt": "engram_lookup_initial",
+      "exit_status": 1,
+      "observed_result": "Scratch alignment mismatch"
+    },
+    {
+      "number": 18,
+      "attempt": "explicit_uncovered_policy_contract",
+      "exit_status": 0,
+      "observed_result": "23 passed"
+    },
+    {
+      "number": 19,
+      "attempt": "engram_after_alignment_fix",
+      "exit_status": 1,
+      "observed_result": "3 passed; masked FP8 load literal dtype failed"
+    },
+    {
+      "number": 20,
+      "attempt": "mhc_after_compensated_projection",
+      "exit_status": 0,
+      "observed_result": "7 passed"
+    },
+    {
+      "number": 21,
+      "attempt": "block_fp8_forward_error_oracle",
+      "exit_status": 0,
+      "observed_result": "16 passed"
+    },
+    {
+      "number": 22,
+      "attempt": "expert_stage_diagnostic",
+      "exit_status": 0,
+      "observed_result": "Localized FC2 accumulation and mid-activation differences"
+    },
+    {
+      "number": 23,
+      "attempt": "engram_after_fp8_mask_fix",
+      "exit_status": 0,
+      "observed_result": "6 passed"
+    },
+    {
+      "number": 24,
+      "attempt": "experts_after_k32_accumulation_fix",
+      "exit_status": 1,
+      "observed_result": "1 production-geometry value rejected"
+    },
+    {
+      "number": 25,
+      "attempt": "native_unquantized_projection_smoke",
+      "exit_status": 0,
+      "observed_result": "Live rows 1 through 17 passed with one compiled geometry"
+    },
+    {
+      "number": 26,
+      "attempt": "mhc_lagged_and_collapse",
+      "exit_status": 0,
+      "observed_result": "10 passed"
+    },
+    {
+      "number": 27,
+      "attempt": "residual_stateless_and_fp32_norm",
+      "exit_status": 0,
+      "observed_result": "5 passed"
+    },
+    {
+      "number": 28,
+      "attempt": "vision_helpers_initial",
+      "exit_status": 1,
+      "observed_result": "NaN in valid outputs from invalid V tail consumption"
+    },
+    {
+      "number": 29,
+      "attempt": "expert_published_gpu_comparison",
+      "exit_status": 0,
+      "observed_result": "FC2 exact against published GPU; localized remaining mid activation discrepancy"
+    },
+    {
+      "number": 30,
+      "attempt": "preliminary_suite_freeze",
+      "exit_status": 0,
+      "observed_result": "Six-case provisional suite, before any generation"
+    },
+    {
+      "number": 31,
+      "attempt": "native_unquantized_projection_regressions",
+      "exit_status": 0,
+      "observed_result": "30 passed"
+    },
+    {
+      "number": 32,
+      "attempt": "final_suite_freeze",
+      "exit_status": 0,
+      "observed_result": "Seven cases and mixed batch; EOS termination included in contract"
+    },
+    {
+      "number": 33,
+      "attempt": "experts_after_precise_silu",
+      "exit_status": 1,
+      "observed_result": "Eager counts passed; changed graph routes failed"
+    },
+    {
+      "number": 34,
+      "attempt": "vision_helpers_after_tail_mask_fix",
+      "exit_status": 0,
+      "observed_result": "4 passed"
+    },
+    {
+      "number": 35,
+      "attempt": "engine_configuration_smoke",
+      "exit_status": 0,
+      "observed_result": "Real TP8 b12x engine configuration resolved"
+    },
+    {
+      "number": 36,
+      "attempt": "model_import_smoke",
+      "exit_status": 0,
+      "observed_result": "V4.1 target/draft/config/state/backend imports passed"
+    },
+    {
+      "number": 37,
+      "attempt": "small_native_vision_tower",
+      "exit_status": 0,
+      "observed_result": "1 seeded block/aligner/graph test passed"
+    },
+    {
+      "number": 38,
+      "attempt": "incomplete_result_rejection",
+      "exit_status": 1,
+      "observed_result": "Expected rejection of deliberately incomplete verifier fixture"
+    },
+    {
+      "number": 39,
+      "attempt": "published_tp8_conversion",
+      "exit_status": 0,
+      "observed_result": "All 48 original shards converted into 8 rank files"
+    },
+    {
+      "number": 40,
+      "attempt": "full_published_reference",
+      "exit_status": 0,
+      "observed_result": "All 8 batches and 10 case executions completed"
+    },
+    {
+      "number": 41,
+      "attempt": "native_vllm_first_start",
+      "exit_status": 1,
+      "observed_result": "CUDA_HOME default did not match installed /opt/cuda"
+    },
+    {
+      "number": 42,
+      "attempt": "framework_config_and_circular_state",
+      "exit_status": 0,
+      "observed_result": "2 passed"
+    },
+    {
+      "number": 43,
+      "attempt": "expert_graph_mutation_diagnostic",
+      "exit_status": 0,
+      "observed_result": "Eager correct; graph has stale input scale bytes"
+    },
+    {
+      "number": 44,
+      "attempt": "policy_corpus_initial",
+      "exit_status": 1,
+      "observed_result": "22 passed; incidental global hidden-size inventory assertion"
+    },
+    {
+      "number": 45,
+      "attempt": "native_loader_cuda_home_smoke",
+      "exit_status": 0,
+      "observed_result": "Native loader ABI1 built and loaded with CUDA_HOME=/opt/cuda"
+    },
+    {
+      "number": 46,
+      "attempt": "native_vllm_cuda_home_retry",
+      "exit_status": 1,
+      "observed_result": "GB10-specific weight loader rejected discrete GPU without host page tables"
+    },
+    {
+      "number": 47,
+      "attempt": "policy_corpus_inventory_retry",
+      "exit_status": 1,
+      "observed_result": "31 passed; incidental fixed geometry count blocked legitimate corpus extension"
+    },
+    {
+      "number": 48,
+      "attempt": "python_frontend_reference_encoding",
+      "exit_status": 0,
+      "observed_result": "All seven frozen encoded prompts matched the real Python frontend exactly"
+    },
+    {
+      "number": 49,
+      "attempt": "native_attention_preparation_smoke",
+      "exit_status": 0,
+      "observed_result": "Forward/inverse/group-first RoPE, negative positions, casts, index weights, frozen graph passed"
+    },
+    {
+      "number": 50,
+      "attempt": "policy_corpus_uncovered_recipe_check",
+      "exit_status": 1,
+      "observed_result": "36 passed; test incorrectly required preplanned evidence for unmeasured V4.1 recipe"
+    },
+    {
+      "number": 51,
+      "attempt": "expert_barrier_fix_regression",
+      "exit_status": 1,
+      "observed_result": "Main 48/top6 graph transition passed; DSpark whole-K oracle mismatch remained"
+    },
+    {
+      "number": 52,
+      "attempt": "dspark_published_gpu_diagnostic",
+      "exit_status": 0,
+      "observed_result": "All mid payload/scales and FC2 outputs matched actual published GPU kernel; whole-K oracle was wrong"
+    },
+    {
+      "number": 53,
+      "attempt": "expert_reference_ordered_final",
+      "exit_status": 0,
+      "observed_result": "All three numerical and frozen graph expert regressions passed"
+    },
+    {
+      "number": 54,
+      "attempt": "policy_coverage_precedence_retry",
+      "exit_status": 1,
+      "observed_result": "62 passed; default W4A8 test selected new V4.1 recipe by accidental ordering"
+    },
+    {
+      "number": 55,
+      "attempt": "policy_legacy_dynamic_eligibility",
+      "exit_status": 1,
+      "observed_result": "66 passed; second legacy recipe selector picked V4.1 by ordering"
+    },
+    {
+      "number": 56,
+      "attempt": "native_fast_gpu_checkpoint_staging",
+      "exit_status": 1,
+      "observed_result": "OOM during sorted GPU payload materialization before loading consumption"
+    },
+    {
+      "number": 57,
+      "attempt": "policy_raw_encoded_query_schema",
+      "exit_status": 1,
+      "observed_result": "71 passed; synthetic query fixture omitted numerical_recipe"
+    },
+    {
+      "number": 58,
+      "attempt": "registered_v41_target_and_draft",
+      "exit_status": 0,
+      "observed_result": "Both registry import tests passed"
+    },
+    {
+      "number": 59,
+      "attempt": "policy_query_schema_final",
+      "exit_status": 0,
+      "observed_result": "132 policy/catalog/corpus/generator checks passed"
+    },
+    {
+      "number": 60,
+      "attempt": "native_streamed_checkpoint_postload",
+      "exit_status": 1,
+      "observed_result": "Checkpoint loaded without OOM; WO-A FP8 masked-load literal failed"
+    },
+    {
+      "number": 61,
+      "attempt": "wo_a_native_unpack_smoke",
+      "exit_status": 0,
+      "observed_result": "Native checkpoint conversion exactly matched independent block32 scale oracle"
+    },
+    {
+      "number": 62,
+      "attempt": "native_first_profiling_forward",
+      "exit_status": 1,
+      "observed_result": "Checkpoint and postprocessing completed; block32 output needed [M,N,1] view"
+    },
+    {
+      "number": 63,
+      "attempt": "legacy_residual_regressions",
+      "exit_status": 0,
+      "observed_result": "110 passed, 1 existing skip"
+    },
+    {
+      "number": 64,
+      "attempt": "legacy_contiguous_regressions",
+      "exit_status": 0,
+      "observed_result": "32 passed"
+    },
+    {
+      "number": 65,
+      "attempt": "legacy_compressed_regressions",
+      "exit_status": 0,
+      "observed_result": "136 passed"
+    },
+    {
+      "number": 66,
+      "attempt": "legacy_block_fp8_regressions",
+      "exit_status": 1,
+      "observed_result": "75 passed before obsolete mocked forwarding fixture"
+    },
+    {
+      "number": 67,
+      "attempt": "legacy_w4a8_regressions",
+      "exit_status": 1,
+      "observed_result": "72 passed, 5 skips before incomplete-binding error fixture"
+    },
+    {
+      "number": 68,
+      "attempt": "root_registry_initial",
+      "exit_status": 1,
+      "observed_result": "Missing two new root operation registrations found"
+    },
+    {
+      "number": 69,
+      "attempt": "root_registry_completed",
+      "exit_status": 0,
+      "observed_result": "13 passed after authoritative inventory update"
+    },
+    {
+      "number": 70,
+      "attempt": "projection_remaining_regressions",
+      "exit_status": 0,
+      "observed_result": "31 passed"
+    },
+    {
+      "number": 71,
+      "attempt": "sparse_moe_api_completed",
+      "exit_status": 0,
+      "observed_result": "21 passed with public planning-boundary regression"
+    },
+    {
+      "number": 72,
+      "attempt": "vllm_block32_adapter_real_gpu",
+      "exit_status": 0,
+      "observed_result": "2D/3D output-view and frozen CUDA-graph replay regressions passed; 2 cases"
+    },
+    {
+      "number": 73,
+      "attempt": "native_profiling_after_block32_view",
+      "exit_status": 1,
+      "observed_result": "Checkpoint load, postprocessing and initial profiling forward passed; heterogeneous KV pages required block-outermost layout declaration"
+    },
+    {
+      "number": 74,
+      "attempt": "mixed_cache_allocator_roundtrip",
+      "exit_status": 0,
+      "observed_result": "14 contiguous packing checks passed, including V4.1 BLHNC mixed-page alignment."
+    },
+    {
+      "number": 75,
+      "attempt": "native_tp8_initial_suite",
+      "exit_status": 0,
+      "observed_result": "Full native TP8 run completed both suite repeats; 19 of 20 exact greedy comparisons failed, and vision compiled after initialization.",
+      "raw_output": "artifact://189"
+    },
+    {
+      "number": 76,
+      "attempt": "v41_vision_postload_warmup",
+      "exit_status": 0,
+      "observed_result": "Single-patch warmup followed by larger images under frozen kernel resolution passed; 1 GPU oracle."
+    },
+    {
+      "number": 77,
+      "attempt": "v41_expert_loader_gate_order_reproduction",
+      "exit_status": 1,
+      "observed_result": "Actual inherited weight loader and native expert execution mismatched all 768 outputs; maximum absolute error 0.6328125.",
+      "raw_output": "artifact://194"
+    },
+    {
+      "number": 78,
+      "attempt": "v41_expert_loader_gate_order_fixed",
+      "exit_status": 0,
+      "observed_result": "Correct gate-first w31 declaration passes exact expert output and mutated-input CUDA-graph replay; 1 GPU regression."
+    },
+    {
+      "number": 79,
+      "attempt": "native_tp8_gate_order_and_vision_warmup",
+      "exit_status": 0,
+      "observed_result": "Completed all 20 outputs and graph capture. Exact comparator improved to 14/20; midturn system, images, and mixed Chinese fail in both repeats. No post-init JIT warning.",
+      "raw_output": "artifact://200"
+    },
+    {
+      "number": 80,
+      "attempt": "reference_midturn_layer_capture",
+      "exit_status": 0,
+      "observed_result": "Captured all attention/FFN/Engram/final-norm states on rank0; reference tokens still equal the frozen midturn oracle."
+    },
+    {
+      "number": 81,
+      "attempt": "native_layer_capture_rpc_serialization",
+      "exit_status": 1,
+      "observed_result": "Local callable RPC needs explicitly enabled trusted pickle serialization; model loaded, capture did not start.",
+      "raw_output": "artifact://210"
+    },
+    {
+      "number": 82,
+      "attempt": "frozen_image_pixel_comparison",
+      "exit_status": 0,
+      "observed_result": "Both real image patch tensors are bit-exact: grids51x74 and33x47, BF16 patch shapes3774x3x14x14 and1551x3x14x14."
+    },
+    {
+      "number": 83,
+      "attempt": "native_layer_capture_nested_pickle",
+      "exit_status": 1,
+      "observed_result": "apply_model callable argument cannot survive standard pickle in worker queue; switched diagnostic to callable collective_rpc method dispatch.",
+      "raw_output": "artifact://212"
+    },
+    {
+      "number": 84,
+      "attempt": "native_embedding_and_registry_gpu",
+      "exit_status": 0,
+      "observed_result": "22 passed; exact BF16/FP32 lookup, both ID widths, frozen live counts/replay, invalid-ID isolated errors, high Int64 offsets, operation registry."
+    },
+    {
+      "number": 85,
+      "attempt": "native_carry_fixture_topology",
+      "exit_status": 1,
+      "observed_result": "New direct-module fixture lacked single-rank parameter topology; corrected fixture without mocking compute.",
+      "raw_output": "artifact://217"
+    },
+    {
+      "number": 86,
+      "attempt": "native_carry_fixture_capacity",
+      "exit_status": 1,
+      "observed_result": "New direct-module fixture lacked engine norm capacity; reused existing explicit-capacity fixture convention.",
+      "raw_output": "artifact://219"
+    },
+    {
+      "number": 87,
+      "attempt": "native_carry_and_mixed_allocator",
+      "exit_status": 0,
+      "observed_result": "15 passed: real native rejected-suffix/accepted-boundary transitions, reorder, PAD/null pages, empty replay and mixed-cache allocator checks."
+    },
+    {
+      "number": 88,
+      "attempt": "real_checkpoint_dense_numerics_probe",
+      "exit_status": 0,
+      "observed_result": "Captured real L0 inputs have exact FP8 quantization; fused WQA/WKV output differs from published TileLang in5/37632 BF16 elements, max_abs0.000244140625. Diagnostic only; no tolerance changed."
+    },
+    {
+      "number": 89,
+      "attempt": "native_carry_high_pool_graph",
+      "exit_status": 0,
+      "observed_result": "Real compressor graph replay with physical partial-state rows beyond Int32 element offsets matches accepted-only execution exactly; 1 passed."
+    },
+    {
+      "number": 90,
+      "attempt": "native_eager_after_paged_carry",
+      "exit_status": 1,
+      "observed_result": "Model post-load succeeded; runtime cache-group planning asserted because opaque full MLA caches have different logical block sizes.",
+      "raw_output": "artifact://225"
+    },
+    {
+      "number": 91,
+      "attempt": "opaque_mla_grouping_reproduction",
+      "exit_status": 1,
+      "observed_result": "Updated CPU allocator regression exercises real cache-group planning and reproduces the same assertion.",
+      "raw_output": "artifact://228"
+    },
+    {
+      "number": 92,
+      "attempt": "opaque_mla_grouping_fixture_capacity",
+      "exit_status": 1,
+      "observed_result": "Weighted planner selected after source fix; fixture required actual max_in_flight_tokens, now explicitly1024.",
+      "raw_output": "artifact://231"
+    },
+    {
+      "number": 93,
+      "attempt": "opaque_mla_grouping_and_legacy_allocator",
+      "exit_status": 0,
+      "observed_result": "118 allocator/cache-group tests passed, including native mixed opaque/paged partial states and existing legacy allocation contracts."
+    },
+    {
+      "number": 94,
+      "attempt": "native_midturn_layer_capture",
+      "exit_status": 0,
+      "observed_result": "Callable worker RPC captured83 real stages. Native eager midturn still differs at token13 (478 vs320). Last prompt-token layer0 attention input exact; output relativeL2 0.00659884, final normalized relativeL2 0.16638.",
+      "raw_output": "artifact://236"
+    },
+    {
+      "number": 95,
+      "attempt": "reference_midturn_attention_details",
+      "exit_status": 0,
+      "observed_result": "Full-tensor reference query/KV/raw-attention and projection/norm capture completed; frozen reference output unchanged."
+    },
+    {
+      "number": 96,
+      "attempt": "native_attention_substage_capture",
+      "exit_status": 0,
+      "observed_result": "Captured89 stages on the real TP8 model; decoded SWA KV is bit-exact and the major prefill discrepancy occurs in WO-A.",
+      "raw_output": "artifact://242"
+    },
+    {
+      "number": 97,
+      "attempt": "woa_precision_characterization",
+      "exit_status": 0,
+      "observed_result": "Weights and inverse RoPE exact; native FP32 accumulation versus reference BF16 split-K reduction characterized. Historical diagnostic, not current acceptance."
+    },
+    {
+      "number": 98,
+      "attempt": "woa_cupti_reduction_profile",
+      "exit_status": 0,
+      "observed_result": "Observed16 BF16 partials for44-row WO-A;3-row path usesFP32 partials and1-row GEMV does not use reduced partials."
+    },
+    {
+      "number": 99,
+      "attempt": "woa_split_reduction_oracle",
+      "exit_status": 0,
+      "observed_result": "K256 BF16 partials reproduce reference within4/45056 output values. No production emulation retained."
+    },
+    {
+      "number": 100,
+      "attempt": "dspark_initial_shared_head",
+      "exit_status": 1,
+      "observed_result": "Target loaded; unused draft vocabulary head remained on meta and failed native precompile.",
+      "raw_output": "artifact://251"
+    },
+    {
+      "number": 101,
+      "attempt": "dspark_target_owned_vocab_binding",
+      "exit_status": 0,
+      "observed_result": "Both existing suite repeats completed; native target embedding/head aliasing retained; observed84/150 accepted drafts in a logging window.",
+      "raw_output": "artifact://253"
+    },
+    {
+      "number": 102,
+      "attempt": "fixed_tile_draft_metadata",
+      "exit_status": 0,
+      "observed_result": "3 existing draft input preparation GPU checks passed after removing live-length-derived constexpr tile."
+    },
+    {
+      "number": 103,
+      "attempt": "nsight_external_profile",
+      "exit_status": null,
+      "observed_result": "Stopped stalled Nsight launch before model initialization; switched to worker-local Torch/CUPTI profiling."
+    },
+    {
+      "number": 104,
+      "attempt": "adaptive_torch_profile_baseline",
+      "exit_status": 0,
+      "observed_result": "All20 complete-response cases passed;8 workers frozen, no lateJIT errors;96 draft proposals,259/480 proposed tokens accepted; collected8 CUPTI traces.",
+      "raw_output": "artifact://267"
+    },
+    {
+      "number": 105,
+      "attempt": "unprofiled_serving_baseline",
+      "exit_status": 0,
+      "observed_result": "Completed representative workload with request latency metrics before numerical-promotion removal.",
+      "raw_output": "artifact://273"
+    },
+    {
+      "number": 106,
+      "attempt": "bf16_wob_transport",
+      "exit_status": 0,
+      "observed_result": "Removed WO-B FP32 transport/scratch; full20-case serving completed with coherent responses.",
+      "raw_output": "artifact://279"
+    },
+    {
+      "number": 107,
+      "attempt": "pcie_oneshot_512k_trial",
+      "exit_status": 0,
+      "observed_result": "Full20-case serving completed but short-request latency worsened versus64KB;512KB crossover rejected.",
+      "raw_output": "artifact://282"
+    },
+    {
+      "number": 108,
+      "attempt": "native_precision_focused_gpu",
+      "exit_status": 0,
+      "observed_result": "4 vision/compressor/block32 GPU checks passed after reverting BF16 checkpoint parameter promotions.",
+      "raw_output": "artifact://287"
+    },
+    {
+      "number": 109,
+      "attempt": "expert_bf16_output_gpu",
+      "exit_status": 0,
+      "observed_result": "Existing expert rounding/router placement regression passed, including BF16 caller output."
+    },
+    {
+      "number": 110,
+      "attempt": "native_precision_full_serving",
+      "exit_status": 0,
+      "observed_result": "All20 representative cases completed coherently with no corrupted-logit flags. Identified missing raw-BF16 sampler warmup specializations.",
+      "raw_output": "artifact://290"
+    },
+    {
+      "number": 111,
+      "attempt": "raw_and_processed_sampler_warmup",
+      "exit_status": 0,
+      "observed_result": "28 warmup lifecycle/block reservation checks passed; both actual sampling paths now warmed."
+    },
+    {
+      "number": 112,
+      "attempt": "native_precision_frozen_profile",
+      "exit_status": 0,
+      "observed_result": "20 complete responses; all8 workers frozen with zero compile misses;8 complete CUPTI traces.",
+      "raw_output": "artifact://302"
+    },
+    {
+      "number": 113,
+      "attempt": "prepared_dma_graph_tp8",
+      "exit_status": 0,
+      "observed_result": "GPU TP8 oracle passed changing live sizes, retained outputs and outer capture."
+    },
+    {
+      "number": 114,
+      "attempt": "prepared_dma_full_serving",
+      "exit_status": 0,
+      "observed_result": "20 complete responses; performance claim withheld because concurrent GPU5 tuning was observed.",
+      "raw_output": "artifact://312"
+    },
+    {
+      "number": 115,
+      "attempt": "speculative_attention_decode_metadata",
+      "exit_status": 0,
+      "observed_result": "15 compressor/page-ownership checks passed after scheduler decode classification was propagated."
+    },
+    {
+      "number": 116,
+      "attempt": "attention_mode_cupti_comparison",
+      "exit_status": 0,
+      "observed_result": "Decode and extend passed unchanged oracle tolerances at1/5/6/24/64 rows; recorded cold-L2 CUPTI samples.",
+      "raw_output": "attention_mode_benchmark.json"
+    },
+    {
+      "number": 117,
+      "attempt": "final_wheel_build",
+      "exit_status": 0,
+      "observed_result": "Built wheel;430 sources/resources byte-match checkout;both import orders, shared freeze state and CLI/plugin discovery passed.",
+      "raw_output": "package_verification.json"
+    },
+    {
+      "number": 118,
+      "attempt": "final_package_compatibility",
+      "exit_status": 0,
+      "observed_result": "13 compatibility and registry tests passed.",
+      "raw_output": "package_verification.json"
+    },
+    {
+      "number": 119,
+      "attempt": "final_speculative_dispatch_trace",
+      "exit_status": 0,
+      "observed_result": "20 complete responses; zero compile/cache misses on8 workers;240/440 drafts accepted;2115 graph launches per worker.",
+      "raw_output": "artifact://339"
+    },
+    {
+      "number": 120,
+      "attempt": "final_speculative_dispatch_unprofiled",
+      "exit_status": 0,
+      "observed_result": "Isolated TP8 run completed20 representative cases; no late JIT errors.",
+      "raw_output": "artifact://349"
+    },
+    {
+      "number": 121,
+      "attempt": "bounded_prefill_gpu_and_cupti",
+      "exit_status": 0,
+      "observed_result": "13 V4.1 GPU cases passed; planned extend uses existing split kernel at64 rows,124.45us indexed versus prior236.34us.",
+      "raw_output": "attention_prefill_policy_benchmark.json"
+    },
+    {
+      "number": 122,
+      "attempt": "legacy_mapped_recipe_regression",
+      "exit_status": 1,
+      "observed_result": "123 passed before old V4 mapped-page rejection guard failed. Restricted new mapped page support to V4.1; kept V4 tests.",
+      "raw_output": "artifact://360"
+    },
+    {
+      "number": 123,
+      "attempt": "legacy_unused_cache_regression",
+      "exit_status": 1,
+      "observed_result": "125 passed before empty unused SWA cache was rejected. Restored empty cache support only when its index width is zero.",
+      "raw_output": "artifact://366"
+    },
+    {
+      "number": 124,
+      "attempt": "tp4_shared_io_native_tests",
+      "exit_status": 0,
+      "observed_result": "57 native reader, PLE and Engram checks passed, including compact rows, graph consumers and high IDs.",
+      "raw_output": "tp4_ssd_progress.json"
+    },
+    {
+      "number": 125,
+      "attempt": "tp4_e8m0_metadata_initial",
+      "exit_status": 1,
+      "observed_result": "Metadata-only loader omitted F8_E8M0; fixed with local dtype-map extension.",
+      "raw_output": "artifact://405"
+    },
+    {
+      "number": 126,
+      "attempt": "tp4_ssd_integration_tests",
+      "exit_status": 0,
+      "observed_result": "11 serving preparation and descriptor-loading checks passed.",
+      "raw_output": "tp4_ssd_progress.json"
+    },
+    {
+      "number": 127,
+      "attempt": "tp4_ssd_initial_memory_budget",
+      "exit_status": 1,
+      "observed_result": "Model loaded and graphs captured;85% budget left-9.89GiB for KV.",
+      "raw_output": "artifact://415"
+    },
+    {
+      "number": 128,
+      "attempt": "tp4_ssd_full_frozen_qualification",
+      "exit_status": 0,
+      "observed_result": "20 responses passed;4 workers frozen;zero compile/cache misses;actual io_uring reads and no resident table parameters.",
+      "raw_output": "artifact://418"
+    },
+    {
+      "number": 129,
+      "attempt": "tp4_ssd_interactive_latency",
+      "exit_status": 0,
+      "observed_result": "20 complete-response cases passed with unprofiled TTFT/per-output-token measurements.",
+      "raw_output": "artifact://425"
+    },
+    {
+      "number": 130,
+      "attempt": "tp4_ssd_final_wheel",
+      "exit_status": 0,
+      "observed_result": "431 sources/resources match;both import orders and shared state pass;actual wheel io_uring and graph consumption pass.",
+      "raw_output": "package_verification.json"
+    }
+  ],
+  "in_progress": []
+}

@@ -26,10 +26,12 @@ class SparseMlaQuery:
     indexed_width: int
     indexed_page_size: int
     query_rows: int
+    cache_format: str = "deepseek_v4"
 
     def profile_fields(self) -> dict[str, object]:
         return {
             "layout": self.layout,
+            "cache_format": self.cache_format,
             "mode": self.mode,
             "q_dtype": self.q_dtype,
             "kv_dtype": self.kv_dtype,
@@ -66,7 +68,8 @@ def _heuristic(
 ) -> SparseMlaConfig:
     capability = None if device is None else device.compute_capability
     uses_single_pass = query.mode != "decode" or (
-        capability == (12, 1)
+        query.cache_format == "deepseek_v4"
+        and capability == (12, 1)
         and query.query_rows >= 16
         and query.num_q_heads == 32
         and query.swa_page_size == 64
@@ -86,11 +89,12 @@ def _validate(
 
 COMPRESSED_SPARSE_MLA_POLICY = ComponentPolicy(
     component_id=COMPRESSED_SPARSE_MLA_ATTENTION,
-    query_schema_version=1,
+    query_schema_version=2,
     config_schema_version=1,
     query_fields=frozenset(
         {
             "layout",
+            "cache_format",
             "mode",
             "q_dtype",
             "kv_dtype",

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "status": "reference_complete",
+  "reference_revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+  "suite_sha256": "2147c5cd925815a00ea710c37d6fd586bbeed8c6dd72b9c55fe143582203a124",
+  "batches": 8,
+  "case_executions": 10,
+  "runtime_seconds": 130.47,
+  "native_vllm_qualified": false,
+  "reference_batch_sensitivity": {
+    "observed": true,
+    "case": "chinese",
+    "singleton": "中国的首都是北京。",
+    "mixed_text_batch": "中国的首都是**北京**。",
+    "decision": "Keep recorded batch-specific goldens. Do not change the frozen suite or silently relax exact parity."
+  },
+  "native_kernel_passes": {
+    "cache_writers": 10,
+    "compressed_attention": 14,
+    "hierarchical_indexer": 4,
+    "sqrtsoftplus_routing": 10,
+    "block_fp8_and_quantization": 16,
+    "engram_hash_lookup": 6,
+    "engram_gate_ordinary_norm": 5,
+    "csa_compression": 5,
+    "mhc_lagged_and_collapse": 10,
+    "residual_auxiliaries_fp32_norm": 5,
+    "generic_unquantized_projection": 30,
+    "vision_helpers": 4,
+    "small_vision_tower": 1
+  },
+  "remaining_kernel_issue": {
+    "component": "moe",
+    "state": "eager production geometry passed after numerical fixes; mutated graph routes still fail",
+    "evidence": "artifact://107"
+  },
+  "framework_smoke": {
+    "model_imports": 0,
+    "engine_configuration": 0
+  }
+}

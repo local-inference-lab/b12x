@@ -1,12 +1,10 @@
-"""BF16 small-N GEMV for narrow projections (e.g. GDN in_proj_ba) where a
-full GEMM tile wastes the CTA.
+"""Native unquantized GEMV-style projections with BF16/FP32 operands.
 
-``mm`` runs ``y = x @ weight.T`` for bf16 ``x (m, K)`` / ``weight (N, K)``
-through an opaque torch custom op (``b12x::bf16_gemv_small_n``), so it
-is torch.compile- and CUDA-graph-safe; shapes the kernel does not cover fall
-back to cuBLAS inside the op.  ``precompile`` compiles and warm-runs every
-decode-m variant for a weight's shape at load time so the hot path never
-JITs or lazily loads a module mid-capture.
+``mm`` runs ``y = x @ weight.T + bias`` through opaque torch custom ops.
+FP32 accumulation and bias addition happen before the final BF16/FP32 cast.
+Caller-owned ``out`` avoids allocation; live rows and input strides reuse
+one geometry/type specialization. ``precompile`` compiles and warm-runs that
+specialization before CUDA graph capture. There is no cuBLAS fallback.
 
 Example:
     from b12x.gemm import bf16_gemv
@@ -35,7 +33,7 @@ META = OpMeta(
         "SMALL_N_GEMV_MAX_OUT",
         "SMALL_N_GEMV_MIN_IN",
     ),
-    dtypes=("bf16",),
+    dtypes=("bf16", "fp32"),
     provenance=Provenance(
         repo="https://github.com/phaelon74/b12x",
         commit="9c78d553",

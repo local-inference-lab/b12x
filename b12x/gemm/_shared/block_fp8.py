@@ -70,9 +70,8 @@ class BlockFP8LinearBinding:
     x_q: MXFP8Rows
     output: torch.Tensor
     bias: torch.Tensor | None = None
-    # DeepGEMM-style regime hint forwarded to dense_gemm (decode vs prefill tile).
-    # None keeps the M-independent default; set it at bind time so the warmed
-    # kernel matches the regime this binding serves.
+    # Fixed row bound forwarded to dense_gemm for decode/prefill specialization.
+    # Plan.bind defaults it to scratch capacity; an explicit value takes precedence.
     expected_m: int | None = None
     mma_tiler_mn: tuple[int, int] | None = None
 
@@ -87,6 +86,7 @@ class BlockFP8LinearScratchCaps:
     in_features: int
     out_features: int
     output_dtype: torch.dtype = torch.bfloat16
+    block_size: tuple[int, int] = (128, 128)
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -97,6 +97,7 @@ class BlockFP8LinearScratchCaps:
         object.__setattr__(self, "in_features", max(int(self.in_features), 1))
         object.__setattr__(self, "out_features", max(int(self.out_features), 1))
         _check_mxfp8_k(self.in_features)
+        object.__setattr__(self, "block_size", _check_block_size(self.block_size))
         if self.output_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"output_dtype must be bf16/fp16, got {self.output_dtype}")
 
@@ -139,6 +140,11 @@ class BlockFP8LinearScratchPlan:
                 "packed weight out_features "
                 f"{packed_weight.out_features} does not match scratch out_features={self.caps.out_features}"
             )
+        if packed_weight.block_size != self.caps.block_size:
+            raise ValueError(
+                f"packed weight block_size={packed_weight.block_size} does not match "
+                f"scratch block_size={self.caps.block_size}"
+            )
         if source_2d.dtype != self.caps.output_dtype:
             raise ValueError(
                 f"source dtype {source_2d.dtype} does not match scratch output_dtype={self.caps.output_dtype}"
@@ -160,7 +166,7 @@ class BlockFP8LinearScratchPlan:
             x_q=x_q,
             output=output,
             bias=bias,
-            expected_m=expected_m,
+            expected_m=self.caps.max_tokens if expected_m is None else expected_m,
             mma_tiler_mn=self.mma_tiler_mn,
         )
 
@@ -178,9 +184,9 @@ def _check_block_size(block_size: Sequence[int]) -> tuple[int, int]:
     if len(block_size) != 2:
         raise ValueError(f"block_size must have two elements, got {block_size}")
     block_n, block_k = int(block_size[0]), int(block_size[1])
-    if (block_n, block_k) != (128, 128):
+    if (block_n, block_k) not in ((128, 128), (32, 32)):
         raise ValueError(
-            f"b12x block FP8 linear currently supports 128x128 weight blocks, got {block_size}"
+            f"b12x block FP8 linear supports 128x128 or 32x32 weight blocks, got {block_size}"
         )
     return block_n, block_k
 
@@ -313,8 +319,8 @@ def _block_fp8_linear_x_q_from_scratch(
         shape=layout.x_scale_mma_physical_shape,
         dtype=torch.uint8,
     )
-    x_scale_rows_u8.fill_(127)
-    x_scale_mma_u8.fill_(127)
+    # Quantization overwrites every scale contributing to a logical output row.
+    # Leave M128 padding unspecified to avoid two CUDA fills when binding scratch.
     x_scale_mma = x_scale_mma_u8.view(torch.float8_e8m0fnu).permute(
         3,
         4,
@@ -417,6 +423,7 @@ def plan_block_fp8_linear_scratch(
             in_features=caps.in_features,
             out_features=caps.out_features,
             output_dtype=str(caps.output_dtype).removeprefix("torch."),
+            weight_block_size=caps.block_size[0],
         ),
     )
     layout = _block_fp8_linear_scratch_layout(
@@ -448,13 +455,13 @@ def pack_block_fp8_linear_weight_mxfp8(
 ) -> BlockFP8LinearWeight:
     """Pack serialized block-FP8 linear weights for the native b12x MXFP8 GEMM.
 
-    The checkpoint weight stays in E4M3. The 128x128 DSV-style block scales are
-    expanded once to the row/32-column UE8M0 scale layout consumed by SM120 MMA.
+    The checkpoint weight stays in E4M3 for UE8M0 scales. The 128x128 DSV4 or
+    32x32 DSV4.1 scales expand once into the row/32-column SM120 MMA layout.
     """
 
     _check_gpu_tensor("weight", weight)
     _check_gpu_tensor("weight_scale", weight_scale)
-    _check_block_size(block_size)
+    block_size = _check_block_size(block_size)
     if weight.ndim != 2:
         raise ValueError(f"weight must have shape [N,K], got {tuple(weight.shape)}")
     out_features, in_features = weight.shape
@@ -467,12 +474,13 @@ def pack_block_fp8_linear_weight_mxfp8(
         m=out_features,
         k=in_features,
         num_groups=1,
+        block_size=block_size,
     )
     return BlockFP8LinearWeight(
         weight=packed,
         in_features=in_features,
         out_features=out_features,
-        block_size=(128, 128),
+        block_size=block_size,
     )
 
 
@@ -483,6 +491,9 @@ def _run_block_fp8_quant_kernel(
     out_scale_mma: torch.Tensor,
     tokens: int,
     in_features: int,
+    *,
+    expected_m: int | None = None,
+    min_amax: float = 0.0,
 ) -> None:
     del tokens, in_features
     quantize_mxfp8_rows_cute(
@@ -490,6 +501,8 @@ def _run_block_fp8_quant_kernel(
         out_values,
         out_scale_rows,
         out_scale_mma,
+        expected_m=expected_m,
+        min_amax=min_amax,
     )
 
 
@@ -501,6 +514,7 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
     source_tk: torch.Tensor,
     tokens: int,
     in_features: int,
+    min_amax: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Functional (allocate + return) quantizer: the raw CuTe kernel writes the
     # MXFP8 output views INSIDE this opaque op, so torch.compile never sees a
@@ -520,7 +534,8 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
         num_groups=1,
     )
     _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
+        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features,
+        min_amax=min_amax,
     )
     return values_base, scale_rows_base, scale_physical_base
 
@@ -530,6 +545,7 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_fake(
     source_tk: torch.Tensor,
     tokens: int,
     in_features: int,
+    min_amax: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return empty_mxfp8_rows_bases(
         tokens, in_features, num_groups=1, device=source_tk.device
@@ -540,9 +556,16 @@ def quantize_block_fp8_linear_input_mxfp8(
     source_tk: torch.Tensor,
     *,
     out: MXFP8Rows | None = None,
+    block_size: Sequence[int] = (128, 128),
 ) -> MXFP8Rows:
-    """Quantize dense BF16/FP16 rows `[tokens, K]` to native MXFP8 rows."""
+    """Quantize rows to E4M3/UE8M0 per K32; block_size selects the weight recipe.
 
+    The 32x32 V4.1 recipe floors activation amax at 1e-4. The default retains
+    the existing DSV4 quantization, including unit scales for zero groups.
+    """
+
+    block_size = _check_block_size(block_size)
+    min_amax = 1e-4 if block_size == (32, 32) else 0.0
     _check_gpu_tensor("source_tk", source_tk)
     if source_tk.ndim != 2:
         raise ValueError(
@@ -555,7 +578,7 @@ def quantize_block_fp8_linear_input_mxfp8(
     if out is None:
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.b12x.quantize_block_fp8_linear_input_mxfp8_alloc(
-                source_tk, tokens, in_features
+                source_tk, tokens, in_features, min_amax
             )
         )
         return mxfp8_rows_from_bases(
@@ -569,7 +592,51 @@ def quantize_block_fp8_linear_input_mxfp8(
 
     _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
     _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features
+        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features,
+        min_amax=min_amax,
+    )
+    return out
+
+
+def _quantize_block_fp8_linear_input_for_immediate_gemm(
+    source_tk: torch.Tensor,
+    *,
+    expected_m: int | None = None,
+    min_amax: float = 0.0,
+) -> MXFP8Rows:
+    """Quantize into fresh storage whose physical padding stays unspecified.
+
+    This private path is used only inside the opaque fused linear op, where the
+    quantized rows are consumed immediately by dense GEMM and never escape to a
+    caller.  It preserves the initialized-padding semantics of the public
+    ``quantize_block_fp8_linear_input_mxfp8`` allocation API.
+    """
+
+    tokens, in_features = source_tk.shape
+    values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
+        tokens,
+        in_features,
+        num_groups=1,
+        device=source_tk.device,
+        initialize_scales=False,
+    )
+    out = mxfp8_rows_from_bases(
+        values_base,
+        scale_rows_base,
+        scale_physical_base,
+        tokens,
+        in_features,
+        num_groups=1,
+    )
+    _run_block_fp8_quant_kernel(
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        in_features,
+        expected_m=expected_m,
+        min_amax=min_amax,
     )
     return out
 
@@ -586,6 +653,7 @@ def _block_fp8_linear_mxfp8_fused_op(
     in_features: int,
     out_features: int,
     expected_m: int,
+    sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
     # Fused, fully opaque block-FP8 linear: quantize + dense GEMM run INSIDE this
@@ -595,16 +663,20 @@ def _block_fp8_linear_mxfp8_fused_op(
     # shapes). The weight views passed in are static-shaped, so they don't hit
     # that path. Returns a contiguous [tokens, out_features] base.
     tokens = int(source_2d.shape[0])
-    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+    planned_tokens = expected_m if expected_m > 0 else tokens
+    if sfb_k_replicated and planned_tokens <= 8 and source_2d.dtype == torch.bfloat16:
         return dense_gemm_fused_quant_a(
             source_2d,
             weight_values.reshape(out_features, in_features, 1),
             weight_scale_mma,
             expected_m=None if expected_m == 0 else expected_m,
-            sfb_k_replicated=True,
+            sfb_k_replicated=sfb_k_replicated,
             stream=stream_int,
         )[:, :, 0]
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d)
+    x_q = _quantize_block_fp8_linear_input_for_immediate_gemm(
+        source_2d, expected_m=None if expected_m == 0 else expected_m,
+        min_amax=0.0 if sfb_k_replicated else 1e-4,
+    )
     return dense_gemm(
         (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
         (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
@@ -613,9 +685,8 @@ def _block_fp8_linear_mxfp8_fused_op(
         c_dtype=_c_dtype_name(source_2d.dtype),
         sf_vec_size=MXFP8_SCALE_VEC_SIZE,
         expected_m=None if expected_m == 0 else expected_m,
-        # Weight scales come from 128x128 blocks expanded to per-32 rows, so
-        # the four SFB bytes per 128-wide k tile are identical by construction.
-        sfb_k_replicated=True,
+        # Only 128x128 checkpoint blocks repeat four adjacent K32 scales.
+        sfb_k_replicated=sfb_k_replicated,
         stream=stream_int,
     )[:, :, 0]
 
@@ -629,6 +700,7 @@ def _block_fp8_linear_mxfp8_fused_fake(
     in_features: int,
     out_features: int,
     expected_m: int,
+    sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
     del stream_int
@@ -650,9 +722,9 @@ def block_fp8_linear_mxfp8(
 ) -> torch.Tensor:
     """Run a serialized block-FP8 linear through the native b12x MXFP8 GEMM.
 
-    expected_m forwards a DeepGEMM-style regime hint to dense_gemm (decode vs
-    prefill tile); None keeps the M-independent default. When a binding is given
-    its stored expected_m is used.
+    expected_m is the fixed row bound used for decode/prefill specialization.
+    A binding owns this value; Plan.bind defaults it to scratch capacity while
+    preserving an explicit expected_m supplied by the caller.
     """
 
     mma_tiler_mn = None
@@ -711,6 +783,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else 0,
+            packed_weight.block_size[1] == 128,
             stream_int,
         )
         if bias is not None:
@@ -732,7 +805,12 @@ def block_fp8_linear_mxfp8(
     assert x_q_storage is not None
     assert output_storage is not None
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
-    if tokens <= 8 and source_2d.dtype == torch.bfloat16:
+    planned_tokens = expected_m if expected_m is not None else tokens
+    if (
+        packed_weight.block_size == (128, 128)
+        and planned_tokens <= 8
+        and source_2d.dtype == torch.bfloat16
+    ):
         output = dense_gemm_fused_quant_a(
             source_2d,
             packed_weight.weight.values.reshape(
@@ -744,13 +822,20 @@ def block_fp8_linear_mxfp8(
             out=output_storage,
             expected_m=expected_m,
             mma_tiler_mn=mma_tiler_mn,
-            sfb_k_replicated=True,
+            sfb_k_replicated=packed_weight.block_size[1] == 128,
             stream=stream,
         )[:, :, 0]
         if bias is not None:
             output += bias
         return output.view(*source.shape[:-1], packed_weight.out_features)
-    x_q = quantize_block_fp8_linear_input_mxfp8(source_2d, out=x_q_storage)
+    if tokens <= 0:
+        raise ValueError("tokens must be positive")
+    x_q = x_q_storage
+    _run_block_fp8_quant_kernel(
+        source_2d, x_q.values, x_q.scale_rows, x_q.scale_mma,
+        tokens, in_features, expected_m=expected_m,
+        min_amax=1e-4 if packed_weight.block_size == (32, 32) else 0.0,
+    )
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
         (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),
@@ -769,7 +854,7 @@ def block_fp8_linear_mxfp8(
         out=output_storage,
         expected_m=expected_m,
         mma_tiler_mn=mma_tiler_mn,
-        sfb_k_replicated=True,
+        sfb_k_replicated=packed_weight.block_size[1] == 128,
         stream=stream,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0
@@ -826,10 +911,11 @@ def prewarm_block_fp8_linear_mxfp8(
             plan = plan_block_fp8_linear_scratch(
                 BlockFP8LinearScratchCaps(
                     device=device,
-                    max_tokens=tokens,
+                    max_tokens=max(tokens, expected_m or tokens),
                     in_features=packed_weight.in_features,
                     out_features=packed_weight.out_features,
                     output_dtype=output_dtype,
+                    block_size=packed_weight.block_size,
                 )
             )
             spec = plan.scratch_specs()[0]
@@ -849,6 +935,9 @@ def prewarm_block_fp8_linear_mxfp8(
                 expected_m=expected_m,
             )
             block_fp8_linear_mxfp8(binding=binding, stream=stream)
+            block_fp8_linear_mxfp8(
+                source, packed_weight, expected_m=expected_m, stream=stream
+            )
         torch.cuda.synchronize(device)
 
 

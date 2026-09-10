@@ -2,11 +2,13 @@
 
 ``plan`` owns the hash geometry, tensor-parallel table partition, and fixed
 serving capacity. ``Plan.allocate_storage`` materializes device-resident or
-CUDA-mapped host table storage according to the planned policy. ``bind`` maps
-the resulting model tensors, packed request metadata, output, and scratch
-without allocation. ``run`` hashes tokens, gathers selected rows from the
-local table shard, applies inline dequantization when the table uses FP8 or
-NVFP4 storage, and writes a BF16 flattened embedding contribution.
+CUDA-mapped host table storage. ``bind`` maps the resulting model tensors,
+packed request metadata, output, and scratch without allocation.
+``run`` hashes tokens, gathers selected rows from the local table shard, applies
+inline dequantization for FP8 or NVFP4, and writes a BF16 embedding contribution.
+``io_uring`` uses ``DiskTable`` with O_DIRECT to stage only the current batch.
+Its host-I/O ``run`` produces fixed GPU outputs outside capture; graphs may
+then consume those outputs without performing disk reads.
 
 The expressed operation is one hash, gather, and dequantization call. Its
 binding exposes only caller-owned inputs, the output, and a device error code;
@@ -28,6 +30,7 @@ META = OpMeta(
         "QuantMode",
         "TableMemory",
         "TableStorage",
+        "DiskTable",
         "Caps",
         "Plan",
         "Binding",
@@ -57,9 +60,9 @@ META = OpMeta(
         "FP8 E4M3 and NVFP4 tables remain quantized in persistent storage; "
         "only selected local rows are dequantized. The expressed API is one "
         "opaque hash, local-shard gather, and inline-dequantization operation. "
-        "Device-resident and CUDA-mapped host table storage share the same "
-        "binding contract. Its Triton implementation is functional but not "
-        "throughput-qualified."
+        "Device-resident, CUDA-mapped host, and io_uring-staged checkpoint "
+        "storage share the gather/dequantization implementation. Its Triton "
+        "implementation is functional but not throughput-qualified."
     ),
 )
 
@@ -67,6 +70,7 @@ if TYPE_CHECKING:
     from .api import (  # noqa: F401
         Binding,
         Caps,
+        DiskTable,
         Plan,
         PleEmbeddingConfig,
         PleEmbeddingQuery,

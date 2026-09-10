@@ -109,7 +109,7 @@ def make_smem_layout_mg(
     # footer in kv_sc). GLM (ARBITRARY_FP32, no extra cache) stages the 528B
     # NoPE+inline-fp32-scales row (scales inline, NO footer) PLUS a kv_rope buffer
     # (GLM has no global-rope path in MG). Both share the rest of the MG layout.
-    is_glm = not traits.has_extra_cache
+    is_glm = not traits.has_extra_cache or traits.d_rope == 0
     if mg_n_hg not in (1, 2):
         raise ValueError(
             f"MG prefill layout supports mg_n_hg in {{1, 2}}, got {mg_n_hg}"
@@ -339,7 +339,7 @@ def get_prefill_mg_shared_storage_cls(
     class SharedStorageMG:
         pass
 
-    is_glm = not traits.has_extra_cache
+    is_glm = not traits.has_extra_cache or traits.d_rope == 0
 
     # Tail (kv_fp8 .. w_fp8) is identical across DSV4 compute modes. DSV4
     # stages a separate UE8M0 footer ``kv_sc`` (rope from global/L2). GLM has NO

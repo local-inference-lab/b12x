@@ -11,6 +11,7 @@ import triton.language as tl
 
 from b12x._lib.dense_gemm import (
     _WO_SPARK_MAX_SMS,
+    _select_default_dense_gemm_plan,
     dense_gemm,
     dense_gemm_fused_quant_a,
     dense_gemm_fused_quant_a_grouped,
@@ -20,7 +21,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
-from b12x._lib.utils import cuda_stream_to_int
+from b12x._lib.utils import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._policy import (
     WO_PROJECTION_POLICY,
     WoProjectionQuery,
@@ -889,14 +890,17 @@ def _expand_block_scales_to_mxfp8_rows(
     m: int,
     k: int,
     num_groups: int,
+    block_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
     _check_gpu_tensor("scale", scale)
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
 
-    m_tiles = math.ceil(m / MXFP8_SCALE_ROW_TILE)
-    k_tiles = math.ceil((k // MXFP8_SCALE_VEC_SIZE) / MXFP8_SCALE_K_TILE)
+    block_n, block_k = block_size
+    m_tiles = math.ceil(m / block_n)
+    k_tiles = math.ceil(k / block_k)
+    scales_per_block_k = block_k // MXFP8_SCALE_VEC_SIZE
     expected_2d = (num_groups * m_tiles, k_tiles)
     expected_3d = (num_groups, m_tiles, k_tiles)
     if scale.shape == expected_2d:
@@ -915,11 +919,11 @@ def _expand_block_scales_to_mxfp8_rows(
 
     scale_rows_u8 = (
         block_u8[:, :, None, :, None]
-        .expand(num_groups, m_tiles, MXFP8_SCALE_ROW_TILE, k_tiles, MXFP8_SCALE_K_TILE)
+        .expand(num_groups, m_tiles, block_n, k_tiles, scales_per_block_k)
         .reshape(
             num_groups,
-            m_tiles * MXFP8_SCALE_ROW_TILE,
-            k_tiles * MXFP8_SCALE_K_TILE,
+            m_tiles * block_n,
+            k_tiles * scales_per_block_k,
         )[:, :m, : k // MXFP8_SCALE_VEC_SIZE]
         .contiguous()
     )
@@ -1115,10 +1119,12 @@ def pack_fp8_block_scaled_weight_mxfp8(
     m: int,
     k: int,
     num_groups: int = 1,
+    block_size: tuple[int, int] = (128, 128),
 ) -> MXFP8Rows:
     """Pack checkpoint FP8 block-scaled weights for native MXFP8 dense GEMM.
 
-    `weight` is FP8 E4M3 and `scale` is the DSV4-style 128x128 block scale.
+    `weight` is FP8 E4M3. `block_size` selects 128x128 DSV4 scales or
+    native 32x32 UE8M0 DSV4.1 scales; the latter never requantize weights.
 
     When `scale` is an *arbitrary* fp32 block scale (the DeepSeek
     `weight_scale_inv` checkpoint format), the weight is **re-quantized** onto an
@@ -1134,13 +1140,18 @@ def pack_fp8_block_scaled_weight_mxfp8(
     if m <= 0 or k <= 0 or num_groups <= 0:
         raise ValueError("m, k, and num_groups must be positive")
     _check_mxfp8_k(k)
+    block_size = tuple(block_size)
+    if block_size not in ((128, 128), (32, 32)):
+        raise ValueError(f"unsupported FP8 weight block_size {block_size}")
+    if block_size == (32, 32) and not _scale_is_exact_ue8m0(scale):
+        raise ValueError("32x32 weight scales must be exact UE8M0")
 
     # Arbitrary fp32 checkpoint scales (e.g. DeepSeek `weight_scale_inv`) are not
     # powers of two; re-quantize onto exact UE8M0 instead of rounding the scale
     # and leaving the FP8 values stale (which costs ~2.7x more error). Scales
     # that are already exact UE8M0 (e8m0/uint8, or a float tensor holding only
     # powers of two) keep their FP8 values verbatim.
-    if not _scale_is_exact_ue8m0(scale):
+    if block_size == (128, 128) and not _scale_is_exact_ue8m0(scale):
         _check_gpu_tensor("scale", scale)
         weight, scale = _requantize_block_fp8_to_ue8m0(
             weight, scale, m=m, k=k, num_groups=num_groups
@@ -1169,6 +1180,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
         m=m,
         k=k,
         num_groups=num_groups,
+        block_size=block_size,
     )
     scale_mma = pack_mxfp8_scales_for_dense_gemm(
         scale_rows,
@@ -2577,6 +2589,16 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     else:
         source = tmp_trg
         inner_span = rank
+    rhs_values_tiled = (
+        wo_b_hgr.values_tiled
+        if expected_m is not None and 1 <= expected_m <= 8
+        else None
+    )
+    mma_tiler_mn = None
+    if rhs_values_tiled is not None:
+        mma_tiler_mn = _wo_b_fused_tiled_plan(
+            tokens, hidden, width, source.device, expected_m
+        )
     return dense_gemm_fused_quant_a(
         source,
         wo_b_hgr.values.reshape(hidden, width, 1),
@@ -2584,15 +2606,43 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         out=out,
         expected_m=expected_m,
         sfb_k_replicated=sfb_k_replicated,
-        rhs_values_tiled=(
-            wo_b_hgr.values_tiled
-            if expected_m is not None and 1 <= expected_m <= 8
-            else None
-        ),
+        rhs_values_tiled=rhs_values_tiled,
+        mma_tiler_mn=mma_tiler_mn,
         a_inner_span=inner_span,
         _atomic_output_precleared=_atomic_output_precleared,
         stream=stream,
     )
+
+
+_WO_B_FUSED_TILED_PLANS = ((16, 64), (16, 128))
+
+
+def _wo_b_fused_tiled_plan(
+    m: int,
+    n: int,
+    k: int,
+    device: torch.device,
+    expected_m: int,
+) -> tuple[int, int]:
+    """Pin the tile-major fused-quant WO-B launch to a production 16xN plan.
+
+    ``dense_gemm_fused_quant_a`` only accepts the tile-major RHS with the
+    16xN/BK128 plans, but the default dense planner prefers (32, 64) for
+    small M on <=48-SM parts, so it must not be left to choose here. Keep the
+    planner's tile when it is one of the supported plans; otherwise fall
+    back to the 16x128 plan the planner itself selects for M=7..8.
+    """
+
+    override = os.getenv("B12X_WO_B_FUSED_TILE", "").strip().lower()
+    if override in ("16x64", "16x128"):
+        rows, cols = override.split("x")
+        return (int(rows), int(cols))
+    plan = _select_default_dense_gemm_plan(
+        m, n, k, get_num_sm(device), is_mxfp8=True, expected_m=expected_m
+    )
+    if plan.mma_tiler_mn in _WO_B_FUSED_TILED_PLANS:
+        return plan.mma_tiler_mn
+    return (16, 128)
 
 
 def wo_projection_mxfp8(

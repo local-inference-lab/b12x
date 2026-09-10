@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "status": "startup_and_serving_verified_with_auto_fit_context_limit",
+  "requested_script": "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh",
+  "target": {
+    "cuda_visible_devices": "0,1,2,3",
+    "tensor_parallel_size": 4,
+    "engram_table_memory": "disk",
+    "max_model_len": "auto",
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 4,
+    "gpu_memory_utilization": 0.95
+  },
+  "observed_failure": {
+    "phase": "model construction before checkpoint loading",
+    "exception": "torch.OutOfMemoryError",
+    "attempted_bytes": 566231040,
+    "torch_allocated_gib": 93.33,
+    "free_mib": 382.25,
+    "supervised_process": "ds41-serve-startup"
+  },
+  "mhc_eager_output_bytes_per_layer": 755826688,
+  "mhc_eager_output_bytes_40_layers": 30233067520,
+  "decision": "Borrow native mHC plan scratch from existing vLLM workspace manager and give live outputs their actual caller-owned lifetimes. Preserve requested capacities.",
+  "regression_checks": {
+    "passed": 6,
+    "scope": "mHC constructor memory, shared scratch/output lifetimes, broadcast input, attention/indexer graph replay and grouped projection reuse",
+    "elapsed_seconds": 8.94,
+    "command": "CUDA_VISIBLE_DEVICES=0 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/model_executor/kernels/test_b12x_linear.py::test_v41_mhc_shares_scratch_and_preserves_live_outputs tests/v1/attention/test_b12x_v41_workspace.py",
+    "cwd": "/home/luke/projects/vllm-hh-rebase"
+  },
+  "removed_mhc_scratch_bytes_40_layers": 1310720000,
+  "removed_attention_activation_bytes_40_layers": 8388608000,
+  "script_capacity_changes": false,
+  "constructor_fix_result": {
+    "model_loading_completed": true,
+    "model_loading_gib_per_rank": 76.22,
+    "requested_batch_capacity": 4096,
+    "requested_context": "auto"
+  },
+  "gemm_fix": {
+    "cause": "automatic BK64 selection ignored an explicit non-128-row MMA tile",
+    "change": "automatic K-depth uses native BK128 when the selected M tile cannot stage BK64; explicit overrides retain validation",
+    "verification": "The new exact-numerical/frozen-live-row regression and 264 existing expected-M tests passed.",
+    "passed": 265,
+    "command": "CUDA_VISIBLE_DEVICES=0 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/b12x/gemm/test_block_fp8_linear_capacity.py::test_v41_large_capacity_respects_narrow_tile_with_automatic_k_depth tests/b12x/gemm/test_dense_gemm_expected_m.py tests/b12x/gemm/test_gemm_stack.py::test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales",
+    "cwd": "/home/luke/projects/flashinfer-b12x-migration",
+    "command_result": "265 passed; the final pre-existing grouped-BK64 test failed with the documented baseline one-ULP mismatch."
+  },
+  "baseline_test_issue": {
+    "test": "test_dense_gemm_mxfp8_bk64_grouped_batches_use_their_own_scales",
+    "result": "One BF16 ULP mismatch in 1/262144 elements.",
+    "pre_fix_control": "identical failure reproduced after removing the new selection guard in a throwaway in-memory baseline",
+    "tolerances_changed": false
+  },
+  "source_sha256": {
+    "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/_lib/dense_gemm.py": "9261b1468ed3cf1285db63d18380bf9a35c5272d0eb33f2026aacfa2fb62802c",
+    "/home/luke/projects/flashinfer-b12x-migration/tests/b12x/gemm/test_block_fp8_linear_capacity.py": "952242070c22a106112004010a6972a0f6bb8263c78b261c455cf4a1e14bf14f",
+    "/home/luke/projects/flashinfer-b12x-migration/docs/b12x/README.md": "22b539fbdfcac02350444f1c3b3a44e2787061689b7abe84e52a0730af166dbe",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/b12x_layers.py": "6f942491b1d200631a8419cd9d395d9f6a3dfc00a5a934951edf1e5212a9cc4b",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/attention.py": "3152a496a1aec9ff86fc3753352235765242427497aaa66387a988dbd74fcffe",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/model.py": "46712f8bf1390e95a5ee7f513132bba93d7d676145552ceb6e7ab51e0c5017dd",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/deepseek_v4_1/nvidia/dspark.py": "d56eb65f8758e7657bcdedb9720667f6fcc327f3d87c10d12c3de4a54f3d3f26",
+    "/home/luke/projects/vllm-hh-rebase/tests/model_executor/kernels/test_b12x_linear.py": "d16bc35cb27cd32e2cde64d56d5c531a70325b420555a15beb3bc81d8a1e0991",
+    "/home/luke/projects/vllm-hh-rebase/tests/v1/attention/test_b12x_v41_workspace.py": "42e4ceefacf79f0f610caa4311bbdab00e5562609f8507b1ff5e9d1055ffbd92",
+    "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh": "11d5f4cfd05e9321aca8b855e9fa396bf716c52b26726b824e623f37a9f75036"
+  },
+  "launch": {
+    "command": "DRY_RUN=0 /usr/bin/bash ./serve-ds41-flash.sh",
+    "cwd": "/home/luke/projects/vllm-hh-rebase",
+    "supervised_name": "ds41-serve-startup",
+    "api_pid": 277671,
+    "ready": true,
+    "left_running": true,
+    "settings_overridden_for_verification": false
+  },
+  "server_result": {
+    "model_loading_gib_per_rank": 76.22,
+    "graph_capture_gib_per_rank": 3.97,
+    "available_kv_cache_gib_per_rank": 7.71,
+    "advertised_max_model_len": 692736,
+    "health_http_status": 200,
+    "smoke_requests_http_200": 7,
+    "arithmetic_checks_passed": 6,
+    "largest_smoke_prompt_tokens": 5430,
+    "concurrent_http_requests": 4,
+    "prefix_cache_hit_tokens": 5376,
+    "sustained_decode_tokens": 32,
+    "speculative_draft_rounds": 17,
+    "accepted_draft_tokens": 28,
+    "request_error_counter": 0,
+    "raw_api_evidence": "startup_serving_smoke.json"
+  },
+  "remaining_context_limit": {
+    "checkpoint_max_model_len": 1048576,
+    "automatic_fit_max_model_len": 692736,
+    "full_context_qualified": false,
+    "bounded_kv_groups": 8,
+    "selected_group_layer_counts": [
+      20,
+      20,
+      3,
+      3,
+      3,
+      1,
+      1,
+      3
+    ],
+    "full_context_shared_pool_required_bytes": 12030289920,
+    "unbounded_baseline_required_bytes": 5508734976,
+    "source": "vllm/v1/core/kv_cache_utils.py:_get_weighted_shared_pool_kv_cache_groups",
+    "decision": "No KV grouping policy or script capacity change in this startup repair. Full-context layout work is separate from the now-verified constructor and GEMM fixes."
+  },
+  "gpu_snapshot": {
+    "command": "nvidia-smi -i 0,1,2,3 --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv",
+    "all_four_gpus": {
+      "memory_total_mib": 97887,
+      "memory_used_mib": 92967,
+      "memory_free_mib": 4325,
+      "utilization_percent": 0
+    }
+  },
+  "qualification_scope": "Actual edited launcher, unchanged auto/.95/4096/4 settings, GPUs 0-3 only. Startup, native graph replay, chunked prefill and prefix reuse verified. No claim of 1M-token request qualification or an isolated performance improvement."
+}

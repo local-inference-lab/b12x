@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "initial_attempts": [
+    {
+      "loader": "b12x",
+      "failure": "CUDA_HOME default /usr/local/cuda missing headers",
+      "resolved_by": "CUDA_HOME=/opt/cuda; native ABI1 load smoke passed"
+    },
+    {
+      "loader": "b12x",
+      "failure": "GB10 shared host-addressable weight pool requires GPU host page tables unavailable on this discrete SM120 platform"
+    },
+    {
+      "loader": "fastsafetensors",
+      "failure": "Sorting the live weight iterator retained GPU payloads; global Engram tensors are about 91.56 GiB each and cannot be staged alongside the resident model.",
+      "source_fix": "Stream mapped weights through AutoWeightsLoader and defer model finalization to the root post-load hook."
+    }
+  ],
+  "selected_loader": "safetensors",
+  "safetensors_load_strategy": "lazy",
+  "basis": "CPU mmap sources remain lazy; each Engram weight loader takes its rank-local row slice before copying to GPU. No global table is materialized on a GPU.",
+  "kernel_plan_unchanged": true,
+  "compute_backends": {
+    "attention": "b12x",
+    "linear": "b12x",
+    "moe": "b12x"
+  },
+  "checkpoint_mutated": false,
+  "toolchain_or_dependency_pins_changed": false
+}

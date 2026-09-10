@@ -633,6 +633,33 @@ def ld_global_nc_v4_u32(
 
 
 @dsl_user_op
+def ld_global_cg_v4_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load 128 bits from global memory, cached at L2 only (ld.global.cg).
+
+    For data written by other CTAs of the running kernel: bypasses the SM's
+    non-coherent L1 so a stale line can never be returned."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
     """Store 64 bits to global memory."""
     llvm.inline_asm(
@@ -1525,6 +1552,46 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def red_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+    """No-return global int32 add reduction (relaxed device scope)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_global_u64(addr: Int64, val: Int64, *, loc=None, ip=None) -> Int64:
+    """Global 64-bit atomic add (relaxed device scope). Returns the old value."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int64(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.relaxed.gpu.global.add.u64 $0, [$1], $2;",
+            "=l,l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -2874,6 +2941,62 @@ def fp8x4_e4m3_to_bfloat2x2_via_f16(
 
 
 @dsl_user_op
+def nvfp4_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode raw NVFP4 and E4M3 scale bytes using PTX 9.2 on SM120a.
+
+    Every finite E2M1 * E4M3 product is exactly representable in BF16.
+    """
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b8 q;
+            .reg .b16 sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u8.u32 q, $1;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.e2m1x2 values, q;
+            cvt.rn.bf16x2.e4m3x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
+def mxfp8_pair_to_bf16x2_sm120(
+    packed: Uint32, scale: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    """Decode E4M3 pairs and an unmodified UE8M0 byte on SM120a."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(packed).ir_value(loc=loc, ip=ip),
+                  Uint32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 q, sf;
+            .reg .b32 values, factors, sf_pair;
+            cvt.u16.u32 q, $1;
+            cvt.rn.bf16x2.e4m3x2 values, q;
+            shl.b32 sf_pair, $2, 8;
+            or.b32 sf_pair, $2, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.ue8m0x2 factors, sf;
+            mul.bf16x2 $0, values, factors;
+        }
+        """,
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@dsl_user_op
 def fp8x4_e4m3_to_bfloat2x2_native_sm120(
     packed: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
@@ -3786,6 +3909,114 @@ def mxfp8_mma_m16n8k32_f32_e4m3(
         ],
         """
         mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
+def nvfp4_mma_m16n8k64_f32_e2m1(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 native NVFP4 block-scaled QMMA `m16n8k64` (E2M1 x E2M1, ue4m3).
+
+    Emits ``mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.
+    m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3``.  Both operands stay as packed
+    E2M1 nibbles (eight per u32 register) -- unlike the ``mxf8f6f4`` 1X path,
+    no byte-container expansion is required.
+
+    Fragment mapping (empirically pinned on SM120 against the NVFP4 phase
+    kernel chain in ``tests/moe/test_nvfp4_phase_kernels.py``
+    (``test_nvfp4_phase_intermediate_matches_torch``); lane l with q = l//4, c = l%4):
+
+    - A reg ``r`` nibble ``n`` holds ``A[q + 8*(r%2), 32*(r//2) + 8*c + n]``
+      -- i.e. each u32 register covers eight consecutive k values of one
+      row; regs 0/2 cover rows q (k halves 0/1) and regs 1/3 rows q+8, and
+      the lane's c index selects the 8-value k group within each half.
+    - B reg ``j`` nibble ``n`` holds ``B[q, 32*j + 8*c + n]`` (col = q).
+    - The SFA scale word of lane ``L`` carries the byte-scaled UE4M3 group
+      for one A row: rows 0..7 ride lanes 0, 4, ..., 28 (``L%4 == 0``), rows
+      8..15 ride lanes 1, 5, ..., 29 (``L%4 == 1``), and lanes with ``L%4``
+      in {2, 3} are ignored by the hardware.  Equivalently, for ``q = L>>2``
+      and ``c = L&3`` the row index is ``q + 8*(c&1)``.
+    - The SFB scale word of lane ``L`` holds ``SF_B[L//4, 0..3]`` (all 32
+      lanes valid; the hardware reads the word from lane ``4*col``).
+    - Accumulator: ``d0 = D[q, 2c]``, ``d1 = D[q, 2c+1]``,
+      ``d2 = D[q+8, 2c]``, ``d3 = D[q+8, 2c+1]``.
+
+    ``bid_a``/``bid_b``/``tid_a``/``tid_b`` are compile-time byte/thread
+    selectors reserved for future multi-atom use; the scale_vec::4X path
+    gathers its own bytes across lanes and passes zero selectors.
+    """
+    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
+
+    def _i16(v: int):
+        return cutlass._mlir.ir.Operation.create(
+            "llvm.mlir.constant",
+            results=[i16_ty],
+            attributes={
+                "value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))
+            },
+        ).result
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            _i16(bid_a),
+            _i16(tid_a),
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            _i16(bid_b),
+            _i16(tid_b),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
         {$0, $1, $2, $3},
         {$4, $5, $6, $7},
         {$8, $9},

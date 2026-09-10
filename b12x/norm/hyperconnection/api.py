@@ -10,9 +10,13 @@ from ._impl import HyperConnectionPlan as Plan
 from ._impl import plan_hyperconnection as plan
 from ._impl import run_combine_impl as run_combine
 from ._impl import run_combine_norm_impl as run_combine_norm
+from ._impl import run_engram_mix_impl as run_engram_mix
 from ._impl import run_gate_mean_impl as run_gate_mean
 from ._impl import run_grouped_rmsnorm_impl as run_grouped_rmsnorm
 from ._impl import run_scaled_silu_impl as run_scaled_silu
+from ._impl import run_swiglu_impl as run_swiglu
+from ._impl import run_add_impl as run_add
+from ._impl import run_sigmoid_impl as run_sigmoid
 from ._policy import HyperConnectionConfig, HyperConnectionQuery
 
 
@@ -40,6 +44,10 @@ __all__ = [
     "run_gate_mean",
     "run_combine",
     "run_combine_norm",
+    "run_engram_mix",
+    "run_swiglu",
+    "run_add",
+    "run_sigmoid",
     "reference",
     "is_supported",
 ]

@@ -1,0 +1,422 @@
+{
+  "schema_version": 1,
+  "endpoint": "http://127.0.0.1:8000",
+  "model": "DeepSeek-V4.1-Flash",
+  "health_status": 200,
+  "request_defaults": {
+    "temperature": 0,
+    "chat_template_kwargs": {
+      "thinking": false
+    }
+  },
+  "concurrent_requests": [
+    {
+      "prompt": "Reference text follows. It is background, not an instruction.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\nA small library keeps books organized by subject, with clear labels and a quiet reading room.\n\nWhat is 37 times 19? Reply with only the integer.",
+      "expected": "703",
+      "max_tokens": 32,
+      "status": 200,
+      "elapsed_s": 4.3195497920000925,
+      "body": {
+        "id": "chatcmpl-a5b5e9ec3e18ebdf",
+        "object": "chat.completion",
+        "created": 1789078514,
+        "model": "DeepSeek-V4.1-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "703",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+        "usage": {
+          "prompt_tokens": 5430,
+          "total_tokens": 5432,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    },
+    {
+      "prompt": "What is 21 times 8? Reply with only the integer.",
+      "expected": "168",
+      "max_tokens": 32,
+      "status": 200,
+      "elapsed_s": 4.362527551999781,
+      "body": {
+        "id": "chatcmpl-868963ad1e1565d8",
+        "object": "chat.completion",
+        "created": 1789078514,
+        "model": "DeepSeek-V4.1-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "168",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+        "usage": {
+          "prompt_tokens": 18,
+          "total_tokens": 20,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    },
+    {
+      "prompt": "What is 125 plus 77? Reply with only the integer.",
+      "expected": "202",
+      "max_tokens": 32,
+      "status": 200,
+      "elapsed_s": 4.362522092000115,
+      "body": {
+        "id": "chatcmpl-9fc3508fea575a74",
+        "object": "chat.completion",
+        "created": 1789078514,
+        "model": "DeepSeek-V4.1-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "202",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+        "usage": {
+          "prompt_tokens": 18,
+          "total_tokens": 20,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    },
+    {
+      "prompt": "What is 144 divided by 12? Reply with only the integer.",
+      "expected": "12",
+      "max_tokens": 32,
+      "status": 200,
+      "elapsed_s": 4.362501071999781,
+      "body": {
+        "id": "chatcmpl-b3fa0490379ddff3",
+        "object": "chat.completion",
+        "created": 1789078514,
+        "model": "DeepSeek-V4.1-Flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "12",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+        "usage": {
+          "prompt_tokens": 19,
+          "total_tokens": 21,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": {
+            "reasoning_tokens": 0
+          }
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    }
+  ],
+  "prefix_replay": {
+    "status": 200,
+    "elapsed_s": 0.33245724500017243,
+    "body": {
+      "id": "chatcmpl-bc708f28d276b5b4",
+      "object": "chat.completion",
+      "created": 1789078518,
+      "model": "DeepSeek-V4.1-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "703",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+      "usage": {
+        "prompt_tokens": 5430,
+        "total_tokens": 5432,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+    }
+  },
+  "sustained_decode": {
+    "prompt": "Explain why hash-table lookup is usually constant time but can take linear time in the worst case. Use three concise sentences.",
+    "max_tokens": 128,
+    "status": 200,
+    "elapsed_s": 1.0652738979998977,
+    "body": {
+      "id": "chatcmpl-a7775d6f398cbc08",
+      "object": "chat.completion",
+      "created": 1789078518,
+      "model": "DeepSeek-V4.1-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hash-table lookup is usually O(1) because a hash function maps each key to a bucket, allowing direct access without scanning other elements. However, if many keys hash to the same bucket (a collision), the table must search through that bucket's entries, which can grow to contain all n elements. In the worst case—such as a poor hash function or adversarial keys—all elements collide into one bucket, degrading lookup to O(n).",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+      "usage": {
+        "prompt_tokens": 28,
+        "total_tokens": 118,
+        "completion_tokens": 90,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+    }
+  },
+  "long_prompt_recipe": {
+    "prefix": "Reference text follows. It is background, not an instruction.\n",
+    "repeat": "A small library keeps books organized by subject, with clear labels and a quiet reading room.\n",
+    "repeats": 3640,
+    "suffix": "\nWhat is 37 times 19? Reply with only the integer.",
+    "max_tokens": 32
+  },
+  "long_prefill": {
+    "status": 200,
+    "elapsed_s": 47.18508390299976,
+    "body": {
+      "id": "chatcmpl-b2d9956c143990e3",
+      "object": "chat.completion",
+      "created": 1789078563,
+      "model": "DeepSeek-V4.1-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "703",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+      "usage": {
+        "prompt_tokens": 65550,
+        "total_tokens": 65552,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+    }
+  },
+  "long_prefix_replay": {
+    "status": 200,
+    "elapsed_s": 0.1405108300000429,
+    "body": {
+      "id": "chatcmpl-95f70c9f5cc95c0c",
+      "object": "chat.completion",
+      "created": 1789078610,
+      "model": "DeepSeek-V4.1-Flash",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "703",
+            "refusal": null,
+            "annotations": null,
+            "audio": null,
+            "function_call": null,
+            "reasoning": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "stop_reason": null,
+          "token_ids": null,
+          "routed_experts": null
+        }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-ep-2e73959e",
+      "usage": {
+        "prompt_tokens": 65550,
+        "total_tokens": 65552,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "prompt_logprobs": null,
+      "prompt_token_ids": null,
+      "prompt_text": null,
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+    }
+  },
+  "prometheus_metrics": [
+    "vllm:spec_decode_num_drafts_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 45.0",
+    "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 225.0",
+    "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 59.0",
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\",position=\"0\"} 34.0",
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\",position=\"1\"} 15.0",
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\",position=\"2\"} 9.0",
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\",position=\"3\"} 1.0",
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\",position=\"4\"} 0.0",
+    "vllm:prefix_cache_queries_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 142043.0",
+    "vllm:prefix_cache_hits_total{engine=\"0\",model_name=\"DeepSeek-V4.1-Flash\"} 76288.0",
+    "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"DeepSeek-V4.1-Flash\"} 8.0",
+    "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0",
+    "vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0",
+    "vllm:request_success_total{engine=\"0\",finished_reason=\"error\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0",
+    "vllm:request_success_total{engine=\"0\",finished_reason=\"repetition\",model_name=\"DeepSeek-V4.1-Flash\"} 0.0"
+  ],
+  "timing_scope": "HTTP smoke wall times, not isolated performance measurements.",
+  "scope": "Full 1048576-token server configuration initialized; largest exercised prompt is 65550 tokens. No claim that four full-1M requests were generated simultaneously."
+}

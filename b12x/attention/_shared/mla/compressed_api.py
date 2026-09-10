@@ -12,18 +12,16 @@ from .api import (
     _use_sm120_sparse_mla,
     _validate_tensor_storage_bounds,
 )
-from .compressed_config import (
-    compressed_sparse_mla_split_chunks_for_contract,
-)
 from .compressed_reference import (
     COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_SPARSE_MLA_HEAD_DIM,
-    compressed_sparse_mla_page_nbytes,
 )
 
 
 _LN2 = math.log(2.0)
+
+
 
 
 def _should_use_sm121_single_pass_decode(
@@ -72,42 +70,101 @@ def compressed_sparse_mla_decode_forward(
     lse_scale: Literal["base2", "natural"] = "base2",
     backend: str | None = None,
     out: torch.Tensor | None = None,
+    cache_format: Literal["deepseek_v4", "deepseek_v41"] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages.
 
     ``out``, when given, is the final O destination: the kernel/merge writes it
     directly (no workspace-to-caller copy). Must be a contiguous BF16
     [rows, heads, 512] tensor on q's device; anything else raises.
+    Without ``binding``, plan and allocate temporary scratch outside CUDA graph
+    capture. Bound calls use the plan's cache recipe; an explicit contradiction
+    is rejected. Warm bound calls before capture, including mapped indices.
     """
 
     if lse_scale not in ("base2", "natural"):
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
 
     if binding is None:
-        raise TypeError("compressed_sparse_mla_decode_forward requires binding")
-    extras = [
-        name
-        for name, value in (
-            ("q_all", q_all),
-            ("swa_indices", swa_indices),
-            ("swa_topk_lengths", swa_topk_lengths),
-            ("indexed_indices", indexed_indices),
-            ("indexed_topk_lengths", indexed_topk_lengths),
-            ("indexed_page_table", indexed_page_table),
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "compressed MLA convenience allocation is not capture safe; plan and bind first"
+            )
+        if q_all is None or swa_indices is None or swa_topk_lengths is None:
+            raise TypeError(
+                "unbound compressed MLA requires q_all, swa_indices, and swa_topk_lengths"
+            )
+        from ...compressed_sparse_mla.api import Caps, plan
+
+        q3 = _normalize_compressed_q(q_all)
+        swa_width = int(
+            _normalize_index_matrix(swa_indices, name="swa_indices").shape[1]
         )
-        if value is not None
-    ]
-    if extras:
-        raise ValueError(
-            "compressed MLA binding owns q and index tensors; "
-            f"do not also pass {', '.join(extras)}"
+        indexed_width = (
+            int(
+                _normalize_index_matrix(indexed_indices, name="indexed_indices").shape[
+                    1
+                ]
+            )
+            if indexed_indices is not None
+            else 0
         )
+        temporary_plan = plan(
+            Caps(
+                device=q3.device,
+                num_q_heads=int(q3.shape[1]),
+                max_q_rows=max(1, int(q3.shape[0])),
+                max_width=max(1, swa_width + indexed_width),
+                swa_width=swa_width,
+                indexed_width=indexed_width,
+                swa_page_size=swa_page_size,
+                indexed_page_size=indexed_page_size,
+                max_page_table_width=(
+                    int(indexed_page_table.shape[-1])
+                    if indexed_page_table is not None
+                    else None
+                ),
+                cache_format=cache_format or "deepseek_v4",
+            )
+        )
+        (spec,) = temporary_plan.scratch_specs()
+        binding = temporary_plan.bind(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=spec.device),
+            q=q3,
+            swa_indices=swa_indices,
+            swa_lengths=swa_topk_lengths,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_topk_lengths,
+            indexed_page_table=indexed_page_table,
+        )
+    else:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("swa_indices", swa_indices),
+                ("swa_topk_lengths", swa_topk_lengths),
+                ("indexed_indices", indexed_indices),
+                ("indexed_topk_lengths", indexed_topk_lengths),
+                ("indexed_page_table", indexed_page_table),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "compressed MLA binding owns q and index tensors; "
+                f"do not also pass {', '.join(extras)}"
+            )
     scratch = getattr(binding, "scratch", None)
     if scratch is None:
         raise TypeError("compressed MLA binding is missing scratch")
-    q_all = getattr(binding, "q")
-    swa_indices = getattr(binding, "swa_indices")
-    swa_topk_lengths = getattr(binding, "swa_lengths")
+    planned_cache_format = getattr(scratch, "cache_format", "deepseek_v4")
+    if cache_format is not None and cache_format != planned_cache_format:
+        raise ValueError("cache_format contradicts the bound compressed MLA recipe")
+    cache_format = planned_cache_format
+    q_all = binding.q
+    swa_indices = binding.swa_indices
+    swa_topk_lengths = binding.swa_lengths
     indexed_indices = getattr(binding, "indexed_indices", None)
     indexed_topk_lengths = getattr(binding, "indexed_lengths", None)
     indexed_page_table = getattr(binding, "indexed_page_table", None)
@@ -129,6 +186,7 @@ def compressed_sparse_mla_decode_forward(
             "compressed sparse MLA requires the active SM120 sparse MLA kernel path; "
             "legacy compressed sparse MLA kernels have been retired"
         )
+    swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     swa_k_cache = _compressed_sparse_mla_cache_byte_view(
         swa_k_cache, name="swa_k_cache"
     )
@@ -136,9 +194,11 @@ def compressed_sparse_mla_decode_forward(
         swa_k_cache,
         page_size=swa_page_size,
         name="swa_k_cache",
+        cache_format=cache_format,
+        cache_kind="swa",
+        allow_empty=swa_indices_2d.shape[1] == 0,
     )
 
-    swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     if swa_indices_2d.device != q3.device:
         raise ValueError("swa_indices must be on the same device as q_all")
     if swa_indices_2d.shape[0] != rows:
@@ -169,11 +229,9 @@ def compressed_sparse_mla_decode_forward(
             raise ValueError(
                 "indexed_page_size is required when indexed_k_cache is provided"
             )
-        if indexed_page_table is not None:
-            raise ValueError(
-                "SM120 sparse-MLA decode does not support a mapped indexed_page_table; "
-                "the extra cache is addressed by raw slot id"
-            )
+        indexed_indices_2d = _normalize_index_matrix(
+            indexed_indices, name="indexed_indices"
+        )
         indexed_k_cache = _compressed_sparse_mla_cache_byte_view(
             indexed_k_cache, name="indexed_k_cache"
         )
@@ -181,9 +239,9 @@ def compressed_sparse_mla_decode_forward(
             indexed_k_cache,
             page_size=int(indexed_page_size),
             name="indexed_k_cache",
-        )
-        indexed_indices_2d = _normalize_index_matrix(
-            indexed_indices, name="indexed_indices"
+            cache_format=cache_format,
+            cache_kind="indexed",
+            allow_empty=indexed_indices_2d.shape[1] == 0,
         )
         if indexed_indices_2d.device != q3.device:
             raise ValueError("indexed_indices must be on the same device as q_all")
@@ -196,6 +254,26 @@ def compressed_sparse_mla_decode_forward(
         )
         if indexed_topk_lengths.device != q3.device:
             raise ValueError("indexed_topk_lengths must be on the same device as q_all")
+        if indexed_page_table is not None:
+            if cache_format != "deepseek_v41":
+                raise ValueError(
+                    "mapped indexed_page_table is only supported for deepseek_v41"
+                )
+            from ...compressed_sparse_mla._metadata import map_indexed_pages
+
+            mapped = getattr(scratch, "mapped_indices", None)
+            if mapped is None:
+                raise ValueError(
+                    "mapped indexed pages require component-planned scratch"
+                )
+            indexed_indices_2d = map_indexed_pages(
+                indexed_indices_2d,
+                indexed_topk_lengths,
+                indexed_page_table,
+                mapped,
+                page_size=int(indexed_page_size),
+                num_pages=int(indexed_k_cache.shape[0]),
+            )
     else:
         indexed_indices_2d = None
         if indexed_page_table is not None:
@@ -230,33 +308,20 @@ def compressed_sparse_mla_decode_forward(
 
     if out is not None:
         _validate_compressed_sparse_mla_out(out, q3=q3)
+    if rows == 0:
+        output = out if out is not None else scratch.output_buffer[:0]
+        return (output, scratch.final_lse[:0]) if return_lse else output
 
-    if scratch.mode in ("extend", "verify", "draft_extend"):
-        return _run_sm120_compressed_prefill(
-            q3=q3,
-            swa_k_cache=swa_k_cache,
-            swa_indices=swa_indices_2d,
-            swa_topk_lengths=swa_topk_lengths,
-            workspace=scratch,
-            sm_scale=sm_scale,
-            swa_page_size=swa_page_size,
-            indexed_k_cache=indexed_k_cache if has_indexed else None,
-            indexed_indices=indexed_indices_2d,
-            indexed_topk_lengths=indexed_topk_lengths if has_indexed else None,
-            indexed_page_size=indexed_page_size if has_indexed else None,
-            attn_sink=attn_sink,
-            return_lse=return_lse,
-            lse_scale=lse_scale,
-            out=out,
+    if scratch.mode in ("extend", "verify", "draft_extend") or (
+        cache_format == "deepseek_v4"
+        and _should_use_sm121_single_pass_decode(
+            rows=rows,
+            heads=heads,
+            swa_width=int(swa_indices_2d.shape[1]),
+            indexed_width=int(indexed_indices_2d.shape[1]) if has_indexed else 0,
+            swa_page_size=int(swa_page_size),
+            indexed_page_size=int(indexed_page_size) if has_indexed else None,
         )
-
-    if _should_use_sm121_single_pass_decode(
-        rows=rows,
-        heads=heads,
-        swa_width=int(swa_indices_2d.shape[1]),
-        indexed_width=(int(indexed_indices_2d.shape[1]) if has_indexed else 0),
-        swa_page_size=int(swa_page_size),
-        indexed_page_size=(int(indexed_page_size) if has_indexed else None),
     ):
         return _run_sm120_compressed_prefill(
             q3=q3,
@@ -276,7 +341,17 @@ def compressed_sparse_mla_decode_forward(
             out=out,
         )
 
+
     from .kernel import run_unified_decode
+    from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
+
+    traits = (
+        make_unified_traits(
+            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
+        )
+        if cache_format == "deepseek_v41"
+        else None
+    )
 
     return run_unified_decode(
         q_all=q3,
@@ -294,6 +369,7 @@ def compressed_sparse_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
+        traits_override=traits,
     )
 
 
@@ -343,6 +419,15 @@ def _run_sm120_compressed_prefill(
     (error like upstream, NOT a legacy fallback).
     """
     from .kernel import run_unified_prefill
+    from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
+
+    traits = (
+        make_unified_traits(
+            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
+        )
+        if getattr(workspace, "cache_format", "deepseek_v4") == "deepseek_v41"
+        else None
+    )
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     if out is not None:
@@ -374,11 +459,13 @@ def _run_sm120_compressed_prefill(
         topk_length=swa_topk_lengths,
         attn_sink=attn_sink,
         output=output,
+        lse_out=workspace.final_lse[: int(q3.shape[0])],
+        traits_override=traits,
         **extra_kwargs,
     )
     if not return_lse:
         return output
-    lse = lse_base2 if lse_scale == "base2" else (lse_base2 * _LN2)
+    lse = lse_base2 if lse_scale == "base2" else lse_base2.mul_(_LN2)
     return output, lse
 
 
@@ -526,12 +613,31 @@ def _validate_compressed_cache_layout(
     *,
     page_size: int,
     name: str,
+    cache_format: str = "deepseek_v4",
+    cache_kind: str = "swa",
+    allow_empty: bool = False,
 ) -> None:
+    if int(cache.shape[0]) < 1 and not allow_empty:
+        raise ValueError(f"{name} must contain at least one physical page")
+    if cache_format == "deepseek_v41" and (
+        cache.data_ptr() % 16 or cache.stride(0) % 16
+    ):
+        raise ValueError(
+            f"{name} V4.1 pages must have 16-byte aligned storage and strides"
+        )
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
-    payload_nbytes = page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
-    padded_page_nbytes = compressed_sparse_mla_page_nbytes(page_size)
+    from .kv_cache import page_nbytes as cache_page_nbytes
+
+    padded_page_nbytes = cache_page_nbytes(
+        page_size, cache_format=cache_format, cache_kind=cache_kind
+    )
+    payload_nbytes = (
+        page_size * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+        if cache_format == "deepseek_v4"
+        else padded_page_nbytes
+    )
     page_nbytes = int(cache.shape[1])
     if page_nbytes not in (payload_nbytes, padded_page_nbytes):
         raise ValueError(

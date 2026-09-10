@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.attention import compressed_sparse_mla
+from b12x.attention._shared.mla.compressed_reference import (
+    pack_deepseek_v41_cache_reference,
+)
 from b12x.attention._shared.mla.kernel import (
     run_unified_decode,
 )
@@ -440,6 +445,7 @@ def test_writer_records_feed_production_head_multisplit_decode() -> None:
     sm_scale = _HEAD_DIM**-0.5
 
     caps = B12XSparseMLAScratchCaps(
+        softmax_scale=1.0,
         device=device,
         dtype=torch.bfloat16,
         kv_dtype=torch.uint8,
@@ -526,3 +532,131 @@ def test_writer_records_feed_production_head_multitile_prefill_mg() -> None:
     )
     torch.cuda.synchronize(device)
     _assert_reader_matches_dequantized_records(actual, expected)
+
+
+def _v41_writer_inputs(rows: int, device: torch.device) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(411)
+    values = torch.randn(rows, 512, generator=generator)
+    values *= torch.logspace(-4, 2, 32).repeat_interleave(16)
+    values[0] = 0
+    if rows > 1:
+        # Floor-scale underflow, signed zero, ties-even, and saturation after
+        # rounding the E4M3 scale all occur within independent 16-value groups.
+        values[1, :16] = torch.tensor(
+            [0, -0.0, 0.0001, -0.0001, 0.001, -0.001, 0.003, -0.003,
+             0.005, -0.005, 0.007, -0.007, 0.009, -0.009, 0.01, -0.01]
+        )
+        values[1, 16:32] = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6,
+             -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5, -6]
+        )
+        values[1, 32:48] = torch.linspace(-6.125, 6.125, 16)
+        values[1, -64:] = torch.linspace(-0.31, 0.29, 64)
+    return values.to(device=device, dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("cache_kind", ["swa", "indexed"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("high_page", [False, True], ids=["low-pid", "high-pid"])
+@torch.inference_mode()
+def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
+    cache_kind: str, slot_dtype: torch.dtype, high_page: bool,
+) -> None:
+    device = require_sm120()
+    page_size = 3
+    page_bytes = compressed_sparse_mla.page_nbytes(
+        page_size, cache_format="deepseek_v41", cache_kind=cache_kind
+    )
+    record_bytes = 528 if cache_kind == "swa" else 288
+    assert page_bytes == page_size * record_bytes
+    page_stride = page_bytes + 16
+    first_page = 2**31 // page_stride + 1 if high_page else 1
+    # Only initialize the live tail and one low-page guard, not the 2-GiB pool.
+    storage = torch.empty(
+        (first_page + 2, page_stride), dtype=torch.uint8, device=device
+    )
+    storage[0].fill_(_SENTINEL)
+    storage[first_page:].fill_(_SENTINEL)
+    cache = storage[:, :page_bytes]
+    kv = _v41_writer_inputs(5, device)
+    slots = torch.tensor(
+        [first_page * page_size, first_page * page_size + 2, -1,
+         (first_page + 1) * page_size + 1, -17],
+        dtype=slot_dtype, device=device,
+    )
+    expected_records = pack_deepseek_v41_cache_reference(
+        kv, page_size=1, cache_kind=cache_kind
+    )
+    expected_tail = torch.full_like(storage[first_page:], _SENTINEL)
+    for source_row, page, offset in ((0, 0, 0), (1, 0, 2), (3, 1, 1)):
+        expected_tail[page, offset * record_bytes:(offset + 1) * record_bytes] = (
+            expected_records[source_row]
+        )
+    compressed_sparse_mla.write_cache(
+        kv, cache, slots, page_size=page_size, cache_kind=cache_kind
+    )
+    torch.testing.assert_close(storage[first_page:], expected_tail, rtol=0, atol=0)
+    torch.testing.assert_close(
+        storage[0], torch.full_like(storage[0], _SENTINEL), rtol=0, atol=0
+    )
+    # Explicitly defend all last 64 post-RoPE values being quantized, not copied
+    # as BF16 or omitted as a tail. The complete record oracle above also checks
+    # their group scales and the absence of outer scales/padding in each record.
+    data_bytes = 512 if cache_kind == "swa" else 256
+    last64_bytes = 64 if cache_kind == "swa" else 32
+    actual_row = cache[first_page, 2 * record_bytes:3 * record_bytes]
+    torch.testing.assert_close(
+        actual_row[data_bytes - last64_bytes:data_bytes],
+        expected_records[1, data_bytes - last64_bytes:data_bytes],
+        rtol=0, atol=0,
+    )
+
+
+@pytest.mark.parametrize("cache_kind", ["swa", "indexed"])
+@torch.inference_mode()
+def test_v41_writer_precompile_dynamic_rows_and_graph_replay(cache_kind: str) -> None:
+    device = require_sm120()
+    page_size = 3
+    page_bytes = compressed_sparse_mla.page_nbytes(
+        page_size, cache_format="deepseek_v41", cache_kind=cache_kind
+    )
+    kv = _v41_writer_inputs(5, device)
+    slots = torch.arange(5, dtype=torch.int64, device=device)
+    cache = torch.full((2, page_bytes), _SENTINEL, dtype=torch.uint8, device=device)
+    compressed_sparse_mla.compile_cache_writer(
+        kv[:3], cache[:1], slots[:3], page_size=page_size, cache_kind=cache_kind
+    )
+    torch.testing.assert_close(
+        cache, torch.full_like(cache, _SENTINEL), rtol=0, atol=0
+    )
+    freeze_kernel_resolution("V4.1 cache writers must reuse dynamic row/page counts")
+    try:
+        for rows in (0, 1, 5):
+            cache.fill_(_SENTINEL)
+            compressed_sparse_mla.write_cache(
+                kv[:rows], cache, slots[:rows],
+                page_size=page_size, cache_kind=cache_kind,
+            )
+            expected = torch.full_like(cache, _SENTINEL)
+            if rows:
+                records = pack_deepseek_v41_cache_reference(
+                    kv[:rows], page_size=1, cache_kind=cache_kind
+                )
+                expected.view(-1, records.shape[1])[:rows].copy_(records)
+            torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compressed_sparse_mla.write_cache(
+                kv, cache, slots, page_size=page_size, cache_kind=cache_kind
+            )
+        kv.neg_()
+        cache.fill_(_SENTINEL)
+        graph.replay()
+        records = pack_deepseek_v41_cache_reference(
+            kv, page_size=1, cache_kind=cache_kind
+        )
+        expected = torch.full_like(cache, _SENTINEL)
+        expected.view(-1, records.shape[1])[:5].copy_(records)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+    finally:
+        unfreeze_kernel_resolution()

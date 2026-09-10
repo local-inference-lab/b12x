@@ -15,11 +15,16 @@ COMMON_CONTEXT_TOKENS = (128, 16_384, 32_768, 65_536, 131_072)
 COMMON_PAGE_SIZES = (64, 128)
 COMMON_KV_DTYPES = ("bfloat16", "float8_e4m3fn")
 GDN_STATE_INDEX_COLUMNS = tuple(range(1, 9))
-QSA_BATCHES = COMMON_SEQUENCE_CAPACITIES
-QSA_CONTEXT_TOKENS = (2_048, 8_192, 32_768, 65_536, 131_072, 262_144)
-QSA_PAGE_SIZES = (16, 64)
-QSA_SPECULATIVE_CONTEXT_TOKENS = (8_192, 65_536, 131_072)
-QSA_POSITION_LAYOUTS = ((1, False), (3, False), (3, True))
+QSA_BATCHES = (4,)
+QSA_CONTEXT_TOKENS = (2_048, 32_768, 262_144)
+QSA_PAGE_SIZES = (16, 64, 1_504, 3_008)
+QSA_SPECULATIVE_CONTEXT_TOKENS = (32_768, 262_144)
+QSA_POSITION_LAYOUTS = ((3, True),)
+QSA_DIRECT_PREFILL_ROWS = {
+    2_048: (65, 128, 1_024, 2_048),
+    32_768: (65, 128, 1_024, 4_096, 6_016, 8_192),
+    262_144: (65, 128, 1_024, 4_096, 6_016, 8_192),
+}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -356,6 +361,7 @@ MLA_GEOMETRIES = (
 class SparseMlaGeometry:
     model_id: str
     layout: str
+    cache_format: str
     num_q_heads: int
     qk_head_dim: int
     v_head_dim: int
@@ -368,16 +374,21 @@ class SparseMlaGeometry:
 
 SPARSE_MLA_GEOMETRIES = tuple(
     SparseMlaGeometry(
-        model_id=f"deepseek-v4-flash-{contract}-h{heads}",
+        model_id=f"{model_name}-{contract}-h{heads}",
         layout="compressed_dsv4",
+        cache_format=cache_format,
         num_q_heads=heads,
         qk_head_dim=512,
-        v_head_dim=448,
+        v_head_dim=512,
         swa_width=128,
         swa_page_size=64,
         indexed_width=indexed_width,
         indexed_page_size=indexed_page_size,
         source="benchmark_compressed_sparse_mla.py TP-sliced contracts",
+    )
+    for model_name, cache_format in (
+        ("deepseek-v4-flash", "deepseek_v4"),
+        ("deepseek-v41", "deepseek_v41"),
     )
     for heads in (64, 32, 16, 8)
     for contract, indexed_width, indexed_page_size in (
@@ -708,72 +719,57 @@ def _qsa_case(
 
 
 def qsa_cases() -> tuple[SweepCase, ...]:
+    """Return the measured selected-prefill policy corpus.
+
+    Every case executes the direct ``rows > 64`` route with the serving plan
+    capacity (batch four, three speculative tokens, interleaved 3-axis M-RoPE).
+    The reduced planner intentionally leaves every other page/capacity point
+    uncovered so AUTO resolution uses the N32 heuristic there.
+    """
     cases = []
     for geometry in QSA_GEOMETRIES:
         for kv_dtype in COMMON_KV_DTYPES:
             for main_page_size in QSA_PAGE_SIZES:
-                for max_batch in QSA_BATCHES:
-                    for max_seq_len in QSA_CONTEXT_TOKENS:
-                        for position_axes, mrope_interleaved in QSA_POSITION_LAYOUTS:
-                            query = _qsa_query(
-                                geometry=geometry,
-                                kv_dtype=kv_dtype,
-                                main_page_size=main_page_size,
-                                max_batch=max_batch,
-                                max_q_rows=max_batch,
-                                max_seq_len=max_seq_len,
-                                max_speculative_tokens=0,
-                                position_axes=position_axes,
-                                mrope_interleaved=mrope_interleaved,
-                            )
-                            cases.append(
-                                _qsa_case(
-                                    geometry=geometry,
-                                    query=query,
-                                    label_suffix="throughput",
-                                )
-                            )
-                for max_seq_len in QSA_SPECULATIVE_CONTEXT_TOKENS:
-                    for position_axes, mrope_interleaved in QSA_POSITION_LAYOUTS:
+                for max_seq_len, row_counts in QSA_DIRECT_PREFILL_ROWS.items():
+                    for max_q_rows in row_counts:
                         query = _qsa_query(
                             geometry=geometry,
                             kv_dtype=kv_dtype,
                             main_page_size=main_page_size,
-                            max_batch=1,
-                            max_q_rows=4,
+                            max_batch=4,
+                            max_q_rows=max_q_rows,
                             max_seq_len=max_seq_len,
                             max_speculative_tokens=3,
-                            position_axes=position_axes,
-                            mrope_interleaved=mrope_interleaved,
+                            position_axes=3,
+                            mrope_interleaved=True,
                         )
                         cases.append(
-                            _qsa_case(
-                                geometry=geometry,
+                            SweepCase.create(
+                                group_id=(
+                                    f"{geometry.model_id}-{kv_dtype}"
+                                    f"-page{main_page_size}"
+                                ),
                                 query=query,
-                                label_suffix="speculative",
+                                scenario="direct-prefill",
+                                metadata={
+                                    "model_id": geometry.model_id,
+                                    "source": geometry.source,
+                                    "tensor_parallel_size": (
+                                        geometry.tensor_parallel_size
+                                    ),
+                                    "rows": max_q_rows,
+                                    "context": max_seq_len,
+                                    "main_page_size": main_page_size,
+                                    "kv_dtype": kv_dtype,
+                                    "kind": "prefill",
+                                },
+                                label=(
+                                    f"{geometry.model_id}-direct-prefill"
+                                    f"-r{max_q_rows}-c{max_seq_len}"
+                                    f"-p{main_page_size}-{kv_dtype}"
+                                ),
                             )
                         )
-                for max_batch in QSA_BATCHES:
-                    for max_q_rows in COMMON_PREFILL_TOKEN_CAPACITIES:
-                        for max_speculative_tokens in (0, 3):
-                            query = _qsa_query(
-                                geometry=geometry,
-                                kv_dtype=kv_dtype,
-                                main_page_size=main_page_size,
-                                max_batch=max_batch,
-                                max_q_rows=max_q_rows,
-                                max_seq_len=131_072,
-                                max_speculative_tokens=max_speculative_tokens,
-                                position_axes=3,
-                                mrope_interleaved=True,
-                            )
-                            cases.append(
-                                _qsa_case(
-                                    geometry=geometry,
-                                    query=query,
-                                    label_suffix=f"prefill-{max_q_rows}",
-                                )
-                            )
     return tuple(cases)
 
 
@@ -831,9 +827,10 @@ def sparse_mla_cases() -> tuple[SweepCase, ...]:
         ):
             query = {
                 "layout": geometry.layout,
+                "cache_format": geometry.cache_format,
                 "mode": "decode" if rows <= 256 else "extend",
                 "q_dtype": "bfloat16",
-                "kv_dtype": "float8_e4m3fn",
+                "kv_dtype": "uint8" if geometry.cache_format == "deepseek_v41" else "float8_e4m3fn",
                 "num_q_heads": geometry.num_q_heads,
                 "qk_head_dim": geometry.qk_head_dim,
                 "v_head_dim": geometry.v_head_dim,
@@ -877,9 +874,11 @@ def _manifest_payload(component: str) -> dict[str, object]:
         shared["qsa_context_tokens"] = list(QSA_CONTEXT_TOKENS)
         shared["qsa_page_sizes"] = list(QSA_PAGE_SIZES)
         shared["qsa_position_layouts"] = [list(item) for item in QSA_POSITION_LAYOUTS]
-        shared["qsa_speculative_context_tokens"] = list(
-            QSA_SPECULATIVE_CONTEXT_TOKENS
-        )
+        shared["qsa_speculative_context_tokens"] = list(QSA_SPECULATIVE_CONTEXT_TOKENS)
+        shared["qsa_direct_prefill_rows"] = {
+            str(context): list(rows)
+            for context, rows in QSA_DIRECT_PREFILL_ROWS.items()
+        }
     elif component == "mla":
         shared["geometries"] = [asdict(item) for item in MLA_GEOMETRIES]
     elif component == "sparse_mla":
@@ -912,6 +911,7 @@ __all__ = [
     "QSA_GEOMETRIES",
     "QSA_BATCHES",
     "QSA_CONTEXT_TOKENS",
+    "QSA_DIRECT_PREFILL_ROWS",
     "QSA_PAGE_SIZES",
     "QSA_POSITION_LAYOUTS",
     "QSA_SPECULATIVE_CONTEXT_TOKENS",

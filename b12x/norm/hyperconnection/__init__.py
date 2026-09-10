@@ -3,6 +3,8 @@
 The residual state is BF16 ``[T, S*H]`` and is logically ``[T, S, H]``.
 Projection GEMMs stay outside this op; this package owns the grouped norm,
 scaled activation, gate reduction, and residual injection kernels around them.
+Engram uses the same multi-stream geometry with an ordinary affine RMSNorm
+(``zero_centered=False``) and ``run_engram_mix`` signed-square-root gating.
 
 Planned lifecycle: ``plan(Caps(...))`` supplies fixed launch policy. ``bind``
 attaches capacity storage for the grouped norm, scaled activation, and gate
@@ -10,6 +12,14 @@ reduction launches. The combine launches return live-sized tensors owned by
 PyTorch so compiled graphs do not functionalize capacity-sized mutations. The
 explicitly named ``reference`` module contains PyTorch correctness oracles and
 is never a runtime fallback for the public GPU entry points.
+
+Stateless ``run_swiglu``, ``run_add``, and ``run_sigmoid`` require disjoint
+caller-owned ``out`` tensors and warmup before capture. Add/sigmoid accept
+BF16 or FP32 inputs and outputs with FP32 arithmetic. SwiGLU consumes BF16
+gate/up FC1 output, uses an upper-only gate clamp and symmetric up clamp,
+and rounds only its BF16 output unless ``round_silu=True`` selects vision's
+intermediate BF16 SiLU rounding. Ordinary grouped RMSNorm preserves FP32
+affine weights when ``zero_centered=False``.
 """
 
 from __future__ import annotations
@@ -35,10 +45,14 @@ META = OpMeta(
         "run_gate_mean",
         "run_combine",
         "run_combine_norm",
+        "run_engram_mix",
+        "run_swiglu",
+        "run_add",
+        "run_sigmoid",
         "reference",
         "is_supported",
     ),
-    dtypes=("bf16",),
+    dtypes=("bf16", "fp32"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
@@ -69,9 +83,13 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         reference,
         run_combine,
         run_combine_norm,
+        run_engram_mix,
         run_gate_mean,
         run_grouped_rmsnorm,
         run_scaled_silu,
+        run_swiglu,
+        run_add,
+        run_sigmoid,
     )
 
 install_lazy_api(globals(), META)

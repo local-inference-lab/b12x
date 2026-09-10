@@ -50,6 +50,7 @@ class B12XCompressedSparseMLAScratchCaps:
     decode_row_capacity: int | None = None
     page_size: int = 64
     layout: str = "compressed_dsv4"
+    cache_format: Literal["deepseek_v4", "deepseek_v41"] = "deepseek_v4"
     mode: Literal["decode", "extend"] = "decode"
     swa_width: int | None = None
     indexed_width: int | None = None
@@ -68,6 +69,8 @@ class B12XCompressedSparseMLAScratchCaps:
         object.__setattr__(self, "max_width", max(int(self.max_width), 1))
         if self.layout != "compressed_dsv4":
             raise ValueError(f"unsupported compressed sparse MLA layout {self.layout!r}")
+        if self.cache_format not in ("deepseek_v4", "deepseek_v41"):
+            raise ValueError(f"unsupported compressed MLA cache_format {self.cache_format!r}")
         if self.mode not in ("decode", "extend"):
             raise ValueError(f"unsupported compressed sparse MLA mode {self.mode!r}")
         legacy_shared_width = (
@@ -156,6 +159,7 @@ class _B12XCompressedSparseMLAScratchLayout:
     kv_chunk_size_offset_bytes: int
     num_chunks_offset_bytes: int
     sm_scale_offset_bytes: int
+    mapped_indices_offset_bytes: int
 
 
 @dataclass(kw_only=True)
@@ -181,12 +185,14 @@ class B12XCompressedSparseMLAScratch:
     indexed_page_size: int
     layout: str
     mode: str = "decode"
+    cache_format: str = "deepseek_v4"
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
     final_lse: torch.Tensor | None = None
+    mapped_indices: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
@@ -292,6 +298,10 @@ def _compressed_sparse_mla_scratch_layout(
     sm_scale_offset_bytes = cursor
     cursor += dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+    mapped_indices_offset_bytes = cursor
+    cursor += max_total_q * int(caps.indexed_width) * dtype_nbytes(torch.int32)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
 
     return _B12XCompressedSparseMLAScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
@@ -302,6 +312,7 @@ def _compressed_sparse_mla_scratch_layout(
         kv_chunk_size_offset_bytes=kv_chunk_size_offset_bytes,
         num_chunks_offset_bytes=num_chunks_offset_bytes,
         sm_scale_offset_bytes=sm_scale_offset_bytes,
+        mapped_indices_offset_bytes=mapped_indices_offset_bytes,
     )
 
 
@@ -421,6 +432,12 @@ def _materialize_compressed_sparse_mla_scratch(
         shape=(1,),
         dtype=torch.float32,
     )
+    mapped_indices, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=layout.mapped_indices_offset_bytes,
+        shape=(max_total_q, int(caps.indexed_width)),
+        dtype=torch.int32,
+    )
     scratch = B12XCompressedSparseMLAScratch(
         shared_scratch=scratch_storage,
         device=caps.device,
@@ -440,12 +457,14 @@ def _materialize_compressed_sparse_mla_scratch(
         max_indexed_width=caps.indexed_width,
         indexed_page_size=caps.indexed_page_size,
         layout=caps.layout,
+        cache_format=caps.cache_format,
         mode=caps.mode,
         use_cuda_graph=caps.use_cuda_graph,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         output_buffer=_split_output_buffer_from_tmp(tmp_output),
         final_lse=final_lse,
+        mapped_indices=mapped_indices,
         kv_chunk_size_ptr=kv_chunk_size_ptr,
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
@@ -457,10 +476,8 @@ def _materialize_compressed_sparse_mla_scratch(
         max_chunks=caps.max_chunks_per_row,
         decode_row_capacity=caps.decode_row_capacity,
     )
-    scratch.set_split_chunk_config(
-        kv_chunk_size=split_cfg.chunk_size,
-        num_chunks=split_cfg.num_chunks,
-    )
+    scratch.kv_chunk_size_value = split_cfg.chunk_size
+    scratch.num_chunks_value = split_cfg.num_chunks
     return scratch
 
 

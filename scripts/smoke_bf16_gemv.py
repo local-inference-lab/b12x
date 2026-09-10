@@ -47,24 +47,22 @@ def main() -> None:
     )
 
     from b12x._lib.compiler import compile_cache_info
-    from b12x.gemm.bf16_gemv import SMALL_M_MAX
-    from b12x.gemm.bf16_gemv._kernel import compile_bf16_gemv_small_n
+    from b12x.gemm.bf16_gemv import SMALL_M_MAX, mm, precompile
 
     n, k = args.n, args.k
     m_max = args.m_max or SMALL_M_MAX
     torch.manual_seed(0)
     device = torch.device("cuda")
     w = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+    print(f"[smoke] warming static geometry ({n}x{k})...", flush=True)
+    precompile(w)
+    print(f"[smoke] warm ({compile_cache_info()})", flush=True)
 
     for m in range(1, m_max + 1):
-        print(f"[smoke] m={m}: compiling ({n}x{k})...", flush=True)
-        launch = compile_bf16_gemv_small_n(m, n, k)
-        print(f"[smoke] m={m}: compiled  ({compile_cache_info()})", flush=True)
-
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
         y = torch.empty(m, n, device=device, dtype=torch.bfloat16)
         print(f"[smoke] m={m}: launching...", flush=True)
-        launch(x, w, y)
+        mm(x, w, out=y)
         print(f"[smoke] m={m}: launched, syncing...", flush=True)
         torch.cuda.synchronize()
         print(f"[smoke] m={m}: synced", flush=True)

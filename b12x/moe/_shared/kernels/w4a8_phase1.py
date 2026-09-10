@@ -23,6 +23,7 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint32
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    div_rn_f32,
     e2m1x8_to_qmma_e2m1x8,
     fabs_f32,
     get_ptr_as_int64,
@@ -97,12 +98,14 @@ class W4A8MaterializedPhase1Kernel:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
+        numerical_recipe: str = "default",
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
                 f"materialized phase 1 source_tile_m must be 64 or 128, got {source_tile_m}"
             )
         self.fast_math = bool(fast_math)
+        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
         self.deterministic_output = bool(deterministic_output)
@@ -142,6 +145,7 @@ class W4A8MaterializedPhase1Kernel:
         w13_sfb_rp: cute.Tensor,
         intermediate_u32: cute.Tensor,
         token_map: cute.Tensor,
+        token_weights: cute.Tensor,
         task_expert: cute.Tensor,
         task_valid_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
@@ -162,6 +166,7 @@ class W4A8MaterializedPhase1Kernel:
             w13_sfb_rp,
             intermediate_u32,
             token_map,
+            token_weights,
             task_expert,
             task_valid_rows,
             expert_tile_base,
@@ -399,6 +404,19 @@ class W4A8MaterializedPhase1Kernel:
     ) -> cutlass.Float32:
         gate = alpha_value * gate
         up = alpha_value * up
+        if cutlass.const_expr(self.deepseek_v41):
+            gate = gate.to(cutlass.BFloat16).to(cutlass.Float32)
+            up = up.to(cutlass.BFloat16).to(cutlass.Float32)
+            gate = cutlass.min(gate, cutlass.Float32(10.0))
+            up = cutlass.max(cutlass.min(up, cutlass.Float32(10.0)), cutlass.Float32(-10.0))
+            # torch SiLU is x / (1 + exp(-x)), not x * rcp.approx.
+            # A one-ulp change here can cross the subsequent BF16 midpoint
+            # and then the E4M3 midpoint; preserve the actual FP32 boundary.
+            silu = div_rn_f32(
+                gate,
+                cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=False),
+            )
+            return silu * up
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
@@ -426,6 +444,7 @@ class W4A8MaterializedPhase1Kernel:
         w13_sfb_rp: cute.Tensor,
         intermediate_u32: cute.Tensor,
         token_map: cute.Tensor,
+        token_weights: cute.Tensor,
         alpha: cute.Tensor,
         input_global_scale: cute.Tensor,
         trellis_lut: cute.Tensor,
@@ -671,6 +690,22 @@ class W4A8MaterializedPhase1Kernel:
                                 bid_a=kb,
                                 bid_b=kb,
                             )
+                        elif cutlass.const_expr(self.deepseek_v41):
+                            # The published expert GEMM rounds each scaled K32
+                            # partial, then accumulates it with FP32 scalar adds.
+                            # Do not feed a long-lived sum back into QMMA.
+                            g0, g1, g2, g3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                a_frag[blk, 0], a_frag[blk, 1],
+                                a_frag[blk, 2], a_frag[blk, 3],
+                                gb0, gb1, asc[blk], gate_sfb,
+                                bid_a=kb, bid_b=kb,
+                            )
+                            g0 = gate_fragment[0] + g0
+                            g1 = gate_fragment[1] + g1
+                            g2 = gate_fragment[2] + g2
+                            g3 = gate_fragment[3] + g3
                         else:
                             g0, g1, g2, g3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                 gate_fragment[0],
@@ -710,6 +745,19 @@ class W4A8MaterializedPhase1Kernel:
                                 bid_a=kb,
                                 bid_b=kb,
                             )
+                        elif cutlass.const_expr(self.deepseek_v41):
+                            u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                a_frag[blk, 0], a_frag[blk, 1],
+                                a_frag[blk, 2], a_frag[blk, 3],
+                                ub0, ub1, asc[blk], up_sfb,
+                                bid_a=kb, bid_b=kb,
+                            )
+                            u0 = up_fragment[0] + u0
+                            u1 = up_fragment[1] + u1
+                            u2 = up_fragment[2] + u2
+                            u3 = up_fragment[3] + u3
                         else:
                             u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                 up_fragment[0],
@@ -977,6 +1025,18 @@ class W4A8MaterializedPhase1Kernel:
                     act3 = self._activated_value(
                         gate_fragment[3], up_fragment[3], alpha_value
                     )
+                    if cutlass.const_expr(self.deepseek_v41):
+                        route_base = Int64(source_m_tile) * Int64(self.source_tile_m) + Int64(m_half * self.tile_m)
+                        weight_lo = cutlass.Float32(0.0)
+                        weight_hi = cutlass.Float32(0.0)
+                        if row_lo < valid_rows:
+                            weight_lo = token_weights[route_base + Int64(row_lo)].to(cutlass.Float32)
+                        if row_hi < valid_rows:
+                            weight_hi = token_weights[route_base + Int64(row_hi)].to(cutlass.Float32)
+                        act0 = act0 * weight_lo
+                        act1 = act1 * weight_lo
+                        act2 = act2 * weight_hi
+                        act3 = act3 * weight_hi
                     st_shared_u32(
                         epilogue_base + (row_lo * Int32(self.tile_n) + col) * Int32(2),
                         pack_f32x2_to_bfloat2(act0, act1),
@@ -1007,6 +1067,8 @@ class W4A8MaterializedPhase1Kernel:
                     abs_value = fabs_f32(value)
                     if abs_value > block_max:
                         block_max = abs_value
+                if cutlass.const_expr(self.deepseek_v41):
+                    block_max = cutlass.max(block_max, cutlass.Float32(1.0e-4))
                 if cutlass.const_expr(self.w4a8_trellis):
                     payload, scale_byte = quantize_block_fp8_mx(
                         _w4a8_trellis_permute_k32(values), block_max
@@ -1045,6 +1107,7 @@ class W4A8MaterializedPhase1Kernel:
         w13_sfb_rp: cute.Tensor,
         intermediate_u32: cute.Tensor,
         token_map: cute.Tensor,
+        token_weights: cute.Tensor,
         task_expert: cute.Tensor,
         task_valid_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
@@ -1117,6 +1180,7 @@ class W4A8MaterializedPhase1Kernel:
                     w13_sfb_rp,
                     intermediate_u32,
                     token_map,
+                    token_weights,
                     alpha,
                     input_global_scale,
                     trellis_lut,

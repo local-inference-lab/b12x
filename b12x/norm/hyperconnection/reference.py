@@ -24,8 +24,9 @@ def grouped_rmsnorm(
     *,
     streams: int,
     eps: float,
+    zero_centered: bool = True,
 ) -> torch.Tensor:
-    """Gemma RMSNorm each stream with FP32 reductions and zero-centered weight."""
+    """RMSNorm each stream with optional Gemma zero-centered affine weights."""
     logical = _logical_state(state, streams)
     if tuple(weight.shape) != (int(state.shape[1]),):
         raise ValueError(
@@ -35,7 +36,8 @@ def grouped_rmsnorm(
     normalized = logical.float() * torch.rsqrt(
         logical.float().square().mean(dim=-1, keepdim=True) + float(eps)
     )
-    return (normalized.flatten(-2) * (1.0 + weight.float())).to(state.dtype)
+    offset = 1.0 if zero_centered else 0.0
+    return (normalized.flatten(-2) * (offset + weight.float())).to(state.dtype)
 
 
 def scaled_silu(projected_down: torch.Tensor, *, streams: int) -> torch.Tensor:

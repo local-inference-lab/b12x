@@ -1,0 +1,1100 @@
+{
+  "schema_version": 1,
+  "prs": {
+    "56214": {
+      "number": 56214,
+      "title": "[Model] Support DeepSeek-V4.1-Flash",
+      "url": "https://github.com/vllm-project/vllm/pull/56214",
+      "author": "zyongye",
+      "state": "open",
+      "merged": false,
+      "draft": false,
+      "head_repository": "vllm-project/vllm",
+      "head_sha": "e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba",
+      "base_sha": "9e2570656013a90cb601b391723af4bf9b3207d4",
+      "changed_files": 147,
+      "additions": 20031,
+      "deletions": 542
+    },
+    "56205": {
+      "number": 56205,
+      "title": "[Feat][Model] Support SWA-bounded replay for DeepSeek-V4.1-Flash",
+      "url": "https://github.com/vllm-project/vllm/pull/56205",
+      "author": "ivanium",
+      "state": "open",
+      "merged": false,
+      "draft": false,
+      "head_repository": "vllm-project/vllm",
+      "head_sha": "61053de9bfebe9b79ccc51aca1ede6ae01e7f459",
+      "base_sha": "e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba",
+      "changed_files": 156,
+      "additions": 20327,
+      "deletions": 546
+    },
+    "56215": {
+      "number": 56215,
+      "title": "[Kernel] Optional Q-norm in fused DSv4 MLA epilogue; group_size=32 for packed FP8 quant",
+      "url": "https://github.com/vllm-project/vllm/pull/56215",
+      "author": "zyongye",
+      "state": "closed",
+      "merged": true,
+      "draft": false,
+      "head_repository": "zyongye/vllm",
+      "head_sha": "443e95ed45422f386588da43d4bf8236104b704d",
+      "base_sha": "9e2570656013a90cb601b391723af4bf9b3207d4",
+      "changed_files": 6,
+      "additions": 267,
+      "deletions": 148
+    },
+    "56208": {
+      "number": 56208,
+      "title": "[Model] Support DeepSeek-V4.1-Flash in Rust and Python frontends",
+      "url": "https://github.com/vllm-project/vllm/pull/56208",
+      "author": "BugenZhao",
+      "state": "open",
+      "merged": false,
+      "draft": false,
+      "head_repository": "BugenZhao/vllm",
+      "head_sha": "18e1282aa5625983a704320fbbf2a055cc60feeb",
+      "base_sha": "9e2570656013a90cb601b391723af4bf9b3207d4",
+      "changed_files": 52,
+      "additions": 2983,
+      "deletions": 113
+    }
+  },
+  "model_files": [
+    {
+      "filename": "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 58,
+      "sha": "06fe7108bd610c460607e99f76ba31a82dcb1c76"
+    },
+    {
+      "filename": "csrc/libtorch_stable/ops.h",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "sha": "2d23115d69e9e243c460aa8a8b32c7abeda60e1a"
+    },
+    {
+      "filename": "csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu",
+      "status": "modified",
+      "additions": 80,
+      "deletions": 71,
+      "sha": "06fa29eaba2910e50f634c0b178bfb6dc992b4a3"
+    },
+    {
+      "filename": "csrc/libtorch_stable/torch_bindings.cpp",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "sha": "9820fe6af10077113782ab2c571d8ace9eef2bee"
+    },
+    {
+      "filename": "rust/Cargo.lock",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "sha": "7cd52d6b1c0ea5333a266f9bb2c43fa2eb1e74f0"
+    },
+    {
+      "filename": "rust/Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "sha": "a9421e7c4aca32f6c5032aa4ca25bf1bef564100"
+    },
+    {
+      "filename": "rust/src/chat/src/backend/hf.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "sha": "717bde28983698b0ae1d33151b7bc953e4510d00"
+    },
+    {
+      "filename": "rust/src/chat/src/error.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "82a2097c6b3af1208ab60cf537d6a878762ebf00"
+    },
+    {
+      "filename": "rust/src/chat/src/lib.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "sha": "5331e4d762d346e9a982c11a20908565ddda8b15"
+    },
+    {
+      "filename": "rust/src/chat/src/multimodal.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 1,
+      "sha": "f342fde76496cdfea5b390cd722eaab3b731ec09"
+    },
+    {
+      "filename": "rust/src/chat/src/multimodal/expand.rs",
+      "status": "modified",
+      "additions": 136,
+      "deletions": 8,
+      "sha": "4f9581ce1f638594ea51fb59b2b0bbb9ca5c1d4b"
+    },
+    {
+      "filename": "rust/src/chat/src/parser/reasoning/mod.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "sha": "e02417011e06119239d26811cfe9fab481e3bb1d"
+    },
+    {
+      "filename": "rust/src/chat/src/parser/reasoning/tests.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "sha": "16189c74327f25cdae5fd2cde50e4695ec7bebb3"
+    },
+    {
+      "filename": "rust/src/chat/src/parser/tool/mod.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "sha": "7b3ca2201247d00cb6f2709c2ee01495e709b426"
+    },
+    {
+      "filename": "rust/src/chat/src/parser/tool/tests.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "sha": "21d2149113e20be78c992618cde259cd7bf0e117"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek.rs",
+      "status": "renamed",
+      "additions": 230,
+      "deletions": 59,
+      "sha": "ab435028ebf3689a79b29b1867db55919ae407a5"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v4/mod.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "sha": "155a6ee1403bbf7760e5f716f22725df09c66d65"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v41/fixtures/test_output_1.txt",
+      "status": "added",
+      "additions": 38,
+      "deletions": 0,
+      "sha": "089708668803c94fa35a096a4360fe3b3b0dd223"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v41/fixtures/test_output_2.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "4e93ce2cbbcee1740a1edf3491fcf2c6ceaffab4"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v41/fixtures/test_output_developer_tools.txt",
+      "status": "added",
+      "additions": 30,
+      "deletions": 0,
+      "sha": "99f4af0d0edaa49a1f06bd0c135d1637c2c9f74f"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v41/mod.rs",
+      "status": "added",
+      "additions": 33,
+      "deletions": 0,
+      "sha": "4e5ddb37257ed2e2e74d4fafa53cb58037b5bf6f"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/deepseek_v41/tests.rs",
+      "status": "added",
+      "additions": 223,
+      "deletions": 0,
+      "sha": "d7b0c538bb5417afb715c58bbd75a4bec3062edd"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/mod.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "a4649a34f70adf1dc76eb13d7af993636204a562"
+    },
+    {
+      "filename": "rust/src/chat/src/renderer/selection.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "sha": "0ece893762f33a0460c9bfa10b0001ebf12478eb"
+    },
+    {
+      "filename": "rust/src/chat/tests/roundtrip.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 1,
+      "sha": "64e11fecdacb05a4a2122a4151f532e42546c119"
+    },
+    {
+      "filename": "rust/src/parser/src/reasoning/mod.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "sha": "b58360703aad3d47bb3ab854a5acc4d3844728d2"
+    },
+    {
+      "filename": "rust/src/parser/src/tool/deepseek_dsml/deepseek_v41.rs",
+      "status": "added",
+      "additions": 47,
+      "deletions": 0,
+      "sha": "44658b1d44f867b5f6590f4a9bf42e14281368d8"
+    },
+    {
+      "filename": "rust/src/parser/src/tool/deepseek_dsml/deepseek_v41/structural_tag.rs",
+      "status": "added",
+      "additions": 108,
+      "deletions": 0,
+      "sha": "d5fb6118fb62f24d5ef0305e0d8b81b986f11598"
+    },
+    {
+      "filename": "rust/src/parser/src/tool/deepseek_dsml/deepseek_v41/tests.rs",
+      "status": "added",
+      "additions": 113,
+      "deletions": 0,
+      "sha": "7669e06f4cfe040272e83c63d0ca7e06f0884882"
+    },
+    {
+      "filename": "rust/src/parser/src/tool/deepseek_dsml/mod.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 16,
+      "sha": "b932005d95df76a804f102f14ab305e81ddbdb56"
+    },
+    {
+      "filename": "rust/src/parser/src/tool/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "sha": "57bbb5952889e58ead46d211485b0dad87cdc4fd"
+    },
+    {
+      "filename": "rust/src/server/src/error.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "sha": "b658388cbdd4801ec8dd897b408b37bcaab971e1"
+    },
+    {
+      "filename": "tests/fusion/test_quant_activation_contract.py",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "sha": "f698a272f5ead0770aedeff83a5a1da818a48010"
+    },
+    {
+      "filename": "tests/kernels/core/test_fused_q_kv_rmsnorm.py",
+      "status": "modified",
+      "additions": 189,
+      "deletions": 0,
+      "sha": "700eed2a7948853066e132583094750ac6a4fef1"
+    },
+    {
+      "filename": "tests/kernels/quantization/test_per_token_group_quant.py",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "sha": "a2788d0583042e68358e4d46f9bdb53501a6475e"
+    },
+    {
+      "filename": "tests/kernels/quantization/test_rocm_mxfp8_linear.py",
+      "status": "added",
+      "additions": 144,
+      "deletions": 0,
+      "sha": "1d5e62c6c4b1554350bf0656f9c4e4b7fed101f4"
+    },
+    {
+      "filename": "tests/kernels/test_compressor_kv_cache.py",
+      "status": "modified",
+      "additions": 432,
+      "deletions": 0,
+      "sha": "1f6601dc6cfcc8a568f8bc2ab5eed41e273c9541"
+    },
+    {
+      "filename": "tests/kernels/test_engram.py",
+      "status": "added",
+      "additions": 778,
+      "deletions": 0,
+      "sha": "f7aa6dd03e79674c5a68086543f9660232366bfd"
+    },
+    {
+      "filename": "tests/kernels/test_fused_deepseek_v4_qnorm_rope_kv_insert.py",
+      "status": "modified",
+      "additions": 99,
+      "deletions": 13,
+      "sha": "0e25884368c1cb50c27d04db8533363e25fd083a"
+    },
+    {
+      "filename": "tests/kernels/test_fused_indexer_q_rope_quant.py",
+      "status": "modified",
+      "additions": 359,
+      "deletions": 9,
+      "sha": "8fd19ffb0b438bf37a419d472dc24e26c4a18c14"
+    },
+    {
+      "filename": "tests/kernels/test_fused_inv_rope_fp8_quant.py",
+      "status": "modified",
+      "additions": 88,
+      "deletions": 17,
+      "sha": "d27144a38e9bd669825fd529e36d0f4c2e98c1f0"
+    },
+    {
+      "filename": "tests/kernels/test_mhc_kernels.py",
+      "status": "modified",
+      "additions": 278,
+      "deletions": 1,
+      "sha": "e3f445b576a3fdf70ab19e7b64d9f79759b6c062"
+    },
+    {
+      "filename": "tests/model_executor/layers/test_mla_short_prefill_indexer.py",
+      "status": "modified",
+      "additions": 110,
+      "deletions": 0,
+      "sha": "de6518ebec7906e26fa92bd93c57d3141e741f22"
+    },
+    {
+      "filename": "tests/models/registry.py",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "44cda9960d9fb546d4c5f0e77a63097e0d5873e0"
+    },
+    {
+      "filename": "tests/models/test_deepseek_v4_mega_moe.py",
+      "status": "modified",
+      "additions": 230,
+      "deletions": 7,
+      "sha": "f2a0154c9e0c30f346f594213b0667d597b27718"
+    },
+    {
+      "filename": "tests/models/test_dspark_mla.py",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 0,
+      "sha": "0d1507a03382838408d498a64b53bb6a2c2f2470"
+    },
+    {
+      "filename": "tests/models/test_registry.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "38d2352e97614de14b626b61644ae2a5897ae3bb"
+    },
+    {
+      "filename": "tests/parser/engine/test_deepseek_v41.py",
+      "status": "added",
+      "additions": 146,
+      "deletions": 0,
+      "sha": "cc7d6e0aedf4f1578d30be11ac5378142ad1d63d"
+    },
+    {
+      "filename": "tests/quantization/test_fp8.py",
+      "status": "modified",
+      "additions": 378,
+      "deletions": 0,
+      "sha": "a91c99bf5378b92f806c82997b2264aa1e48f512"
+    },
+    {
+      "filename": "tests/quantization/test_modelopt.py",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "sha": "06fb760866b0cacbbeeabcff9194b304a8947fca"
+    },
+    {
+      "filename": "tests/tokenizers_/fixtures/deepseek_v41/test_output_1.txt",
+      "status": "added",
+      "additions": 38,
+      "deletions": 0,
+      "sha": "089708668803c94fa35a096a4360fe3b3b0dd223"
+    },
+    {
+      "filename": "tests/tokenizers_/fixtures/deepseek_v41/test_output_2.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "4e93ce2cbbcee1740a1edf3491fcf2c6ceaffab4"
+    },
+    {
+      "filename": "tests/tokenizers_/test_deepseek_v41.py",
+      "status": "added",
+      "additions": 169,
+      "deletions": 0,
+      "sha": "a038db868d129a00966ee0f1846c232bfb89bd54"
+    },
+    {
+      "filename": "tests/tool_parsers/test_structural_tag_registry.py",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 0,
+      "sha": "b77b4efaffe6efc95011a5839d7323f623bec234"
+    },
+    {
+      "filename": "tests/v1/core/test_contiguous_kv_packing.py",
+      "status": "modified",
+      "additions": 102,
+      "deletions": 0,
+      "sha": "2bdb5e74a7b914aa780a66e51ac9a1cc559e8b7e"
+    },
+    {
+      "filename": "tests/v1/cudagraph/test_breakable_cudagraph.py",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 0,
+      "sha": "ded83d800de9a6c7f16b0617a525cc55c544e515"
+    },
+    {
+      "filename": "tests/v1/kv_connector/unit/test_mooncake_store_hma_e2e.py",
+      "status": "modified",
+      "additions": 99,
+      "deletions": 0,
+      "sha": "e6b730242981132d278acc0aeafd6998fddbe5ef"
+    },
+    {
+      "filename": "tests/v1/kv_connector/unit/test_nixl_desc_geometry.py",
+      "status": "modified",
+      "additions": 109,
+      "deletions": 0,
+      "sha": "778fd9a2da1cd76a3f98319abca09aae0723dcef"
+    },
+    {
+      "filename": "tests/v1/kv_connector/unit/test_simple_cpu_offload_connector.py",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 0,
+      "sha": "af4c7858fcaddb3934786f79d94457b209d2f8c8"
+    },
+    {
+      "filename": "tests/v1/simple_kv_offload/test_scheduler.py",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 11,
+      "sha": "cb19986b6b6db0d02a05e27d613ec55026335694"
+    },
+    {
+      "filename": "vllm/_aiter_ops.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "sha": "8503440c7d211c464abceb2389fac7cf7382274f"
+    },
+    {
+      "filename": "vllm/compilation/breakable_cudagraph.py",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 7,
+      "sha": "8e25d05c280f86b3f15fb660adf43525bcafc597"
+    },
+    {
+      "filename": "vllm/config/__init__.py",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "8036d29093f5699a34e03a29887ad28903671726"
+    },
+    {
+      "filename": "vllm/config/engram.py",
+      "status": "added",
+      "additions": 54,
+      "deletions": 0,
+      "sha": "a3749c6d9fd92bbe7a0fa4be35d3d81d35c0c684"
+    },
+    {
+      "filename": "vllm/config/kernel.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "f13b77c5e281718c51a55bd10d03effea043e489"
+    },
+    {
+      "filename": "vllm/config/model.py",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "sha": "98f96a3360def9c0c37ec00906230cd20c8fc7fc"
+    },
+    {
+      "filename": "vllm/config/speculative.py",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 8,
+      "sha": "d6a91ca2fea3bde8b0c3067ba36a1cc491bb5e47"
+    },
+    {
+      "filename": "vllm/config/vllm.py",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "sha": "6bc0613a8c445cdd03c79acb31b85c00b31df487"
+    },
+    {
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "67a935d7eedc2a4686a7b9c6d9f9fd3e4ca2775d"
+    },
+    {
+      "filename": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "sha": "67293e5526a34ae228a680d4c493b6cf7b4581b3"
+    },
+    {
+      "filename": "vllm/engine/arg_utils.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "sha": "f988535b1e4b6ea1f0bfecc9401e72910eb85b2a"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/attention/dsa/candidate_blocks.py",
+      "status": "added",
+      "additions": 234,
+      "deletions": 0,
+      "sha": "efc7c418cad6afbe330338f26e37daa9a04f8561"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/linear/__init__.py",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 3,
+      "sha": "1ea06b2a93bc0fbdbd145253b6155fafba0d6a27"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/linear/mxfp8/Mxfp8LinearKernel.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "sha": "3fe34029e5cbe660444016dfc92737b0f3c024b7"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/linear/mxfp8/deep_gemm.py",
+      "status": "added",
+      "additions": 128,
+      "deletions": 0,
+      "sha": "b74f11497b42a1a9d6e6b52bebc4b4285f9953b9"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 14,
+      "sha": "02700a0ced0c7f21b92152740882acfc9f60fa80"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/mhc/tilelang.py",
+      "status": "modified",
+      "additions": 200,
+      "deletions": 0,
+      "sha": "c4fe6dd1632840dc6f6dace84098a7beb6f50c69"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/mhc/tilelang_kernels.py",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 18,
+      "sha": "1c23d152b916d2e2556d2b177bcbbf76184380cd"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/mhc/torch.py",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 0,
+      "sha": "9c57cc169cc637156d0480216da5a3a40dfd38b9"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/mhc/triton.py",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 1,
+      "sha": "d94d71a6ea1c21675e427d7e58102c9f9bd9bc46"
+    },
+    {
+      "filename": "vllm/model_executor/kernels/mhc/warmup.py",
+      "status": "added",
+      "additions": 74,
+      "deletions": 0,
+      "sha": "6a42ca62227046ef2f1f843978434ba92e66f8a1"
+    },
+    {
+      "filename": "vllm/model_executor/layers/fusion/quant_activation.py",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "sha": "bd6cab668e8bcaef5693852b2ab84dfde7e13d26"
+    },
+    {
+      "filename": "vllm/model_executor/layers/quantization/__init__.py",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 2,
+      "sha": "84e0390657aa5afafb9c5f0af3047122f15e6c7c"
+    },
+    {
+      "filename": "vllm/model_executor/layers/quantization/modelopt.py",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 2,
+      "sha": "015fb18fb5d4c4594f88027eed5d5fd670f02180"
+    },
+    {
+      "filename": "vllm/model_executor/layers/quantization/utils/fp8_utils.py",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 17,
+      "sha": "e2d57ff02cea0de03217c42e83e500b639f17afe"
+    },
+    {
+      "filename": "vllm/model_executor/layers/quantization/utils/mxfp8_utils.py",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 2,
+      "sha": "bfcc69e4b1deecc2150165be852838eb9bdfae77"
+    },
+    {
+      "filename": "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "status": "modified",
+      "additions": 97,
+      "deletions": 4,
+      "sha": "1c1e73fa6a27247ef8b832ee22b4078fd218d8c6"
+    },
+    {
+      "filename": "vllm/model_executor/models/config.py",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "sha": "bbbe98bc8de037f59ca0214850976997b3bd3abd"
+    },
+    {
+      "filename": "vllm/model_executor/models/registry.py",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "sha": "b70b2d9b6378438388c48a01dbc6af5b6a6dec93"
+    },
+    {
+      "filename": "vllm/model_executor/warmup/deepseek_v4_mhc_warmup.py",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "sha": "fc7731509d6fbae96961d6bf812f764081ef60bf"
+    },
+    {
+      "filename": "vllm/model_executor/warmup/flashinfer_sparse_mla_warmup.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "sha": "5209b944345b92acb3050683e1d40d04358273e4"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py",
+      "status": "modified",
+      "additions": 88,
+      "deletions": 49,
+      "sha": "cc53f6bb361ace5ad03d9e14f1da673b23459fbd"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4/common/vision.py",
+      "status": "modified",
+      "additions": 95,
+      "deletions": 2,
+      "sha": "8152a8eb1f4090657931ab3560c5c019810c832c"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4/nvidia/model.py",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 15,
+      "sha": "a271ba4a57b26ff2ffbdbf40f23df6d333118be8"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "sha": "16e98abf23e1b1d8c818ba1640d17bee280e81ba"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4/nvidia/ops/o_proj.py",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 18,
+      "sha": "72ce43b46cbf048a6c798005ffbe136acb56581b"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/__init__.py",
+      "status": "added",
+      "additions": 20,
+      "deletions": 0,
+      "sha": "b69e1c6dcdd8e85a2cef78c751a44ee0738bc201"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/amd/__init__.py",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "sha": "208f01a7cb5ee04c88d276fec2082cd4e830884b"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/amd/dspark.py",
+      "status": "added",
+      "additions": 546,
+      "deletions": 0,
+      "sha": "3a6cef8aa74d76f4e155224c82cfbf44948b999e"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/amd/model.py",
+      "status": "added",
+      "additions": 1087,
+      "deletions": 0,
+      "sha": "99c963ecb77014e66e0285dbd88aad5610a219fb"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/amd/rocm.py",
+      "status": "added",
+      "additions": 905,
+      "deletions": 0,
+      "sha": "9271e7ae5a148a6c6b81b45a4f3fe096add9276b"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/amd/vl_model.py",
+      "status": "added",
+      "additions": 357,
+      "deletions": 0,
+      "sha": "91a13bd725067f18d5ce2c55cf1d96b4479864fd"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/attention.py",
+      "status": "added",
+      "additions": 1225,
+      "deletions": 0,
+      "sha": "77e98a376e955854b1f3fe69a34383cb4205df91"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/__init__.py",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "sha": "208f01a7cb5ee04c88d276fec2082cd4e830884b"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/engram.py",
+      "status": "added",
+      "additions": 1033,
+      "deletions": 0,
+      "sha": "f30c3a5606d11539936bdd49746265f568bd2469"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/mm_preprocess.py",
+      "status": "added",
+      "additions": 463,
+      "deletions": 0,
+      "sha": "8bd8d70caea3c7b46f172c1207ece169e0d57f4a"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/ops/__init__.py",
+      "status": "added",
+      "additions": 42,
+      "deletions": 0,
+      "sha": "73c4d1b4daab9e68afd0aa1a35c03465f4418dc4"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/ops/cache_utils.py",
+      "status": "added",
+      "additions": 1254,
+      "deletions": 0,
+      "sha": "e2da6f5e2bed5a5b4fae98682959a2be32de9666"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/ops/fused_compress_quant_cache.py",
+      "status": "added",
+      "additions": 383,
+      "deletions": 0,
+      "sha": "5950c4b6ba5c886d14b2bf5ab5272a74a583c0a9"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/ops/indexer_k_store.py",
+      "status": "added",
+      "additions": 253,
+      "deletions": 0,
+      "sha": "c4bd98b9e99ecf8742a70d7c1bbf373655be01e6"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/ops/query_quant.py",
+      "status": "added",
+      "additions": 142,
+      "deletions": 0,
+      "sha": "4894a615bc8ab8ac29c79284e9ae41188b81c071"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/common/rope.py",
+      "status": "added",
+      "additions": 53,
+      "deletions": 0,
+      "sha": "51ff8792699202ce124dbcafdd2444cf0188a73c"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/compressor.py",
+      "status": "added",
+      "additions": 323,
+      "deletions": 0,
+      "sha": "d09d97d04c2713addfe2f01afd43b705aefc08cf"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/__init__.py",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "sha": "208f01a7cb5ee04c88d276fec2082cd4e830884b"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/dspark.py",
+      "status": "added",
+      "additions": 558,
+      "deletions": 0,
+      "sha": "46fe2558ab7fca17afdc12f7b93b5e2972a60274"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py",
+      "status": "added",
+      "additions": 908,
+      "deletions": 0,
+      "sha": "802ddede9c642752e35bd0c62ff509fc815a0f54"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/flashmla.py",
+      "status": "added",
+      "additions": 387,
+      "deletions": 0,
+      "sha": "86d8fb2031cafa131919d19cc92e883e582fc9f7"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/model.py",
+      "status": "added",
+      "additions": 1111,
+      "deletions": 0,
+      "sha": "6d803736ec5c791fbbcf9130b71805f9d9cd893f"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/model_state.py",
+      "status": "added",
+      "additions": 98,
+      "deletions": 0,
+      "sha": "1ba0f4160333e1a04d4378ab97b11e9d1820d617"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/nvidia/vl_model.py",
+      "status": "added",
+      "additions": 357,
+      "deletions": 0,
+      "sha": "111936b43115128ad362f9cfc3b002936d7f670d"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/quant_config.py",
+      "status": "added",
+      "additions": 229,
+      "deletions": 0,
+      "sha": "c8361b2da5b2fb665fe3759b934449c13d67da74"
+    },
+    {
+      "filename": "vllm/models/deepseek_v4_1/sparse_mla.py",
+      "status": "added",
+      "additions": 231,
+      "deletions": 0,
+      "sha": "6a0f09f952e41386437ae9e23daa1863af23f403"
+    },
+    {
+      "filename": "vllm/parser/deepseek_v4.py",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 5,
+      "sha": "07364dafabec66eadce6d611b2bf385094359c21"
+    },
+    {
+      "filename": "vllm/parser/deepseek_v41.py",
+      "status": "added",
+      "additions": 62,
+      "deletions": 0,
+      "sha": "4e32c384cafc9ad852e1c81b8d5e23fa3b3eb65e"
+    },
+    {
+      "filename": "vllm/parser/engine/registered_adapters.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "sha": "8e10a1b5efbe61a85808167b822ad34757c9f080"
+    },
+    {
+      "filename": "vllm/reasoning/__init__.py",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "sha": "615820bb29a927cbbaca10048a9d9e81826dc36c"
+    },
+    {
+      "filename": "vllm/reasoning/deepseek_v41_engine_reasoning_parser.py",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "sha": "bace0eb4f807aaabd7111e095bcf38c332cb156c"
+    },
+    {
+      "filename": "vllm/renderers/registry.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "740c2023b28a9923c668be8981848b730b729242"
+    },
+    {
+      "filename": "vllm/tokenizers/deepseek_v41.py",
+      "status": "added",
+      "additions": 121,
+      "deletions": 0,
+      "sha": "3a577172708ed391c8c2771288db63e029422994"
+    },
+    {
+      "filename": "vllm/tokenizers/deepseek_v41_encoding.py",
+      "status": "added",
+      "additions": 577,
+      "deletions": 0,
+      "sha": "8971845d031716189feea095691563a9aff8ac24"
+    },
+    {
+      "filename": "vllm/tokenizers/registry.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "b9c9226675e1691a92f6c33f8d3a8abfbd492971"
+    },
+    {
+      "filename": "vllm/tool_parsers/__init__.py",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "sha": "c43a34772fc9206380411de32716c5e5eec64e23"
+    },
+    {
+      "filename": "vllm/tool_parsers/deepseekv41_engine_tool_parser.py",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "sha": "a4c699aeabc0f33125e7067a014e56bdee708466"
+    },
+    {
+      "filename": "vllm/tool_parsers/structural_tag_registry.py",
+      "status": "modified",
+      "additions": 96,
+      "deletions": 1,
+      "sha": "34e57840bed75bf9c82a824d1059875996d74491"
+    },
+    {
+      "filename": "vllm/transformers_utils/config.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "80e35229e6c35c8a645ac020ace34dda737c5dd6"
+    },
+    {
+      "filename": "vllm/transformers_utils/configs/__init__.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "fda48fd20db3e9d48925141a30b295cf889094d3"
+    },
+    {
+      "filename": "vllm/transformers_utils/configs/deepseek_v41.py",
+      "status": "added",
+      "additions": 76,
+      "deletions": 0,
+      "sha": "3a406d24bdc500081b10280078e96e27212b19b3"
+    },
+    {
+      "filename": "vllm/transformers_utils/model_arch_config_convertor.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "sha": "72f2920480a126b2cf37fc56ef29288abe793b32"
+    },
+    {
+      "filename": "vllm/v1/attention/backends/mla/indexer.py",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "sha": "70315e5348de75e55a3fd0eb956a5dc684618e68"
+    },
+    {
+      "filename": "vllm/v1/attention/backends/mla/sparse_swa.py",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 17,
+      "sha": "2375cce86ad267dc32b0dd7a4e200daccd1b5634"
+    },
+    {
+      "filename": "vllm/v1/attention/backends/registry.py",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "sha": "c1c63305767c8aebbd2942e7f092d9c0a537951e"
+    },
+    {
+      "filename": "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+      "status": "modified",
+      "additions": 105,
+      "deletions": 8,
+      "sha": "22f83ac2bfba718005c38052c3978b033e60a599"
+    },
+    {
+      "filename": "vllm/v1/core/kv_cache_utils.py",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 14,
+      "sha": "076e4932d8810185b1b38f8bb9d6989a9b3eda91"
+    },
+    {
+      "filename": "vllm/v1/simple_kv_offload/manager.py",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 9,
+      "sha": "2667c4df4129deab75b50e5845d4c9c81ef751a0"
+    },
+    {
+      "filename": "vllm/v1/worker/gpu/spec_decode/dspark/utils.py",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "sha": "7ac87280c268ac019fe924fd83f930cd648d4c76"
+    },
+    {
+      "filename": "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "sha": "8327742dcb3dc8aa7c4217e54c7480cc46c89d45"
+    },
+    {
+      "filename": "vllm/v1/worker/gpu_model_runner.py",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 3,
+      "sha": "df1c2df1335a1bfbc6cf8feb70ffd54caeb50545"
+    }
+  ],
+  "author_affiliation": {
+    "zyongye": "Inferact (public GitHub profile); not established as DeepSeek staff"
+  },
+  "integration_decision": "Use modeling PR as source after inspecting dependencies; do not import bounded-replay approximation into exact-reference qualification."
+}

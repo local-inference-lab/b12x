@@ -38,6 +38,7 @@ _GLM_NEXT_IO_STRIDE = 528
 # + 128B BF16 RoPE. The 288B NoPE+scales+pad region bulk-copies into the kv_fp8
 # row; RoPE is read from global/L2 by the math exactly like GLM.
 _NVFP4_IO_STRIDE = 432
+_GLM_NEXT_NVFP4_IO_STRIDE = 304
 _NVFP4_NOPE_SCALE_BYTES = 288
 _NVFP4_FP8_ROPE_IO_STRIDE = 368
 
@@ -59,6 +60,7 @@ def io_issue_gather_dsv4_nope(
     bi: cutlass.Constexpr,
     kv_smem_stride: cutlass.Constexpr,
     io_threads: cutlass.Constexpr = _IO_THREADS,
+    dsv41_swa: cutlass.Constexpr = True,
 ):
     """Gather one BI=64 DSV4 prefill tile into MG smem.
 
@@ -66,6 +68,15 @@ def io_issue_gather_dsv4_nope(
     ``io_gather_scales`` + ``io_bulk_gather_tile`` with
     ``KV_SMEM_COPY_BYTES == D_NOPE``.
     """
+    if cutlass.const_expr(kv_smem_stride == 544):
+        io_issue_gather_glm_mg(
+            kv_cache_u8, topk_indices, kv_fp8_dst_addr, full_mbar_ptr,
+            g_start, g_end, page_block_size, stride_kv_block, io_lane,
+            cache_policy, bi=bi, kv_smem_stride=kv_smem_stride,
+            io_threads=io_threads, scale_format=2, has_rope=False,
+            dsv41=True, dsv41_swa=dsv41_swa,
+        )
+        return
     _ios = Int64(_DSV4_IO_STRIDE)
     _nope = Int32(_DSV4_NOPE_BYTES)
     _foot = Int32(_DSV4_FOOTER_BYTES)
@@ -150,6 +161,8 @@ def io_issue_gather_glm_mg(
     has_rope: cutlass.Constexpr = True,
     per_token_latent_scale: cutlass.Constexpr = False,
     kv_sc_dst_addr: Int32 = Int32(0),
+    dsv41: cutlass.Constexpr = False,
+    dsv41_swa: cutlass.Constexpr = True,
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -163,19 +176,36 @@ def io_issue_gather_glm_mg(
 
     ``scale_format`` (const_expr): ARBITRARY_FP32 (1, GLM 656B/528B) or
     NVFP4_E4M3 (2, NVFP4 432B/288B) record geometry."""
-    if cutlass.const_expr(scale_format == 2):
+    if cutlass.const_expr(dsv41):
+        _ios = Int64(528 if dsv41_swa else 288)
+        _nope = Int32(528 if dsv41_swa else 288)
+        eo = Int32(0)
+        for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+            entry = eo + io_lane
+            if entry < Int32(bi):
+                source_tag = Uint32(2)
+                if g_start + entry < g_end:
+                    if Int32(topk_indices[g_start + entry]) >= Int32(0):
+                        source_tag = Uint32(1 if dsv41_swa else 0)
+                st_shared_u32(
+                    kv_fp8_dst_addr + entry * Int32(kv_smem_stride) + Int32(528),
+                    source_tag,
+                )
+            eo += Int32(io_threads)
+        cute.arch.fence_acq_rel_cta()
+    elif cutlass.const_expr(scale_format == 2):
         if cutlass.const_expr(fp8_rope):
             _ios = Int64(_NVFP4_FP8_ROPE_IO_STRIDE)
-        else:
+        elif cutlass.const_expr(has_rope):
             _ios = Int64(_NVFP4_IO_STRIDE)
+        else:
+            _ios = Int64(_GLM_NEXT_NVFP4_IO_STRIDE)
         _nope = Int32(_NVFP4_NOPE_SCALE_BYTES)
     else:
         _ios = Int64(_GLM_IO_STRIDE if has_rope else _GLM_NEXT_IO_STRIDE)
         _nope = Int32(_GLM_NOPE_SCALE_BYTES)
 
-    if cutlass.const_expr(
-        scale_format == 2 and fp8_rope and per_token_latent_scale
-    ):
+    if cutlass.const_expr(scale_format == 2 and per_token_latent_scale):
         # NVFP4 two-level record: scalar-gather the per-token fp32 latent
         # scale ([292, 296); loaded as the second word of the 8-aligned pair
         # at [288, 296)) into the contiguous smem kv_sc buffer -- the MG

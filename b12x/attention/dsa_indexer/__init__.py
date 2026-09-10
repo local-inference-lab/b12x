@@ -12,13 +12,19 @@ A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
    ``q2k_indices_decode`` / ``q2k_indices_prefill`` (+ query-position
    helpers).
 
-Planning: one ``Caps``/``plan`` pair sizes the caller-owned scratch; facet
-binds produce ``PagedBinding`` / ``ContiguousBinding`` / ``MSAPagedBinding``
-/ ``MSAContiguousBinding`` (views only, capture safe). ``plan_paged_schedule``
-builds the paged-MQA schedule metadata. The persistent top-k-2048 selector
-ships as its own facet (``*_persistent_topk2048``). Paged index-K packing
-helpers (``PagedMetadata``, ``prepare_paged_metadata``, ``index_topk_fp8``)
-round out the cache-side contract.
+The production paged DSA lifecycle is ``plan(Caps(...))`` -> ``bind`` ->
+``run(binding)``. Planning owns route and scratch selection, binding captures
+all live tensors without allocating, and execution launches the selected route.
+For ``cache_format="mxfp4"``, ``score`` exposes the BF16 rank-local head sum;
+the integrator all-reduces that buffer in place before ``select``. The source
+recipe emits sorted block8 candidates; later indexers score only those bounded
+logical positions. ``quantize_q_mxfp4`` and ``quantize_write_index_k_mxfp4``
+consume BF16 vectors with their last 64 dimensions already RoPE-rotated.
+MXFP4 ``Caps.page_size`` counts stored index states, not uncompressed input
+tokens, and must match the cache writer's ``page_size``. This lets a serving
+allocator pack main KV and index K for the same logical token block without
+turning the indexer's former 64-state default into a separate allocation unit.
+The FP8 recipe continues to require 64-state pages.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
@@ -34,69 +40,25 @@ META = OpMeta(
     group="attention",
     api_style="planned",
     entry_points=(
-        # planning + scratch
         "Caps",
         "Plan",
-        "DsaIndexerConfig",
-        "DsaIndexerQuery",
-        "PagedScratch",
-        "ContiguousScratch",
-        "PagedBinding",
-        "ContiguousBinding",
-        "MSAPagedBinding",
-        "MSAContiguousBinding",
+        "Binding",
         "plan",
-        "bind_paged",
-        "bind_contiguous",
-        "bind_msa_paged",
-        "bind_msa_contiguous",
-        # stage 1: quantize
-        "quantize_q_fp8",
-        # stage 2: score
-        "logits_paged",
-        "logits_contiguous",
-        "block_scores_paged",
-        "block_scores_contiguous",
-        "ScoreMode",
-        "OutputMode",
-        # stage 3: select
-        "topk_blocks",
-        "topk_tiled",
-        "q2k_indices_decode",
-        "q2k_indices_prefill",
-        "query_positions_decode",
-        "query_positions_prefill",
-        "resolve_contiguous_prefill_block_k",
-        # paged schedule + cache-side contract
-        "plan_paged_schedule",
-        "uses_paged_schedule",
-        "PagedMetadata",
-        "PagedDecodeMetadata",
-        "ContiguousMetadata",
-        "prepare_paged_metadata",
-        "index_topk_fp8",
-        "resolve_local_num_q_heads",
-        "resolve_replicated_num_q_heads",
-        "resolve_paged_prefill_k_rows",
+        "bind",
+        "run",
+        "score",
+        "select",
+        "quantize_q_mxfp4",
+        "quantize_write_index_k_mxfp4",
+        "index_mxfp4_page_bytes",
+        "MXFP4_INDEX_PAGE_BYTES",
         "INDEX_HEAD_DIM",
         "PAGED_INDEX_PAGE_SIZE",
-        "SOURCE_LAYOUT_PAGED",
-        "SOURCE_LAYOUT_CONTIGUOUS",
-        # persistent top-k facet
-        "PersistentTopK2048Caps",
-        "PersistentTopK2048Plan",
-        "PersistentTopK2048Binding",
-        "plan_persistent_topk2048",
-        "bind_persistent_topk2048",
-        "run_persistent_topk2048",
-        "supports_persistent_topk2048",
-        "persistent_topk2048_scratch_nbytes",
-        # maintenance
         "is_supported",
         "clear_caches",
     ),
-    dtypes=("bf16", "fp8_e4m3"),
-    recipes=("dsv4", "glm_nsa", "msa"),
+    dtypes=("bf16", "fp8_e4m3", "mxfp4"),
+    recipes=("dsv4", "dsv4.1", "glm_nsa", "msa"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",

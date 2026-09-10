@@ -73,6 +73,7 @@ class W4A8MaterializedPhase2Kernel:
         deterministic_output: bool = False,
         trellis_bits: int | None = None,
         trellis_direct_lut: bool = False,
+        numerical_recipe: str = "default",
     ):
         if source_tile_m not in (64, 128):
             raise ValueError(
@@ -81,6 +82,7 @@ class W4A8MaterializedPhase2Kernel:
         self.source_tile_m = int(source_tile_m)
         self.source_halves = self.source_tile_m // self.tile_m
         self.deterministic_output = bool(deterministic_output)
+        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
         if trellis_bits is not None and trellis_bits not in (2, 3, 4):
             raise ValueError(
                 f"trellis_bits must be 2, 3, or 4, got {trellis_bits!r}"
@@ -469,6 +471,21 @@ class W4A8MaterializedPhase2Kernel:
                                 bid_a=kb,
                                 bid_b=kb,
                             )
+                        elif cutlass.const_expr(self.deepseek_v41):
+                            # Match reference kernel.py:550-554: a fresh K32
+                            # contraction followed by FP32 accumulation.
+                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                cutlass.Float32(0.0), cutlass.Float32(0.0),
+                                a_frag[blk, 0], a_frag[blk, 1],
+                                a_frag[blk, 2], a_frag[blk, 3],
+                                b0, b1, asc[blk], sfb_word,
+                                bid_a=kb, bid_b=kb,
+                            )
+                            d0 = fragment[0] + d0
+                            d1 = fragment[1] + d1
+                            d2 = fragment[2] + d2
+                            d3 = fragment[3] + d3
                         else:
                             d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                 fragment[0],
@@ -515,7 +532,9 @@ class W4A8MaterializedPhase2Kernel:
                 if row_lo < valid_rows:
                     physical_row = physical_row_base + row_lo
                     tok = token_map[physical_row].to(Int32)
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
+                    scale = down_scale
+                    if cutlass.const_expr(not self.deepseek_v41):
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         # The routing front-end stores the token-major pair
                         # index in token_map for deterministic specializations.
@@ -537,7 +556,9 @@ class W4A8MaterializedPhase2Kernel:
                 if row_hi < valid_rows:
                     physical_row = physical_row_base + row_hi
                     tok = token_map[physical_row].to(Int32)
-                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
+                    scale = down_scale
+                    if cutlass.const_expr(not self.deepseek_v41):
+                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(scatter_output, tok * scatter_n + col),

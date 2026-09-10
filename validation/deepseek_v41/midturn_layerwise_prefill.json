@@ -1,0 +1,3003 @@
+{
+  "step": 0,
+  "reference_steps": 21,
+  "native_steps": 22,
+  "stages": [
+    {
+      "stage": "layers.0.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 0,
+      "elements": 5120,
+      "max_abs": 0.0,
+      "relative_l2": 0.0,
+      "cosine": 1.0000005960464478
+    },
+    {
+      "stage": "layers.0.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 3778,
+      "elements": 5120,
+      "max_abs": 0.03125,
+      "relative_l2": 0.0065988413989543915,
+      "cosine": 0.9999791383743286
+    },
+    {
+      "stage": "layers.0.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 3130,
+      "elements": 5120,
+      "max_abs": 0.00390625,
+      "relative_l2": 0.005667279940098524,
+      "cosine": 0.9999850988388062
+    },
+    {
+      "stage": "layers.0.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4685,
+      "elements": 5120,
+      "max_abs": 0.015625,
+      "relative_l2": 0.017698751762509346,
+      "cosine": 0.9998457431793213
+    },
+    {
+      "stage": "layers.1.engram",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        4,
+        5120
+      ],
+      "native_shape": [
+        44,
+        4,
+        5120
+      ],
+      "mismatches": 3834,
+      "elements": 5120,
+      "max_abs": 0.00390625,
+      "relative_l2": 0.00639576418325305,
+      "cosine": 0.9999806880950928
+    },
+    {
+      "stage": "layers.1.engram",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        4,
+        5120
+      ],
+      "native_shape": [
+        44,
+        4,
+        5120
+      ],
+      "mismatches": 3834,
+      "elements": 5120,
+      "max_abs": 0.00390625,
+      "relative_l2": 0.006396635435521603,
+      "cosine": 0.9999808073043823
+    },
+    {
+      "stage": "layers.1.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4411,
+      "elements": 5120,
+      "max_abs": 0.001220703125,
+      "relative_l2": 0.014333208091557026,
+      "cosine": 0.9998981952667236
+    },
+    {
+      "stage": "layers.1.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4836,
+      "elements": 5120,
+      "max_abs": 0.046875,
+      "relative_l2": 0.02900499664247036,
+      "cosine": 0.9995829463005066
+    },
+    {
+      "stage": "layers.1.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4662,
+      "elements": 5120,
+      "max_abs": 0.0146484375,
+      "relative_l2": 0.022030318155884743,
+      "cosine": 0.9997581243515015
+    },
+    {
+      "stage": "layers.1.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4925,
+      "elements": 5120,
+      "max_abs": 0.012939453125,
+      "relative_l2": 0.0468476302921772,
+      "cosine": 0.9989046454429626
+    },
+    {
+      "stage": "layers.2.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4761,
+      "elements": 5120,
+      "max_abs": 0.01953125,
+      "relative_l2": 0.027553876861929893,
+      "cosine": 0.9996253252029419
+    },
+    {
+      "stage": "layers.2.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5021,
+      "elements": 5120,
+      "max_abs": 0.12890625,
+      "relative_l2": 0.07506158947944641,
+      "cosine": 0.9971846342086792
+    },
+    {
+      "stage": "layers.2.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4937,
+      "elements": 5120,
+      "max_abs": 0.026519775390625,
+      "relative_l2": 0.048692695796489716,
+      "cosine": 0.9988158941268921
+    },
+    {
+      "stage": "layers.2.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4982,
+      "elements": 5120,
+      "max_abs": 0.01708984375,
+      "relative_l2": 0.0715307965874672,
+      "cosine": 0.9974623322486877
+    },
+    {
+      "stage": "layers.3.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4924,
+      "elements": 5120,
+      "max_abs": 0.003173828125,
+      "relative_l2": 0.04376916587352753,
+      "cosine": 0.999043345451355
+    },
+    {
+      "stage": "layers.3.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4985,
+      "elements": 5120,
+      "max_abs": 0.14990234375,
+      "relative_l2": 0.07799999415874481,
+      "cosine": 0.996968686580658
+    },
+    {
+      "stage": "layers.3.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4934,
+      "elements": 5120,
+      "max_abs": 0.033203125,
+      "relative_l2": 0.055028513073921204,
+      "cosine": 0.998487114906311
+    },
+    {
+      "stage": "layers.3.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4991,
+      "elements": 5120,
+      "max_abs": 0.0263671875,
+      "relative_l2": 0.06570152193307877,
+      "cosine": 0.9979946613311768
+    },
+    {
+      "stage": "layers.4.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4961,
+      "elements": 5120,
+      "max_abs": 0.0045166015625,
+      "relative_l2": 0.05213609337806702,
+      "cosine": 0.99864262342453
+    },
+    {
+      "stage": "layers.4.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5029,
+      "elements": 5120,
+      "max_abs": 0.16259765625,
+      "relative_l2": 0.10620364546775818,
+      "cosine": 0.9943827986717224
+    },
+    {
+      "stage": "layers.4.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4971,
+      "elements": 5120,
+      "max_abs": 0.041259765625,
+      "relative_l2": 0.061779193580150604,
+      "cosine": 0.9980928897857666
+    },
+    {
+      "stage": "layers.4.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5011,
+      "elements": 5120,
+      "max_abs": 0.02679443359375,
+      "relative_l2": 0.07869902998209,
+      "cosine": 0.9969501495361328
+    },
+    {
+      "stage": "layers.5.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4949,
+      "elements": 5120,
+      "max_abs": 0.005279541015625,
+      "relative_l2": 0.06154017522931099,
+      "cosine": 0.9981080293655396
+    },
+    {
+      "stage": "layers.5.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5037,
+      "elements": 5120,
+      "max_abs": 0.173828125,
+      "relative_l2": 0.12836818397045135,
+      "cosine": 0.9917833209037781
+    },
+    {
+      "stage": "layers.5.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 4992,
+      "elements": 5120,
+      "max_abs": 0.047454833984375,
+      "relative_l2": 0.07132045924663544,
+      "cosine": 0.9974576830863953
+    },
+    {
+      "stage": "layers.5.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5035,
+      "elements": 5120,
+      "max_abs": 0.05419921875,
+      "relative_l2": 0.11427542567253113,
+      "cosine": 0.9937151670455933
+    },
+    {
+      "stage": "layers.6.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5021,
+      "elements": 5120,
+      "max_abs": 0.007568359375,
+      "relative_l2": 0.08839116245508194,
+      "cosine": 0.9960943460464478
+    },
+    {
+      "stage": "layers.6.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5039,
+      "elements": 5120,
+      "max_abs": 0.16796875,
+      "relative_l2": 0.11145626753568649,
+      "cosine": 0.9938342571258545
+    },
+    {
+      "stage": "layers.6.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5008,
+      "elements": 5120,
+      "max_abs": 0.068359375,
+      "relative_l2": 0.08198533207178116,
+      "cosine": 0.9966408610343933
+    },
+    {
+      "stage": "layers.6.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5035,
+      "elements": 5120,
+      "max_abs": 0.0390625,
+      "relative_l2": 0.10923183709383011,
+      "cosine": 0.9941075444221497
+    },
+    {
+      "stage": "layers.7.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5020,
+      "elements": 5120,
+      "max_abs": 0.007080078125,
+      "relative_l2": 0.0836590975522995,
+      "cosine": 0.9965016841888428
+    },
+    {
+      "stage": "layers.7.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5036,
+      "elements": 5120,
+      "max_abs": 0.185546875,
+      "relative_l2": 0.11405298858880997,
+      "cosine": 0.9934768676757812
+    },
+    {
+      "stage": "layers.7.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5001,
+      "elements": 5120,
+      "max_abs": 0.0771484375,
+      "relative_l2": 0.08277390897274017,
+      "cosine": 0.9965757131576538
+    },
+    {
+      "stage": "layers.7.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.0830078125,
+      "relative_l2": 0.18309688568115234,
+      "cosine": 0.983134388923645
+    },
+    {
+      "stage": "layers.8.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5020,
+      "elements": 5120,
+      "max_abs": 0.1318359375,
+      "relative_l2": 0.11896214634180069,
+      "cosine": 0.9929100275039673
+    },
+    {
+      "stage": "layers.8.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.27734375,
+      "relative_l2": 0.13640591502189636,
+      "cosine": 0.9909047484397888
+    },
+    {
+      "stage": "layers.8.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5044,
+      "elements": 5120,
+      "max_abs": 0.09619140625,
+      "relative_l2": 0.10937155038118362,
+      "cosine": 0.9940227270126343
+    },
+    {
+      "stage": "layers.8.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5032,
+      "elements": 5120,
+      "max_abs": 0.054931640625,
+      "relative_l2": 0.11270199716091156,
+      "cosine": 0.9936485290527344
+    },
+    {
+      "stage": "layers.9.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5031,
+      "elements": 5120,
+      "max_abs": 0.01123046875,
+      "relative_l2": 0.09841222316026688,
+      "cosine": 0.9951582551002502
+    },
+    {
+      "stage": "layers.9.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5039,
+      "elements": 5120,
+      "max_abs": 0.235107421875,
+      "relative_l2": 0.10525824129581451,
+      "cosine": 0.9945178627967834
+    },
+    {
+      "stage": "layers.9.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5030,
+      "elements": 5120,
+      "max_abs": 0.0850830078125,
+      "relative_l2": 0.0985012874007225,
+      "cosine": 0.9951506853103638
+    },
+    {
+      "stage": "layers.9.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5049,
+      "elements": 5120,
+      "max_abs": 0.060546875,
+      "relative_l2": 0.12287382036447525,
+      "cosine": 0.9925068616867065
+    },
+    {
+      "stage": "layers.10.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5056,
+      "elements": 5120,
+      "max_abs": 0.009521484375,
+      "relative_l2": 0.10182385891675949,
+      "cosine": 0.9948177337646484
+    },
+    {
+      "stage": "layers.10.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.30078125,
+      "relative_l2": 0.13671711087226868,
+      "cosine": 0.9906120300292969
+    },
+    {
+      "stage": "layers.10.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5030,
+      "elements": 5120,
+      "max_abs": 0.086669921875,
+      "relative_l2": 0.10643310099840164,
+      "cosine": 0.9943372011184692
+    },
+    {
+      "stage": "layers.10.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5040,
+      "elements": 5120,
+      "max_abs": 0.05224609375,
+      "relative_l2": 0.1277143508195877,
+      "cosine": 0.9918745756149292
+    },
+    {
+      "stage": "layers.11.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5041,
+      "elements": 5120,
+      "max_abs": 0.0101318359375,
+      "relative_l2": 0.1069018766283989,
+      "cosine": 0.9942877888679504
+    },
+    {
+      "stage": "layers.11.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5045,
+      "elements": 5120,
+      "max_abs": 0.30078125,
+      "relative_l2": 0.13200965523719788,
+      "cosine": 0.9918091893196106
+    },
+    {
+      "stage": "layers.11.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5022,
+      "elements": 5120,
+      "max_abs": 0.09521484375,
+      "relative_l2": 0.10766831785440445,
+      "cosine": 0.9942041039466858
+    },
+    {
+      "stage": "layers.11.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5069,
+      "elements": 5120,
+      "max_abs": 0.09423828125,
+      "relative_l2": 0.20679733157157898,
+      "cosine": 0.978664219379425
+    },
+    {
+      "stage": "layers.12.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5061,
+      "elements": 5120,
+      "max_abs": 0.01397705078125,
+      "relative_l2": 0.14542436599731445,
+      "cosine": 0.9894324541091919
+    },
+    {
+      "stage": "layers.12.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5060,
+      "elements": 5120,
+      "max_abs": 0.2830810546875,
+      "relative_l2": 0.16087976098060608,
+      "cosine": 0.9869784712791443
+    },
+    {
+      "stage": "layers.12.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5044,
+      "elements": 5120,
+      "max_abs": 0.12109375,
+      "relative_l2": 0.14077262580394745,
+      "cosine": 0.9900946617126465
+    },
+    {
+      "stage": "layers.12.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5075,
+      "elements": 5120,
+      "max_abs": 0.06396484375,
+      "relative_l2": 0.1749088317155838,
+      "cosine": 0.9846817255020142
+    },
+    {
+      "stage": "layers.13.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5057,
+      "elements": 5120,
+      "max_abs": 0.011962890625,
+      "relative_l2": 0.13682211935520172,
+      "cosine": 0.9906419515609741
+    },
+    {
+      "stage": "layers.13.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5058,
+      "elements": 5120,
+      "max_abs": 0.2880859375,
+      "relative_l2": 0.15704503655433655,
+      "cosine": 0.9877747297286987
+    },
+    {
+      "stage": "layers.13.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5073,
+      "elements": 5120,
+      "max_abs": 0.123046875,
+      "relative_l2": 0.13807618618011475,
+      "cosine": 0.9904687404632568
+    },
+    {
+      "stage": "layers.13.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.07421875,
+      "relative_l2": 0.1325581967830658,
+      "cosine": 0.9912140369415283
+    },
+    {
+      "stage": "layers.14.engram",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        4,
+        5120
+      ],
+      "native_shape": [
+        44,
+        4,
+        5120
+      ],
+      "mismatches": 4828,
+      "elements": 5120,
+      "max_abs": 0.015625,
+      "relative_l2": 0.031009802594780922,
+      "cosine": 0.9995203614234924
+    },
+    {
+      "stage": "layers.14.engram",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        4,
+        5120
+      ],
+      "native_shape": [
+        44,
+        4,
+        5120
+      ],
+      "mismatches": 4822,
+      "elements": 5120,
+      "max_abs": 0.01171875,
+      "relative_l2": 0.031140699982643127,
+      "cosine": 0.9995409250259399
+    },
+    {
+      "stage": "layers.14.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5055,
+      "elements": 5120,
+      "max_abs": 0.0302734375,
+      "relative_l2": 0.14049677550792694,
+      "cosine": 0.9901538491249084
+    },
+    {
+      "stage": "layers.14.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5053,
+      "elements": 5120,
+      "max_abs": 0.312255859375,
+      "relative_l2": 0.1385129690170288,
+      "cosine": 0.9903709292411804
+    },
+    {
+      "stage": "layers.14.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5043,
+      "elements": 5120,
+      "max_abs": 0.125,
+      "relative_l2": 0.1323174089193344,
+      "cosine": 0.9912441968917847
+    },
+    {
+      "stage": "layers.14.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5084,
+      "elements": 5120,
+      "max_abs": 0.2109375,
+      "relative_l2": 0.24721872806549072,
+      "cosine": 0.9698894023895264
+    },
+    {
+      "stage": "layers.15.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5072,
+      "elements": 5120,
+      "max_abs": 0.0205078125,
+      "relative_l2": 0.18907372653484344,
+      "cosine": 0.9821244478225708
+    },
+    {
+      "stage": "layers.15.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5081,
+      "elements": 5120,
+      "max_abs": 0.75,
+      "relative_l2": 0.2203608900308609,
+      "cosine": 0.9764928817749023
+    },
+    {
+      "stage": "layers.15.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5058,
+      "elements": 5120,
+      "max_abs": 0.36328125,
+      "relative_l2": 0.15164130926132202,
+      "cosine": 0.9885029196739197
+    },
+    {
+      "stage": "layers.15.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5076,
+      "elements": 5120,
+      "max_abs": 0.6484375,
+      "relative_l2": 0.20703382790088654,
+      "cosine": 0.9792972803115845
+    },
+    {
+      "stage": "layers.16.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.02783203125,
+      "relative_l2": 0.18265806138515472,
+      "cosine": 0.9833164811134338
+    },
+    {
+      "stage": "layers.16.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5057,
+      "elements": 5120,
+      "max_abs": 0.40234375,
+      "relative_l2": 0.18258285522460938,
+      "cosine": 0.9855812788009644
+    },
+    {
+      "stage": "layers.16.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5073,
+      "elements": 5120,
+      "max_abs": 0.234375,
+      "relative_l2": 0.1708051711320877,
+      "cosine": 0.9854111671447754
+    },
+    {
+      "stage": "layers.16.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.200439453125,
+      "relative_l2": 0.1762831062078476,
+      "cosine": 0.9843897819519043
+    },
+    {
+      "stage": "layers.17.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.019989013671875,
+      "relative_l2": 0.1600499451160431,
+      "cosine": 0.987197756767273
+    },
+    {
+      "stage": "layers.17.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5068,
+      "elements": 5120,
+      "max_abs": 0.46240234375,
+      "relative_l2": 0.24626372754573822,
+      "cosine": 0.9692097902297974
+    },
+    {
+      "stage": "layers.17.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5057,
+      "elements": 5120,
+      "max_abs": 0.24658203125,
+      "relative_l2": 0.16278217732906342,
+      "cosine": 0.9867526292800903
+    },
+    {
+      "stage": "layers.17.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5093,
+      "elements": 5120,
+      "max_abs": 0.341796875,
+      "relative_l2": 0.37304970622062683,
+      "cosine": 0.9291659593582153
+    },
+    {
+      "stage": "layers.18.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5081,
+      "elements": 5120,
+      "max_abs": 0.0250244140625,
+      "relative_l2": 0.2349148839712143,
+      "cosine": 0.9724140167236328
+    },
+    {
+      "stage": "layers.18.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5082,
+      "elements": 5120,
+      "max_abs": 0.560546875,
+      "relative_l2": 0.22502253949642181,
+      "cosine": 0.9746898412704468
+    },
+    {
+      "stage": "layers.18.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5077,
+      "elements": 5120,
+      "max_abs": 0.3203125,
+      "relative_l2": 0.2111884206533432,
+      "cosine": 0.9777031540870667
+    },
+    {
+      "stage": "layers.18.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5091,
+      "elements": 5120,
+      "max_abs": 0.43359375,
+      "relative_l2": 0.3371894657611847,
+      "cosine": 0.9434399604797363
+    },
+    {
+      "stage": "layers.19.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5086,
+      "elements": 5120,
+      "max_abs": 0.0218505859375,
+      "relative_l2": 0.23386667668819427,
+      "cosine": 0.9726470708847046
+    },
+    {
+      "stage": "layers.19.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5088,
+      "elements": 5120,
+      "max_abs": 0.55078125,
+      "relative_l2": 0.21059584617614746,
+      "cosine": 0.9781012535095215
+    },
+    {
+      "stage": "layers.19.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.25244140625,
+      "relative_l2": 0.21687373518943787,
+      "cosine": 0.9764835834503174
+    },
+    {
+      "stage": "layers.19.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5092,
+      "elements": 5120,
+      "max_abs": 0.203125,
+      "relative_l2": 0.2587871551513672,
+      "cosine": 0.9662166237831116
+    },
+    {
+      "stage": "layers.20.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5077,
+      "elements": 5120,
+      "max_abs": 0.01861572265625,
+      "relative_l2": 0.23092152178287506,
+      "cosine": 0.9733433127403259
+    },
+    {
+      "stage": "layers.20.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 0.5,
+      "relative_l2": 0.19549477100372314,
+      "cosine": 0.9824813604354858
+    },
+    {
+      "stage": "layers.20.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.2032470703125,
+      "relative_l2": 0.17981582880020142,
+      "cosine": 0.983828604221344
+    },
+    {
+      "stage": "layers.20.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5080,
+      "elements": 5120,
+      "max_abs": 0.2421875,
+      "relative_l2": 0.24823589622974396,
+      "cosine": 0.9690354466438293
+    },
+    {
+      "stage": "layers.21.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5075,
+      "elements": 5120,
+      "max_abs": 0.0201416015625,
+      "relative_l2": 0.19927890598773956,
+      "cosine": 0.980148434638977
+    },
+    {
+      "stage": "layers.21.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5076,
+      "elements": 5120,
+      "max_abs": 0.4169921875,
+      "relative_l2": 0.20669963955879211,
+      "cosine": 0.9790346026420593
+    },
+    {
+      "stage": "layers.21.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5078,
+      "elements": 5120,
+      "max_abs": 0.26953125,
+      "relative_l2": 0.18822062015533447,
+      "cosine": 0.9822849631309509
+    },
+    {
+      "stage": "layers.21.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5091,
+      "elements": 5120,
+      "max_abs": 0.208984375,
+      "relative_l2": 0.23370613157749176,
+      "cosine": 0.9723802804946899
+    },
+    {
+      "stage": "layers.22.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5077,
+      "elements": 5120,
+      "max_abs": 0.036865234375,
+      "relative_l2": 0.19014465808868408,
+      "cosine": 0.9819246530532837
+    },
+    {
+      "stage": "layers.22.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5078,
+      "elements": 5120,
+      "max_abs": 0.4794921875,
+      "relative_l2": 0.18516205251216888,
+      "cosine": 0.9829866290092468
+    },
+    {
+      "stage": "layers.22.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5081,
+      "elements": 5120,
+      "max_abs": 0.285400390625,
+      "relative_l2": 0.1817287653684616,
+      "cosine": 0.9834827780723572
+    },
+    {
+      "stage": "layers.22.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.23291015625,
+      "relative_l2": 0.20221079885959625,
+      "cosine": 0.9796142578125
+    },
+    {
+      "stage": "layers.23.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.022216796875,
+      "relative_l2": 0.1749393194913864,
+      "cosine": 0.98470139503479
+    },
+    {
+      "stage": "layers.23.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5089,
+      "elements": 5120,
+      "max_abs": 0.5390625,
+      "relative_l2": 0.2393523007631302,
+      "cosine": 0.9732151627540588
+    },
+    {
+      "stage": "layers.23.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5065,
+      "elements": 5120,
+      "max_abs": 0.28662109375,
+      "relative_l2": 0.17789047956466675,
+      "cosine": 0.984177827835083
+    },
+    {
+      "stage": "layers.23.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5080,
+      "elements": 5120,
+      "max_abs": 0.23828125,
+      "relative_l2": 0.19709770381450653,
+      "cosine": 0.9803897738456726
+    },
+    {
+      "stage": "layers.24.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 0.0301513671875,
+      "relative_l2": 0.16991162300109863,
+      "cosine": 0.9855641722679138
+    },
+    {
+      "stage": "layers.24.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5062,
+      "elements": 5120,
+      "max_abs": 0.45703125,
+      "relative_l2": 0.16047881543636322,
+      "cosine": 0.9870569705963135
+    },
+    {
+      "stage": "layers.24.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 0.23828125,
+      "relative_l2": 0.15864412486553192,
+      "cosine": 0.9874151349067688
+    },
+    {
+      "stage": "layers.24.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.243408203125,
+      "relative_l2": 0.18388985097408295,
+      "cosine": 0.9830632209777832
+    },
+    {
+      "stage": "layers.25.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5049,
+      "elements": 5120,
+      "max_abs": 0.026123046875,
+      "relative_l2": 0.15516451001167297,
+      "cosine": 0.9879624843597412
+    },
+    {
+      "stage": "layers.25.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5056,
+      "elements": 5120,
+      "max_abs": 0.41796875,
+      "relative_l2": 0.14619866013526917,
+      "cosine": 0.9895544648170471
+    },
+    {
+      "stage": "layers.25.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5062,
+      "elements": 5120,
+      "max_abs": 0.25,
+      "relative_l2": 0.1434846967458725,
+      "cosine": 0.9897060394287109
+    },
+    {
+      "stage": "layers.25.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 0.3125,
+      "relative_l2": 0.14585836231708527,
+      "cosine": 0.9893854856491089
+    },
+    {
+      "stage": "layers.26.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.01531982421875,
+      "relative_l2": 0.16444550454616547,
+      "cosine": 0.986480712890625
+    },
+    {
+      "stage": "layers.26.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5078,
+      "elements": 5120,
+      "max_abs": 0.7265625,
+      "relative_l2": 0.18674559891223907,
+      "cosine": 0.9824104309082031
+    },
+    {
+      "stage": "layers.26.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5051,
+      "elements": 5120,
+      "max_abs": 0.2509765625,
+      "relative_l2": 0.1323137730360031,
+      "cosine": 0.9912463426589966
+    },
+    {
+      "stage": "layers.26.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5061,
+      "elements": 5120,
+      "max_abs": 0.267578125,
+      "relative_l2": 0.16745640337467194,
+      "cosine": 0.986088216304779
+    },
+    {
+      "stage": "layers.27.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5056,
+      "elements": 5120,
+      "max_abs": 0.02490234375,
+      "relative_l2": 0.14039474725723267,
+      "cosine": 0.9901445508003235
+    },
+    {
+      "stage": "layers.27.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5078,
+      "elements": 5120,
+      "max_abs": 0.6357421875,
+      "relative_l2": 0.2278258502483368,
+      "cosine": 0.9737605452537537
+    },
+    {
+      "stage": "layers.27.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5055,
+      "elements": 5120,
+      "max_abs": 0.2265625,
+      "relative_l2": 0.13498179614543915,
+      "cosine": 0.9908909797668457
+    },
+    {
+      "stage": "layers.27.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5060,
+      "elements": 5120,
+      "max_abs": 0.2294921875,
+      "relative_l2": 0.18101058900356293,
+      "cosine": 0.9836135506629944
+    },
+    {
+      "stage": "layers.28.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5051,
+      "elements": 5120,
+      "max_abs": 0.021759033203125,
+      "relative_l2": 0.13920029997825623,
+      "cosine": 0.9903148412704468
+    },
+    {
+      "stage": "layers.28.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5065,
+      "elements": 5120,
+      "max_abs": 0.46484375,
+      "relative_l2": 0.14206930994987488,
+      "cosine": 0.9898673295974731
+    },
+    {
+      "stage": "layers.28.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5049,
+      "elements": 5120,
+      "max_abs": 0.21875,
+      "relative_l2": 0.1306425780057907,
+      "cosine": 0.9914674162864685
+    },
+    {
+      "stage": "layers.28.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5063,
+      "elements": 5120,
+      "max_abs": 0.3671875,
+      "relative_l2": 0.18005254864692688,
+      "cosine": 0.9845384359359741
+    },
+    {
+      "stage": "layers.29.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 0.019775390625,
+      "relative_l2": 0.14417897164821625,
+      "cosine": 0.9896083474159241
+    },
+    {
+      "stage": "layers.29.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5076,
+      "elements": 5120,
+      "max_abs": 0.388671875,
+      "relative_l2": 0.1880301535129547,
+      "cosine": 0.9825989007949829
+    },
+    {
+      "stage": "layers.29.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5061,
+      "elements": 5120,
+      "max_abs": 0.25,
+      "relative_l2": 0.13461987674236298,
+      "cosine": 0.990940272808075
+    },
+    {
+      "stage": "layers.29.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.3291015625,
+      "relative_l2": 0.20333586633205414,
+      "cosine": 0.9801079034805298
+    },
+    {
+      "stage": "layers.30.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5055,
+      "elements": 5120,
+      "max_abs": 0.02178955078125,
+      "relative_l2": 0.15103790163993835,
+      "cosine": 0.9885941743850708
+    },
+    {
+      "stage": "layers.30.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.310546875,
+      "relative_l2": 0.16826088726520538,
+      "cosine": 0.9857454299926758
+    },
+    {
+      "stage": "layers.30.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5047,
+      "elements": 5120,
+      "max_abs": 0.25,
+      "relative_l2": 0.14019061625003815,
+      "cosine": 0.9901735782623291
+    },
+    {
+      "stage": "layers.30.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5077,
+      "elements": 5120,
+      "max_abs": 0.28515625,
+      "relative_l2": 0.1932889223098755,
+      "cosine": 0.9811704158782959
+    },
+    {
+      "stage": "layers.31.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.02490234375,
+      "relative_l2": 0.1504548341035843,
+      "cosine": 0.988686740398407
+    },
+    {
+      "stage": "layers.31.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5079,
+      "elements": 5120,
+      "max_abs": 0.609375,
+      "relative_l2": 0.1978367120027542,
+      "cosine": 0.9802931547164917
+    },
+    {
+      "stage": "layers.31.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5068,
+      "elements": 5120,
+      "max_abs": 0.306884765625,
+      "relative_l2": 0.1472328156232834,
+      "cosine": 0.9891605377197266
+    },
+    {
+      "stage": "layers.31.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5057,
+      "elements": 5120,
+      "max_abs": 0.27734375,
+      "relative_l2": 0.17679035663604736,
+      "cosine": 0.9843286871910095
+    },
+    {
+      "stage": "layers.32.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.017669677734375,
+      "relative_l2": 0.15295149385929108,
+      "cosine": 0.9883038401603699
+    },
+    {
+      "stage": "layers.32.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5078,
+      "elements": 5120,
+      "max_abs": 0.55078125,
+      "relative_l2": 0.19744393229484558,
+      "cosine": 0.9804834723472595
+    },
+    {
+      "stage": "layers.32.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5064,
+      "elements": 5120,
+      "max_abs": 0.27734375,
+      "relative_l2": 0.14339113235473633,
+      "cosine": 0.9897194504737854
+    },
+    {
+      "stage": "layers.32.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5082,
+      "elements": 5120,
+      "max_abs": 0.265625,
+      "relative_l2": 0.20217712223529816,
+      "cosine": 0.97991943359375
+    },
+    {
+      "stage": "layers.33.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5062,
+      "elements": 5120,
+      "max_abs": 0.01641845703125,
+      "relative_l2": 0.15839023888111115,
+      "cosine": 0.9874619245529175
+    },
+    {
+      "stage": "layers.33.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5045,
+      "elements": 5120,
+      "max_abs": 0.385009765625,
+      "relative_l2": 0.11599823087453842,
+      "cosine": 0.9933292865753174
+    },
+    {
+      "stage": "layers.33.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5054,
+      "elements": 5120,
+      "max_abs": 0.2470703125,
+      "relative_l2": 0.14292791485786438,
+      "cosine": 0.9897865653038025
+    },
+    {
+      "stage": "layers.33.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.2578125,
+      "relative_l2": 0.18533790111541748,
+      "cosine": 0.9827927947044373
+    },
+    {
+      "stage": "layers.34.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.01482391357421875,
+      "relative_l2": 0.14940200746059418,
+      "cosine": 0.9888390898704529
+    },
+    {
+      "stage": "layers.34.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5079,
+      "elements": 5120,
+      "max_abs": 0.9765625,
+      "relative_l2": 0.2217969298362732,
+      "cosine": 0.9750945568084717
+    },
+    {
+      "stage": "layers.34.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5063,
+      "elements": 5120,
+      "max_abs": 0.259765625,
+      "relative_l2": 0.15556378662586212,
+      "cosine": 0.9879003763198853
+    },
+    {
+      "stage": "layers.34.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5085,
+      "elements": 5120,
+      "max_abs": 0.34765625,
+      "relative_l2": 0.16811436414718628,
+      "cosine": 0.9867542386054993
+    },
+    {
+      "stage": "layers.35.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5076,
+      "elements": 5120,
+      "max_abs": 0.015869140625,
+      "relative_l2": 0.1657862365245819,
+      "cosine": 0.986253559589386
+    },
+    {
+      "stage": "layers.35.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5064,
+      "elements": 5120,
+      "max_abs": 0.51171875,
+      "relative_l2": 0.17997430264949799,
+      "cosine": 0.9837726354598999
+    },
+    {
+      "stage": "layers.35.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5062,
+      "elements": 5120,
+      "max_abs": 0.3125,
+      "relative_l2": 0.15298126637935638,
+      "cosine": 0.9882996082305908
+    },
+    {
+      "stage": "layers.35.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5090,
+      "elements": 5120,
+      "max_abs": 0.45849609375,
+      "relative_l2": 0.26523005962371826,
+      "cosine": 0.9641892910003662
+    },
+    {
+      "stage": "layers.36.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5057,
+      "elements": 5120,
+      "max_abs": 0.02490234375,
+      "relative_l2": 0.1688886135816574,
+      "cosine": 0.9857375621795654
+    },
+    {
+      "stage": "layers.36.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5075,
+      "elements": 5120,
+      "max_abs": 0.65673828125,
+      "relative_l2": 0.2521106004714966,
+      "cosine": 0.9682934880256653
+    },
+    {
+      "stage": "layers.36.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5038,
+      "elements": 5120,
+      "max_abs": 0.31640625,
+      "relative_l2": 0.1620865911245346,
+      "cosine": 0.9868698120117188
+    },
+    {
+      "stage": "layers.36.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5060,
+      "elements": 5120,
+      "max_abs": 0.36328125,
+      "relative_l2": 0.1892881691455841,
+      "cosine": 0.9819601774215698
+    },
+    {
+      "stage": "layers.37.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5059,
+      "elements": 5120,
+      "max_abs": 0.028087615966796875,
+      "relative_l2": 0.17444589734077454,
+      "cosine": 0.984785258769989
+    },
+    {
+      "stage": "layers.37.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5090,
+      "elements": 5120,
+      "max_abs": 1.1123046875,
+      "relative_l2": 0.33478862047195435,
+      "cosine": 0.9461177587509155
+    },
+    {
+      "stage": "layers.37.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5058,
+      "elements": 5120,
+      "max_abs": 0.3349609375,
+      "relative_l2": 0.1672573983669281,
+      "cosine": 0.9860143065452576
+    },
+    {
+      "stage": "layers.37.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5066,
+      "elements": 5120,
+      "max_abs": 0.4150390625,
+      "relative_l2": 0.19858279824256897,
+      "cosine": 0.9805315136909485
+    },
+    {
+      "stage": "layers.38.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5069,
+      "elements": 5120,
+      "max_abs": 0.02197265625,
+      "relative_l2": 0.17595356702804565,
+      "cosine": 0.9845128655433655
+    },
+    {
+      "stage": "layers.38.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5071,
+      "elements": 5120,
+      "max_abs": 0.3671875,
+      "relative_l2": 0.1931774616241455,
+      "cosine": 0.9812073707580566
+    },
+    {
+      "stage": "layers.38.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5054,
+      "elements": 5120,
+      "max_abs": 0.3756103515625,
+      "relative_l2": 0.1673906147480011,
+      "cosine": 0.9859861731529236
+    },
+    {
+      "stage": "layers.38.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5052,
+      "elements": 5120,
+      "max_abs": 0.76171875,
+      "relative_l2": 0.18530285358428955,
+      "cosine": 0.9829307794570923
+    },
+    {
+      "stage": "layers.39.attn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5065,
+      "elements": 5120,
+      "max_abs": 0.0185546875,
+      "relative_l2": 0.1696602702140808,
+      "cosine": 0.9856097102165222
+    },
+    {
+      "stage": "layers.39.attn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5024,
+      "elements": 5120,
+      "max_abs": 2.125,
+      "relative_l2": 0.09206321835517883,
+      "cosine": 0.9957702159881592
+    },
+    {
+      "stage": "layers.39.ffn",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5056,
+      "elements": 5120,
+      "max_abs": 0.28515625,
+      "relative_l2": 0.1594407707452774,
+      "cosine": 0.9872875809669495
+    },
+    {
+      "stage": "layers.39.ffn",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5032,
+      "elements": 5120,
+      "max_abs": 8.0,
+      "relative_l2": 0.07868412882089615,
+      "cosine": 0.9974122047424316
+    },
+    {
+      "stage": "norm",
+      "io": "input",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5067,
+      "elements": 5120,
+      "max_abs": 8.0,
+      "relative_l2": 0.138315811753273,
+      "cosine": 0.9906240701675415
+    },
+    {
+      "stage": "norm",
+      "io": "output",
+      "reference_shape": [
+        1,
+        44,
+        5120
+      ],
+      "native_shape": [
+        44,
+        5120
+      ],
+      "mismatches": 5063,
+      "elements": 5120,
+      "max_abs": 0.15234375,
+      "relative_l2": 0.16638028621673584,
+      "cosine": 0.9860788583755493
+    }
+  ]
+}

@@ -31,8 +31,42 @@ MHC_DEFAULT_BLOCK_K = 256
 MHC_DEFAULT_BLOCK_H = 512
 MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
-MHC_SUPPORTED_HIDDEN_SIZES = (4096, 7168)
-MHC_SUPPORTED_RMS_EPS = (1.0e-6, 1.0e-5)
+MHC_SUPPORTED_HIDDEN_SIZES = (4096, 5120, 7168)
+MHC_SUPPORTED_RMS_EPS = (1.0e-20, 1.0e-6, 1.0e-5)
+
+
+def run_collapse(
+    state: torch.Tensor, pre_mix: torch.Tensor | None, *, out: torch.Tensor,
+) -> torch.Tensor:
+    """Contract BF16 ``[T,4,H]`` using FP32 weights, or a uniform stream mean.
+
+    Accumulation is FP32 with one BF16 output rounding. ``out`` must be a
+    disjoint contiguous caller-owned ``[T,H]`` tensor. Warm either mixing mode
+    before graph capture; live rows never select a compiled specialization.
+    """
+    if state.ndim != 3 or state.shape[1] != MHC_MULT:
+        raise ValueError("state must have shape [T, 4, H]")
+    tokens, _, hidden = state.shape
+    if hidden not in MHC_SUPPORTED_HIDDEN_SIZES:
+        raise ValueError(f"hidden size must be one of {MHC_SUPPORTED_HIDDEN_SIZES}")
+    if state.device.type != "cuda":
+        raise ValueError("state must be a CUDA tensor")
+    for name, tensor, shape, dtype in (
+        ("state", state, (tokens, MHC_MULT, hidden), torch.bfloat16),
+        ("out", out, (tokens, hidden), torch.bfloat16),
+    ):
+        _validate_optional_view(
+            tensor, shape=shape, dtype=dtype, device=state.device, name=name,
+        )
+    if pre_mix is not None:
+        _validate_optional_view(
+            pre_mix, shape=(tokens, MHC_MULT), dtype=torch.float32,
+            device=state.device, name="pre_mix",
+        )
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.mhc_collapse(state, pre_mix, out)
+    return out
 
 
 def _required_mhc_split_k(hidden_size: int, block_k: int) -> int:
@@ -78,6 +112,7 @@ class B12XMHCBinding:
     post_buffer: torch.Tensor | None = None
     comb_buffer: torch.Tensor | None = None
     out: torch.Tensor | None = None
+    pre_out: torch.Tensor | None = None
     split_k: int = MHC_DEFAULT_SPLIT_K
     expected_m: int | None = None
 
@@ -91,6 +126,7 @@ class B12XMHCBinding:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        pre_mix: torch.Tensor | None = None,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
         block_k: int = MHC_DEFAULT_BLOCK_K,
@@ -104,6 +140,7 @@ class B12XMHCBinding:
             rms_eps=rms_eps,
             hc_eps=hc_eps,
             sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
             binding=self,
@@ -124,6 +161,7 @@ class B12XMHCBinding:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        pre_mix: torch.Tensor | None = None,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
         fn_bf16: torch.Tensor | None = None,
@@ -142,6 +180,7 @@ class B12XMHCBinding:
             rms_eps=rms_eps,
             hc_eps=hc_eps,
             sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
             fn_bf16=fn_bf16,
@@ -158,7 +197,7 @@ class B12XMHCScratchCaps:
     max_tokens: int
     hidden_size: int
     dtype: torch.dtype = torch.bfloat16
-    split_k: int = MHC_DEFAULT_SPLIT_K
+    split_k: int | None = None
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -167,7 +206,12 @@ class B12XMHCScratchCaps:
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "hidden_size", max(int(self.hidden_size), 1))
-        object.__setattr__(self, "split_k", max(int(self.split_k), 1))
+        split_k = (
+            _required_mhc_split_k(self.hidden_size, MHC_DEFAULT_BLOCK_K)
+            if self.split_k is None
+            else int(self.split_k)
+        )
+        object.__setattr__(self, "split_k", split_k)
         if self.dtype != torch.bfloat16:
             raise ValueError(
                 f"mHC scratch currently supports torch.bfloat16 outputs, got {self.dtype}"
@@ -224,6 +268,7 @@ class B12XMHCScratchPlan:
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
+        pre_out: torch.Tensor | None = None,
     ) -> B12XMHCBinding:
         live_tokens = int(self.caps.max_tokens) if tokens is None else int(tokens)
         if live_tokens < 0 or live_tokens > int(self.caps.max_tokens):
@@ -236,6 +281,13 @@ class B12XMHCScratchPlan:
             max_tokens=int(self.caps.max_tokens),
         )
         partials = self._partials_from_scratch(scratch=scratch)[:live_tokens]
+        _validate_optional_view(
+            pre_out,
+            shape=(live_tokens, MHC_MULT),
+            dtype=torch.float32,
+            device=self.caps.device,
+            name="mHC pre_out",
+        )
         _validate_mhc_binding_views(
             partials=partials,
             y=y,
@@ -255,6 +307,7 @@ class B12XMHCScratchPlan:
             post_buffer=post,
             comb_buffer=comb,
             out=out,
+            pre_out=pre_out,
             split_k=int(self.caps.split_k),
             expected_m=expected_m,
         )
@@ -494,6 +547,8 @@ def _validate_pre_inputs(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ) -> tuple[int, int, int]:
+    if residual.ndim == 3:
+        return _validate_post_pre_inputs(residual, fn, hc_scale, hc_base)
     if residual.device.type != "cuda":
         raise ValueError("residual must be a CUDA tensor")
     if residual.dtype != torch.bfloat16:
@@ -622,6 +677,40 @@ def _canonicalize_post_mix_input(
     return post
 
 
+def _lagged_mix_views(
+    pre_mix: torch.Tensor | None,
+    pre_out: torch.Tensor | None,
+    *,
+    tokens: int,
+    device: torch.device,
+    outputs: tuple[torch.Tensor | None, ...],
+    inputs: tuple[torch.Tensor | None, ...],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if (pre_mix is None) != (pre_out is None):
+        raise ValueError("pre_mix and caller-owned pre_out must be supplied together")
+    if pre_mix is None:
+        return None, None
+    _validate_optional_view(
+        pre_mix, shape=(tokens, MHC_MULT), dtype=torch.float32,
+        device=device, name="pre_mix",
+    )
+    pre_out = _slice_capacity_view(
+        pre_out, tokens=tokens, tail_shape=(MHC_MULT,), dtype=torch.float32,
+        device=device, name="pre_out",
+    )
+    if torch._C._overlaps(pre_mix, pre_out):
+        raise ValueError("pre_mix and pre_out must not alias; use ping-pong buffers")
+    for tensor in outputs:
+        if tensor is not None and (
+            torch._C._overlaps(pre_out, tensor) or torch._C._overlaps(pre_mix, tensor)
+        ):
+            raise ValueError("pre_mix and pre_out must not alias other mHC outputs or scratch")
+    for tensor in inputs:
+        if tensor is not None and torch._C._overlaps(pre_out, tensor):
+            raise ValueError("pre_out must not alias mHC inputs")
+    return pre_mix, pre_out
+
+
 def _b12x_mhc_pre_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -635,10 +724,12 @@ def _b12x_mhc_pre_impl(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
     binding: B12XMHCBinding | None = None,
-    split_k: int = MHC_DEFAULT_SPLIT_K,
+    split_k: int | None = None,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -651,6 +742,7 @@ def _b12x_mhc_pre_impl(
         or y_out is not None
         or post_out is not None
         or comb_out is not None
+        or pre_out is not None
     )
     partials = None
     if binding is not None:
@@ -661,6 +753,7 @@ def _b12x_mhc_pre_impl(
                 ("y_out", y_out),
                 ("post_out", post_out),
                 ("comb_out", comb_out),
+                ("pre_out", pre_out),
             )
             if value is not None
         ]
@@ -674,12 +767,18 @@ def _b12x_mhc_pre_impl(
         y_out = binding.y
         post_out = binding.post_buffer
         comb_out = binding.comb_buffer
+        pre_out = binding.pre_out
         split_k = int(binding.split_k)
 
     tokens, hidden_size, _ = _validate_pre_inputs(residual, fn, hc_scale, hc_base)
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
+    pre_mix, pre_out = _lagged_mix_views(
+        pre_mix, pre_out, tokens=tokens, device=residual.device,
+        outputs=(partials, residual_out, y_out, post_out, comb_out),
+        inputs=(residual, fn, hc_scale, hc_base, norm_weight),
+    )
 
-    split_k = int(split_k)
+    split_k = _required_mhc_split_k(hidden_size, block_k) if split_k is None else int(split_k)
     block_k = int(block_k)
     block_h = int(block_h)
     sinkhorn_iters = int(sinkhorn_iters)
@@ -843,7 +942,7 @@ def _b12x_mhc_pre_impl(
             fn=fn,
             partials=partials,
             out=residual_out,
-            compute_gram=norm_weight is not None,
+            compute_gram=norm_weight is not None and pre_mix is None,
         )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -853,6 +952,8 @@ def _b12x_mhc_pre_impl(
             y=y_out,
             post=post_out,
             comb=comb_out,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
             rms_eps=float(rms_eps),
             hc_eps=float(hc_eps),
             sinkhorn_iters=sinkhorn_iters,
@@ -891,12 +992,14 @@ def _b12x_mhc_post_pre_impl(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
     fn_bf16: torch.Tensor | None = None,
     expected_m: int | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
     binding: B12XMHCBinding | None = None,
-    split_k: int = MHC_DEFAULT_SPLIT_K,
+    split_k: int | None = None,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -912,6 +1015,7 @@ def _b12x_mhc_post_pre_impl(
         or y_out is not None
         or post_out is not None
         or comb_out is not None
+        or pre_out is not None
     )
     partials = None
     planned_config: MhcConfig | None = None
@@ -923,6 +1027,7 @@ def _b12x_mhc_post_pre_impl(
                 ("y_out", y_out),
                 ("post_out", post_out),
                 ("comb_out", comb_out),
+                ("pre_out", pre_out),
             )
             if value is not None
         ]
@@ -937,6 +1042,7 @@ def _b12x_mhc_post_pre_impl(
         y_out = binding.y
         post_out = binding.post_buffer
         comb_out = binding.comb_buffer
+        pre_out = binding.pre_out
         split_k = int(binding.split_k)
         if (
             expected_m is not None
@@ -954,6 +1060,11 @@ def _b12x_mhc_post_pre_impl(
     expected_m = _canonicalize_mhc_expected_m(expected_m, min_tokens=tokens)
     policy_m = tokens if expected_m is None else expected_m
     _validate_norm_weight(norm_weight, hidden_size=hidden_size, device=residual.device)
+    pre_mix, pre_out = _lagged_mix_views(
+        pre_mix, pre_out, tokens=tokens, device=residual.device,
+        outputs=(partials, residual_out, y_out, post_out, comb_out),
+        inputs=(x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, norm_weight),
+    )
     if x.dtype != residual.dtype or x.dtype != torch.bfloat16:
         raise ValueError(
             f"x and residual must both be torch.bfloat16, got {x.dtype} and {residual.dtype}"
@@ -986,7 +1097,7 @@ def _b12x_mhc_post_pre_impl(
     _require_contiguous(x, name="x")
     _require_contiguous(prev_comb, name="prev_comb")
 
-    split_k = int(split_k)
+    split_k = _required_mhc_split_k(hidden_size, block_k) if split_k is None else int(split_k)
     block_k = int(block_k)
     block_h = int(block_h)
     sinkhorn_iters = int(sinkhorn_iters)
@@ -1233,6 +1344,7 @@ def _b12x_mhc_post_pre_impl(
                 fn=fn,
                 partials=partials,
                 config=planned_config,
+                split_fp32_fn=pre_mix is not None,
             )
         elif use_prefill_bf16_mma:
             run_mhc_post_pre_prefill_gram(
@@ -1257,7 +1369,7 @@ def _b12x_mhc_post_pre_impl(
                 fn=fn,
                 partials=partials,
                 out=residual_out,
-                compute_gram=True,
+                compute_gram=pre_mix is None,
                 block_m=prefill_block_m_size,
                 tile_n=prefill_tile_n,
             )
@@ -1270,7 +1382,7 @@ def _b12x_mhc_post_pre_impl(
                 fn=fn,
                 partials=partials,
                 out=residual_out,
-                compute_gram=True,
+                compute_gram=pre_mix is None,
             )
         else:
             run_mhc_post_pre_partial(
@@ -1281,7 +1393,7 @@ def _b12x_mhc_post_pre_impl(
                 fn=fn,
                 partials=partials,
                 out=residual_out,
-                compute_gram=norm_weight is not None,
+                compute_gram=norm_weight is not None and pre_mix is None,
             )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -1291,6 +1403,8 @@ def _b12x_mhc_post_pre_impl(
             y=y_out,
             post=post_out,
             comb=comb_out,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
             rms_eps=float(rms_eps),
             hc_eps=float(hc_eps),
             sinkhorn_iters=sinkhorn_iters,
@@ -1485,7 +1599,7 @@ def _mhc_pre_planned_functional_fake(
     del rms_eps, hc_eps, sinkhorn_iters, norm_eps, fuse_norm
     del split_k, block_k, block_h
     tokens = residual.shape[0]
-    hidden_size = residual.shape[1]
+    hidden_size = residual.shape[-1]
     y = torch.empty(
         (tokens, hidden_size),
         dtype=residual.dtype,
@@ -1645,13 +1759,16 @@ def b12x_mhc_pre(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
     binding: B12XMHCBinding | None = None,
-    split_k: int = MHC_DEFAULT_SPLIT_K,
+    split_k: int | None = None,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    split_k = _required_mhc_split_k(residual.shape[-1], block_k) if split_k is None else split_k
     compiling = torch.compiler.is_compiling()
     no_caller_owned_buffers = (
         binding is None
@@ -1659,6 +1776,8 @@ def b12x_mhc_pre(
         and y_out is None
         and post_out is None
         and comb_out is None
+        and pre_mix is None
+        and pre_out is None
     )
     if compiling and no_caller_owned_buffers:
         norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
@@ -1694,6 +1813,8 @@ def b12x_mhc_pre(
         y_out=y_out,
         post_out=post_out,
         comb_out=comb_out,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         binding=binding,
@@ -1719,15 +1840,18 @@ def b12x_mhc_post_pre(
     y_out: torch.Tensor | None = None,
     post_out: torch.Tensor | None = None,
     comb_out: torch.Tensor | None = None,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
     fn_bf16: torch.Tensor | None = None,
     expected_m: int | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
     binding: B12XMHCBinding | None = None,
-    split_k: int = MHC_DEFAULT_SPLIT_K,
+    split_k: int | None = None,
     block_k: int = MHC_DEFAULT_BLOCK_K,
     block_h: int = MHC_DEFAULT_BLOCK_H,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    split_k = _required_mhc_split_k(residual.shape[-1], block_k) if split_k is None else split_k
     compiling = torch.compiler.is_compiling()
     no_caller_owned_buffers = (
         binding is None
@@ -1735,6 +1859,8 @@ def b12x_mhc_post_pre(
         and y_out is None
         and post_out is None
         and comb_out is None
+        and pre_mix is None
+        and pre_out is None
     )
     if compiling and no_caller_owned_buffers:
         fn_bf16_for_kernel = fn_bf16 if fn_bf16 is not None else fn
@@ -1781,6 +1907,8 @@ def b12x_mhc_post_pre(
         y_out=y_out,
         post_out=post_out,
         comb_out=comb_out,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
         fn_bf16=fn_bf16,
         expected_m=expected_m,
         norm_weight=norm_weight,

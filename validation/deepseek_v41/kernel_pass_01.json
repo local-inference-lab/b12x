@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "completed_cycles": 8,
+  "reference_revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+  "profile_migrations": [
+    {
+      "path": "flashinfer/b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
+      "before_sha256": "c318b691226459b6a17141bb14730b22403a80ea0ee2d01b049a997c114f8616",
+      "after_sha256": "2b159d0bc7e568f98ec90d8c8d893a23456acb75016bd5db1776bf3901f9c08f",
+      "changes": {
+        "attention.compressed_sparse_mla": [
+          2,
+          "cache_format",
+          "deepseek_v4"
+        ],
+        "attention.dsa_indexer": [
+          2,
+          "cache_format",
+          "fp8"
+        ],
+        "gemm.block_fp8_linear": [
+          2,
+          "weight_block_size",
+          128
+        ],
+        "moe.decode": [
+          5,
+          "numerical_recipe",
+          "default"
+        ]
+      },
+      "new_measured_coverage": false
+    },
+    {
+      "path": "flashinfer/b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz",
+      "before_sha256": "638f74f81cee7860a33c67ed34b60496299e8cd4745999bef05af4937bf09574",
+      "after_sha256": "df96793ce6eb143172dffbd2220690a690e60fad92aa9c41ebfdccfd07df7a99",
+      "changes": {
+        "attention.compressed_sparse_mla": [
+          2,
+          "cache_format",
+          "deepseek_v4"
+        ],
+        "attention.dsa_indexer": [
+          2,
+          "cache_format",
+          "fp8"
+        ],
+        "gemm.block_fp8_linear": [
+          2,
+          "weight_block_size",
+          128
+        ],
+        "moe.decode": [
+          5,
+          "numerical_recipe",
+          "default"
+        ]
+      },
+      "new_measured_coverage": false
+    },
+    {
+      "path": "flashinfer/b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.max-q.json.gz",
+      "before_sha256": "0891c92636e0a877bc319f08ff8c46595a29859765335c6b8650dc0c508b6918",
+      "after_sha256": "8de1324aaf08a2a5ce77506bcb6724dd0f266ff8fb261e42d5224f4416fbebc3",
+      "changes": {
+        "attention.compressed_sparse_mla": [
+          2,
+          "cache_format",
+          "deepseek_v4"
+        ],
+        "attention.dsa_indexer": [
+          2,
+          "cache_format",
+          "fp8"
+        ],
+        "gemm.block_fp8_linear": [
+          2,
+          "weight_block_size",
+          128
+        ],
+        "moe.decode": [
+          5,
+          "numerical_recipe",
+          "default"
+        ]
+      },
+      "new_measured_coverage": false
+    }
+  ],
+  "results": [
+    {
+      "component": "v41_cache_writers",
+      "command": "CUDA_VISIBLE_DEVICES=3 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/b12x/attention/test_mla_kv_cache.py -k v41",
+      "exit_status": 0,
+      "passed": 10,
+      "raw_output": "artifact://29"
+    },
+    {
+      "component": "v41_compressed_attention",
+      "command": "CUDA_VISIBLE_DEVICES=4 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/b12x/attention/test_compressed_sparse_mla.py -k 'v41 or convenience'",
+      "exit_status": 0,
+      "passed": 14
+    },
+    {
+      "component": "engram_residual_and_ordinary_rmsnorm",
+      "command": "CUDA_VISIBLE_DEVICES=6 /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -xq tests/b12x/norm/test_engram_mix.py",
+      "exit_status": 0,
+      "passed": 5
+    },
+    {
+      "component": "lagged_mhc",
+      "exit_status": 1,
+      "issue": "CuTe TYPE_UNSTABLE_JOIN loop index warp in conditional RMSNorm reduction",
+      "raw_output": "artifact://31"
+    },
+    {
+      "component": "v41_moe_experts",
+      "exit_status": 1,
+      "issue": "Torch custom op schema grew to65 arguments; pinned maximum64",
+      "raw_output": "artifact://27"
+    },
+    {
+      "component": "v41_routing",
+      "exit_status": 2,
+      "issue": "Blocked by same MoE custom-op import error",
+      "raw_output": "artifact://28"
+    },
+    {
+      "component": "v41_block_fp8",
+      "exit_status": 1,
+      "passed_before_failure": 4,
+      "issue": "One-BF16-ULP oracle bound failed at M33,K1280,N8192; investigating quantized operands/accumulation",
+      "raw_output": "artifact://32"
+    }
+  ],
+  "full_model_qualified": false
+}

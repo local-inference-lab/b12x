@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "scope": "Existing representative suite only; basic functionality gate before performance optimization.",
+  "global": [
+    "Complete responses rather than max-token truncation",
+    "No repetition loops or corrupted logits",
+    "Correct facts or executable code; harmless formatting and wording differences allowed"
+  ],
+  "cases": {
+    "arithmetic": "Integer703",
+    "python": "Executable maximum-of-nonempty-list function, including negative values and duplicates",
+    "chinese": "Beijing is the capital of China",
+    "midturn_system": "Follow the mid-conversation update and answer in Chinese",
+    "tool_request": "Complete structured get_weather call for Beijing; do not invent current weather",
+    "two_images": "Identify carrots then corn; edible carrot root and corn kernels/grains",
+    "hierarchical_context": "Retrieve blue as the check value",
+    "mixed_text_batch": "Each request satisfies its corresponding criterion despite mixed batching"
+  },
+  "priority_after_pass": "Profile the real serving path and optimize measured latency/throughput bottlenecks."
+}

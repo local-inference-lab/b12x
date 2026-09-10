@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "reference_revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+  "common_structure": "lag-ordered n-gram XOR/modulo/offset lookup, projected per-stream keys and shared value, normalized-dot signed-square-root sigmoid gating",
+  "differences": {
+    "token_ids": {
+      "qwen_ple": "raw token IDs",
+      "deepseek_engram": "normalized compressed vocabulary (99092 IDs)"
+    },
+    "history_boundary": {
+      "qwen_ple": "EOS bounds older history; left padding uses EOS",
+      "deepseek_engram": "DEAD=-1 including current image positions blocks all older lags; EOS itself ordinary; compressed token2 supplies padding"
+    },
+    "hash_geometry": {
+      "qwen_ple": "checkpoint buffers are authoritative; initializer uses SplitMix64 seed1234+10007*dense-layer-ordinal",
+      "deepseek_engram": "PCG64 seeded10007*actual-layer-id1or14; globally unique primes across layers/orders/heads"
+    },
+    "table_sharding": {
+      "common": "both shard vocabulary rows, not embedding heads",
+      "qwen_ple": "aligned padded global rows divided evenly across TP",
+      "deepseek_engram": "ceil(unpadded global rows/TP), last shard padded only to that extent"
+    },
+    "table_quantization": {
+      "qwen_ple": "BF16, per-table-scale FP8, or group16NVFP4 with global scale",
+      "deepseek_engram": "E4M3 values with E8M0 per32channels"
+    },
+    "projection": {
+      "qwen_ple": "separate BF16 key/value projections",
+      "deepseek_engram": "combined FP8 block32 wkv projection"
+    },
+    "normalization_and_rounding": {
+      "qwen_ple": "zero-centered1+weight, BF16 normalizedQ/K, BF16 gate and U",
+      "deepseek_engram": "ordinary affine weights combined FP32, FP32 normalized dot/gate/residual addition thenBF16"
+    },
+    "stateful_branch": {
+      "qwen_ple": "U + SiLU(depthwise dilated convolution(RMSNorm(U))); convolution history state",
+      "deepseek_engram": "direct gated value injection, no convolution or convolution state"
+    }
+  },
+  "observed_semantic_probe": {
+    "zero_similarity_ple_gate_bf16": 0.5,
+    "zero_similarity_engram_gate_fp32": 0.500249981880188,
+    "engram_residual_after_cancellation": 0.0002498626708984375,
+    "ple_order3_window_after_eos": [
+      2,
+      2,
+      9
+    ],
+    "engram_order3_window_with_ordinary_eos": [
+      7,
+      2,
+      9
+    ]
+  },
+  "reuse_decision": "Reuse request mapping, lag loading, prime validation, scratch/compiler utilities, native projections and multi-stream reductions; keep different hash/table/numerical/state contracts explicit rather than route Engram through unchanged PLE.",
+  "sources": [
+    "flashinfer/b12x/sequence/ple/reference.py:118-176",
+    "flashinfer/b12x/sequence/ple_hash/reference.py:64-209",
+    "flashinfer/b12x/sequence/ple_embedding/_contracts.py:340-464",
+    "/home/luke/projects/vllm-hh-rebase/vllm/models/qwen3_8_flash_next/ple_layer.py:213-302,782-865,1079-1115",
+    "inference/engram.py:17-184",
+    "inference/model.py:296-365"
+  ]
+}

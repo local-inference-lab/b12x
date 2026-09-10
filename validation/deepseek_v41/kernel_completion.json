@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "main_experts": "qualified",
+  "dspark_experts": "qualified",
+  "graph_route_mutation": "qualified after distinct five-pair named barriers",
+  "expert_oracle": "published K32 FP32 contraction and BF16 boundaries; original tolerances unchanged",
+  "attention_preparation": "forward/inverse/group-first RoPE, negative positions, casts, weight scale and graph replay passed",
+  "full_vllm_qualified": false,
+  "reference_complete": true,
+  "attempts_recorded": 54
+}

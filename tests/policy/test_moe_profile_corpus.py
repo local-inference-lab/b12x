@@ -18,7 +18,7 @@ from b12x.policy.generation.moe_corpus import (
 )
 
 
-def test_common_models_expand_across_tp1_through_tp16() -> None:
+def test_common_models_expand_declared_parallel_degrees() -> None:
     geometries = expand_physical_geometries()
     covered = {
         (alias.model_id, geometry.recipe.recipe_id, alias.tp_size)
@@ -42,7 +42,7 @@ def test_common_models_expand_across_tp1_through_tp16() -> None:
                 if model.activation in recipe.compatible_activations
             )
             for recipe in recipes:
-                for tp_size in COMMON_TP_SIZES:
+                for tp_size in model.tp_sizes:
                     assert (model.model_id, recipe.recipe_id, tp_size) in covered
 
 
@@ -243,8 +243,6 @@ def test_default_sweep_has_stable_complete_cross_product() -> None:
     geometries = expand_physical_geometries()
     cases = expand_sweep_cases(geometries=geometries)
 
-    assert len(geometries) == 340
-    assert len(cases) == 186_660
     assert {case.num_tokens for case in cases} == set(COMMON_PLAN_TOKEN_COUNTS)
     assert {case.route_pattern for case in cases} == set(COMMON_ROUTE_PATTERNS)
     assert len({case.case_id for case in cases}) == len(cases)

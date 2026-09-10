@@ -33,14 +33,26 @@ def is_disabled() -> bool:
     )
 
 
-def mm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``y = x @ weight.T`` for bf16 ``x (m, K)`` / ``weight (N, K)``.
+def mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Native ``x @ weight.T + bias`` with BF16 or FP32 operands.
 
-    Dispatches through the opaque ``b12x::bf16_gemv_small_n`` custom op
-    (torch.compile- and CUDA-graph-safe); shapes the kernel does not cover
-    fall back to ``F.linear`` inside the op.
+    Accumulation and bias addition precede the final output cast. Live rows
+    and input strides are runtime arguments; unsupported inputs fail rather
+    than switching compute providers. ``out`` selects allocation-free serving.
     """
-    return torch.ops.b12x.bf16_gemv_small_n(x, weight)
+    if out is None:
+        return torch.ops.b12x.bf16_gemv_small_n(x, weight, bias, output_dtype)
+    if output_dtype is not None and out.dtype != output_dtype:
+        raise ValueError("output_dtype disagrees with caller-owned out")
+    torch.ops.b12x.bf16_gemv_small_n_out(x, weight, out, bias)
+    return out
 
 
 def is_supported(device=None) -> bool:

@@ -75,15 +75,14 @@ def _bf16_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -97,6 +96,8 @@ def _bf16_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     value = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -126,6 +127,7 @@ def _fp8_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -148,6 +150,8 @@ def _fp8_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
     row_base = local_row * tl.full((), HEAD_DIM, tl.int64)
     quantized = tl.load(
         weight_ptr + row_base + columns.to(tl.int64),
@@ -184,15 +188,14 @@ def _nvfp4_lookup_kernel(
     SHARD_START: tl.constexpr,
     SHARD_END: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPACT_ROWS: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     columns = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     column_mask = columns < HEAD_DIM
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
-    token_live = (
-        (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
-    )
+    token_live = (token < num_tokens) & (num_tokens >= 0) & (num_tokens <= MAX_TOKENS)
     id_offset = token.to(tl.int64) * HEAD_COUNT + head.to(tl.int64)
     embedding_id = tl.load(ids_ptr + id_offset, mask=token_live, other=-1).to(tl.int64)
     local = (
@@ -206,6 +209,8 @@ def _nvfp4_lookup_kernel(
         embedding_id - tl.full((), SHARD_START, tl.int64),
         0,
     ).to(tl.int64)
+    if COMPACT_ROWS:
+        local_row = id_offset
 
     packed_row_base = local_row * tl.full((), HEAD_DIM // 2, tl.int64)
     packed = tl.load(
@@ -279,8 +284,9 @@ def _launch_bf16_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _bf16_lookup_kernel[grid](
         weight,
         ids,
@@ -294,6 +300,7 @@ def _launch_bf16_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -311,8 +318,9 @@ def _launch_fp8_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _fp8_lookup_kernel[grid](
         weight,
         weight_scale,
@@ -327,6 +335,7 @@ def _launch_fp8_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -345,8 +354,9 @@ def _launch_nvfp4_lookup(
     table_vocab_size: int,
     shard_start: int,
     shard_end: int,
+    compact_rows: bool = False,
 ) -> None:
-    grid = (max_tokens, head_count, triton.cdiv(head_dim, _BLOCK_D))
+    grid = (out.shape[0], head_count, triton.cdiv(head_dim, _BLOCK_D))
     _nvfp4_lookup_kernel[grid](
         weight,
         weight_scale,
@@ -362,6 +372,7 @@ def _launch_nvfp4_lookup(
         SHARD_START=shard_start,
         SHARD_END=shard_end,
         BLOCK_D=_BLOCK_D,
+        COMPACT_ROWS=compact_rows,
         num_warps=4,
     )
 
@@ -546,6 +557,7 @@ def _launch_hash(
     heads_per_order: int,
     max_seqs: int,
     max_tokens: int,
+    token_count: int,
 ) -> None:
     _launch_hash_pipeline(
         token_ids,
@@ -565,11 +577,13 @@ def _launch_hash(
         heads_per_order,
         max_seqs,
         max_tokens,
+        token_count=token_count,
     )
 
 
+# Schema-specific names prevent reuse of incompatible Inductor artifacts.
 @torch.library.custom_op(
-    "b12x::ple_embedding_bf16_pipeline",
+    "b12x::ple_embedding_bf16_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _bf16_pipeline_op(
@@ -626,6 +640,7 @@ def _bf16_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_bf16_lookup(
         weight,
@@ -680,7 +695,7 @@ def _bf16_pipeline_fake(
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_fp8_pipeline",
+    "b12x::ple_embedding_fp8_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _fp8_pipeline_op(
@@ -738,6 +753,7 @@ def _fp8_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_fp8_lookup(
         weight,
@@ -794,7 +810,7 @@ def _fp8_pipeline_fake(
 
 
 @torch.library.custom_op(
-    "b12x::ple_embedding_nvfp4_pipeline",
+    "b12x::ple_embedding_nvfp4_gather_pipeline",
     mutates_args=("scratch", "out"),
 )
 def _nvfp4_pipeline_op(
@@ -853,6 +869,7 @@ def _nvfp4_pipeline_op(
         heads_per_order,
         max_seqs,
         max_tokens,
+        out.shape[0],
     )
     _launch_nvfp4_lookup(
         weight,
@@ -911,7 +928,7 @@ def _nvfp4_pipeline_fake(
     del ids_offset_bytes, request_ids_offset_bytes, error_code_offset_bytes
 
 
-def run_pipeline(binding: Binding) -> None:
+def run_pipeline(binding: Binding, *, token_count: int) -> None:
     """Launch one opaque hash, local gather, and inline dequantization op."""
     plan = binding.plan
     caps = plan.caps
@@ -925,7 +942,7 @@ def run_pipeline(binding: Binding) -> None:
         plan.prime_sizes,
         plan.table_offsets,
         binding.scratch,
-        binding.out,
+        binding.out[:token_count],
         caps.eos_token_id,
         caps.vocab_size,
         caps.max_order,
@@ -944,19 +961,22 @@ def run_pipeline(binding: Binding) -> None:
         plan._layout.hash_scratch_offset_bytes
         + plan._hash_plan.layout.error_code_offset_bytes,
     )
+    weight = binding.weight
+    weight_scale = binding.weight_scale
+    assert weight is not None
     if caps.quant_mode == "bf16":
-        torch.ops.b12x.ple_embedding_bf16_pipeline(binding.weight, *hash_args)
+        torch.ops.b12x.ple_embedding_bf16_gather_pipeline(weight, *hash_args)
     elif caps.quant_mode == "fp8_e4m3_per_tensor":
-        assert binding.weight_scale is not None
-        torch.ops.b12x.ple_embedding_fp8_pipeline(
-            binding.weight, binding.weight_scale, *hash_args
+        assert weight_scale is not None
+        torch.ops.b12x.ple_embedding_fp8_gather_pipeline(
+            weight, weight_scale, *hash_args
         )
     elif caps.quant_mode == "nvfp4_group16":
-        assert binding.weight_scale is not None
+        assert weight_scale is not None
         assert binding.weight_scale_2 is not None
-        torch.ops.b12x.ple_embedding_nvfp4_pipeline(
-            binding.weight,
-            binding.weight_scale,
+        torch.ops.b12x.ple_embedding_nvfp4_gather_pipeline(
+            weight,
+            weight_scale,
             binding.weight_scale_2,
             *hash_args,
         )

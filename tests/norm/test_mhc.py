@@ -343,3 +343,212 @@ def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
     torch.testing.assert_close(y, y_ref, rtol=0.0, atol=4e-3)
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
+
+
+def _lagged_reference(residual, fn, scale, bias, incoming, weight):
+    flat = residual.flatten(1).float()
+    projection = F.linear(flat, fn) * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + 1e-20
+    )
+    predicted = torch.sigmoid(projection[:, :4] * scale[0] + bias[:4]) + 1e-6
+    _, post, comb = _mhc_pre_reference(
+        residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20
+    )
+    collapsed = (incoming.unsqueeze(-1) * residual.float()).sum(1).bfloat16()
+    y = collapsed.float()
+    if weight is not None:
+        y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + 1e-20) * weight.float()
+    return post, comb, y.bfloat16(), predicted
+
+
+@pytest.mark.parametrize("hidden_size", [4096, 5120])
+def test_mhc_lagged_multisublayer_propagation(hidden_size):
+    device = require_sm120()
+    tokens = 3
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens, hidden_size=hidden_size, seed=92150, device=device
+    )
+    weight = torch.linspace(0.5, 1.5, hidden_size, device=device).bfloat16()
+    incoming = torch.zeros((tokens, 4), device=device)
+    incoming[:, 0] = 1
+    prev_post = prev_comb = None
+    for layer in range(3):
+        predicted = torch.full_like(incoming, float("nan"))
+        if layer == 0:
+            actual = mhc.run_pre(
+                residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
+                rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+                norm_weight=weight, norm_eps=1e-20,
+            )
+            current = residual
+        else:
+            current = _mhc_post_reference(x, residual, prev_post, prev_comb)
+            actual = mhc.run_post_pre(
+                x, residual, prev_post, prev_comb, fn, scale, bias,
+                pre_mix=incoming, pre_out=predicted, rms_eps=1e-20,
+                hc_eps=1e-6, sinkhorn_iters=20, norm_weight=weight, norm_eps=1e-20,
+            )
+        torch.testing.assert_close(actual[0], current, rtol=0, atol=0.008)
+        expected = _lagged_reference(actual[0], fn, scale, bias, incoming, weight)
+        for got, want in zip((*actual[1:], predicted), expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+        residual, prev_post, prev_comb, x = actual
+        incoming = predicted
+        # Distinct sublayer projections prevent accidentally carrying a stale mix.
+        fn = -fn
+        bias = bias.roll(4)
+
+
+def test_mhc_lagged_rounded_variance_and_ownership():
+    device = require_sm120()
+    hidden_size = 5120
+    residual, _, fn, scale, bias = _make_inputs(
+        tokens=1, hidden_size=hidden_size, seed=92151, device=device
+    )
+    residual[:, 0] = 1
+    residual[:, 1] = 1
+    residual[:, 1, 4096:] = 1.0078125
+    incoming = torch.tensor([[1.0, -0.999, 0.0, 0.0]], device=device)
+    predicted = torch.empty_like(incoming)
+    weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+    kwargs = dict(rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    actual = mhc.run_pre(
+        residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
+        norm_weight=weight, norm_eps=1e-20, **kwargs,
+    )
+    expected = _lagged_reference(residual, fn, scale, bias, incoming, weight)
+    torch.testing.assert_close(actual[-1], expected[2], rtol=0, atol=0.001)
+    with pytest.raises(ValueError, match="supplied together"):
+        mhc.run_pre(residual, fn, scale, bias, pre_mix=incoming, **kwargs)
+    with pytest.raises(ValueError, match="must not alias"):
+        mhc.run_pre(residual, fn, scale, bias, pre_mix=incoming, pre_out=incoming, **kwargs)
+    with pytest.raises(ValueError, match="must not alias"):
+        mhc.run_pre(
+            residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
+            post_out=predicted, **kwargs,
+        )
+    plan = mhc.plan(mhc.Caps(device=device, max_tokens=1, hidden_size=hidden_size))
+    scratch = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in plan.shapes_and_dtypes())
+    binding = mhc.bind(plan, scratch=scratch, pre_out=predicted)
+    with pytest.raises(ValueError, match="binding owns scratch and output buffers"):
+        mhc.run_pre(
+            residual, fn, scale, bias, pre_mix=incoming, pre_out=predicted,
+            binding=binding, **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "capacity", "fuse_norm"),
+    [("pre", 17, False), ("pre", 17, True), ("post_pre", 17, True), ("post_pre", 389, True)],
+)
+def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, request):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    hidden_size = 5120
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=capacity, hidden_size=hidden_size, seed=92152, device=device
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20
+    )
+    prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
+    weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device) if fuse_norm else None
+    incoming = torch.zeros((capacity, 4), device=device)
+    incoming[:, 0] = 1
+    predicted = torch.empty_like(incoming)
+    plan = mhc.plan(mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden_size))
+    scratch = tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in plan.shapes_and_dtypes())
+    binding = mhc.bind(
+        plan, scratch=scratch, pre_out=predicted,
+        y=torch.empty_like(x), out=torch.empty_like(residual),
+        post=torch.empty_like(prev_post), comb=torch.empty_like(prev_comb),
+    )
+
+    def run(live):
+        if phase == "pre":
+            return mhc.run_pre(
+                residual[:live], fn, scale, bias, binding=binding,
+                pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
+                rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+            )
+        return mhc.run_post_pre(
+            x[:live], residual[:live], prev_post[:live], prev_comb[:live],
+            fn, scale, bias, binding=binding, pre_mix=incoming[:live],
+            norm_weight=weight, norm_eps=1e-20, rms_eps=1e-20,
+            hc_eps=1e-6, sinkhorn_iters=20,
+        )
+
+    run(capacity)
+    torch.cuda.synchronize(device)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("V4.1 lagged mHC fixed-capacity multi-live capture")
+    for live in (3, capacity - 1, capacity):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run(live)
+        pointers = tuple(t.data_ptr() for t in (*actual, predicted))
+        # Replay must read the incoming mix anew, not the warmup one-hot value.
+        incoming.copy_(incoming.roll(1, dims=1))
+        for output in (*actual, predicted):
+            output.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+        assert tuple(t.data_ptr() for t in (*actual, predicted)) == pointers
+        current = (
+            residual[:live] if phase == "pre" else
+            _mhc_post_reference(x[:live], residual[:live], prev_post[:live], prev_comb[:live])
+        )
+        torch.testing.assert_close(actual[0], current, rtol=0, atol=0.008)
+        expected = _lagged_reference(actual[0], fn, scale, bias, incoming[:live], weight)
+        for got, want in zip((*actual[1:], predicted[:live]), expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+        assert bool(torch.isnan(predicted[live:]).all())
+
+
+@pytest.mark.parametrize("hidden", [4096, 5120, 7168])
+def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, request):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    capacity = 9
+    state = torch.empty(capacity, 4, hidden, dtype=torch.bfloat16, device=device)
+    # BF16 intermediate accumulation would lose the small positive streams.
+    streams = torch.tensor([256.0, 1.0, -256.0, 0.5], device=device)
+    state.copy_(streams[None, :, None].expand_as(state))
+    mix = torch.tensor([1.0, 0.75, 1.0, 0.25], device=device).repeat(capacity, 1)
+    weighted = torch.empty(capacity, hidden, dtype=torch.bfloat16, device=device)
+    mean = torch.empty_like(weighted)
+
+    def launch(rows):
+        return (
+            mhc.run_collapse(state[:rows], mix[:rows], out=weighted[:rows]),
+            mhc.run_collapse(state[:rows], None, out=mean[:rows]),
+        )
+
+    launch(capacity)
+    torch.cuda.synchronize(device)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("standalone mHC collapse across live rows")
+    for rows in (0, 1, 7, capacity):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = launch(rows)
+        pointers = tuple(t.data_ptr() for t in outputs)
+        state[:, 1].add_(0.5)
+        mix[:, 3].add_(0.125)
+        weighted.fill_(float("nan"))
+        mean.fill_(float("nan"))
+        allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+        assert tuple(t.data_ptr() for t in outputs) == pointers
+        expected = (state[:rows].float() * mix[:rows, :, None]).sum(1).bfloat16()
+        expected_mean = state[:rows].float().mean(1).bfloat16()
+        torch.testing.assert_close(outputs[0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(outputs[1], expected_mean, rtol=0, atol=0)
+        assert bool(torch.isnan(weighted[rows:]).all())
+        assert bool(torch.isnan(mean[rows:]).all())

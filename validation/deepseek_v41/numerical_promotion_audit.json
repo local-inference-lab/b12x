@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "authority": "User requested removal of likely unnecessary numerical promotions used to chase exact oracle results.",
+  "removed": [
+    {
+      "site": "attention WO-B",
+      "change": "BF16 output is reduced directly; removed FP32 promotion, cast-back, and per-layer FP32 output scratch."
+    },
+    {
+      "site": "routed MoE output",
+      "change": "Keep native FP32 local accumulation but return BF16 activation-shaped output for TP transport."
+    },
+    {
+      "site": "vocabulary/Markov heads",
+      "change": "Remove unconditional FP32 output override; follow model dtype unless head_dtype explicitly requests otherwise."
+    },
+    {
+      "site": "router/compressor parameters",
+      "change": "Keep serialized BF16 weights in BF16 instead of expanding them to FP32; native arithmetic still accumulates to FP32."
+    },
+    {
+      "site": "text/vision/Engram affine parameters",
+      "change": "Keep serialized BF16 affine weights in BF16; retain FP32 reduction/derived normalization state."
+    }
+  ],
+  "retained": [
+    {
+      "site": "mHC parameters and attention sinks",
+      "reason": "Checkpoint stores these parameters in FP32."
+    },
+    {
+      "site": "norm/softmax/GEMM accumulation",
+      "reason": "Stable native mathematical accumulation, not transport or redundant parameter storage."
+    },
+    {
+      "site": "ratio2 compressor values/gates/carry",
+      "reason": "Native softmax-pooling state contract; changing it would be a separate numerical algorithm change."
+    },
+    {
+      "site": "router logits and correction biases",
+      "reason": "Top-k routing and bias/normalization contract remains FP32."
+    },
+    {
+      "site": "confidence projection",
+      "reason": "Native FP32 confidence/logistic computation."
+    }
+  ],
+  "verification": {
+    "gpu_focused": "4 vision/compressor/block32 checks and1 expert output check passed.",
+    "full_serving": "performance_native_precision.json completed all20 cases with stop termination and no corrupted-logits flag. Responses reviewed as coherent and correct for basic suite.",
+    "warmup_gap": "Plain BF16 logits exposed sampler warmup covering only processed FP32 logits; warmup now exercises both real request paths, verification in progress.",
+    "strict_serving": {
+      "completed": true,
+      "cases": 20,
+      "all_workers_frozen": true,
+      "compile_miss_delta": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "raw_output": "artifact://302",
+      "trace_directory": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/native_precision_trace",
+      "sampler_warmup": "28 CPU lifecycle checks passed; cold strict-JIT serving completed without compilation errors."
+    }
+  },
+  "b12x_pcie": {
+    "selected": true,
+    "oneshot_cap_bytes": 65536,
+    "larger_512k_trial": "Measured worse latency on the short-request suite; not selected as a default."
+  }
+}

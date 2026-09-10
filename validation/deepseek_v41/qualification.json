@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "status": "qualified",
+  "completed_cycles": 130,
+  "maximum_cycles": 1000,
+  "full_model_qualified": true,
+  "acceptance_suite": "quality_suite.json",
+  "acceptance_criteria": "quality_criteria.json",
+  "acceptance_revision": "acceptance_revision.json",
+  "priority": "TP4 interactive latency with SSD Engram offload through common Qwen PLE io_uring storage",
+  "acceptance_commands": "commands.json",
+  "latest_kernel_evidence": "tp4_ssd_native_execution.json",
+  "upstream_pr_evidence": "upstream_prs.json",
+  "ple_comparison_evidence": "ple_comparison.json",
+  "attempt_ledger": "attempts.json",
+  "legacy_regressions": "legacy_regressions.json",
+  "loader_selection": "loader_selection.json",
+  "reference_results": "reference_results.json",
+  "initial_native_results": "vllm_before_gate_order_fix.json",
+  "initial_native_parity": "parity_before_gate_order_fix.json",
+  "layerwise_diagnostic": "midturn_layerwise_prefill.json",
+  "source_identity": {
+    "/home/luke/projects/flashinfer-b12x-migration": {
+      "identity": [
+        "/home/luke/projects/flashinfer-b12x-migration",
+        "4426486a64a0fed7b6ffa0ce08c7bb26a6402475"
+      ],
+      "initial_changes": []
+    },
+    "/home/luke/projects/vllm-hh-rebase": {
+      "identity": [
+        "/home/luke/projects/vllm-hh-rebase",
+        "4b276a363c94bbf7eb99b1e32c5ee2a88d839809"
+      ],
+      "initial_changes": [
+        "M  serve-qwen38-flash-next-nvfp4.sh",
+        "M  tests/engine/test_arg_utils.py",
+        "A  tests/kernels/mamba/test_gdn_prefill_b12x.py",
+        "M  tests/model_executor/layers/test_qwen_gdn_linear_attn.py",
+        "M  tests/models/test_qwen3_8_flash_next_model.py",
+        "M  tests/models/test_qwen3_8_flash_next_qsa.py",
+        "M  tests/models/test_qwen3_8_flash_next_weight_loading.py",
+        "M  tests/v1/attention/test_gdn_metadata_builder.py",
+        "A  tests/v1/attention/test_ple_metadata_builder.py",
+        "M  tests/v1/cudagraph/test_cudagraph_manager.py",
+        "M  vllm/engine/arg_utils.py",
+        "M  vllm/envs.py",
+        "M  vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+        "A  vllm/model_executor/layers/mamba/ops/b12x_gdn_prefill.py",
+        "M  vllm/model_executor/warmup/qwen_triton_warmup.py",
+        "M  vllm/models/qwen3_8_flash_next/model.py",
+        "M  vllm/models/qwen3_8_flash_next/model_state.py",
+        "M  vllm/models/qwen3_8_flash_next/nvidia/qsa.py",
+        "A  vllm/models/qwen3_8_flash_next/ple_attn.py",
+        "M  vllm/models/qwen3_8_flash_next/ple_layer.py",
+        "M  vllm/utils/b12x.py",
+        "A  vllm/v1/attention/backends/b12x_gdn_metadata.py",
+        "M  vllm/v1/attention/backends/gdn_attn.py",
+        "M  vllm/v1/worker/gpu/cudagraph_utils.py",
+        "M  vllm/v1/worker/gpu/model_runner.py",
+        "M  vllm/v1/worker/gpu/model_states/interface.py",
+        "?? serve-glm52.sh"
+      ]
+    }
+  },
+  "reference": {
+    "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+    "snapshot": "/home/luke/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+    "files": {
+      "DeepSeek_V41_Tech_Report.pdf": {
+        "bytes": 1809802,
+        "sha256": "ba68e2e40408125ae6d2f63a9a241b61c73910691c74ec1a2a7023c851eac08d"
+      },
+      "config.json": {
+        "bytes": 3311,
+        "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+      },
+      "inference/model.py": {
+        "bytes": 61549,
+        "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+      },
+      "inference/kernel.py": {
+        "bytes": 23790,
+        "sha256": "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455"
+      },
+      "inference/engram.py": {
+        "bytes": 8138,
+        "sha256": "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897"
+      },
+      "inference/generate.py": {
+        "bytes": 8722,
+        "sha256": "8668d67f7d108e32b90d50cb0d8606889ceb2219bfe95741d84e22f70768e9f0"
+      },
+      "inference/convert.py": {
+        "bytes": 9458,
+        "sha256": "035028340479145594a81d6084a8424e57363adf83c0d5983914783d95614d76"
+      },
+      "inference/vision.py": {
+        "bytes": 4457,
+        "sha256": "5d49edc196a4ef22384abe76d35a40098cbe1e74b586c8f66a2edff4f076b26c"
+      },
+      "inference/config.json": {
+        "bytes": 1982,
+        "sha256": "2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809"
+      },
+      "tokenizer.json": {
+        "missing": true
+      }
+    }
+  },
+  "rules": [
+    "b12x hosted in the FlashInfer fork, not FlashInfer kernel API migration",
+    "Read original /home/luke/projects/b12x/AGENTS.md",
+    "CuTe DSL core kernels; Triton metadata/minor helpers only",
+    "Attempt existing kernel specialization/extension first",
+    "Pin blockers and continue independent in-scope work",
+    "Preserve toolchain pins, original checkout, checkpoint contents and user changes"
+  ],
+  "cycles": [
+    {
+      "number": 1,
+      "component": "editable_vllm_environment",
+      "change": "Installed fork editable with --no-deps --no-build-isolation, BUILD_NVEP=0 and FLASHINFER_BUILD_NO_PIP=1; removed old separate editable b12x distribution",
+      "verification": [
+        {
+          "command": "/home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -q tests/test_b12x_compat.py tests/b12x/test_registry.py",
+          "cwd": "/home/luke/projects/flashinfer-b12x-migration",
+          "exit_status": 0,
+          "result": "13 passed, 2 preexisting CuTe deprecation warnings"
+        },
+        {
+          "action": "From /tmp import both spellings for root, compiler, policy.context, compressed_sparse_mla, norm.mhc, loader; assert shared module objects and canonical paths under this fork; assert editable direct_url.json",
+          "exit_status": 0,
+          "result": {
+            "editable": {
+              "url": "file:///home/luke/projects/flashinfer-b12x-migration",
+              "dir_info": {
+                "editable": true
+              }
+            },
+            "modules": [
+              {
+                "name": "flashinfer.b12x",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/__init__.py",
+                "shared": true
+              },
+              {
+                "name": "flashinfer.b12x._lib.compiler",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/_lib/compiler.py",
+                "shared": true
+              },
+              {
+                "name": "flashinfer.b12x.policy.context",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/policy/context.py",
+                "shared": true
+              },
+              {
+                "name": "flashinfer.b12x.attention.compressed_sparse_mla",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/attention/compressed_sparse_mla/__init__.py",
+                "shared": true
+              },
+              {
+                "name": "flashinfer.b12x.norm.mhc",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/norm/mhc/__init__.py",
+                "shared": true
+              },
+              {
+                "name": "flashinfer.b12x.loader",
+                "file": "/home/luke/projects/flashinfer-b12x-migration/flashinfer/b12x/loader/__init__.py",
+                "shared": true
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "pinned_blockers": [
+    {
+      "id": "exact_greedy_parity",
+      "status": "superseded_by_user",
+      "evidence": "Historical token differences were traced mainly to cuBLAS BF16 split-K partial reduction versus native FP32 accumulation. The user explicitly clarified that coherent strong outputs, not bit/token parity, define functionality; performance is paramount after that.",
+      "continue_with": "Preserve native FP32 accumulation, check complete representative responses, and optimize measured real-serving bottlenecks. Historical parity artifacts remain diagnostic evidence only."
+    },
+    {
+      "id": "checkpoint_download",
+      "status": "resolved",
+      "evidence": "All 48 pinned checkpoint shards and tokenizer files are present (510296708312 shard bytes). Published convert.py completed TP8 conversion in .cache/deepseek_v41_tp8; original checkpoint contents unchanged.",
+      "affects": [
+        "full reference generation",
+        "vLLM checkpoint loading"
+      ],
+      "continue_with": "Full published-reference generation has started on all eight GPUs."
+    },
+    {
+      "id": "bounded_replay_exactness",
+      "status": "not_enabled_without_quality_evidence",
+      "evidence": "Technical report section3.2.2 describes bounded encoder/decoder SWA replay as approximate. Current native DSpark uses full target verification.",
+      "decision": "Prioritize measured bottlenecks in the functioning native path; do not silently introduce an unqualified approximation."
+    },
+    {
+      "id": "tp4_memory_budget",
+      "status": "resolved",
+      "evidence": "97% memory budget provides1.51GiB KV after measured model/graph requirements;89534 cache tokens."
+    }
+  ],
+  "coverage": [
+    {
+      "component": "main_kv",
+      "required": "all512 post-RoPE E2M1 + E4M3/group16, no global scale",
+      "baseline": "448 FP8/group64 plus BF16 RoPE64",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "swa_kv",
+      "required": "all512 post-RoPE E4M3 + UE8M0/group32",
+      "baseline": "448 FP8/group64 plus BF16 RoPE64",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "csa2",
+      "required": "Full2/8/14 ratio2, Full20 ratio1, Reindex24/28/32/36, intervening Reuse; nonoverlap/no APE compressor; indexK from pre-RoPE latent",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "hierarchical_indexer",
+      "required": "FP4 query/key group32, candidate2048 blocks of8 after weighted-ReLU scores, later reindex candidate-only, top512",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "mhc",
+      "required": "H5120; incoming previous-sublayer pre_mix; outgoing current pre_mix; current post/comb",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "dense_fp8",
+      "required": "E4M3 weights with UE8M0 scales per32x32, activation group32",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "moe_routing",
+      "required": "sqrtsoftplus, modality selection correction, unbiased normalized weights x1.5; E384/top6 and E128/top3",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "moe_expert_math",
+      "required": "BF16 round FC1 branches before SwiGLU; route weight before FC2 input BF16 and FP8 quantization",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "engram",
+      "required": "tokenizer compression; ngram2/3/4 x8 heads x256, FP8 lookup/projection, normalized-dot signed-sqrt sigmoid gate, no convolution",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json",
+      "storage": "shared DiskRowCache io_uring/O_DIRECT; no resident table weight/scale parameters"
+    },
+    {
+      "component": "vision_dspark",
+      "required": "qualify existing DSV4 vision/DSpark and extend V4.1 contracts",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    },
+    {
+      "component": "native_token_embedding",
+      "required": "unquantized BF16/FP32 caller-owned lookup, shared target/draft weight identity, Int64 offsets",
+      "status": "gpu_oracle_and_native_serving_passed",
+      "serving_evidence": "tp4_ssd_native_execution.json"
+    }
+  ],
+  "source_manifest": "source_manifest.json",
+  "package_verification": "package_verification.json",
+  "numerical_promotion_evidence": "numerical_promotion_audit.json",
+  "performance_evidence": "tp4_ssd_latency.json",
+  "functional_evidence": "tp4_ssd_progress.json",
+  "qualified_scope": {
+    "device": "NVIDIA RTX PRO6000 Blackwell Max-Q SM120",
+    "cuda_visible_devices": "0,1,2,3",
+    "tensor_parallel_size": 4,
+    "dtype": "bfloat16",
+    "engram_table_memory": "disk",
+    "gpu_memory_utilization": 0.97,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 4,
+    "kv_capacity_tokens": 89534,
+    "full_length_request_concurrency": 2.73,
+    "images_per_prompt": 2,
+    "speculation": "three-stage DSpark, five draft tokens, adaptive verification"
+  },
+  "remaining_gates": [],
+  "current_target": {
+    "tensor_parallel_size": 4,
+    "cuda_visible_devices": "0,1,2,3",
+    "engram_storage": "SSD via io_uring",
+    "performance_priority": "interactive latency",
+    "tp8_testing_authorized": false
+  },
+  "historical_tp8_evidence": [
+    "native_execution.json",
+    "performance_summary.json",
+    "basic_functionality.json"
+  ]
+}

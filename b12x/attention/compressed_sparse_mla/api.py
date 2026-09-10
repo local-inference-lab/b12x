@@ -12,9 +12,10 @@ from .._shared.mla.api import (
 from .._shared.mla.compressed_api import (
     compressed_sparse_mla_decode_forward as run,
 )
-from .._shared.mla.compressed_api import (
+from .._shared.mla.compressed_config import (
     compressed_sparse_mla_split_chunks_for_contract as split_chunks_for_contract,
 )
+from .._shared.mla.kv_cache import compile_cache_writer, page_nbytes, write_cache
 from . import META
 from ._policy import (
     COMPRESSED_SPARSE_MLA_POLICY,
@@ -49,9 +50,10 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
     policy.require_device(caps.device)
     query = SparseMlaQuery(
         layout=caps.layout,
+        cache_format=caps.cache_format,
         mode=caps.mode,
         q_dtype="bfloat16",
-        kv_dtype="float8_e4m3fn",
+        kv_dtype="uint8" if caps.cache_format == "deepseek_v41" else "float8_e4m3fn",
         num_q_heads=caps.num_q_heads,
         qk_head_dim=caps.head_dim,
         v_head_dim=caps.v_head_dim,
@@ -106,6 +108,9 @@ __all__ = [
     "bind",
     "run",
     "split_chunks_for_contract",
+    "page_nbytes",
+    "write_cache",
+    "compile_cache_writer",
     "is_supported",
     "clear_caches",
 ]

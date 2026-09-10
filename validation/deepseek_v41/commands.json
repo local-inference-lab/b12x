@@ -1,0 +1,253 @@
+{
+  "schema_version": 2,
+  "cwd": "/home/luke/projects/flashinfer-b12x-migration",
+  "target": {
+    "tensor_parallel_size": 4,
+    "cuda_visible_devices": "0,1,2,3",
+    "engram_storage": "SSD via io_uring",
+    "performance_priority": "interactive latency",
+    "tp8_testing_authorized": false
+  },
+  "reference_revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+  "suite_sha256": "48e07eac3d02be983deb58ebcd2e017b2c77a61cd7c3ade9765a9423ccae5a96",
+  "engine": "engine_tp4_ssd.json",
+  "engine_sha256": "3a3e617aa371a88d65e051dc374955bac2cced7667e61fb6d6e126d7bf5a3d9f",
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CUDA_HOME": "/opt/cuda",
+    "CUTE_DSL_ARCH": "sm_120a",
+    "OMP_NUM_THREADS": "8",
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_P2P_LEVEL": "SYS",
+    "HF_HUB_OFFLINE": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+    "VLLM_ENABLE_PCIE_ALLREDUCE": "1",
+    "VLLM_PCIE_ALLREDUCE_BACKEND": "b12x"
+  },
+  "native_trace": [
+    "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+    "validation/b12x/deepseek_v41/trace_native.py",
+    "--suite",
+    "validation/b12x/deepseek_v41/quality_suite.json",
+    "--engine",
+    "validation/b12x/deepseek_v41/engine_tp4_ssd.json",
+    "--output-dir",
+    ".cache/deepseek_v41_diagnostics/tp4_ssd_memory97",
+    "--profiler",
+    "torch",
+    "--repeats",
+    "2"
+  ],
+  "native_trace_extra_environment": {
+    "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+    "B12X_LOG_CUTE_COMPILES": "1"
+  },
+  "native_trace_security": "Trusted offline worker RPC only; do not enable insecure serialization on a public server.",
+  "interactive_measurement": [
+    "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+    "validation/b12x/deepseek_v41/verify.py",
+    "vllm",
+    "--suite",
+    "validation/b12x/deepseek_v41/quality_suite.json",
+    "--engine",
+    "validation/b12x/deepseek_v41/engine_tp4_ssd.json",
+    "--repeats",
+    "2",
+    "--output",
+    "validation/b12x/deepseek_v41/tp4_ssd_interactive.json"
+  ],
+  "measurement_rules": [
+    "Report TTFT and decode latency per output token separately; retain output token counts.",
+    "No performance comparison to TP8 or to runs with different work without explicit qualification.",
+    "Only physical GPUs0,1,2,3 are authorized."
+  ],
+  "historical_tp8_commands": {
+    "schema_version": 1,
+    "cwd": "/home/luke/projects/flashinfer-b12x-migration",
+    "reference_revision": "fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+    "suite_sha256": "48e07eac3d02be983deb58ebcd2e017b2c77a61cd7c3ade9765a9423ccae5a96",
+    "freeze": [
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+      "freeze",
+      "--reference",
+      "/home/luke/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+      "--output",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/frozen_suite.json"
+    ],
+    "reference": [
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "-m",
+      "torch.distributed.run",
+      "--standalone",
+      "--nproc-per-node=8",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+      "reference",
+      "--suite",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/frozen_suite.json",
+      "--checkpoint",
+      "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_tp8",
+      "--output",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/reference_results.json"
+    ],
+    "vllm": [
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "validation/b12x/deepseek_v41/verify.py",
+      "vllm",
+      "--suite",
+      "validation/b12x/deepseek_v41/quality_suite.json",
+      "--engine",
+      "validation/b12x/deepseek_v41/engine_dspark_adaptive.json",
+      "--repeats",
+      "2",
+      "--output",
+      "validation/b12x/deepseek_v41/performance_prefill_policy.json"
+    ],
+    "compare": [
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+      "compare",
+      "--reference-output",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/reference_results.json",
+      "--vllm-output",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/vllm_results.json",
+      "--output",
+      "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/parity_result.json"
+    ],
+    "common_environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "HF_HUB_OFFLINE": "1",
+      "CUDA_HOME": "/opt/cuda",
+      "CUTE_DSL_ARCH": "sm_120a"
+    },
+    "vllm_environment": {
+      "VLLM_USE_V2_MODEL_RUNNER": "1",
+      "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
+      "VLLM_ENABLE_PCIE_ALLREDUCE": "1",
+      "VLLM_PCIE_ALLREDUCE_BACKEND": "b12x",
+      "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": "64KB",
+      "B12X_LOG_CUTE_COMPILES": "1",
+      "NCCL_IB_DISABLE": "1",
+      "NCCL_P2P_LEVEL": "SYS",
+      "OMP_NUM_THREADS": "8"
+    },
+    "completed": false,
+    "historical_commands": {
+      "freeze": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+        "freeze",
+        "--reference",
+        "/home/luke/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/fb2764a5cf321eaa5070ca8f9e892818f477c16d",
+        "--output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/frozen_suite.json"
+      ],
+      "reference": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+        "reference",
+        "--suite",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/frozen_suite.json",
+        "--checkpoint",
+        "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_tp8",
+        "--output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/reference_results.json"
+      ],
+      "vllm": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+        "vllm",
+        "--suite",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/frozen_suite.json",
+        "--engine",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/engine.json",
+        "--repeats",
+        "2",
+        "--output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/vllm_results.json"
+      ],
+      "compare": [
+        "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/verify.py",
+        "compare",
+        "--reference-output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/reference_results.json",
+        "--vllm-output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/vllm_results.json",
+        "--output",
+        "/home/luke/projects/flashinfer-b12x-migration/validation/b12x/deepseek_v41/parity_result.json"
+      ]
+    },
+    "acceptance": "quality_criteria.json; exact token equality is historical diagnostics only",
+    "native_trace": [
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "validation/b12x/deepseek_v41/trace_native.py",
+      "--suite",
+      "validation/b12x/deepseek_v41/quality_suite.json",
+      "--engine",
+      "validation/b12x/deepseek_v41/engine_dspark_adaptive.json",
+      "--output-dir",
+      ".cache/deepseek_v41_diagnostics/prefill_policy_trace",
+      "--profiler",
+      "torch",
+      "--repeats",
+      "2"
+    ],
+    "native_trace_extra_environment": {
+      "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"
+    },
+    "native_trace_security": "Trusted offline worker RPC only; do not export VLLM_ALLOW_INSECURE_SERIALIZATION to a public server.",
+    "wheel_build": [
+      "uv",
+      "build",
+      "--wheel",
+      "--no-build-isolation",
+      "--python",
+      "/home/luke/projects/vllm-hh-rebase/.venv/bin/python",
+      "--out-dir",
+      "/tmp/b12x-v41-prefill-wheel-verification"
+    ],
+    "build_environment": {
+      "BUILD_NVEP": "0",
+      "FLASHINFER_BUILD_NO_PIP": "1"
+    },
+    "status": "historical_tp8_commands_not_current_target",
+    "current_target": {
+      "tensor_parallel_size": 4,
+      "cuda_visible_devices": "0,1,2,3",
+      "engram_storage": "SSD via io_uring",
+      "performance_priority": "interactive latency",
+      "tp8_testing_authorized": false
+    }
+  },
+  "completed": true,
+  "source_manifest": "source_manifest.json",
+  "serve_launcher": {
+    "path": "/home/luke/projects/vllm-hh-rebase/serve-ds41-flash.sh",
+    "command": [
+      "./serve-ds41-flash.sh"
+    ],
+    "dry_run": [
+      "env",
+      "DRY_RUN=1",
+      "./serve-ds41-flash.sh"
+    ],
+    "sha256": "410425a5f11eac4513eeb55ba4f34a2275f1fefd28f7571a6f3fd09add3a64ae",
+    "verification": {
+      "shell_syntax": "passed",
+      "dry_run_loader": "instanttensor",
+      "full_model_rerun_after_loader_change": false
+    },
+    "endpoint": "http://127.0.0.1:8000/v1",
+    "served_model_name": "DeepSeek-V4.1-Flash",
+    "load_format": "instanttensor",
+    "qualification_note": "User requested InstantTensor after the safetensors TP4 serving qualification; loader selection changed only in the launcher."
+  }
+}

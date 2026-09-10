@@ -34,6 +34,11 @@ aliases. `gemm.block_fp8_linear` retains a separate planned interface because
 it owns caller-provided scratch and inline requantization. The fused MLA query
 projection (`gemm.mla_query_projection`) and grouped WO projection
 (`gemm.wo_projection`) are used around MLA attention.
+`gemm.block_fp8_linear` also accepts V4.1's 32x32 E4M3/UE8M0 weight blocks
+with per-32 activation quantization. `gemm.bf16_gemv.mm` handles unquantized
+BF16/FP32 projections, including FP32 outputs and bias before final rounding;
+live row counts share one compiled geometry/type specialization.
+
 
 **`attention`** — `attention.paged` (paged-KV decode/extend, FP8 KV, MSA block
 sparse, CUDA-graph-replayable), `attention.sparse_mla` and
@@ -42,6 +47,14 @@ contracts, kept separate on purpose), `attention.dsa_indexer` (the DSA/MSA quant
 score → select pipeline), `attention.qsa` (group-selected exact sparse GQA
 decode over caller-populated, read-only main BF16 K/V), and `attention.varlen`
 (contiguous batched/varlen).
+The `deepseek_v41` compressed-MLA recipe uses distinct post-RoPE cache
+records: 528-byte SWA rows (E4M3 plus per-32 UE8M0 scales) and 288-byte main
+rows (E2M1 plus per-16 E4M3 scales, without a global scale).
+`attention.mla_compress` produces normalized pre-RoPE latents for the
+nonoverlapping ratio-1/ratio-2 compressor. The MXFP4 DSA recipe exposes a
+score/reduce/select boundary and bounded candidate indices for hierarchical
+reindexing; tensor-parallel score reduction precedes selection.
+
 
 **`moe`** — `moe.fused_moe`, fused FP4 TP MoE across a micro-kernel decode
 path, a unified dynamic path (persistent grid, `nvfp4`/`w4a8_mx`/`w4a8_nvfp4`),
@@ -53,12 +66,66 @@ parallel).
 `norm.hyperconnection` (learned multi-stream residual primitives),
 `sequence.{ple_hash,ple_embedding,ple}` (prime-hashed embedding IDs, fused
 quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
-recurrent decode),
+recurrent decode), `sequence.gdn_prefill` (research-only scalar-gated prefill;
+see [GDN prefill](docs/gdn-prefill.md)), `sequence.kda_prefill` (KDA prefill),
 `sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
-`quantization.{nvfp4,mxfp8}` (row quantizers), and `comm.pcie` (IPC-backed PCIe
+`quantization.{nvfp4,mxfp8}` (row quantizers), `comm.roce` (RoCEnante: one-shot
+RDMA all-reduce/all-gather for multi-node DGX Spark TP, see `docs/rocenante.md`),
+and `comm.pcie` (IPC-backed PCIe
 collectives). The Qwen3.8-Flash-Next QSA, HyperConnection, PLE, GDN decode,
 and MTP feedback Triton implementations are correctness references and are
 not throughput-qualified production kernels.
+`sequence.engram` implements V4.1's compressed-token, DEAD-bounded n-gram
+hashing and row-sharded FP8/group-32 lookup. It is not an alias for Qwen PLE:
+their tokenizer domains, boundary rules, scale layouts, and convolution state
+differ. Engram's direct residual injection uses
+`norm.hyperconnection.run_engram_mix`; ordinary affine RMSNorm is selected
+with `zero_centered=False`. `norm.mhc.run_pre` and `run_post_pre` accept
+incoming `pre_mix` and caller-owned `pre_out` for lagged V4.1 mixing, while
+`run_collapse` supports the final weighted collapse and uniform stream mean.
+
+PLE and Engram share the bounded io_uring row cache in
+`sequence._shared.disk_table`: registered file regions, aligned O_DIRECT reads,
+block deduplication/coalescing, mapped-host staging, and stream-safe reuse.
+Their hashing and decoding stay separate. Engram's `DiskTable` reads the
+checkpoint's FP8 weight rows and separate E8M0 scale rows without conversion or
+full-table allocation; `run_lookup(..., token_count=...)` prepares fixed GPU
+outputs outside `torch.compile` and CUDA graph capture. The V4.1 vLLM adapter
+selects this path with `--engram-config '{"table_memory":"disk"}'` and prepares
+both Engram layers before each target forward, including speculative
+verification. DSpark's own draft/Markov graph has no Engram disk reads.
+
+`sequence.embedding` provides exact unquantized BF16/FP32 row lookup into
+caller-owned output, with Int32/Int64 IDs and Int64 table offsets. Its
+`precompile` entrypoint warms width/type specializations before capture;
+live row counts and table extents do not select compiler-cache entries.
+
+The V4.1 serving adapter retains checkpoint-native BF16 weight storage and
+BF16 activation/collective outputs instead of promoting them solely to match
+reference rounding. Native accumulation, normalization, routing scores and
+ratio-two softmax-pooling state remain FP32 where required. Speculative
+rejection preserves per-token compressor partials in request-owned bounded
+rings rather than overwriting one terminal carry state.
+
+The adapter binds mHC and sparse-attention/indexer plan scratch to vLLM's shared
+workspace. Outputs remain separate, live-row-sized allocations rather than
+per-layer scheduler-capacity buffers reserved during model construction.
+The [startup verification record](validation/deepseek_v41/startup_workspace_fix.json)
+covers the constructor-memory repair. The subsequent
+[native KV allocation repair](validation/deepseek_v41/native_kv_allocation_fix.json)
+aligns main KV and index K on the same logical token blocks, preserves their
+packed 890-byte-per-token global footprint, and restores model-derived cache
+grouping instead of the fork's bounded GLM grouping path. TP4 SSD serving now
+initializes the full 1M context at a 4096-token batch capacity and 0.95 memory
+utilization; the record distinguishes capacity accounting from exercised
+prompt lengths and includes graph replay, rejection, and prefix-reuse checks.
+
+`comm.pcie.PCIeDmaAllReduce.prepare_eager_replay(dtype)` prepares a lossless,
+capacity-sized CUDA graph for large eager collectives. All ranks prepare it
+before serving. Live prefixes reuse that graph through fixed staging buffers;
+returned outputs remain independent across calls. Compressed wire modes and
+outer graph captures keep their existing execution paths.
+
 `b12x` owns planning, scratch layout, and policy, so serving stacks only supply
 metadata and capacity limits.
 
@@ -151,13 +218,14 @@ Compressed transport requires BF16 input and a per-rank shard divisible by
 B12X_PCIE_DMA_FP8=i8_ring python -m your_server
 ```
 
-Compilation happens lazily per shape/config and is cached. For serving, warm
-up the shapes you need, then freeze:
+Specializations follow static geometry, dtype, planned capacity and
+device/toolchain identity, not live request counts. Before serving, precompile
+the selected specializations and exercise their runtime paths, then freeze:
 
 ```python
 import b12x
 
-# ... run warmup traffic covering every shape you will serve ...
+# ... preplan capacities and warm every selected specialization ...
 b12x.freeze_kernel_resolution("serving")
 ```
 
@@ -178,5 +246,9 @@ actually covered. `B12X_TIMING=1` enables per-kernel timing logs.
   from tile-sweep experiments).
 - `docs/` has design notes: the MoE execution model, the eager-plan-bind
   architecture, and an SM120 MLA postmortem.
+- `validation/deepseek_v41/` retains the original qualification artifacts from
+  the `Initial DSV41 bringup` backport (`674cacac5226baf8143327560040ce1e2e67fea5`).
+  Its JSON/CSV records preserve migration-era paths and hashes as provenance;
+  they do not qualify subsequent changes to this standalone tree.
 
 Failing that, ask your friendly neighborhood AI agent — it does fine here.

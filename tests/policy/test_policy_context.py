@@ -153,6 +153,43 @@ def test_auto_uses_heuristic_for_uncovered_query_or_device() -> None:
     )
 
 
+def test_explicit_empty_component_coverage_is_not_a_preplanned_config() -> None:
+    from b12x.policy import profile_from_dict
+
+    payload = {
+        "profile_id": "nvidia.synthetic.unqualified",
+        "targets": [{
+            "vendor": _DEVICE.vendor,
+            "product_name": _DEVICE.product_name,
+            "compute_capability": list(_DEVICE.compute_capability),
+            "sm_count": _DEVICE.sm_count,
+        }],
+        "components": [{
+            "component_id": "test.decode",
+            "query_schema_version": 1,
+            "config_schema_version": 1,
+            "rules": [],
+            "coverage": {"status": "unqualified"},
+        }],
+    }
+    registry = ProfileRegistry()
+    registry.register(profile_from_dict(payload))
+    registry.freeze()
+    query = _Query(family="a", rows=5)
+    automatic = PolicyContext.for_identity(_DEVICE, registry=registry)
+    result = automatic.resolve(_component(), query)
+    assert result.source is PolicySource.HEURISTIC
+    assert result.config == _Config(backend="heuristic", workers=5)
+    strict = PolicyContext.for_identity(
+        _DEVICE, registry=registry, mode=PolicyMode.PREPLANNED_ONLY
+    )
+    with pytest.raises(PreplannedPolicyNotFoundError):
+        strict.resolve(_component(), query)
+    del payload["components"][0]["rules"]
+    with pytest.raises(ValueError):
+        profile_from_dict(payload)
+
+
 def test_auto_warns_once_per_missing_profile_query(caplog) -> None:
     component = replace(_component(), component_id="test.warning")
     context = PolicyContext.for_identity(

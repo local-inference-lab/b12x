@@ -13,7 +13,16 @@ def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
         tensor.storage_offset()
     ) * int(tensor.element_size())
-    return start, start + int(tensor.numel()) * int(tensor.element_size())
+    span = (
+        0
+        if tensor.numel() == 0
+        else 1
+        + sum(
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    )
+    return start, start + span * int(tensor.element_size())
 
 
 def _require_disjoint(
@@ -211,18 +220,32 @@ def _grouped_rmsnorm_op(
     hidden_size: int,
     block_h: int,
     num_warps: int,
+    zero_centered: bool = True,
 ) -> None:
     _require_disjoint("normalized", out, (("state", state), ("weight", weight)))
-    _norm_launch(
-        state,
-        weight,
-        out,
-        eps,
-        streams,
-        hidden_size,
-        block_h,
-        num_warps,
-    )
+    if zero_centered:
+        _norm_launch(
+            state,
+            weight,
+            out,
+            eps,
+            streams,
+            hidden_size,
+            block_h,
+            num_warps,
+        )
+    else:
+        from ._cute import grouped_rmsnorm
+
+        grouped_rmsnorm(
+            state,
+            weight,
+            out,
+            eps=eps,
+            streams=streams,
+            hidden_size=hidden_size,
+            zero_centered=False,
+        )
 
 
 @_grouped_rmsnorm_op.register_fake
@@ -235,6 +258,7 @@ def _grouped_rmsnorm_fake(
     hidden_size: int,
     block_h: int,
     num_warps: int,
+    zero_centered: bool = True,
 ) -> None:
     del state, weight, out, eps, streams, hidden_size, block_h, num_warps
 
@@ -247,7 +271,9 @@ def _scaled_silu_op(
     block: int,
 ) -> None:
     _require_disjoint("bottleneck", out, (("projected_down", projected_down),))
-    _scaled_silu_launch(projected_down, out, streams, block)
+    from ._cute import scaled_silu
+
+    scaled_silu(projected_down, out, streams=streams)
 
 
 @_scaled_silu_op.register_fake
@@ -304,15 +330,15 @@ def _combine_op(
 ) -> torch.Tensor:
     combined = torch.empty_like(state)
     if int(state.shape[0]) != 0:
-        _combine_launch(
+        from ._cute import combine
+
+        combine(
             state,
             block_output,
             injection_logits,
             combined,
-            streams,
-            hidden_size,
-            block_h,
-            num_warps,
+            streams=streams,
+            hidden_size=hidden_size,
         )
     return combined
 
@@ -402,6 +428,7 @@ def run_grouped_rmsnorm(
     hidden_size: int,
     block_h: int,
     num_warps: int,
+    zero_centered: bool = True,
 ) -> None:
     torch.ops.b12x.hyperconnection_grouped_rmsnorm(
         state,
@@ -412,6 +439,7 @@ def run_grouped_rmsnorm(
         int(hidden_size),
         int(block_h),
         int(num_warps),
+        bool(zero_centered),
     )
 
 
@@ -492,10 +520,120 @@ def run_combine_norm(
     )
 
 
+@torch.library.custom_op("b12x::hyperconnection_engram_mix", mutates_args=("out",))
+def _engram_mix_op(
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    out: torch.Tensor,
+    eps: float,
+    streams: int,
+    hidden_size: int,
+) -> None:
+    from ._cute import engram_mix
+
+    _require_disjoint(
+        "out",
+        out,
+        (("state", state), ("projected_kv", projected_kv), ("norm_weights", norm_weights)),
+    )
+    engram_mix(
+        state,
+        projected_kv,
+        norm_weights,
+        token_mask,
+        out,
+        eps=eps,
+        streams=streams,
+        hidden_size=hidden_size,
+    )
+
+
+@_engram_mix_op.register_fake
+def _engram_mix_fake(
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    out: torch.Tensor,
+    eps: float,
+    streams: int,
+    hidden_size: int,
+) -> None:
+    del state, projected_kv, norm_weights, token_mask, out, eps, streams, hidden_size
+
+
+def run_engram_mix(
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    out: torch.Tensor,
+    *,
+    eps: float,
+    streams: int,
+    hidden_size: int,
+) -> None:
+    torch.ops.b12x.hyperconnection_engram_mix(
+        state, projected_kv, norm_weights, token_mask, out, eps, streams, hidden_size
+    )
+
+
+@torch.library.custom_op("b12x::hyperconnection_swiglu", mutates_args=("out",))
+def _swiglu_op(
+    gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+) -> None:
+    _require_disjoint("out", out, (("gate_up", gate_up),))
+    from ._cute import pointwise
+
+    if out.numel():
+        pointwise(
+            "swiglu", gate_up, gate_up, out, width=int(out.shape[1]),
+            limit=limit, round_silu=round_silu,
+        )
+
+
+@_swiglu_op.register_fake
+def _swiglu_fake(
+    gate_up: torch.Tensor, out: torch.Tensor, limit: float, round_silu: bool,
+) -> None:
+    del gate_up, out, limit, round_silu
+
+
+@torch.library.custom_op("b12x::hyperconnection_add", mutates_args=("out",))
+def _add_op(left: torch.Tensor, right: torch.Tensor, out: torch.Tensor) -> None:
+    _require_disjoint("out", out, (("left", left), ("right", right)))
+    from ._cute import pointwise
+
+    if out.numel():
+        pointwise("add", left, right, out)
+
+
+@_add_op.register_fake
+def _add_fake(left: torch.Tensor, right: torch.Tensor, out: torch.Tensor) -> None:
+    del left, right, out
+
+
+@torch.library.custom_op("b12x::hyperconnection_sigmoid", mutates_args=("out",))
+def _sigmoid_op(input: torch.Tensor, out: torch.Tensor) -> None:
+    _require_disjoint("out", out, (("input", input),))
+    from ._cute import pointwise
+
+    if out.numel():
+        pointwise("sigmoid", input, input, out)
+
+
+@_sigmoid_op.register_fake
+def _sigmoid_fake(input: torch.Tensor, out: torch.Tensor) -> None:
+    del input, out
+
+
 __all__ = [
     "run_grouped_rmsnorm",
     "run_scaled_silu",
     "run_gate_mean",
     "run_combine",
     "run_combine_norm",
+    "run_engram_mix",
 ]

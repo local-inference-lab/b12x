@@ -1,0 +1,84 @@
+{
+  "status": "research-only",
+  "operation": "GLM-5.3-Flash NVFP4 routed MoE shared-input and separate FC1/FC2 compute",
+  "host": "aiserver",
+  "physical_gpus": [4, 5, 6, 7],
+  "gpu_model": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "gpu_uuids": [
+    "GPU-8800cf0c-1ba5-7136-d796-2a91f9e9586e",
+    "GPU-4a0aa20b-8e36-2e05-4efb-8befbf1181d4",
+    "GPU-1a0323f7-8113-a1e1-c68b-f23fecf77171",
+    "GPU-0027fc86-3322-ce2a-856c-f49eb61eb63e"
+  ],
+  "nvml_observed_settings": {
+    "graphics_offset": 0,
+    "memory_offset": 6000,
+    "power_limit_watts": 600,
+    "settings_changed_by_poc": false
+  },
+  "image": {
+    "tag": "localinferencelab/vllm:jovian-judgement-community-20260909-r32",
+    "registry_digest": "sha256:c9ad4a6ef4aa55232df9ed1a37e85d94eb8c7d5349561a6cbe828e72b61de83c",
+    "image_id": "sha256:84a2c85d9f889bf0a4b0d08f33630544e1366deb3546d2b26046b64e3e1f364a",
+    "filesystem_layers": 2
+  },
+  "reference_sources": {
+    "b12x": "3edbcbce70f491741b82f5eab9c1b30b39447228",
+    "vllm": "5576927057cf71b6ec61d120932338b333efa089"
+  },
+  "candidate_sources": {
+    "b12x_pr_353_head": "87bde512e507c5832b6dfb6edb29d0f902392395",
+    "b12x_compatibility_commit": "7b9b834d",
+    "b12x_test_configuration_commit": "8e642724",
+    "vllm": "ae89131442359dc332d9c46009be3c1f8cdee0b4",
+    "installation": "read-only B12X package and one vLLM adapter file mounted over R32; no image publication"
+  },
+  "checkpoint": {
+    "repository": "local-inference-lab/GLM-5.3-Flash-NVFP4",
+    "revision": "46aaae8a82032f77100f2f03e9cc11b391df3b4d",
+    "input_scales_sha256": "4255779f031450572af8548c610fd9abfe7df89704985d18595c21788593cd05",
+    "modified": false
+  },
+  "serving": {
+    "port": 5241,
+    "tensor_parallel_size": 4,
+    "decode_context_parallel_size": 1,
+    "speculation": false,
+    "target_kv_dtype": "fp8",
+    "cache_mode": "vram",
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 32,
+    "max_model_len": 1048576,
+    "gpu_memory_utilization": 0.93,
+    "omp_num_threads": 1,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "nccl_min_nchannels": 16,
+    "nccl_max_nchannels": 16,
+    "nccl_buffsize": 2097152,
+    "VLLM_LM_HEAD_A16": 1,
+    "launcher": "diagnostics/launch_glm_nvfp4_split_local.sh"
+  },
+  "prefill_measurement": {
+    "client": "diagnostics/measure_exact_cold_prefill.py",
+    "prompt_tokens": 32768,
+    "prompt_type": "cyclic token IDs with unique leading nonce",
+    "warmup_requests": 1,
+    "measurement_duration_seconds": 30,
+    "max_output_tokens": 1,
+    "temperature": 0,
+    "require_entire_prompt_compute": true,
+    "metric": "input tokens divided by client time to first generated token"
+  },
+  "decode_measurement": {
+    "client": "llm-decode-bench v0.6.1",
+    "source_sha256": "516dc590b80dda6d9880f9f5034026fdf1b2074e9747bf8a920758680f019817",
+    "concurrency": 1,
+    "context_tokens_argument": 0,
+    "warmup_seconds": 10,
+    "measurement_seconds": 30,
+    "max_tokens": 8192,
+    "temperature": 1,
+    "top_p": "omitted; model generation configuration resolves to 0.95",
+    "respect_eos": true
+  }
+}

@@ -12,7 +12,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as cutlass_utils
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
-from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass import Float32, Int32, Int64, Uint32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
@@ -31,6 +31,7 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     bfloat2_to_float2_scaled,
     f32_to_raw_bits,
+    f32_to_tf32_bits,
     get_ptr_as_int64,
     ld_global_nc_u32,
     ldmatrix_m8n8x4_b16,
@@ -42,6 +43,103 @@ from b12x._lib.intrinsics import (
 from b12x._lib.utils import current_cuda_stream
 from b12x.norm.mhc._policy import MhcConfig
 
+@cute.jit
+def _contract_four(
+    p0: Float32, p1: Float32, p2: Float32, p3: Float32,
+    r0: Float32, r1: Float32, r2: Float32, r3: Float32,
+) -> Float32:
+    return p0 * r0 + p1 * r1 + p2 * r2 + p3 * r3
+
+
+class _MhcCollapse:
+    """Standalone four-stream contraction; no projection or scratch."""
+
+    def __init__(self, hidden_size: int, weighted: bool) -> None:
+        self.hidden_size = int(hidden_size)
+        self.weighted = bool(weighted)
+
+    @cute.jit
+    def __call__(
+        self, state: cute.Tensor, pre_mix: cute.Tensor, out: cute.Tensor,
+        tokens: Int32, stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(state, pre_mix, out).launch(
+            grid=((self.hidden_size + 255) // 256, tokens, 1),
+            block=(256, 1, 1), stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, state: cute.Tensor, pre_mix: cute.Tensor, out: cute.Tensor):
+        tile, row, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        token = Int64(row)
+        h = Int64(tile) * Int64(256) + Int64(thread)
+        if h < Int64(self.hidden_size):
+            p0 = Float32(0.25)
+            p1 = Float32(0.25)
+            p2 = Float32(0.25)
+            p3 = Float32(0.25)
+            if const_expr(self.weighted):
+                p0 = Float32(pre_mix[token, 0])
+                p1 = Float32(pre_mix[token, 1])
+                p2 = Float32(pre_mix[token, 2])
+                p3 = Float32(pre_mix[token, 3])
+            out[token, h] = _contract_four(
+                p0, p1, p2, p3,
+                Float32(state[token, 0, h]), Float32(state[token, 1, h]),
+                Float32(state[token, 2, h]), Float32(state[token, 3, h]),
+            ).to(cutlass.BFloat16)
+
+
+@lru_cache(maxsize=None)
+def _collapse_kernel(hidden_size: int, weighted: bool) -> _MhcCollapse:
+    return _MhcCollapse(hidden_size, weighted)
+
+
+@torch.library.custom_op("b12x::mhc_collapse", mutates_args=("out",))
+def _mhc_collapse_op(
+    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
+) -> None:
+    if torch._C._overlaps(state, out) or (
+        pre_mix is not None and torch._C._overlaps(pre_mix, out)
+    ):
+        raise ValueError("collapse out must not alias state or pre_mix")
+    tokens, _, hidden = state.shape
+    if not tokens:
+        return
+    weighted = pre_mix is not None
+    args = (
+        _to_kernel_tensor(state, cutlass.BFloat16, assumed_align=2, dynamic_layout=True),
+        _to_kernel_tensor(
+            pre_mix if weighted else state,
+            cutlass.Float32 if weighted else cutlass.BFloat16,
+            assumed_align=4 if weighted else 2, dynamic_layout=True,
+        ),
+        _to_kernel_tensor(out, cutlass.BFloat16, assumed_align=2, dynamic_layout=True),
+        Int32(tokens), current_cuda_stream(),
+    )
+    key = (
+        hidden, weighted,
+        tensor_key(
+            "state", state,
+            dims=(DimKey.dynamic(), DimKey.exact(4), DimKey.exact(hidden)),
+        ),
+        tensor_key("out", out, dims=(DimKey.dynamic(), DimKey.exact(hidden))),
+    )
+    b12x_launch(
+        _collapse_kernel(hidden, weighted),
+        compile_spec=KernelCompileSpec.from_key("norm.mhc.collapse", 1, key),
+        compile_args=args, runtime_args=args,
+    )
+
+
+@_mhc_collapse_op.register_fake
+def _mhc_collapse_fake(
+    state: torch.Tensor, pre_mix: torch.Tensor | None, out: torch.Tensor,
+) -> None:
+    del state, pre_mix, out
+
+
 _MHC_MULT = 4
 _TOKENS = 1
 _HIDDEN = 4096
@@ -49,7 +147,7 @@ _TOTAL_K = _MHC_MULT * _HIDDEN
 _SPLIT_K = 64
 _SOURCE_TILE_H = 128
 _SOURCE_TILES = _HIDDEN // _SOURCE_TILE_H
-_SUPPORTED_HIDDEN_SIZES = (_HIDDEN, 7168)
+_SUPPORTED_HIDDEN_SIZES = (_HIDDEN, 5120, 7168)
 _MIXES = 24
 _PARTIALS = 1 + _MIXES
 _PARTIALS_PER_CTA = 2
@@ -241,6 +339,24 @@ def _materialize_residual_gram_f32(value, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _tf32_residual_bits(value: Float32, high: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Round the FP32 remainder after the first TF32 term."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip), Uint32(high).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 hi, lo; mov.b32 hi, $2; sub.rn.f32 lo, $1, hi; cvt.rna.tf32.f32 $0, lo; }",
+            "=r,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _source_tiles_for_hidden(hidden_size: int) -> int:
     hidden_size = int(hidden_size)
     if hidden_size <= 0:
@@ -381,7 +497,7 @@ def _norm_weight_kernel_tensor(
     fallback: torch.Tensor,
 ) -> cutlass.cute.Tensor:
     if norm_weight is None:
-        return _to_kernel_tensor(fallback, cutlass.BFloat16)
+        return _to_kernel_tensor(fallback, cutlass.BFloat16, dynamic_layout=True)
     if norm_weight.dtype == torch.bfloat16:
         return _to_kernel_tensor(norm_weight, cutlass.BFloat16)
     if norm_weight.dtype == torch.float32:
@@ -824,6 +940,7 @@ class MHCPostPrePartialKernel:
         out: cute.Tensor,
     ):
         hidden_tile, partial_group, token = cute.arch.block_idx()
+        token = Int64(token)
         tidx = cute.arch.thread_idx()[0]
         if const_expr(_MHC_PDL):
             cute.arch.griddepcontrol_wait()
@@ -851,15 +968,21 @@ class MHCPostPrePartialKernel:
         partial0 = partial_group * Int32(self.partials_per_cta)
         h = hidden_tile * Int32(self.source_tile_h) + tidx
         if const_expr(self.pre_only):
-            r0 = Float32(residual[token, h])
-            r1 = r0
-            r2 = r0
-            r3 = r0
+            if const_expr(cute.rank(residual) == 2):
+                r0 = Float32(residual[token, h])
+                r1 = r0
+                r2 = r0
+                r3 = r0
+            else:
+                r0 = Float32(residual[token, 0, h])
+                r1 = Float32(residual[token, 1, h])
+                r2 = Float32(residual[token, 2, h])
+                r3 = Float32(residual[token, 3, h])
             if partial_group == Int32(0):
                 out[token, Int32(0), h] = r0.to(cutlass.BFloat16)
-                out[token, Int32(1), h] = r0.to(cutlass.BFloat16)
-                out[token, Int32(2), h] = r0.to(cutlass.BFloat16)
-                out[token, Int32(3), h] = r0.to(cutlass.BFloat16)
+                out[token, Int32(1), h] = r1.to(cutlass.BFloat16)
+                out[token, Int32(2), h] = r2.to(cutlass.BFloat16)
+                out[token, Int32(3), h] = r3.to(cutlass.BFloat16)
         else:
             r0 = Float32(residual[token, Int32(0), h])
             r1 = Float32(residual[token, Int32(1), h])
@@ -941,7 +1064,7 @@ class MHCPostPrePartialKernel:
                 value = Float32(0.0)
                 if partial == Int32(0):
                     value = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
-                elif const_expr(self.pre_only):
+                elif const_expr(self.pre_only and cute.rank(residual) == 2):
                     if partial < Int32(self.partials):
                         mix = partial - Int32(1)
                         value = Float32(fn[mix, h]) * r0
@@ -1151,19 +1274,19 @@ class MHCPostPreDecodeSplitNPartialKernel:
                 x_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         x,
-                        token * Int32(self.hidden_size) + h,
+                        Int64(token) * Int64(self.hidden_size) + h,
                     )
                 )
                 rin0_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size) + h,
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size) + h,
                     )
                 )
                 rin1_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(self.hidden_size)
                         + h,
                     )
@@ -1171,7 +1294,7 @@ class MHCPostPreDecodeSplitNPartialKernel:
                 rin2_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(2 * self.hidden_size)
                         + h,
                     )
@@ -1179,7 +1302,7 @@ class MHCPostPreDecodeSplitNPartialKernel:
                 rin3_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(3 * self.hidden_size)
                         + h,
                     )
@@ -2006,7 +2129,7 @@ class MHCPostPrePrefillGramKernel:
         for gp in cutlass.range_constexpr(_GRAM_PAIRS):
             gvals[gp] = Float32(0.0)
 
-        token = Int32(token)
+        token = Int64(token)
         out_u32 = cute.recast_tensor(out, Uint32)
         for hidden_pair_iter in cutlass.range_constexpr(self.hidden_pair_iters):
             h = Int32(2 * hidden_pair_iter * self.num_threads) + tidx * Int32(2)
@@ -2014,19 +2137,19 @@ class MHCPostPrePrefillGramKernel:
                 x_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         x,
-                        token * Int32(self.hidden_size) + h,
+                        Int64(token) * Int64(self.hidden_size) + h,
                     )
                 )
                 rin0_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size) + h,
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size) + h,
                     )
                 )
                 rin1_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(self.hidden_size)
                         + h,
                     )
@@ -2034,7 +2157,7 @@ class MHCPostPrePrefillGramKernel:
                 rin2_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(2 * self.hidden_size)
                         + h,
                     )
@@ -2042,7 +2165,7 @@ class MHCPostPrePrefillGramKernel:
                 rin3_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
                         residual,
-                        token * Int32(_MHC_MULT * self.hidden_size)
+                        Int64(token) * Int64(_MHC_MULT * self.hidden_size)
                         + Int32(3 * self.hidden_size)
                         + h,
                     )
@@ -2520,8 +2643,10 @@ class MHCPrefillTf32ProjectTmaKernel:
         k_splits: int | None = None,
         chunk_geometry: bool = False,
         long_geometry: bool = False,
+        split_fp32_fn: bool = False,
     ):
         self.hidden_size = int(hidden_size)
+        self.split_fp32_fn = bool(split_fp32_fn)
         use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
         use_4096_long_geometry = long_geometry and self.hidden_size == _HIDDEN
         explicit_geometry = (
@@ -2830,6 +2955,12 @@ class MHCPrefillTf32ProjectTmaKernel:
                 Float32,
             )
             acc.fill(0.0)
+            if const_expr(self.split_fp32_fn):
+                acc_low = cute.make_rmem_tensor(
+                    cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
+                    Float32,
+                )
+                acc_low.fill(0.0)
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
@@ -2864,6 +2995,27 @@ class MHCPrefillTf32ProjectTmaKernel:
                         # TMA likewise zero-fills a partial final N tile.
                         b0_f = Float32(sB[b_mix_local, a_k0, consumer_state.index])
                         b1_f = Float32(sB[b_mix_local, a_k1, consumer_state.index])
+                        b0_tf32 = f32_to_raw_bits(b0_f)
+                        b1_tf32 = f32_to_raw_bits(b1_f)
+                        if const_expr(self.split_fp32_fn):
+                            # BF16 A is TF32-exact. Splitting only FP32 B into
+                            # high + low terms retains its projection precision
+                            # without an extra residual traversal or scratch.
+                            b0_tf32 = f32_to_tf32_bits(b0_f)
+                            b1_tf32 = f32_to_tf32_bits(b1_f)
+                            l0, l1, l2, l3 = tf32_mma_m16n8k8_f32(
+                                acc_low[warp_mma_n, 0],
+                                acc_low[warp_mma_n, 1],
+                                acc_low[warp_mma_n, 2],
+                                acc_low[warp_mma_n, 3],
+                                a0_tf32, a1_tf32, a2_tf32, a3_tf32,
+                                _tf32_residual_bits(b0_f, b0_tf32),
+                                _tf32_residual_bits(b1_f, b1_tf32),
+                            )
+                            acc_low[warp_mma_n, 0] = l0
+                            acc_low[warp_mma_n, 1] = l1
+                            acc_low[warp_mma_n, 2] = l2
+                            acc_low[warp_mma_n, 3] = l3
 
                         d0, d1, d2, d3 = tf32_mma_m16n8k8_f32(
                             acc[warp_mma_n, 0],
@@ -2874,8 +3026,8 @@ class MHCPrefillTf32ProjectTmaKernel:
                             a1_tf32,
                             a2_tf32,
                             a3_tf32,
-                            f32_to_raw_bits(b0_f),
-                            f32_to_raw_bits(b1_f),
+                            b0_tf32,
+                            b1_tf32,
                         )
                         acc[warp_mma_n, 0] = d0
                         acc[warp_mma_n, 1] = d1
@@ -2885,6 +3037,9 @@ class MHCPrefillTf32ProjectTmaKernel:
                 consumer_state.advance()
 
             for warp_mma_n in cutlass.range_constexpr(self.n_mma_tiles_per_warp):
+                if const_expr(self.split_fp32_fn):
+                    for column in cutlass.range_constexpr(4):
+                        acc[warp_mma_n, column] += acc_low[warp_mma_n, column]
                 mma_n = Int32(warp_mma_n * self.num_n_warps) + warp_n
                 mix0 = n_tile * Int32(self.tile_n) + Int32(mma_n * 8) + lane_pair_base
                 mix1 = mix0 + Int32(1)
@@ -3024,7 +3179,7 @@ class MHCPrefillBf16ProjectKernel:
                     value = ld_global_nc_u32(
                         get_ptr_as_int64(
                             out,
-                            token * Int32(self.total_k) + kval,
+                            Int64(token) * Int64(self.total_k) + kval,
                         )
                     )
                 st_shared_u32(
@@ -3108,6 +3263,7 @@ class MHCFinalizeGramKernel:
         single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
         single_cta_groups: int = 1,
         active_source_splits: int = 0,
+        lagged_mix: bool = False,
     ):
         self.hidden_size = int(hidden_size)
         self.single_cta = bool(single_cta)
@@ -3118,7 +3274,9 @@ class MHCFinalizeGramKernel:
         if not self.single_cta and self.single_cta_groups != 1:
             raise ValueError("single_cta_groups requires single_cta=True")
         self.num_threads = (
-            self.single_cta_threads
+            _PREFILL_FINALIZE_THREADS
+            if lagged_mix
+            else self.single_cta_threads
             if self.single_cta
             else (_PREFILL_FINALIZE_THREADS if compact_partials else _GRAM_BLOCK_H)
         )
@@ -3167,7 +3325,9 @@ class MHCFinalizeGramKernel:
         self.norm_eps = float(norm_eps)
         # When False, norm_weight is ignored: y is the raw collapsed activation
         # (no Gram reduction, no RMSNorm). The partial then skips the Gram.
-        self.fuse_norm = bool(fuse_norm)
+        self.lagged_mix = bool(lagged_mix)
+        self.lagged_norm = bool(fuse_norm) and self.lagged_mix
+        self.fuse_norm = bool(fuse_norm) and not self.lagged_mix
         self.compact_partials = bool(compact_partials)
         self.compact_projection_splits = int(compact_projection_splits)
         if self.compact_projection_splits <= 0:
@@ -3183,7 +3343,9 @@ class MHCFinalizeGramKernel:
                 "compact_projection_splits must be less than partials split_k"
             )
         self.tiles_per_cta = (
-            self.hidden_tiles // self.single_cta_groups
+            self.hidden_tiles
+            if self.lagged_mix
+            else self.hidden_tiles // self.single_cta_groups
             if self.single_cta
             else self.hidden_tiles
             if self.compact_partials
@@ -3208,6 +3370,8 @@ class MHCFinalizeGramKernel:
         post: cute.Tensor,
         comb: cute.Tensor,
         norm_weight: cute.Tensor,
+        pre_mix: cute.Tensor,
+        pre_out: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
     ):
@@ -3218,12 +3382,12 @@ class MHCFinalizeGramKernel:
         if const_expr(y.element_type != cutlass.BFloat16):
             raise TypeError("y must be BFloat16")
         if const_expr(
-            self.fuse_norm
+            (self.fuse_norm or self.lagged_norm)
             and norm_weight.element_type != cutlass.BFloat16
             and norm_weight.element_type != cutlass.Float32
         ):
             raise TypeError("norm_weight must be BFloat16 or Float32")
-        self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight).launch(
+        self.kernel(residual, partials, scale, bias, y, post, comb, norm_weight, pre_mix, pre_out).launch(
             grid=(self.hidden_tiles // self.tiles_per_cta, num_tokens, 1),
             block=[self.num_threads, 1, 1],
             stream=stream,
@@ -3241,8 +3405,11 @@ class MHCFinalizeGramKernel:
         post: cute.Tensor,
         comb: cute.Tensor,
         norm_weight: cute.Tensor,
+        pre_mix: cute.Tensor,
+        pre_out: cute.Tensor,
     ):
         tile_group, token, _ = cute.arch.block_idx()
+        token = Int64(token)
         tile_group = Int32(tile_group)
         tidx = Int32(cute.arch.thread_idx()[0])
 
@@ -3800,7 +3967,52 @@ class MHCFinalizeGramKernel:
         p1 = Float32(s_pre[1])
         p2 = Float32(s_pre[2])
         p3 = Float32(s_pre[3])
-        if const_expr(self.compact_partials or self.single_cta):
+        if const_expr(self.lagged_mix):
+            if tidx < Int32(_MHC_MULT):
+                pre_out[token, tidx] = Float32(s_pre[tidx])
+            p0 = Float32(pre_mix[token, 0])
+            p1 = Float32(pre_mix[token, 1])
+            p2 = Float32(pre_mix[token, 2])
+            p3 = Float32(pre_mix[token, 3])
+            # V4.1 normalizes the rounded BF16 contraction, not pre^T G pre.
+            values = cute.make_rmem_tensor(
+                cute.make_layout((self.hidden_tiles,), stride=(1,)), Float32
+            )
+            square_sum = Float32(0.0)
+            for tile in cutlass.range_constexpr(self.hidden_tiles):
+                h = Int32(tile * self.num_threads) + tidx
+                value = _contract_four(
+                    p0, p1, p2, p3,
+                    Float32(residual[token, 0, h]), Float32(residual[token, 1, h]),
+                    Float32(residual[token, 2, h]), Float32(residual[token, 3, h]),
+                ).to(cutlass.BFloat16)
+                values[tile] = Float32(value)
+                square_sum += Float32(value) * Float32(value)
+            if const_expr(self.lagged_norm):
+                reductions = storage.partials.get_tensor(
+                    cute.make_layout((self.num_threads,), stride=(1,))
+                )
+                square_sum = _warp_allreduce_sum(square_sum)
+                if tidx % Int32(32) == Int32(0):
+                    reductions[tidx // Int32(32)] = square_sum
+                cute.arch.sync_threads()
+                total = Float32(0.0)
+                if tidx < Int32(self.num_threads // 32):
+                    total = Float32(reductions[tidx])
+                total = _warp_allreduce_sum(total)
+                if tidx == Int32(0):
+                    s_post[0] = cute.math.rsqrt(
+                        total / Float32(self.hidden_size) + Float32(self.norm_eps),
+                        fastmath=True,
+                    )
+                cute.arch.sync_threads()
+            for tile in cutlass.range_constexpr(self.hidden_tiles):
+                h = Int32(tile * self.num_threads) + tidx
+                value = Float32(values[tile])
+                if const_expr(self.lagged_norm):
+                    value = value * Float32(s_post[0]) * Float32(norm_weight[h])
+                y[token, h] = value.to(cutlass.BFloat16)
+        elif const_expr(self.compact_partials or self.single_cta):
             y_u32 = cute.recast_tensor(y, Uint32)
             first_pair = Int32(0)
             if const_expr(self.single_cta and self.single_cta_groups > 1):
@@ -3811,7 +4023,7 @@ class MHCFinalizeGramKernel:
                 self.hidden_size // (2 * self.num_threads * self.single_cta_groups)
             ):
                 h = (first_pair + Int32(pair_iter * self.num_threads) + tidx) * Int32(2)
-                residual_base = token * Int32(_MHC_MULT * self.hidden_size) + h
+                residual_base = token * Int64(_MHC_MULT * self.hidden_size) + Int64(h)
                 ro0_pair = ld_global_nc_u32(get_ptr_as_int64(residual, residual_base))
                 ro1_pair = ld_global_nc_u32(
                     get_ptr_as_int64(
@@ -3993,6 +4205,7 @@ def _prefill_tf32_project_kernel(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
+    split_fp32_fn: bool = False,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
@@ -4004,6 +4217,7 @@ def _prefill_tf32_project_kernel(
         num_m_warps=num_m_warps,
         num_n_warps=num_n_warps,
         k_splits=k_splits,
+        split_fp32_fn=split_fp32_fn,
     )
 
 
@@ -4022,6 +4236,7 @@ def _finalize_gram_kernel(
     single_cta_threads: int = _PREFILL_FINALIZE_THREADS,
     single_cta_groups: int = 1,
     active_source_splits: int = 0,
+    lagged_mix: bool = False,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=hidden_size,
@@ -4037,6 +4252,7 @@ def _finalize_gram_kernel(
         single_cta_threads=single_cta_threads,
         single_cta_groups=single_cta_groups,
         active_source_splits=active_source_splits,
+        lagged_mix=lagged_mix,
     )
 
 
@@ -5053,6 +5269,7 @@ def _run_mhc_prefill_tf32_project_launch(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
+    split_fp32_fn: bool = False,
 ) -> None:
     tokens = int(out.shape[0])
     hidden_size = int(out.shape[2])
@@ -5082,6 +5299,7 @@ def _run_mhc_prefill_tf32_project_launch(
         int(num_m_warps),
         int(num_n_warps),
         int(k_splits),
+        bool(split_fp32_fn),
     )
     args = (
         _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
@@ -5134,6 +5352,7 @@ def _run_mhc_prefill_tf32_project_launch(
         ("num_compute_warps", kernel.num_compute_warps),
         ("threads", kernel.num_threads),
         ("k_splits", kernel.k_splits),
+        ("split_fp32_fn", bool(split_fp32_fn)),
         ("pdl", _MHC_PDL),
         (
             "operand_layout",
@@ -5143,7 +5362,7 @@ def _run_mhc_prefill_tf32_project_launch(
     )
     b12x_launch(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 7, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 8, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -5205,6 +5424,7 @@ def _mhc_prefill_tf32_project_launch_op(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
+    split_fp32_fn: bool = False,
 ) -> None:
     _run_mhc_prefill_tf32_project_launch(
         out=out,
@@ -5217,6 +5437,7 @@ def _mhc_prefill_tf32_project_launch_op(
         num_m_warps=num_m_warps,
         num_n_warps=num_n_warps,
         k_splits=k_splits,
+        split_fp32_fn=split_fp32_fn,
     )
 
 
@@ -5232,6 +5453,7 @@ def _mhc_prefill_tf32_project_launch_fake(
     num_m_warps: int,
     num_n_warps: int,
     k_splits: int,
+    split_fp32_fn: bool = False,
 ) -> None:
     del (
         out,
@@ -5254,6 +5476,7 @@ def run_mhc_prefill_tf32_project(
     fn: torch.Tensor,
     partials: torch.Tensor,
     config: MhcConfig | None = None,
+    split_fp32_fn: bool = False,
 ) -> None:
     selected = config or _legacy_mhc_prefill_tf32_config(
         tokens=int(out.shape[0]),
@@ -5270,6 +5493,7 @@ def run_mhc_prefill_tf32_project(
         selected.projection_num_m_warps,
         selected.projection_num_n_warps,
         selected.projection_k_splits,
+        bool(split_fp32_fn),
     )
 
 
@@ -5511,15 +5735,18 @@ def _run_mhc_pre_partial_launch(
     compute_gram: bool = False,
 ) -> None:
     tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[1])
+    hidden_size = int(residual.shape[-1])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
     partials_per_cta = _selected_post_pre_partials_per_cta(
         num_tokens=tokens,
         hidden_size=hidden_size,
     )
-    _validate_tensor_shape("residual", residual, (tokens, hidden_size))
-    _validate_tensor_shape("fn", fn, (_MIXES, hidden_size))
+    expanded = residual.ndim == 3
+    residual_shape = (tokens, _MHC_MULT, hidden_size) if expanded else (tokens, hidden_size)
+    fn_width = _MHC_MULT * hidden_size if expanded else hidden_size
+    _validate_tensor_shape("residual", residual, residual_shape)
+    _validate_tensor_shape("fn", fn, (_MIXES, fn_width))
     _validate_tensor_shape("partials", partials, (tokens, split_k, _PARTIALS))
     _validate_tensor_shape("out", out, (tokens, _MHC_MULT, hidden_size))
     compute_gram = bool(compute_gram)
@@ -5553,15 +5780,12 @@ def _run_mhc_pre_partial_launch(
         tensor_key(
             "residual",
             residual,
-            dims=(
-                DimKey.dynamic(),
-                DimKey.exact(hidden_size),
-            ),
+            dims=(DimKey.dynamic(),) + tuple(DimKey.exact(dim) for dim in residual_shape[1:]),
         ),
         tensor_key(
             "fn",
             fn,
-            dims=(DimKey.exact(_MIXES), DimKey.exact(hidden_size)),
+            dims=(DimKey.exact(_MIXES), DimKey.exact(fn_width)),
         ),
         tensor_key(
             "partials",
@@ -5689,6 +5913,8 @@ def _run_mhc_finalize_gram_launch(
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
     active_source_splits: int = 0,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
 ) -> None:
     rms_eps = float(rms_eps)
     hc_eps = float(hc_eps)
@@ -5705,10 +5931,11 @@ def _run_mhc_finalize_gram_launch(
     tokens = int(residual.shape[0])
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
+    lagged_mix = pre_mix is not None
     _validate_split_k(hidden_size, split_k)
     single_cta_threads = (
         0
-        if compact_partials
+        if compact_partials or lagged_mix
         else _selected_mhc_decode_finalize_threads(
             num_tokens=tokens,
             hidden_size=hidden_size,
@@ -5760,6 +5987,8 @@ def _run_mhc_finalize_gram_launch(
             dynamic_layout=True,
         ),
         norm_weight_tensor,
+        _to_kernel_tensor(pre_mix if lagged_mix else scale, cutlass.Float32, assumed_align=4, dynamic_layout=True),
+        _to_kernel_tensor(pre_out if lagged_mix else bias, cutlass.Float32, assumed_align=4, dynamic_layout=True),
         Int32(tokens),
         current_cuda_stream(),
     )
@@ -5785,6 +6014,7 @@ def _run_mhc_finalize_gram_launch(
         ),
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
         ("fuse_norm", fuse_norm),
+        ("lagged_mix", lagged_mix),
         ("compact_partials", compact_partials),
         ("compact_projection_splits", compact_projection_splits),
         ("single_cta", single_cta),
@@ -5889,8 +6119,9 @@ def _run_mhc_finalize_gram_launch(
             single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
             single_cta_groups,
             active_source_splits,
+            lagged_mix,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -5898,7 +6129,7 @@ def _run_mhc_finalize_gram_launch(
 
 @torch.library.custom_op(
     "b12x::mhc_finalize_gram_launch",
-    mutates_args=("y", "post", "comb"),
+    mutates_args=("y", "post", "comb", "pre_out"),
 )
 def _mhc_finalize_gram_launch_op(
     residual: torch.Tensor,
@@ -5917,6 +6148,8 @@ def _mhc_finalize_gram_launch_op(
     compact_partials: bool,
     compact_projection_splits: int,
     active_source_splits: int,
+    pre_mix: torch.Tensor | None,
+    pre_out: torch.Tensor | None,
 ) -> None:
     _run_mhc_finalize_gram_launch(
         residual=residual,
@@ -5935,6 +6168,8 @@ def _mhc_finalize_gram_launch_op(
         compact_partials=compact_partials,
         compact_projection_splits=compact_projection_splits,
         active_source_splits=active_source_splits,
+        pre_mix=pre_mix,
+        pre_out=pre_out,
     )
 
 
@@ -5956,6 +6191,8 @@ def _mhc_finalize_gram_launch_fake(
     compact_partials: bool,
     compact_projection_splits: int,
     active_source_splits: int,
+    pre_mix: torch.Tensor | None,
+    pre_out: torch.Tensor | None,
 ) -> None:
     return None
 
@@ -5977,16 +6214,12 @@ def run_mhc_finalize_gram(
     compact_partials: bool = False,
     compact_projection_splits: int = 1,
     active_source_splits: int = 0,
+    pre_mix: torch.Tensor | None = None,
+    pre_out: torch.Tensor | None = None,
 ) -> None:
-    # When norm_weight is None the kernel ignores it (fuse_norm=False), but it
-    # still needs a valid tensor arg. Do NOT alias `y` here: `y` is a mutated arg
-    # of this op, and passing a mutated arg a second time as a read-only arg makes
-    # auto_functionalized's decomposition fail under torch.compile (the
-    # replace_by_example node-count assertion). Use a fresh, non-mutated
-    # placeholder with y's (kernel-proven) shape/dtype instead.
-    norm_weight_for_kernel = (
-        norm_weight if norm_weight is not None else torch.empty_like(y)
-    )
+    # Use an existing read-only tensor for the unused norm argument: serving
+    # calls without RMSNorm must not allocate a placeholder during capture.
+    norm_weight_for_kernel = norm_weight if norm_weight is not None else residual
     torch.ops.b12x.mhc_finalize_gram_launch(
         residual,
         partials,
@@ -6004,6 +6237,8 @@ def run_mhc_finalize_gram(
         bool(compact_partials),
         int(compact_projection_splits),
         int(active_source_splits),
+        pre_mix,
+        pre_out,
     )
 
 
@@ -6071,7 +6306,7 @@ def _mhc_pre_launch_functional_op(
     fuse_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = int(residual.shape[0])
-    hidden_size = int(residual.shape[1])
+    hidden_size = int(residual.shape[-1])
     split_k = _split_k_for_hidden(hidden_size)
     partials = torch.empty(
         (tokens, split_k, _PARTIALS),
@@ -6138,7 +6373,7 @@ def _mhc_pre_launch_functional_fake(
     fuse_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = residual.shape[0]
-    hidden_size = residual.shape[1]
+    hidden_size = residual.shape[-1]
     y = torch.empty(
         (tokens, hidden_size),
         dtype=residual.dtype,

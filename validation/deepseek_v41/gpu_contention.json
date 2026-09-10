@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": "resolved_for_tp4_qualification",
+  "prior_external_process": {
+    "gpu_index": 5,
+    "pid": 1619355,
+    "status": "exited before initial final trace"
+  },
+  "new_external_process": {
+    "gpu_index": 0,
+    "gpu_uuid": "GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff",
+    "pid": 2281086,
+    "process": "/home/luke/projects/b12x/.venv/bin/python",
+    "observed_memory_mib": 1500,
+    "start_time": "unknown; process exited before ps inspection"
+  },
+  "decision": "User freed GPUs0,1,2,3; continuous process samples for TP4 qualification contained only recorded VLLM workers.",
+  "user_request": "ok wait, I'll free the gpus"
+}

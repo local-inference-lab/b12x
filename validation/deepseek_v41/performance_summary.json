@@ -1,0 +1,702 @@
+{
+  "schema_version": 1,
+  "status": "verified_before_prefill_policy_trial",
+  "baseline": "performance_baseline_unprofiled.json",
+  "candidate": "performance_final_unprofiled.json",
+  "ratio_direction": "baseline_elapsed_seconds / candidate_elapsed_seconds; greater than1 is faster",
+  "caveats": [
+    "Two observations per batch; not a statistical performance guarantee.",
+    "Generation lengths and text can differ; only equal-output-length comparisons isolate latency without that confound.",
+    "The prepared-DMA earlier trial performance_dma_prepared_graph.json had an external GPU5 workload and is not an isolated timing comparison."
+  ],
+  "comparison": [
+    {
+      "batch": "arithmetic",
+      "repeat": 0,
+      "before_ms": 60.2836930193007,
+      "after_ms": 57.368720008526,
+      "before_over_after": 1.0508111913659828,
+      "before_tokens": [
+        2
+      ],
+      "after_tokens": [
+        2
+      ]
+    },
+    {
+      "batch": "python",
+      "repeat": 0,
+      "before_ms": 149.63751600589603,
+      "after_ms": 134.4825839623809,
+      "before_over_after": 1.1126906666795937,
+      "before_tokens": [
+        14
+      ],
+      "after_tokens": [
+        14
+      ]
+    },
+    {
+      "batch": "chinese",
+      "repeat": 0,
+      "before_ms": 99.63684401009232,
+      "after_ms": 68.59628797974437,
+      "before_over_after": 1.4525107253546115,
+      "before_tokens": [
+        8
+      ],
+      "after_tokens": [
+        6
+      ]
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 0,
+      "before_ms": 220.67646199138835,
+      "after_ms": 119.41296799341217,
+      "before_over_after": 1.8480108626356455,
+      "before_tokens": [
+        21
+      ],
+      "after_tokens": [
+        9
+      ]
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 0,
+      "before_ms": 581.6247899783775,
+      "after_ms": 552.4059390299954,
+      "before_over_after": 1.052893803060281,
+      "before_tokens": [
+        48
+      ],
+      "after_tokens": [
+        48
+      ]
+    },
+    {
+      "batch": "two_images",
+      "repeat": 0,
+      "before_ms": 1408.5319510195404,
+      "after_ms": 1393.652392027434,
+      "before_over_after": 1.010676664480488,
+      "before_tokens": [
+        48
+      ],
+      "after_tokens": [
+        55
+      ]
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 0,
+      "before_ms": 11572.958686971106,
+      "after_ms": 11589.792918006424,
+      "before_over_after": 0.9985474950972452,
+      "before_tokens": [
+        2
+      ],
+      "after_tokens": [
+        2
+      ]
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "before_ms": 406.2662110081874,
+      "after_ms": 387.37690198468044,
+      "before_over_after": 1.0487620942981621,
+      "before_tokens": [
+        2,
+        14,
+        8
+      ],
+      "after_tokens": [
+        2,
+        14,
+        8
+      ]
+    },
+    {
+      "batch": "arithmetic",
+      "repeat": 1,
+      "before_ms": 66.27268600277603,
+      "after_ms": 65.78010495286435,
+      "before_over_after": 1.0074882983276576,
+      "before_tokens": [
+        2
+      ],
+      "after_tokens": [
+        2
+      ]
+    },
+    {
+      "batch": "python",
+      "repeat": 1,
+      "before_ms": 146.01644896902144,
+      "after_ms": 129.40072204219177,
+      "before_over_after": 1.1284052103002333,
+      "before_tokens": [
+        14
+      ],
+      "after_tokens": [
+        14
+      ]
+    },
+    {
+      "batch": "chinese",
+      "repeat": 1,
+      "before_ms": 85.88248601881787,
+      "after_ms": 53.95247502019629,
+      "before_over_after": 1.5918173538223976,
+      "before_tokens": [
+        8
+      ],
+      "after_tokens": [
+        6
+      ]
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 1,
+      "before_ms": 218.54997699847445,
+      "after_ms": 114.83681900426745,
+      "before_over_after": 1.9031350649860208,
+      "before_tokens": [
+        21
+      ],
+      "after_tokens": [
+        9
+      ]
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 1,
+      "before_ms": 489.67493197415024,
+      "after_ms": 462.9665110260248,
+      "before_over_after": 1.0576897471243316,
+      "before_tokens": [
+        48
+      ],
+      "after_tokens": [
+        48
+      ]
+    },
+    {
+      "batch": "two_images",
+      "repeat": 1,
+      "before_ms": 823.3123350073583,
+      "after_ms": 559.2639389797114,
+      "before_over_after": 1.4721355653814574,
+      "before_tokens": [
+        66
+      ],
+      "after_tokens": [
+        44
+      ]
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 1,
+      "before_ms": 85.74502600822598,
+      "after_ms": 60.57726300787181,
+      "before_over_after": 1.4154655022476619,
+      "before_tokens": [
+        2
+      ],
+      "after_tokens": [
+        2
+      ]
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "before_ms": 407.58182399440557,
+      "after_ms": 376.1103639844805,
+      "before_over_after": 1.0836761307944804,
+      "before_tokens": [
+        2,
+        14,
+        8
+      ],
+      "after_tokens": [
+        2,
+        14,
+        8
+      ]
+    }
+  ],
+  "native_compute_evidence": "native_execution.json",
+  "gpu_samples": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/gpu_profile_final.csv",
+  "raw_output": "artifact://349",
+  "largest_profiled_costs": [
+    {
+      "rank": 0,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.574943288999936,
+          "fraction_device_time": 0.31621764875797775
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.931743248000023,
+          "fraction_device_time": 0.16629208739645257
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.48222978899999,
+          "fraction_device_time": 0.14079513043717296
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 1.402140317999983,
+          "fraction_device_time": 0.07953112553836472
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.8030371749999996,
+          "fraction_device_time": 0.04554925748658167
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.46254218100018,
+          "fraction_device_time": 0.3133629379351601
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.928263358999988,
+          "fraction_device_time": 0.16798208211842205
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.487394710999985,
+          "fraction_device_time": 0.1426913126921826
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 1.062550858000035,
+          "fraction_device_time": 0.060954048048641525
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.781238331000004,
+          "fraction_device_time": 0.04481633834906111
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.443365446000113,
+          "fraction_device_time": 0.30818232355423936
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.9305603590000042,
+          "fraction_device_time": 0.16591700662247774
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.7302457220000025,
+          "fraction_device_time": 0.15457596570119483
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8608270040000368,
+          "fraction_device_time": 0.048736699547870174
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.7886689460000007,
+          "fraction_device_time": 0.044651389054165685
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.665291731000092,
+          "fraction_device_time": 0.31555202976264557
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.9097012649999923,
+          "fraction_device_time": 0.16206793643998316
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.837113436999981,
+          "fraction_device_time": 0.1580248548920146
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8581756800000354,
+          "fraction_device_time": 0.04779967044506386
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.7850186199999994,
+          "fraction_device_time": 0.043724883148911
+        }
+      ]
+    },
+    {
+      "rank": 4,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.9046482380000183,
+          "fraction_device_time": 0.2110808838606207
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 2.3080175610000473,
+          "fraction_device_time": 0.1677237127608844
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.0474116260000086,
+          "fraction_device_time": 0.148785470814931
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8516571230000421,
+          "fraction_device_time": 0.06188995139487907
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.7972737630000013,
+          "fraction_device_time": 0.05793791081869455
+        }
+      ]
+    },
+    {
+      "rank": 5,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 4.035731996000077,
+          "fraction_device_time": 0.26168810927515695
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.843187013000008,
+          "fraction_device_time": 0.18436016922954243
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.1049580900000087,
+          "fraction_device_time": 0.13649134858843523
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8450281309999823,
+          "fraction_device_time": 0.054793978912592994
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.780855884000002,
+          "fraction_device_time": 0.05063287158385875
+        }
+      ]
+    },
+    {
+      "rank": 6,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.481957541999896,
+          "fraction_device_time": 0.31058623892919496
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.900331088999995,
+          "fraction_device_time": 0.1643213975446623
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.6721016260000123,
+          "fraction_device_time": 0.15139081025300394
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8620087070000214,
+          "fraction_device_time": 0.04883803644595249
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.798206306999998,
+          "fraction_device_time": 0.04522324240589611
+        }
+      ]
+    },
+    {
+      "rank": 7,
+      "top_kernels": [
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xcommpcie_dma_kernels_FlagLaunch_object_at__tensorptri32gmemo10_tensorptri32gmemo10_0",
+          "device_seconds": 5.516985660000136,
+          "fraction_device_time": 0.30964154898630053
+        },
+        {
+          "name": "kernel_cutlass_kernel_dual_flashinferb12xattention_sharedmlaprefill_mgUnifiedPrefillMGKernel_object_at__tensorptrbf16gmemalign16oi64i641_tensorptri8gmemalign16o10306561_tensorptri32gmemoi_0",
+          "device_seconds": 2.9070785710000115,
+          "fraction_device_time": 0.16316016883562146
+        },
+        {
+          "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+          "device_seconds": 2.7987690970000063,
+          "fraction_device_time": 0.15708128529919907
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xgemmbf16_gemv_kernelSmallNGemvKernel_object_at__tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641_tensorptrbf16gmemoi641________0",
+          "device_seconds": 0.8593152530000365,
+          "fraction_device_time": 0.04822918209406393
+        },
+        {
+          "name": "kernel_cutlass_kernel_flashinferb12xmoe_sharedkernelsw4a8_phase1W4A8MaterializedPhase1Kernel_object_at__tensorptri32gmemalign16o1_tensorptri8gmemalign16o1_tensorptri32gmemalign16o14155776_1",
+          "device_seconds": 0.8041648079999987,
+          "fraction_device_time": 0.045133856082813235
+        }
+      ]
+    }
+  ],
+  "bounded_prefill_trial": {
+    "status": "inconclusive_isolation",
+    "candidate": "performance_prefill_policy.json",
+    "baseline": "performance_final_unprofiled.json",
+    "comparison": [
+      {
+        "batch": "arithmetic",
+        "repeat": 0,
+        "before_ms": 57.369,
+        "after_ms": 55.632,
+        "before_over_after": 1.0312,
+        "before_tokens": [
+          2
+        ],
+        "after_tokens": [
+          2
+        ]
+      },
+      {
+        "batch": "python",
+        "repeat": 0,
+        "before_ms": 134.483,
+        "after_ms": 133.565,
+        "before_over_after": 1.0069,
+        "before_tokens": [
+          14
+        ],
+        "after_tokens": [
+          14
+        ]
+      },
+      {
+        "batch": "chinese",
+        "repeat": 0,
+        "before_ms": 68.596,
+        "after_ms": 68.259,
+        "before_over_after": 1.0049,
+        "before_tokens": [
+          6
+        ],
+        "after_tokens": [
+          6
+        ]
+      },
+      {
+        "batch": "midturn_system",
+        "repeat": 0,
+        "before_ms": 119.413,
+        "after_ms": 161.761,
+        "before_over_after": 0.7382,
+        "before_tokens": [
+          9
+        ],
+        "after_tokens": [
+          21
+        ]
+      },
+      {
+        "batch": "tool_request",
+        "repeat": 0,
+        "before_ms": 552.406,
+        "after_ms": 581.039,
+        "before_over_after": 0.9507,
+        "before_tokens": [
+          48
+        ],
+        "after_tokens": [
+          48
+        ]
+      },
+      {
+        "batch": "two_images",
+        "repeat": 0,
+        "before_ms": 1393.652,
+        "after_ms": 1610.98,
+        "before_over_after": 0.8651,
+        "before_tokens": [
+          55
+        ],
+        "after_tokens": [
+          73
+        ]
+      },
+      {
+        "batch": "hierarchical_context",
+        "repeat": 0,
+        "before_ms": 11589.793,
+        "after_ms": 14072.22,
+        "before_over_after": 0.8236,
+        "before_tokens": [
+          2
+        ],
+        "after_tokens": [
+          2
+        ]
+      },
+      {
+        "batch": "mixed_text_batch",
+        "repeat": 0,
+        "before_ms": 387.377,
+        "after_ms": 414.309,
+        "before_over_after": 0.935,
+        "before_tokens": [
+          2,
+          14,
+          8
+        ],
+        "after_tokens": [
+          2,
+          14,
+          6
+        ]
+      },
+      {
+        "batch": "arithmetic",
+        "repeat": 1,
+        "before_ms": 65.78,
+        "after_ms": 75.548,
+        "before_over_after": 0.8707,
+        "before_tokens": [
+          2
+        ],
+        "after_tokens": [
+          2
+        ]
+      },
+      {
+        "batch": "python",
+        "repeat": 1,
+        "before_ms": 129.401,
+        "after_ms": 150.327,
+        "before_over_after": 0.8608,
+        "before_tokens": [
+          14
+        ],
+        "after_tokens": [
+          14
+        ]
+      },
+      {
+        "batch": "chinese",
+        "repeat": 1,
+        "before_ms": 53.952,
+        "after_ms": 72.821,
+        "before_over_after": 0.7409,
+        "before_tokens": [
+          6
+        ],
+        "after_tokens": [
+          6
+        ]
+      },
+      {
+        "batch": "midturn_system",
+        "repeat": 1,
+        "before_ms": 114.837,
+        "after_ms": 185.038,
+        "before_over_after": 0.6206,
+        "before_tokens": [
+          9
+        ],
+        "after_tokens": [
+          21
+        ]
+      },
+      {
+        "batch": "tool_request",
+        "repeat": 1,
+        "before_ms": 462.967,
+        "after_ms": 471.781,
+        "before_over_after": 0.9813,
+        "before_tokens": [
+          48
+        ],
+        "after_tokens": [
+          48
+        ]
+      },
+      {
+        "batch": "two_images",
+        "repeat": 1,
+        "before_ms": 559.264,
+        "after_ms": 689.385,
+        "before_over_after": 0.8113,
+        "before_tokens": [
+          44
+        ],
+        "after_tokens": [
+          63
+        ]
+      },
+      {
+        "batch": "hierarchical_context",
+        "repeat": 1,
+        "before_ms": 60.577,
+        "after_ms": 64.746,
+        "before_over_after": 0.9356,
+        "before_tokens": [
+          2
+        ],
+        "after_tokens": [
+          2
+        ]
+      },
+      {
+        "batch": "mixed_text_batch",
+        "repeat": 1,
+        "before_ms": 376.11,
+        "after_ms": 394.668,
+        "before_over_after": 0.953,
+        "before_tokens": [
+          2,
+          14,
+          8
+        ],
+        "after_tokens": [
+          2,
+          14,
+          6
+        ]
+      }
+    ],
+    "correctness_passed": true,
+    "native_frozen_trace_passed": true,
+    "raw_output": "artifact://384",
+    "reason": "Another external b12x GPU process was observed; its start time could not be established. User is freeing GPUs for an exclusive rerun."
+  }
+}

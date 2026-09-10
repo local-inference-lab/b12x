@@ -231,7 +231,16 @@ def _byte_interval(tensor: torch.Tensor) -> tuple[int, int]:
     start = int(tensor.untyped_storage().data_ptr()) + int(
         tensor.storage_offset()
     ) * int(tensor.element_size())
-    return start, start + int(tensor.numel()) * int(tensor.element_size())
+    span = (
+        0
+        if tensor.numel() == 0
+        else 1
+        + sum(
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    )
+    return start, start + span * int(tensor.element_size())
 
 
 def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -246,6 +255,7 @@ def _validate_input(
     shape: tuple[int, ...],
     caps: HyperConnectionCaps,
     name: str,
+    row_strided: bool = False,
 ) -> None:
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
@@ -254,7 +264,10 @@ def _validate_input(
             f"{name} must use dtype={caps.dtype} and device={caps.device}; "
             f"got dtype={tensor.dtype}, device={tensor.device}"
         )
-    if not tensor.is_contiguous():
+    if row_strided:
+        if tensor.stride(1) != 1 or tensor.stride(0) < tensor.shape[1]:
+            raise ValueError(f"{name} requires unit column stride and disjoint rows")
+    elif not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
 
 
@@ -294,13 +307,22 @@ def run_grouped_rmsnorm_impl(
     *,
     eps: float,
     binding: HyperConnectionBinding,
+    zero_centered: bool = True,
 ) -> torch.Tensor:
+    """Grouped BF16 RMSNorm; ordinary mode preserves BF16 or FP32 affine weights."""
     _require_cuda(binding.plan)
     caps = binding.plan.caps
     width = caps.streams * caps.hidden_size
     shape = (binding.tokens, width)
     _validate_input(state, shape=shape, caps=caps, name="state")
-    _validate_input(weight, shape=(width,), caps=caps, name="weight")
+    if not zero_centered and weight.dtype == torch.float32:
+        if (
+            tuple(weight.shape) != (width,) or weight.device != caps.device
+            or not weight.is_contiguous()
+        ):
+            raise ValueError(f"weight must be contiguous FP32 [{width}] on {caps.device}")
+    else:
+        _validate_input(weight, shape=(width,), caps=caps, name="weight")
     _validate_output_disjoint(
         "normalized",
         binding.normalized_capacity,
@@ -319,6 +341,7 @@ def run_grouped_rmsnorm_impl(
             hidden_size=caps.hidden_size,
             block_h=binding.plan.reduction_block_h,
             num_warps=binding.plan.reduction_num_warps,
+            zero_centered=zero_centered,
         )
     return binding.normalized
 
@@ -335,6 +358,7 @@ def run_scaled_silu_impl(
         shape=(binding.tokens, caps.lowrank),
         caps=caps,
         name="projected_down",
+        row_strided=True,
     )
     _validate_output_disjoint(
         "bottleneck",
@@ -409,6 +433,7 @@ def _validate_combine_inputs(
         shape=(tokens, caps.streams),
         caps=caps,
         name="injection_logits",
+        row_strided=True,
     )
 
 
@@ -483,6 +508,143 @@ def run_combine_norm_impl(
     )
 
 
+def run_engram_mix_impl(
+    state: torch.Tensor,
+    projected_kv: torch.Tensor,
+    norm_weights: torch.Tensor,
+    *,
+    eps: float,
+    plan: HyperConnectionPlan,
+    out: torch.Tensor,
+    token_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply Engram's signed-sqrt gate to caller-owned multi-stream state.
+
+    ``projected_kv`` concatenates the S keys and one shared value. The FP32
+    ``norm_weights`` is the offline product of the query/key affine weights;
+    unlike Gemma normalization, these weights are not zero-centered.
+    """
+    _require_cuda(plan)
+    caps = plan.caps
+    tokens = plan._live_tokens(state.shape[0])
+    width = caps.streams * caps.hidden_size
+    _validate_input(state, shape=(tokens, width), caps=caps, name="state")
+    _validate_input(
+        projected_kv,
+        shape=(tokens, width + caps.hidden_size),
+        caps=caps,
+        name="projected_kv",
+    )
+    _validate_input(out, shape=(tokens, width), caps=caps, name="out")
+    if (
+        norm_weights.shape != (width,)
+        or norm_weights.dtype != torch.float32
+        or norm_weights.device != caps.device
+        or not norm_weights.is_contiguous()
+    ):
+        raise ValueError(
+            f"norm_weights must be contiguous FP32 [{width}] on {caps.device}"
+        )
+    if token_mask is not None and (
+        token_mask.shape != (tokens,)
+        or token_mask.dtype != torch.bool
+        or token_mask.device != caps.device
+        or not token_mask.is_contiguous()
+    ):
+        raise ValueError(
+            f"token_mask must be contiguous bool [{tokens}] on {caps.device}"
+        )
+    _validate_output_disjoint(
+        "out",
+        out,
+        (("state", state), ("projected_kv", projected_kv), ("norm_weights", norm_weights)),
+    )
+    eps = _require_eps(eps)
+    if tokens:
+        from ._kernels import run_engram_mix
+
+        run_engram_mix(
+            state,
+            projected_kv,
+            norm_weights,
+            token_mask,
+            out,
+            eps=eps,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+        )
+    return out
+
+
+def _validate_pointwise_tensor(
+    tensor: torch.Tensor, *, name: str, shape: tuple[int, ...],
+    device: torch.device,
+) -> None:
+    if tensor.device.type != "cuda" or tensor.device != device:
+        raise ValueError(f"{name} must be on CUDA device {device}")
+    if tensor.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"{name} must be BF16 or FP32")
+    if tuple(tensor.shape) != shape or not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous with shape {shape}")
+
+
+def run_swiglu_impl(
+    gate_up: torch.Tensor, *, limit: float, out: torch.Tensor,
+    round_silu: bool = False,
+) -> torch.Tensor:
+    """Clamp gate above only and up symmetrically, then compute FP32 SiLU*up.
+
+    Inputs are BF16 FC1 outputs, with gate followed by up along the last axis.
+    ``round_silu=True`` rounds SiLU to BF16 before multiplying for vision.
+    ``limit=inf`` disables clamping. No activation scaling is applied.
+    Warm once before capture; ``out`` is disjoint caller-owned BF16 storage.
+    """
+    if gate_up.ndim != 2 or gate_up.shape[1] <= 0 or gate_up.shape[1] % 2:
+        raise ValueError("gate_up must have shape [T, 2I] with I positive")
+    if gate_up.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("gate_up and out must be BF16")
+    _validate_pointwise_tensor(
+        gate_up, name="gate_up", shape=tuple(gate_up.shape), device=gate_up.device,
+    )
+    _validate_pointwise_tensor(
+        out, name="out", shape=(gate_up.shape[0], gate_up.shape[1] // 2),
+        device=gate_up.device,
+    )
+    limit = float(limit)
+    if math.isnan(limit) or limit <= 0:
+        raise ValueError("limit must be positive (or infinity to disable clamping)")
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_swiglu(gate_up, out, limit, bool(round_silu))
+    return out
+
+
+def run_add_impl(
+    left: torch.Tensor, right: torch.Tensor, *, out: torch.Tensor,
+) -> torch.Tensor:
+    """Add BF16/FP32 operands in FP32, casting once to disjoint BF16/FP32 out."""
+    for name, tensor in (("left", left), ("right", right), ("out", out)):
+        _validate_pointwise_tensor(
+            tensor, name=name, shape=tuple(left.shape), device=left.device,
+        )
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_add(left, right, out)
+    return out
+
+
+def run_sigmoid_impl(input: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
+    """Compute FP32 sigmoid and cast once to disjoint caller-owned BF16/FP32 out."""
+    for name, tensor in (("input", input), ("out", out)):
+        _validate_pointwise_tensor(
+            tensor, name=name, shape=tuple(input.shape), device=input.device,
+        )
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_sigmoid(input, out)
+    return out
+
+
 __all__ = [
     "HyperConnectionCaps",
     "HyperConnectionPlan",
@@ -493,4 +655,8 @@ __all__ = [
     "run_gate_mean_impl",
     "run_combine_impl",
     "run_combine_norm_impl",
+    "run_engram_mix_impl",
+    "run_swiglu_impl",
+    "run_add_impl",
+    "run_sigmoid_impl",
 ]

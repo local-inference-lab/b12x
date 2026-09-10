@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the public Qwen3.8 Flash Next GDN decode transaction.
+"""Benchmark public Qwen GDN decode or prefill transactions.
 
 The benchmark restores the recurrent state before every measured invocation.
 State restoration is reported separately from CUDA-graph replay latency and is
@@ -550,10 +550,17 @@ def _jsonable(value: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--operation", choices=("decode", "prefill"), default="decode")
+    parser.add_argument("--race", choices=("none", "flashinfer"), default="none")
+    parser.add_argument("--capacity-tokens", type=int, help="planned prefill token capacity")
+    parser.add_argument("--policy-profile", type=pathlib.Path,
+                        help="prefill profile artifact; require measured coverage for every case")
     parser.add_argument("--cases", default="all")
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--profile-replays", type=int, default=0,
+                        help="prefill diagnostic graph replays inside a CUDA profiler capture range")
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--l2-flush", action="store_true")
     parser.add_argument("--l2-flush-bytes", type=int, default=0)
@@ -571,6 +578,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.warmup < 1 or args.iterations < 1:
         parser.error("--warmup and --iterations must be positive")
+    if args.profile_replays < 0:
+        parser.error("--profile-replays must be nonnegative")
+    if args.capacity_tokens is not None and args.capacity_tokens < 1:
+        parser.error("--capacity-tokens must be positive")
     if args.capacity_seqs is not None and args.capacity_seqs < 1:
         parser.error("--capacity-seqs must be positive")
     if args.capacity_columns is not None and not 1 <= args.capacity_columns <= 8:
@@ -579,6 +590,12 @@ def main(argv: list[str] | None = None) -> int:
         args.json = args.json.expanduser().resolve()
         if args.json.exists():
             parser.error(f"refusing to overwrite existing output: {args.json}")
+    if args.operation == "prefill":
+        from benchmarks._gdn_prefill_race import main as prefill_main
+        return prefill_main(args, list(sys.argv[1:] if argv is None else argv), parser)
+    if (args.race != "none" or args.capacity_tokens is not None
+            or args.policy_profile is not None or args.profile_replays):
+        parser.error("--race, --capacity-tokens, --policy-profile, and --profile-replays require --operation prefill")
     try:
         cases = select_cases(args.cases)
     except ValueError as error:

@@ -86,7 +86,7 @@ def _mhc_cases() -> tuple[SweepCase, ...]:
                 "split_k": split_k,
             },
         )
-        for hidden_size, split_k in ((4_096, 64), (7_168, 112))
+        for hidden_size, split_k in ((4_096, 64), (5_120, 80), (7_168, 112))
         for tokens in capacities
     )
 
@@ -431,6 +431,21 @@ class _MhcSession(_GpuSession):
             norm_weight=norm_weight,
             norm_eps=1.0e-6,
         )
+        pre_mix = None
+        if hidden_size == 5_120:
+            pre_mix = torch.zeros((tokens, 4), dtype=torch.float32, device=device)
+            pre_mix[:, 0] = 1
+            current = expected[0]
+            collapsed = (current.float() * pre_mix.unsqueeze(-1)).sum(1).bfloat16()
+            normalized = collapsed.float() * torch.rsqrt(
+                collapsed.float().square().mean(-1, keepdim=True) + 1.0e-20
+            ) * norm_weight.float()
+            flat = current.flatten(1).float()
+            projection = torch_functional.linear(flat, fn) * torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + 1.0e-6
+            )
+            next_pre = torch.sigmoid(projection[:, :4] * scale[0] + bias[:4]) + 1.0e-6
+            expected = (current, normalized.bfloat16(), expected[2], expected[3], next_pre)
         base_policy = PolicyContext.for_device(
             device,
             mode=PolicyMode.HEURISTIC_ONLY,
@@ -475,6 +490,10 @@ class _MhcSession(_GpuSession):
                     dtype=torch.float32,
                     device=device,
                 )
+                pre_out = torch.empty_like(pre_mix) if pre_mix is not None else None
+                actual_outputs = (output, y, post, comb)
+                if pre_out is not None:
+                    actual_outputs += (pre_out,)
                 binding = mhc.bind(
                     plan,
                     scratch=scratch,
@@ -483,6 +502,7 @@ class _MhcSession(_GpuSession):
                     post=post,
                     comb=comb,
                     out=output,
+                    pre_out=pre_out,
                 )
 
                 def run() -> None:
@@ -498,8 +518,9 @@ class _MhcSession(_GpuSession):
                         hc_eps=1.0e-6,
                         sinkhorn_iters=20,
                         norm_weight=norm_weight,
-                        norm_eps=1.0e-6,
+                        norm_eps=1.0e-20 if pre_mix is not None else 1.0e-6,
                         binding=binding,
+                        pre_mix=pre_mix,
                     )
 
                 for _ in range(settings.warmup):
@@ -508,7 +529,7 @@ class _MhcSession(_GpuSession):
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     run()
-                for actual in (output, y, post, comb):
+                for actual in actual_outputs:
                     actual.fill_(float("nan"))
                 allocated_before = torch.cuda.memory_allocated(device)
                 graph.replay()
@@ -522,23 +543,23 @@ class _MhcSession(_GpuSession):
                         ).item()
                     )
                     for actual, reference in zip(
-                        (output, y, post, comb),
+                        actual_outputs,
                         expected,
                         strict=True,
                     )
                 )
                 finite = all(
                     bool(torch.isfinite(actual).all().item())
-                    for actual in (output, y, post, comb)
+                    for actual in actual_outputs
                 )
                 nonzero = all(
                     bool(torch.count_nonzero(actual).item())
-                    for actual in (output, y, post, comb)
+                    for actual in actual_outputs
                 )
                 prepared[candidate.candidate_id] = _PreparedMhcCandidate(
                     candidate=candidate,
                     graph=graph,
-                    retained=(scratch, output, y, post, comb, binding),
+                    retained=(scratch, *actual_outputs, binding, pre_mix),
                     correct=(
                         finite
                         and nonzero
@@ -688,7 +709,7 @@ class MhcGenerator(DiscreteSweepGenerator):
             cases=_mhc_cases() if cases is None else cases,
             benchmark_factory=_OneCaseFactory(_MhcSession),
             coverage={
-                "hidden_sizes": [4_096, 7_168],
+                "hidden_sizes": [4_096, 5_120, 7_168],
                 "prefill_capacities": list(COMMON_PREFILL_TOKEN_CAPACITIES),
                 "medium_prefill_anchors": [2_304, 3_072, 3_584],
             },

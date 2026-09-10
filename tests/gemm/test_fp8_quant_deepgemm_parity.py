@@ -19,6 +19,7 @@ so any divergence from DeepGEMM was invisible. These tests pin the contract:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from b12x.gemm._shared.block_fp8 import (
@@ -153,3 +154,32 @@ def test_weight_pack_keeps_ue8m0_values_verbatim() -> None:
     torch.testing.assert_close(
         packed.weight.values.view(torch.uint8), w_fp8.view(torch.uint8), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("tokens", (1, 9))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_v41_activation_floor_matches_reference(tokens, dtype) -> None:
+    """Zero/tiny K32 groups and exact UE8M0 boundaries use source quantization."""
+    require_b12x()
+    peaks = torch.tensor(
+        [0.0, 1e-8, 5e-5, 1e-4, 2e-4, 0.875, 1.75, 3.5],
+        device="cuda", dtype=dtype,
+    )
+    pattern = torch.linspace(-1, 1, 32, device="cuda", dtype=torch.float32)
+    source = (peaks.float()[:, None] * pattern).to(dtype).reshape(1, 256)
+    source = source.repeat(tokens, 1)
+    expected_values, expected_scales = _per_token_cast_to_fp8(source, 32)
+    actual = quantize_block_fp8_linear_input_mxfp8(
+        source, block_size=(32, 32),
+    )
+    torch.testing.assert_close(
+        actual.values.view(torch.uint8), expected_values.view(torch.uint8),
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(
+        actual.scale_rows.view(torch.uint8)[0],
+        _sf_fp32_to_e8m0_u8(expected_scales), rtol=0, atol=0,
+    )
+    # The older recipe deliberately retains its unit scale for a zero group.
+    legacy = quantize_block_fp8_linear_input_mxfp8(source)
+    assert torch.all(legacy.scale_rows.view(torch.uint8)[0, :, 0] == 127)

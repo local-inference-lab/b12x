@@ -1,0 +1,287 @@
+{
+  "schema_version": 1,
+  "target": {
+    "tensor_parallel_size": 4,
+    "cuda_visible_devices": "0,1,2,3",
+    "engram_table_memory": "disk",
+    "priority": "interactive_latency"
+  },
+  "common_storage": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+  "native_reader": "unchanged loader/_ple_reader.c io_uring/O_DIRECT implementation",
+  "tests": [
+    {
+      "scope": "native reader plus PLE/Engram kernels",
+      "passed": 57,
+      "seconds": 3.88
+    },
+    {
+      "scope": "Engram/Ple serving preparation and descriptor loading",
+      "passed": 11,
+      "seconds": 10.81
+    }
+  ],
+  "current_state": "qualified",
+  "liburing_version": "2.15",
+  "locked_memory_limit": "unlimited",
+  "historical_tp8_evidence": "not qualification of the current TP4 SSD target",
+  "attempts": [
+    {
+      "name": "shared_storage_and_native_engram",
+      "exit_status": 0,
+      "passed": 57
+    },
+    {
+      "name": "file_source_e8m0_initial",
+      "exit_status": 1,
+      "reason": "metadata-only loader omitted F8_E8M0; local dtype map extended",
+      "raw_output": "artifact://405"
+    },
+    {
+      "name": "ssd_serving_boundaries",
+      "exit_status": 0,
+      "passed": 11
+    },
+    {
+      "name": "tp4_ssd_initial",
+      "exit_status": 1,
+      "reason": "TP4 loaded and captured graphs;85% memory budget left-9.89GiB for KV",
+      "raw_output": "artifact://415"
+    }
+  ],
+  "gpu_memory_utilization": 0.97,
+  "full_serving": {
+    "case_executions": 20,
+    "quality_passed": true,
+    "worker_compile_miss_delta": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "worker_memory_miss_delta": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "all_workers_frozen": true,
+    "draft_tokens_proposed": 495,
+    "draft_tokens_accepted": 252,
+    "native_reader_sha256": "fa9a4b4f64d17caff2bdc54d7868e6bdaa29e666fbdfcaea074280e2ced661cd",
+    "native_reader_unchanged": true,
+    "raw_output": "artifact://418",
+    "trace_directory": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/tp4_ssd_memory97",
+    "disk_tables_by_rank": {
+      "0": {
+        "language_model.model.layers.1.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384006168,
+          "shard_start": 0,
+          "shard_end": 96001542,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 311296,
+            "read_calls": 72,
+            "unique_blocks": 76,
+            "coalesced_reads": 4,
+            "submit_calls": 2,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.0009432030000000001,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        },
+        "language_model.model.layers.14.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384016682,
+          "shard_start": 0,
+          "shard_end": 96004171,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 307200,
+            "read_calls": 72,
+            "unique_blocks": 75,
+            "coalesced_reads": 3,
+            "submit_calls": 2,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.00020281000000000002,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        }
+      },
+      "1": {
+        "language_model.model.layers.1.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384006168,
+          "shard_start": 96001542,
+          "shard_end": 192003084,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 303104,
+            "read_calls": 72,
+            "unique_blocks": 74,
+            "coalesced_reads": 2,
+            "submit_calls": 4,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.000910903,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        },
+        "language_model.model.layers.14.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384016682,
+          "shard_start": 96004171,
+          "shard_end": 192008342,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 307200,
+            "read_calls": 72,
+            "unique_blocks": 75,
+            "coalesced_reads": 3,
+            "submit_calls": 5,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.000170501,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        }
+      },
+      "2": {
+        "language_model.model.layers.1.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384006168,
+          "shard_start": 192003084,
+          "shard_end": 288004626,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 307200,
+            "read_calls": 72,
+            "unique_blocks": 75,
+            "coalesced_reads": 3,
+            "submit_calls": 3,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.000931143,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        },
+        "language_model.model.layers.14.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384016682,
+          "shard_start": 192008342,
+          "shard_end": 288012513,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 303104,
+            "read_calls": 72,
+            "unique_blocks": 74,
+            "coalesced_reads": 2,
+            "submit_calls": 2,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.0001585,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        }
+      },
+      "3": {
+        "language_model.model.layers.1.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384006168,
+          "shard_start": 288004626,
+          "shard_end": 384006168,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 307200,
+            "read_calls": 72,
+            "unique_blocks": 75,
+            "coalesced_reads": 3,
+            "submit_calls": 2,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.0009496830000000001,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        },
+        "language_model.model.layers.14.engram.embed_tokens": {
+          "backend": "flashinfer.b12x.sequence._shared.disk_table.DiskRowCache",
+          "table_rows": 384016682,
+          "shard_start": 288012513,
+          "shard_end": 384016684,
+          "resident_weight_parameter": false,
+          "resident_scale_parameter": false,
+          "stats": {
+            "lookups": 192,
+            "requested_bytes": 9504,
+            "read_bytes": 299008,
+            "read_calls": 72,
+            "unique_blocks": 73,
+            "coalesced_reads": 1,
+            "submit_calls": 2,
+            "staging_bytes": 4194304,
+            "metadata_bytes": 7087512,
+            "execution_seconds": 0.000165241,
+            "ids_host_bytes": 196608,
+            "weight_cache_bytes": 6291456,
+            "scale_cache_bytes": 196608,
+            "cache_bytes": 6488064,
+            "owned_staging_bytes": 10878976
+          }
+        }
+      }
+    }
+  },
+  "interactive_measurement": "tp4_ssd_latency.json",
+  "package_verification": "package_verification.json"
+}

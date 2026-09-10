@@ -290,19 +290,22 @@ class Bf16VocabProjectionGenerator(DiscreteSweepGenerator):
 def _block_fp8_cases() -> tuple[SweepCase, ...]:
     return tuple(
         SweepCase.create(
-            group_id=f"m{tokens}-k{in_features}-n{out_features}",
+            group_id=f"b{weight_block_size}-m{tokens}-k{in_features}-n{out_features}",
             query={
                 "max_tokens": tokens,
                 "in_features": in_features,
                 "out_features": out_features,
                 "output_dtype": "bfloat16",
+                "weight_block_size": weight_block_size,
             },
         )
-        for tokens in (4, 32)
-        for in_features, out_features in (
-            (2_560, 2_560),
-            (2_560, 10_240),
+        for weight_block_size, geometries in (
+            (128, ((2_560, 2_560), (2_560, 10_240))),
+            (32, ((5_120, 1_280), (5_120, 512), (1_280, 8_192),
+                  (1_024, 5_120), (6_144, 25_600))),
         )
+        for tokens in ((4, 32) if weight_block_size == 128 else (4, 33))
+        for in_features, out_features in geometries
     )
 
 
@@ -350,6 +353,7 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
         tokens = int(case.query["max_tokens"])
         in_features = int(case.query["in_features"])
         out_features = int(case.query["out_features"])
+        block_size = int(case.query["weight_block_size"])
         generator = torch.Generator(device=device).manual_seed(
             settings.seed + int(case.case_id[-8:], 16)
         )
@@ -366,13 +370,19 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                 device=device,
                 generator=generator,
             ).mul_(0.125).to(torch.float8_e4m3fn)
-            scale = torch.ones(
-                (out_features // 128, in_features // 128),
-                dtype=torch.float8_e8m0fnu,
-                device=device,
+            scale = (
+                torch.arange(
+                    ((out_features + block_size - 1) // block_size)
+                    * (in_features // block_size),
+                    device=device, dtype=torch.int32,
+                ).reshape(-1, in_features // block_size) % 5 + 124
+            ).to(torch.uint8).view(torch.float8_e8m0fnu)
+            packed = block_fp8.pack_weight(
+                weight, scale, block_size=(block_size, block_size)
             )
-            packed = block_fp8.pack_weight(weight, scale)
-            source_q = block_fp8.quantize_input(source)
+            source_q = block_fp8.quantize_input(
+                source, block_size=(block_size, block_size)
+            )
             source_dequantized = dequantize_mxfp8_rows_torch(
                 source_q.values,
                 source_q.scale_rows,
@@ -400,6 +410,7 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
                             in_features=in_features,
                             out_features=out_features,
                             output_dtype=torch.bfloat16,
+                            block_size=(block_size, block_size),
                         ),
                         policy=policy,
                     )
@@ -499,13 +510,14 @@ class BlockFp8LinearGenerator(DiscreteSweepGenerator):
     def __init__(self, *, cases: Sequence[SweepCase] | None = None) -> None:
         super().__init__(
             component_id=BLOCK_FP8_LINEAR,
-            query_schema_version=1,
+            query_schema_version=2,
             config_schema_version=2,
             query_fields=(
                 "max_tokens",
                 "in_features",
                 "out_features",
                 "output_dtype",
+                "weight_block_size",
             ),
             range_fields=frozenset(
                 {"max_tokens", "in_features", "out_features"}

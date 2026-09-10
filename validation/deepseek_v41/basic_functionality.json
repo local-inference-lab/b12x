@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "criterion": "User-authorized basic coherent complete output checks; token parity is not required.",
+  "result_path": "/home/luke/projects/flashinfer-b12x-migration/.cache/deepseek_v41_diagnostics/adaptive_torch_baseline/vllm_results.json",
+  "passed": true,
+  "checks": [
+    {
+      "batch": "arithmetic",
+      "repeat": 0,
+      "case": "arithmetic",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "python",
+      "repeat": 0,
+      "case": "python",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "chinese",
+      "repeat": 0,
+      "case": "chinese",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 0,
+      "case": "midturn_system",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 0,
+      "case": "tool_request",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "two_images",
+      "repeat": 0,
+      "case": "two_images",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 0,
+      "case": "hierarchical_context",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "arithmetic",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "python",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 0,
+      "case": "chinese",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "arithmetic",
+      "repeat": 1,
+      "case": "arithmetic",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "python",
+      "repeat": 1,
+      "case": "python",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "chinese",
+      "repeat": 1,
+      "case": "chinese",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "midturn_system",
+      "repeat": 1,
+      "case": "midturn_system",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "tool_request",
+      "repeat": 1,
+      "case": "tool_request",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "two_images",
+      "repeat": 1,
+      "case": "two_images",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "hierarchical_context",
+      "repeat": 1,
+      "case": "hierarchical_context",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "arithmetic",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "python",
+      "passed": true,
+      "complete": true
+    },
+    {
+      "batch": "mixed_text_batch",
+      "repeat": 1,
+      "case": "chinese",
+      "passed": true,
+      "complete": true
+    }
+  ],
+  "manual_review": "Both repetitions are coherent without loops. Image answers identify carrots then corn and correctly describe edible root versus grain/fruit/seed. Tool calls are complete and request Beijing weather instead of inventing it. Reviewed generated maximum code executed correctly on four distinct input cases."
+}

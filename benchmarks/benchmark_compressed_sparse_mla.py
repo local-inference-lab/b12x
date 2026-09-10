@@ -39,7 +39,9 @@ from b12x.attention._shared.mla.compressed_config import (
 )
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLAScratchCaps,
-    plan_compressed_sparse_mla_scratch,
+)
+from b12x.attention.compressed_sparse_mla import (
+    plan as plan_compressed_sparse_mla_scratch,
 )
 
 from benchmarks.common import (
@@ -689,6 +691,8 @@ def _make_binding(
             max_batch=case.rows,
             page_size=swa_page_size,
             max_chunks_per_row=split_chunks,
+            mode=mode,
+            use_cuda_graph=True,
         )
     )
     scratch = [
@@ -703,8 +707,6 @@ def _make_binding(
         indexed_indices=indexed_indices,
         indexed_lengths=indexed_lengths,
     )
-    binding.scratch.mode = mode
-    binding.scratch.use_cuda_graph = True
     return binding, split_chunks
 
 

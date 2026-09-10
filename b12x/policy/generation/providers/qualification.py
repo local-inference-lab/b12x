@@ -163,18 +163,23 @@ class _DsaIndexerProbe:
             for tokens in COMMON_PREFILL_TOKEN_CAPACITIES
         ),
     )
+    _MXFP4_CASES = (
+        ("dsv41-mxfp4-full", 0, 0),
+        ("dsv41-mxfp4-source20", 0, 2048),
+        ("dsv41-mxfp4-reindex", 16384, 0),
+    )
 
     @property
     def case_count(self) -> int:
-        return len(self._CASES) + len(self._MSA_CASES)
+        return len(self._CASES) + len(self._MSA_CASES) + len(self._MXFP4_CASES)
 
     @property
     def case_ids(self) -> tuple[str, ...]:
-        return tuple(case[0] for case in (*self._CASES, *self._MSA_CASES))
+        return tuple(case[0] for case in (*self._CASES, *self._MSA_CASES, *self._MXFP4_CASES))
 
     @property
     def description(self) -> str:
-        return "production DSA and MSA indexer qualification"
+        return "production DSA, MSA, and V4.1 MXFP4 hierarchical indexer qualification"
 
     def __call__(
         self,
@@ -351,6 +356,72 @@ class _DsaIndexerProbe:
             )
             gc.collect()
             torch.cuda.empty_cache()
+        measurements.extend(self._mxfp4_measurements(context, flush))
+        return tuple(measurements)
+
+    def _mxfp4_measurements(self, context, flush):
+        import torch
+        from b12x.attention import dsa_indexer as api
+
+        device = torch.device("cuda", context.device_ordinal)
+        measurements = []
+        for label, max_candidates, source_blocks in self._MXFP4_CASES:
+            rows, width, heads, visible = 4, 32768, 32, 251
+            p = api.plan(api.Caps(
+                device=device, num_q_heads=heads, max_q_rows=rows,
+                max_page_table_width=width // 64, topk=512, cache_format="mxfp4",
+                max_candidates=max_candidates, candidate_topk_blocks=source_blocks,
+            ))
+            scratch = torch.empty(p.scratch_specs()[0].shape, dtype=torch.uint8, device=device)
+            q = torch.ones((rows, heads, 128), dtype=torch.bfloat16, device=device)
+            packed = torch.empty((rows, heads, 64), dtype=torch.uint8, device=device)
+            scales = torch.empty((rows, heads, 4), dtype=torch.uint8, device=device)
+            api.quantize_q_mxfp4(q, q_mxfp4=packed, q_scales=scales)
+            pool = torch.empty((width // 64, api.MXFP4_INDEX_PAGE_BYTES), dtype=torch.uint8, device=device)
+            keys = torch.ones((width, 128), dtype=torch.bfloat16, device=device)
+            slots = torch.arange(width, dtype=torch.int64, device=device)
+            api.quantize_write_index_k_mxfp4(keys, index_k_cache=pool, slot_mapping=slots)
+            pages = torch.arange(width // 64, dtype=torch.int32, device=device)[None]
+            lengths = torch.full((rows,), visible, dtype=torch.int32, device=device)
+            active = torch.tensor([width], dtype=torch.int32, device=device)
+            weights = torch.full((rows, heads), 1 / 64, dtype=torch.bfloat16, device=device)
+            output = torch.empty((rows, 512), dtype=torch.int32, device=device)
+            output_scores = torch.empty((rows, 512), dtype=torch.float32, device=device)
+            expected = torch.full_like(output, -1)
+            expected[:, :visible] = torch.arange(visible, dtype=torch.int32, device=device)
+            extra = {}
+            if max_candidates:
+                candidates = torch.full((rows, max_candidates), -1, dtype=torch.int32, device=device)
+                candidates[:, :visible] = expected[:, :visible]
+                extra.update(candidate_indices=candidates, candidate_lengths=lengths)
+            if source_blocks:
+                candidates_out = torch.empty((rows, source_blocks * 8), dtype=torch.int32, device=device)
+                candidate_lengths_out = torch.empty_like(lengths)
+                extra.update(candidate_output=candidates_out, candidate_output_lengths=candidate_lengths_out)
+            binding = api.bind(
+                p, scratch=scratch, q_mxfp4=packed, q_scales=scales,
+                query_weights=weights, index_k_cache=pool, page_table=pages,
+                cache_lengths=lengths, active_width=active, output_indices=output,
+                output_scores=output_scores, **extra,
+            )
+            measurement = _timed_exact_graph_measurement(
+                context=context, label=label, run=lambda: api.run(binding),
+                output=output, expected=expected, flush=flush,
+            )
+            score_exact = bool((output_scores[:, :visible] == 64).all().item())
+            source_exact = True
+            if source_blocks:
+                source_exact = bool(
+                    torch.equal(candidates_out[:, :visible], expected[:, :visible])
+                    and (candidates_out[:, visible:] == -1).all().item()
+                    and torch.equal(candidate_lengths_out, lengths)
+                )
+            measurements.append(GpuProbeMeasurement(
+                label=label, latency_us=measurement.latency_us,
+                correct=measurement.correct and score_exact and source_exact,
+                metrics={**dict(measurement.metrics), "bf16_scores_exact": score_exact,
+                         "source_candidates_exact": source_exact},
+            ))
         return tuple(measurements)
 
 
@@ -398,6 +469,7 @@ class _SparseMlaProbe:
         policy = PolicyContext.for_device(device, mode=PolicyMode.HEURISTIC_ONLY)
         measurements = []
         for index, (label, rows, heads, topk) in enumerate(self._GLM52_CASES):
+            sm_scale = 1.0 / math.sqrt(576)
             q, kv_cache, selected, cache_seqlens, _kv_bytes = _make_glm_inputs(
                 rows=rows,
                 num_heads=heads,
@@ -411,6 +483,7 @@ class _SparseMlaProbe:
                     num_q_heads=heads,
                     max_q_rows=rows,
                     max_width=topk,
+                    softmax_scale=sm_scale,
                     dtype=torch.bfloat16,
                     kv_dtype=torch.uint8,
                     head_dim=576,
@@ -433,11 +506,11 @@ class _SparseMlaProbe:
                 plan,
                 scratch=scratch,
                 q=q,
+                kv_cache=kv_cache,
                 selected_indices=selected,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=cache_seqlens,
+                cache_lengths=cache_seqlens,
+                selected_lengths=cache_seqlens,
             )
-            sm_scale = 1.0 / math.sqrt(576)
             expected = sparse_mla_reference(
                 q_all=q,
                 kv_cache=kv_cache,
@@ -448,12 +521,7 @@ class _SparseMlaProbe:
             )
 
             def run():
-                return sparse_mla.run_decode(
-                    kv_cache=kv_cache,
-                    binding=binding,
-                    sm_scale=sm_scale,
-                    v_head_dim=512,
-                )
+                return sparse_mla.run(binding)
 
             output = run()
             torch.cuda.synchronize(device)
@@ -513,12 +581,14 @@ class _SparseMlaProbe:
             cache_seqlens = torch.full(
                 (rows,), num_records, dtype=torch.int32, device=device
             )
+            sm_scale = 256**-0.5
             plan = sparse_mla.plan(
                 sparse_mla.Caps(
                     device=device,
                     num_q_heads=heads,
                     max_q_rows=rows,
                     max_width=width,
+                    softmax_scale=sm_scale,
                     dtype=torch.bfloat16,
                     kv_dtype=torch.uint8,
                     head_dim=512,
@@ -541,11 +611,11 @@ class _SparseMlaProbe:
                     device=scratch_spec.device,
                 ),
                 q=q,
+                kv_cache=kv_cache,
                 selected_indices=selected,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=active,
+                cache_lengths=cache_seqlens,
+                selected_lengths=active,
             )
-            sm_scale = 256**-0.5
             expected = sparse_mla_reference(
                 q_all=q,
                 kv_cache=kv_cache.view(num_records, 1, 528),
@@ -556,12 +626,7 @@ class _SparseMlaProbe:
             )
 
             def run_glm53():
-                return sparse_mla.run_decode(
-                    kv_cache=kv_cache,
-                    binding=binding,
-                    sm_scale=sm_scale,
-                    v_head_dim=512,
-                )
+                return sparse_mla.run(binding)
 
             output = run_glm53()
             torch.cuda.synchronize(device)
@@ -883,6 +948,16 @@ class DsaIndexerGenerator(MeasuredPolicyGenerator):
                 shared_page_table=False,
             )
             for heads in (64, 16, 8)
+        )
+        queries += tuple(
+            DsaIndexerQuery(
+                source_layout="paged", mode="decode", dtype="bfloat16",
+                kv_dtype="uint8", num_q_heads=32, num_idx_heads=1,
+                max_q_rows=4, max_k_rows=0, top_k=512, page_size=64,
+                score_mode="dsa", shared_page_table=False, cache_format="mxfp4",
+                max_candidates=candidates, candidate_topk_blocks=blocks,
+            )
+            for _, candidates, blocks in _DsaIndexerProbe._MXFP4_CASES
         )
         super().__init__(
             policy=DSA_INDEXER_POLICY,

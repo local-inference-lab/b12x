@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "status": "focused_regressions_passed",
+  "passed": [
+    {
+      "suite": "legacy_and_extended_residual",
+      "passed": 110,
+      "skipped": 1,
+      "raw": "artifact://168"
+    },
+    {
+      "suite": "contiguous_attention_and_vision_helpers",
+      "passed": 32,
+      "raw": "artifact://165"
+    },
+    {
+      "suite": "compressed_attention_cache_indexer_compression",
+      "passed": 136,
+      "raw": "artifact://167"
+    },
+    {
+      "suite": "policy_catalog_corpus_generators",
+      "passed": 132
+    },
+    {
+      "suite": "registered_v41_target_and_draft",
+      "passed": 2
+    },
+    {
+      "suite": "block_fp8_and_wo_projection_remaining",
+      "passed": 31,
+      "raw": "artifact://174"
+    },
+    {
+      "suite": "sparse_moe_api",
+      "passed": 21
+    },
+    {
+      "suite": "compatibility_and_root_registry",
+      "passed": 13
+    }
+  ],
+  "corrected_test_contracts": [
+    "Removed mocked quantizer-argument forwarding test; real GPU capacity/graph tests remain.",
+    "Moved incompatible compressed-tensors/NVFP4 validation to public weight planning instead of an incomplete fabricated run binding.",
+    "Registered new operations in authoritative root inventory; both namespace module identities retained.",
+    "Migrated raw synthetic MoE queries to schema5 numerical_recipe and preserved legacy tuning recipe selection."
+  ],
+  "remaining": [
+    "full native vLLM qualification"
+  ]
+}

@@ -1,16 +1,46 @@
 """Grouped-selector sparse GQA for the Qwen3.8-Flash-Next QSA contract.
 
-QSA keeps exact, original-token BF16 GQA K/V and uses a second compressed
-BF16 key cache only to select groups of logical token positions.  The public
-lifecycle is ``Caps -> plan -> bind -> run``.  Planning owns split and scratch
-policy; binding validates tensors and creates references without allocating.
+QSA keeps exact, original-token BF16 or globally scaled FP8 E4M3 GQA K/V and
+uses a second compressed BF16 key cache only to select groups of logical token
+positions. The public lifecycle is ``Caps -> plan -> bind -> prewarm -> run``.
+Planning owns split and scratch policy; binding validates tensors and creates
+references without allocating tensors. Optional stream scheduling creates a
+completion event at bind time. ``prewarm`` compiles both request-ID widths and
+both sparse-GQA row regimes without reading or mutating cache state and may be
+omitted when first-use JIT latency is acceptable.
 
-``run`` executes the decode transaction behind one opaque mutating dispatcher
-boundary and never dispatches the slow functions in
+``run`` executes the decode transaction through opaque mutating dispatcher
+operations and never dispatches the slow functions in
 :mod:`b12x.attention.qsa.reference`.  The bound main K/V cache and both page
 tables are read-only.  The bound output, selected-position matrix, compressed
 selector cache, and raw selector state are mutable.  The caller writes the
-live original-token K/V before calling ``run``; QSA has no main-cache writer.
+live original-token K/V on the calling stream before ``run``; QSA has no main-cache writer.
+
+An optional ``selection_stream`` on the binding lets ``run`` overlap selection
+with main Q/K/V production. The caller records ``index_ready`` after producing
+all selector inputs and metadata, before enqueuing independent main Q/K/V
+work. QSA joins selection before attention on the calling stream. Streams and
+synchronization resources are established before graph capture.
+
+For overlapped execution, create resources and prewarm before capture::
+
+    selection_stream = torch.cuda.Stream(device=caps.device)
+    index_ready = torch.cuda.Event()
+    binding = qsa.bind(plan, **buffers, selection_stream=selection_stream)
+    qsa.prewarm(binding)
+
+The caller's launch sequence, also used inside CUDA graph capture, is::
+
+    produce_selector_inputs_and_metadata()
+    index_ready.record()  # Includes prior writes to bound selector state.
+    produce_main_query_and_write_kv()
+    output = qsa.run(binding, **inputs, index_ready=index_ready)
+
+The producer names denote caller operations; QSA does not own projection or
+main-cache writes. ``inputs`` contains the same query, index projections and
+request metadata as serial ``run``. Compiled producers that mutate caller
+buffers must expose their writes at the event boundary; deferring writes to a
+compiler epilogue cannot establish producer readiness.
 
 Raw selector state is indexed by persistent state slots, not batch indices.
 ``request_ids[row]`` selects a batch entry and ``raw_state_slot_ids[batch]``
@@ -49,6 +79,53 @@ Selected positions are request-relative original-token positions.  Every row
 has fixed width ``budget + compress_ratio - 1``; valid positions are packed
 first and unused entries are ``-1``.  Completed groups are expanded in their
 selected order, followed by the causally visible incomplete-group tail.
+The selected-position reader supports widths of at least 2051. Width is a
+planned specialization; changing live rows preserves the warmed callable
+within each split or direct reader regime.
+
+Draft layers may bind persistent selection anchors for reuse within one MTP
+round. B12X describes the layout; the caller allocates the storage::
+
+    anchor_plan = plan.draft_selection_plan()
+    anchor_storage = {
+        spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in anchor_plan.storage_specs()
+    }
+    anchors = anchor_plan.bind(storage=anchor_storage)
+    anchors.reset()
+    binding = qsa.bind(plan, **buffers, draft_selection=anchors)
+
+``buffers`` includes the caller allocations required by ``plan.scratch_specs``
+and the ordinary cache, output, and selected-position buffers. Temporary
+anchor-gather and causal-tail buffers are included in that scratch contract.
+Binding creates views without allocating or initializing tensor storage.
+Prewarm preserves anchors and allocates only its synthetic warmup inputs.
+
+An ordinary ``qsa.run(binding, **inputs)`` records an independent copy of the
+selection, logical positions, error mask, and valid row count. Subsequent draft
+steps supply a caller-owned int32/int64 vector mapping batch request IDs to
+accepted rows of that recording::
+
+    output = qsa.run(
+        binding, query=query, request_ids=request_ids,
+        query_positions=query_positions,
+        reuse=qsa.DraftSelectionReuse(source_rows=accepted_rows),
+    )
+
+Reuse requires one query per request and omits selector inputs and
+``index_ready``. It preserves anchors and selector caches, appends the causal
+suffix bounded by ``max_speculative_tokens``, and poisons invalid active rows.
+The caller must reset at round boundaries and request recycling, and map each
+request to an anchor from the same request, model layer, and round. Bounds and
+causal positions are checked; request identity and round provenance are not.
+Returned anchor views are for inspection; ``reset`` and ``run`` own mutations.
+
+Capacity variants of a layer's plan may share anchors when device, selection
+width, and cache/request assignment match. Pass ``max_source_rows`` to
+``draft_selection_plan`` to cover the largest recording plan. Each plan reports
+its own scratch requirements. Order resets, recordings, map writes, and reuse
+on the calling stream or join them with caller-owned events; keep all storage
+alive through graph replay and do not overlap operations sharing mutable state.
 """
 
 from __future__ import annotations
@@ -64,6 +141,9 @@ META = OpMeta(
     entry_points=(
         "CacheRequirements",
         "Caps",
+        "DraftSelectionPlan",
+        "DraftSelectionReuse",
+        "DraftSelectionState",
         "Plan",
         "Binding",
         "QsaConfig",
@@ -71,6 +151,7 @@ META = OpMeta(
         "cache_requirements",
         "plan",
         "bind",
+        "prewarm",
         "run",
         "is_supported",
     ),
@@ -89,12 +170,11 @@ META = OpMeta(
     test_path="tests/attention/test_qsa_contract.py",
     since="1.3.0",
     notes=(
-        "The Qwen sparse-GQA layout uses CuTeDSL for every row count "
-        "and fails closed when its CuTe contract is not satisfied. No "
-        "alternate sparse-GQA implementation is dispatched. Triton is used "
-        "only for auxiliary selection and cache-maintenance stages in the "
-        "Qwen pipeline. Main K/V cache writes are unsupported. Page- and "
-        "state-slot-scaled addressing uses signed 64-bit arithmetic."
+        "The Qwen sparse-GQA layout uses split CuTeDSL kernels for at most "
+        "64 query rows. Larger prefills use the selected-position specialization "
+        "of the CuTe paged-forward engine. "
+        "Unsupported geometry fails closed. Main K/V cache writes are unsupported. "
+        "Page- and state-slot-scaled addressing uses signed 64-bit arithmetic."
     ),
 )
 
@@ -103,6 +183,9 @@ if TYPE_CHECKING:
         Binding,
         CacheRequirements,
         Caps,
+        DraftSelectionPlan,
+        DraftSelectionReuse,
+        DraftSelectionState,
         Plan,
         QsaConfig,
         QsaQuery,
@@ -110,6 +193,7 @@ if TYPE_CHECKING:
         cache_requirements,
         is_supported,
         plan,
+        prewarm,
         run,
     )
 

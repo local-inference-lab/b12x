@@ -94,7 +94,7 @@ def _heuristic(
     hidden_size = int(query.hidden_size)
     backend = (
         "tf32_tma"
-        if hidden_size in {4_096, 7_168}
+        if hidden_size in {4_096, 5_120, 7_168}
         and tokens >= _PREFILL_TF32_MIN_TOKENS
         else "native"
     )
@@ -176,8 +176,8 @@ def _validate(
         raise ValueError(f"unsupported mHC backend {config.backend!r}")
     if config.backend == "native":
         return
-    if query.hidden_size not in {4_096, 7_168}:
-        raise ValueError("TF32 mHC projection supports hidden sizes 4096 and 7168")
+    if query.hidden_size not in {4_096, 5_120, 7_168}:
+        raise ValueError("TF32 mHC projection supports hidden sizes 4096, 5120 and 7168")
     if config.projection_num_stages not in range(1, 9):
         raise ValueError("projection_num_stages must be in [1, 8]")
     if config.projection_num_m_warps <= 0 or config.projection_num_n_warps <= 0:
