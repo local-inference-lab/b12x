@@ -71,6 +71,8 @@ def check_uncached(before, after, usage, *, sglang_reports_only_hits=False) -> f
         reported = 0
     metric = "vllm:prefix_cache_hits_total"
     observed = after[metric] - before[metric] if metric in before and metric in after else None
+    if reported is None and observed is None:
+        raise RuntimeError("Cannot qualify cold prefill without cache-hit evidence")
     for value in (reported, observed):
         if value is not None and value != 0:
             raise RuntimeError(
@@ -141,7 +143,7 @@ def main() -> None:
             "ignore_eos": True,
         }
         before = read_metrics(base_url)
-        if "vllm:prefix_cache_hits_total" in before:
+        if not args.sglang_flush_cache:
             payload["cache_salt"] = cache_salt
         started = time.perf_counter()
         response = request_json(f"{base_url}/v1/completions", payload)
@@ -182,7 +184,7 @@ def main() -> None:
         "seed": args.seed,
         "sampling": {**DEFAULT_SAMPLING, "temperature": args.temperature},
         "cache_salt": cache_salt,
-        "cache_control": "sglang_flush" if args.sglang_flush_cache else "vllm_salt_when_available",
+        "cache_control": "sglang_flush" if args.sglang_flush_cache else "vllm_salt_and_observed_zero_hits",
         "median_wall_tokens_per_second": statistics.median(
             float(sample["wall_tokens_per_second"]) for sample in measured
         ),

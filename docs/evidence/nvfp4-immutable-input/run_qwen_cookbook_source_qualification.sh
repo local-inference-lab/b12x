@@ -8,18 +8,21 @@ set -euo pipefail
 # LANGUAGE_MODEL_ONLY=0 enables up to four images, resized to at most 4 MiPixels
 # each. Video inputs are disabled in that configuration.
 # Source code is supplied by the image; model and compiler caches are mounts.
-physical_gpu=${PHYSICAL_GPU:?Set PHYSICAL_GPU to an explicitly assigned GPU index}
-[[ $physical_gpu =~ ^(0|[1-9][0-9]*)$ ]] || exit 2
-nvidia-smi -i "$physical_gpu" --query-gpu=uuid --format=csv,noheader >/dev/null
 tensor_parallel_size=${TENSOR_PARALLEL_SIZE:-1}
 case $tensor_parallel_size in
-    1) gpu_request="device=$physical_gpu" ;;
+    1)
+        physical_gpu=${PHYSICAL_GPU:?Set PHYSICAL_GPU to an explicitly assigned GPU index}
+        [[ $physical_gpu =~ ^(0|[1-9][0-9]*)$ ]] || exit 2
+        nvidia-smi -i "$physical_gpu" --query-gpu=uuid --format=csv,noheader >/dev/null
+        gpu_request="device=$physical_gpu"
+        ;;
     2)
         tp_gpu_ids=${TP_GPU_IDS:-2,3}
         case $tp_gpu_ids in
             0,1|1,2|2,3) gpu_request="\"device=$tp_gpu_ids\"" ;;
             *) echo "TP_GPU_IDS must be 0,1 or 1,2 or 2,3" >&2; exit 2 ;;
         esac
+        nvidia-smi -i "$tp_gpu_ids" --query-gpu=uuid --format=csv,noheader >/dev/null
         ;;
     *) echo "TENSOR_PARALLEL_SIZE must be 1 or 2" >&2; exit 2 ;;
 esac

@@ -2,12 +2,13 @@
 
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
 
 import httpx
-from qualify_glm53_lmcache_long_prefix import delta, metrics
+from prompt_source_metrics import delta, metrics
 
 
 def main():
@@ -20,6 +21,8 @@ def main():
     parser.add_argument("--top-p", type=float, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error("Duration must be positive and finite")
     if args.output.exists() or args.tokens < 8:
         parser.error("Use a fresh output path and at least eight tokens")
     if not (0 <= args.temperature <= 2 and 0 < args.top_p <= 1):
@@ -32,7 +35,8 @@ def main():
               "warmup": None, "samples": samples}
     with httpx.Client(timeout=600) as client:
         measured_started = None
-        while measured_started is None or time.monotonic() - measured_started < args.duration:
+        while (measured_started is None or not samples
+               or time.monotonic() - measured_started < args.duration):
             nonce = time.time_ns()
             prompt = [1000 + byte for byte in nonce.to_bytes(8, "little")]
             prompt.extend(1400 + i % 127 for i in range(args.tokens - 8))

@@ -11,6 +11,13 @@ immutable inference-weight declaration in
 [vLLM #727](https://github.com/local-inference-lab/vllm/pull/727).
 They are not measurements of this preparation change alone.
 
+The launch predicate reads prepared metadata and, for versioned tensors, the
+version counter. It performs no scale-value inspection, policy lookup, device
+allocation or reduction. CUDA graph replay does not execute that Python
+predicate. Eager mutation invalidates the proof until weights are prepared
+again; a long-lived cached binding boolean must not bypass this invalidation.
+Inference-tensor owners guarantee immutability for the graph lifetime.
+
 ## Hardware, artifacts and source boundaries
 
 Every comparison uses RTX PRO 6000 Blackwell Workstation GPUs at a 600 W power
@@ -97,12 +104,27 @@ the private NVFP4 draft head and W4A16 draft MoE are unchanged.
 | GLM 32K, bracketed controls | 15842.49 / 15737.30 | 17152.43 | +8.27% / +8.99% |
 | Qwen 32K, HTTP wall time | 15707.42 | 17211.35 | +9.57% |
 
+Decode concurrency means simultaneous active clients: **C1 is one client**
+and **C8 is eight clients**, with C8 rates aggregated across clients.
+The decode workload uses context argument zero, temperature 1, respected EOS,
+a ten-second warmup and a thirty-second measured cell.
+
 Every measured and excluded warmup latency is retained in the adjacent JSON
 receipts. The [serving summary](evidence/nvfp4-immutable-input/serving-summary.json)
 also preserves every GLM C1 observation, including the approximately 177 tok/s
 state on both reference and candidate. No decode speedup is established.
 The Qwen C1/C8 verifier rates differ by less than 1%; output-rate changes include
 stochastic proposal acceptance and are not a statistical decode-equivalence test.
+Their complete receipts are [the reference decode](evidence/nvfp4-immutable-input/qwen-reference-decode.json)
+and [the split decode](evidence/nvfp4-immutable-input/qwen-split-decode.json).
+Artifact fields in the GLM summary identify the locally recorded origin files;
+the summary contains all aggregate observations, not every generated transcript.
+
+The included clients preserve the measured request and timer semantics on the
+qualified domain. Input validation additionally rejects invalid durations and
+absent cache evidence; those cases were not accepted by the serving qualification.
+The GLM client includes only its prompt-counter dependency, not an unrelated
+external-cache restore command. The Qwen command here qualifies vLLM TP1 only.
 
 The actual GLM rank-0 prefill trace records 168 calls each to routing, FC1 and
 FC2 kernels (42 layers × four target forwards). Qwen records 288 each
