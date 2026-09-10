@@ -167,6 +167,7 @@ _WORK_SOURCES = {
     _WORK_SOURCE_MATERIALIZED_QUEUE,
     _WORK_SOURCE_READY_QUEUE,
 }
+_SPLIT_PHASES = {"fused", "prepare", "compute"}
 # w4a8 smem staging geometry: one 128-row x 64-byte packed-FP4 B tile per
 # k-tile. Rows pad to 80 bytes: 16-aligned (cp.async.cg requires dst
 # alignment = copy size) and 20*g mod 32 spreads the eight g-rows a lane
@@ -714,6 +715,8 @@ class MoEDynamicKernelBackend:
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
         numerical_recipe: str = "default",
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         self.deepseek_v41 = numerical_recipe == "deepseek_v41"
@@ -738,6 +741,15 @@ class MoEDynamicKernelBackend:
             raise ValueError(
                 f"unsupported work_source {work_source!r}; "
                 f"expected one of {sorted(_WORK_SOURCES)}"
+            )
+        if split_phase not in _SPLIT_PHASES:
+            raise ValueError(
+                f"unsupported split_phase {split_phase!r}; "
+                f"expected one of {sorted(_SPLIT_PHASES)}"
+            )
+        if split_phase == "compute" and quant_recipe != "nvfp4":
+            raise ValueError(
+                "split_phase='compute' currently supports quant_recipe='nvfp4' only"
             )
         if quant_recipe != "nvfp4" and activation == SWIGLUOAI_UNINTERLEAVE:
             raise NotImplementedError(
@@ -769,6 +781,10 @@ class MoEDynamicKernelBackend:
         self.work_source = work_source
         self.work_is_persistent_grid = work_source == _WORK_SOURCE_PERSISTENT_GRID
         self.work_is_streaming = work_source == _WORK_SOURCE_READY_QUEUE
+        self.split_phase = split_phase
+        self.prepare_only = split_phase == "prepare"
+        self.compute_only = split_phase == "compute"
+        self.low_smem_pipeline = bool(low_smem_pipeline)
         # w6a8_mx: MX-FP6 weights (3:4-packed bytes in gmem, expanded in-smem
         # to Float8E4M3FN byte-containers) against MXFP8-E4M3 activations with
         # UE8M0 K/32 block scales, computed on the inline ``mxf8f6f4``
@@ -1411,6 +1427,10 @@ class MoEDynamicKernelBackend:
         # 32%3!=0 causes pipeline phase mismatch. Round down to nearest divisor.
         while self.ab_stage > 1 and 32 % self.ab_stage != 0:
             self.ab_stage -= 1
+        if self.low_smem_pipeline:
+            if self.quant_recipe != "nvfp4":
+                raise ValueError("low_smem_pipeline currently supports nvfp4 only")
+            self.ab_stage = 2
         self.w4a8_fc2_compute_width = 1
         if self.is_w4a8:
             # w4a8 repurposes the staging regions as fixed double buffers; a
@@ -2139,6 +2159,7 @@ class MoEDynamicKernelBackend:
                 cute.arch.sync_threads()
                 intermediate_slice += Int32(1)
 
+    @cute.jit
     def _publish_ready_tasks(
         self,
         task_tail: cute.Tensor,
@@ -2660,7 +2681,7 @@ class MoEDynamicKernelBackend:
             # stream work occupies the remaining SMs, leaving resident CTAs
             # spinning and the unscheduled CTAs unable to arrive.  Cooperative
             # launch makes the all-CTA residency contract explicit.
-            cooperative=True,
+            cooperative=not self.compute_only,
             stream=stream,
         )
         # External split-materialized launch (same @cute.jit call, same
@@ -3155,7 +3176,7 @@ class MoEDynamicKernelBackend:
         # Phase 0: cooperative init — zero routing state, queue state, and output.
         task_capacity = Int32(task_ready.shape[0])
         tile_write_slots = Int32(tile_write_count.shape[0])
-        if cutlass.const_expr(not self.direct_routing):
+        if cutlass.const_expr(not self.direct_routing and not self.compute_only):
             i = flat_tid
             while i < num_experts:
                 expert_write_rows[i] = Int32(0)
@@ -3174,7 +3195,11 @@ class MoEDynamicKernelBackend:
         # routed scratch therefore needs no 4x-output clear; poison/replay
         # coverage verifies that phase 2 really overwrites the full domain.
         if cutlass.const_expr(
-            self.deepseek_v41 or not (self.deterministic_output and self.external_materialized_fc2)
+            not self.compute_only
+            and (
+                self.deepseek_v41
+                or not (self.deterministic_output and self.external_materialized_fc2)
+            )
         ):
             scatter_rows = Int32(scatter_output.shape[0])
             scatter_total_u32 = scatter_rows * cols_u32
@@ -3198,7 +3223,7 @@ class MoEDynamicKernelBackend:
 
         # Materialized slots are overwritten before the second grid barrier;
         # only a true ready queue needs generation flags cleared up front.
-        if cutlass.const_expr(self.work_is_streaming):
+        if cutlass.const_expr(self.work_is_streaming and not self.compute_only):
             k = flat_tid
             while k < task_capacity:
                 task_ready[k] = Int32(0)
@@ -3209,14 +3234,15 @@ class MoEDynamicKernelBackend:
                 tile_write_count[tw] = Int32(0)
                 tw += flat_stride
 
-        if flat_tid == Int32(0):
-            pair_head[Int32(0)] = Int32(0)
-            producers_done_count[Int32(0)] = Int32(0)
-            all_work_published[Int32(0)] = Int32(0)
-            task_head[Int32(0)] = Int32(0)
-            task_tail[Int32(0)] = Int32(0)
+        if cutlass.const_expr(not self.compute_only):
+            if flat_tid == Int32(0):
+                pair_head[Int32(0)] = Int32(0)
+                producers_done_count[Int32(0)] = Int32(0)
+                all_work_published[Int32(0)] = Int32(0)
+                task_head[Int32(0)] = Int32(0)
+                task_tail[Int32(0)] = Int32(0)
 
-        if cutlass.const_expr(self.w4a8_m1_materialized):
+        if cutlass.const_expr(self.w4a8_m1_materialized and not self.compute_only):
             # Fixed M=1 preparation is itself a grid-sized arithmetic domain:
             # one thread per K32 quantization block, plus one thread per route.
             # Fold it into phase 0 so the existing resident barrier publishes
@@ -3278,13 +3304,14 @@ class MoEDynamicKernelBackend:
                         cutlass.Float32
                     )
 
-        cute.arch.sync_threads()
-        self._resident_grid_barrier(
-            barrier_count,
-            barrier_epoch,
-            Int32(gdim_z),
-            is_cta_leader,
-        )
+        if cutlass.const_expr(not self.compute_only):
+            cute.arch.sync_threads()
+            self._resident_grid_barrier(
+                barrier_count,
+                barrier_epoch,
+                Int32(gdim_z),
+                is_cta_leader,
+            )
 
         # General grouped execution compacts routes by expert.  Tiny direct-
         # routing decode instead gives every routed pair its own physical M tile:
@@ -3293,7 +3320,9 @@ class MoEDynamicKernelBackend:
         # The external route-plan specialization gets the grouped histogram and
         # prefix from an ordered Triton launch and skips the same control phase.
         if cutlass.const_expr(
-            not self.direct_routing and not self.external_route_plan
+            not self.compute_only
+            and not self.direct_routing
+            and not self.external_route_plan
         ):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
@@ -3366,7 +3395,9 @@ class MoEDynamicKernelBackend:
         route_output_base = cute.make_rmem_tensor((8,), Int32)
         route_scale_base = cute.make_rmem_tensor((8,), Int32)
         produce_active = (
-            Int32(0) if cutlass.const_expr(self.w4a8_m1_materialized) else Int32(1)
+            Int32(0)
+            if cutlass.const_expr(self.w4a8_m1_materialized or self.compute_only)
+            else Int32(1)
         )
         while produce_active > Int32(0):
             batch_base = Int32(0)
@@ -4098,7 +4129,9 @@ class MoEDynamicKernelBackend:
                                             )
                         warp_item += Int32(1)
 
-        if cutlass.const_expr(not self.w4a8_m1_materialized):
+        if cutlass.const_expr(
+            not self.compute_only and not self.w4a8_m1_materialized
+        ):
             cute.arch.sync_threads()
             # Conservative publish fence before the last-producer CTA flushes
             # any partial tiles. All producer threads in the CTA must order
@@ -4106,7 +4139,7 @@ class MoEDynamicKernelBackend:
             _threadfence()
             cute.arch.sync_threads()
 
-        if cutlass.const_expr(not self.work_is_streaming):
+        if cutlass.const_expr(not self.compute_only and not self.work_is_streaming):
             # The active materialized sources rendezvous once, publish every
             # physical tile, then consume a fully addressable work domain.
             if cutlass.const_expr(not self.w4a8_m1_materialized):
@@ -4190,40 +4223,41 @@ class MoEDynamicKernelBackend:
                         get_ptr_as_int64(all_work_published, Int32(0)),
                         Int32(1),
                     )
-        elif is_cta_leader > Int32(0):
-            prev_done = atomic_add_global_i32(
-                get_ptr_as_int64(producers_done_count, Int32(0)),
-                Int32(1),
-            )
-            if prev_done == Int32(gdim_z) - Int32(1):
-                expert_flush = Int32(0)
-                while expert_flush < num_experts:
-                    rows = row_counts[expert_flush]
-                    rem = rows % Int32(self.tile_shape_mnk[0])
-                    if rem != Int32(0):
-                        partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(
-                            self.tile_shape_mnk[0]
-                        )
-                        self._publish_ready_tasks(
-                            task_tail,
-                            task_ready,
-                            task_expert,
-                            task_m_tile,
-                            task_slice_begin,
-                            task_slice_count,
-                            task_valid_rows,
-                            route_gate_tile_cnt,
-                            task_slice_chunk,
-                            expert_flush,
-                            partial_m_tile,
-                            rem,
-                        )
-                    expert_flush += Int32(1)
-                _threadfence()
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
+        elif cutlass.const_expr(not self.compute_only):
+            if is_cta_leader > Int32(0):
+                prev_done = atomic_add_global_i32(
+                    get_ptr_as_int64(producers_done_count, Int32(0)),
                     Int32(1),
                 )
+                if prev_done == Int32(gdim_z) - Int32(1):
+                    expert_flush = Int32(0)
+                    while expert_flush < num_experts:
+                        rows = row_counts[expert_flush]
+                        rem = rows % Int32(self.tile_shape_mnk[0])
+                        if rem != Int32(0):
+                            partial_m_tile = expert_tile_base[
+                                expert_flush
+                            ] + rows // Int32(self.tile_shape_mnk[0])
+                            self._publish_ready_tasks(
+                                task_tail,
+                                task_ready,
+                                task_expert,
+                                task_m_tile,
+                                task_slice_begin,
+                                task_slice_count,
+                                task_valid_rows,
+                                route_gate_tile_cnt,
+                                task_slice_chunk,
+                                expert_flush,
+                                partial_m_tile,
+                                rem,
+                            )
+                        expert_flush += Int32(1)
+                    _threadfence()
+                    _st_global_release_i32(
+                        get_ptr_as_int64(all_work_published, Int32(0)),
+                        Int32(1),
+                    )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
         # Single tiled view over concatenated w13 [2*I_tp, K, E].
@@ -4831,7 +4865,9 @@ class MoEDynamicKernelBackend:
                 get_ptr_as_int64(task_tail, Int32(0))
             )
         consumer_live = (
-            Int32(0) if cutlass.const_expr(self.external_materialized_fc1) else Int32(1)
+            Int32(0)
+            if cutlass.const_expr(self.prepare_only or self.external_materialized_fc1)
+            else Int32(1)
         )
         while consumer_live > Int32(0):
             if cutlass.const_expr(self.w4a8_m1_materialized):
@@ -9445,7 +9481,9 @@ class MoEDynamicKernelBackend:
         # exclusion via not is_w4a8); relying on fresh-pipeline acquire
         # parity here would be untested behavior.
         if cutlass.const_expr(
-            not self.is_w4a8 and not self.external_materialized_fc1
+            not self.is_w4a8
+            and not self.external_materialized_fc1
+            and not self.prepare_only
         ):
             if warp_idx == self.tma_load_warp_id:
                 ml_pipeline.producer_tail(prod_state)
