@@ -96,6 +96,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         numerical_recipe: str = "default",
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -122,6 +124,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
             numerical_recipe=numerical_recipe,
+            split_phase=split_phase,
+            low_smem_pipeline=low_smem_pipeline,
         )
 
 
@@ -200,6 +204,8 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         activation = SWIGLUOAI_UNINTERLEAVE
         super().__init__(
@@ -225,6 +231,8 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
                 activation, swiglu_alpha
             ),
             swiglu_beta=normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+            split_phase=split_phase,
+            low_smem_pipeline=low_smem_pipeline,
         )
 
 
