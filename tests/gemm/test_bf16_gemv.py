@@ -151,6 +151,61 @@ def test_unquantized_bias_and_live_rows_reuse_native_graph(
 
 
 @cuda_required
+@pytest.mark.parametrize("n", [384, 512, 1024])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_prefill_projection_reuses_warm_kernel_and_preserves_live_graph_inputs(
+    n,
+    output_dtype,
+):
+    """Both dispatch regimes share an unquantized contract and caller ownership."""
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm import bf16_gemv
+
+    torch.manual_seed(415122)
+    capacity, k = 4096, 5120
+    source = torch.randn(capacity, k, device="cuda").bfloat16()
+    weight = (torch.randn(n, k, device="cuda") / k**0.5).bfloat16()
+    output = torch.empty(capacity, n, device="cuda", dtype=output_dtype)
+    source_copy, weight_copy = source.clone(), weight.clone()
+    bf16_gemv.precompile(weight, output_dtype=output_dtype)
+    freeze_kernel_resolution("BF16 prefill and scalar projection row coverage")
+    try:
+        for rows in (1, 17, 255, 256, 513, capacity):
+            output.fill_(float("nan"))
+            bf16_gemv.mm(source[:rows], weight, out=output[:rows])
+            expected = source[:rows].double() @ weight.double().T
+            if output_dtype == torch.float32:
+                torch.testing.assert_close(
+                    output[:rows].double(), expected, atol=1e-6, rtol=1e-6
+                )
+            else:
+                torch.testing.assert_close(
+                    output[:rows].double(), expected, atol=0.004, rtol=0.004
+                )
+            assert torch.isnan(output[rows:]).all()
+        torch.testing.assert_close(source, source_copy, atol=0, rtol=0)
+        torch.testing.assert_close(weight, weight_copy, atol=0, rtol=0)
+        output.fill_(float("nan"))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source[:513], weight, out=output[:513])
+        source.mul_(0.5)
+        weight.mul_(0.25)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = source[:513].double() @ weight.double().T
+        torch.testing.assert_close(
+            output[:513].double(),
+            expected,
+            atol=1e-6 if output_dtype == torch.float32 else 0.004,
+            rtol=1e-6 if output_dtype == torch.float32 else 0.004,
+        )
+        assert torch.isnan(output[513:]).all()
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@cuda_required
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("m,n,k", [(257, 2048, 1024), (129, 1025, 513)])
 def test_broad_bf16_projection(output_dtype, m, n, k):
@@ -281,6 +336,41 @@ def test_precompile_covers_live_rows_and_strides_under_freeze(output_dtype):
         )
     finally:
         unfreeze_kernel_resolution()
+
+
+@cuda_required
+def test_prefill_router_topk_agrees_with_fp64_and_scalar_projection():
+    """A 384-expert router keeps the same six selected expert identifiers."""
+    from b12x.gemm import bf16_gemv
+    from b12x.gemm.bf16_gemv._kernel import _launch_scalar
+
+    torch.manual_seed(415123)
+    source = torch.randn(4096, 5120, device="cuda").bfloat16()
+    weight = (torch.randn(384, 5120, device="cuda") / 5120**0.5).bfloat16()
+    scalar = torch.empty(4096, 384, device="cuda")
+    _launch_scalar(source, weight, scalar)
+    result = bf16_gemv.mm(source, weight, output_dtype=torch.float32)
+    oracle = source.double() @ weight.double().T
+    for value in (scalar, result):
+        torch.testing.assert_close(value.double(), oracle, rtol=1e-6, atol=1e-6)
+        assert torch.equal(
+            value.topk(6, dim=-1).indices, oracle.topk(6, dim=-1).indices
+        )
+
+
+@cuda_required
+def test_prefill_projection_retains_small_terms_between_cancelling_large_terms():
+    """Compensated carry preserves exact representable BF16 products in FP32."""
+    from b12x.gemm import bf16_gemv
+
+    source = torch.ones(256, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(512, 5120, device="cuda", dtype=torch.bfloat16)
+    weight[:, ::32] = 1024
+    weight[:, 1::32] = 0.015625
+    weight[:, 31::32] = -1024
+    result = bf16_gemv.mm(source, weight, output_dtype=torch.float32)
+    expected = source.double() @ weight.double().T
+    torch.testing.assert_close(result.double(), expected, atol=0, rtol=0)
 
 
 @cuda_required

@@ -33,6 +33,7 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from ._prefill import prefill_mm, supports_prefill
 
 _THREADS = 128
 SMALL_M_MAX = 8  # Rows sharing a weight load, not a live-row support limit.
@@ -518,7 +519,9 @@ class ProjectionKernel:
             stream,
         )
         if cutlass.const_expr(self.has_mma):
-            if warm_all != Int32(0):
+            if warm_all == Int32(2):
+                self.simt(*arguments)
+            elif warm_all != Int32(0):
                 self.mma(*arguments)
                 self.simt(*arguments)
             elif rows >= Int32(self.minimum_mma_rows):
@@ -644,6 +647,26 @@ def _validate(x, weight, out, bias):
 
 
 def _launch(x, weight, out, bias=None):
+    # The 1024-column projection reaches the general MMA crossover at 128
+    # rows. Keep its qualified FP32 accumulation accuracy through that range.
+    prefill_min_rows = 128 if weight.ndim == 2 and weight.shape[0] == 1024 else 256
+    if (
+        x.ndim == weight.ndim == 2
+        and x.shape[0] >= prefill_min_rows
+        and supports_prefill(x, weight, out, bias)
+    ):
+        _validate(x, weight, out, bias)
+        prefill_mm(x, weight, out)
+        return
+    _launch_projection(x, weight, out, bias)
+
+
+def _launch_scalar(x, weight, out, bias=None):
+    """Invoke the SIMT reference explicitly, regardless of the MMA crossover."""
+    _launch_projection(x, weight, out, bias, force_simt=True)
+
+
+def _launch_projection(x, weight, out, bias=None, *, force_simt=False):
     _validate(x, weight, out, bias)
     if x.shape[0] == 0:
         return
@@ -687,7 +710,7 @@ def _launch(x, weight, out, bias=None):
             int(x.stride(1)),
             int(weight.stride(1)),
             vector_loads,
-            0,
+            2 if force_simt else 0,
             current_cuda_stream(),
         )
         # The same compiled host program owns both GPU entrypoints. Its row
@@ -757,9 +780,11 @@ def precompile_bf16_gemv_small_n(
         )
         key = _key(x, weight, out, bias)
         with _LOCK:
-            if key in _WARMED:
-                return
-        _launch(x, weight, out, bias)
+            scalar_warm = key in _WARMED
+        if not scalar_warm:
+            _launch(x, weight, out, bias)
+        if supports_prefill(x, weight, out, bias):
+            prefill_mm(x, weight, out)
         torch.cuda.current_stream(weight.device).synchronize()
     if log is not None:
         log.debug(

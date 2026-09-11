@@ -77,6 +77,8 @@ from b12x._lib.intrinsics import (
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
+    mxfp8_pair_to_bf16x2_sm120,
+    nvfp4_pair_to_bf16x2_sm120,
     pack_f32x2_to_bfloat2,
     pow2_ceil_ue8m0,
     rcp_approx_ftz,
@@ -1456,6 +1458,11 @@ def _nvfp4_pair_bfloat2(
     ``latent_scale_per_token`` -- the record's own fp32 second-level scale,
     staged per candidate into the contiguous kv_sc buffer by the IO gather
     (record bytes [292, 296)).
+
+    The 544-byte mixed-source staging layout uses native SM120 packed
+    conversion with no outer scale: full-post-RoPE MXFP8 for SWA and NVFP4
+    for indexed candidates. UE8M0 byte zero represents 2**-127, not zero;
+    byte 255 represents NaN. Invalid source tags produce zero.
     """
     swa = Int32(0)
     if cutlass.const_expr(kv_smem_stride == 544):
@@ -1463,6 +1470,24 @@ def _nvfp4_pair_bfloat2(
         swa = ld_shared_u32(kv_fp4_base_addr + entry * Int32(544) + Int32(528)).to(
             Int32
         )
+        result = Uint32(0)
+        if swa == Int32(1):
+            packed = _ld_u16_zext(kv_fp4_base_addr, entry * Int32(544) + dim_even)
+            scale = _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(544) + Int32(512) + dim_even // Int32(32),
+            )
+            result = mxfp8_pair_to_bf16x2_sm120(packed, scale)
+        elif swa == Int32(0):
+            packed = _ld_u8_zext(
+                kv_fp4_base_addr, entry * Int32(544) + dim_even // Int32(2)
+            )
+            scale = _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(544) + Int32(256) + dim_even // Int32(16),
+            )
+            result = nvfp4_pair_to_bf16x2_sm120(packed, scale)
+        return result
     v0 = Float32(0.0)
     v1 = Float32(0.0)
     scale_f = Float32(0.0)
@@ -1506,6 +1531,29 @@ def _nvfp4_pair_bfloat2(
         (v0 * scale_f) * outer,
         (v1 * scale_f) * outer,
     )
+
+
+@cute.jit
+def _nvfp4_scalar_bf16_u16(
+    kv_fp4_base_addr: Int32,
+    entry: Int32,
+    dim: Int32,
+    latent_scale: Float32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+    latent_scale_per_token: cutlass.Constexpr = False,
+    kv_sc_base_addr: Int32 = Int32(0),
+) -> Uint32:
+    pair = _nvfp4_pair_bfloat2(
+        kv_fp4_base_addr,
+        entry,
+        dim & ~Int32(1),
+        latent_scale,
+        kv_smem_stride=kv_smem_stride,
+        latent_scale_per_token=latent_scale_per_token,
+        kv_sc_base_addr=kv_sc_base_addr,
+    )
+    return _bf16x2_extract_lane_u16(pair, dim & Int32(1))
 
 
 @cute.jit

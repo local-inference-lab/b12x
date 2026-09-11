@@ -5,7 +5,9 @@ FP32 accumulation and bias addition happen before the final BF16/FP32 cast.
 Caller-owned row-strided ``out`` avoids allocation. BF16/BF16 projections
 use tiled tensor-core GEMM when their row/output geometry provides sufficient
 parallelism; small-row/skinny projections and any FP32 operand retain SIMT.
-One geometry/type-specialized compiled callable owns both GPU entrypoints.
+BF16 [M,5120] projections to 384/512/1024 outputs with M >= 256 use a
+specialized TMA path with compensated FP32 carry. Other eligible broad shapes
+use the general tensor-core/SIMT dispatcher.
 Live rows and input strides are runtime arguments. ``precompile`` warm-runs
 all eligible entrypoints before capture. There is no quantization or cuBLAS fallback.
 

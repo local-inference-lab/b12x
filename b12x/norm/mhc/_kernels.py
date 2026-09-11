@@ -2958,6 +2958,11 @@ class MHCPrefillTf32ProjectTmaKernel:
                     Float32,
                 )
                 acc_low.fill(0.0)
+                acc_sum = cute.make_rmem_tensor(
+                    cute.make_layout((self.n_mma_tiles_per_warp, 4), stride=(4, 1)),
+                    Float32,
+                )
+                acc_sum.fill(0.0)
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer,
                 self.num_stages,
@@ -3030,13 +3035,27 @@ class MHCPrefillTf32ProjectTmaKernel:
                         acc[warp_mma_n, 1] = d1
                         acc[warp_mma_n, 2] = d2
                         acc[warp_mma_n, 3] = d3
+                        if const_expr(self.split_fp32_fn and kk % 4 == 3):
+                            # Bound tensor-core accumulation length, then add
+                            # the high/low projection through FP32 ALU sums.
+                            for column in cutlass.range_constexpr(4):
+                                acc_sum[warp_mma_n, column] += (
+                                    acc[warp_mma_n, column]
+                                    + acc_low[warp_mma_n, column]
+                                )
+                                acc[warp_mma_n, column] = Float32(0)
+                                acc_low[warp_mma_n, column] = Float32(0)
                 load_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
 
             for warp_mma_n in cutlass.range_constexpr(self.n_mma_tiles_per_warp):
                 if const_expr(self.split_fp32_fn):
                     for column in cutlass.range_constexpr(4):
-                        acc[warp_mma_n, column] += acc_low[warp_mma_n, column]
+                        acc[warp_mma_n, column] = (
+                            acc_sum[warp_mma_n, column]
+                            + acc[warp_mma_n, column]
+                            + acc_low[warp_mma_n, column]
+                        )
                 mma_n = Int32(warp_mma_n * self.num_n_warps) + warp_n
                 mix0 = n_tile * Int32(self.tile_n) + Int32(mma_n * 8) + lane_pair_base
                 mix1 = mix0 + Int32(1)

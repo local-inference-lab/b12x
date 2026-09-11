@@ -745,6 +745,7 @@ def _b12x_mhc_pre_impl(
         or pre_out is not None
     )
     partials = None
+    planned_config: MhcConfig | None = None
     if binding is not None:
         extras = [
             name
@@ -763,6 +764,7 @@ def _b12x_mhc_pre_impl(
                 f"do not also pass {', '.join(extras)}"
             )
         partials = binding.partials
+        planned_config = binding.plan.config
         residual_out = binding.out
         y_out = binding.y
         post_out = binding.post_buffer
@@ -917,6 +919,7 @@ def _b12x_mhc_pre_impl(
     ):
         from b12x.norm.mhc._kernels import (
             run_mhc_finalize_gram,
+            run_mhc_prefill_tf32_project,
             run_mhc_pre_functional,
             run_mhc_pre_partial,
         )
@@ -937,13 +940,29 @@ def _b12x_mhc_pre_impl(
                 norm_eps=float(norm_eps),
             )
 
-        run_mhc_pre_partial(
-            residual=residual,
-            fn=fn,
-            partials=partials,
-            out=residual_out,
-            compute_gram=norm_weight is not None and pre_mix is None,
+        use_lagged_prefill = (
+            planned_config is not None
+            and planned_config.backend == "tf32_tma"
+            and residual.ndim == 3
+            and pre_mix is not None
+            and norm_weight is not None
         )
+        if use_lagged_prefill:
+            from b12x.norm.mhc._pre_prefill import prepare_lagged_prefill
+
+            prepare_lagged_prefill(residual, residual_out, partials)
+            run_mhc_prefill_tf32_project(
+                out=residual_out, fn=fn, partials=partials,
+                config=planned_config, split_fp32_fn=True,
+            )
+        else:
+            run_mhc_pre_partial(
+                residual=residual,
+                fn=fn,
+                partials=partials,
+                out=residual_out,
+                compute_gram=norm_weight is not None and pre_mix is None,
+            )
         run_mhc_finalize_gram(
             residual=residual_out,
             partials=partials,
@@ -959,6 +978,10 @@ def _b12x_mhc_pre_impl(
             sinkhorn_iters=sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
+            compact_partials=use_lagged_prefill,
+            compact_projection_splits=(
+                planned_config.projection_k_splits if use_lagged_prefill else 1
+            ),
         )
         return residual_out, post_out, comb_out, y_out
 

@@ -149,6 +149,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 )
                 ring.prepare_eager_replay(dtype, max_elements=planned_elements)
                 ring.prepare_eager_replay(dtype, max_elements=planned_elements)
+                replays = ring._eager_replays[dtype]
+                assert replays[-1][0].numel() == planned_elements
+                assert (
+                    len({item[0].untyped_storage().data_ptr() for item in replays}) == 1
+                )
+                capacities = [item[0].numel() * dtype.itemsize for item in replays]
+                assert capacities == (
+                    [1 << 20, 2 << 20, 3 << 20]
+                    if dtype.itemsize == 2
+                    else [1 << 20, 2 << 20, 4 << 20, 6 << 20]
+                )
                 with pytest.raises(ValueError):
                     ring.prepare_eager_replay(
                         dtype, max_elements=planned_elements + alignment

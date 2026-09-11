@@ -439,7 +439,8 @@ def test_mhc_lagged_rounded_variance_and_ownership():
 
 @pytest.mark.parametrize(
     ("phase", "capacity", "fuse_norm"),
-    [("pre", 17, False), ("pre", 17, True), ("post_pre", 17, True), ("post_pre", 389, True)],
+    [("pre", 17, False), ("pre", 17, True), ("pre", 389, True),
+     ("post_pre", 17, True), ("post_pre", 389, True)],
 )
 def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, request):
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
@@ -506,6 +507,101 @@ def test_mhc_lagged_frozen_multilive_graph(phase, capacity, fuse_norm, request):
         for got, want in zip((*actual[1:], predicted[:live]), expected, strict=True):
             torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
         assert bool(torch.isnan(predicted[live:]).all())
+
+
+def test_lagged_prefill_fp32_projection_precision():
+    """Tensor-core projection retains FP32 mixing coefficients at long K."""
+    device = require_sm120()
+    hidden, rows = 5120, 513
+    residual, _, fn, scale, bias = _make_inputs(
+        tokens=rows, hidden_size=hidden, seed=415120, device=device
+    )
+    incoming = torch.full((rows, 4), 0.25, device=device)
+    weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+    plan = mhc.plan(mhc.Caps(device=device, max_tokens=4096, hidden_size=hidden))
+    assert plan.config.backend == "tf32_tma"
+    scratch = tuple(torch.empty(shape, dtype=dtype, device=device)
+                    for shape, dtype in plan.shapes_and_dtypes())
+    predicted = torch.empty_like(incoming)
+    binding = mhc.bind(
+        plan, scratch=scratch, tokens=rows, pre_out=predicted,
+        y=torch.empty((rows, hidden), dtype=torch.bfloat16, device=device),
+        out=torch.empty_like(residual), post=torch.empty_like(incoming),
+        comb=torch.empty((rows, 4, 4), device=device),
+    )
+    _, post, _, _ = mhc.run_pre(
+        residual, fn, scale, bias, binding=binding,
+        pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
+        rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+    )
+    flat = residual.flatten(1).double()
+    mixes = (flat @ fn.double().T) * torch.rsqrt(
+        flat.square().mean(dim=-1, keepdim=True) + 1e-20
+    )
+    expected = 2 * torch.sigmoid(mixes[:, 4:8] * scale.double()[1] + bias.double()[4:8])
+    torch.testing.assert_close(post.double(), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_lagged_prefill_scalar_parity_graph(request):
+    """Projection changes preserve scalar BF16 rounding and fixed-capacity replay.
+
+    The scalar finalizer defines BF16 normalization rounding. Independent Torch
+    norm reductions can straddle a BF16 midpoint; strict scalar parity prevents
+    a projection optimization from changing that rounding contract.
+    """
+    from dataclasses import replace
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    device = require_sm120()
+    hidden, capacity = 5120, 4096
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=capacity, hidden_size=hidden, seed=92152, device=device
+    )
+    incoming = torch.zeros((capacity, 4), device=device)
+    incoming[:, 0] = 1
+    weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+    plan = mhc.plan(mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden))
+    native = replace(plan, config=replace(plan.config, backend="native"))
+    bindings = []
+    for selected in (plan, native):
+        scratch = tuple(torch.empty(shape, dtype=dtype, device=device)
+                        for shape, dtype in selected.shapes_and_dtypes())
+        bindings.append(mhc.bind(
+            selected, scratch=scratch, out=torch.empty_like(residual),
+            y=torch.empty_like(x), pre_out=torch.empty_like(incoming),
+            post=torch.empty_like(incoming),
+            comb=torch.empty((capacity, 4, 4), device=device),
+        ))
+
+    def run(binding, live):
+        return mhc.run_pre(
+            residual[:live], fn, scale, bias, binding=binding,
+            pre_mix=incoming[:live], norm_weight=weight, norm_eps=1e-20,
+            rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+        )
+
+    for binding in bindings:
+        run(binding, capacity)
+    torch.cuda.synchronize(device)
+    request.addfinalizer(unfreeze_kernel_resolution)
+    freeze_kernel_resolution("lagged prefill scalar parity")
+    for live in (3, capacity - 1, capacity):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run(bindings[0], live)
+        incoming.copy_(incoming.roll(1, dims=1))
+        for output in (*actual, bindings[0].pre_out):
+            output.fill_(float("nan"))
+        graph.replay()
+        expected = run(bindings[1], live)
+        torch.cuda.synchronize(device)
+        for got, want in zip((*actual, bindings[0].pre_out[:live]),
+                             (*expected, bindings[1].pre_out[:live]), strict=True):
+            if got.dtype == torch.bfloat16:
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(got, want, rtol=2e-6, atol=2e-6)
+        assert bool(torch.isnan(bindings[0].pre_out[live:]).all())
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120, 7168])
