@@ -43,8 +43,10 @@ class _MXFP8RowsQuantLaunch:
         threads: int,
         trellis_native_mma_order: bool,
         min_amax: float,
+        source_k: int,
     ) -> None:
         self._k = int(k)
+        self._source_k = int(source_k)
         self._groups_k = self._k // 32
         self._source_type = source_type
         self._subgroup_width = int(subgroup_width)
@@ -66,7 +68,7 @@ class _MXFP8RowsQuantLaunch:
     ) -> None:
         source = cute.make_tensor(
             source_ptr,
-            cute.make_ordered_layout((m, self._k), order=(1, 0)),
+            cute.make_ordered_layout((m, self._source_k), order=(1, 0)),
         )
         values_u32 = cute.make_tensor(
             values_ptr,
@@ -116,7 +118,7 @@ class _MXFP8RowsQuantLaunch:
                     values = cute.make_rmem_tensor((8,), cutlass.Float32)
                     k0 = group * Int32(32) + lane8 * Int32(8)
                     for elem in cutlass.range_constexpr(8):
-                        values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
+                        values[elem] = self._load(source, row, k0 + Int32(elem))
 
                     max_abs = fabs_f32(values[0])
                     for elem in cutlass.range_constexpr(1, 8):
@@ -188,16 +190,14 @@ class _MXFP8RowsQuantLaunch:
                             )
                             tile = Int32(16)
                         base = k0 + tile + (r << Int32(1))
-                        values[0] = cutlass.Float32(source[row, base])
-                        values[1] = cutlass.Float32(source[row, base + Int32(1)])
-                        values[2] = cutlass.Float32(source[row, base + Int32(8)])
-                        values[3] = cutlass.Float32(source[row, base + Int32(9)])
+                        values[0] = self._load(source, row, base)
+                        values[1] = self._load(source, row, base + Int32(1))
+                        values[2] = self._load(source, row, base + Int32(8))
+                        values[3] = self._load(source, row, base + Int32(9))
                     else:
                         k0 += lane4 * Int32(4)
                         for elem in cutlass.range_constexpr(4):
-                            values[elem] = cutlass.Float32(
-                                source[row, k0 + Int32(elem)]
-                            )
+                            values[elem] = self._load(source, row, k0 + Int32(elem))
 
                     max_abs = fabs_f32(values[0])
                     for elem in cutlass.range_constexpr(1, 4):
@@ -236,7 +236,7 @@ class _MXFP8RowsQuantLaunch:
                 values = cute.make_rmem_tensor((32,), cutlass.Float32)
                 k0 = group * Int32(32)
                 for elem in cutlass.range_constexpr(32):
-                    values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
+                    values[elem] = self._load(source, row, k0 + Int32(elem))
 
                 max_abs = max_abs_32(values)
                 if cutlass.const_expr(self._min_amax > 0.0):
@@ -250,6 +250,16 @@ class _MXFP8RowsQuantLaunch:
                     values_u32[row, word0 + Int32(word)] = payload[word]
                 self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
                 block += Int32(gdim) * Int32(self._threads)
+
+    @cute.jit
+    def _load(self, source: cute.Tensor, row: Int32, column: Int32) -> cutlass.Float32:
+        value = cutlass.Float32(0.0)
+        # Aligned kernels eliminate the mask at compile time.
+        if cutlass.const_expr(self._source_k == self._k):  # noqa: SIM114
+            value = cutlass.Float32(source[row, column])
+        elif column < Int32(self._source_k):
+            value = cutlass.Float32(source[row, column])
+        return value
 
     @cute.jit
     def _store_scale(
@@ -285,10 +295,14 @@ def _get_compiled_mxfp8_rows_quant(
     threads: int,
     value_order: str,
     min_amax: float = 0.0,
+    source_k: int | None = None,
 ) -> Callable:
     k = int(k)
+    source_k = k if source_k is None else int(source_k)
     if k <= 0 or k % 32 != 0:
         raise ValueError(f"MXFP8 CuTe quantizer requires K divisible by 32, got {k}")
+    if source_k <= 0 or source_k % 32 or source_k > k:
+        raise ValueError(f"MXFP8 source K must be K32-aligned and within output K={k}, got {source_k}")
     if source_dtype == torch.bfloat16:
         source_type = cutlass.BFloat16
         source_dtype_name = "bf16"
@@ -325,6 +339,7 @@ def _get_compiled_mxfp8_rows_quant(
         threads,
         value_order == "trellis_native_mma",
         min_amax,
+        source_k,
     )
     cache_key = (
         k,
@@ -333,6 +348,7 @@ def _get_compiled_mxfp8_rows_quant(
         int(threads),
         value_order,
         min_amax,
+        source_k,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -350,7 +366,7 @@ def _get_compiled_mxfp8_rows_quant(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.mxfp8_quant_cute",
-            4,
+            5,
             cache_key,
         ),
     )
@@ -426,6 +442,8 @@ def quantize_mxfp8_rows_cute(
 
     expected_m fixes the row bound used for lane-layout specialization.
     min_amax=1e-4 selects the DeepSeek V4.1 activation scale floor.
+    Output rows may be wider than the source by whole K32 groups. The same
+    kernel writes zero payloads and finite scales for that physical K tail.
     """
 
     if source.dtype not in (torch.bfloat16, torch.float16):
@@ -444,12 +462,13 @@ def quantize_mxfp8_rows_cute(
     else:
         subgroup_width = _WARP_SUBGROUP_WIDTH
     _get_compiled_mxfp8_rows_quant(
-        int(source.shape[1]),
+        int(values.shape[1]),
         source.dtype,
         subgroup_width,
         threads,
         value_order,
         min_amax,
+        int(source.shape[1]),
     )(
         source,
         values,
