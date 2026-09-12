@@ -535,7 +535,8 @@ def test_block_fp8_linear_expected_m_short_k_large_n_matches_reference() -> None
     "tokens,in_features,out_features",
     [(1, 5120, 1280), (8, 5120, 512), (9, 256, 96),
      (129, 256, 160), (33, 1280, 8192), (7, 1024, 5120),
-     (9, 6144, 25600)],
+     (9, 6144, 25600), (1, 32, 256), (1, 576, 5120),
+     (8, 576, 5120), (17, 576, 5120), (4096, 576, 5120)],
 )
 def test_block_fp8_linear_v41_independent_k32_n32_scales(
     tokens: int, in_features: int, out_features: int,
@@ -551,7 +552,7 @@ def test_block_fp8_linear_v41_independent_k32_n32_scales(
     weight, scale = _make_block_fp8_weight(out_features, in_features, 32)
     packed = bfl.pack_weight(weight, scale, block_size=(32, 32))
     torch.testing.assert_close(
-        packed.weight.values.view(torch.uint8), weight.view(torch.uint8),
+        packed.weight.values[:, :in_features].view(torch.uint8), weight.view(torch.uint8),
         rtol=0, atol=0,
     )
     from tests.gemm.test_fp8_quant_deepgemm_parity import (
@@ -561,19 +562,73 @@ def test_block_fp8_linear_v41_independent_k32_n32_scales(
     x_values, x_scales = _per_token_cast_to_fp8(source, 32)
     x_q = bfl.quantize_input(source, block_size=(32, 32))
     torch.testing.assert_close(
-        x_q.values.view(torch.uint8), x_values.view(torch.uint8), rtol=0, atol=0,
+        x_q.values[:, :in_features].view(torch.uint8), x_values.view(torch.uint8), rtol=0, atol=0,
     )
     torch.testing.assert_close(
-        x_q.scale_rows.view(torch.uint8)[0], _sf_fp32_to_e8m0_u8(x_scales),
+        x_q.scale_rows.view(torch.uint8)[0, :, :in_features // 32], _sf_fp32_to_e8m0_u8(x_scales),
         rtol=0, atol=0,
     )
     torch.testing.assert_close(
-        packed.weight.scale_rows.view(torch.uint8)[0],
+        packed.weight.scale_rows.view(torch.uint8)[0, :, :in_features // 32],
         scale.view(torch.uint8).repeat_interleave(32, dim=0)[:out_features],
         rtol=0, atol=0,
     )
     actual = bfl.run(source, packed, expected_m=tokens)
     _assert_v41_accumulation_matches_reference(source, weight, scale, actual)
+    assert packed.in_features == in_features
+    assert packed.padded_in_features == (in_features + 127) // 128 * 128
+    assert not torch.count_nonzero(packed.weight.values[:, in_features:].view(torch.uint8))
+    assert not torch.count_nonzero(x_q.values[:, in_features:].view(torch.uint8))
+    assert torch.isfinite(x_q.scale_rows.float()).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_block_fp8_linear_k32_tail_scratch_graph_replay(dtype) -> None:
+    """TP shard padding is rewritten in caller scratch on every graph replay."""
+    require_b12x()
+    torch.manual_seed(1337)
+    capacity, in_features, out_features = 128, 576, 5120
+    source = torch.randn((capacity, in_features), device="cuda", dtype=dtype).mul_(0.25)
+    weight, scale = _make_block_fp8_weight(out_features, in_features, 32)
+    packed = bfl.pack_weight(weight, scale, block_size=(32, 32))
+    plan = bfl.plan(bfl.Caps(
+        device=source.device, max_tokens=capacity, in_features=in_features,
+        out_features=out_features, output_dtype=dtype, block_size=(32, 32),
+    ))
+    scratch = tuple(torch.empty(shape, dtype=dt, device=source.device)
+                    for shape, dt in plan.shapes_and_dtypes())
+    output = torch.empty((capacity, out_features, 1), device=source.device, dtype=dtype)
+    # Warm both the planned and functional paths at one fixed capacity. Live
+    # row counts must not create another compiled specialization afterward.
+    plan.bind(scratch=scratch, source=source, packed_weight=packed, output=output).run()
+    bfl.run(source, packed, expected_m=capacity)
+    torch.cuda.synchronize()
+    freeze_kernel_resolution()
+    try:
+        for tokens in (1, 8, 17, 128):
+            live_source, live_output = source[:tokens], output[:tokens]
+            binding = plan.bind(scratch=scratch, source=live_source,
+                                packed_weight=packed, output=live_output)
+            binding.run()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                binding.run()
+            for poison in (0, 255):
+                for storage in scratch:
+                    storage.fill_(poison)
+                live_source.neg_()
+                graph.replay()
+                torch.cuda.synchronize()
+                _assert_v41_accumulation_matches_reference(
+                    live_source, weight, scale, live_output[:, :, 0],
+                )
+                assert not torch.count_nonzero(binding.x_q.values[:, in_features:].view(torch.uint8))
+                assert torch.isfinite(binding.x_q.scale_rows.float()).all()
+                functional = bfl.run(live_source, packed, expected_m=capacity)
+                _assert_v41_accumulation_matches_reference(live_source, weight, scale, functional)
+    finally:
+        unfreeze_kernel_resolution()
 
 
 def test_block_fp8_linear_v41_rejects_lossy_weight_scale_repacking() -> None:

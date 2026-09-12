@@ -62,6 +62,11 @@ class BlockFP8LinearWeight:
     out_features: int
     block_size: tuple[int, int]
 
+    @property
+    def padded_in_features(self) -> int:
+        """Physical GEMM width; in_features retains the checkpoint's TP shard."""
+        return int(self.weight.values.shape[1])
+
 
 @dataclass(frozen=True, kw_only=True)
 class BlockFP8LinearBinding:
@@ -96,8 +101,8 @@ class BlockFP8LinearScratchCaps:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "in_features", max(int(self.in_features), 1))
         object.__setattr__(self, "out_features", max(int(self.out_features), 1))
-        _check_mxfp8_k(self.in_features)
         object.__setattr__(self, "block_size", _check_block_size(self.block_size))
+        _block_fp8_padded_k(self.in_features, self.block_size)
         if self.output_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"output_dtype must be bf16/fp16, got {self.output_dtype}")
 
@@ -157,7 +162,7 @@ class BlockFP8LinearScratchPlan:
         x_q = _block_fp8_linear_x_q_from_scratch(
             scratch,
             tokens=tokens,
-            in_features=self.caps.in_features,
+            in_features=_block_fp8_padded_k(self.caps.in_features, self.caps.block_size),
             output_dtype=self.caps.output_dtype,
         )
         return build_block_fp8_linear_binding(
@@ -199,6 +204,14 @@ def _c_dtype_name(dtype: torch.dtype) -> str:
     raise ValueError(
         f"b12x block FP8 linear output dtype must be bf16/fp16, got {dtype}"
     )
+
+
+def _block_fp8_padded_k(k: int, block_size: tuple[int, int]) -> int:
+    if k <= 0 or k % block_size[1]:
+        raise ValueError(
+            f"block FP8 linear K must be a positive multiple of {block_size[1]}, got {k}"
+        )
+    return _align_up(k, 128)
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -353,7 +366,7 @@ def _check_block_fp8_linear_tensors(
     _check_mxfp8_rows_storage(
         x_q,
         m=tokens,
-        k=packed_weight.in_features,
+        k=packed_weight.padded_in_features,
         num_groups=1,
     )
     if output.shape != (tokens, packed_weight.out_features, 1):
@@ -428,7 +441,7 @@ def plan_block_fp8_linear_scratch(
     )
     layout = _block_fp8_linear_scratch_layout(
         tokens=caps.max_tokens,
-        in_features=caps.in_features,
+        in_features=_block_fp8_padded_k(caps.in_features, caps.block_size),
         out_features=caps.out_features,
         output_dtype=caps.output_dtype,
     )
@@ -457,6 +470,8 @@ def pack_block_fp8_linear_weight_mxfp8(
 
     The checkpoint weight stays in E4M3 for UE8M0 scales. The 128x128 DSV4 or
     32x32 DSV4.1 scales expand once into the row/32-column SM120 MMA layout.
+    K32-aligned TP shards retain their logical width; zero weight columns and
+    unit scales extend the physical GEMM width to a multiple of 128.
     """
 
     _check_gpu_tensor("weight", weight)
@@ -465,14 +480,40 @@ def pack_block_fp8_linear_weight_mxfp8(
     if weight.ndim != 2:
         raise ValueError(f"weight must have shape [N,K], got {tuple(weight.shape)}")
     out_features, in_features = weight.shape
-    _check_mxfp8_k(in_features)
+    padded_k = _block_fp8_padded_k(in_features, block_size)
     if out_features <= 0:
         raise ValueError("out_features must be positive")
+    if padded_k != in_features:
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
+        scale_shape = (math.ceil(out_features / block_size[0]), in_features // block_size[1])
+        if weight_scale.shape not in (scale_shape, (1, *scale_shape)):
+            raise ValueError(
+                f"block scale must have shape {scale_shape} or {(1, *scale_shape)}, "
+                f"got {tuple(weight_scale.shape)}"
+            )
+        # Packing is load-time only. Preserve every serialized byte and TP
+        # shard offset; the runtime quantizer writes the activation tail.
+        weight_bytes = torch.zeros(
+            (out_features, padded_k), dtype=torch.uint8, device=weight.device
+        )
+        weight_bytes[:, :in_features].copy_(weight.view(torch.uint8))
+        weight = weight_bytes.view(torch.float8_e4m3fn)
+        byte_scales = weight_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+        scale_source = weight_scale.view(torch.uint8) if byte_scales else weight_scale
+        scale_padded = torch.full(
+            (*weight_scale.shape[:-1], padded_k // block_size[1]),
+            127 if byte_scales else 1.0,
+            dtype=scale_source.dtype,
+            device=weight_scale.device,
+        )
+        scale_padded[..., :scale_shape[-1]].copy_(scale_source)
+        weight_scale = scale_padded.view(weight_scale.dtype)
     packed = pack_fp8_block_scaled_weight_mxfp8(
         weight.detach(),
         weight_scale.detach(),
         m=out_features,
-        k=in_features,
+        k=padded_k,
         num_groups=1,
         block_size=block_size,
     )
@@ -574,7 +615,7 @@ def quantize_block_fp8_linear_input_mxfp8(
     tokens, in_features = source_tk.shape
     if tokens <= 0:
         raise ValueError("tokens must be positive")
-    _check_mxfp8_k(in_features)
+    in_features = _block_fp8_padded_k(in_features, block_size)
     if out is None:
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.b12x.quantize_block_fp8_linear_input_mxfp8_alloc(
@@ -613,6 +654,7 @@ def _quantize_block_fp8_linear_input_for_immediate_gemm(
     """
 
     tokens, in_features = source_tk.shape
+    in_features = _align_up(in_features, 128)
     values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
         tokens,
         in_features,
@@ -780,7 +822,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.values,
             packed_weight.weight.scale_rows,
             packed_weight.weight.scale_mma,
-            packed_weight.in_features,
+            packed_weight.padded_in_features,
             packed_weight.out_features,
             int(expected_m) if expected_m is not None else 0,
             packed_weight.block_size[1] == 128,
@@ -838,11 +880,11 @@ def block_fp8_linear_mxfp8(
     )
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
-        (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),
+        (x_q.values.reshape(tokens, packed_weight.padded_in_features, 1), x_q.scale_mma),
         (
             packed_weight.weight.values.reshape(
                 packed_weight.out_features,
-                packed_weight.in_features,
+                packed_weight.padded_in_features,
                 1,
             ),
             packed_weight.weight.scale_mma,
