@@ -4200,9 +4200,27 @@ class DenseGemmKernel:
                             sfa_pair = ld_global_b16(
                                 get_ptr_as_int64(directSFA_mkl, sfa_offset)
                             )
-                            sfb_pair = ld_global_b16(
-                                get_ptr_as_int64(directSFB_nkl, sfb_offset)
-                            )
+                            # The persistent swizzle rounds N tiles up to its
+                            # raster width. TMA zero-fills these extra B tiles,
+                            # but the packed scale allocation contains only
+                            # ceil(N/128) atoms. Scalar loads need the same
+                            # bound; unit scales keep the zero-filled tile inert.
+                            if cutlass.const_expr(
+                                tile_sched_params.swizzle_size > 1
+                                and ((directB_nkl.shape[0] + 127) // 128)
+                                % tile_sched_params.swizzle_size != 0
+                            ):
+                                sfb_pair = Uint32(0x7F7F)
+                                if sfb_tile < Int32(
+                                    (directB_nkl.shape[0] + 127) // 128
+                                ):
+                                    sfb_pair = ld_global_b16(
+                                        get_ptr_as_int64(directSFB_nkl, sfb_offset)
+                                    )
+                            else:
+                                sfb_pair = ld_global_b16(
+                                    get_ptr_as_int64(directSFB_nkl, sfb_offset)
+                                )
                             sfa_smem_addr = shared_ptr_to_u32(
                                 elem_pointer(
                                     sSFA,
