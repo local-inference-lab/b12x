@@ -73,6 +73,25 @@ class _PagedIndexerChunkGeometry:
     token_count: int
 
 
+def _paged_carry_halves_are_contiguous(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+) -> bool:
+    """Return whether each independently launched carry half is contiguous.
+
+    A runtime row prefix of a capacity-sized ``(2, max_rows, topk)`` buffer is
+    not contiguous as one three-dimensional view because the two halves retain
+    their capacity stride.  The tiled top-k kernels consume one two-dimensional
+    half at a time, so those are the views whose layout is authoritative.
+    """
+
+    return all(
+        buffer[half].is_contiguous()
+        for buffer in (values, indices)
+        for half in range(2)
+    )
+
+
 def _paged_indexer_chunk_geometry(
     *,
     chunk_idx: int,
@@ -1009,9 +1028,9 @@ def index_topk_fp8(
                 "paged indexer carry indices must be a CUDA torch.int32 "
                 "tensor on the q_fp8 device"
             )
-        if (
-            not carry_buf_values.is_contiguous()
-            or not carry_buf_indices.is_contiguous()
+        if not _paged_carry_halves_are_contiguous(
+            carry_buf_values,
+            carry_buf_indices,
         ):
             raise ValueError("paged indexer carry buffers must be contiguous")
 
