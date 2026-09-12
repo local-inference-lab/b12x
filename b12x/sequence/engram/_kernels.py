@@ -125,6 +125,7 @@ def _lookup(
     START: tl.constexpr,
     END: tl.constexpr,
     COMPACT: tl.constexpr,
+    RESIDENT_SCALES: tl.constexpr,
 ):
     t, head = tl.program_id(0), tl.program_id(1)
     col = tl.arange(0, 256)
@@ -139,8 +140,11 @@ def _lookup(
     quant = tl.load(weight + local_row * 256 + col.to(tl.int64), local, 0.0).to(
         tl.float32
     )
+    scale_row = local_row
+    if RESIDENT_SCALES:
+        scale_row = tl.where(local, row - tl.full((), START, tl.int64), 0)
     exponent = tl.load(
-        scales + local_row * 8 + (col // 32).to(tl.int64), local, 127
+        scales + scale_row * 8 + (col // 32).to(tl.int64), local, 127
     ).to(tl.uint32)
     # E8M0 byte zero is 2^-127, not floating point zero; 255 is NaN.
     scale = (exponent << 23).to(tl.float32, bitcast=True)
@@ -257,6 +261,7 @@ def lookup_op(
     compact_rows: bool = False,
     prepared_tokens: int = -1,
     clear_tail: bool = True,
+    resident_scales: bool = False,
 ) -> None:
     capacity = hashes.shape[0] if prepared_tokens < 0 else prepared_tokens
     if not 0 <= capacity <= hashes.shape[0]:
@@ -274,6 +279,7 @@ def lookup_op(
             shard_start,
             shard_end,
             compact_rows,
+            resident_scales,
             num_warps=4,
         )
     if clear_tail and capacity < hashes.shape[0]:
@@ -293,5 +299,6 @@ def _lookup_fake(
     compact_rows=False,
     prepared_tokens=-1,
     clear_tail=True,
+    resident_scales=False,
 ):
     return None

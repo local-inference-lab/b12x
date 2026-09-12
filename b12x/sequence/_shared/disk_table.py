@@ -12,14 +12,18 @@ import operator
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
-from cuda.bindings import runtime as cudart
+if TYPE_CHECKING:
+    from cuda.bindings import runtime as cudart
 
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
+    from cuda.bindings import runtime as cudart
+
     if error != cudart.cudaError_t.cudaSuccess:
         raise RuntimeError(f"{operation} failed: {error}")
 
@@ -58,6 +62,8 @@ class MappedHostAllocation:
     def __init__(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> None:
+        from cuda.bindings import runtime as cudart
+
         self._host_pointer = 0
         self._closed = True
         if device.type != "cuda" or device.index is None:
@@ -102,6 +108,8 @@ class MappedHostAllocation:
                 raise
 
     def close(self) -> None:
+        from cuda.bindings import runtime as cudart
+
         if self._closed:
             return
         torch.cuda.synchronize(self.device)
@@ -265,6 +273,10 @@ class DiskRowCache:
                     self._transaction_thread = None
 
     def read_rows(self, ids: torch.Tensor, count: int) -> None:
+        self._stage_ids(ids, count)
+        self._read_staged(count)
+
+    def _stage_ids(self, ids: torch.Tensor, count: int) -> None:
         if self._transaction_thread != threading.get_ident():
             raise RuntimeError("read_rows requires an active disk row transaction")
         count = operator.index(count)
@@ -282,15 +294,18 @@ class DiskRowCache:
             raise ValueError("disk row IDs do not cover the requested count")
         self.ids_host[:count].copy_(ids.view(-1)[:count], non_blocking=True)
         self._ids_ready.record(self._transaction_stream)
+
+    def _read_staged(self, count: int) -> None:
         # Completes ID production and all prior cache readers before host writes.
-        self._ids_ready.synchronize()
-        self._native.ple_reader_run(
-            self._reader,
-            self._ids_buffer,
-            self._weight_buffer,
-            self._scale_buffer,
-            count,
-        )
+        with torch.cuda.device(self.device):
+            self._ids_ready.synchronize()
+            self._native.ple_reader_run(
+                self._reader,
+                self._ids_buffer,
+                self._weight_buffer,
+                self._scale_buffer,
+                count,
+            )
 
     def stats(self) -> dict[str, int | float]:
         with self._lock:
@@ -311,3 +326,79 @@ class DiskRowCache:
                 + result["cache_bytes"]
             )
             return result
+
+
+class DiskPrefetch:
+    """One in-flight read, retaining its owner's transaction until consumption.
+
+    begin/consume/abort must run on the same host thread outside capture. The
+    caller must not mutate the ID tensor before consume. Only the I/O worker
+    runs concurrently; it never launches the downstream GPU decoder.
+    """
+
+    def __init__(self, cache: DiskRowCache) -> None:
+        self.cache = cache
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="b12x-disk")
+        self._pending = None
+        self._closed = False
+
+    @property
+    def pending(self) -> bool:
+        return self._pending is not None
+
+    def begin(self, ids: torch.Tensor, count: int) -> None:
+        if self._closed or self._pending is not None:
+            raise RuntimeError("disk prefetch is closed or has unconsumed rows")
+        transaction = self.cache.transaction()
+        transaction.__enter__()
+        try:
+            self.cache._stage_ids(ids, count)
+            future = self._executor.submit(self.cache._read_staged, count)
+            self._pending = (future, transaction, threading.get_ident(), ids, count)
+        except BaseException:
+            transaction.__exit__(*sys.exc_info())
+            raise
+
+    @contextmanager
+    def consume(self, ids: torch.Tensor, count: int) -> Iterator[None]:
+        if self._pending is None:
+            raise RuntimeError("disk prefetch has no rows to consume")
+        future, transaction, thread, prepared_ids, prepared_count = self._pending
+        if thread != threading.get_ident():
+            raise RuntimeError("disk prefetch must be consumed on its preparing thread")
+        if ids is not prepared_ids or count != prepared_count:
+            raise ValueError("disk prefetch IDs/count do not match its preparation")
+        with torch.cuda.device(self.cache.device):
+            if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("disk prefetch consume must run outside compile/capture")
+            # transaction records completion on the preparing stream. Requiring
+            # that stream prevents staging reuse before the GPU decoder finishes.
+            if torch.cuda.current_stream(self.cache.device) != self.cache._transaction_stream:
+                raise RuntimeError("disk prefetch must be consumed on its preparing stream")
+            try:
+                future.result()
+                yield
+            finally:
+                self._pending = None
+                transaction.__exit__(*sys.exc_info())
+
+    def abort(self) -> None:
+        if self._pending is None:
+            return
+        future, transaction, thread, _, _ = self._pending
+        if thread != threading.get_ident():
+            raise RuntimeError("disk prefetch must be aborted on its preparing thread")
+        try:
+            future.result()
+        finally:
+            self._pending = None
+            transaction.__exit__(*sys.exc_info())
+
+    def close(self) -> None:
+        if self._pending is not None and self._pending[2] != threading.get_ident():
+            raise RuntimeError("disk prefetch must be closed on its preparing thread")
+        try:
+            self.abort()
+        finally:
+            self._closed = True
+            self._executor.shutdown(wait=True)

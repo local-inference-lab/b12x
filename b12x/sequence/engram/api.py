@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Sequence
 import operator
+import os
 
 import torch
 
@@ -124,19 +125,35 @@ class DiskTable:
     locate each plane's first byte, including inside a checkpoint container.
     Files must remain immutable for this owner's lifetime. Preparation is
     eager-only; downstream graphs consume the binding's stable BF16 output.
+
+    resident_scales retains the owned original E8M0 bytes in mapped host RAM
+    and removes scale-plane disk reads. prefetch allows one outstanding read
+    per table. Both are opt-in; callers must budget scale RAM and drain reads
+    before reusing request state.
     """
 
     def __init__(
-        self, plan: Plan, shard_rows: int | None = None, queue_depth: int = 128
+        self,
+        plan: Plan,
+        shard_rows: int | None = None,
+        queue_depth: int = 128,
+        *,
+        resident_scales: bool = False,
+        prefetch: bool = False,
     ) -> None:
-        from .._shared.disk_table import DiskRowCache
+        from .._shared.disk_table import DiskPrefetch, DiskRowCache, MappedHostAllocation
 
         if not isinstance(plan, Plan):
             raise TypeError("plan must be Plan")
         if plan.caps.device.type != "cuda":
             raise ValueError("disk Engram requires CUDA")
         _require_disk_eager(plan.caps.device)
+        if not isinstance(resident_scales, bool) or not isinstance(prefetch, bool):
+            raise TypeError("resident_scales and prefetch must be bool")
         self.plan = plan
+        self.resident_scales = resident_scales
+        self._scale_sources: set[int] = set()
+        self._scale_owner = None
         self._cache = DiskRowCache(
             device=plan.caps.device,
             max_lookups=plan.caps.max_tokens * 24,
@@ -145,21 +162,115 @@ class DiskTable:
             shard_end=min(plan.shard_end, plan.table_rows),
             shard_rows=plan.table_rows if shard_rows is None else shard_rows,
             weight_row_bytes=256,
-            scale_row_bytes=8,
+            scale_row_bytes=0 if resident_scales else 8,
             queue_depth=queue_depth,
         )
         self.weight = self._cache.weight.view(torch.float8_e4m3fn)
         self.scale_bytes = self._cache.scale
+        if resident_scales:
+            # Retain the original E8M0 bytes, not decoded/requantized scales.
+            # The caller must budget this allocation: ceil(rows/TP) * 8 bytes.
+            self._scale_owner = MappedHostAllocation(
+                plan.scale_shape, torch.uint8, plan.caps.device
+            )
+            self._scale_owner.host_view.zero_()
+            self.scale_bytes = self._scale_owner.device_view
+        self._prefetch = DiskPrefetch(self._cache) if prefetch else None
+        self._prefetch_binding = None
+
+    @property
+    def prefetch_pending(self) -> bool:
+        """Whether staging is still owned by an unconsumed prefetch."""
+        return self._prefetch is not None and self._prefetch.pending
+
+    def prefetch(self, binding: LookupBinding, token_count: int) -> None:
+        """Start a bounded read; run_lookup consumes it without repeating I/O.
+
+        All IDs and num_tokens must stay immutable until consumption. Independent
+        tables may begin reads before either is consumed. Both calls must be on
+        the same host thread and CUDA stream, outside compilation/capture.
+        """
+        if self._prefetch is None:
+            raise RuntimeError("disk prefetch must be enabled at construction")
+        if binding.disk_table is not self:
+            raise ValueError("binding belongs to another disk table")
+        if self._prefetch_binding is not None:
+            raise RuntimeError("disk table has an unconsumed prefetch")
+        token_count = operator.index(token_count)
+        if not 0 <= token_count <= self.plan.caps.max_tokens:
+            raise ValueError("token_count exceeds planned capacity")
+        self._prefetch.begin(binding.hash_ids, token_count * 24)
+        self._prefetch_binding = binding
+
+    def abort_prefetch(self) -> None:
+        """Drain a failed/cancelled request before its staging can be reused."""
+        try:
+            if self._prefetch is not None:
+                self._prefetch.abort()
+        finally:
+            if self._prefetch is None or not self._prefetch.pending:
+                self._prefetch_binding = None
+
+    def close(self) -> None:
+        """Join any outstanding I/O worker; existing GPU storage stays owned."""
+        try:
+            if self._prefetch is not None:
+                self._prefetch.close()
+        finally:
+            if self._prefetch is None or not self._prefetch.pending:
+                self._prefetch_binding = None
 
     def add_shard(
         self, index: int, path: str, offset: int, *, scale: bool = False
     ) -> None:
         """Register an immutable global source shard before binding."""
-        self._cache.add_shard(index, path, offset, scale=scale)
+        if not (scale and self.resident_scales):
+            self._cache.add_shard(index, path, offset, scale=scale)
+            return
+        with self._cache._lock:
+            if self._cache._frozen:
+                raise RuntimeError("cannot change disk shards after binding")
+            index, offset = operator.index(index), operator.index(offset)
+            if not 0 <= index < self._cache.shard_count or offset < 0:
+                raise ValueError("invalid scale shard index or offset")
+            if index in self._scale_sources:
+                raise ValueError("checkpoint scale shard is already registered")
+            start = index * self._cache.shard_rows
+            end = min(start + self._cache.shard_rows, self.plan.table_rows)
+            first, last = max(start, self.plan.shard_start), min(end, self.plan.shard_end)
+            if first >= last:
+                return
+            view = self._scale_owner.host_view[
+                first - self.plan.shard_start : last - self.plan.shard_start
+            ]
+            data = memoryview(view.numpy()).cast("B")
+            with open(os.fspath(path), "rb", buffering=0) as source:
+                if offset + (end - start) * 8 > os.fstat(source.fileno()).st_size:
+                    raise ValueError("scale plane exceeds checkpoint file bounds")
+                source.seek(offset + (first - start) * 8)
+                done = 0
+                while done < len(data):
+                    count = source.readinto(data[done : done + (16 << 20)])
+                    if not count:
+                        raise ValueError("short resident Engram scale read")
+                    done += count
+            self._scale_sources.add(index)
+
+    def _require_complete(self) -> None:
+        self._cache.require_complete()
+        if self.resident_scales:
+            first = self._cache.shard_start // self._cache.shard_rows
+            last = (self._cache.shard_end + self._cache.shard_rows - 1) // self._cache.shard_rows
+            for shard in range(first, last):
+                if shard not in self._scale_sources:
+                    raise ValueError(f"missing resident scale shard {shard}")
 
     def stats(self) -> dict[str, int | float]:
         """Return shared reader counters and batch-bounded staging sizes."""
-        return self._cache.stats()
+        result = self._cache.stats()
+        result["resident_scale_bytes"] = self._scale_owner.nbytes if self._scale_owner else 0
+        result["owned_host_bytes"] = result["owned_staging_bytes"] + result["resident_scale_bytes"]
+        return result
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -354,9 +465,11 @@ def bind_lookup(
         if weight is not None or scales is not None:
             raise ValueError("disk lookup requires weight=None and scales=None")
         _require_disk_eager(c.device)
-        disk_table._cache.require_complete()
+        disk_table._require_complete()
         weight, scales = disk_table.weight, disk_table.scale_bytes
         weight_shape, scale_shape = (c.max_tokens * 24, 256), (c.max_tokens * 24, 8)
+        if disk_table.resident_scales:
+            scale_shape = plan.scale_shape
     else:
         if weight is None or scales is None:
             raise ValueError("resident lookup requires weight and scales")
@@ -469,21 +582,34 @@ def run_lookup(
     else:
         _require_disk_eager(p.caps.device)
         cache = b.disk_table._cache
-        with cache.transaction():
-            cache.read_rows(b.hash_ids, prepared * 24)
-            lookup_op(
-                b.weight,
-                b.scale_bytes,
-                b.hash_ids,
-                b.num_tokens,
-                b.out,
-                p.table_rows,
-                p.shard_start,
-                p.shard_end,
-                compact_rows=True,
-                prepared_tokens=prepared,
-                clear_tail=clear_tail,
-            )
+        prefetched = b.disk_table._prefetch_binding
+        if prefetched is not None and prefetched is not b:
+            raise ValueError("disk table has a prefetch for a different binding")
+        context = (
+            b.disk_table._prefetch.consume(b.hash_ids, prepared * 24)
+            if prefetched is not None else cache.transaction()
+        )
+        try:
+            with context:
+                if prefetched is None:
+                    cache.read_rows(b.hash_ids, prepared * 24)
+                lookup_op(
+                    b.weight,
+                    b.scale_bytes,
+                    b.hash_ids,
+                    b.num_tokens,
+                    b.out,
+                    p.table_rows,
+                    p.shard_start,
+                    p.shard_end,
+                    compact_rows=True,
+                    resident_scales=b.disk_table.resident_scales,
+                    prepared_tokens=prepared,
+                    clear_tail=clear_tail,
+                )
+        finally:
+            if prefetched is not None and not b.disk_table._prefetch.pending:
+                b.disk_table._prefetch_binding = None
     return b.out
 
 
