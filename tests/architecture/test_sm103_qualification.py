@@ -19,12 +19,21 @@ def test_source_archive_prepares_outside_its_directory(tmp_path):
     (source / "b12x").mkdir()
     (source / "b12x" / "__init__.py").write_text("# archive package\n")
     for name in ("qualify_sm103.py", "_sm103_source.py"):
-        shutil.copyfile(qualification.ROOT / "scripts" / name, source / "scripts" / name)
+        shutil.copyfile(
+            qualification.ROOT / "scripts" / name, source / "scripts" / name
+        )
     output = tmp_path / "prepared"
     subprocess.run(
-        [sys.executable, str(source / "scripts/qualify_sm103.py"),
-         "--output-dir", str(output)],
-        cwd=tmp_path, check=True, capture_output=True, text=True,
+        [
+            sys.executable,
+            str(source / "scripts/qualify_sm103.py"),
+            "--output-dir",
+            str(output),
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     receipt = json.loads((output / "qualification.json").read_text())
     assert receipt["status"] == "prepared"
@@ -37,9 +46,21 @@ def test_source_archive_prepares_outside_its_directory(tmp_path):
 def test_exported_revision_does_not_inherit_enclosing_checkout(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(
-        ["git", "-C", str(tmp_path), "-c", "user.name=Archive Test",
-         "-c", "user.email=archive@example.invalid", "commit", "-q", "--allow-empty",
-         "-m", "Create enclosing checkout"], check=True,
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Archive Test",
+            "-c",
+            "user.email=archive@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "Create enclosing checkout",
+        ],
+        check=True,
     )
     source = tmp_path / "export"
     source.mkdir()

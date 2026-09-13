@@ -4168,6 +4168,26 @@ mma_m16n8k16_f32_bf16 = bf16_mma_m16n8k16_f32
 
 
 @dsl_user_op
+def named_barrier_sync(
+    barrier_id: Int32, num_threads: Int32, *, loc=None, ip=None
+) -> None:
+    """Synchronize named participants arriving from different control paths.
+
+    ``bar.sync`` implies ``.aligned`` and requires the same instruction across
+    the CTA. Producer and consumer branches must use ``barrier.cta.sync``
+    without that promise, with matching barrier IDs and participant counts.
+    """
+    llvm.inline_asm(
+        None,
+        [Int32(barrier_id).ir_value(loc=loc, ip=ip),
+         Int32(num_threads).ir_value(loc=loc, ip=ip)],
+        "barrier.cta.sync $0, $1;",
+        "r,r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
 def byte_perm(a: Uint32, b: Uint32, selector: Int32, *, loc=None, ip=None) -> Uint32:
     """PTX byte permutation helper."""
     return Uint32(

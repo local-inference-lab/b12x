@@ -287,7 +287,7 @@ See the source-level work table and qualification order in
 Station TP2 serving remain unsupported. A model-wide vLLM capability gate is
 not enabled by this prototype; the b12x operation API remains the integration
 boundary. Serving changes depend on qualifying the required individual ops.
-# Source archive qualification
+## Source archive qualification
 
 The compile and qualification tools accept exported source trees without Git
 metadata. An exported `.git_archival.txt` records the base revision; package
@@ -295,3 +295,45 @@ hashes identify the actual files under test. Source roots nested in unrelated
 checkouts do not inherit the enclosing repository's revision. Offline tests
 cover archive preparation, archived revision handling, and execution from a
 different directory.
+
+## GLM sparse attention and shared-prefill synchronization
+
+The public sparse-MLA plan now selects ordinary FP8/BF16 warp MMA on SM103
+for the GLM NSA and GLM Next packed-cache contracts. Decode resolves its split
+count from capacity, and prefill reuses the shared multigroup pipeline. FP8
+group scaling follows ordinary FP8 QK accumulation; NVFP4 retains inline BF16
+dequantization. CUDA graph replay uses caller-owned scratch and cached kernels.
+
+The test corpus exposed a dynamic DLPack extent overflow for a packed pool
+larger than 2 GiB. A one-byte base-pointer view plus an Int64 physical page
+stride preserves the existing storage and large-offset addressing. Tests cover
+high recycled page IDs, selected-length mutation, eight-head tails, head-major
+output, empty bindings, and live row counts under frozen resolution.
+
+Compute Sanitizer synchronization checking also found a shared-prefill barrier
+error in both the portable and existing SM120 paths. Producer and consumer
+branches reached separate `bar.sync` instructions with an aligned control-flow
+promise. Both sites now emit `barrier.cta.sync`. Focused reproductions and the
+shared-prefill corpus pass synchronization checking after that change.
+
+Validation uses package hash
+`d5dbd8cab6dd6004f00be4ba1c421acc37506bec04ff3f16d273b7e3e85d895c` in
+`/home/jasonc/b12x-sm103` and the identical package on ripper at
+`/home/jasonc/b12x-sm103-regression-20260912`. The base Git revision is
+`6e2d2ca10289923b523f56cd09f00dbc29f7b623`; the compile manifest records the
+modified source state. The physical regression device is RTX PRO 4000
+Blackwell, CC 12.0, UUID `GPU-47363510-b87a-13a5-4824-2542e97df76c`.
+
+| Check | Result |
+| --- | --- |
+| Host library, architecture, policy, sparse-binding and portable sparse suites | 413 passed, 27 skipped |
+| Portable GLM sparse suite, Compute Sanitizer 13.4.57 memcheck | 50 passed, zero sanitizer errors |
+| Portable GLM sparse and shared-prefill corpus, synccheck | 69 passed, six decode cases deselected, zero sanitizer errors |
+| All-component offline SM103 compilation | 128 callables, 136 CUDA entries; all retained artifact hashes verified |
+
+The offline corpus includes 45 sparse-attention and cache-writer callables.
+Six sparse-prefill cases report stack frames of 8–136 bytes with zero reported
+local storage. Dynamic launch SMEM and target occupancy remain unmeasured.
+The source-bound [validation receipt](sm103-sparse-validation.json) retains
+resource flags and raw log identities under `../b12x-sm103-evidence/`.
+No SM103 execution or target performance measurement was performed.

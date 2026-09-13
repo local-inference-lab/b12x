@@ -209,6 +209,29 @@ def sm103_context(monkeypatch):
     return PolicyContext.for_identity(B300)
 
 
+@pytest.mark.parametrize("model,dim", [(1, 576), (2, 512)])
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_sm103_sparse_mla_plan_retains_warp_policy(sm103_context, model, dim, mode):
+    from b12x.attention import sparse_mla
+    from b12x.attention.sparse_mla._policy import SparseMlaConfig
+    from b12x.policy import SPARSE_MLA_ATTENTION
+
+    caps = sparse_mla.Caps(
+        device="cuda:0", num_q_heads=24, max_q_rows=8, max_width=2051,
+        softmax_scale=256**-0.5, kv_dtype=torch.uint8, head_dim=dim,
+        v_head_dim=512, model_type=model, mode=mode,
+    )
+    plan = sparse_mla.plan(caps, policy=sm103_context)
+    resolution = plan.policy_resolution
+    assert resolution.source is PolicySource.HEURISTIC
+    assert resolution.device == B300
+    assert resolution.config == SparseMlaConfig(backend="warp", num_splits=4 if mode == "decode" else 1)
+    with pytest.raises(ValueError, match="requires the warp backend"):
+        sparse_mla.plan(caps, policy=sm103_context.with_override(
+            SPARSE_MLA_ATTENTION, SparseMlaConfig(backend="native"),
+        ))
+
+
 def make_experts(*, device="cpu", e=2, k=256, n=256, w13_layout="w13", mode="a4"):
     wp = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout=w13_layout),

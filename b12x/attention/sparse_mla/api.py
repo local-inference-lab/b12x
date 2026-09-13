@@ -17,7 +17,7 @@ from .._shared.mla.api import (
     MLASparseExtendMetadata as ExtendMetadata,
 )
 from .._shared.mla.api import (
-    clear_mla_caches as clear_caches,
+    clear_mla_caches as _clear_legacy_caches,
 )
 from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
@@ -45,6 +45,7 @@ class Binding:
     runtime: _RuntimeBinding
     kv_cache: torch.Tensor
     attention_sink: torch.Tensor | None = None
+    execution: object | None = None
 
 
 def plan(
@@ -108,11 +109,16 @@ def bind(
         nsa_cache_seqlens_int32=selected_lengths,
         kv_cache=kv_cache,
     )
+    execution = None
+    if plan.policy_resolution.config.backend == "warp":
+        from . import _sm103
+        execution = _sm103.bind(plan, runtime, attention_sink)
     return Binding(
         plan=plan,
         runtime=runtime,
         kv_cache=kv_cache,
         attention_sink=attention_sink,
+        execution=execution,
     )
 
 
@@ -161,8 +167,15 @@ def concat_and_cache_glm_next_mla_nvfp4(
     concat_and_cache_glm_next_mla(kv_c, kv_cache, slot_mapping, plan=plan)
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
-    return default_is_supported(device, requires=META.requires)
+    """True on an admitted CUDA architecture with the required dependencies."""
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
+
+
+def clear_caches() -> None:
+    _clear_legacy_caches()
+    from . import _sm103
+
+    _sm103.clear_caches()
 
 
 __all__ = [

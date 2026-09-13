@@ -719,6 +719,7 @@ def s1_qk_nope_block_scaled(
     scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     valid_hpb: cutlass.Constexpr = 16,
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    block_scaled_mma: cutlass.Constexpr = True,
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -752,6 +753,11 @@ def s1_qk_nope_block_scaled(
 
     A (Q) loaded via ldmatrix.x4 (FP8 A 16x32 for scale_format 0/1, BF16 A
     16x16 for scale_format 2); B follows the matching FP8 or BF16 path.
+
+    With ``block_scaled_mma=False``, ordinary FP8 MMA accumulates each raw
+    quantization group. FP32 Q and K scales are then applied per output row
+    and candidate. This schedule supports SM103 without SM12x block-scaled
+    warp instructions and retains the same stored quantization format.
     """
     if cutlass.const_expr(scale_format == 2):
         return s1_qk_nope_nvfp4_bf16(
@@ -806,7 +812,7 @@ def s1_qk_nope_block_scaled(
         # GLM accumulates each group's partial into a SEPARATE temp so the
         # arbitrary fp32 group scale can be applied post-MMA; DSV4 accumulates
         # directly into qk (byte-identical to the pre-P10f trace).
-        if cutlass.const_expr(scale_format == 0):
+        if cutlass.const_expr(scale_format == 0 and block_scaled_mma):
             acc0, acc1, acc2, acc3 = qk[0], qk[1], qk[2], qk[3]
         else:
             acc0 = Float32(0.0)
@@ -829,26 +835,42 @@ def s1_qk_nope_block_scaled(
                 + b_col,
             )
             b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
-            acc0, acc1, acc2, acc3 = mxfp8_mma_m16n8k32_f32_e4m3(
-                acc0,
-                acc1,
-                acc2,
-                acc3,
-                a0,
-                a1,
-                a2,
-                a3,
-                b0,
-                b1,
-                sfa,
-                sfb,
-            )
+            if cutlass.const_expr(block_scaled_mma):
+                acc0, acc1, acc2, acc3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    acc0, acc1, acc2, acc3, a0, a1, a2, a3, b0, b1, sfa, sfb
+                )
+            else:
+                acc0, acc1, acc2, acc3 = mma_m16n8k32_f32_e4m3(
+                    acc0, acc1, acc2, acc3, a0, a1, a2, a3, b0, b1
+                )
+        if cutlass.const_expr(not block_scaled_mma):
+            # Each group has one Q scale per head. Ordinary FP8 MMA retains
+            # raw operands; apply scales to the output fragment's two rows.
+            qs0 = q_sc_view[gid * Int32(num_scales) + Int32(blk)]
+            qs1 = q_sc_view[(gid + Int32(8)) * Int32(num_scales) + Int32(blk)]
+            acc0 = acc0 * qs0
+            acc1 = acc1 * qs0
+            acc2 = acc2 * qs1
+            acc3 = acc3 * qs1
         if cutlass.const_expr(scale_format == 0):
-            qk[0] = acc0
-            qk[1] = acc1
-            if cutlass.const_expr(hi):
-                qk[2] = acc2
-                qk[3] = acc3
+            if cutlass.const_expr(block_scaled_mma):
+                qk[0] = acc0
+                qk[1] = acc1
+                if cutlass.const_expr(hi):
+                    qk[2] = acc2
+                    qk[3] = acc3
+            else:
+                ks0 = _ue8m0_byte_to_fp32(ld_shared_u8_offset(
+                    kv_sc_base_addr + glm_c0 * Int32(scale_bytes_per_token), blk
+                ))
+                ks1 = _ue8m0_byte_to_fp32(ld_shared_u8_offset(
+                    kv_sc_base_addr + glm_c1 * Int32(scale_bytes_per_token), blk
+                ))
+                qk[0] = qk[0] + acc0 * ks0
+                qk[1] = qk[1] + acc1 * ks1
+                if cutlass.const_expr(hi):
+                    qk[2] = qk[2] + acc2 * ks0
+                    qk[3] = qk[3] + acc3 * ks1
         else:
             # GLM: post-MMA FP32 scale by the per-candidate arbitrary fp32 group
             # scale (legacy _accumulate_scaled_score_frag). c0 -> qk[0]/qk[2];
@@ -3468,5 +3490,3 @@ def _d2_load_b_fp8(
     t23 = byte_perm(r2, r3, sel)
     b1 = byte_perm(t01, t23, Int32(0x5410))
     return b0, b1
-
-
