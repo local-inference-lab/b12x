@@ -14,10 +14,13 @@ numbers or measured B300 policy profile are included.
 | Trellis | Existing t256 SQG E4M3 K2/K3/K4 reconstruction; exact SM120 tests and SM103 compilation | Decoder execution; scale/rotation staging and UMMA expert implementation |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
-| NSA/MLA, DSA, KDA/GDN, quantized linears | SM103 unsupported; capability and plan gates reject them | Implement and qualify individual backends |
+| KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
+| Dense MLA | Implemented BF16/E4M3 compressed-cache attention for (QK,V) widths (576,512) and (1088,1024); SM120 tests and SM103 compilation | SM103 correctness, high-pid, split, query-quantization, and graph qualification |
+| Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
+| GLM sparse NSA/MLA, DSA, quantized linears | SM103 unsupported; capability and plan gates reject them | Admit portable paths after a complete compile/correctness corpus; implement SM103 paths for architecture-specific scaled MMA |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
 
-SM100 and SM103 use tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
+Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
 descriptor records 512 TMEM columns and a 227 KiB block SMEM limit for SM103,
 versus no TMEM and 99 KiB for SM12x. Physical opt-in limits are checked before
 launch compilation. SM100 recognition does not enable an implementation.
@@ -37,10 +40,12 @@ occupancy decisions. Cluster multicast, persistent expert scheduling, and
 producer/consumer specialization are future tuning work.
 
 The architecture-independent source/checkpoint schema, loader, geometry,
-scratch layout and graph lifecycle remain shared. Warp-MMA linears, MoE,
-sparse-MLA dots, and DSA score kernels require architecture-specific execution.
-SIMT metadata, reductions, recurrent kernels, Engram gather and communication
-are candidates for reuse after compilation and correctness checks. CuTe/CUTLASS
+scratch layout and graph lifecycle remain shared. Ordinary BF16 and E4M3 warp
+MMA also compile for SM103; the dense MLA and unquantized projection paths reuse
+those instructions. Architecture-specific SM12x block-scaled MMA requires a
+different SM103 implementation. Recurrent kernels reuse portable SIMT and
+BF16 warp-MMA instructions. Engram gather and communication require their
+platform-specific execution checks. CuTe/CUTLASS
 supplies matrix, layout, TMA and synchronization primitives; b12x owns routing,
 fusion, capacity, lifecycle and policy. Generic NVIDIA attention/linear backends
 remain appropriate integration fallbacks where b12x has no SM103 implementation.
@@ -72,12 +77,66 @@ python scripts/compile_sm103.py --component all --output-dir /tmp/sm103-compile
 
 The output directory must be empty. Optional `--nvdisasm /path/to/nvdisasm`
 and `--cuobjdump /path/to/cuobjdump` retain SASS and resource reports. The manifest
-records source/toolchain identity and per-file hashes. Twenty callables comprise
-nine MoE launchers, eight TP2 communication launchers and three reconstruction
-launchers. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+records source/toolchain identity and per-file hashes. The representative corpus
+contains nine MoE launchers, eight TP2 communication launchers, three reconstruction
+launchers, 36 recurrent launchers, 17 dense MLA launchers, and ten unquantized
+projection launchers. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
+
+`scripts/qualify_sm103.py` prepares an execution manifest without inspecting
+CUDA. With `--execute`, it requires an explicit physical GPU UUID and rejects
+any target other than SM103. It records package/test source identities,
+device identity, GPU snapshots, test logs, and JUnit counts. A failed or skipped
+required test prevents an operator qualification result. Optional compile
+manifests must match the source and every retained artifact hash.
+
+```bash
+python scripts/qualify_sm103.py --output-dir /tmp/sm103-prepared \
+  --compile-manifest /tmp/sm103-compile/manifest.json
+# Execute only on the selected physical B300 after transferring the checkout.
+python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
+  --output-dir /tmp/sm103-runtime
+```
+
+Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
+same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
+Full-model serving, sparse MLA/DSA, quantized linears, Trellis experts,
+Grace/Station behavior, and plugin installation are explicitly outside this
+operator suite. Passing it does not enable a model-wide serving route.
+
+## Recurrent, dense MLA, and unquantized projection contracts
+
+SM103 GDN planning selects CuTe for both Qwen's 3:1 value/key-head recurrence
+and GLM/Kimi's equal-head KDA recurrence. A Triton core override is rejected on
+SM103. SM12x retains its existing KDA heuristic; an explicit CuTe override
+selects the portable implementation. KDA uses per-coordinate lower-bounded
+decay, FP32 working state, BF16 or FP32 checkpoint storage, BF16 recurrent
+output, and FP32 gated RMSNorm before final BF16 storage. Triton supplies only
+transactional metadata validation for this KDA path. Bound row/column capacities,
+strides, scale, lower bound, and live device counts remain runtime arguments.
+Tests cover smaller bound views and mutable counts under frozen resolution,
+accepted-draft restarts, null slots, malformed metadata, parameter dtypes,
+noncontiguous beta, graph allocation, and state offsets beyond 2^31 elements.
+
+Sequential KDA and GDN prefill retain the shared chunked CuTe implementation,
+including checkpoints and long sequences spanning workspace windows. SM103
+rejects the separate GDN chunk-parallel algorithm; profile generation excludes
+its candidates for that target. Existing embedded GDN decode profiles retain
+their measured configs with config schema 4; their measurements do not qualify
+the CuTe KDA backend. B300 profiles remain unavailable pending GPU measurements.
+
+Dense MLA consumes the compressed cache contract described by its public Caps;
+it does not implement GLM Next's distinct 512-wide sparse NSA contract. It
+retains FP8/BF16 compute, caller-owned split storage, optional query quantization,
+window masking, physical record strides, and Int64 pool offsets. Unquantized
+projections retain FP32 accumulation and their existing SIMT/warp-MMA dispatch.
+Neither path claims tcgen05 fusion or target performance. Four 1088-wide dense
+MLA specializations report stack frames of 8–192 bytes in the SM103 resource
+census. These cases require target profiling; compilation and SM120 correctness
+do not settle their SM103 latency. Static SMEM reports omit dynamic launch
+storage, so the census does not establish achieved occupancy.
 
 ## MoE correctness, graphs and timing
 
@@ -322,9 +381,9 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | --- | --- |
 | B300 MoE correctness | `sm103/nvfp4_gemm.py`, `pointwise.py`, `launch.py`: oracle, sanitizer, live-capacity and real-weight graph tests |
 | Tiny-M/prefill scheduling | `fused_moe/_sm103.py`, `_policy.py`: implement separate strategies, then race M1/M4/M8/prefill under native plans |
-| GLM NSA/MLA | `attention/sparse_mla`, `attention/dense_mla`: preserve GLM cache/head traits; add TMA/UMMA execution and split reduction |
+| GLM NSA/MLA | `attention/sparse_mla`: preserve GLM cache/head traits, qualify portable warp paths or implement SM103 compute; dense compressed MLA is a separate implemented contract |
 | DSA | `attention/dsa_indexer/{kernel,scratch,_policy}.py`: separate scoring from top-k; qualify sparse IDs, ties and pages beyond 32-bit byte offsets |
-| KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: recurrence, state layouts, null slots, checkpoints and graphs; retain independent-load scheduling |
+| KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled`, `_lib/dense_gemm.py`: use native CUTLASS operations under existing layouts and plans |
 | Trellis experts | `sm103/trellis.py`, `fused_moe/trellis.py`: scale/rotation staging, mixed rates, compressed-to-SMEM pipeline and BF16/FP8 UMMA; no full-model BF16 repack |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
