@@ -31,7 +31,7 @@ def test_sm103_precision_uses_unmeasured_heuristic_without_embedded_profile(reci
 
 
 def test_compiler_admits_only_portable_a16_and_native_dense_entry_types():
-    for module in ("b12x.gemm.blockscaled._a16_cute", "b12x.gemm.blockscaled._sm103"):
+    for module in ("b12x.gemm.blockscaled._a16_cute", "b12x.gemm.blockscaled._sm103", "b12x.gemm.blockscaled._fp8_cute"):
         require_kernel_architecture(module, (10, 3))
     with pytest.raises(UnsupportedArchitectureError):
         require_kernel_architecture("b12x._lib.dense_gemm", (10, 3))
@@ -65,7 +65,7 @@ def test_native_compile_miss_fails_under_frozen_resolution():
         unfreeze_kernel_resolution()
 
 
-@pytest.mark.parametrize("option", [dict(plain_fp8=True), dict(block_fp8=True), dict(swap_ab=True), dict(_tile_k_override=256)])
+@pytest.mark.parametrize("option", [dict(swap_ab=True), dict(_tile_k_override=256), dict(plain_fp8=True, swap_ab=True), dict(block_fp8=True, _tile_k_override=256)])
 def test_unsupported_dense_modes_fail_before_compilation(monkeypatch, option):
     from b12x._lib.dense_gemm import dense_gemm
     monkeypatch.setattr("b12x._lib.gating.get_compute_capability", lambda device: (10, 3))

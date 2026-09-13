@@ -427,3 +427,56 @@ these deltas require target profiling. Existing stack-resource flags remain
 visible in the [source-bound receipt](sm103-blockscaled-validation.json).
 Full Trellis experts, compressed DeepSeek sparse attention, tensor/block FP8,
 MXFP6, DFlash2/full serving, and HBM GDR remain implementation gaps.
+
+## Tensor-scaled and compact K128 FP8 projections
+
+`gemm/blockscaled/_fp8_cute.py` provides a CuTe entry for ordinary E4M3 warp
+MMA with the shared TMA pipeline. The existing tensor-FP8 packed API and
+compact K128 block-FP8 API select it on SM103. Static weight geometry and
+output dtype select a conservative persistent tile; live row counts and
+group strides remain runtime arguments. Output and scale addressing use
+Int64. No measured SM103 profile is added.
+
+Tensor-scaled FP8 uses the output multiplier exclusively. The shared core
+uses the ordinary FP8 MMA descriptor and omits unused scale layouts,
+transfers, and fragments. SM103 packed calls do not create a unit-scale cache
+entry for each live count. Omitted alpha compiles out its load. Compact FP32
+scales are applied to each K128 partial sum before final accumulation.
+
+The FP32 regression exposed misplaced output columns in the shared tiled
+epilogue. Unsplit plain FP8 now stores FP32 accumulators directly; split-K
+retains its existing partial-output path. Transposed MMA also bypasses the
+unused output TMA descriptor, preserving arbitrary one-group output widths.
+Independent NVFP4 TMA/cp.async tests cover that shared store-path change.
+
+The unchanged parent revision reproduces the legacy tensor-FP8 test failure
+on the 70-SM RTX PRO 4000. That test assumed the <=64-SM compact-block policy.
+Its assertions now check whether the actual device selects compact scales or
+tensor scaling. Five host-side NVFP4 tile assertions also fail on the unchanged
+parent: they apply small-SM probe expectations to a 188-SM device. The test
+now covers both 48-SM and 188-SM policy contracts. The implementation's SM12x
+policy remains unchanged.
+
+The full SM103 compile corpus contains 241 callables and 249 CUDA entry
+points. Its 19 FP8 callables use 55–128 allocated GPRs, with zero stack and
+local memory. Existing callables have no positive register, stack, static-SMEM,
+or local-memory deltas against the native block-scaled projection receipt.
+The prior 31 stack flags remain visible; resource reports do not establish
+dynamic-SMEM occupancy or performance.
+
+SM120 regression on GPU `GPU-47363510-b87a-13a5-4824-2542e97df76c`, in Default
+compute mode, passes 190 tests under both memcheck and synccheck with zero
+errors. Fourteen device-specific legacy cases skip. Six additional serialized
+API and NVFP4 epilogue tests pass both sanitizers with zero errors. Host tests
+pass 690 cases and skip 66 GPU cases. The FP8 suite
+includes independent numerical oracles, BF16/FP16/FP32 output, grouped capacity
+strides, frozen resolution over multiple live counts, scale/input mutation,
+graph replay, allocation checks, and output addresses beyond 2^31 elements.
+The wheel and sdist contain byte-identical package Python and profile files.
+
+[FP8 validation receipt](sm103-fp8-validation.json) binds compilation,
+resource accounting, SM120 logs, and packaging to the package source hash.
+No physical SM103 execution or performance qualification occurred. Planned
+BF16 block-FP8 linear, MXFP6, full Trellis experts, compressed DeepSeek sparse
+attention, mHC/MTP, full serving, and direct HBM transport remain implementation
+work.

@@ -9,7 +9,7 @@ import cutlass
 
 import b12x._lib.dense_gemm as dense_module
 from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.utils import convert_sf_from_mma_layout, get_num_sm
+from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x._lib.dense_gemm import (
     DenseGemmKernel,
     _select_default_dense_gemm_plan,
@@ -343,6 +343,21 @@ def test_dense_gemm_fp4_small_tilen_support_matrix() -> None:
             )
 
 
+@pytest.mark.parametrize("tile", [(64, 16), (64, 32)])
+@pytest.mark.parametrize("load_path", ["tma", "cpasync"])
+def test_fp4_swapped_epilogue_independent_oracle(tile, load_path):
+    require_b12x()
+    from tests.gemm.test_sm103_blockscaled import operand, check
+    a, sfa, decoded_a = operand("nvfp4", 1, 32, 128)
+    b, sfb, decoded_b = operand("nvfp4", 1, 64, 128)
+    alpha = torch.tensor([.5], device="cuda")
+    out = dense_gemm((a, sfa), (b, sfb), alpha=alpha, ab_dtype="float4_e2m1fn",
+                     sf_dtype="float8_e4m3fn", sf_vec_size=16, c_dtype="bfloat16",
+                     mma_tiler_mn=tile, load_path=load_path, swap_ab=True)
+    expected = (torch.bmm(decoded_a, decoded_b.transpose(1, 2)) * alpha).permute(1, 2, 0)
+    check(out, expected)
+
+
 def test_dense_gemm_fp8_small_tile_and_swap_support_matrix() -> None:
     base = dict(
         ab_dtype=cutlass.Float8E4M3FN,
@@ -572,18 +587,23 @@ def test_default_dense_tile_selector_handles_small_m_wide_n(
         (2, 512, 5376, (64, 64), False),
     ],
 )
-def test_default_dense_fp4_plan_handles_m1_probe_regimes(
+@pytest.mark.parametrize("sm_count", [48, 188])
+def test_default_dense_fp4_plan_handles_device_probe_regimes(
     m: int,
     n: int,
     k: int,
     expected_tile: tuple[int, int],
     expected_swap: bool,
+    sm_count: int,
 ) -> None:
+    if sm_count == 188:
+        # The high-SM decode policy retains 64-column tiles for this corpus.
+        expected_tile, expected_swap = (64, 64), False
     plan = _select_default_dense_gemm_plan(
         m,
         n,
         k,
-        188,
+        sm_count,
         is_mxfp8=False,
     )
     assert plan.mma_tiler_mn == expected_tile

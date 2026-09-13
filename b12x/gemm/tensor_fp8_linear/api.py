@@ -14,9 +14,9 @@ from . import META
 
 
 def is_supported(device=None) -> bool:
-    """Return whether the SM12x tensor-FP8 linear path is available."""
+    """Return whether the tensor-FP8 linear path and dependencies are available."""
     kernel_supported, _ = _kernel_is_supported()
-    return default_is_supported(device, requires=META.requires) and kernel_supported
+    return default_is_supported(device, archs=META.archs, requires=META.requires) and kernel_supported
 
 
 __all__ = ["Weight", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"]

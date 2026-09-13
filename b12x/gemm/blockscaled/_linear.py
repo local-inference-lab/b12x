@@ -341,8 +341,8 @@ def pack_mxfp8_linear_weight(
 
 
 def is_tensor_fp8_linear_supported() -> tuple[bool, str | None]:
-    if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
-        return False, "CUTLASS DSL does not expose cute.nvgpu.warp.MmaMXF8Op"
+    if not hasattr(cute.nvgpu.warp, "MmaFP8Op"):
+        return False, "CUTLASS DSL does not expose cute.nvgpu.warp.MmaFP8Op"
     return True, None
 
 
