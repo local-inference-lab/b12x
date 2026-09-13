@@ -98,6 +98,16 @@ def _heuristic(
         and tokens >= _PREFILL_TF32_MIN_TOKENS
         else "native"
     )
+    if hidden_size == 5_120 and tokens == 128:
+        return _tf32_config(
+            tile_m=32,
+            tile_n=8,
+            tile_k=256,
+            num_stages=1,
+            num_m_warps=2,
+            num_n_warps=1,
+            k_splits=8,
+        )
     if hidden_size == 4_096 and tokens >= 8_192:
         return _tf32_config(
             backend=backend,
@@ -130,6 +140,17 @@ def _heuristic(
             num_m_warps=4,
             num_n_warps=1,
             k_splits=8,
+        )
+    if hidden_size == 5_120 and tokens == 4_096:
+        return _tf32_config(
+            backend=backend,
+            tile_m=64,
+            tile_n=24,
+            tile_k=64,
+            num_stages=2,
+            num_m_warps=4,
+            num_n_warps=1,
+            k_splits=4,
         )
     if hidden_size != 4_096 and tokens >= 4_096:
         return _tf32_config(
