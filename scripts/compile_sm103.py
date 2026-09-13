@@ -216,6 +216,8 @@ def compile_dense_mla(out):
         for qk_dim, value_dim in ((576, 512), (1088, 1024)):
             for query_tile in (1, 2, 4) if fp8 else (1, 2):
                 for window in (None, 128):
+                    if window is not None and query_tile != 1:
+                        continue
                     name = f"dense_mla_{'fp8' if fp8 else 'bf16'}_d{qk_dim}_q{query_tile}_w{window}"
                     kernel = DenseMlaForwardKernel(
                         layout=make_smem_layout(
