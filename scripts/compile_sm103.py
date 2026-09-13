@@ -12,7 +12,10 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts._sm103_source import package_source_sha256, source_identity
 
 
 def compile_sequence(out):
@@ -459,16 +462,9 @@ def main():
         },
         "geometry": vars(caps),
         "cutlass_dsl": importlib.metadata.version("nvidia-cutlass-dsl"),
-        "source_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "source_sha256": hashlib.sha256(
-            b"".join(p.read_bytes() for p in sorted(Path("b12x").rglob("*.py")))
-        ).hexdigest(),
+        **source_identity(ROOT),
+        "source_sha256": package_source_sha256(ROOT),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "git_status": subprocess.check_output(
-            ["git", "status", "--porcelain"], text=True
-        ).splitlines(),
         "packages": {
             name: importlib.metadata.version(name)
             for name in (

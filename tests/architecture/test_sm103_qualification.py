@@ -2,11 +2,69 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 
 import pytest
 import torch
 
 from scripts import qualify_sm103 as qualification
+from scripts._sm103_source import package_source_sha256, source_identity
+
+
+def test_source_archive_prepares_outside_its_directory(tmp_path):
+    source = tmp_path / "source"
+    (source / "scripts").mkdir(parents=True)
+    (source / "b12x").mkdir()
+    (source / "b12x" / "__init__.py").write_text("# archive package\n")
+    for name in ("qualify_sm103.py", "_sm103_source.py"):
+        shutil.copyfile(qualification.ROOT / "scripts" / name, source / "scripts" / name)
+    output = tmp_path / "prepared"
+    subprocess.run(
+        [sys.executable, str(source / "scripts/qualify_sm103.py"),
+         "--output-dir", str(output)],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    receipt = json.loads((output / "qualification.json").read_text())
+    assert receipt["status"] == "prepared"
+    assert receipt["source_revision"] is None
+    assert receipt["git_status"] is None
+    assert receipt["source_sha256"] == package_source_sha256(source)
+    assert receipt["worktree"] == str(source)
+
+
+def test_exported_revision_does_not_inherit_enclosing_checkout(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.name=Archive Test",
+         "-c", "user.email=archive@example.invalid", "commit", "-q", "--allow-empty",
+         "-m", "Create enclosing checkout"], check=True,
+    )
+    source = tmp_path / "export"
+    source.mkdir()
+    identity = source_identity(source)
+    assert identity["source_revision"] is None
+    assert identity["git_status"] is None
+    archival = source / ".git_archival.txt"
+    archival.write_text("$Format:%H$\n")
+    assert source_identity(source)["source_revision"] is None
+    archival.write_text("a" * 40 + "\n")
+    identity = source_identity(source)
+    assert identity["source_revision"] == "a" * 40
+    assert identity["source_kind"] == "archive"
+    assert identity["git_status"] is None
+
+
+def test_checkout_identity_uses_explicit_source_root(tmp_path, monkeypatch):
+    expected = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=qualification.ROOT, text=True
+    ).strip()
+    monkeypatch.chdir(tmp_path)
+    identity = source_identity(qualification.ROOT)
+    assert identity["source_revision"] == expected
+    assert identity["source_kind"] == "git"
+    assert isinstance(identity["git_status"], list)
 
 
 def test_preparation_never_creates_a_cuda_context(tmp_path, monkeypatch):
