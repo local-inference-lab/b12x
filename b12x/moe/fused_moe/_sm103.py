@@ -51,6 +51,12 @@ def capacity_regime(tokens: int) -> str:
 
 
 def heuristic(query):
+    if query.source_format in {"b12x_trellis", "btx"}:
+        from ._sm103_trellis import BACKEND as trellis_backend
+
+        config = MoeDecodeConfig(trellis_backend, "internal", None)
+        validate_policy(query, config)
+        return config
     config = MoeDecodeConfig(
         backend=BACKEND, route_planner="internal", max_active_clusters=None
     )
@@ -67,10 +73,9 @@ def independent_reference(a, experts, ids, weights):
 
 def validate_policy(query, config):
     if query.source_format in {"b12x_trellis", "btx"}:
-        raise UnsupportedArchitectureError(
-            "SM103 Trellis reconstruction/UMMA execution is not implemented; "
-            "the existing checkpoint format remains portable"
-        )
+        from ._sm103_trellis import validate_policy as validate_trellis
+
+        return validate_trellis(query, config)
     if (
         query.quant_mode not in {"nvfp4", "nvfp4_auto"}
         or query.source_format != "modelopt_nvfp4"
@@ -130,9 +135,21 @@ def plan_execution(
     from ._impl import TPMoEPlan
 
     if weight_plan.source_format in {"b12x_trellis", "btx"}:
-        from .._shared.kernels.sm103.trellis import TrellisPipeline
+        from ._sm103_trellis import plan_execution as plan_trellis
 
-        TrellisPipeline.from_weight_plan(weight_plan).require_execution()
+        return plan_trellis(
+            num_tokens=num_tokens,
+            num_topk=num_topk,
+            device=device,
+            weight_plan=weight_plan,
+            quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            policy_context=policy_context,
+            policy_resolution=policy_resolution,
+        )
     if weight_plan.io_dtype != "bfloat16":
         raise UnsupportedArchitectureError("SM103 NVFP4 MoE requires BF16 I/O")
     if apply_router_weight_on_input:
@@ -160,7 +177,9 @@ def plan_execution(
             or policy_resolution.component_id != MOE_DECODE_POLICY.component_id
             or policy_resolution.device != policy_context.device
         ):
-            raise ValueError("MoE policy resolution must match the component and device")
+            raise ValueError(
+                "MoE policy resolution must match the component and device"
+            )
         validate_policy(query, policy_resolution.config)
         resolution = policy_resolution
     spec = make_moe_spec(
@@ -375,6 +394,12 @@ class BackendPlan:
 def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
     from ._impl import TPMoEArenaLayout, TPMoEScratchPlan
 
+    if caps.weight_plan.source_format in {"b12x_trellis", "btx"}:
+        from ._sm103_trellis import plan_scratch as plan_trellis
+
+        return plan_trellis(
+            caps, prewarm_launches=prewarm_launches, policy_resolution=policy_resolution
+        )
     if caps.collect_activation_amax or caps.route_logits_dtype is not None:
         raise UnsupportedArchitectureError(
             "SM103 MoE requires preselected top-k routes without calibration"

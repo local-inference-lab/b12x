@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -313,6 +313,8 @@ def prepare_weights(
             config=plan.source,
             weights=weights,
         )
+        if prepared.plan != plan._impl:
+            plan = replace(plan, _impl=prepared.plan)
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")

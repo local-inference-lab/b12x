@@ -319,7 +319,7 @@ def _symmetric_bits(config: TrellisConfig, rates: torch.Tensor) -> torch.Tensor:
     if config.codebook is TrellisCodebook.MCG:
         allowed = (3, 4, 5)
     elif config.codebook is TrellisCodebook.SQG_E4M3:
-        allowed = (3,)
+        allowed = (2, 3, 4)
     else:
         raise NotImplementedError(
             "sqg_fp16 is represented by the v2 format but is not implemented "
@@ -477,7 +477,9 @@ def _uniform_prepared(
         activation=activation,
         fc1_tile_n=256,
         fc2_tile_n=256,
-        params_dtype=params_dtype,
+        # Trellis projections round in the FP16 quantizer basis independently
+        # of the public activation dtype retained by the weight plan.
+        params_dtype=torch.float16,
         w13_layout="trellis_t256_proj",
         trellis_bits=bit,
         codebook=config.codebook.value,

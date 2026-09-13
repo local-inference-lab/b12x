@@ -951,7 +951,9 @@ class TPMoEScratchPlan:
     @property
     def full_rotation(self) -> bool:
         """Whether this plan owns the EXL3 full-rotation execution path."""
-        return self._backend_plan is None and self._core_workspace_plan.full_rotation
+        if self._backend_plan is not None:
+            return getattr(self._backend_plan, "full_rotation", False)
+        return self._core_workspace_plan.full_rotation
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -6701,6 +6703,7 @@ def prepare_b12x_trellis_v2_weights(
     from b12x.moe.fused_moe.config import TrellisConfig
     from b12x.moe.fused_moe.trellis import prepare_trellis_weights
     from b12x.moe.fused_moe.weights import TrellisWeights
+    from b12x.moe._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
 
     if not isinstance(config, TrellisConfig):
         raise TypeError("config must be a TrellisConfig")
@@ -6721,6 +6724,10 @@ def prepare_b12x_trellis_v2_weights(
         hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size,
     )
+    if isinstance(value, PreparedW4A16MoeWeights) and value.trellis is not None:
+        # The canonical rate tensor supplies this static checkpoint fact at
+        # preparation. Capacity plans must prewarm its actual codebook rate.
+        plan = replace(plan, trellis_bits=value.trellis.bits)
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",
         layout=PreparedWeightLayout.TRELLIS_NATIVE,

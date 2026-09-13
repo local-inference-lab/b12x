@@ -1,0 +1,159 @@
+{
+  "status": "implemented_and_cross_compiled",
+  "runtime_qualified_sm103": false,
+  "uniform_trellis_moe_supported": true,
+  "mixed_rate_trellis_moe_supported": false,
+  "scope": "Native uniform-rate materialized Trellis MoE through the existing planner, binder and runner; ordinary and coupled expert transforms; canonical SQG K2/K3/K4 preparation and existing SM120 execution regression",
+  "source_revision_at_compile": "7e743dc78f61987afa30e35d75757174f80dac73",
+  "package_python_sha256": "4bf2ec03de896fb4a5ea2b29c9654b1a76ada2a733242844354b82f6b3fef1ae",
+  "source_files": {
+    "b12x/moe/_shared/execution.py": "81af19d8bf395fb7d888d22adc513c832e49dfcb9874d90482cc66bbfcb13df6",
+    "b12x/moe/_shared/kernels/sm103/trellis.py": "9c29ba12b685288f34339ecaa847d09dd211f6bad986a11facc1013d73d3e8f9",
+    "b12x/moe/_shared/kernels/sm103/trellis_transforms.py": "c6cd34ce184b1febb8a69bade68429e055de55144a5da3dc0679e57406d48be4",
+    "b12x/moe/fused_moe/_impl.py": "2dadfa417fb188a5476bb66a42c0664123104458dd2c7f511d01c026cf898b0d",
+    "b12x/moe/fused_moe/_policy.py": "5675a155ca3371d4db0d3dac1f70142964842c91c8096888a19eb7a97bd59278",
+    "b12x/moe/fused_moe/_sm103.py": "f74cc841f6eb3ac5a962e753d3f7b22de6bf34c31975a0fe9692fd06745e2958",
+    "b12x/moe/fused_moe/_sm103_trellis.py": "22d364fcec5b30394fc47953f0e3d2eef0a72b9b6f9aaca555a9717670b3da8d",
+    "b12x/moe/fused_moe/planning.py": "0799fce1134139590da98a04bec9f4a1fee9fccbe610811d6b612843e71e7d0d",
+    "b12x/moe/fused_moe/trellis.py": "617e1460fc7ede0510306af1ceed65fdf92878fb92278cc1cb6ea3d26749c45d",
+    "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz": "a97f8ab7eed4472a558b634d54c8d2a56ce87ef6922d62752c3d3209cf76370f",
+    "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz": "d704be5fa1d7e9ed3297641476b85ec21252b37ad5c214fdfa22c865ca2a3d24",
+    "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.max-q.json.gz": "e7c0b0964144167d9cd61b62ef7865f176e47208cb5e36e044f249b0ccfc5397",
+    "b12x/policy/generation/providers/moe.py": "3b1bb237645561c0185c2e8a81f1042f05e9cb07eea9dd7b4490a02b3788a1d6",
+    "b12x/policy/generation/providers/moe_gpu_worker.py": "cf1c4dc0acbeab03b9432a52f172c04fd488b7d7079fe5a49f0ec4a3ec95913c",
+    "b12x/policy/generation/providers/trellis_reference.py": "be2d90eba53ae22f004baf20af956c52b7271063f966fcb54e13dec4ba11a995",
+    "scripts/compile_sm103.py": "ab7b8b2ec88cbd7cb3cfbab66aee9c45004eb89c8355465b246829318bfbe69f",
+    "scripts/qualify_sm103.py": "06c229fd1f54ca5a0c22ddeec05da377b10e476df1a41433a910ba06cf079219",
+    "tests/_reference/trellis_decode.py": "2350965c905d4df9378ff685a7f34aca282c7b0ec1a1a62aaaebf3d50e3c90eb",
+    "tests/_reference/trellis_transforms.py": "29291d470f76f6ab35d44990c7729442187a3ebebedff8570fecff4363387d9c",
+    "tests/architecture/test_sm103.py": "f41a659b5ac726c9d706ef5e4352c4985586167e2983ed6dd6326f415a089ff8",
+    "tests/architecture/test_sm103_trellis.py": "9b5e562c345057982e3bcfaad3eb02779f24aa594034b5d41270ec593f1f56fa",
+    "tests/architecture/test_sm103_trellis_moe.py": "a03a0b9043ef972b7845ebb7ec620b064339d3414bf41ab07b5ac5cbb8aa78bc",
+    "tests/moe/test_sm103_trellis_moe.py": "ac57f6e7fe48d3a8b682e1d0926e4e4ed6a6a089515b3288f7a85c7a9941f287",
+    "tests/moe/test_sm103_trellis_transforms.py": "9d6fcbe38259952ff930c45511a5c0a4f12639ada7dc4948e706852ec7473856"
+  },
+  "compile": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-complete-sm103-final/manifest.json",
+    "sha256": "d7060d28ea95e025f62cd523f7e591d5cc08f27a681b346160b7430e92481b9e",
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "all",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/trellis-moe-complete-sm103-final",
+      "--nvdisasm",
+      ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "callables": 436,
+    "cuda_entries": 444,
+    "added_trellis_moe_callables": 64,
+    "added_allocated_gpr_range": [
+      12,
+      140
+    ],
+    "added_stack_or_local_entries": 0,
+    "positive_existing_resource_deltas": {},
+    "retained_stack_flagged_callables": 31,
+    "tmem_load_wait_callables": 96,
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-resources-final.json",
+      "sha256": "5f5cb8e9c141312d974664967db9d462a374ec32c8c51d2a35593c661167690d"
+    },
+    "resource_audit": {
+      "path": "/home/jasonc/b12x-sm103-evidence/audit_trellis_moe_artifacts.py",
+      "sha256": "22064afbc8c6dadb2f3cd65c3e5783995f3d29751bda3018ae6893dcdce39bca"
+    },
+    "toolchain": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    }
+  },
+  "validation": [
+    {
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/moe/test_fused_moe_planning.py tests/moe/test_trellis_config.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis_transforms.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-host-release.log",
+      "sha256": "b8f7559c4965e65f17bd3b5ae02c12fa24625d1316c0869ba5d89772e2072f44",
+      "result": "501 passed, 42 skipped in 26.06s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_transforms.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-sm120-memcheck-release.log",
+      "sha256": "d8bdc3794dde9018ac170dadbb182f07d9f878fc1852cdcaa06af7a3c63ae2ba",
+      "result": "61 passed, 13 skipped in 39.69s",
+      "sanitizer_summary": [
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    },
+    {
+      "command": "CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_transforms.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-sm120-synccheck-release.log",
+      "sha256": "0b3b99aaaa4e078bb34b77139f19d748904e854ebfb398d2b0611fc50838a4b2",
+      "result": "61 passed, 13 skipped in 20.64s",
+      "sanitizer_summary": [
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    }
+  ],
+  "sm120_device": {
+    "hostname": "ripper",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "name": "NVIDIA RTX PRO 4000 Blackwell",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "gpu_mode": "Default",
+    "driver": "580.173.02"
+  },
+  "sanitizer_scope": "Kernel memory and synchronization instrumentation. CUDA API reporting is disabled because CUDA Python 13.4 probes APIs absent from the installed 13.0 driver; see sm103-fp6-validation.json. This is not driver/API compatibility qualification.",
+  "package": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-moe-package-final.json",
+    "sha256": "1463dc0dcb9457f9177c088f528f8225af5f42b88946b98ddd146f45fd679126",
+    "verified_python_files": 455,
+    "verified_profiles": 3,
+    "files_identical": 458,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": "5773692a275f11d64ae42112a28861ff18b48a78b3f35dfb369b5e247968631e",
+      "b12x-1.3.0.tar.gz": "32ae255e9e1561bd2d3025553a422705f506a7ae4db0d8a09c17a5366d86d22d"
+    }
+  },
+  "policy": {
+    "query_schema_version": 6,
+    "config_schema_version": 5,
+    "candidate_contract_version": 20,
+    "embedded_profile_changes": "Only existing MoE config schema versions changed; all measured profile payloads are preserved. No SM103 measured profile emitted."
+  },
+  "deferred": {
+    "suite": "trellis_moe",
+    "native_sm103_cases": 13,
+    "v41_geometry": {
+      "experts": 384,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "top_k": 6
+    },
+    "checks": [
+      "Independent decoded-weight and transform oracle",
+      "Finite and nonzero output, relative L2 below 1%, cosine at least 0.999",
+      "Live counts 1/3/4/8 under frozen kernel resolution",
+      "Mutated inputs, compressed weights, scales and route maps under graph replay",
+      "Stable addresses and no replay allocation",
+      "Native projection and transform offset tests beyond 2^31"
+    ]
+  },
+  "remaining_implementation": [
+    "Canonical MCG and mixed/paired-rate expert dispatch",
+    "Mixed-rate descriptor capacities above 256 experts",
+    "Compressed DeepSeek sparse MLA, mHC/MTP and full DFlash2/model integration",
+    "Station direct HBM GDR transport"
+  ]
+}

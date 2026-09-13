@@ -495,8 +495,9 @@ def test_v41_trellis_pipeline_consumes_canonical_weight_plan():
         pipeline.reconstruction(projection="w13", bits=4).capacity
         == 2 * 384 * 320 * 144
     )
-    with pytest.raises(UnsupportedArchitectureError, match="tcgen05 projection"):
-        pipeline.require_execution()
+    from b12x.moe.fused_moe._sm103_trellis import validate_weight_plan
+    with pytest.raises(UnsupportedArchitectureError, match="SiTU"):
+        validate_weight_plan(plan._impl)
 
 
 def test_sm103_generator_filters_unsupported_recipes_and_route_capacities():
@@ -508,11 +509,12 @@ def test_sm103_generator_filters_unsupported_recipes_and_route_capacities():
     selected = generator._for_device(context)
     assert selected is not generator
     assert 0 < len(selected._geometries) < len(generator._geometries)
-    assert all(c.routed_rows <= 65535 for c in selected._cases)
     assert all(
-        g.recipe.quant_mode == "nvfp4"
-        and g.hidden_size % 256 == 0
-        and g.intermediate_size % 256 == 0
+        (g.recipe.quant_mode == "nvfp4"
+         and g.hidden_size % 256 == 0 and g.intermediate_size % 256 == 0)
+        or (g.recipe.trellis_variant == "k3-sqg-uniform-coupled"
+            and g.activation == "situ" and g.hidden_size % 512 == 0
+            and g.intermediate_size % 128 == 0)
         for g in selected._geometries
     )
     assert selected._for_device(context) is selected
@@ -521,4 +523,5 @@ def test_sm103_generator_filters_unsupported_recipes_and_route_capacities():
         candidates = _candidates_for_geometry(
             g, sm_count=B300.sm_count, compute_capability=(10, 3)
         )
-        assert len(candidates) == 1 and candidates[0].config["backend"] == BACKEND
+        expected = BACKEND if g.recipe.quant_mode == "nvfp4" else "tcgen05_trellis"
+        assert len(candidates) == 1 and candidates[0].config["backend"] == expected

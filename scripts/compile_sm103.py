@@ -775,6 +775,22 @@ def compile_trellis(out):
                     args = [pointer(t) for t in (cutlass.Float16, cutlass.Uint32, cutlass.Uint8, id_dtype, cutlass.Float16)]
                     args += [cutlass.Int32(1), cutlass.Int64(k), cutlass.Int64(n), cuda.CUstream(0)]
                     compile_case(name, RoutedTrellisGemm(n, k, 384, 128, bits=bits, codebook=codebook), args)
+    from b12x.moe.fused_moe._sm103_trellis import compile_launches as compile_moe
+    import torch
+    for label, codebook, bits, coupled, activation, dtype in (
+        ("v41", "sqg_e4m3", 3, True, "situ", torch.float16),
+        ("mcg", "mcg", 3, False, "silu", torch.bfloat16),
+        ("sqg", "sqg_e4m3", 4, False, "situ", torch.float16),
+        ("sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
+    ):
+        caps = SimpleNamespace(
+            k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
+            route_num_experts=768, dtype=dtype, activation=activation,
+            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis" if codebook == "sqg_e4m3" else "btx",
+                                        trellis_bits=bits, trellis_codebook=codebook),
+        )
+        compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix="trellis_moe_" + label + "_")
+        launches.update({"trellis_moe_" + label + "_" + key: fn for key, fn in compiled.items()})
     return launches
 
 
@@ -1107,7 +1123,7 @@ def main():
             "experts": 384,
             "hidden": 5120,
             "intermediate": 2304,
-            "stage": "unscaled quantizer-basis tiles and inline FP16 projections",
+            "stage": "quantizer-basis tiles, inline FP16 projections, and uniform-rate expert MoE",
         },
         "roce_geometry": {
             "world_size": 2,

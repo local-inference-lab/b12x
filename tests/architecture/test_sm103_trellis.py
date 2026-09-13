@@ -2,7 +2,6 @@
 
 import pytest
 
-from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x.moe._shared.kernels.sm103.trellis import (
     TrellisPipeline,
     ReconstructTrellisTiles,
@@ -22,8 +21,6 @@ def test_weight_plan_projection_geometry(stage, n, k):
         384,
         128,
     )
-    with pytest.raises(UnsupportedArchitectureError, match="mixed-rate MoE"):
-        pipeline.require_execution()
 
 
 @pytest.mark.parametrize(

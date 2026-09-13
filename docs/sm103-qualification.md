@@ -1,7 +1,7 @@
 # SM103 / B300 qualification
 
 Status: **implemented prototype, unqualified on B300**. The normal b12x API
-selects a native NVFP4 MoE backend for SM103. Physical SM103 execution, complete
+selects native NVFP4 and uniform-rate Trellis MoE backends for SM103. Physical SM103 execution, complete
 GLM serving, V4.1 serving and Station RDMA remain unqualified. No B300 performance
 numbers or measured B300 policy profile are included.
 
@@ -11,7 +11,7 @@ numbers or measured B300 policy profile are included.
 | --- | --- | --- |
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
-| Trellis | Existing t256 MCG/SQG reconstruction and inline FP16 tcgen05 projection; exact decoder/staging tests on SM120 and SM103 compilation | Native projection numerics and graphs; complete expert rotations and mixed-rate MoE integration remain implementation work |
+| Trellis | Native uniform-rate MoE with inline FP16 tcgen05 projection, ordinary/coupled transforms, routing and weighted reduction; host, SM120 preparation/transform tests and SM103 compilation | Native complete-expert numerics and graphs; mixed-rate dispatch remains implementation work |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
@@ -89,11 +89,11 @@ The output directory must be empty. Optional `--nvdisasm /path/to/nvdisasm`
 and `--cuobjdump /path/to/cuobjdump` retain SASS and resource reports. The manifest
 records source/toolchain identity and per-file hashes. The representative corpus
 contains nine MoE launchers, eight TP2 communication launchers, 20 reconstruction
-and 28 Trellis projection launchers,
-launchers, 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
+and 28 Trellis projection launchers, 64 complete Trellis MoE launchers,
+36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
-activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 372
+activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 436
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -116,7 +116,7 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, compressed DeepSeek sparse MLA, Trellis experts,
+Full-model serving, compressed DeepSeek sparse MLA, mixed-rate Trellis experts,
 Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
@@ -563,26 +563,45 @@ the native SM103 GEMM. See the
 
 ## Trellis and V4.1
 
-Status: **reconstruction and quantizer-basis projection implemented and
-cross-compiled; complete Trellis MoE unsupported**. The native FP16 projection
-decodes existing t256 records directly into shared memory and accumulates with
-tcgen05/TMEM. It does not allocate a decoded weight matrix in global memory.
-Each CTA handles one route and 128 output columns, using one 128x64 operand
-stage. The schedule waits for MMA completion before reusing that stage; it
-does not overlap compressed loads, decoding, and MMA.
+Status: **uniform-rate MoE implemented and cross-compiled; B300 execution
+unqualified**. The existing MoE plan/bind/run API selects `tcgen05_trellis`.
+The native FP16 projection decodes t256 records directly into shared memory
+and accumulates with tcgen05/TMEM. Each CTA handles one route and 128 output
+columns, using one 128x64 operand stage. The schedule waits for MMA completion
+before reusing that stage. Overlap, persistent scheduling and route batching
+require subsequent profiling and tuning.
 
-The decoder preserves FP16 checkpoint values for MCG K2–K6, SQG E4M3 K2–K4,
-and SQG FP16 K5/K6. Diagnostic output may be FP16 or BF16. The projection
-consumes and returns FP16 quantizer-basis activations. Model boundary
-rotations, their FP16 rounding, coupled Hadamards, mixed per-expert/projection
-rates, activation, and weighted reduction still need integration through the
-existing MoE plan/bind/run API. That API continues to reject full Trellis
-execution on SM103.
+CuTe kernels implement scaled H128 input/intermediate/output transforms,
+SiLU or SiTU, coupled H512/H128 transforms and router-weighted reduction.
+The default output is FP32; caller output may use FP32 or the public FP16/BF16
+input dtype. Ordinary gate/up input scales may differ. Coupled execution
+requires their shared input-scale tensor and SiTU. Runtime Int32/Int64 route
+IDs and optional route/output maps are supported. Every pool-scaled offset
+uses Int64 before multiplication. Invalid routes write zeros without reading
+invalid expert weights or scale rows.
+
+Canonical uniform SQG E4M3 K2/K3/K4 weights use the existing checkpoint loader.
+Preparation records the loaded rate in the immutable prepared weight plan and
+uses FP16 internal projection buffers independently of public I/O dtype.
+Private native BTX layouts also support uniform MCG K3–K6 and SQG FP16 K5/K6.
+All callables, including supported canonical rate variants, are resolved before
+capture. Binding retains compressed payload views and fixed scratch capacity;
+replay performs no allocation or policy lookup. This is a materialized expert
+schedule, not a claim of single-kernel fusion.
+
+Canonical MCG preparation, mixed per-expert/projection rates and paired records
+remain unsupported by the SM103 MoE backend. The existing mixed-rate descriptor
+builder also has a 256-expert tier-capacity limit that must be addressed for
+384-expert V4.1 geometry. The standalone decoder and projection support MCG K2
+for diagnostics; the existing private MoE weight contract starts MCG at K3.
 
 ```bash
 python -m pytest tests/moe/test_sm103_trellis.py -q
 python scripts/compile_sm103.py --component trellis --output-dir /tmp/sm103-trellis
-# Execute native projection qualification only on the selected B300.
+# Execute native expert and projection qualification on the selected B300.
+python scripts/qualify_sm103.py --component trellis_moe --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-trellis-moe \
+  --sanitizer /path/to/compute-sanitizer
 python scripts/qualify_sm103.py --component trellis_projection --execute \
   --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-trellis-projection \
   --sanitizer /path/to/compute-sanitizer
@@ -603,6 +622,21 @@ Portable staging tests execute the production decoder and shared-memory stores
 on SM120, including source and weight offsets beyond 2^31. Their exact equality
 does not qualify SM103 MMA ordering or arithmetic. See the
 [Trellis projection validation receipt](sm103-trellis-validation.json).
+
+The complete uniform-rate backend adds 64 callables to the offline corpus.
+Its host suite passes 501 tests. SM120 runs pass 61 preparation, transform,
+decoder and staging tests under both memcheck and synccheck; 13 native SM103
+cases remain deferred. Those cases include E=384, H=5120, I=2304, top-k=6,
+multiple live counts, changed graph inputs and weights, stable addresses,
+and no replay allocation. The whole-expert numeric gates require finite,
+nonzero output, relative L2 error below 1% and cosine at least 0.999 against
+the independent FP32 oracle. The added kernels use 12–140 allocated GPRs
+and no stack or local memory. Existing resource use has no positive deltas;
+31 prior stack-flagged callables remain visible in the full census.
+See the [uniform Trellis MoE validation receipt](sm103-trellis-moe-validation.json)
+for exact source, test, package and artifact identities. SM120 execution
+qualifies the portable stages and preparation changes; native SM103 MMA
+and full-expert execution require B300 qualification.
 
 The projection benchmark gates both arms against an independent FP32 oracle,
 then compares native compressed projection with per-route Torch FP16 GEMMs
@@ -629,8 +663,8 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Native Trellis projection,
-V4.1 compressed attention, mHC and complete MTP execution remain model blockers.
+fit. Preserve HBM for KV, scratch and graph pools. Mixed-rate expert dispatch, V4.1 compressed attention, mHC and complete MTP
+execution remain model blockers.
 
 ## Engram placement
 
@@ -715,7 +749,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
-| Trellis experts | `sm103/trellis.py`, `sm103/trellis_gemm.py`, `fused_moe/trellis.py`: integrate the inline FP16 projection with scale/rotation staging, coupled Hadamards, mixed rates, and the MoE backend; no full-model repack |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `w4a16/mixed_trellis.py`: add mixed-rate dispatch and descriptors covering 384 experts; qualify the implemented uniform-rate backend |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |
 
