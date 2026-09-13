@@ -4120,7 +4120,7 @@ def mma_m16n8k32_f32_e4m3(
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32, Float32, Float32]:
-    """Plain (non-block-scaled) SM120 FP8 E4M3 warp MMA `m16n8k32`.
+    """Ordinary FP8 E4M3 warp MMA `m16n8k32` for SM103 and SM12x.
 
     d{0..3} are the accumulator IN-OUT (C on input, D on output)."""
     result = llvm.inline_asm(

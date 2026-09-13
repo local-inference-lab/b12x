@@ -37,7 +37,7 @@ from b12x._lib.intrinsics import (
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
-    mxfp8_mma_m16n8k32_f32_e4m3,
+    mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
@@ -604,7 +604,7 @@ def _compute_mxfp8_tile_partials(
             Int32(16),
             Int32(_INDEX_HEAD_DIM // 16),
         )
-        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+        d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
             q0_acc,
             q1_acc,
             q2_acc,
@@ -615,8 +615,6 @@ def _compute_mxfp8_tile_partials(
             q3,
             b0_k0,
             b0_k1,
-            Uint32(0x7F7F7F7F),
-            Uint32(0x7F7F7F7F),
         )
         q0_acc = d0
         q1_acc = d1
@@ -706,7 +704,7 @@ def _compute_mxfp8_tile_head_token_max(
             Int32(16),
             Int32(_INDEX_HEAD_DIM // 16),
         )
-        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+        d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
             q0_acc,
             q1_acc,
             q2_acc,
@@ -717,8 +715,6 @@ def _compute_mxfp8_tile_head_token_max(
             q3,
             b0_k0,
             b0_k1,
-            Uint32(0x7F7F7F7F),
-            Uint32(0x7F7F7F7F),
         )
         q0_acc = d0
         q1_acc = d1
@@ -2380,10 +2376,10 @@ def run_paged_logits_kernel(
             weights_kernel,
             dynamic_dims=(0,),
         ),
-        _tensor_meta_key(k_quant_bytes),
-        _tensor_meta_key(k_tma_desc_ptrs),
+        _tensor_compile_key("k_quant_bytes", k_quant_bytes, dynamic_dims=(0,)),
+        _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs, dynamic_dims=(0,)),
         _tensor_meta_key(use_scalar_k_load_tensor),
-        _tensor_meta_key(k_scales),
+        _tensor_compile_key("k_scales", k_scales, dynamic_dims=(0,)),
         _tensor_compile_key(
             "real_page_table",
             real_page_table_kernel,
@@ -2910,10 +2906,10 @@ def _run_paged_tiled_logits_kernel_common(
             weights_kernel,
             dynamic_dims=(0,),
         ),
-        _tensor_meta_key(k_quant_bytes),
-        _tensor_meta_key(k_tma_desc_ptrs),
+        _tensor_compile_key("k_quant_bytes", k_quant_bytes, dynamic_dims=(0,)),
+        _tensor_compile_key("k_tma_desc_ptrs", k_tma_desc_ptrs, dynamic_dims=(0,)),
         _tensor_meta_key(use_scalar_k_load_tensor),
-        _tensor_meta_key(k_scales),
+        _tensor_compile_key("k_scales", k_scales, dynamic_dims=(0,)),
         _tensor_compile_key(
             "real_page_table",
             real_page_table_kernel,
@@ -3218,7 +3214,7 @@ def _compute_mxfp8_tile_partials_qldm(
             Int32(16),
             Int32(_INDEX_HEAD_DIM // 16),
         )
-        d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+        d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
             q0_acc,
             q1_acc,
             q2_acc,
@@ -3229,8 +3225,6 @@ def _compute_mxfp8_tile_partials_qldm(
             a3,
             b0_k0,
             b0_k1,
-            Uint32(0x7F7F7F7F),
-            Uint32(0x7F7F7F7F),
         )
         q0_acc = d0
         q1_acc = d1
@@ -3627,7 +3621,7 @@ class DSAPagedStreamLogitsKernel:
                                     ),
                                 )
                                 b0, b1 = ldmatrix_m8n8x2_b16(b_addr)
-                                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
                                     d0,
                                     d1,
                                     d2,
@@ -3638,8 +3632,6 @@ class DSAPagedStreamLogitsKernel:
                                     ak[kk * 4 + 3],
                                     b0,
                                     b1,
-                                    Uint32(0x7F7F7F7F),
-                                    Uint32(0x7F7F7F7F),
                                 )
                             h0 = Int32(nt * 8) + t * Int32(2)
                             h1 = h0 + Int32(1)

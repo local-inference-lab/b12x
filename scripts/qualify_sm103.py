@@ -36,6 +36,10 @@ SUITES = {
         "tests/attention/test_dense_mla_window.py",
     ],
     "sparse_mla": ["tests/attention/test_sm103_sparse_mla.py"],
+    "dsa_indexer": [
+        "tests/attention/test_sm103_dsa_indexer.py",
+        "tests/attention/test_fused_indexer.py",
+    ],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
 }
 
@@ -137,7 +141,7 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "DSA indexer and compressed DeepSeek sparse MLA",
+            "compressed DeepSeek sparse MLA",
             "quantized linear backends",
             "Trellis experts",
             "Grace memory",
