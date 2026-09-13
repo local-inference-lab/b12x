@@ -41,6 +41,7 @@ SUITES = {
         "tests/attention/test_fused_indexer.py",
     ],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
+    "blockscaled": ["tests/gemm/test_sm103_blockscaled.py"],
 }
 
 
@@ -142,7 +143,7 @@ def main(argv=None):
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
             "compressed DeepSeek sparse MLA",
-            "quantized linear backends",
+            "tensor/block FP8 and MXFP6 linear backends",
             "Trellis experts",
             "Grace memory",
             "Station RDMA",

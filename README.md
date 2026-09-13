@@ -3,7 +3,8 @@
 `b12x` is a CuTe DSL and Triton kernel library for local LLM inference on
 Blackwell GPUs. SM120/SM121 paths target DGX Spark and Blackwell RTX cards.
 The SM103/B300 prototype implements native NVFP4 MoE, CuTe KDA/GDN recurrence,
-dense MLA, and unquantized projections behind the existing public APIs, with
+dense and GLM sparse MLA, DSA indexing, unquantized projections, and
+NVFP4/MXFP4/MXFP8 dense GEMM behind the existing public APIs, with
 Engram memory placement and an explicitly enabled Grace TP2 transport.
 SM103 kernels are cross-compiled; B300 execution and model serving remain
 unqualified. See the [SM103 qualification guide](docs/sm103-qualification.md)

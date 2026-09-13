@@ -46,7 +46,8 @@ def _snapshot():
     rows = [line for line in raw.splitlines() if line.startswith(uuid)]
     if len(rows) != 1:
         raise RuntimeError(f"could not identify physical GPU {uuid} in nvidia-smi")
-    return dict(fields=fields.split(","), values=[v.strip() for v in rows[0].split(",")])
+    return dict(fields=fields.split(","), values=[v.strip() for v in rows[0].split(",")],
+                compute_capability=list(torch.cuda.get_device_capability()))
 
 
 def _reference_weight(recipe, n, k):
@@ -68,6 +69,13 @@ def _reference_weight(recipe, n, k):
     packed = blockscaled.pack_weight(quant.values, quant.scale_rows[0])
     decoded = dequantize_mxfp8_rows_torch(quant.values, quant.scale_rows)
     return packed, decoded.float(), torch.ones(1, device="cuda")
+
+
+def quantized_nvfp4_reference(source, local_weight, multiplier, activation_scale):
+    """Independent E2M1/E4M3 activation rounding followed by FP32 GEMM."""
+    from b12x.moe._shared.kernels.materialized_nvfp4_reference import quantize_dequantize
+    activation = quantize_dequantize(source, activation_scale)
+    return (activation @ local_weight.T) * (multiplier / activation_scale)
 
 
 def _check(result, reference, label):
@@ -134,7 +142,17 @@ def _ratio_interval(pairs, candidate, baseline):
 
 
 def _clock_checks(before, after):
-    a, b = dict(zip(before["fields"], before["values"])), dict(zip(after["fields"], after["values"]))
+    a, b = dict(zip(before["fields"], before["values"], strict=True)), dict(zip(after["fields"], after["values"], strict=True))
+    if before.get("compute_capability") == [10, 3]:
+        checks = {
+            "physical_identity": a["uuid"] == b["uuid"] and after.get("compute_capability") == [10, 3],
+            "p0": a["pstate"] == b["pstate"] == "P0",
+            "memory_clock": a["clocks.mem"] == b["clocks.mem"],
+            "sm_clock_delta_le_30mhz": abs(float(a["clocks.sm"]) - float(b["clocks.sm"])) <= 30,
+            "throttle_mask_zero": all(int(row["clocks_event_reasons.active"], 16) == 0 for row in (a, b)),
+        }
+        return dict(checks=checks, valid=all(checks.values()),
+                    throttle_contract="SM103 qualification; zero throttle mask, P0, stable memory clock, SM delta <=30MHz")
     if a["name"] == b["name"] == "NVIDIA GB10":
         checks = {
             "physical_identity": a["uuid"] == b["uuid"],
@@ -160,8 +178,10 @@ def _clock_checks(before, after):
 def _compile_state():
     from b12x._lib.compiler import compile_cache_info
     from b12x._lib.dense_gemm import _get_compiled_dense_gemm
-    return dict(implementation="DenseGemmKernel", compiler=compile_cache_info(),
-                dense_resolver=_get_compiled_dense_gemm.cache_info()._asdict())
+    from b12x.gemm.blockscaled._sm103 import compile_kernel
+    return dict(compiler=compile_cache_info(),
+                dense_resolver=_get_compiled_dense_gemm.cache_info()._asdict(),
+                sm103_resolver=compile_kernel.cache_info()._asdict())
 
 
 def run(args, specs, *, flashinfer_error):
@@ -169,14 +189,16 @@ def run(args, specs, *, flashinfer_error):
         raise ValueError("A16 evidence requires --evidence FILE and enabled correctness checks")
     if args.iters < 20 or args.warmup < 3:
         raise ValueError("A16 evidence requires at least 20 trials and 3 warmups")
-    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
-        raise ValueError("A16 evidence requires SM120/SM121")
+    if torch.cuda.get_device_capability() not in ((10, 3), (12, 0), (12, 1)):
+        raise ValueError("A16 evidence requires SM103/SM120/SM121")
     recipe = "nvfp4" if args.dtype == "fp4-a16" else "mxfp8"
     counts = args.batch_sizes or COUNTS
     if any(m <= 0 for m in counts):
         raise ValueError("benchmark M must be positive")
     root = pathlib.Path(__file__).resolve().parents[1]
     paths = [*sorted((root / "b12x/gemm/blockscaled").glob("*.py")),
+             root / "b12x/gemm/_shared/sm103_blockscaled.py",
+             root / "b12x/moe/_shared/kernels/materialized_nvfp4_reference.py",
              root / "b12x/_lib/dense_gemm.py", root / "b12x/_lib/intrinsics.py", pathlib.Path(__file__).resolve()]
     manifest = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     args.evidence.parent.mkdir(parents=True, exist_ok=True)
@@ -207,10 +229,8 @@ def run(args, specs, *, flashinfer_error):
                 qcall()
                 # The quantized path has its own activation oracle.
                 if recipe == "nvfp4":
-                    aq, asc = quantize_grouped_nvfp4_torch(source[None], torch.tensor([m], device="cuda"), options["activation_global_scale"])
-                    qref = dense_gemm((aq, asc), (weight.values[:, :, None], weight.scale_mma),
-                                     ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn", c_dtype="bfloat16",
-                                     sf_vec_size=16, alpha=multiplier / options["activation_global_scale"], expected_m=m)[:, :, 0]
+                    qref = quantized_nvfp4_reference(
+                        source, local_weight, multiplier, options["activation_global_scale"])
                 else:
                     aq = quantize_mxfp8_rows_torch(source)
                     adeq = dequantize_mxfp8_rows_torch(aq.values, aq.scale_rows).float()
@@ -243,7 +263,7 @@ def run(args, specs, *, flashinfer_error):
                                                 weight.weight.scale_mma, k, k, n, m, None)
                     correctness["existing_quantized"] = _check(existing(), qref, "existing_quantized")
                     graphs["existing_quantized"] = _capture(existing)
-                    if m <= 8:
+                    if m <= 8 and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
                         fused_out = torch.empty(m, n, 1, device="cuda", dtype=torch.bfloat16)
                         fused_scratch = torch.empty(2 * m * n, device="cuda", dtype=torch.float32)
                         fused_call = lambda: dense_gemm_fused_quant_a(source, weight.weight.values[:, :, None],

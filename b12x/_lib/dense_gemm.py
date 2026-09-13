@@ -6411,7 +6411,11 @@ def _get_compiled_dense_gemm(
             ),
         ]
 
-    launch = _DenseGemmLaunch(
+    launch_type = _DenseGemmLaunch
+    if sm_version == "sm_103a":
+        from b12x.gemm.blockscaled._a16_cute import DenseA16Launch
+        launch_type = DenseA16Launch
+    launch = launch_type(
         n=n,
         k=k,
         l=l,
@@ -7736,6 +7740,24 @@ def dense_gemm(
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
+    from b12x._lib.gating import get_compute_capability
+    if get_compute_capability(a_torch.device) == (10, 3):
+        from b12x._lib.architecture import UnsupportedArchitectureError
+        from b12x.gemm.blockscaled._sm103 import execute
+        if (cluster_shape_mn != (1, 1) or mma_tiler_mn not in (None, (128, 128))
+                or load_path not in (None, "tma") or swap_ab not in (None, False)
+                or sfb_k_replicated or rhs_values_tiled is not None or _quantized_c is not None
+                or a_preexpanded or b_preexpanded or b_packed or a_fmt is not None or b_fmt is not None
+                or x_bf16 is not None or w_gscale is not None or plain_fp8 or row_scale is not None
+                or block_fp8 or _tile_k_override is not None or _split_k_slices_override is not None
+                or _large_m_unroll_override is not None or _target_occupancy_override is not None):
+            raise UnsupportedArchitectureError("SM103 dense GEMM does not implement the requested layout, fusion, or launch override")
+        if alpha_dtype not in (None, "float32"):
+            raise ValueError("SM103 dense GEMM alpha must use FP32")
+        if expected_m is not None and expected_m <= 0:
+            raise ValueError("expected_m must be positive when supplied")
+        return execute(lhs, rhs, out, ab_dtype=ab_dtype, sf_dtype=sf_dtype,
+                       c_dtype=c_dtype, sf_vec_size=sf_vec_size, alpha=alpha, stream=stream)
     if load_path is not None and load_path not in _DENSE_LOAD_PATHS:
         raise ValueError(
             f"dense_gemm load_path must be one of {_DENSE_LOAD_PATHS}, got {load_path!r}"

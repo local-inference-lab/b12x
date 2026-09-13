@@ -818,6 +818,72 @@ def compile_bf16_projection(out):
     return launches
 
 
+def compile_blockscaled(out):
+    """Compile production dense tcgen05 and inline A16 launch factories."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    import torch
+    from b12x._lib import dense_gemm as a16
+    from b12x.gemm.blockscaled import _sm103 as native
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    with patch.object(torch.cuda, "is_current_stream_capturing", lambda: False):
+        native.compile_kernel.cache_clear()
+        with patch.object(native, "b12x_compile", capture):
+            for recipe in ("nvfp4", "mxfp4", "mxfp8"):
+                for n, k, groups in ((136, 384, 2), (512, 1024, 1)):
+                    for c_dtype in ("bfloat16", "float16", "float32"):
+                        case = f"blockscaled_{recipe}_n{n}_k{k}_g{groups}_{c_dtype}"
+                        native.compile_kernel(n, k, groups, recipe, c_dtype, 0)
+                case = f"blockscaled_{recipe}_n8_k128_g1_alpha_one"
+                native.compile_kernel(8, 128, 1, recipe, "bfloat16", 0, True)
+            case = "blockscaled_nvfp4_large_output_address"
+            native.compile_kernel(524288, 128, 1, "nvfp4", "bfloat16", 0, True)
+        a16._get_compiled_dense_gemm.cache_clear()
+        with (patch.object(a16, "b12x_compile", capture),
+              patch.object(a16, "current_cuda_stream", lambda: cuda.CUstream(0))):
+            for recipe in ("nvfp4", "mxfp8"):
+                for bn, bk, split, k, input_k, reciprocal in (
+                    (64, 64, 1, 1024, 1024, False),
+                    (128, 64, 4, 1024, 1024, False),
+                    (64, 128, 4, 1024, 1024, False),
+                    (128, 128, 8, 1024, 1024, False),
+                    (64, 64, 1, 96, 80, False),
+                    *(([(128, 64, 4, 1024, 1024, True)]) if recipe == "nvfp4" else []),
+                ):
+                    case = f"a16_{recipe}_n{bn}_k{bk}_s{split}_width{k}_input{input_k}_reciprocal{int(reciprocal)}"
+                    a16._get_compiled_dense_gemm(
+                        136, k, 1, split, "k", "k", "n", cutlass.BFloat16, cutlass.Uint8,
+                        cutlass.Float32 if split > 1 else cutlass.BFloat16,
+                        cutlass.Float32, 16 if recipe == "nvfp4" else 32, 16, bk,
+                        (16, bn), (1, 1), a16._DenseGemmPolicy(True, True, False, split, False, False),
+                        148, "sm_103a", "tma", False, False, False,
+                        alpha_is_one=recipe == "mxfp8", target_occupancy_override=1,
+                        weight_only=recipe, alpha_reciprocal=reciprocal,
+                        input_k=input_k, device_ordinal=0,
+                    )
+            with patch("b12x._lib.gating.get_compute_capability", lambda device=None: (10, 3)):
+                a16._get_compiled_dense_split_k_reduce.cache_clear()
+                for split in (2, 4, 8):
+                    case = f"a16_reduce_s{split}"
+                    a16._get_compiled_dense_split_k_reduce(136, split, 0)
+    return launches
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -840,6 +906,7 @@ def main():
             "sparse_mla",
             "dsa_indexer",
             "projection",
+            "blockscaled",
             "all",
         ),
         default="moe",
@@ -942,6 +1009,8 @@ def main():
             launches.update(compile_dsa_indexer(out))
         if args.component in ("projection", "all"):
             launches.update(compile_bf16_projection(out))
+        if args.component in ("blockscaled", "all"):
+            launches.update(compile_blockscaled(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__

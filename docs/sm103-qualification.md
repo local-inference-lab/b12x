@@ -19,7 +19,7 @@ numbers or measured B300 policy profile are included.
 | Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
-| Quantized linears | SM103 unsupported; capability and plan gates reject them | Implement and qualify native quantized projections under existing plans |
+| Quantized linears | Implemented NVFP4/MXFP4/MXFP8 tcgen05/TMEM dense GEMM and inline W4A16/W8A16; cross-compiled through production factories | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs; tensor/block FP8 and MXFP6 remain unsupported |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
@@ -90,7 +90,8 @@ and `--cuobjdump /path/to/cuobjdump` retain SASS and resource reports. The manif
 records source/toolchain identity and per-file hashes. The representative corpus
 contains nine MoE launchers, eight TP2 communication launchers, three reconstruction
 launchers, 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
-and cache-writer launchers, 58 indexer launchers, and ten unquantized projection launchers: 186
+and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
+and 36 quantized-linear launchers: 222
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -113,9 +114,62 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, compressed DeepSeek sparse MLA, quantized linears, Trellis experts,
+Full-model serving, compressed DeepSeek sparse MLA, tensor/block FP8 and MXFP6 linears, Trellis experts,
 Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
+
+## Quantized projections
+
+`gemm.blockscaled.mm` selects the dense SM103 tcgen05/TMEM implementation for
+NVFP4, MXFP4, and MXFP8. W4A16 and W8A16 preserve BF16 activations and inline
+weight dequantization in the shared warp-MMA engine. W4A16 applies only the
+weight global scale; quantized NVFP4 additionally applies the activation
+quantizer multiplier. Packed weights, precision policy, prewarm, caller-owned
+output, and quantization workspace use the existing public interfaces.
+
+The dense native pipeline shares its TMA, scale staging, TMEM allocation, and
+accumulator lifecycle with routed NVFP4 MoE. Dense CTAs compute 128x128 tiles;
+they do not create route IDs or pad each source row into a separate MoE route.
+Native values are K-major, K is divisible by 128, and N by eight. Scale storage
+is F8_128x4. Grouped output is physical `[groups,M,N]` viewed as `[M,N,groups]`.
+Live M and group strides are runtime arguments; compile keys contain immutable
+weight geometry, recipe, dtype, and device/toolchain identity.
+
+The precision generator races actual public A16 and native quantized calls.
+Its NVFP4 oracle independently rounds activations to E2M1/E4M3 and evaluates
+FP32 GEMM. It excludes the SM12x fused activation-quantization candidate on
+SM103. Candidate contract version 4 invalidates incompatible checkpoints;
+serialized precision configs and existing measured SM12x profiles retain their
+schema. SM103 has no measured embedded profile. Its initial tiny-M A16 routes
+are unmeasured defaults.
+
+`tests/gemm/test_sm103_blockscaled.py` covers inline A16, independent native
+oracles, M1/M3/M8/M129/M257 reuse under frozen resolution, two-group strides,
+N/K tails, FP32/FP16/BF16 output, graph mutation, stable addresses, and replay
+allocation. A large-output case allocates about 4 GiB and verifies the CTA row
+whose element offset begins at 2^31; output row and group strides use Int64.
+The native cases require physical SM103. They are included in:
+
+```bash
+python scripts/qualify_sm103.py --component blockscaled --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-blockscaled \
+  --sanitizer /path/to/compute-sanitizer
+```
+
+Run synccheck after memcheck, then use the existing precision benchmark and
+profile generator. SM103 timing qualification requires P0, a zero throttle mask,
+stable memory clocks, and an SM-clock delta no greater than 30 MHz. Compile
+success and SM120 A16 regressions do not establish B300 correctness or latency.
+Tensor/block FP8, MXFP6, fused activation quantization, and SM12x-specific launch
+overrides remain rejected. Complete draft/target serving remains unsupported.
+
+The [quantized-linear validation receipt](sm103-blockscaled-validation.json)
+binds the compile corpus, SM120 regression logs, and wheel to package source.
+The 36 linear callables report no stack or local memory. Shared-pipeline MoE
+projections use 142 allocated GPRs, up from 138 for Int32 routes and 140 for
+Int64 routes in the preceding corpus. Those positive deltas remain flagged
+for target profiling. Static resource reports omit dynamic launch SMEM and
+do not establish occupancy or latency.
 
 ## Recurrent, dense MLA, and unquantized projection contracts
 
@@ -462,7 +516,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths; compressed DeepSeek sparse MLA remains a separate implementation gap |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
-| Dense/draft linears | `gemm/blockscaled`, `_lib/dense_gemm.py`: use native CUTLASS operations under existing layouts and plans |
+| Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`: physical qualification of implemented NVFP4/MXFP4/MXFP8 and A16; implement tensor/block FP8 and MXFP6 before advertising those recipes |
 | Trellis experts | `sm103/trellis.py`, `fused_moe/trellis.py`: scale/rotation staging, mixed rates, compressed-to-SMEM pipeline and BF16/FP8 UMMA; no full-model BF16 repack |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |
