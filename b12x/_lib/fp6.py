@@ -1449,7 +1449,7 @@ def fp6_block_ue8m0_exact(
             ],
             """
             {
-                .reg .pred p_zero, p_neg, p_ovf, p_mant;
+                .reg .pred p_zero, p_neg, p_ovf, p_mant, p_subnormal, p_below_min;
                 .reg .f32 t, ratio;
                 .reg .b32 bits, expf, mant, result;
 
@@ -1464,6 +1464,13 @@ def fp6_block_ue8m0_exact(
                 setp.ne.u32 p_mant, mant, 0;
                 selp.s32 result, 1, 0, p_mant;
                 add.s32 result, result, expf;
+
+                // Positive subnormals at or below 2^-127 clamp to byte zero.
+                // Larger subnormals round upward to byte one (2^-126).
+                setp.eq.u32 p_subnormal, expf, 0;
+                setp.le.u32 p_below_min, mant, 0x00400000;
+                and.pred p_below_min, p_subnormal, p_below_min;
+                selp.s32 result, 0, result, p_below_min;
 
                 setp.lt.s32 p_neg, result, 0;
                 setp.gt.s32 p_ovf, result, 255;

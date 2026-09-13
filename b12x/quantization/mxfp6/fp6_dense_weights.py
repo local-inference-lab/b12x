@@ -162,6 +162,10 @@ def _quantize_matrix_fp6(
         raise ValueError(
             f"GPU FP6 quantizer requires M%{_TILE}==0 and K%{_TILE}==0, got M={m} K={k}"
         )
+    from b12x._lib.gating import get_compute_capability
+    if get_compute_capability(mat_bf16.device) == (10, 3):
+        from ._linear_workspace import quantize_fp6_weight
+        return quantize_fp6_weight(mat_bf16.contiguous(), fmt, global_scale)
     # Lazy import to avoid an import cycle with the package __init__.
     from b12x.quantization.mxfp6 import (
         allocate_bf16_to_fp6_tma_outputs,
@@ -377,6 +381,10 @@ class FP6DenseWeight:
         width reaches ``PACKED_GEMM_MIN_N``. Using the logical width keeps the
         route stable when tensor parallelism changes the local shard width.
         """
+        if self.packed.device.type == "cuda":
+            from b12x._lib.gating import get_compute_capability
+            if get_compute_capability(self.packed.device) == (10, 3):
+                return True
         n = self.out_features_unsharded or self.out_features
         return n >= PACKED_GEMM_MIN_N
 
@@ -462,6 +470,9 @@ def dense_fp6_linear_expanded(
     *,
     out: Optional[torch.Tensor] = None,
     act_fmt: Optional[str] = None,
+    workspace=None,
+    expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Tensor-level FP6 dense linear over a raw weight tensor.
 
@@ -482,6 +493,17 @@ def dense_fp6_linear_expanded(
         raise ValueError(
             f"in_features mismatch: x K={k}, weight in_features={in_features}"
         )
+    from b12x._lib.gating import get_compute_capability
+    if workspace is not None or get_compute_capability(x_bf16.device) == (10, 3):
+        from ._linear_workspace import linear_with_workspace
+        return linear_with_workspace(x_bf16, weight, scale_storage, global_scale,
+            fmt, out_features, in_features, out=out, act_fmt=act_fmt,
+            workspace=workspace, per_row=_DENSE_PER_ROW_GS, expected_m=expected_m, stream=stream)
+    if expected_m is not None or stream is not None:
+        from ._linear_workspace import linear_with_workspace
+        return linear_with_workspace(x_bf16, weight, scale_storage, global_scale,
+            fmt, out_features, in_features, out=out, act_fmt=act_fmt,
+            per_row=_DENSE_PER_ROW_GS, expected_m=expected_m, stream=stream)
     w_k = weight.shape[1]
     if w_k == in_features:
         b_packed = False
@@ -670,6 +692,9 @@ def dense_fp6_linear(
     weight: FP6DenseWeight,
     *,
     out: Optional[torch.Tensor] = None,
+    workspace=None,
+    expected_m: int | None = None,
+    stream: object = None,
 ) -> torch.Tensor:
     """Compute ``y = x @ W.T`` in MX-FP6 for a pre-quantized dense weight.
 
@@ -689,6 +714,9 @@ def dense_fp6_linear(
         weight.in_features,
         out=out,
         act_fmt=weight.act_fmt,
+        workspace=workspace,
+        expected_m=expected_m,
+        stream=stream,
     )
 
 

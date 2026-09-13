@@ -95,8 +95,10 @@ def require_kernel_architecture(
         "b12x.gemm.blockscaled._a16_cute",
         "b12x.gemm.blockscaled._fp8_cute",
         "b12x.gemm.blockscaled._sm103",
+        "b12x.gemm.blockscaled._fp6",
         "b12x.gemm._shared.sm103_blockscaled",
         "b12x._lib.quant.mxfp8_rows",
+        "b12x.quantization.mxfp6._rows",
     }:
         # Portable recurrent kernels have SM103 compilation evidence. Transport
         # construction additionally requires explicit Grace qualification.

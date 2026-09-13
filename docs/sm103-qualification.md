@@ -19,7 +19,7 @@ numbers or measured B300 policy profile are included.
 | Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
-| Quantized linears | Implemented NVFP4/MXFP4/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs; MXFP6 remains unsupported |
+| Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
@@ -92,7 +92,7 @@ contains nine MoE launchers, eight TP2 communication launchers, three reconstruc
 launchers, 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
-activation-quantizer launchers: 269
+activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 327
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -115,7 +115,7 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, compressed DeepSeek sparse MLA, MXFP6 linears, Trellis experts,
+Full-model serving, compressed DeepSeek sparse MLA, Trellis experts,
 Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
@@ -161,9 +161,76 @@ Run synccheck after memcheck, then use the existing precision benchmark and
 profile generator. SM103 timing qualification requires P0, a zero throttle mask,
 stable memory clocks, and an SM-clock delta no greater than 30 MHz. Compile
 success and SM120 A16 regressions do not establish B300 correctness or latency.
-MXFP6, fused activation quantization, and
-SM12x-specific launch overrides remain rejected. Complete draft/target serving
+Fused activation quantization and SM12x-specific launch overrides remain
+rejected by the native block-scaled entry. Complete draft/target serving
 remains unsupported.
+
+### MXFP6 linears
+
+Status: **implemented and cross-compiled; unqualified on SM103**. The existing
+`dense_fp6_linear` and `gemm.blockscaled.mm` interfaces select an internal
+tcgen05/TMEM implementation for FP6. E2M3, E3M2, and E4M3 operands have
+independent formats. FP6 values remain packed at 3K/4 bytes per row in global
+memory. Explicit byte-container operands are packed within shared memory.
+K must be divisible by 128 and N by eight. Packed TMA addresses must be
+32-byte aligned; activation group strides must be divisible by 96 bytes.
+
+The TMA layout follows NVIDIA's
+[sub-byte tensor-copy restrictions](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#restriction-on-tensor-copy-instructions):
+each sixteen FP6 elements occupies twelve data bytes plus four padding bytes
+in shared memory. Barrier transaction counts use the transferred global bytes,
+as in the [CUTLASS block-scaled mainloop](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/collective/sm100_blockscaled_mma_warpspecialized.hpp).
+Valid descriptors, padding interpretation, and MMA synchronization still require
+physical SM103 execution.
+
+`allocate_fp6_linear_workspace` owns fixed quantization capacity. Warm the
+workspace before capture and pass it with caller-owned output:
+
+```python
+from b12x.quantization.mxfp6 import allocate_fp6_linear_workspace, dense_fp6_linear
+
+workspace = allocate_fp6_linear_workspace(
+    capacity, weight.in_features, device=x.device, act_fmt=weight.act_fmt,
+)
+out = torch.empty((capacity, weight.out_features), device=x.device, dtype=torch.bfloat16)
+dense_fp6_linear(x[:1], weight, out=out[:1], workspace=workspace, expected_m=capacity)
+# Inside a later CUDA graph capture, reuse the same workspace and output.
+dense_fp6_linear(x[:live_rows], weight, out=out[:live_rows], workspace=workspace,
+                 expected_m=capacity)
+```
+
+Each graph with overlapping execution needs its own workspace. Live rows are
+runtime scalars in the quantization and GEMM callables. Per-row activation
+scaling preserves the BF16 prescale and output-correction roundings. Padding
+scale rows are overwritten, and pool-sized row products use Int64. The shared
+FP6 scale conversion clamps subnormal exponents to its representable floor.
+
+The hardware suite includes independent code/scale and GEMM oracles, mixed
+formats, groups, packed and expanded operands, graph mutation, allocation
+checks, explicit streams, and offsets beyond 2^31 elements. Execute it before
+collecting timings:
+
+```bash
+python scripts/qualify_sm103.py --component fp6 --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-fp6 \
+  --sanitizer /path/to/compute-sanitizer
+python benchmarks/benchmark_fp6_linear.py --rows 1 4 8 128 --capacity 128 \
+  --n 4096 --k 4096 --act-fmt e4m3 --weight-fmt e2m3 \
+  --device-uuid GPU-actual-B300-UUID --output /tmp/sm103-fp6-timing.json
+```
+
+The benchmark compares complete FP6 quantization/projection/correction with
+a Torch BF16 projection using the original weights. It gates FP6 against an
+independently quantized oracle, retains paired warm/cold samples, and records
+the ratio as FP6/BF16. Those arms use different numerical contracts. No timing
+result is supplied before physical SM103 execution.
+
+The [FP6 validation receipt](sm103-fp6-validation.json) binds source, compile
+artifacts, package contents, and regression logs. SM120 kernel memcheck and
+synccheck pass with API reporting disabled because the installed CUDA Python
+bindings probe APIs newer than that host's driver. The unfiltered run and an
+isolated loader reproducer are retained. Those checks do not qualify driver
+API compatibility or physical SM103 execution.
 
 The [quantized-linear validation receipt](sm103-blockscaled-validation.json)
 binds the compile corpus, SM120 regression logs, and wheel to package source.
@@ -601,7 +668,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths; compressed DeepSeek sparse MLA remains a separate implementation gap |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
-| Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `gemm/block_fp8_linear`: qualify implemented native block-scaled, A16, tensor/compact FP8, and planned BF16/FP16 block-FP8; implement MXFP6 |
+| Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | Trellis experts | `sm103/trellis.py`, `fused_moe/trellis.py`: scale/rotation staging, mixed rates, compressed-to-SMEM pipeline and BF16/FP8 UMMA; no full-model BF16 repack |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |

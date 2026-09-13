@@ -44,21 +44,40 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 class BlockscaledGemm:
-    def __init__(self, n, k, groups, *, recipe, c_dtype, routed_capacity=None, alpha_is_one=False):
-        if recipe not in ("nvfp4", "mxfp4", "mxfp8"):
-            raise ValueError("SM103 blockscaled GEMM requires NVFP4, MXFP4, or MXFP8")
+    def __init__(self, n, k, groups, *, recipe, c_dtype, routed_capacity=None, alpha_is_one=False,
+                 a_fmt=None, b_fmt=None, a_preexpanded=False, b_preexpanded=False,
+                 apply_row_scale=False):
+        if recipe not in ("nvfp4", "mxfp4", "mxfp8", "mxfp6"):
+            raise ValueError("SM103 blockscaled GEMM requires NVFP4, MXFP4, MXFP6, or MXFP8")
         self.n, self.k = n, k
         self.experts = groups
         self.routed = routed_capacity is not None
         self.capacity = routed_capacity
         self.recipe = recipe
         self.mma_tiler_mn = (128, 128)
-        self.mma_inst_shape_k = 32 if recipe == "mxfp8" else 64
+        self.mma_inst_shape_k = 32 if recipe in ("mxfp6", "mxfp8") else 64
         self.ab_dtype = cutlass.Float8E4M3FN if recipe == "mxfp8" else cutlass.Float4E2M1FN
+        self.a_dtype = self.b_dtype = self.ab_dtype
+        self.pack_a_smem = self.pack_b_smem = False
+        if recipe == "mxfp6":
+            if routed_capacity is not None:
+                raise ValueError("MXFP6 dense GEMM does not use the routed NVFP4 contract")
+            types = {"e2m3": cutlass.Float6E2M3FN, "e3m2": cutlass.Float6E3M2FN,
+                     "e4m3": cutlass.Float8E4M3FN}
+            if a_fmt not in types or b_fmt not in types:
+                raise ValueError("MXFP6 operand formats must be e2m3, e3m2, or e4m3")
+            self.a_dtype, self.b_dtype = types[a_fmt], types[b_fmt]
+            self.pack_a_smem = a_preexpanded and self.a_dtype.width == 6
+            self.pack_b_smem = b_preexpanded and self.b_dtype.width == 6
+        self.a_gmem_dtype = cutlass.Uint8 if self.pack_a_smem else self.a_dtype
+        self.b_gmem_dtype = cutlass.Uint8 if self.pack_b_smem else self.b_dtype
+        self.a_smem_dtype = cutlass.Uint8 if self.a_dtype.width == 6 else self.a_dtype
+        self.b_smem_dtype = cutlass.Uint8 if self.b_dtype.width == 6 else self.b_dtype
         self.sf_dtype = cutlass.Float8E4M3FN if recipe == "nvfp4" else cutlass.Float8E8M0FNU
         self.sf_vec_size = 16 if recipe == "nvfp4" else 32
         self.c_dtype = c_dtype
         self.alpha_is_one = alpha_is_one
+        self.apply_row_scale = apply_row_scale
         self.threads_per_cta = 128
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_103")
         self.num_tmem_alloc_cols = 512
@@ -81,6 +100,7 @@ class BlockscaledGemm:
         c_group_stride: cutlass.Int64,
         alpha_stride: cutlass.Int64,
         stream: cuda.CUstream,
+        row_scale=None,
     ):
         if cutlass.const_expr(self.routed):
             ids = cute.make_tensor(ids, cute.make_layout(self.capacity))
@@ -88,6 +108,8 @@ class BlockscaledGemm:
         else:
             m, l = cutlass.Int64(live_rows), self.experts
         alpha = cute.make_tensor(alpha, cute.make_layout(self.experts, stride=alpha_stride))
+        if cutlass.const_expr(self.apply_row_scale):
+            row_scale = cute.make_tensor(row_scale, cute.make_layout(m))
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
         n, k = self.n, self.k
 
@@ -108,7 +130,7 @@ class BlockscaledGemm:
             cute.make_layout(
                 (m, cute.assume(k, 32), l),
                 stride=(cute.assume(k, 32), 1,
-                        cute.assume(a_group_stride, 128 // self.ab_dtype.width)),
+                        cute.assume(a_group_stride, 128 if self.a_gmem_dtype.width == 6 else 128 // self.a_gmem_dtype.width)),
             ),
         )
         b_tensor = cute.make_tensor(
@@ -147,7 +169,7 @@ class BlockscaledGemm:
             )
         else:
             mma_op = tcgen05.MmaMXF8F6F4Op(
-                self.ab_dtype, self.ab_dtype,
+                self.a_dtype, self.b_dtype,
                 (*self.mma_tiler_mn, self.mma_inst_shape_k),
                 tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
                 tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K,
@@ -162,13 +184,13 @@ class BlockscaledGemm:
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
-            self.ab_dtype,
+            self.a_smem_dtype,
             self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
             self.mma_tiler,
-            self.ab_dtype,
+            self.b_smem_dtype,
             self.num_ab_stage,
         )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
@@ -194,6 +216,7 @@ class BlockscaledGemm:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=self.a_smem_dtype if cutlass.const_expr(self.a_dtype.width == 6) else None,
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -203,6 +226,7 @@ class BlockscaledGemm:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=self.b_smem_dtype if cutlass.const_expr(self.b_dtype.width == 6) else None,
         )
 
         sfa_smem_layout = cute.slice_(
@@ -231,8 +255,10 @@ class BlockscaledGemm:
             internal_type=cutlass.Int16,
         )
 
-        a_copy_size = cute.size_in_bytes(self.ab_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.ab_dtype, b_smem_layout)
+        # TMA completion counts the transferred global bytes, excluding the
+        # padding it appends to packed FP6 groups in shared memory.
+        a_copy_size = cute.size(a_smem_layout) * self.a_gmem_dtype.width // 8
+        b_copy_size = cute.size(b_smem_layout) * self.b_gmem_dtype.width // 8
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (
@@ -262,6 +288,7 @@ class BlockscaledGemm:
             self.sfb_smem_layout_staged,
             ids,
             alpha,
+            row_scale,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -289,6 +316,7 @@ class BlockscaledGemm:
         sfb_smem_layout_staged: cute.Layout,
         ids,
         alpha: cute.Tensor,
+        row_scale,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -324,13 +352,13 @@ class BlockscaledGemm:
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sA = smem.allocate_tensor(
-            element_type=self.ab_dtype,
+            element_type=self.a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
         )
         sB = smem.allocate_tensor(
-            element_type=self.ab_dtype,
+            element_type=self.b_smem_dtype,
             layout=b_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
@@ -531,6 +559,14 @@ class BlockscaledGemm:
 
                 ab_full = ab_consumer.wait_and_advance()
 
+                if cutlass.const_expr(self.pack_a_smem):
+                    self._pack_fp6_smem(sA[(None, None, None, ab_full.index)], self.mma_tiler[0] * self.mma_tiler[2])
+                if cutlass.const_expr(self.pack_b_smem):
+                    self._pack_fp6_smem(sB[(None, None, None, ab_full.index)], self.mma_tiler[1] * self.mma_tiler[2])
+                if cutlass.const_expr(self.pack_a_smem or self.pack_b_smem):
+                    cute.arch.sync_warp()
+                    cute.arch.fence_proxy("async.shared", space="cta")
+
                 s2t_stage_coord = (None, None, None, None, ab_full.index)
                 tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
                 tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
@@ -604,6 +640,8 @@ class BlockscaledGemm:
                     value = tTR_rAcc[idx]
                     if cutlass.const_expr(not self.alpha_is_one):
                         value = value * alpha[safe_expert]
+                    if cutlass.const_expr(self.apply_row_scale):
+                        value = value.to(self.c_dtype).to(cutlass.Float32) * row_scale[global_row].to(cutlass.Float32)
                 tTR_gC[idx] = value.to(self.c_dtype)
 
         acc_full.release()
@@ -612,3 +650,21 @@ class BlockscaledGemm:
         tmem.free(acc_tmem_ptr)
 
         return
+
+    @cute.jit
+    def _pack_fp6_smem(self, tile: cute.Tensor, byte_count: cutlass.Constexpr):
+        """Pack sixteen byte codes into twelve bytes plus four ignored bytes.
+
+        A warp owns disjoint aligned sixteen-byte groups. Every code is loaded
+        before its group is overwritten; the caller publishes stores to UMMA.
+        """
+        lane = cute.arch.lane_idx()
+        storage = cute.make_tensor(tile.iterator, cute.make_layout(byte_count))
+        for group in cutlass.range(lane, byte_count // 16, 32):
+            codes = cute.make_rmem_tensor(16, cutlass.Uint32)
+            for i in cutlass.range_constexpr(16):
+                codes[i] = cutlass.Uint32(storage[group * 16 + i]) & 63
+            for i in cutlass.range_constexpr(4):
+                word = codes[4*i] | (codes[4*i+1] << 6) | (codes[4*i+2] << 12) | (codes[4*i+3] << 18)
+                for j in cutlass.range_constexpr(3):
+                    storage[group * 16 + 3*i + j] = cutlass.Uint8(word >> (8*j))

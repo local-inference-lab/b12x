@@ -44,6 +44,7 @@ SUITES = {
     "blockscaled": ["tests/gemm/test_sm103_blockscaled.py"],
     "fp8": ["tests/gemm/test_sm103_fp8.py"],
     "block_fp8_linear": ["tests/gemm/test_sm103_block_fp8_linear.py"],
+    "fp6": ["tests/gemm/test_sm103_fp6.py", "tests/quantization/test_fp6_workspace.py", "tests/gemm/test_fp6_smem_packing.py"],
 }
 
 
@@ -145,7 +146,6 @@ def main(argv=None):
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
             "compressed DeepSeek sparse MLA",
-            "MXFP6 linear backend",
             "Trellis experts",
             "Grace memory",
             "Station RDMA",
