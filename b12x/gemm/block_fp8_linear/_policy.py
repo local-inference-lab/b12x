@@ -56,12 +56,28 @@ def _encode(query: BlockFp8LinearQuery) -> dict[str, object]:
 
 def _heuristic(
     query: BlockFp8LinearQuery,
-    _device: DeviceIdentity | None,
+    device: DeviceIdentity | None,
 ) -> BlockFp8LinearConfig:
+    backend = "mxfp8"
     if query.max_tokens == 1:
         tile = (16, 64)
     elif query.max_tokens <= 8:
         tile = (16, 128)
+        # Narrow long-K projections need more independent CTAs. Four FP32
+        # partials preserve activation quantization and avoid BF16 atomic sums.
+        if (
+            device is not None
+            and device.compute_capability == (12, 0)
+            and device.sm_count == 188
+            and query.weight_block_size == 32
+            and query.output_dtype == "bfloat16"
+        ):
+            shape = (query.out_features, query.in_features)
+            if shape in {(1792, 5120), (1152, 5120)}:
+                tile = (16, 64)
+                backend = "mxfp8_split4_fp32"
+            elif shape == (4096, 1280):
+                tile = (16, 64)
     elif query.max_tokens <= 128 and query.out_features > 1_536:
         tile = (32, 128)
     elif query.max_tokens <= 128:
@@ -69,7 +85,7 @@ def _heuristic(
     else:
         tile = (64, 128)
     return BlockFp8LinearConfig(
-        backend="mxfp8",
+        backend=backend,
         tile_m=tile[0],
         tile_n=tile[1],
     )
@@ -80,7 +96,7 @@ def _validate(
     config: BlockFp8LinearConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if config.backend != "mxfp8":
+    if config.backend not in ("mxfp8", "mxfp8_split2_fp32", "mxfp8_split4_fp32"):
         raise ValueError(f"unsupported block-FP8 backend {config.backend!r}")
     if (config.tile_m, config.tile_n) not in {
         (16, 64),
@@ -99,12 +115,24 @@ def _validate(
         raise ValueError("block-FP8 in_features must be a positive multiple of 32")
     if query.weight_block_size not in (32, 128):
         raise ValueError("block-FP8 weight_block_size must be 32 or 128")
+    slices = {"mxfp8_split2_fp32": 2, "mxfp8_split4_fp32": 4}.get(config.backend, 1)
+    if slices > 1 and not (
+        2 <= query.max_tokens <= 8
+        and query.weight_block_size == 32
+        and query.output_dtype == "bfloat16"
+        and query.in_features % (256 * slices) == 0
+        and config.tile_m == 16
+    ):
+        raise ValueError(
+            f"FP32 split{slices} requires BF16 block32, capacity 2..8, "
+            f"K divisible by {256 * slices}, and a 16-row tile"
+        )
 
 
 BLOCK_FP8_LINEAR_POLICY = ComponentPolicy(
     component_id=BLOCK_FP8_LINEAR,
     query_schema_version=2,
-    config_schema_version=2,
+    config_schema_version=4,
     query_fields=frozenset(BlockFp8LinearQuery.__dataclass_fields__),
     config_fields=frozenset(BlockFp8LinearConfig.__dataclass_fields__),
     encode_query=_encode,

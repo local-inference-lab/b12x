@@ -90,6 +90,7 @@ class BlockFP8LinearBinding:
     # Plan.bind defaults it to scratch capacity; an explicit value takes precedence.
     expected_m: int | None = None
     mma_tiler_mn: tuple[int, int] | None = None
+    split_k_partials: torch.Tensor | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self, stream=stream)
@@ -124,6 +125,8 @@ class BlockFP8LinearScratchPlan:
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     mma_tiler_mn: tuple[int, int]
     policy_resolution: object | None = None
+    split_k_offset_bytes: int | None = None
+    split_k_slices: int = 1
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -176,6 +179,13 @@ class BlockFP8LinearScratchPlan:
             in_features=self.caps.in_features,
             output_dtype=self.caps.output_dtype,
         )
+        partials = None
+        if self.split_k_offset_bytes is not None:
+            partials = _scratch_view(
+                scratch, offset_bytes=self.split_k_offset_bytes,
+                shape=(self.split_k_slices, tokens, self.caps.out_features),
+                dtype=torch.float32,
+            )
         return build_block_fp8_linear_binding(
             source=source,
             packed_weight=packed_weight,
@@ -184,6 +194,7 @@ class BlockFP8LinearScratchPlan:
             bias=bias,
             expected_m=self.caps.max_tokens if expected_m is None else expected_m,
             mma_tiler_mn=self.mma_tiler_mn,
+            split_k_partials=partials,
         )
 
 
@@ -396,6 +407,7 @@ def build_block_fp8_linear_binding(
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
     mma_tiler_mn: tuple[int, int] | None = None,
+    split_k_partials: torch.Tensor | None = None,
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -422,6 +434,7 @@ def build_block_fp8_linear_binding(
         bias=bias,
         expected_m=expected_m,
         mma_tiler_mn=mma_tiler_mn,
+        split_k_partials=split_k_partials,
     )
 
 
@@ -453,17 +466,27 @@ def plan_block_fp8_linear_scratch(
         output_dtype=caps.output_dtype,
     )
     config = resolution.config
+    split_k_offset = None
+    nbytes = layout.nbytes
+    split_k_slices = {
+        "mxfp8_split2_fp32": 2, "mxfp8_split4_fp32": 4,
+    }.get(config.backend, 1)
+    if split_k_slices > 1:
+        split_k_offset = _align_up(nbytes, _SCRATCH_ALIGN_BYTES)
+        nbytes = split_k_offset + split_k_slices * caps.max_tokens * caps.out_features * 4
     return BlockFP8LinearScratchPlan(
         caps=caps,
         _scratch_specs=(
             scratch_buffer_spec(
                 "block_fp8_linear.scratch",
-                nbytes=layout.nbytes,
+                nbytes=nbytes,
                 device=caps.device,
             ),
         ),
         mma_tiler_mn=(config.tile_m, config.tile_n),
         policy_resolution=resolution,
+        split_k_offset_bytes=split_k_offset,
+        split_k_slices=split_k_slices,
     )
 
 
@@ -803,6 +826,7 @@ def block_fp8_linear_mxfp8(
     """
 
     mma_tiler_mn = None
+    split_k_partials = None
     if binding is not None:
         extras = [
             name
@@ -825,6 +849,7 @@ def block_fp8_linear_mxfp8(
         bias = binding.bias
         expected_m = binding.expected_m
         mma_tiler_mn = binding.mma_tiler_mn
+        split_k_partials = binding.split_k_partials
     else:
         x_q_storage = None
         output_storage = None
@@ -932,6 +957,11 @@ def block_fp8_linear_mxfp8(
         expected_m=expected_m,
         mma_tiler_mn=mma_tiler_mn,
         sfb_k_replicated=packed_weight.block_size[1] == 128,
+        _split_k_slices_override=(
+            split_k_partials.shape[0] if split_k_partials is not None else None
+        ),
+        _split_k_atomic_bf16_override=False if split_k_partials is not None else None,
+        _split_k_workspace=split_k_partials,
         stream=stream,
     )[:, :, 0]
     t_gemm = time.perf_counter() if _B12X_TIMING else 0.0

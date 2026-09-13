@@ -10,6 +10,7 @@ in the b12x repo.
 from __future__ import annotations
 
 import torch
+import pytest
 
 from b12x.gemm import wo_projection as wo
 from b12x.gemm._shared.wo_mxfp8 import (
@@ -18,6 +19,97 @@ from b12x.gemm._shared.wo_mxfp8 import (
 )
 
 from ..conftest import require_b12x
+
+
+@pytest.mark.parametrize("block_size", (32, 128))
+def test_planned_decode_tile_replays_live_rows_without_kernel_resolution(block_size):
+    """Capacity-eight plans retain fresh inputs across every smaller live batch."""
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm.wo_projection._policy import WoProjectionConfig
+    from b12x.policy import WO_PROJECTION, PolicyContext
+
+    require_b12x()
+    torch.manual_seed(41764)
+    policy = PolicyContext.for_device("cuda")
+
+    def operand(n, k):
+        value = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        scales = (
+            torch.randint(118, 124, (n // block_size, k // block_size), device="cuda")
+            .byte()
+            .view(torch.float8_e8m0fnu)
+        )
+        return value, scales
+
+    a, sa = operand(2048, 4096)
+    b, sb = operand(5120, 2048)
+    weights = [
+        wo.pack_weights(
+            a,
+            sa,
+            b,
+            sb,
+            groups=2,
+            group_width=4096,
+            rank=1024,
+            hidden=5120,
+            block_size=(block_size, block_size),
+            policy=policy.with_override(
+                WO_PROJECTION, WoProjectionConfig(decode_tile_n=tile)
+            ),
+        )
+        for tile in (0, 64)
+    ]
+    assert [w.decode_tile_n for w in weights] == [0, 64]
+    source = (torch.randn(8, 16, 512, device="cuda") / 4).bfloat16()
+    positions = torch.arange(8, device="cuda", dtype=torch.int64)
+    angles = torch.randn(64, 32, device="cuda")
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
+
+    def run(rows, weight):
+        return wo.run_inv_rope(
+            source[:rows],
+            positions[:rows],
+            cos_sin,
+            weight,
+            heads_per_group=8,
+            nope_dim=448,
+            rope_dim=64,
+            expected_m=8,
+        )
+
+    for weight in weights:
+        run(8, weight)
+    torch.cuda.synchronize()
+    freeze_kernel_resolution("WO capacity-eight live-row graph qualification")
+    try:
+        for rows in range(1, 9):
+            graphs, outputs = [], []
+            for weight in weights:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = run(rows, weight)
+                graphs.append(graph)
+                outputs.append(output)
+            for _ in range(3):
+                source.copy_((torch.randn_like(source.float()) / 4).bfloat16())
+                positions.copy_(torch.randint(0, 64, (8,), device="cuda"))
+                replacement = torch.randn_like(weights[0].wo_b.values.float())
+                for weight in weights:
+                    weight.wo_b.values.copy_(replacement)
+                for output in outputs:
+                    output.fill_(float("nan"))
+                for graph in graphs:
+                    graph.replay()
+                torch.cuda.synchronize()
+                assert bool(torch.isfinite(outputs[0]).all())
+                assert bool(torch.count_nonzero(outputs[0]))
+                torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+                torch.testing.assert_close(
+                    outputs[1], run(rows, weights[1]), atol=0, rtol=0
+                )
+    finally:
+        unfreeze_kernel_resolution()
 
 
 def test_plan_bind_run_singleton_group_matches_quantized_reference() -> None:

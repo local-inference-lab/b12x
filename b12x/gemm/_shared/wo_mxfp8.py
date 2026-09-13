@@ -99,6 +99,8 @@ class WOProjectionMXFP8Weights:
     rank: int
     hidden: int
     sfb_k_replicated: bool = False
+    decode_tile_n: int = 0
+    decode_policy_resolution: object | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,7 @@ class WOProjectionBinding:
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection (N=hidden,
     # the n>1536 path). None keeps the M-independent default tile.
     expected_m: int | None = None
+    decode_tile_n: int = 0
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return wo_projection_mxfp8(binding=self, stream=stream)
@@ -142,6 +145,7 @@ class WOProjectionInvRopeBinding:
     return_3d: bool = False
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
+    decode_tile_n: int = 0
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return wo_projection_inv_rope_mxfp8(binding=self, stream=stream)
@@ -210,6 +214,7 @@ class WOProjectionScratchPlan:
             weights=weights,
             return_3d=return_3d,
             expected_m=expected_m,
+            decode_tile_n=self.policy_resolution.config.decode_tile_n,
         )
 
     def bind_inv_rope(
@@ -249,6 +254,7 @@ class WOProjectionScratchPlan:
             rope_dim=rope_dim,
             return_3d=return_3d,
             expected_m=expected_m,
+            decode_tile_n=self.policy_resolution.config.decode_tile_n,
         )
 
     def _views_from_scratch(
@@ -1223,6 +1229,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
     rank: int,
     hidden: int,
     block_size: tuple[int, int] = (128, 128),
+    policy: PolicyContext | None = None,
 ) -> WOProjectionMXFP8Weights:
     """Pack local DSV4/DSV4.1 FP8 WO-A/WO-B checkpoint weights."""
 
@@ -1243,6 +1250,23 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         num_groups=1,
         block_size=block_size,
     )
+    policy = policy or get_auto_policy(wo_a_weight.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(wo_a_weight.device)
+    # This fixed capacity describes the supported fused-quant decode band,
+    # not a live request. Resolve once while packing immutable model weights.
+    resolution = policy.resolve(
+        WO_PROJECTION_POLICY,
+        WoProjectionQuery(
+            dtype="bfloat16",
+            max_tokens=8,
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+        ),
+    )
     return WOProjectionMXFP8Weights(
         wo_a=wo_a,
         wo_b=wo_b,
@@ -1251,6 +1275,8 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         rank=rank,
         hidden=hidden,
         sfb_k_replicated=block_size == (128, 128),
+        decode_tile_n=resolution.config.decode_tile_n,
+        decode_policy_resolution=resolution,
     )
 
 
@@ -2172,6 +2198,7 @@ def _build_wo_projection_binding_from_views(
     weights: WOProjectionMXFP8Weights,
     return_3d: bool = False,
     expected_m: int | None = None,
+    decode_tile_n: int = 0,
 ) -> WOProjectionBinding:
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     _check_wo_projection_views(
@@ -2191,6 +2218,7 @@ def _build_wo_projection_binding_from_views(
         output=output,
         return_3d=bool(return_3d),
         expected_m=expected_m,
+        decode_tile_n=decode_tile_n,
     )
 
 
@@ -2259,6 +2287,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
     rope_dim: int = 64,
     return_3d: bool = False,
     expected_m: int | None = None,
+    decode_tile_n: int = 0,
 ) -> WOProjectionInvRopeBinding:
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
@@ -2291,6 +2320,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
         rope_dim=int(rope_dim),
         return_3d=bool(return_3d),
         expected_m=expected_m,
+        decode_tile_n=decode_tile_n,
     )
 
 
@@ -2560,6 +2590,7 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     out: torch.Tensor | None = None,
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
+    decode_tile_n: int = 0,
     _atomic_output_precleared: bool = False,
     stream: object = None,
 ) -> torch.Tensor:
@@ -2598,8 +2629,8 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         if expected_m is not None and 1 <= expected_m <= 8
         else None
     )
-    mma_tiler_mn = None
-    if rhs_values_tiled is not None:
+    mma_tiler_mn = (16, decode_tile_n) if decode_tile_n else None
+    if mma_tiler_mn is None and rhs_values_tiled is not None:
         mma_tiler_mn = _wo_b_fused_tiled_plan(
             tokens, hidden, width, source.device, expected_m
         )
@@ -2733,6 +2764,7 @@ def wo_projection_mxfp8(
             out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
+            decode_tile_n=binding.decode_tile_n,
             stream=stream,
         )
     else:
@@ -2777,6 +2809,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
+    decode_tile_n: int = 0,
 ) -> torch.Tensor:
     # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
     # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
@@ -2925,6 +2958,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
+            decode_tile_n=decode_tile_n,
             _atomic_output_precleared=atomic_output_precleared,
             stream=stream_int,
         )
@@ -2962,6 +2996,7 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
+    decode_tile_n: int = 0,
 ) -> torch.Tensor:
     del stream_int
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
@@ -3071,6 +3106,7 @@ def wo_projection_inv_rope_mxfp8(
         expected_m,
         weights.sfb_k_replicated,
         cuda_stream_to_int(stream),
+        binding.decode_tile_n if binding is not None else weights.decode_tile_n,
     )
     if return_3d:
         return output

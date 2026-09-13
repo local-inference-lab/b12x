@@ -40,6 +40,71 @@ def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
+@pytest.mark.parametrize("rows", range(1, 9))
+@pytest.mark.parametrize("block_size", (32, 128))
+def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block_size):
+    """Column tiling preserves MXFP8 group-major quantization and BF16 output."""
+    from b12x.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
+
+    require_b12x()
+    torch.manual_seed(41732 + rows)
+    source = (torch.randn(2, rows, 1024, device="cuda") / 4).bfloat16()
+    source = source.permute(1, 2, 0)
+    # Include an all-zero quantization block and distinct scales per group.
+    source[:, :32, 0] = 0
+    values = torch.randn(5120, 2048, device="cuda").to(torch.float8_e4m3fn)
+    exponents = torch.randint(
+        118, 124, (5120 // block_size, 2048 // block_size), device="cuda"
+    ).byte()
+    packed = pack_fp8_block_scaled_weight_mxfp8(
+        values,
+        exponents.view(torch.float8_e8m0fnu),
+        m=5120,
+        k=2048,
+        num_groups=1,
+        block_size=(block_size, block_size),
+    )
+    grouped = source.permute(0, 2, 1).reshape(rows, 64, 32).float()
+    amax = grouped.abs().amax(-1)
+    scales = torch.exp2(
+        torch.ceil(
+            torch.log2(torch.where(amax > 0, amax / 448, torch.ones_like(amax)))
+        ).clamp(-127, 127)
+    )
+    quantized = (grouped / scales[..., None]).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    ).double() * scales[..., None].double()
+    w_scales = (
+        torch.exp2(exponents.double() - 127)
+        .repeat_interleave(block_size, 0)
+        .repeat_interleave(block_size, 1)
+    )
+    expected = quantized.reshape(rows, 2048) @ (values.double() * w_scales).T
+    # FP32 tensor-core accumulation may round an exact BF16 midpoint to either
+    # neighbor. Permit one BF16 ULP, not a generic relative-error threshold.
+    rounded = expected.bfloat16()
+    ulp = (
+        torch.nextafter(rounded, torch.full_like(rounded, float("inf"))).double()
+        - rounded.double()
+    ).abs()
+    results = []
+    for tile in (0, 64, 128):
+        actual = wo_b_dense_gemm_fused_quant_mxfp8(
+            source,
+            packed,
+            expected_m=rows,
+            sfb_k_replicated=block_size == 128,
+            decode_tile_n=tile,
+        )
+        actual = actual[..., 0].clone()
+        assert bool(torch.isfinite(actual).all())
+        assert bool(torch.count_nonzero(actual))
+        assert bool(((actual.double() - rounded.double()).abs() <= ulp).all())
+        results.append(actual)
+    for actual in results[1:]:
+        torch.testing.assert_close(actual, results[0], atol=0, rtol=0)
+
+
 def _make_wo_projection_binding(
     source_tgd: torch.Tensor,
     weights,
