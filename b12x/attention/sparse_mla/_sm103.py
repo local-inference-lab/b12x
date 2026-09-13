@@ -38,24 +38,36 @@ _PLANS = {}
 
 
 class SplitLse:
-    """Emit the selected-token LSE in the public sparse-MLA convention."""
+    """Reduce split LSEs, optionally including the attention sink."""
 
-    def __init__(self, num_splits, natural):
+    def __init__(self, num_splits, natural, has_sink=False):
         self.num_splits = num_splits
         self.natural = natural
+        self.has_sink = has_sink
 
     @cute.jit
     def __call__(
         self, partial: cute.Tensor, output: cute.Tensor, stream: cuda.CUstream
     ):
-        self.kernel(partial, output).launch(
+        self.kernel(partial, output, output).launch(
+            grid=(output.shape[0], output.shape[1], 1),
+            block=(32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def call_sink(
+        self, partial: cute.Tensor, output: cute.Tensor, sink: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(partial, output, sink).launch(
             grid=(output.shape[0], output.shape[1], 1),
             block=(32, 1, 1),
             stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, partial: cute.Tensor, output: cute.Tensor):
+    def kernel(self, partial: cute.Tensor, output: cute.Tensor, sink: cute.Tensor):
         row, head, _ = cute.arch.block_idx()
         row, head = Int64(row), Int64(head)
         lane = cute.arch.lane_idx()
@@ -68,6 +80,10 @@ class SplitLse:
             maximum = cutlass.max(
                 maximum, cute.arch.shuffle_sync_bfly(maximum, offset=offset)
             )
+        sink_log2 = Float32(-Float32.inf)
+        if cutlass.const_expr(self.has_sink):
+            sink_log2 = Float32(sink[head]) * Float32(math.log2(math.e))
+            maximum = cutlass.max(maximum, sink_log2)
         total = Float32(0.0)
         index = Int32(lane)
         while index < self.num_splits:
@@ -78,6 +94,9 @@ class SplitLse:
         for offset in (16, 8, 4, 2, 1):
             total += cute.arch.shuffle_sync_bfly(total, offset=offset)
         if lane == 0:
+            if cutlass.const_expr(self.has_sink):
+                if sink_log2 != Float32(-Float32.inf):
+                    total += cute.math.exp2(sink_log2 - maximum, fastmath=True)
             result = Float32(-Float32.inf)
             if total > Float32(0.0):
                 result = maximum + cute.math.log2(total, fastmath=True)

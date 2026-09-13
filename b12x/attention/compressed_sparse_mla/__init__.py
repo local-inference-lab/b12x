@@ -38,6 +38,7 @@ META = OpMeta(
     dtypes=("bf16", "fp8_e4m3"),
     recipes=("dsv4", "dsv41"),
     requires=("triton",),
+    archs=("sm103a", "sm120a", "sm121a"),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="6627d342",

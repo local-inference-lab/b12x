@@ -18,6 +18,7 @@ numbers or measured B300 policy profile are included.
 | Dense MLA | Implemented BF16/E4M3 compressed-cache attention for (QK,V) widths (576,512) and (1088,1024); SM120 tests and SM103 compilation | SM103 correctness, high-pid, split, query-quantization, and graph qualification |
 | Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
+| DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
@@ -94,7 +95,8 @@ four mixed-rate projection launchers and 30 projection-tiered MoE launchers,
 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
-activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 470
+activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
+147 DeepSeek compressed attention/cache-writer launchers: 617
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -117,7 +119,7 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, compressed DeepSeek sparse MLA, paired/grouped Trellis records,
+Full-model serving, paired/grouped Trellis records,
 Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
@@ -247,6 +249,57 @@ projections use 142 allocated GPRs, up from 138 for Int32 routes and 140 for
 Int64 routes in the preceding corpus. Those positive deltas remain flagged
 for target profiling. Static resource reports omit dynamic launch SMEM and
 do not establish occupancy or latency.
+
+## DeepSeek compressed MLA
+
+Status: **implemented, unqualified on SM103**. The existing
+`attention.compressed_sparse_mla.plan/bind/run` API selects `backend="warp"`
+on SM103. Decode uses fixed planned splits and ordinary FP8/BF16 warp MMA;
+extend uses the shared multigroup prefill pipeline. SM12x retains its native
+policy and can select the ordinary-MMA implementation explicitly for regression
+testing. V4 retains 448 FP8 NoPE and 64 BF16 RoPE coordinates. V4.1 reads
+528-byte SWA records and 288-byte indexed records, with all 512 coordinates
+quantized. Compressed KV is decoded in shared memory.
+
+The plan reserves aligned selection arrays and length vectors. One metadata
+CTA per live row pads selections, maps optional indexed page tables, masks
+invalid slots, and trims empty trailing selections. Both pools use Int64 page
+offsets and independent runtime physical strides. Live rows, widths, pool sizes,
+mapping state, lengths, and softmax scale do not enter kernel compilation keys.
+Warmup compiles sink/no-sink and both LSE conventions before frozen resolution
+or graph capture. LSE includes the sink for this compressed attention contract.
+Metadata preparation zeroes reserved control padding for masked reads when a
+cache has no physical pages. No decoded KV adapter or replay allocation is needed.
+
+The GPU tests cover head tails, SWA-only/indexed-only operation, independent
+V4.1 FP8 quantization, missing pages, all-invalid rows, offsets beyond 2 GiB,
+fixed scratch, full-graph `torch.compile`, and replay after input and cache
+mutation. V4.1 replay writes the SWA cache before reading it. Cache-writer tests
+compare complete bytes against an independent oracle, including odd page sizes,
+Int32/Int64 slots, padding guards, large page IDs, and frozen resolution.
+
+```bash
+python scripts/compile_sm103.py --component compressed_mla \
+  --output-dir /tmp/sm103-compressed-mla-code
+python scripts/qualify_sm103.py --component compressed_mla --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-compressed-mla \
+  --sanitizer /path/to/compute-sanitizer
+CUDA_VISIBLE_DEVICES=GPU-actual-B300-UUID python scripts/generate_gpu_profile.py \
+  --device 0 --components attention.compressed_sparse_mla \
+  --profile-id local.b300.compressed-mla --work-dir /tmp/b300-compressed-profile \
+  --output /tmp/b300-compressed-profile.json --dry-run
+```
+
+After correctness qualification, remove `--dry-run` to race the planned split
+configurations. The generator checks finite/nonzero outputs and the numerical
+oracle before timing the production graph. It records the selected backend and
+the actual fixed split geometry. No SM103 measurements are embedded in this tree.
+
+Four added prefill callables report an eight-byte stack frame with local
+loads/stores. Keep those cases visible during B300 profiling. Static resources
+and SM120 execution do not establish SM103 performance or complete V4.1 serving.
+The [compressed-MLA validation receipt](sm103-compressed-mla-validation.json)
+records source, artifact, package, and regression identities.
 
 ## Recurrent, dense MLA, and unquantized projection contracts
 
@@ -679,7 +732,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped or coupled mixed-rate formats, V4.1 compressed attention, mHC and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped or coupled mixed-rate formats, mHC and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -762,7 +815,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | B300 MoE correctness | `sm103/nvfp4_gemm.py`, `pointwise.py`, `launch.py`: oracle, sanitizer, live-capacity and real-weight graph tests |
 | Tiny-M/prefill scheduling | `fused_moe/_sm103.py`, `_policy.py`: implement separate strategies, then race M1/M4/M8/prefill under native plans |
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths |
-| DeepSeek compressed attention | `attention/compressed_sparse_mla/{api,_policy,_scratch}.py`, `attention/_shared/mla/compressed_api.py`: add SM103 dispatch for the distinct sliding-window and indexed-cache contract, then qualify V4/V4.1 numerics and graph replay |
+| DeepSeek compressed attention | `attention/compressed_sparse_mla/_warp.py`, `attention/_shared/mla/kv_cache.py`: physical SM103 qualification of V4/V4.1 numerics, native cache writes, head tails, high page IDs, and graph replay |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
