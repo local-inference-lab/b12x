@@ -57,8 +57,8 @@ offline compile. Raw artifacts are outside the repository at
   compatibility planning, scratch, format, compiler runtime and packaging tests.
   An initial broad collection failed because upstream removed
   `validation/cutlass_migration/` in `070af610` while a compiler-cache test still
-  imports two modules from it. Four exact historical dependency files from
-  `070af610^` are supplied through an isolated `/tmp` PYTHONPATH to run that
+  imported two modules from it. Four exact historical dependency files from
+  `070af610^` were supplied through an isolated `/tmp` PYTHONPATH to run that
   unchanged test. No test is disabled or replaced with a stub.
 - Physical regression host: two RTX PRO 4000 Blackwell GPUs, CC 12.0, 24 GB each,
   driver 580.173.02. Tests use the isolated
@@ -104,8 +104,8 @@ PYTHONPATH=/tmp/b12x-sm103-historical-tools:. .venv/bin/python -m pytest \
   tests/test_packaging.py -q
 ```
 
-To reproduce the isolated historical dependencies, copy these exact paths from
-`git show 070af610^:<path>` under `/tmp/b12x-sm103-historical-tools/`:
+That historical run used these exact paths from `070af610^` under
+`/tmp/b12x-sm103-historical-tools/`:
 
 ```text
 validation/cutlass_migration/evidence/kernel_resources.py
@@ -113,6 +113,9 @@ validation/cutlass_migration/acceptance/corpus/ptx_capture.py
 validation/cutlass_migration/core/comparison_identity.py
 validation/cutlass_migration/paths.py
 ```
+
+The retained [artifact integrity tooling](../validation/cutlass_migration/README.md)
+supersedes this temporary setup. Clean-checkout commands are recorded below.
 
 The three GPU suite commands, with `CUTE_DSL_ARCH=sm_120a`, are:
 
@@ -133,7 +136,68 @@ matches the committed Python source. Projection kernels use 138/140 registers
 for int32/int64 IDs; resource reports show zero stack and local memory for all
 twenty kernels. Reported static SMEM excludes dynamic launch SMEM, so these
 numbers do not establish occupancy. The full manifest and generated artifacts
-are in `../b12x-sm103-evidence/final-sm103/`.
+are identified by the receipt's `artifact_root`. The initial collection remains
+archived in `../b12x-sm103-evidence/final-sm103/`.
+
+## Policy and qualification fixes, 2026-09-13
+
+Status: implemented; host contracts and selected SM120 regressions pass.
+B300 runtime qualification remains deferred.
+
+Revision `652621da` retains one SM103 capacity lowering and one policy resolution,
+including AUTO precision and override provenance. Warmup counts share the
+lowering, and prewarm compiles it without repeating policy selection. The SM12x
+planning path retains its existing behavior.
+
+The SM103 generator, benchmark and correctness tests share a packaged Torch
+oracle for the materialized BF16-stage contract. Its tests cover FP4 ties,
+E4M3 saturation/underflow, zero inputs, and analytical FC2/router rounding.
+Generator candidate contract version 19 invalidates earlier qualification
+checkpoints. The GPU test matrix includes AUTO with up/gate weights.
+
+Revision `1a114fcb` restores the independent manifest validators and their
+dependencies. PTX capture uses `b12x._lib.compiler`; raw retention controls,
+semantic hashes and object hashes remain intact. Eight offline integrity cases
+check current/historical manifest schemas, tamper rejection, separate comparison
+identities and hook installation.
+
+The combined host command requires no temporary import path:
+
+```bash
+.venv/bin/python -m pytest tests/_lib tests/architecture tests/policy \
+  tests/test_registry.py tests/moe/test_fused_moe_planning.py \
+  tests/moe/test_tp_moe_scratch_bindings.py tests/moe/test_trellis_config.py \
+  tests/moe/test_tp_moe_w13_layout.py tests/test_packaging.py \
+  validation/cutlass_migration/integrity_checks tests/moe/test_sm103_nvfp4.py -q
+```
+
+Result: **487 passed, 14 skipped**. Six skips require physical B300 execution.
+The independent auditor's `--help` command also succeeds from the checkout.
+
+Live inspection found both RTX PRO 4000 Blackwell GPUs idle on `ripper`. The
+isolated checkout `/home/jasonc/b12x-sm103-regression-20260912` ran:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest \
+  tests/moe/test_sm103_pointwise.py tests/moe/test_sm103_trellis.py \
+  tests/moe/test_nvfp4_auto.py tests/moe/test_fused_moe.py -q
+```
+
+Result: **29 passed**. The quantizer cases include zero and saturated inputs.
+The physical GPU UUID was `GPU-47363510-b87a-13a5-4824-2542e97df76c`, CC 12.0.
+These checks provide no SM103 runtime or performance evidence. Logs use the
+`review-fixes-` prefix under `../b12x-sm103-evidence/logs/`.
+
+Offline compilation at clean revision `1a114fcb` produced all twenty
+PTX/cubin/MLIR/SASS/resource sets under
+`../b12x-sm103-evidence/review-fixes-sm103/`. All cubin hashes match the initial
+collection; the fixes do not change device code. The compact compile receipt
+binds the collection to package source SHA-256
+`e0184490812929bd5687f28f2dd9bb97dc0e4a7aa182c230105cee4add4e80de`.
+
+`uv build --out-dir ../b12x-sm103-evidence/review-fixes-dist` produced a wheel
+and source distribution. Inspection verified that the wheel contains the
+packaged qualification oracle with identical source bytes.
 
 ## Compiler attempts and limitations
 

@@ -88,6 +88,19 @@ Global activation scales may be scalar or per expert. A16, FP8/MX formats,
 expert maps, input router weighting and calibration are rejected for SM103.
 The compile key contains geometry and planned capacity, never live token counts.
 Caller-owned scratch, bound launch arguments and output addresses survive replay.
+SM103 planning resolves policy once at the declared capacity, including AUTO
+precision. Warmup counts share that lowering and its original provenance.
+Prewarm compiles the retained plan; bind and replay do not resolve policy.
+
+The materialized numeric contract rounds FC1 to BF16 before SiLU, rounds the
+SiLU result before NVFP4 requantization, and rounds FC2 before FP32 router
+weighting and accumulation. The final output is BF16. E4M3 block scales saturate
+at 448 and E2M1 payloads use nearest-even rounding. These boundaries differ
+from the FP32 intermediate accumulation in the existing SM12x oracle.
+The tests, benchmark and SM103 profile generator all use
+`b12x/moe/_shared/kernels/materialized_nvfp4_reference.py`; production execution
+does not import this qualification oracle. Real-checkpoint and complete-layer
+comparisons remain required to assess the resulting model accuracy.
 
 ```bash
 python -m pytest tests/architecture -q
@@ -104,7 +117,8 @@ ncu --set full --target-processes all -o /tmp/sm103-moe-ncu \
   --output /tmp/sm103-glm-ncu.json
 ```
 
-Tests use `atol=0.02`, `rtol=0.03` and cosine >0.999
+Tests cover A4 in both gate orders and AUTO in the supported up/gate order.
+They use `atol=0.02`, `rtol=0.03` and cosine >0.999
 against an independent unpack/quantize/Torch oracle with the specified BF16
 stage boundaries. They mutate inputs/routes, poison output, check stable storage
 and allocated bytes, and reuse capacity at M1/M4/M8/M2 under frozen compilation.
@@ -112,6 +126,10 @@ Collect sanitizer diagnostics before interpreting timings. A TMA bounds fault,
 TMEM guardrail trap, wrong scale stripe, swapped gate/up or stale graph output
 is a correctness failure. The benchmark records raw graph samples; profiler
 runs are diagnostics and must not supply unprofiled latency claims.
+
+Host checks cover FP4 ties, saturated and underflowed E4M3 scales, zero output,
+and an analytical FC2/router-rounding case. Portable quantizer tests execute
+random, saturated and zero inputs on SM103 or existing SM12x hardware.
 
 For real weights, use a GLM-5.3-Flash checkpoint converted and calibrated to
 **ModelOpt NVFP4**. The published
@@ -162,6 +180,8 @@ python scripts/generate_gpu_profile.py --device cuda:0 --components moe.decode \
 
 The SM103 generator filters out unsupported recipes, dimensions and route
 capacities. Its one candidate still requires real GPU correctness and timing.
+Candidate contract version 19 invalidates checkpoints qualified with the
+different FP32-stage oracle.
 It does not emit an `nvfp4_auto` precision comparison or a full device profile.
 Use the generator's partition/resume facilities for expensive corpus runs.
 
