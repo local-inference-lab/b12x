@@ -1,0 +1,10 @@
+format=local-inference-b12x-wheel-runtime/v1
+status=research-only
+builder.image=nvcr.io/nvidia/pytorch@sha256:33ef5fc15e8937602d64022209cdb2777b32dadf742f41332023d946041b3c14
+buildx.builder=lil-wheel-cu134-sm120
+python.version=3.12
+cuda.version=13.4.1
+pytorch.version=2.14.0a0+4fdf77b940.nv26.8.63802676
+pytorch.commit=4fdf77b940a7e61d854b9be527884e38f32d335a
+cutlass-dsl.version=4.6.2
+cuda.arch-list=12.0a

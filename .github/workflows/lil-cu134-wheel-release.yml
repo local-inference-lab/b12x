@@ -1,0 +1,119 @@
+name: LIL B12X CUDA 13.4 wheels
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - b12x-cu134-stable-*
+    paths:
+      - .github/workflows/lil-cu134-wheel-release.yml
+      - b12x/**
+      - ci/lil_wheels/**
+      - pyproject.toml
+      - setup.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lil-b12x-cu134-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-beta:
+    if: github.repository == 'local-inference-lab/b12x' && github.ref_type == 'branch'
+    runs-on: [self-hosted, lil-wheel-builder]
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact B12X source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build and verify the source-locked wheel
+        run: >-
+          flock --exclusive --wait 21600
+          /var/lib/github-flashinfer/locks/cu134-sm120-build.lock
+          ci/lil_wheels/build_bundle.sh
+
+      - name: Publish or verify the immutable beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          output=dist/lil-b12x-wheel
+          tag="b12x-cu134-beta-${GITHUB_SHA}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            mkdir existing-release
+            gh release download "${tag}" --dir existing-release
+            python ci/lil_wheels/verify_release_assets.py \
+              --directory existing-release \
+              --source-commit "${GITHUB_SHA}" \
+              --beta-tag "${tag}"
+            exit 0
+          fi
+          gh release create "${tag}" \
+            --target "${GITHUB_SHA}" \
+            --prerelease \
+            --title "B12X CUDA 13.4 beta ${GITHUB_SHA:0:12}" \
+            --notes-file "${output}/release-notes.md" \
+            "${output}"/bundle/wheels/*.whl \
+            "${output}"/bundle/manifest.json \
+            "${output}"/bundle/SHA256SUMS \
+            "${output}"/bundle/requirements-github.txt \
+            "${output}"/bundle/install.sh \
+            "${output}"/bundle/runtime.lock \
+            "${output}"/b12x-cu134-*.tar.zst \
+            "${output}"/b12x-cu134-*.tar.zst.sha256
+
+  promote-stable:
+    if: github.repository == 'local-inference-lab/b12x' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the tagged release verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Promote the wheel bytes produced for the tagged source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          beta_tag="b12x-cu134-beta-${GITHUB_SHA}"
+          stable_tag="${GITHUB_REF_NAME}"
+          mkdir assets
+          gh release download "${beta_tag}" --dir assets
+          python ci/lil_wheels/verify_release_assets.py \
+            --directory assets \
+            --source-commit "${GITHUB_SHA}" \
+            --beta-tag "${beta_tag}"
+          if gh release view "${stable_tag}" >/dev/null 2>&1; then
+            mkdir existing-stable-release
+            gh release download "${stable_tag}" --dir existing-stable-release
+            python ci/lil_wheels/verify_release_assets.py \
+              --directory existing-stable-release \
+              --source-commit "${GITHUB_SHA}" \
+              --beta-tag "${beta_tag}" \
+              --promotion
+            exit 0
+          fi
+          jq -n \
+            --arg status qualified \
+            --arg source_release "${beta_tag}" \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg source_manifest_sha256 "$(sha256sum assets/manifest.json | awk '{print $1}')" \
+            '{schema: "local-inference-b12x-promotion/v1", status: $status,
+              source_release: $source_release, source_commit: $source_commit,
+              source_manifest_sha256: $source_manifest_sha256,
+              invariant: "Wheel bytes are unchanged from the qualified beta release."}' \
+            > assets/stable-promotion.json
+          gh release create "${stable_tag}" \
+            --target "${GITHUB_SHA}" \
+            --title "B12X CUDA 13.4 stable ${GITHUB_SHA:0:12}" \
+            --notes "Qualified promotion of ${beta_tag}; wheel bytes were not rebuilt." \
+            assets/*
