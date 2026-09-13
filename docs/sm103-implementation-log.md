@@ -771,3 +771,56 @@ Physical SM103 correctness and performance remain deferred. Checkpoint-specific
 paired/grouped or coupled mixed-rate Trellis, mHC/MTP/DFlash2 and complete
 GLM/V4.1 serving integration, and Station direct-HBM transport remain
 implementation work.
+
+
+## Planned DeepSeek mHC execution on SM103
+
+Status: implemented and cross-compiled; unqualified on physical SM103.
+The existing CuTe pre/post/post-pre kernels support four residual streams at
+H=4096/5120/7168 through normal planning and binding. Plans retain native
+partial/reduction schedules and prefill choices. Live counts change grids and
+masks while callable selection uses planned capacity. Native unbound execution
+uses a fixed default schedule. Invalid decode splits are rejected before
+launch when they cannot fill complete thread blocks.
+
+SM103 planned prefill explicitly converts TF32 operands and decomposes FP32
+projection weights into high/low terms. The independent FP32 oracle exposed
+precision loss in the single-term projection; the policy selects the two-term
+path instead of relaxing the oracle tolerance. SM12x non-lagged precision is
+unchanged. Legacy unbound TF32 helpers retain their precision configuration;
+SM103 prefill uses the planned contract. The mHC config schema and generator
+candidate contract are both 3. Embedded profiles change only their mHC schema
+version, preserving all recorded measurements. Generator candidates must pass
+correctness and replay-allocation checks before timing.
+
+Validation: 550 host tests pass with 121 hardware-dependent skips. All 82 mHC
+GPU tests pass normally, under memcheck and under synccheck on SM120. Both
+sanitizers report zero kernel errors; API reporting is disabled for the
+previously diagnosed CUDA Python/driver probe mismatch. Local and remote
+package sources have identical hashes. Graph tests mutate inputs after capture,
+poison scratch and inactive tails, freeze kernel/policy resolution, and require
+stable addresses with no replay allocation. Caller-owned Dynamo tracing remains
+unsupported; functional tracing and caller-owned CUDA graphs are separate
+contracts.
+
+The SM103 corpus contains 748 callables and 756 CUDA entry points, including
+131 mHC callables. Offline CuTe compilation supplies the documented 228 KiB
+SM103 per-SM shared-memory capacity only for preferred-carveout calculation;
+all other device-attribute requests fail. The 617 existing callables have no
+positive resource or exact register-count deltas and no instruction-count
+changes. All 104 TMEM readers retain completion waits. Added mHC callables use
+17–255 allocated GPRs. Three high/low TF32 projections have 16-byte stack frames;
+two H=5120 block-prefill producers have 408/496-byte frames. These five variants
+remain flagged for B300 profiling alongside the 35 retained flags. Wheel and
+sdist match all 457 package Python files and three embedded profiles. An
+isolated wheel import resolves the SM103 precision policy. Exact commands and
+hashes are recorded in `sm103-mhc-validation.json`.
+
+Source inspection of LIL vLLM's GLM integration revision
+`05c8e2750794ae79a221c0d94f4dfe304e610e99` confirms SM120-family gates in
+MXFP8 linears and fused MoE. GLM mHC and DeepSeek attention also need capability
+routing and plan/warmup review. The b12x MTP feedback operator implements a
+Qwen tensor contract; GLM and DeepSeek feedback require their own contract
+validation. These are source-level integration tasks. Paired/grouped or coupled
+mixed-rate Trellis, complete MTP/DFlash2 and GLM/V4.1 serving, and Station
+HBM registration/transport remain implementation work.

@@ -52,8 +52,8 @@ def bind(plan: Plan, **kwargs) -> Binding:
 
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0."""
-    return default_is_supported(device, requires=META.requires)
+    """Return whether the device has an implemented CuTe mHC path."""
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [

@@ -1,0 +1,400 @@
+{
+  "schema": "b12x.sm103.mhc.validation.v1",
+  "recorded_at_utc": "2026-09-13T23:43:19.107289+00:00",
+  "status": "implemented and cross-compiled; unqualified on physical SM103",
+  "base_revision": "1e776ae0ff91e7478fe789b7446501d05ae12f21",
+  "source_sha256": "e5b44be1acf294d807e08fac11089f7ada13a7c232a5865d4156728f5b61da2c",
+  "local_and_sm120_source_hashes_match": true,
+  "implementation": {
+    "api": "b12x.norm.mhc.plan/bind/run_pre/run_post/run_post_pre/run_collapse",
+    "core_compute": "CuTe ordinary MMA and scalar mixing/reduction",
+    "hidden_sizes": [
+      4096,
+      5120,
+      7168
+    ],
+    "residual_streams": 4,
+    "max_planned_tokens": 65535,
+    "serving": [
+      "immutable planned native schedule",
+      "runtime live counts",
+      "frozen callable reuse",
+      "independent pre/post numerical oracles",
+      "mutable graph inputs",
+      "poisoned scratch and inactive output tails",
+      "stable pointers and no replay allocation"
+    ],
+    "precision": "SM103 planned TF32 projection explicitly converts BF16 activations and decomposes FP32 weights into high/low TF32 operands",
+    "policy": {
+      "query_schema": 1,
+      "config_schema": 3,
+      "candidate_contract": 3,
+      "embedded_profile_change": "mHC config schema 2 to 3 only; all other profile data unchanged"
+    },
+    "limitations": [
+      "caller-owned Dynamo tracing unsupported",
+      "legacy unbound TF32 helper retains its existing precision configuration"
+    ]
+  },
+  "validation": [
+    {
+      "name": "host",
+      "passed": 550,
+      "skipped": 121,
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/architecture",
+        "tests/policy",
+        "tests/norm",
+        "-q"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mhc-host-release.log",
+        "sha256": "a0b6b473e949a428357855a7fa13a13080885d1ac10aa01da39989c5fc0852dc",
+        "bytes": 834
+      },
+      "kernel_errors": null
+    },
+    {
+      "name": "sm120-normal",
+      "passed": 82,
+      "skipped": 0,
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/norm/test_mhc.py",
+        "tests/norm/test_residual_mhc.py",
+        "tests/norm/test_mhc_lagged_parallel.py",
+        "tests/norm/test_sm103_mhc.py",
+        "-q",
+        "-ra"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mhc-sm120-normal-release.log",
+        "sha256": "bd4d83f128784737d1115b9c00e1a6b8f2bd2acda820b72e71fce495dae0dca0",
+        "bytes": 3258
+      },
+      "kernel_errors": null
+    },
+    {
+      "name": "sm120-memcheck",
+      "passed": 82,
+      "skipped": 0,
+      "command": [
+        ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/norm/test_mhc.py",
+        "tests/norm/test_residual_mhc.py",
+        "tests/norm/test_mhc_lagged_parallel.py",
+        "tests/norm/test_sm103_mhc.py",
+        "-q",
+        "-ra"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/b12x-sm103-mhc-memcheck-20260913"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mhc-sm120-memcheck-release.log",
+        "sha256": "d99d950c9cbc4289e2a255bd03eb8ba1d8f1f45b27a4d1aab6397b734c13d82b",
+        "bytes": 3320
+      },
+      "kernel_errors": 0
+    },
+    {
+      "name": "sm120-synccheck",
+      "passed": 82,
+      "skipped": 0,
+      "command": [
+        ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/norm/test_mhc.py",
+        "tests/norm/test_residual_mhc.py",
+        "tests/norm/test_mhc_lagged_parallel.py",
+        "tests/norm/test_sm103_mhc.py",
+        "-q",
+        "-ra"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mhc-sm120-synccheck-release.log",
+        "sha256": "7fb382fbf033f013c382e76339f98317596078fb7480fc08465e19118803e7bd",
+        "bytes": 836
+      },
+      "kernel_errors": 0
+    }
+  ],
+  "sm120_hardware": {
+    "host": "ripper",
+    "product": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "gpu_uuids": [
+      "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+    ],
+    "mode": "Default",
+    "driver": "580.173.02"
+  },
+  "sanitizer_scope": "Kernel memory and synchronization checks. API reporting disabled for CUDA Python 13.4 probes against the host CUDA 13.0 driver; prior bare-loader diagnosis is recorded in sm103-fp6-validation.json. The deferred SM103 suite retains API reporting.",
+  "compilation": {
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mhc-sm103-release/manifest.json",
+      "sha256": "1c1a0c7eab68bc2be2c5c33b6886edc878edae09d526c1b5a36a22d858bbcb29",
+      "bytes": 961998
+    },
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "all",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/mhc-sm103-release",
+      "--nvdisasm",
+      ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "packages": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    },
+    "callables": 748,
+    "cuda_entries": 756,
+    "added_callables": 131,
+    "target": "sm_103a",
+    "runtime_qualified": false,
+    "offline_device_attributes": {
+      "MAX_SHARED_MEMORY_PER_MULTIPROCESSOR": 233472,
+      "source": "https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#shared-memory-capacity",
+      "use": "CuTe preferred-SMEM-carveout calculation for minimum CTA residency"
+    }
+  },
+  "resources": {
+    "report": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mhc-resources-release.json",
+      "sha256": "919d27d588ba647e3dd50f34a1e9548d42cd09ee96017e87a68879e85509ed6f",
+      "bytes": 1287349
+    },
+    "auditor": {
+      "path": "/home/jasonc/b12x-sm103-evidence/audit_mhc_release.py",
+      "sha256": "0d39aa8c9221e5d09dde18db3f962a28c6e354777ba19597c5c82bf1c59e535e",
+      "bytes": 3776
+    },
+    "added_allocated_gpr_range": [
+      17,
+      255
+    ],
+    "positive_existing_resource_deltas": {},
+    "positive_existing_register_count_deltas": {},
+    "existing_instruction_count_deltas": {},
+    "tmem_readers_with_completion_waits": 104,
+    "retained_stack_flags": 35,
+    "added_stack_flags": {
+      "mhc_h4096_tf32_capacity384_split1": {
+        "resources": [
+          {
+            "REG": 255,
+            "STACK": 16,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "sass": {
+          "register_counts": {
+            "R": 253,
+            "UR": 73,
+            "P": 7,
+            "UP": 7
+          },
+          "instruction_count": 2080,
+          "local_loads": 4,
+          "local_stores": 4
+        }
+      },
+      "mhc_h5120_compact_b2_gram0": {
+        "resources": [
+          {
+            "REG": 128,
+            "STACK": 408,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "sass": {
+          "register_counts": {
+            "R": 126,
+            "UR": 27,
+            "P": 5,
+            "UP": 2
+          },
+          "instruction_count": 10008,
+          "local_loads": 519,
+          "local_stores": 529
+        }
+      },
+      "mhc_h5120_compact_b2_gram1": {
+        "resources": [
+          {
+            "REG": 128,
+            "STACK": 496,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "sass": {
+          "register_counts": {
+            "R": 126,
+            "UR": 27,
+            "P": 5,
+            "UP": 2
+          },
+          "instruction_count": 10816,
+          "local_loads": 714,
+          "local_stores": 734
+        }
+      },
+      "mhc_h5120_tf32_capacity384_split1": {
+        "resources": [
+          {
+            "REG": 255,
+            "STACK": 16,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "sass": {
+          "register_counts": {
+            "R": 253,
+            "UR": 73,
+            "P": 7,
+            "UP": 7
+          },
+          "instruction_count": 2080,
+          "local_loads": 4,
+          "local_stores": 4
+        }
+      },
+      "mhc_h5120_tf32_capacity4096_split1": {
+        "resources": [
+          {
+            "REG": 255,
+            "STACK": 16,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "sass": {
+          "register_counts": {
+            "R": 253,
+            "UR": 73,
+            "P": 7,
+            "UP": 7
+          },
+          "instruction_count": 2080,
+          "local_loads": 4,
+          "local_stores": 4
+        }
+      }
+    },
+    "disposition": "Three high/low TF32 projection variants have 16-byte stack frames; two H=5120 block-prefill producers have 408/496-byte frames. Retain all five in B300 correctness, resource and latency qualification. No performance result is inferred."
+  },
+  "packaging": {
+    "report": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mhc-package-release.json",
+      "sha256": "29e4181bccc89888e1af4e88ca3fbb75b07a7230faf271b8cf65901375516ea9",
+      "bytes": 372
+    },
+    "files": 460,
+    "python_files": 457,
+    "profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "9b3bfc6c4624d00d3b48971e418ca4e66d6724c81d57d80a8f46eb560a66a72b",
+        "bytes": 2580733
+      },
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "693f1463960b7052296b75c0701d7978b02010f7c84bedf6e4341e797a62532e",
+        "bytes": 2354623
+      }
+    },
+    "installed_wheel_check": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mhc-wheel-import-release.log",
+      "sha256": "7394bb98d53200d86d0828d26c1a63eeb402a9986e0930076aaa5d9f1f9eb237",
+      "bytes": 322
+    }
+  },
+  "deferred_suite": {
+    "component": "mhc",
+    "prepared_receipt": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mhc-prepared-release/qualification.json",
+      "sha256": "f84d86ced86d2d782432da59d65f27f4e38806782f5b8e0566d35703b450b931",
+      "bytes": 2717
+    },
+    "expected_cases": 82,
+    "physical_sm103_execution": false
+  },
+  "test_sources": {
+    "tests/conftest.py": "5599f4cb5d6dfca823577bd86b1cfee6cb0b5a19f1379f907cff366202616ce9",
+    "tests/architecture/test_sm103_mhc.py": "44c9db5b258dc3052c00e4dd9c9118d32f5fde550310d7df460e37ffd7dea9db",
+    "tests/norm/test_mhc.py": "68f9374da296ae8885d4ffcf936581293c585f7da0f88e4005bc17e06a688a51",
+    "tests/norm/test_residual_mhc.py": "52c6d2cec84ec02cbc14a9c47182c57dd972d90e6ba8c90bb7a4e075415bf6f8",
+    "tests/norm/test_mhc_lagged_parallel.py": "2888cec71bf4236a6ea38411a96a9ae73653fd1ba097fa9d669eaff79155225b",
+    "tests/norm/test_sm103_mhc.py": "e577760499e2f1ff912b48323e1865abe6b95e6c762ac34cb8d4bcb689b04315"
+  },
+  "remaining_implementation": [
+    "checkpoint-specific paired/grouped and coupled mixed-rate Trellis",
+    "MTP/DFlash2 tensor contracts and complete GLM/V4.1 serving integration",
+    "Station direct-HBM GDR transport"
+  ],
+  "companion_source_audit": {
+    "repository": "local-inference-lab/vllm",
+    "main_revision": "47ccf6c57d92f03630ebcbad3809450545825488",
+    "glm_integration_revision": "05c8e2750794ae79a221c0d94f4dfe304e610e99",
+    "findings": [
+      "MXFP8 and fused-MoE integration retain SM120-family gates",
+      "GLM mHC and DeepSeek attention require capability-routing review",
+      "model-specific MTP feedback must not reuse the Qwen contract without tensor-contract validation"
+    ]
+  }
+}

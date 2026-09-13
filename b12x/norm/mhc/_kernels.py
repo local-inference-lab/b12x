@@ -545,6 +545,23 @@ def _validate_post_pre_partials_per_cta(partials_per_cta: int) -> int:
 
 
 
+def _selected_mhc_decode_finalize_threads(*, num_tokens: int, hidden_size: int,
+                                compute_capability: tuple[int, int] | None = None) -> int:
+    from . import _policy
+    if compute_capability is None and torch.cuda.is_available():
+        compute_capability = tuple(torch.cuda.get_device_capability())
+    return _policy._selected_mhc_decode_finalize_threads(num_tokens=num_tokens, hidden_size=hidden_size,
+                           compute_capability=compute_capability)
+
+
+def _selected_post_pre_partials_per_cta(*, num_tokens: int, hidden_size: int,
+                                compute_capability: tuple[int, int] | None = None) -> int:
+    from . import _policy
+    if compute_capability is None and torch.cuda.is_available():
+        compute_capability = tuple(torch.cuda.get_device_capability())
+    return _policy._selected_post_pre_partials_per_cta(num_tokens=num_tokens, hidden_size=hidden_size,
+                           compute_capability=compute_capability)
+
 @lru_cache(maxsize=32)
 def _post_pre_partial_group_storage_cls(
     partials_per_cta: int,
@@ -2929,6 +2946,11 @@ class MHCPrefillTf32ProjectTmaKernel:
                     a1_tf32 = f32_to_raw_bits(a1_f)
                     a2_tf32 = f32_to_raw_bits(a2_f)
                     a3_tf32 = f32_to_raw_bits(a3_f)
+                    if const_expr(self.split_fp32_fn):
+                        a0_tf32 = f32_to_tf32_bits(a0_f)
+                        a1_tf32 = f32_to_tf32_bits(a1_f)
+                        a2_tf32 = f32_to_tf32_bits(a2_f)
+                        a3_tf32 = f32_to_tf32_bits(a3_f)
                     for warp_mma_n in cutlass.range_constexpr(
                         self.n_mma_tiles_per_warp
                     ):
@@ -5340,6 +5362,9 @@ def _run_mhc_pre_partial_launch(
     if lagged_mix and compute_gram:
         raise ValueError("compute_gram and lagged_mix cannot both be enabled")
     tokens = int(residual.shape[0])
+    policy_tokens = 1 if planned_tokens is None else int(planned_tokens)
+    if policy_tokens <= 0:
+        raise ValueError("planned_tokens must be positive")
     hidden_size = int(residual.shape[-1])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
@@ -5522,6 +5547,9 @@ def _run_mhc_finalize_gram_launch(
         y,
     )
     tokens = int(residual.shape[0])
+    policy_tokens = 1 if planned_tokens is None else int(planned_tokens)
+    if policy_tokens <= 0:
+        raise ValueError("planned_tokens must be positive")
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     lagged_mix = pre_mix is not None
