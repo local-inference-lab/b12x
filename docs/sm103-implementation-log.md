@@ -531,3 +531,57 @@ compile artifacts, resources, regression logs, and package hashes. No SM103
 execution or performance claim is made. MXFP6, complete Trellis expert
 execution, compressed DeepSeek sparse attention, mHC/MTP/DFlash2 and complete
 serving, and direct HBM transport remain implementation work.
+## Native MXFP6 projections and fixed-capacity activation quantization
+
+The existing dense FP6 interfaces dispatch to `gemm/blockscaled/_fp6.py` on
+SM103. The shared TMA/tcgen05/TMEM engine supports independent E2M3, E3M2, and
+E4M3 operand formats, packed FP6 global storage, byte-container compatibility,
+grouped output, FP32 alpha, and BF16 row correction. TMA inserts FP6 shared
+padding; barrier counts use packed global transfer bytes. Explicit byte
+containers are packed in shared memory before MMA.
+
+`FP6LinearWorkspace` and `allocate_fp6_linear_workspace` provide caller-owned
+quantization storage through the existing FP6 namespace. Runtime row counts
+drive both CuTe quantization kernels and GEMM. Shape, dtype, alignment,
+capacity, device, and writable overlap checks precede launch. Scale tile tails
+are overwritten. The SM120 default path retains its existing implementation;
+the explicit workspace path is exercised on SM120 for regression evidence.
+
+Independent tests exposed two boundary issues. The shared FP6 exponent helper
+rounded positive subnormal ratios below its scale floor upward; it now clamps
+them to byte zero. The numerical oracle's logarithm could round an exact power
+of two slightly upward; the oracle uses exponent decomposition to avoid that
+false failure. Exact subnormal-boundary and existing quantization tests pass.
+
+Validation is recorded in [the FP6 receipt](sm103-fp6-validation.json):
+
+- Architecture/policy and existing binding contracts: 678 passed, one skipped.
+- Deferred FP6 and qualification-host collection: eight passed, 24 physical
+  SM103 tests skipped on the GPU-less host.
+- Physical RTX PRO 4000 Blackwell SM120 regression: 122 passed. Kernel memcheck
+  and synccheck each pass all 122 tests with zero kernel reports, including
+  source element and packed-output byte offsets beyond 2^31.
+- The unfiltered sanitizer run emits 82 CUDA API reports. A minimal CUDA
+  initialization and `cuDeviceGetCount` reproducer emits the same reports from
+  CUDA Python's loader probing newer APIs against the CUDA 13.0 driver. The
+  kernel-instrumentation runs explicitly use `--report-api-errors no`; raw
+  reports remain available. Driver API compatibility is not qualified.
+- A fresh complete SM103 build contains 327 callables and 335 CUDA entries.
+  All 58 added FP6 callables compile, use 16–150 allocated GPRs, and report no
+  stack or local memory. Existing allocated-register, stack, static-SMEM, and
+  local-memory counts show no positive deltas. Every retained artifact hash
+  verifies against the manifest.
+- Wheel and sdist contents match all 450 package Python files and three
+  embedded profiles. The operator qualification manifest prepares successfully
+  against that identical package source.
+
+`scripts/qualify_sm103.py --component fp6` includes native GEMM, quantization,
+graph, stream, opaque serving-op, and large-offset tests.
+`benchmarks/benchmark_fp6_linear.py` retains independently gated, paired
+warm/cold graph measurements against an original-weight BF16 projection.
+Neither command has executed on physical SM103.
+
+Full Trellis expert execution, compressed DeepSeek sparse attention,
+mHC/MTP/DFlash2 and complete serving, and remaining Station transport work
+remain implementation gaps. The existing undefined Trellis rank-LUT decoder
+identified in the planned FP8 log also remains unresolved.

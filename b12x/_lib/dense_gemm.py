@@ -7757,6 +7757,21 @@ def dense_gemm(
     if get_compute_capability(a_torch.device) == (10, 3):
         from b12x._lib.architecture import UnsupportedArchitectureError
         from b12x.gemm.blockscaled._sm103 import execute
+        if ab_dtype in ("float6_e2m3fn", "float6_e3m2fn"):
+            if (cluster_shape_mn != (1, 1) or mma_tiler_mn not in (None, (128, 128))
+                    or load_path not in (None, "tma") or swap_ab not in (None, False)
+                    or sfb_k_replicated or rhs_values_tiled is not None or _quantized_c is not None
+                    or x_bf16 is not None or w_gscale is not None or plain_fp8 or block_fp8
+                    or _tile_k_override is not None or _split_k_slices_override is not None
+                    or _large_m_unroll_override is not None or _target_occupancy_override is not None):
+                raise UnsupportedArchitectureError("SM103 MXFP6 does not implement the requested fusion or launch override")
+            if alpha_dtype not in (None, "float32") or expected_m is not None and expected_m <= 0:
+                raise ValueError("SM103 MXFP6 requires FP32 alpha and a positive expected_m when supplied")
+            from b12x.gemm.blockscaled._fp6 import execute as execute_fp6
+            return execute_fp6(lhs, rhs, out, ab_dtype=ab_dtype, sf_dtype=sf_dtype,
+                c_dtype=c_dtype, sf_vec_size=sf_vec_size, a_fmt=a_fmt, b_fmt=b_fmt,
+                a_preexpanded=a_preexpanded, b_preexpanded=b_preexpanded, b_packed=b_packed,
+                alpha=alpha, row_scale=row_scale, stream=stream)
         if plain_fp8 or block_fp8:
             if (cluster_shape_mn != (1, 1) or mma_tiler_mn is not None
                     or load_path not in (None, "tma") or swap_ab is not None

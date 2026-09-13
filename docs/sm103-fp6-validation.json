@@ -1,0 +1,146 @@
+{
+  "status": "implemented_and_cross_compiled",
+  "runtime_qualified_sm103": false,
+  "scope": "Native dense MXFP6/mixed FP6-FP8 GEMM and shared fixed-capacity FP6 linear quantization",
+  "source_revision_at_compile": "56f2eaaa73c8d199a6869faf0842a47ac23442cc",
+  "package_python_sha256": "8690ba086e1dc58fb53899155c2bcb7bdb96ecacb4ee914fc177cf65810e3bbd",
+  "compile": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp6-complete-sm103/manifest.json",
+    "sha256": "9dcfa6c2b9fc7857a646f24023b5e2020664974cf2423c7d29f54c36197db528",
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "all",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/fp6-complete-sm103",
+      "--nvdisasm",
+      ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "callables": 327,
+    "cuda_entries": 335,
+    "added_callables": 58,
+    "added_stack_or_local_entries": 0,
+    "added_allocated_gpr_range": [
+      16,
+      150
+    ],
+    "positive_existing_resource_deltas": {},
+    "retained_stack_flagged_callables": 31,
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/fp6-resources.json",
+      "sha256": "45b4a98c28c0d5aa0a9c00bd185accc7ab3ffd4035a6459e9f8e655350e1c11a"
+    },
+    "toolchain": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    }
+  },
+  "sm120_device": {
+    "product": "NVIDIA RTX PRO 4000 Blackwell",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "driver": "580.173.02",
+    "mode": "Default"
+  },
+  "validation": [
+    {
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/gemm/test_dense_gemm_expected_m.py tests/gemm/test_block_fp8_linear_scratch_bindings.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-host.log",
+      "sha256": "01d4636cea972c6864a516b306f1cba9e6c017a580c38e97bf8fcc1a3dd040fd",
+      "result": "678 passed, 1 skipped in 27.76s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/gemm/test_sm103_fp6.py tests/architecture/test_sm103_qualification.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-qualification-host.log",
+      "sha256": "92f19e0ba1d0ca7526fb16b0c2a547c8d3e2e4c44dd7afa10ac92f7515526b4c",
+      "result": "8 passed, 24 skipped in 2.10s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest -q tests/quantization/test_fp6_workspace.py tests/gemm/test_fp6_smem_packing.py tests/quantization/test_fp6_row_gs_quant.py tests/quantization/test_fp6_small_m_quant.py tests/quantization/test_fp6_quantization.py tests/gemm/test_fp6_dense_w6a8.py tests/gemm/test_fp6_packed_b.py -x",
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-sm120-regression-final.log",
+      "sha256": "aee34692c59b523f4251b39bc797f381fa49a52cbc2cced4e9cdaed7720cd193",
+      "result": "122 passed, 1416 warnings in 42.70s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/quantization/test_fp6_workspace.py tests/gemm/test_fp6_smem_packing.py tests/quantization/test_fp6_row_gs_quant.py tests/quantization/test_fp6_small_m_quant.py tests/quantization/test_fp6_quantization.py tests/gemm/test_fp6_dense_w6a8.py tests/gemm/test_fp6_packed_b.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-sm120-memcheck-kernels.log",
+      "sha256": "1be4349bce24c756507fcad607f6e478650325038f48b64d9cdd176623a361b7",
+      "result": "122 passed in 21.09s",
+      "sanitizer_summary": [
+        "ERROR SUMMARY: 0 errors"
+      ]
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/quantization/test_fp6_workspace.py tests/gemm/test_fp6_smem_packing.py tests/quantization/test_fp6_row_gs_quant.py tests/quantization/test_fp6_small_m_quant.py tests/quantization/test_fp6_quantization.py tests/gemm/test_fp6_dense_w6a8.py tests/gemm/test_fp6_packed_b.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-sm120-synccheck-kernels.log",
+      "sha256": "c1d076cc1d9d74e08c85ca5c2634efcdb6a505912af252a232badeed7641bccd",
+      "result": "122 passed in 6.79s",
+      "sanitizer_summary": [
+        "ERROR SUMMARY: 0 errors"
+      ]
+    }
+  ],
+  "sanitizer_api_reporting": {
+    "status": "disabled_only_for_kernel_instrumentation_runs",
+    "reason": "cuda-bindings 13.4 probes APIs newer than the CUDA 13.0 driver. A CUDA initialization and cuDeviceGetCount-only reproducer emits the same 82 API reports without b12x. Memcheck and synccheck kernel instrumentation remain enabled. These are not clean API-compatibility qualifications.",
+    "unfiltered_regression": {
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp6-sm120-memcheck.log",
+      "sha256": "926d4a9b9db5517cf6a89b20a57d34a679c9a3ba29220d2673f21c6ebc94214c"
+    },
+    "isolated_probe": {
+      "path": "/home/jasonc/b12x-sm103-evidence/fp6-driver-probe.xml",
+      "sha256": "4652d7185c49bca523972fcb03adb913b8d76a1ee7d6cac7b9aae24e73432a88"
+    },
+    "isolated_probe_command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --xml --save /home/jasonc/fp6-driver-probe.xml .venv/bin/python -c \"import torch; torch.cuda.init(); import cuda.bindings.driver as d; print(d.cuDeviceGetCount())\""
+  },
+  "package": {
+    "package_python_sha256": "8690ba086e1dc58fb53899155c2bcb7bdb96ecacb4ee914fc177cf65810e3bbd",
+    "verified_files": 453,
+    "python_files": 450,
+    "profiles": {
+      "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz": "5a5a4591a696d8dfd43917fb863dc1fd1d27fdb2bbf1292ade6dcbfc9583a34c",
+      "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz": "a8351dea0656184ba3c2cd658e6d2982b6df4a1f718973552ad31cd8437febb6",
+      "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.max-q.json.gz": "790c0bc7c0e1792fdd6559ab6a7ff10442fc431167f28e372e1e29706ef89926"
+    },
+    "packages": {
+      "b12x-1.3.0-py3-none-any.whl": "602fea5aa735321cb5cb8a2d737ac39abe77edbb347321d52434ec097d1b3691",
+      "b12x-1.3.0.tar.gz": "3c2d99a16cf5832c939e5c117d9f8211412ab3d33ce8cb040b1ec2b4ebe8a019"
+    }
+  },
+  "prepared_operator_suite": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp6-prepared/qualification.json",
+    "sha256": "f5d4132b33fcf234952f5e38b0e1a0889750679c3c3025d3b3a6a3484e872630"
+  },
+  "deferred_tests": [
+    "tests/gemm/test_sm103_fp6.py",
+    "tests/quantization/test_fp6_workspace.py",
+    "tests/gemm/test_fp6_smem_packing.py"
+  ],
+  "deferred_benchmark": "benchmarks/benchmark_fp6_linear.py",
+  "remaining_implementation": [
+    "complete Trellis experts",
+    "compressed DeepSeek sparse attention",
+    "mHC/MTP/DFlash2 and complete serving",
+    "remaining Station transport"
+  ],
+  "limits": [
+    "No physical SM103 execution or performance measurements.",
+    "Native FP6 TMA descriptor bounds, packed padding, barrier completion, and MMA layouts require SM103 qualification.",
+    "The compile corpus is representative, not an exhaustive specialization census.",
+    "SM120 legacy paths retain their kernels; the shared FP6 subnormal scale conversion is corrected and regressed."
+  ]
+}

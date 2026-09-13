@@ -230,6 +230,10 @@ from b12x.quantization.mxfp6.fp6_dense_weights import (  # noqa: E402
     save_fp6_dense_weight,
     load_fp6_dense_weight,
 )
+from b12x.quantization.mxfp6._linear_workspace import (  # noqa: E402
+    FP6LinearWorkspace,
+    allocate_fp6_linear_workspace,
+)
 from b12x.quantization.mxfp6.fp6_checkpoint import (  # noqa: E402
     FP6LinearTensors,
     quantize_linear_to_fp6,
@@ -283,6 +287,8 @@ __all__ = [
     "save_fp6_moe_weights",
     "load_fp6_moe_weights",
     "FP6DenseWeight",
+    "FP6LinearWorkspace",
+    "allocate_fp6_linear_workspace",
     "quantize_dense_weight_to_fp6",
     "dense_fp6_linear",
     "save_fp6_dense_weight",

@@ -900,6 +900,55 @@ def compile_fp8(out):
     return launches
 
 
+def compile_fp6(out):
+    """Compile packed FP6 GEMM, mixed formats, and runtime-row quantization."""
+    import cutlass.cute as cute
+    import torch
+    from b12x.gemm.blockscaled import _fp6
+    from b12x.quantization.mxfp6 import _rows
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}")
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    formats = (("e3m2", "e2m3", False, False), ("e2m3", "e3m2", False, False),
+               ("e4m3", "e2m3", True, False), ("e3m2", "e4m3", False, True),
+               ("e3m2", "e2m3", True, False), ("e2m3", "e3m2", False, True),
+               ("e3m2", "e3m2", True, True))
+    for fn in (_fp6.compile_kernel, _rows.compile_scales, _rows.compile_quantizer):
+        fn.cache_clear()
+    with (patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+          patch.object(_fp6, "b12x_compile", capture),
+          patch.object(_rows, "b12x_compile", capture)):
+        for a_fmt, b_fmt, a_bytes, b_bytes in formats:
+            for dtype in ("bfloat16", "float16", "float32"):
+                case = f"fp6_{a_fmt}_{b_fmt}_bytes{int(a_bytes)}{int(b_bytes)}_{dtype}_n136_k384_g2"
+                _fp6.compile_kernel(136, 384, 2, a_fmt, b_fmt, a_bytes, b_bytes, dtype, False, True, 0)
+        for a_fmt in ("e3m2", "e4m3"):
+            for n, k, one in ((8192, 4096, False), (8, 128, True)):
+                case = f"fp6_{a_fmt}_e2m3_n{n}_k{k}_alpha_one{int(one)}"
+                _fp6.compile_kernel(n, k, 1, a_fmt, "e2m3", a_fmt == "e4m3", False, "bfloat16", one, False, 0)
+        case = "fp6_large_output_address"
+        _fp6.compile_kernel(524288, 128, 1, "e3m2", "e2m3", False, False, "bfloat16", True, False, 0)
+        for k in (384, 65536):
+            for fmt in ("e2m3", "e3m2", "e4m3"):
+                for per_row in (False, True):
+                    case = f"fp6_row_scales_k{k}_{fmt}_per_row{int(per_row)}"
+                    _rows.compile_scales(k, fmt, per_row, 0, "sm_103a")
+                    for packed in (False, True) if fmt != "e4m3" else (False,):
+                        case = f"fp6_rows_k{k}_{fmt}_per_row{int(per_row)}_packed{int(packed)}"
+                        _rows.compile_quantizer(k, fmt, per_row, packed, 0, "sm_103a")
+    return launches
+
+
 def compile_blockscaled(out):
     """Compile production dense tcgen05 and inline A16 launch factories."""
     import cuda.bindings.driver as cuda
@@ -990,6 +1039,7 @@ def main():
             "projection",
             "blockscaled",
             "fp8",
+            "fp6",
             "block_fp8_linear",
             "all",
         ),
@@ -1097,6 +1147,8 @@ def main():
             launches.update(compile_blockscaled(out))
         if args.component in ("fp8", "all"):
             launches.update(compile_fp8(out))
+        if args.component in ("fp6", "all"):
+            launches.update(compile_fp6(out))
         if args.component in ("block_fp8_linear", "all"):
             launches.update(compile_block_fp8_linear(out))
         artifacts = []
