@@ -6,8 +6,35 @@ import pytest
 import torch
 
 import b12x.gemm._shared.block_fp8 as block_impl
+from b12x._lib.scratch import ScratchBufferSpec
 from b12x.gemm._shared.block_fp8 import BlockFP8LinearBinding, BlockFP8LinearScratchCaps, BlockFP8LinearWeight, plan_block_fp8_linear_scratch
 from b12x.gemm._shared.wo_mxfp8 import MXFP8Rows
+
+
+@pytest.mark.parametrize("dtype", [
+    torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+    torch.float16, torch.bfloat16, torch.float32, torch.float64,
+    torch.complex64, torch.complex128, torch.float8_e4m3fn, torch.float8_e5m2,
+    torch.float8_e8m0fnu, torch.float4_e2m1fn_x2, torch.qint8, torch.quint8,
+    torch.qint32, torch.quint4x2, torch.quint2x4,
+])
+def test_scratch_byte_accounting_does_not_construct_tensors(monkeypatch, dtype):
+    """Byte metadata must be exact without allocating on the default device."""
+    from b12x.moe.fused_moe import _impl as moe_impl
+
+    expected = torch.empty((), dtype=dtype, device="cpu").element_size()
+    specs = [ScratchBufferSpec(name="test", shape=shape, dtype=dtype,
+                              device=torch.device(device))
+             for shape in ((), (0,), (3, 17)) for device in ("cpu", "cuda:0")]
+
+    def forbid_allocation(*args, **kwargs):
+        raise AssertionError("Scratch byte accounting must not allocate tensors")
+
+    monkeypatch.setattr(torch, "empty", forbid_allocation)
+    assert block_impl._dtype_nbytes(dtype) == expected
+    assert moe_impl._dtype_nbytes(dtype) == expected
+    for spec in specs:
+        assert spec.nbytes == math.prod(spec.shape) * expected
 
 
 def _packed_weight(*, in_features: int = 128, out_features: int = 256) -> BlockFP8LinearWeight:

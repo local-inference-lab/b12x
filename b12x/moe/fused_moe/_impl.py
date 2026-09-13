@@ -3295,7 +3295,7 @@ def _build_tp_moe_fp4_binding_from_views(
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    return dtype.itemsize
 
 
 def _tensor_numel(shape: Tuple[int, ...]) -> int:

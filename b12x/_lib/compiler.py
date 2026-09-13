@@ -382,28 +382,34 @@ def tensor_compile_fact(
     shape = tuple(int(dim) for dim in tensor.shape)
     if dims is None:
         dynamic_dim_set = set(dynamic_dims)
-        dims = tuple(
-            DimKey.dynamic() if idx in dynamic_dim_set else DimKey.exact(dim)
+        dim_facts = tuple(
+            ("dim", "dynamic", None)
+            if idx in dynamic_dim_set else ("dim", "exact", dim)
             for idx, dim in enumerate(shape)
         )
-    if len(dims) != len(shape):
-        raise ValueError(
-            f"tensor key {name!r} dim policy rank {len(dims)} "
-            f"does not match tensor rank {len(shape)}"
-        )
+    else:
+        if len(dims) != len(shape):
+            raise ValueError(
+                f"tensor key {name!r} dim policy rank {len(dims)} "
+                f"does not match tensor rank {len(shape)}"
+            )
+        dim_facts = tuple(_dim_policy_fact(dim) for dim in dims)
 
     raw_strides = tuple(int(stride) for stride in tensor.stride())
     if strides is None:
         dynamic_stride_set = set(dynamic_strides)
-        strides = tuple(
-            DimKey.dynamic() if idx in dynamic_stride_set else DimKey.exact(stride)
+        stride_facts = tuple(
+            ("dim", "dynamic", None)
+            if idx in dynamic_stride_set else ("dim", "exact", stride)
             for idx, stride in enumerate(raw_strides)
         )
-    if len(strides) != len(raw_strides):
-        raise ValueError(
-            f"tensor key {name!r} stride policy rank {len(strides)} "
-            f"does not match tensor rank {len(raw_strides)}"
-        )
+    else:
+        if len(strides) != len(raw_strides):
+            raise ValueError(
+                f"tensor key {name!r} stride policy rank {len(strides)} "
+                f"does not match tensor rank {len(raw_strides)}"
+            )
+        stride_facts = tuple(_dim_policy_fact(stride) for stride in strides)
 
     device = tensor.device
     layout_fact = None if layout is None else _json_pod(layout, path="layout")
@@ -412,8 +418,8 @@ def tensor_compile_fact(
         str(name),
         str(tensor.dtype),
         len(shape),
-        tuple(_dim_policy_fact(dim) for dim in dims),
-        tuple(_dim_policy_fact(stride) for stride in strides),
+        dim_facts,
+        stride_facts,
         (str(device.type), device.index),
         None if align is None else int(align),
         layout_fact,

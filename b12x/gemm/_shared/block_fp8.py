@@ -218,7 +218,7 @@ def _c_dtype_name(dtype: torch.dtype) -> str:
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    return dtype.itemsize
 
 
 def _align_up(value: int, alignment: int) -> int:
