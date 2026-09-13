@@ -1,4 +1,4 @@
-"""DeepSeek Sparse Attention indexer for SM12x.
+"""DeepSeek Sparse Attention indexer for SM103 and SM12x.
 
 A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
 ``attention.compressed_sparse_mla``:
@@ -18,6 +18,12 @@ Declarations carry no executable layout, CUDA allocation, or policy result.
 Lower-level scorer and selector stages are private implementation facets.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
+
+SM103 planning selects the ``warp`` backend. FP8 scoring uses ordinary
+E4M3 warp MMA; MXFP4 scoring dequantizes inline to BF16 for warp MMA in both
+decode and prefill. Selection retains the shared exact GPU radix pipeline.
+SM12x keeps its native MXFP4 prefill schedule; an explicit warp policy override
+selects the portable implementation for regression.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ META = OpMeta(
     name="dsa_indexer",
     group="attention",
     api_style="planned",
+    archs=("sm103a", "sm120a", "sm121a"),
     entry_points=(
         "Caps",
         "Plan",

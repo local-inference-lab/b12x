@@ -84,6 +84,12 @@ def require_kernel_architecture(
         "b12x.attention._shared.mla.merge",
         "b12x.attention._shared.mla.kv_cache",
         "b12x.attention.sparse_mla._sm103",
+        "b12x.attention.dsa_indexer.kernel",
+        "b12x.attention.dsa_indexer.fused_indexer",
+        "b12x.attention.dsa_indexer.contiguous_kernel",
+        "b12x.attention.dsa_indexer.tiled_topk",
+        "b12x.attention.dsa_indexer.persistent_topk",
+        "b12x.attention.dsa_indexer.mxfp4",
         "b12x.gemm.bf16_gemv._kernel",
         "b12x.gemm.bf16_gemv._prefill",
     }:

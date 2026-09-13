@@ -36,7 +36,7 @@ from b12x._lib.intrinsics import (
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
-    mxfp8_mma_m16n8k32_f32_e4m3,
+    mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_global_v2_f32,
     st_global_v4_f32,
@@ -850,7 +850,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
     # pointers stay materialized across the unrolled K dimension without
     # silently aliasing a future second Q tile.
     num_mma_q = 1
-    unit_scale = Uint32(0x7F7F7F7F)
     group_id = lane // Int32(4)
     thread_id_in_group = lane % Int32(4)
     row_base_q = warp_q_idx * Int32(16)
@@ -909,7 +908,7 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
             )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
-                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
                     s_frag[mma_q, mma_kv, 0],
                     s_frag[mma_q, mma_kv, 1],
                     s_frag[mma_q, mma_kv, 2],
@@ -920,10 +919,8 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                     q_regs[mma_q, 3],
                     b0_k0,
                     b0_k1,
-                    unit_scale,
-                    unit_scale,
                 )
-                d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                d4, d5, d6, d7 = mma_m16n8k32_f32_e4m3(
                     s_frag[mma_q, mma_kv, 4],
                     s_frag[mma_q, mma_kv, 5],
                     s_frag[mma_q, mma_kv, 6],
@@ -934,8 +931,6 @@ def _literal_qk_mma_into_sfrag_mxfp8_raw(
                     q_regs[mma_q, 3],
                     b1_k0,
                     b1_k1,
-                    unit_scale,
-                    unit_scale,
                 )
                 s_frag[mma_q, mma_kv, 0] = d0
                 s_frag[mma_q, mma_kv, 1] = d1
@@ -1414,7 +1409,6 @@ def _prefill_qk_mma_from_smem_q(
     upcast_stride_k,
 ) -> None:
     """QK MMA using Q from smem (via raw pointer) instead of global memory."""
-    unit_scale = Uint32(0x7F7F7F7F)
     k_offset = _permuted_offset_128b(
         row_base
         + warp_kv_idx * num_mma_kv * Int32(16)
@@ -1461,7 +1455,7 @@ def _prefill_qk_mma_from_smem_q(
             )
 
             for mma_q in cutlass.range_constexpr(num_mma_q):
-                d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+                d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
                     s_frag[mma_q, mma_kv, 0],
                     s_frag[mma_q, mma_kv, 1],
                     s_frag[mma_q, mma_kv, 2],
@@ -1472,10 +1466,8 @@ def _prefill_qk_mma_from_smem_q(
                     q_regs[mma_q, 3],
                     b0_k0,
                     b0_k1,
-                    unit_scale,
-                    unit_scale,
                 )
-                d4, d5, d6, d7 = mxfp8_mma_m16n8k32_f32_e4m3(
+                d4, d5, d6, d7 = mma_m16n8k32_f32_e4m3(
                     s_frag[mma_q, mma_kv, 4],
                     s_frag[mma_q, mma_kv, 5],
                     s_frag[mma_q, mma_kv, 6],
@@ -1486,8 +1478,6 @@ def _prefill_qk_mma_from_smem_q(
                     q_regs[mma_q, 3],
                     b1_k0,
                     b1_k1,
-                    unit_scale,
-                    unit_scale,
                 )
                 s_frag[mma_q, mma_kv, 0] = d0
                 s_frag[mma_q, mma_kv, 1] = d1

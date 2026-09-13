@@ -1,0 +1,239 @@
+{
+  "source_sha256": "75fdf3cac5d9891c5974cba6940d10bf52a502e3d98ff636ab3f9592f43242dc",
+  "source_revision": "6e472940b7ba2e6a77f4750c1a8a6bbd41f1a375",
+  "source_kind": "git",
+  "git_status": [
+    " M b12x/_lib/architecture.py",
+    " M b12x/_lib/intrinsics.py",
+    " M b12x/attention/dsa_indexer/__init__.py",
+    " M b12x/attention/dsa_indexer/_policy.py",
+    " M b12x/attention/dsa_indexer/api.py",
+    " M b12x/attention/dsa_indexer/contiguous_kernel.py",
+    " M b12x/attention/dsa_indexer/fused_indexer.py",
+    " M b12x/attention/dsa_indexer/kernel.py",
+    " M b12x/attention/dsa_indexer/mxfp4.py",
+    " M b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
+    " M b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz",
+    " M b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.max-q.json.gz",
+    " M b12x/policy/generation/providers/tunable.py",
+    " M scripts/compile_sm103.py",
+    " M scripts/qualify_sm103.py",
+    " M tests/architecture/test_sm103.py",
+    " M tests/attention/test_fused_indexer.py",
+    "?? tests/attention/test_sm103_dsa_indexer.py"
+  ],
+  "target": "sm_103a",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/home/jasonc/b12x-sm103-evidence/indexer-qualified-source-sm103",
+    "--nvdisasm",
+    ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+  ],
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "callables": 186,
+  "runtime_qualified": false,
+  "status": "cross-compiled; SM120 regression passed; no SM103 execution",
+  "manifest_sha256": "32f1d7c991a885ada79456cf8a77ed083e3251b0e5a02bd6925cdf6b96acd8aa",
+  "artifact_root": "/home/jasonc/b12x-sm103-evidence/indexer-qualified-source-sm103",
+  "cuda_entries": 194,
+  "resource_flags": [
+    {
+      "name": "dense_mla_bf16_d1088_q2_wNone",
+      "resources": "REG:168 STACK:160 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q1_w128",
+      "resources": "REG:255 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q2_wNone",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q4_wNone",
+      "resources": "REG:96 STACK:192 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h8_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h16_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h32_prefill",
+      "resources": "REG:168 STACK:136 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf2_pts0_h32_prefill",
+      "resources": "REG:168 STACK:128 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h16_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h32_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas1",
+      "resources": "REG:64 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h16",
+      "resources": "REG:255 STACK:64 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h16",
+      "resources": "REG:255 STACK:152 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h32",
+      "resources": "REG:255 STACK:200 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h32",
+      "resources": "REG:255 STACK:312 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k512_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas4",
+      "resources": "REG:64 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h64",
+      "resources": "REG:255 STACK:208 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h64",
+      "resources": "REG:255 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_mxfp4_h32_candidates1",
+      "resources": "REG:128 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1096 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    }
+  ],
+  "checks": [
+    {
+      "name": "indexer-host-final-source.log",
+      "counts": {
+        "passed": 462,
+        "skipped": 25
+      },
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/indexer-host-final-source.log",
+      "sha256": "aa7371ece2dfbbd828e5a823c496d2ac0308e41040e4d90bafbdd7a7368db858"
+    },
+    {
+      "name": "sm103-indexer-memcheck-final.log",
+      "counts": {
+        "passed": 174,
+        "sanitizer_errors": 0
+      },
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/sm103-indexer-memcheck-final.log",
+      "sha256": "63dde357ab366a419e8b11647afeb9647c07a1671ab87941616ad0b29d0dd6b0"
+    },
+    {
+      "name": "sm103-indexer-synccheck-final.log",
+      "counts": {
+        "passed": 174,
+        "sanitizer_errors": 0
+      },
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/sm103-indexer-synccheck-final.log",
+      "sha256": "3b66cab3dc60cdfeb06c69777662fb4de44abb979e3bb2804fffc8d35dd29cc9"
+    }
+  ],
+  "regression_device": {
+    "host": "ripper",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "product_name": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "compute_mode": "Default",
+    "qualification": "regression only; not target hardware"
+  },
+  "gpu_test_files": [
+    "tests/attention/test_sm103_dsa_indexer.py",
+    "tests/attention/test_fused_indexer.py",
+    "tests/attention/test_paged_indexer_integration.py"
+  ],
+  "sanitizer": "Compute Sanitizer 13.4.57; --error-exitcode 99; pytest -q --maxfail=2",
+  "barrier_baseline": {
+    "revision": "6e472940",
+    "package_source_sha256": "d5dbd8cab6dd6004f00be4ba1c421acc37506bec04ff3f16d273b7e3e85d895c",
+    "test": "test_cooperative_barrier_waits_for_every_publishing_warp",
+    "result": "failed: observed missing publications [3,2,1,0]",
+    "log_sha256": "25bece49acf8949df6dc49c9d77a30e5d040f24339a57731df60872def4eb423"
+  },
+  "wheel": {
+    "path": "/home/jasonc/b12x-sm103-evidence/indexer-dist/b12x-1.3.0-py3-none-any.whl",
+    "sha256": "31ab7fed918b607e3faff28e4575b284ccf213cb928a9392efbdead37bc82e59",
+    "package_sources_match": true,
+    "embedded_profiles_match": true
+  }
+}

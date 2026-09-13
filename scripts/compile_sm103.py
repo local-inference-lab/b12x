@@ -297,6 +297,221 @@ def compile_dense_mla(out):
     return launches
 
 
+def compile_dsa_indexer(out):
+    """Compile FP8 scoring, exact selection, and inline MXFP4 dequantization."""
+    import cuda.bindings.driver as cuda
+    import cutlass as c
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor
+    from b12x.attention.dsa_indexer import (
+        kernel as paged,
+        contiguous_kernel as contiguous,
+    )
+    from b12x.attention.dsa_indexer.fused_indexer import DSAFusedIndexerKernel
+    from b12x.attention.dsa_indexer.tiled_topk import DSATiledTopkKernel
+    from b12x.attention.dsa_indexer.persistent_topk import DSAPersistentTopK2048Kernel
+    from b12x.attention.dsa_indexer import mxfp4
+
+    launches = {}
+
+    def tensor(dtype, shape):
+        return make_fake_compact_tensor(
+            dtype,
+            shape,
+            assumed_align=16,
+            stride_order=tuple(reversed(range(len(shape)))),
+        )
+
+    def emit(name, kernel, args):
+        name = "indexer_" + name
+        directory = out / name
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel,
+            *args,
+            cuda.CUstream(0),
+            no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+
+    rows, pages = cute.sym_int(), cute.sym_int()
+    k = tensor(c.Uint8, (pages, 64, 128))
+    scales = tensor(c.Float32, (pages, 64))
+    table = tensor(c.Int32, (rows, 64))
+    lengths = tensor(c.Int32, (rows,))
+    scalar = tensor(c.Int32, (1,))
+    desc = tensor(c.Int64, (pages,))
+    logits = tensor(c.Float32, (rows, 4096))
+    flat = tensor(c.Float32, (cute.sym_int(),))
+    for heads in (16, 32, 64):
+        q = tensor(c.Uint8, (rows, heads, 128))
+        weights = tensor(c.Float32, (rows, heads))
+        args = (q, weights, k, desc, scalar, scales, table, lengths, scalar)
+        emit(f"paged_h{heads}", paged.DSAPagedLogitsKernel(4, heads), (*args, logits))
+        emit(
+            f"stream_h{heads}",
+            paged.DSAPagedStreamLogitsKernel(
+                4, heads, k_quant_page_stride=8448, k_scales_row_stride=2112
+            ),
+            (*args, c.Int32(0), c.Int32(4096), flat),
+        )
+        for topk in (512, 2048):
+            for ctas in (1, 4, 192):
+                output_i = tensor(c.Int32, (rows, topk))
+                output_v = tensor(c.Float32, (rows, topk))
+                kernel = DSAFusedIndexerKernel(
+                    num_heads_static=heads,
+                    topk=topk,
+                    ctas_per_group=ctas,
+                    num_sms=148,
+                    paged_output=True,
+                    k_quant_page_stride=8448,
+                    k_scales_row_stride=2112,
+                    max_seq_capacity=65536,
+                    vectorized_q_load=True,
+                    q_row_stride_bytes=heads * 128,
+                )
+                emit(
+                    f"fused_h{heads}_k{topk}_ctas{ctas}",
+                    kernel,
+                    (
+                        q,
+                        weights,
+                        k,
+                        scales,
+                        table,
+                        lengths,
+                        lengths,
+                        lengths,
+                        output_i,
+                        output_v,
+                        flat,
+                        tensor(c.Int32, (cute.sym_int(),)),
+                        tensor(c.Int32, (cute.sym_int(),)),
+                    ),
+                )
+        q32 = tensor(c.Uint32, (rows, heads, 32))
+        kflat = tensor(c.Uint8, (cute.sym_int(), 128))
+        args = (
+            q32,
+            weights,
+            kflat,
+            desc,
+            tensor(c.Float32, (cute.sym_int(),)),
+            lengths,
+            lengths,
+            logits,
+            flat,
+        )
+        runtime = (c.Int32(4), c.Int32(4096), c.Int32(0), c.Int32(8), c.Int32(1))
+        emit(
+            f"contiguous_h{heads}",
+            contiguous.DSAContiguousLogitsKernel(),
+            (*args, *runtime),
+        )
+        emit(
+            f"prefill_h{heads}",
+            contiguous.DSAContiguousLogitsPrefillKernel(tiled_output=True),
+            (
+                *args,
+                tensor(c.Float32, (heads, rows, 64)),
+                c.Int32(128),
+                c.Int32(4096),
+                c.Int32(64),
+                c.Int32(0),
+                c.Int32(8),
+                c.Int32(1),
+            ),
+        )
+        emit(
+            f"prefill512_h{heads}",
+            contiguous.DSAContiguousLogitsPrefill512Kernel(tiled_output=True),
+            (*args, *runtime),
+        )
+    for topk in (512, 2048):
+        output_i = tensor(c.Int32, (cute.sym_int(),))
+        for physical in (False, True):
+            emit(
+                f"persistent_k{topk}_physical{int(physical)}",
+                DSAPersistentTopK2048Kernel(paged_output=physical, topk=topk),
+                (
+                    flat,
+                    lengths,
+                    table,
+                    output_i,
+                    scalar,
+                    *[c.Int32(v) for v in (4, 4096, 1024, 4, 4, 64)],
+                ),
+            )
+            for first in (False, True):
+                emit(
+                    f"tiled_k{topk}_physical{int(physical)}_first{int(first)}",
+                    DSATiledTopkKernel(
+                        topk=topk, is_first=first, output_physical_slots=physical
+                    ),
+                    (
+                        flat,
+                        lengths,
+                        lengths,
+                        flat,
+                        output_i,
+                        flat,
+                        output_i,
+                        table,
+                        *[
+                            c.Int32(v)
+                            for v in (
+                                64,
+                                4,
+                                4096,
+                                8,
+                                0,
+                                1,
+                                1,
+                                topk,
+                                0,
+                                4096,
+                                0,
+                                64,
+                                topk,
+                                0,
+                            )
+                        ],
+                    ),
+                )
+
+    def capture(kernel, *args, compile_spec):
+        emit(compile_spec.kernel_id.rsplit(".", 1)[-1] + "_" + case, kernel, args[:-1])
+        return launches[next(reversed(launches))]
+
+    for heads in (8, 16, 32):
+        for candidates in (False, True):
+            case = f"h{heads}_candidates{int(candidates)}"
+            with (
+                patch.object(mxfp4, "b12x_compile", capture),
+                patch.object(mxfp4, "current_cuda_stream", lambda: cuda.CUstream(0)),
+            ):
+                mxfp4._compile("score", (heads, candidates, 64), 0)
+    for kind, recipe in (
+        ("quantize", (False, 64)),
+        ("quantize", (True, 64)),
+        ("prepare", (False, False)),
+        ("prepare", (True, False)),
+        ("prepare", (False, True)),
+        ("sort", (512, False)),
+        ("sort", (2048, True)),
+    ):
+        case = f"{kind}_{str(recipe).replace(' ', '')}"
+        with (
+            patch.object(mxfp4, "b12x_compile", capture),
+            patch.object(mxfp4, "current_cuda_stream", lambda: cuda.CUstream(0)),
+        ):
+            mxfp4._compile(kind, recipe, 0)
+    return launches
+
+
 def compile_sparse_mla(out):
     """Compile GLM cache recipes with ordinary FP8 or BF16 warp MMA."""
     import cuda.bindings.driver as cuda
@@ -623,6 +838,7 @@ def main():
             "sequence",
             "dense_mla",
             "sparse_mla",
+            "dsa_indexer",
             "projection",
             "all",
         ),
@@ -722,6 +938,8 @@ def main():
             launches.update(compile_dense_mla(out))
         if args.component in ("sparse_mla", "all"):
             launches.update(compile_sparse_mla(out))
+        if args.component in ("dsa_indexer", "all"):
+            launches.update(compile_dsa_indexer(out))
         if args.component in ("projection", "all"):
             launches.update(compile_bf16_projection(out))
         artifacts = []

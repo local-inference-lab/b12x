@@ -337,3 +337,47 @@ local storage. Dynamic launch SMEM and target occupancy remain unmeasured.
 The source-bound [validation receipt](sm103-sparse-validation.json) retains
 resource flags and raw log identities under `../b12x-sm103-evidence/`.
 No SM103 execution or target performance measurement was performed.
+
+## FP8 and MXFP4 DSA indexing
+
+The public DSA planner selects the portable warp backend on SM103. Paged,
+fused, and contiguous FP8 scorers use ordinary E4M3 MMA with their existing
+external scales. MXFP4 decode and prefill use CuTe inline BF16 dequantization,
+retaining the published dot/product/head-sum rounding boundaries and explicit
+TP reduction before selection. The policy, generator, and embedded profiles
+use DSA config schema 2; the merge race uses candidate contract version 2.
+
+Frozen-resolution tests found physical pool extents in the paged/fused compile
+identity. Those extents are now dynamic. The public fused, tiled, and prefill
+paths reuse compiled callables across live row counts and pool views, including
+records beyond the 2 GiB byte-offset boundary. Tests mutate visible lengths
+during graph replay and check exact top-k sets, stable storage, and allocation
+counters.
+
+The pre-port cooperative merge could announce CTA arrival before other warps
+finished publishing histogram entries. Its grid barrier now waits at a CTA
+barrier before thread zero's release operation. A delayed-warp test against
+revision `6e472940` observes missing-publication counts `[3,2,1,0]`; the fixed
+kernel observes zero. A broader baseline memcheck run also failed a correctness
+case and later stalled; its owned process was terminated after more than two
+minutes. That interrupted run is diagnostic evidence only.
+
+The final package hash is
+`75fdf3cac5d9891c5974cba6940d10bf52a502e3d98ff636ab3f9592f43242dc`.
+The local checkout and ripper regression checkout have identical package
+sources. Validation runs on physical RTX PRO 4000 Blackwell, CC 12.0, UUID
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`, in Default compute mode.
+
+| Check | Result |
+| --- | --- |
+| Host library, architecture, policy, indexer bindings and fused-indexer suites | 462 passed, 25 skipped |
+| Portable indexer, fused-indexer and paged integration suites, memcheck | 174 passed, zero sanitizer errors |
+| Identical GPU suites, synccheck | 174 passed, zero sanitizer errors |
+| All-component SM103 compilation | 186 callables, 194 CUDA entries; artifact hashes verified |
+| Wheel contents | All 443 package Python sources and embedded profiles match the checkout |
+
+The indexer contributes 58 compile cases. Twenty-one have nonzero stack frames
+of 8–312 bytes, with zero reported local storage. The
+[indexer receipt](sm103-indexer-validation.json) records source identity,
+resource flags, raw-log hashes, artifact paths, and package verification.
+No SM103 runtime qualification or performance claim is included.

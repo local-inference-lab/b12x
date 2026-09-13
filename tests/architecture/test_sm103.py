@@ -117,10 +117,48 @@ def test_sm120_override_never_selected_on_sm103():
 
 
 def test_unimplemented_attention_rejects_before_query_or_profile_lookup():
-    from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY
+    from b12x.attention.compressed_sparse_mla._policy import COMPRESSED_SPARSE_MLA_POLICY
 
-    with pytest.raises(UnsupportedArchitectureError, match="dsa_indexer"):
-        PolicyContext.for_identity(B300).resolve(DSA_INDEXER_POLICY, object())
+    with pytest.raises(UnsupportedArchitectureError, match="compressed_sparse_mla"):
+        PolicyContext.for_identity(B300).resolve(COMPRESSED_SPARSE_MLA_POLICY, object())
+
+
+@pytest.mark.parametrize("cache_format", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_sm103_public_indexer_plan_selects_warp(cache_format, mode, sm103_context, monkeypatch):
+    from b12x.attention import dsa_indexer
+    from b12x.attention.dsa_indexer._policy import DsaIndexerConfig
+    from b12x.policy import DSA_INDEXER
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *_: SimpleNamespace(
+        major=10, minor=3, multi_processor_count=148,
+    ))
+    caps = dsa_indexer.Caps(
+        device="cuda:0", num_q_heads=32, max_q_rows=8,
+        max_page_table_width=128, topk=512, cache_format=cache_format, mode=mode,
+    )
+    policy = sm103_context
+    plan = dsa_indexer.plan(caps, policy=policy)
+    assert plan.policy_resolution.config.backend == "warp"
+    if cache_format == "fp8" and mode == "decode":
+        assert plan.inner.layout.route == "paged_fused"
+    assert plan.policy_resolution.source == PolicySource.HEURISTIC
+    with pytest.raises(ValueError, match="requires the warp backend"):
+        dsa_indexer.plan(caps, policy=policy.with_override(DSA_INDEXER, DsaIndexerConfig(backend="native")))
+
+
+def test_sm103_indexer_generator_candidates_use_runtime_policy():
+    from b12x.attention.dsa_indexer._policy import DSA_INDEXER_POLICY, DsaIndexerQuery
+    from b12x.policy.generation.providers.tunable import _DsaIndexerMergeSession, _dsa_indexer_merge_cases
+
+    session = _DsaIndexerMergeSession(SimpleNamespace(device=B300))
+    case = _dsa_indexer_merge_cases()[0]
+    candidates = session.candidates(case)
+    assert {c.config["fused_merge"] for c in candidates} == {"cooperative", "serial"}
+    for candidate in candidates:
+        config = DSA_INDEXER_POLICY.decode_profile(candidate.config)
+        assert config.backend == "warp"
+        DSA_INDEXER_POLICY.validate_config(DsaIndexerQuery(**case.query), config, B300)
 
 
 @pytest.mark.parametrize("recipe", ("kda_decode", "qwen_decode", "kda_prefill", "gdn_prefill", "dense_mla"))

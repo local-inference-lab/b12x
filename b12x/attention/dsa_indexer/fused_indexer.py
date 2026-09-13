@@ -102,7 +102,7 @@ from b12x._lib.intrinsics import (
     spin_wait_global_ge_i32,
     ldmatrix_m8n8x4_b16,
     ld_shared_v4_u32,
-    mxfp8_mma_m16n8k32_f32_e4m3,
+    mma_m16n8k32_f32_e4m3,
     st_shared_u8,
     st_shared_v4_u32,
     threadfence,
@@ -378,6 +378,9 @@ def _fused_group_barrier(
 ) -> Int32:
     """Grid barrier over the group's CTAs on the arrival counter; returns the next phase."""
     arrival_ptr = _fused_state_ptr(state, group_id, Int32(_FUSED_STATE_ARRIVAL))
+    # Every warp publishes histogram bins. Thread zero may announce this
+    # CTA's arrival only after those writes precede its release operation.
+    cute.arch.sync_threads()
     if tx == Int32(0):
         red_add_global_release_i32(arrival_ptr, Int32(1))
         spin_wait_global_ge_i32(arrival_ptr, (phase + Int32(1)) * ctas_per_group)
@@ -793,7 +796,7 @@ def _score_tokens_direct_k(
             else:
                 bk0 = k0_3
                 bk1 = k1_3
-            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e4m3(
+            d0, d1, d2, d3 = mma_m16n8k32_f32_e4m3(
                 acc0,
                 acc1,
                 acc2,
@@ -804,8 +807,6 @@ def _score_tokens_direct_k(
                 a3,
                 bk0,
                 bk1,
-                Uint32(0x7F7F7F7F),
-                Uint32(0x7F7F7F7F),
             )
             acc0 = d0
             acc1 = d1
@@ -912,7 +913,8 @@ def resolve_fused_indexer_path(
     metadata; live seqlen is deliberately absent, so the selected route is stable
     across vLLM CUDA-graph replays. The general small-decode gate remains six
     rows. C4's 64-head and 32-head top-k-512 shapes use fused through B16 on
-    SM120 and SM121. GLM-5.2's 32-head/top-k-2048 shape uses fused through B16
+    SM103, SM120 and SM121. The SM103 limits are unmeasured bring-up
+    defaults. GLM-5.2's 32-head/top-k-2048 shape uses fused through B16
     and the streamed tiled route beyond. Prefill is selected before this
     decode-only resolver and remains packed-contiguous.
     """
@@ -922,7 +924,7 @@ def resolve_fused_indexer_path(
         # C4 (DSV4 heads=64, GLM-5.3-Flash heads=32): both RTX-class SM120 and
         # GB10/SM121 use the same fixed-page scorer and top-k specialization.
         return (
-            compute_capability in {(12, 0), (12, 1)}
+            compute_capability in {(10, 3), (12, 0), (12, 1)}
             and int(num_rows) <= _C4_B12X_FUSED_MAX_ROWS
         )
     if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
@@ -941,7 +943,7 @@ def fused_indexer_scratch_max_rows(
     if (
         int(topk) == 512
         and int(num_heads) in {32, 64}
-        and compute_capability in {(12, 0), (12, 1)}
+        and compute_capability in {(10, 3), (12, 0), (12, 1)}
     ):
         return _C4_B12X_FUSED_MAX_ROWS
     if int(topk) == 2048 and int(num_heads) == 32:
@@ -2866,6 +2868,8 @@ def _fused_indexer_tensor_key(name: str, tensor: torch.Tensor) -> tuple[object, 
     dynamic_row_names = {
         "q",
         "w",
+        "kq",
+        "ks",
         "pt",
         "sl",
         "kstart",
@@ -2900,14 +2904,14 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
         # so this keeps its historical key. The suffix keeps the key honest (no trace
         # collision) if a <16-SM device ever oversubscribes a direct-K build.
         variant = (
-            "fused_indexer_v10_directk64"
+            "fused_indexer_v11_directk64"
             if kernel.coop_co_resident
-            else "fused_indexer_v10_directk64_oversub_serial"
+            else "fused_indexer_v11_directk64_oversub_serial"
         )
     elif kernel.coop_co_resident:
-        variant = "fused_indexer_v8_coop"
+        variant = "fused_indexer_v9_coop"
     else:
-        variant = "fused_indexer_v8_oversub_serial"
+        variant = "fused_indexer_v9_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )
