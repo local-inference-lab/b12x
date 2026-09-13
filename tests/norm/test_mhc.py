@@ -542,7 +542,8 @@ def test_lagged_prefill_fp32_projection_precision():
     torch.testing.assert_close(post.double(), expected, rtol=1e-6, atol=1e-6)
 
 
-def test_lagged_prefill_scalar_parity_graph(request):
+@pytest.mark.parametrize("capacity", [128, 4096])
+def test_lagged_prefill_scalar_parity_graph(request, capacity):
     """Projection changes preserve scalar BF16 rounding and fixed-capacity replay.
 
     The scalar finalizer defines BF16 normalization rounding. Independent Torch
@@ -553,7 +554,7 @@ def test_lagged_prefill_scalar_parity_graph(request):
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     device = require_sm120()
-    hidden, capacity = 5120, 4096
+    hidden = 5120
     residual, x, fn, scale, bias = _make_inputs(
         tokens=capacity, hidden_size=hidden, seed=92152, device=device
     )

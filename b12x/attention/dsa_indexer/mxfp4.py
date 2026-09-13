@@ -516,6 +516,60 @@ class _TensorCorePagedScore(_PagedScore):
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
+        extent = cutlass.min(width, cutlass.min(lengths[row], active[0]))
+        if cutlass.const_expr(self.candidates):
+            extent = cutlass.min(width, candidate_lengths[row])
+            if lengths[row] <= Int32(0) or active[0] <= Int32(0):
+                extent = Int32(0)
+        if Int32(bx) * Int32(64) < extent:
+            self._score_tile(
+                q,
+                qs,
+                weights,
+                pool,
+                pages,
+                lengths,
+                active,
+                candidates,
+                candidate_lengths,
+                scores,
+                rows,
+                width,
+                page_width,
+                page_row_stride,
+                pool_stride,
+                pool_pages,
+            )
+        else:
+            # Public scores require a -inf tail, but invisible tiles need no MMA.
+            column = Int32(bx) * Int32(64) + Int32(tx)
+            if Int32(tx) < Int32(64) and column < width:
+                scores[Int64(row) * Int64(width) + Int64(column)] = BFloat16(
+                    -float("inf")
+                )
+
+    @cute.jit
+    def _score_tile(
+        self,
+        q: cute.Tensor,
+        qs: cute.Tensor,
+        weights: cute.Tensor,
+        pool: cute.Tensor,
+        pages: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        candidates: cute.Tensor,
+        candidate_lengths: cute.Tensor,
+        scores: cute.Tensor,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+    ):
+        tx, _, _ = cute.arch.thread_idx()
+        bx, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
         col = (
             Int32(bx) * Int32(64)
@@ -1033,6 +1087,7 @@ class MXFP4PagedPlan:
     caps: object
     views: tuple
     nbytes: int
+    score_kind: str
 
     @property
     def layout(self):
@@ -1098,7 +1153,12 @@ def plan_mxfp4(caps):
         nbytes = numel * dtype_nbytes(dtype)
         views.append((name, shape, dtype, offset, nbytes))
         offset += nbytes
-    return MXFP4PagedPlan(caps, tuple(views), offset)
+    score_kind = (
+        "score_tensorcore"
+        if caps.mode == "prefill" or caps.num_q_heads == 32
+        else "score"
+    )
+    return MXFP4PagedPlan(caps, tuple(views), offset, score_kind)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1250,9 +1310,8 @@ def score_mxfp4(binding):
         rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
     )
     page_stride = 0 if rt.page_table.shape[0] == 1 else rt.page_table.stride(0)
-    kind = "score_tensorcore" if caps.mode == "prefill" else "score"
     _launch(
-        kind,
+        binding.plan.inner.score_kind,
         (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
         (
             binding.q_mxfp4,

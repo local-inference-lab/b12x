@@ -7734,6 +7734,7 @@ def dense_gemm(
     block_fp8: bool = False,
     _tile_k_override: Optional[int] = None,
     _split_k_slices_override: Optional[int] = None,
+    _split_k_atomic_bf16_override: Optional[bool] = None,
     _large_m_unroll_override: Optional[bool] = None,
     _target_occupancy_override: Optional[int] = None,
     _split_k_workspace: Optional[torch.Tensor] = None,
@@ -8112,6 +8113,26 @@ def dense_gemm(
         generalize_mxfp8_split_k=(is_mxfp8 and not block_fp8 and not plain_fp8),
         generalize_block_fp8_split_k=block_fp8,
     )
+    if _split_k_atomic_bf16_override is not None and (
+        _split_k_atomic_bf16_override is not False
+        or _split_k_slices_override not in (2, 4)
+        or _split_k_workspace is None
+        or c_dtype != "bfloat16"
+    ):
+        raise ValueError(
+            "explicit FP32 partial reduction requires two or four slices, "
+            "BF16 output, and caller-owned workspace"
+        )
+    if _split_k_atomic_bf16_override is False and _split_k_slices_override == 4:
+        if (
+            out is None or out.shape != (m, n, 1)
+            or out.dtype != torch.bfloat16 or out.device != a_torch.device
+            or not out.is_contiguous() or out.data_ptr() % 16
+        ):
+            raise ValueError(
+                "four FP32 partials require caller-owned aligned contiguous "
+                "BF16 output of shape [M, N, 1] on the input device"
+            )
     if _split_k_slices_override is not None:
         mxfp8_autotune = (
             is_mxfp8
@@ -8149,9 +8170,14 @@ def dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
+            if (
+                _split_k_slices_override > 2
+                and not _B12X_DENSE_SPLITK_TURBO
+                and _split_k_atomic_bf16_override is not False
+            ):
                 raise ValueError(
-                    "four-way split-K requires the atomic-BF16 reduction path"
+                    "four-way split-K requires atomic-BF16 or an explicit "
+                    "caller-owned FP32 reduction"
                 )
         policy = _DenseGemmPolicy(
             single_work_tile_per_cta=policy.single_work_tile_per_cta,
@@ -8160,6 +8186,7 @@ def dense_gemm(
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
                 _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                and _split_k_atomic_bf16_override is not False
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -8540,7 +8567,16 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        if split_k_slices == 4:
+            # The partials remain FP32 until the single output conversion.
+            # The CuTe reducer accepts the same contiguous [slice, M, N]
+            # storage used by weight-only GEMM; its live row count is dynamic.
+            dense_gemm_a16_reduce(
+                split_storage, out, n=n, m=m, slices=split_k_slices,
+                stream=stream,
+            )
+        else:
+            _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()

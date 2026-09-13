@@ -95,10 +95,20 @@ def _reduce_store(
 class SmallNGemvKernel:
     """One CTA per output column and fixed tile of up to eight live rows."""
 
-    def __init__(self, n: int, k: int, bf16_operands: bool, has_bias: bool):
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        bf16_operands: bool,
+        has_bias: bool,
+        rows_per_tile: int = SMALL_M_MAX,
+    ):
         self.n, self.k = int(n), int(k)
         self.bf16_operands = bool(bf16_operands)
         self.has_bias = bool(has_bias)
+        if rows_per_tile not in (1, 2, 4, 8):
+            raise ValueError("SIMT projection supports 1, 2, 4, or 8 rows per tile")
+        self.rows_per_tile = int(rows_per_tile)
 
     @cute.jit
     def __call__(
@@ -129,7 +139,11 @@ class SmallNGemvKernel:
             weight_column_stride,
             vector_loads,
         ).launch(
-            grid=(self.n, (rows + Int32(SMALL_M_MAX - 1)) // Int32(SMALL_M_MAX), 1),
+            grid=(
+                self.n,
+                (rows + Int32(self.rows_per_tile - 1)) // Int32(self.rows_per_tile),
+                1,
+            ),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -152,10 +166,10 @@ class SmallNGemvKernel:
         thread, _, _ = cute.arch.thread_idx()
         column, row_tile, _ = cute.arch.block_idx()
         tid = Int32(thread)
-        first_row = Int64(row_tile) * Int64(SMALL_M_MAX)
+        first_row = Int64(row_tile) * Int64(self.rows_per_tile)
         w_base = Int64(column) * weight_stride
-        acc = cute.make_rmem_tensor((SMALL_M_MAX,), Float32)
-        for r in cutlass.range_constexpr(SMALL_M_MAX):
+        acc = cute.make_rmem_tensor((self.rows_per_tile,), Float32)
+        for r in cutlass.range_constexpr(self.rows_per_tile):
             acc[r] = Float32(0.0)
         if cutlass.const_expr(self.bf16_operands and self.k % 8 == 0):
             if vector_loads != Int32(0):
@@ -165,7 +179,7 @@ class SmallNGemvKernel:
                     w0, w1, w2, w3 = ld_global_v4_u32(
                         get_ptr_as_int64(weight, w_base + offset)
                     )
-                    for r in cutlass.range_constexpr(SMALL_M_MAX):
+                    for r in cutlass.range_constexpr(self.rows_per_tile):
                         row = first_row + Int64(r)
                         if row < Int64(rows):
                             acc[r] = _dot_bf16x8(
@@ -202,7 +216,7 @@ class SmallNGemvKernel:
         reduction = allocator.allocate_tensor(
             Float32, cute.make_layout((1, _THREADS // 32)), byte_alignment=16
         )
-        for r in cutlass.range_constexpr(SMALL_M_MAX):
+        for r in cutlass.range_constexpr(self.rows_per_tile):
             row = first_row + Int64(r)
             if row < Int64(rows):
                 _reduce_store(
@@ -232,7 +246,7 @@ class SmallNGemvKernel:
         index = tid
         while index < Int32(self.k):
             value = Float32(weight[w_base + Int64(index) * weight_column_stride])
-            for r in cutlass.range_constexpr(SMALL_M_MAX):
+            for r in cutlass.range_constexpr(self.rows_per_tile):
                 row = first_row + Int64(r)
                 if row < Int64(rows):
                     acc[r] += (
@@ -480,12 +494,34 @@ class ProjectionKernel:
 
     def __init__(self, n: int, k: int, bf16_operands: bool, has_bias: bool):
         self.simt = SmallNGemvKernel(n, k, bf16_operands, has_bias)
+        self.has_row_tiled_simt = bf16_operands and k == 5120 and n in (32, 384, 512)
+        if self.has_row_tiled_simt:
+            self.row_tiled_simt = SmallNGemvKernel(
+                n, k, bf16_operands, has_bias, rows_per_tile=2 if n == 32 else 4
+            )
         self.mma = Bf16GemmKernel(n, k, has_bias)
         self.has_mma = bf16_operands and n >= 256 and k >= 16
         n_tiles = (n + 63) // 64
         self.minimum_mma_rows = (
             24 if n_tiles >= 64 else ((64 + n_tiles - 1) // n_tiles) * 32
         )
+
+    @cute.jit
+    def launch_simt(self, arguments, rows, vector_loads, warm_all):
+        if cutlass.const_expr(self.has_row_tiled_simt):
+            if warm_all == Int32(1):
+                self.simt(*arguments)
+                self.row_tiled_simt(*arguments)
+            elif (
+                warm_all == Int32(0)
+                and rows <= Int32(SMALL_M_MAX)
+                and vector_loads != Int32(0)
+            ):
+                self.row_tiled_simt(*arguments)
+            else:
+                self.simt(*arguments)
+        else:
+            self.simt(*arguments)
 
     @cute.jit
     def __call__(
@@ -523,13 +559,13 @@ class ProjectionKernel:
                 self.simt(*arguments)
             elif warm_all != Int32(0):
                 self.mma(*arguments)
-                self.simt(*arguments)
+                self.launch_simt(arguments, rows, vector_loads, warm_all)
             elif rows >= Int32(self.minimum_mma_rows):
                 self.mma(*arguments)
             else:
-                self.simt(*arguments)
+                self.launch_simt(arguments, rows, vector_loads, warm_all)
         else:
-            self.simt(*arguments)
+            self.launch_simt(arguments, rows, vector_loads, warm_all)
 
 
 def _pointer(tensor: torch.Tensor):
@@ -595,7 +631,7 @@ def _compile(key, x_dtype, weight_dtype, out_dtype, bias_dtype, device):
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
                     "gemm.bf16_projection",
-                    1,
+                    3,
                     key,
                 ),
             )

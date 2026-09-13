@@ -74,6 +74,9 @@ class Bf16PrefillKernel:
     tile_n = 64
     tile_k = 64
     num_stages = 2
+    # Keep the long K pipeline compact. Full unrolling increases register live
+    # ranges without changing the ordered compensated accumulation contract.
+    unroll_k = False
     buffer_align_bytes = 1024
 
     def __init__(self, n: int, k: int):
@@ -295,7 +298,7 @@ class Bf16PrefillKernel:
             tSsA = smem_thr_copy_A.partition_S(sA)
             tSsB = smem_thr_copy_B.partition_S(sB)
 
-            for _k_tile in cutlass.range_constexpr(self.k_tiles):
+            for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.consumer_wait(consumer_state)
                 _warp_gemm(
                     thr_mma,
@@ -327,7 +330,7 @@ class Bf16PrefillKernel:
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
             )
-            for k_tile in cutlass.range_constexpr(self.k_tiles):
+            for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.producer_acquire(producer_state)
                 cute.copy(
                     tma_atom_A,
@@ -401,6 +404,6 @@ def prefill_mm(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None
     )
     launch(
         _kernel(weight.shape[0], weight.shape[1]),
-        compile_spec=KernelCompileSpec.from_key("gemm.bf16_prefill", 1, key),
+        compile_spec=KernelCompileSpec.from_key("gemm.bf16_prefill", 3, key),
         compile_args=args, runtime_args=args,
     )

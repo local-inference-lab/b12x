@@ -65,6 +65,46 @@ def test_last_element_contributes():
 
 
 @cuda_required
+@pytest.mark.parametrize("n", [32, 384, 512])
+def test_long_k_row_tiles_reuse_graph_and_preserve_fp32_projection(n):
+    """Warmup covers both row-tile sizes without live-row-dependent compilation."""
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.gemm import bf16_gemv
+
+    torch.manual_seed(419132)
+    source = torch.randn(17, 5120, device="cuda").bfloat16() * 0.125
+    weight = torch.randn(n, 5120, device="cuda").bfloat16() * 0.125
+    bias = torch.linspace(-0.25, 0.25, n, device="cuda")
+    storage = torch.full((18, n + 8), 123.0, device="cuda")
+    output = storage[:17, :n]
+    bf16_gemv.precompile(weight, output_dtype=torch.float32, bias=bias)
+    freeze_kernel_resolution("long-K decode row tiles are precompiled")
+    try:
+        for rows in (1, 3, 7, 8, 9, 17):
+            storage.fill_(123)
+            bf16_gemv.mm(source[:rows], weight, out=output[:rows], bias=bias)
+            oracle = source[:rows].double() @ weight.double().T + bias.double()
+            torch.testing.assert_close(
+                output[:rows].double(), oracle, rtol=2e-5, atol=2e-5
+            )
+            assert (storage[rows:] == 123).all()
+            assert (storage[:, n:] == 123).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bf16_gemv.mm(source[:8], weight, out=output[:8], bias=bias)
+        source.neg_()
+        bias.add_(0.03125)
+        storage.fill_(123)
+        graph.replay()
+        oracle = source[:8].double() @ weight.double().T + bias.double()
+        torch.testing.assert_close(output[:8].double(), oracle, rtol=2e-5, atol=2e-5)
+        assert (storage[8:] == 123).all()
+        assert (storage[:, n:] == 123).all()
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@cuda_required
 def test_noncontiguous_x():
     """The native scalar path must read a strided column view correctly."""
     op = _op()
@@ -359,12 +399,13 @@ def test_prefill_router_topk_agrees_with_fp64_and_scalar_projection():
 
 
 @cuda_required
-def test_prefill_projection_retains_small_terms_between_cancelling_large_terms():
+@pytest.mark.parametrize("n", [384, 512])
+def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n):
     """Compensated carry preserves exact representable BF16 products in FP32."""
     from b12x.gemm import bf16_gemv
 
     source = torch.ones(256, 5120, device="cuda", dtype=torch.bfloat16)
-    weight = torch.zeros(512, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(n, 5120, device="cuda", dtype=torch.bfloat16)
     weight[:, ::32] = 1024
     weight[:, 1::32] = 0.015625
     weight[:, 31::32] = -1024

@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import gc
-import statistics
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 
 from b12x.policy.components import BF16_VOCAB_PROJECTION, BLOCK_FP8_LINEAR
-from b12x.policy.generation.contracts import GenerationContext
-from b12x.policy.generation.measured import (
-    GpuProbeMeasurement,
-    MeasuredPolicyGenerator,
-)
 from b12x.policy.generation.sweep import (
     DiscreteSweepGenerator,
     SweepCandidate,
@@ -301,10 +295,11 @@ def _block_fp8_cases() -> tuple[SweepCase, ...]:
         )
         for weight_block_size, geometries in (
             (128, ((2_560, 2_560), (2_560, 10_240))),
-            (32, ((5_120, 1_280), (5_120, 512), (1_280, 8_192),
+            (32, ((5_120, 1_280), (5_120, 512), (5_120, 1_792),
+                  (5_120, 1_152), (1_280, 4_096), (1_280, 8_192),
                   (1_024, 5_120), (6_144, 25_600))),
         )
-        for tokens in ((4, 32) if weight_block_size == 128 else (4, 33))
+        for tokens in ((4, 32) if weight_block_size == 128 else (1, 2, 4, 8, 9, 33))
         for in_features, out_features in geometries
     )
 
@@ -332,8 +327,18 @@ class _BlockFp8Session(AbstractContextManager["_BlockFp8Session"]):
         return None
 
     def candidates(self, case: SweepCase) -> tuple[SweepCandidate, ...]:
-        del case
-        return self._CANDIDATES
+        choices = self._CANDIDATES
+        if (int(case.query["weight_block_size"]) == 32
+                and 2 <= int(case.query["max_tokens"]) <= 8
+                and int(case.query["in_features"]) % 512 == 0):
+            choices += tuple(SweepCandidate.create({
+                "backend": "mxfp8_split2_fp32", "tile_m": 16, "tile_n": n,
+            }) for n in (64, 128))
+            if int(case.query["in_features"]) % 1024 == 0:
+                choices += tuple(SweepCandidate.create({
+                    "backend": "mxfp8_split4_fp32", "tile_m": 16, "tile_n": n,
+                }) for n in (64, 128))
+        return choices
 
     def measure(
         self,
@@ -511,7 +516,7 @@ class BlockFp8LinearGenerator(DiscreteSweepGenerator):
         super().__init__(
             component_id=BLOCK_FP8_LINEAR,
             query_schema_version=2,
-            config_schema_version=2,
+            config_schema_version=4,
             query_fields=(
                 "max_tokens",
                 "in_features",
@@ -519,109 +524,17 @@ class BlockFp8LinearGenerator(DiscreteSweepGenerator):
                 "output_dtype",
                 "weight_block_size",
             ),
-            range_fields=frozenset(
-                {"max_tokens", "in_features", "out_features"}
-            ),
+            # Split2 eligibility depends on exact K divisibility and M<=8.
+            # Do not synthesize unmeasured capacity or geometry coverage.
+            range_fields=frozenset(),
             cases=_block_fp8_cases() if cases is None else cases,
             benchmark_factory=_BlockFp8Factory(),
             coverage={},
+            candidate_contract_version=3,
         )
 
 
-class _WoProjectionProbe:
-    _CASES = ((1, 1), (4, 2), (32, 4), (32, 8))
-
-    @property
-    def case_count(self) -> int:
-        return len(self._CASES)
-
-    @property
-    def case_ids(self) -> tuple[str, ...]:
-        return tuple(
-            f"m{tokens}-tp{tp_size}"
-            for tokens, tp_size in self._CASES
-        )
-
-    @property
-    def description(self) -> str:
-        return "production W_o two-GEMM graph qualification over TP slices"
-
-    def __call__(
-        self,
-        context: GenerationContext,
-    ) -> tuple[GpuProbeMeasurement, ...]:
-        import torch
-
-        from benchmarks.benchmark_wo_projection import bench_one
-
-        flush = _l2_flush_fn(
-            torch.device("cuda", context.device_ordinal),
-            enabled=context.settings.cold_l2,
-        )
-        if flush is None:
-            def flush() -> None:
-                return None
-        measurements = []
-        for index, (tokens, tp_size) in enumerate(self._CASES):
-            result = bench_one(
-                tokens,
-                groups=24 // tp_size,
-                group_width=512,
-                rank=512,
-                hidden=2_560,
-                warmup=context.settings.warmup,
-                iters=context.settings.groups * context.settings.repetitions,
-                check=True,
-                l2_flush=flush,
-                seed=context.settings.seed + 10_007 * index,
-                inv_rope=False,
-                context_length=16_384,
-                nope_dim=448,
-                rope_dim=64,
-            )
-            samples = result.get("b12x")
-            if not isinstance(samples, list) or not samples:
-                raise RuntimeError("W_o benchmark did not produce b12x samples")
-            measurements.append(
-                GpuProbeMeasurement(
-                    label=f"m{tokens}-tp{tp_size}",
-                    latency_us=statistics.median(samples) * 1_000.0,
-                    correct=True,
-                    metrics={"tokens": tokens, "tp_size": tp_size},
-                )
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
-        return tuple(measurements)
-
-
-class WoProjectionGenerator(MeasuredPolicyGenerator):
-    """Generate a measured policy for the production W_o composite."""
-
-    def __init__(self) -> None:
-        from b12x.gemm.wo_projection._policy import (
-            WO_PROJECTION_POLICY,
-            WoProjectionQuery,
-        )
-
-        queries = tuple(
-            WoProjectionQuery(
-                dtype="bfloat16",
-                max_tokens=tokens,
-                groups=24 // tp_size,
-                group_width=512,
-                rank=512,
-                hidden=2_560,
-            )
-            for tokens in (4, 32)
-            for tp_size in (1, 2, 4, 8)
-        )
-        super().__init__(
-            policy=WO_PROJECTION_POLICY,
-            queries=queries,
-            encode_config=lambda config: config.to_dict(),
-            probe=_WoProjectionProbe(),
-        )
+from .wo_projection import WoProjectionGenerator
 
 
 __all__ = [

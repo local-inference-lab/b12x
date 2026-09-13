@@ -312,7 +312,8 @@ def test_tensorcore_prefill_preserves_bf16_scores_and_selection(heads, high_page
 
 @pytest.mark.parametrize("exponents", [(-40, -4, 6, 40), (-6, -2, 3, 7)])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_varied_scales_preserve_staged_rounding_against_fp64(exponents, mode):
+@pytest.mark.parametrize("heads", [8, 32])
+def test_varied_scales_preserve_staged_rounding_against_fp64(exponents, mode, heads):
     """Use FP64 dots so the oracle does not lose opposed exponent products.
 
     A BF16 einsum differs from the FP64 dot rounded to BF16 at 130 output
@@ -321,9 +322,9 @@ def test_varied_scales_preserve_staged_rounding_against_fp64(exponents, mode):
     """
     torch.manual_seed(41081)
     scales = torch.exp2(torch.tensor(exponents, device="cuda", dtype=torch.float32))
-    q = (torch.randn((9, 8, 4, 32), device="cuda") * scales[None, None, :, None]).bfloat16().view(9, 8, 128)
+    q = (torch.randn((9, heads, 4, 32), device="cuda") * scales[None, None, :, None]).bfloat16().view(9, heads, 128)
     keys = (torch.randn((641, 4, 32), device="cuda") / scales[None, :, None]).bfloat16().view(641, 128)
-    weights = torch.randn((9, 8), device="cuda").bfloat16() / 64
+    weights = torch.randn((9, heads), device="cuda").bfloat16() / 64
     lengths = torch.tensor([0, 1, 63, 64, 65, 127, 512, 640, 641], device="cuda", dtype=torch.int32)
     plan, args = _allocate(q, keys, lengths, mode=mode)
     _, _, dq = _oracle_quant(q)
@@ -331,7 +332,7 @@ def test_varied_scales_preserve_staged_rounding_against_fp64(exponents, mode):
     dot = torch.einsum("rhd,kd->rhk", dq.double(), dk.double()).bfloat16()
     products = (dot.relu() * weights[:, :, None]).float()
     total = torch.zeros((9, 641), device="cuda")
-    for head in range(8):
+    for head in range(heads):
         total += products[:, head]
     expected = total.bfloat16()
     expected.masked_fill_(torch.arange(641, device="cuda")[None] >= lengths[:, None], -torch.inf)
@@ -341,6 +342,60 @@ def test_varied_scales_preserve_staged_rounding_against_fp64(exponents, mode):
     assert bool(torch.isneginf(actual[:, 641:]).all())
     api.select(binding)
     _assert_topk(expected, args["output_indices"], args["output_scores"])
+
+
+@pytest.mark.parametrize("high_pages", [False, True])
+def test_tensorcore_score_clears_invisible_tiles_in_captured_capacity(high_pages):
+    """GPU visibility may change while the public score capacity stays fixed."""
+    torch.manual_seed(41065)
+    q = torch.randn((4, 32, 128), device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn((2048, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((4, 32), device="cuda", dtype=torch.bfloat16) / 64
+    lengths = torch.tensor([0, 63, 511, 2048], device="cuda", dtype=torch.int32)
+    _, args = _allocate(q, keys, lengths, high_pages=high_pages, page_size=128)
+    plan = api.plan(
+        api.Caps(
+            device=q.device,
+            num_q_heads=32,
+            max_q_rows=64,
+            max_page_table_width=512,
+            topk=512,
+            cache_format="mxfp4",
+            page_size=128,
+            mode="prefill",
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    args["scratch"] = torch.empty(spec.shape, device="cuda", dtype=spec.dtype)
+    binding = api.bind(plan, query_weights=weights, **args)
+    scores = api.score(binding)
+    api.select(binding)
+    expected_full = _oracle_scores(q, keys, weights)
+    freeze_kernel_resolution("MXFP4 inactive score tiles")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            api.score(binding)
+            api.select(binding)
+        for live_lengths, active in (
+            ([0, 63, 511, 2048], 2048),
+            ([128, 0, 2048, 1], 1024),
+            ([2048, 2048, 2048, 2048], 0),
+        ):
+            lengths.copy_(torch.tensor(live_lengths, device="cuda", dtype=torch.int32))
+            args["active_width"].fill_(active)
+            scores.fill_(42)
+            graph.replay()
+            extent = torch.minimum(lengths, args["active_width"])
+            expected = expected_full.masked_fill(
+                torch.arange(2048, device="cuda")[None] >= extent[:, None],
+                -torch.inf,
+            )
+            torch.testing.assert_close(scores[:, :2048], expected, rtol=0, atol=0)
+            assert bool(torch.isneginf(scores[:, 2048:]).all())
+            _assert_topk(expected, args["output_indices"], args["output_scores"])
+    finally:
+        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
