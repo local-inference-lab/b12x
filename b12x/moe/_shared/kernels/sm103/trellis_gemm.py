@@ -79,9 +79,7 @@ class RoutedTrellisGemm:
     def kernel(
         self, mma, layout, a, packed, lut, ids, out, a_stride: Int64, out_stride: Int64
     ):
-        thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         route = Int64(block // cute.ceil_div(self.n, 128))
         n_base = Int64(block % cute.ceil_div(self.n, 128)) * 128
         route_ids = cute.make_tensor(ids, cute.make_layout(self.capacity))
@@ -96,6 +94,39 @@ class RoutedTrellisGemm:
         output = cute.make_tensor(
             out, cute.make_layout(Int64(self.capacity) * out_stride)
         )
+
+        self.execute_tiles(
+            mma,
+            layout,
+            source,
+            weights,
+            lut,
+            expert,
+            route,
+            a_stride,
+            output,
+            n_base,
+            out_stride,
+        )
+
+    @cute.jit
+    def execute_tiles(
+        self,
+        mma,
+        layout,
+        source,
+        weights,
+        lut,
+        selection,
+        route: Int64,
+        a_stride: Int64,
+        output,
+        n_base: Int64,
+        out_stride: Int64,
+    ):
+        """Share TMEM lifetime, MMA completion, and the FP16 epilogue across decoders."""
+        thread, _, _ = cute.arch.thread_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         @cute.struct
         class Storage:
@@ -127,7 +158,7 @@ class RoutedTrellisGemm:
 
         for stage in cutlass.range(cute.ceil_div(self.k, 64)):
             self.stage_operands(
-                source, weights, lut, expert, route, a_stride, stage, n_base, sA, sB
+                source, weights, lut, selection, route, a_stride, stage, n_base, sA, sB
             )
 
             # Every writer publishes its stores to the async MMA proxy before

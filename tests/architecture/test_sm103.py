@@ -515,6 +515,9 @@ def test_sm103_generator_filters_unsupported_recipes_and_route_capacities():
         or (g.recipe.trellis_variant == "k3-sqg-uniform-coupled"
             and g.activation == "situ" and g.hidden_size % 512 == 0
             and g.intermediate_size % 128 == 0)
+        or (g.recipe.trellis_variant == "glm-mcg-projection-tiered"
+            and g.activation in {"silu", "situ"} and g.hidden_size % 128 == 0
+            and g.intermediate_size % 128 == 0)
         for g in selected._geometries
     )
     assert selected._for_device(context) is selected

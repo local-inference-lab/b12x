@@ -2394,6 +2394,7 @@ def build_projection_tiered_maps(
     *,
     tier_slots: Sequence[int],
     device: torch.device,
+    local_index_bits: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build route and projection descriptors for a mixed-bitrate MoE layer.
 
@@ -2404,8 +2405,11 @@ def build_projection_tiered_maps(
 
     Returns ``(global_to_combined, descriptor_map)``. ``descriptor_map`` is a
     contiguous ``int32[3 * sum(tier_slots)]`` tensor laid out as gate, up, and
-    down rows. A populated entry encodes ``(tier << 8) | tier_local_index``;
-    unused padded slots contain ``-1``.
+    down rows. A populated entry encodes
+    ``(tier << local_index_bits) | tier_local_index``; unused padded slots
+    contain ``-1``. The SM12x kernel consumes eight local-index bits. The
+    24-bit form preserves Int32 storage for larger expert capacities and
+    requires a backend that explicitly supports that descriptor format.
     """
 
     projections = (
@@ -2414,12 +2418,15 @@ def build_projection_tiered_maps(
         ("down", tuple(int(t) for t in down_tiers)),
     )
     slots = tuple(int(value) for value in tier_slots)
+    if local_index_bits not in (8, 24):
+        raise ValueError("mixed Trellis local_index_bits must be 8 or 24")
+    max_slots = 1 << local_index_bits
     if len(slots) not in (2, 3):
         raise ValueError(
             "mixed Trellis tier_slots must contain exactly two or three counts"
         )
-    if any(value < 0 or value > 256 for value in slots):
-        raise ValueError("mixed Trellis tier slots must be in [0, 256]")
+    if any(value < 0 or value > max_slots for value in slots):
+        raise ValueError(f"mixed Trellis tier slots must be in [0, {max_slots}]")
     num_experts = len(projections[0][1])
     rows: list[int] = []
     projection_counts: list[tuple[int, ...]] = []
@@ -2438,11 +2445,11 @@ def build_projection_tiered_maps(
         for tier in tiers:
             local = counters[tier]
             counters[tier] += 1
-            if local > 0xFF:
+            if local >= max_slots:
                 raise ValueError(
-                    f"mixed Trellis {name} tier {tier} exceeds 256 experts"
+                    f"mixed Trellis {name} tier {tier} exceeds {max_slots} experts"
                 )
-            row.append((tier << 8) | local)
+            row.append((tier << local_index_bits) | local)
         projection_counts.append(tuple(counters))
         rows.extend(row)
     # The launch sizes the descriptor namespace as the sum of the tier slot
@@ -2474,6 +2481,7 @@ def build_projection_tiered_maps(
         )
     # Preserve the gate/up counts encoded by the descriptor so binding can
     # reject a mismatched storage contract without a device synchronization.
+    descriptor._mt_descriptor_local_bits = local_index_bits
     descriptor._mt_projection_counts = (
         projection_counts[0],
         projection_counts[1],
@@ -2498,6 +2506,8 @@ def _check_descriptor_projection_counts(
     never synchronize.
     """
 
+    if getattr(descriptor_map, "_mt_descriptor_local_bits", 8) != 8:
+        raise ValueError("SM12x mixed Trellis requires eight-bit local descriptors")
     encoded = getattr(descriptor_map, "_mt_projection_counts", None)
     if encoded is None:
         rows = descriptor_map.detach().cpu().view(3, total_experts)

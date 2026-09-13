@@ -742,6 +742,7 @@ def compile_trellis(out):
     from b12x.moe._shared.kernels.sm103.launch import pointer
     from b12x.moe._shared.kernels.sm103.trellis import ReconstructTrellisTiles
     from b12x.moe._shared.kernels.sm103.trellis_gemm import RoutedTrellisGemm
+    from b12x.moe._shared.kernels.sm103.trellis_mixed_gemm import RoutedMixedTrellisGemm
 
     launches = {}
 
@@ -791,6 +792,26 @@ def compile_trellis(out):
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix="trellis_moe_" + label + "_")
         launches.update({"trellis_moe_" + label + "_" + key: fn for key, fn in compiled.items()})
+    for local_bits, experts, dtype, activation in (
+        (8, 5, torch.float16, "situ"),
+        (24, 384, torch.bfloat16, "silu"),
+    ):
+        label = f"trellis_mixed_d{local_bits}_"
+        caps = SimpleNamespace(
+            k=5120, n=2304, weight_E=experts, max_tokens=128, num_topk=min(experts, 6),
+            route_num_experts=2 * experts, dtype=dtype, activation=activation,
+            weight_plan=SimpleNamespace(coupled_hadamard=False, source_format="b12x_trellis",
+                                        trellis_bits=3, trellis_codebook="mcg"),
+        )
+        compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
+        launches.update({label + key: fn for key, fn in compiled.items()})
+        for id_dtype in (cutlass.Int32, cutlass.Int64):
+            args = [pointer(t) for t in (cutlass.Float16, cutlass.Uint32, cutlass.Uint8, id_dtype, cutlass.Int32, cutlass.Float16)]
+            args += [cutlass.Int32(0), cutlass.Int64(3 * experts), cutlass.Int64(1),
+                     (cutlass.Int64(0),) * 3, (cutlass.Int32(0),) * 3,
+                     cutlass.Int32(1), cutlass.Int64(80), cutlass.Int64(144), cuda.CUstream(0)]
+            compile_case(label + "tail_" + id_dtype.__name__,
+                         RoutedMixedTrellisGemm(144, 80, experts, 128, descriptor_local_bits=local_bits), args)
     return launches
 
 
@@ -1123,7 +1144,7 @@ def main():
             "experts": 384,
             "hidden": 5120,
             "intermediate": 2304,
-            "stage": "quantizer-basis tiles, inline FP16 projections, and uniform-rate expert MoE",
+            "stage": "quantizer-basis tiles, inline FP16 projections, and uniform or MCG projection-tiered expert MoE",
         },
         "roce_geometry": {
             "world_size": 2,
