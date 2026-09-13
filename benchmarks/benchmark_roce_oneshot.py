@@ -287,6 +287,8 @@ def main() -> None:
     )
     ap.add_argument("--gather-cols", type=int, default=38720)
     ap.add_argument("--output", default="")
+    ap.add_argument("--transport", choices=("auto", "spark_mapped", "grace_mapped", "hbm_gdr"), default="auto")
+    ap.add_argument("--experimental-transport", action="store_true")
     args = ap.parse_args()
 
     dist.init_process_group("nccl")
@@ -305,6 +307,8 @@ def main() -> None:
         max_gather_bytes=16 << 20,
         threads=args.runtime_threads,
         blocks=args.runtime_blocks,
+        transport=args.transport,
+        experimental=args.experimental_transport,
     )
     runtime.prepare((dtype,))
     sizes = [int(s) for s in args.sizes.split(",") if int(s) <= args.max_size]

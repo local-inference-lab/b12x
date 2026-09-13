@@ -23,6 +23,7 @@ META = OpMeta(
     group="comm",
     api_style="stateful",
     entry_points=(
+        "PlatformCapabilities", "TransportSelection", "probe_platform", "select_transport",
         "API_VERSION",
         "AllReduce",
         "DEFAULT_MAX_GATHER_BYTES",
@@ -36,7 +37,7 @@ META = OpMeta(
         "discover_hcas",
         "is_supported",
     ),
-    archs=("sm121a",),
+    archs=("sm103a", "sm121a"),
     dtypes=("bf16", "fp16", "fp32", "int32", "int64"),
     requires=("multi_node", "rdma"),
     provenance=Provenance(
@@ -54,6 +55,7 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
+        PlatformCapabilities, TransportSelection, probe_platform, select_transport,
         API_VERSION,
         DEFAULT_MAX_GATHER_BYTES,
         DEFAULT_MAX_SIZE,
