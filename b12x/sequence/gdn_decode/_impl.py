@@ -863,6 +863,11 @@ def run_kda(
     scale_value = caps.key_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(scale_value) or scale_value <= 0.0:
         raise ValueError(f"scale must be finite and positive, got {scale_value}")
+    if binding.plan.config.backend == "cutedsl":
+        from ._cute_kda import run as run_cute_kda
+
+        run_cute_kda(binding, scale=scale_value, lower_bound=lower_bound_value, eps=eps_value)
+        return binding.output
     from ._kernels import run_gdn_decode
 
     run_gdn_decode(

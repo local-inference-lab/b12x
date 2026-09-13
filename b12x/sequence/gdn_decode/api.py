@@ -21,8 +21,7 @@ from ._tuning import GdnConfig, GdnQuery
 
 def is_supported(device=None) -> bool:
     """True when mandatory Qwen CuTe and its Triton auxiliaries are usable."""
-    del device
-    return has_cutlass_dsl() and has_triton()
+    return default_is_supported(device, requires=("triton",), archs=("sm103a", "sm120a", "sm121a"))
 
 
 __all__ = [

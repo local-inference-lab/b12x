@@ -20,6 +20,17 @@ def require_b12x():
     return torch.device("cuda")
 
 
+def require_sm103_or_sm12x():
+    """Require an implemented CuTe recurrent target, including SM103."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for recurrent kernel qualification")
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 3), (12, 0), (12, 1)):
+        pytest.skip(f"CuTe recurrent target required, found {capability}")
+    return torch.device("cuda")
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_seed():
     try:

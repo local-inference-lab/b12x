@@ -71,8 +71,19 @@ def require_kernel_architecture(
         return
     if module.startswith("b12x.moe._shared.kernels.sm103."):
         return
-    if module in {"b12x.comm.roce._oneshot_cute", "b12x.comm.roce._allgather_cute"}:
-        # Transport construction separately requires explicit Grace qualification.
+    if module in {
+        "b12x.comm.roce._oneshot_cute", "b12x.comm.roce._allgather_cute",
+        "b12x.sequence.gdn_decode._cute_kernels",
+        "b12x.sequence.gdn_decode._cute_kda",
+        "b12x.sequence._shared.delta_prefill._cute_kernels",
+        "b12x.attention.dense_mla._forward",
+        "b12x.attention.dense_mla._merge",
+        "b12x.attention._shared.static_fp8_quant",
+        "b12x.gemm.bf16_gemv._kernel",
+        "b12x.gemm.bf16_gemv._prefill",
+    }:
+        # Portable recurrent kernels have SM103 compilation evidence. Transport
+        # construction additionally requires explicit Grace qualification.
         return
     raise UnsupportedArchitectureError(
         f"{module} has no admitted SM103 CuTe implementation; use an implemented backend"

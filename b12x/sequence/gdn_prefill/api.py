@@ -13,7 +13,7 @@ from ._tuning import GdnPrefillConfig, GdnPrefillQuery
 
 def is_supported(device=None) -> bool:
     """True when the CuTe DSL kernels can run on ``device``."""
-    return default_is_supported(device)
+    return default_is_supported(device, archs=("sm103a", "sm120a", "sm121a"))
 
 
 __all__ = [
