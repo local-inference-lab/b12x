@@ -19,8 +19,19 @@ def require_sm103():
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def case(device, *, hidden=256, intermediate=256, experts=4, top_k=2, capacity=8):
-    prepared = make_experts(device=device, k=hidden, n=intermediate, e=experts)
+def case(
+    device,
+    *,
+    hidden=256,
+    intermediate=256,
+    experts=4,
+    top_k=2,
+    capacity=8,
+    w13_layout="w13",
+):
+    prepared = make_experts(
+        device=device, k=hidden, n=intermediate, e=experts, w13_layout=w13_layout
+    )
     raw = prepared._impl
     for w in (raw.w1_fp4, raw.w2_fp4):
         w.random_(0, 256)
@@ -44,9 +55,10 @@ def case(device, *, hidden=256, intermediate=256, experts=4, top_k=2, capacity=8
 
 
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype):
+@pytest.mark.parametrize("w13_layout", ["w13", "w31"])
+def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, w13_layout):
     device = require_sm103()
-    prepared, plan, scratch = case(device)
+    prepared, plan, scratch = case(device, w13_layout=w13_layout)
     initial_ptrs = (
         scratch.data_ptr(),
         prepared._impl.w1_fp4.data_ptr(),
@@ -58,6 +70,8 @@ def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype):
             a = torch.randn((m, 256), device=device, dtype=torch.bfloat16) * 0.1
             ids = torch.arange(m * 2, device=device, dtype=id_dtype).reshape(m, 2) % 4
             ids[0, 0] = -1
+            if m == 4:
+                ids[0, 0] = 2**32 + 1 if id_dtype == torch.int64 else 4
             weights = torch.rand((m, 2), device=device)
             binding = fused_moe.bind(
                 plan,

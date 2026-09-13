@@ -145,9 +145,9 @@ def sm103_context(monkeypatch):
     return PolicyContext.for_identity(B300)
 
 
-def make_experts(*, device="cpu", e=2, k=256, n=256):
+def make_experts(*, device="cpu", e=2, k=256, n=256, w13_layout="w13"):
     wp = fused_moe.plan_weights(
-        source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout=w13_layout),
         activation=fused_moe.ActivationSpec(
             mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16
         ),
