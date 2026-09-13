@@ -937,6 +937,7 @@ class TPMoEScratchPlan:
     launch_plan: TPMoEPlan
     _core_workspace_plan: _TPCoreWorkspacePlan
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    _backend_plan: object | None = field(default=None, repr=False)
     _prewarmed_fused_launches: tuple[tuple[int, object], ...] = field(
         default=(), repr=False
     )
@@ -950,7 +951,7 @@ class TPMoEScratchPlan:
     @property
     def full_rotation(self) -> bool:
         """Whether this plan owns the EXL3 full-rotation execution path."""
-        return self._core_workspace_plan.full_rotation
+        return self._backend_plan is None and self._core_workspace_plan.full_rotation
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -976,6 +977,13 @@ class TPMoEScratchPlan:
         output_expert_map: torch.Tensor | None = None,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
+        if self._backend_plan is not None:
+            return self._backend_plan.bind(
+                self, scratch=scratch, a=a, experts=experts,
+                topk_weights=topk_weights, topk_ids=topk_ids, output=output,
+                activation_amax=activation_amax, route_expert_map=route_expert_map,
+                output_expert_map=output_expert_map, unit_scale_contract=unit_scale_contract,
+            )
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
         if experts.plan != self.caps.weight_plan:
@@ -1209,6 +1217,7 @@ class TPMoEFP4Binding:
     route_pack_launches: object | None = None
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
+    _backend_binding: object | None = field(default=None, repr=False)
 
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
@@ -6957,6 +6966,15 @@ def plan_tp_moe_execution(
     if not isinstance(decode_config, MoeDecodeConfig):
         raise TypeError("decode_config must be a concrete MoeDecodeConfig")
     weight_E = weight_plan.num_experts
+    backend = architecture_backend(policy_context.device)
+    if backend is not None:
+        return backend.plan_execution(
+            num_tokens=num_tokens, num_topk=num_topk, device=device,
+            weight_plan=weight_plan, quant_mode=quant_mode,
+            swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta, apply_router_weight_on_input=apply_router_weight_on_input,
+            policy_context=policy_context,
+        )
     k = weight_plan.hidden_size
     n = weight_plan.intermediate_size
     source_format = weight_plan.source_format
@@ -8517,6 +8535,9 @@ def _plan_tp_moe_arena_layout_from_caps(
 
 def tp_moe_required_nbytes(caps: TPMoEScratchCaps) -> int:
     """Return the planned arena bytes without compiling launches or retaining storage."""
+    backend = architecture_backend(getattr(getattr(caps, "policy_context", None), "device", None))
+    if backend is not None:
+        return backend.plan_scratch(caps, prewarm_launches=False).layout.total_nbytes
     return _plan_tp_moe_arena_layout_from_caps(caps).total_nbytes
 
 
@@ -8525,6 +8546,9 @@ def plan_tp_moe_scratch(
     *,
     prewarm_launches: bool = True,
 ) -> TPMoEScratchPlan:
+    backend = architecture_backend(getattr(getattr(caps, "policy_context", None), "device", None))
+    if backend is not None:
+        return backend.plan_scratch(caps, prewarm_launches=prewarm_launches)
     deterministic_output = caps.deterministic_output
     layout = _plan_tp_moe_arena_layout_from_caps(
         caps,
@@ -12595,6 +12619,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
         raise TypeError("binding must be a TPMoEFP4Binding")
+    if binding._backend_binding is not None:
+        return binding._backend_binding.run()
 
     a = binding.a
     experts = binding.experts

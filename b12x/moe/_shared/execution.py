@@ -92,11 +92,13 @@ class GraphPartition(_StringEnum):
     """
 
     FUSED = "fused"
+    MATERIALIZED = "materialized"
 
 
 class GemmEngine(_StringEnum):
     DIRECT_DOT = "direct_dot"
     NVFP4_MMA = "nvfp4_mma"
+    NVFP4_TCGEN05 = "nvfp4_tcgen05"
     MXFP8_QMMA = "mxfp8_qmma"
     MXFP6_QMMA = "mxfp6_qmma"
     W4A16_MMA = "w4a16_mma"

@@ -1,4 +1,4 @@
-"""Fused tensor-parallel MoE for SM12x.
+"""Fused tensor-parallel MoE with architecture-specific execution backends.
 
 The canonical API keeps checkpoint encoding, prepared representation, and
 activation precision independent:
@@ -60,6 +60,7 @@ META = OpMeta(
     name="fused_moe",
     group="moe",
     api_style="planned",
+    archs=("sm103a", "sm120a", "sm121a"),
     entry_points=(
         "ActivationMode",
         "ActivationSpec",
