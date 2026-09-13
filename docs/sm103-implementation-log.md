@@ -199,6 +199,67 @@ binds the collection to package source SHA-256
 and source distribution. Inspection verified that the wheel contains the
 packaged qualification oracle with identical source bytes.
 
+## Portable operator admission
+
+Status: **implemented, unqualified on SM103**. Revisions `c878e33a` and
+`02f40a30` add CuTe KDA decode and admit portable Qwen GDN decode, sequential
+KDA/GDN prefill, dense compressed MLA, and unquantized projections. The CuTe
+KDA path uses per-coordinate lower-bounded decay and FP32 gated RMSNorm, with
+Triton restricted to metadata validation. SM12x keeps its existing KDA default.
+GDN config schema is 4; embedded measured configs retain their values. The
+GDN and prefill candidate contracts are 3 and 6 respectively. SM103 rejects
+Triton recurrent compute and the unqualified chunk-parallel GDN algorithm.
+
+The package source SHA-256 is
+`2c787cb1ca067a3468fc4d9a5e988429986f97aea2ead79d5c738d4182c63106`.
+The isolated SM120 checkout reports the same hash. Host validation produced
+**503 passed, 58 skipped** in `expanded-host.log`; GPU-dependent checks account
+for most skips. Final focused architecture/qualification checks produced
+**43 passed**. These counts overlap and are not additive.
+
+On physical RTX PRO 4000 Blackwell GPU
+`GPU-47363510-b87a-13a5-4824-2542e97df76c`, the recurrent regression suite
+produced **308 passed** through the public APIs. Dense MLA/projection
+produced **69 passed, 2 skipped**; the skips require an installed combined
+FlashInfer/vLLM plugin environment. The KDA suite independently produced
+**24 passed**, including smaller bound capacities, frozen kernel resolution,
+zero/live counts, BF16/FP32 parameters, strided beta, accepted draft checkpoints,
+graph replay, and a state slot beyond the signed 32-bit element-offset boundary.
+
+CUDA 13.4.57 Compute Sanitizer completed the same 24 KDA tests under both
+memcheck and synccheck with **zero errors and exit status 0**. The tool was
+extracted inside the isolated checkout's `.deps/`; system CUDA was unchanged.
+The archive is available from NVIDIA's
+[CUDA redistribution index](https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/linux-x86_64/).
+Its SHA-256 is `443465d4dcb77f45a2eb2c9adf2d1e0d7b4d0966ce84acf6d89b4c555bd55f5b`.
+One CUDA 12.8 synccheck invocation ended with status 255 after passing its test
+assertions and is excluded from qualification; both a repeat and the CUDA 13.4
+run completed cleanly. No kernel failure was reported in that interrupted log.
+
+Offline compilation at `02f40a30` produced **83 callables / 91 CUDA entry
+points** under `../b12x-sm103-evidence/portable-operators-sm103/`. The corpus
+contains 36 recurrent, 17 dense MLA, ten unquantized projection, and the
+existing twenty MoE/communication/reconstruction callables. The existing twenty
+cubin hashes are unchanged. Dense window cases use the public planner's
+single-query tile; unreachable multi-query window combinations are excluded.
+
+KDA recurrence uses 80–92 allocated registers in the sampled variants; its
+norm uses 24. Both have zero reported stack/local storage. Four reachable
+1088-wide dense MLA variants report 8–192-byte stack frames. These resource
+flags remain visible in `docs/sm103-validation.json` and require SM103 profiling.
+The reports do not measure dynamic launch SMEM, occupancy, or performance.
+
+`scripts/qualify_sm103.py` prepares a manifest without a CUDA context. Execution
+requires `--execute --device-uuid`, verifies physical SM103 identity, rejects
+skipped required tests, and records source, tool, GPU, and test identities.
+Supplying an offline compile manifest verifies all retained artifact hashes.
+Preparation succeeded against the complete compile bundle under
+`../b12x-sm103-evidence/portable-operators-qualification/`; no GB300 execution
+was requested or performed. Wheel and source distribution artifacts are under
+`../b12x-sm103-evidence/portable-operators-dist/`. The wheel's portable operator
+sources match the checkout byte for byte. Qualification scripts and tests run
+from a full checkout, not the installable wheel.
+
 ## Compiler attempts and limitations
 
 Python 3.12, PyTorch 2.14.0+cu130, CUTLASS DSL and library wheels 4.6.2, and
@@ -206,8 +267,9 @@ cuda-python 13.4.1 are installed in the isolated virtual environment. CPU-only
 `cute.compile(..., no_jit_engine=True, options="--gpu-arch=sm_103a")` produces
 actual PTX, cubins and host-side MLIR without a CUDA driver context.
 
-The compile corpus contains nine MoE launchers, eight TP2 RoCE launchers and
-three Trellis reconstruction launchers. NVIDIA `nvdisasm` 13.4.49 can inspect
+The native MoE/transport/reconstruction subset contains nine MoE launchers,
+eight TP2 RoCE launchers and three Trellis reconstruction launchers.
+NVIDIA `nvdisasm` 13.4.49 can inspect
 the cubins. Projection code contains `tcgen05.mma` in PTX and
 `UTCOMMA.BLOCK16`/TMEM operations in SASS. Static register/resource reports
 describe generated code, not achieved occupancy or runtime correctness.
