@@ -741,25 +741,40 @@ def compile_trellis(out):
     import cutlass.cute as cute
     from b12x.moe._shared.kernels.sm103.launch import pointer
     from b12x.moe._shared.kernels.sm103.trellis import ReconstructTrellisTiles
+    from b12x.moe._shared.kernels.sm103.trellis_gemm import RoutedTrellisGemm
 
     launches = {}
-    # One V4.1 FC2 family in the checkpoint's K16/N16 tile ordering.
-    capacity = 384 * (5120 // 16) * (2304 // 16)
-    for bits in (2, 3, 4):
-        name = f"trellis_k{bits}"
+
+    def compile_case(name, kernel, args):
         directory = out / name
         directory.mkdir()
-        kernel = ReconstructTrellisTiles(bits, capacity)
-        args = [pointer(t) for t in (cutlass.Uint32, cutlass.Uint8, cutlass.BFloat16)]
-        args += [cutlass.Int32(1), cuda.CUstream(0)]
         compiled = cute.compile(
-            kernel,
-            *args,
-            no_jit_engine=True,
+            kernel, *args, no_jit_engine=True,
             options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
         )
         (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
         launches[name] = compiled
+
+    # One V4.1 FC2 family in the checkpoint's K16/N16 tile ordering.
+    capacity = 384 * (5120 // 16) * (2304 // 16)
+    for codebook, rates in (("mcg", (2, 3, 4, 5, 6)), ("sqg_e4m3", (2, 3, 4)), ("sqg_fp16", (5, 6))):
+        for bits in rates:
+            for dtype in (cutlass.Float16, cutlass.BFloat16):
+                name = f"trellis_{codebook}_k{bits}_{dtype.__name__}"
+                if codebook == "sqg_e4m3" and dtype == cutlass.BFloat16:
+                    name = f"trellis_k{bits}"
+                args = [pointer(t) for t in (cutlass.Uint32, cutlass.Uint8, dtype)]
+                args += [cutlass.Int32(1), cuda.CUstream(0)]
+                compile_case(name, ReconstructTrellisTiles(bits, capacity, codebook=codebook), args)
+            geometries = [("tail", 144, 80)]
+            if bits == 3 and codebook in {"mcg", "sqg_e4m3"}:
+                geometries += [("gate", 2304, 5120), ("down", 5120, 2304)]
+            for stage, n, k in geometries:
+                for id_dtype in (cutlass.Int32, cutlass.Int64):
+                    name = f"trellis_projection_{codebook}_k{bits}_{stage}_{id_dtype.__name__}"
+                    args = [pointer(t) for t in (cutlass.Float16, cutlass.Uint32, cutlass.Uint8, id_dtype, cutlass.Float16)]
+                    args += [cutlass.Int32(1), cutlass.Int64(k), cutlass.Int64(n), cuda.CUstream(0)]
+                    compile_case(name, RoutedTrellisGemm(n, k, 384, 128, bits=bits, codebook=codebook), args)
     return launches
 
 
@@ -1092,7 +1107,7 @@ def main():
             "experts": 384,
             "hidden": 5120,
             "intermediate": 2304,
-            "stage": "unscaled quantizer-basis tiles",
+            "stage": "unscaled quantizer-basis tiles and inline FP16 projections",
         },
         "roce_geometry": {
             "world_size": 2,
@@ -1164,6 +1179,8 @@ def main():
             text = ptxs[0].read_text()
             if ".target sm_103a" not in text:
                 raise RuntimeError(f"{name}: wrong PTX target")
+            if "tcgen05.ld." in text and "tcgen05.wait::ld" not in text:
+                raise RuntimeError(f"{name}: missing asynchronous TMEM load completion wait")
             if name.startswith("fc") and "tcgen05.mma" not in text:
                 raise RuntimeError(f"{name}: missing native tcgen05 MMA")
             inspected = []

@@ -1,0 +1,155 @@
+{
+  "status": "implemented_and_cross_compiled",
+  "runtime_qualified_sm103": false,
+  "complete_trellis_moe_supported": false,
+  "scope": "Native quantizer-basis FP16 Trellis projection, exact circular reconstruction, and explicit TMEM load completion in both native SM103 engines",
+  "source_revision_at_compile": "5e7f0c6a646d67a55efd373ed72ad5efb7d99a0e",
+  "package_python_sha256": "1f80048143768e7add04ae14a45f820d48603d71bb88b1e936459e5e6714c4b0",
+  "source_files": {
+    "b12x/gemm/_shared/sm103_blockscaled.py": "54b4dff29f191be172f6c0dd97fd72533021f5d103d00025a020bff633d022f8",
+    "b12x/moe/_shared/kernels/sm103/trellis.py": "ec58c2e15190a4f4882268bcfdf0803961d3f9ad7b2945aab40a50a671ee244b",
+    "b12x/moe/_shared/kernels/sm103/trellis_decode.py": "bbd3c4a7f5a4f3da2fbb82cee439d4d9f29562aef5d8ce6233b025ecfeebfbd9",
+    "b12x/moe/_shared/kernels/sm103/trellis_gemm.py": "890eb91e1b2a873ec20d351e26d798942f495ebc71e73d7958e840be2f4d2ee1",
+    "tests/architecture/test_sm103_trellis.py": "596017dbf2d4186f683c2bace0a8dd4c883817e03e712b3ddaeb21d997c1154e",
+    "tests/moe/test_sm103_trellis.py": "79b6a1d2b307ee8c165e1af3f21138c595bfbe5e8af7948c1a5707928704c979",
+    "tests/moe/test_sm103_trellis_staging.py": "d323c13d3adaf2b9a7fb4761d17ee8647d3240008ddc557a09bbb1ff83a0649f",
+    "tests/moe/test_sm103_trellis_gemm.py": "128aedb6fa6bd6f030804209a2c4ac9107a21e8f09163babe31055882750ae87",
+    "tests/_reference/trellis_decode.py": "902b5daef42892063da16bfbe342e6576d697024063c01323e082b79f8ed534d",
+    "scripts/compile_sm103.py": "80e81188f7ac14c8078c597143b21381ede77a2242513774e8ddaf5432529f14",
+    "scripts/qualify_sm103.py": "1858366cd6b5b65e44410403f451f4f0af6e8f9c67a5105452f0009704878c0d",
+    "benchmarks/benchmark_sm103_trellis_projection.py": "f3ffd58c3401d5975130ac5048ed40a2d45631c6949b1971252e407a9b730559"
+  },
+  "compile": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-complete-sm103-final/manifest.json",
+    "sha256": "542bb421e23f9081f0cf4d903ac02fc3db047e63c2ff8d0d8d2336a19527ed8d",
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "all",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/trellis-complete-sm103-final",
+      "--nvdisasm",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "callables": 372,
+    "cuda_entries": 380,
+    "trellis_reconstruction_callables": 20,
+    "trellis_projection_callables": 28,
+    "added_callables": 45,
+    "added_allocated_gpr_range": [
+      16,
+      140
+    ],
+    "added_stack_or_local_entries": 0,
+    "positive_existing_resource_deltas": {},
+    "retained_stack_flagged_callables": 31,
+    "tmem_load_wait_callables": 80,
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-resources-final.json",
+      "sha256": "59ab2cb36cc029cccdb32bfbf556dd055bb6ce4e6e2c4b9853635ece2151d4fb"
+    },
+    "resource_audit": {
+      "path": "/home/jasonc/b12x-sm103-evidence/audit_trellis_artifacts.py",
+      "sha256": "09be00773ff417999aad0cb089586850e27db0756a460013a42467ef8ebbb7a0"
+    },
+    "toolchain": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    }
+  },
+  "validation": [
+    {
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/moe/test_sm103_trellis_gemm.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-host-final.log",
+      "sha256": "4f2c5288da594194f09969c3c9279e894fd12cb319a71951deb04311daff5429",
+      "result": "422 passed, 35 skipped in 26.11s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-sm120-final.log",
+      "sha256": "5b6ff0edc50735d3ce8f7dbbd130b2bd7c676fa9a3d40923d93d3606483a81ad",
+      "result": "34 passed in 5.38s",
+      "sanitizer_summary": []
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-sm120-memcheck-final.log",
+      "sha256": "740065e1b707e93359ff2af446d9a52b19d111cdf07eba3945ba2fa9fd721e9a",
+      "result": "34 passed in 6.48s",
+      "sanitizer_summary": [
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    },
+    {
+      "command": "cd /home/jasonc/b12x-sm103-regression-20260912 && CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis.py tests/moe/test_sm103_trellis_staging.py",
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-sm120-synccheck-final.log",
+      "sha256": "5342687f40d0b50ea0b1f58ef850612787612af337f815f49e8a6a39f8e40dfc",
+      "result": "34 passed in 5.90s",
+      "sanitizer_summary": [
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    }
+  ],
+  "sm120_device": {
+    "product": "NVIDIA RTX PRO 4000 Blackwell",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "driver": "580.173.02",
+    "mode": "Default",
+    "package_python_sha256": "1f80048143768e7add04ae14a45f820d48603d71bb88b1e936459e5e6714c4b0"
+  },
+  "sanitizer_api_reporting": {
+    "status": "disabled_only_for_kernel_instrumentation",
+    "reason": "CUDA Python 13.4 probes entry points newer than the available CUDA 13.0 driver; the isolated probe and unfiltered evidence are retained in docs/sm103-fp6-validation.json. These runs check kernel memory and synchronization, not clean driver API compatibility."
+  },
+  "package": {
+    "receipt": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-package-final.json",
+      "sha256": "1955d1b0d8a9b5845d0caa8817517cb545a4c87fb1d5a6559d6a70a624cd08e9"
+    },
+    "package_python_sha256": "1f80048143768e7add04ae14a45f820d48603d71bb88b1e936459e5e6714c4b0",
+    "verified_files": 455,
+    "python_files": 452,
+    "profiles": 3,
+    "artifacts": {
+      "/home/jasonc/b12x-sm103-evidence/trellis-dist-final/b12x-1.3.0-py3-none-any.whl": "208672242f68686d554e79ead835eee99c03c01abc30841170d799b592812398",
+      "/home/jasonc/b12x-sm103-evidence/trellis-dist-final/b12x-1.3.0.tar.gz": "1c39c05fb2a710576c918302f2f05f21740bda8f1af534218a80ab812b34e5c8"
+    }
+  },
+  "prepared_qualification": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-prepared-final/qualification.json",
+    "sha256": "33067134ae058f609a79929fae7c0eab8a6511242635db2e60ec9d8fd46b4f63"
+  },
+  "deferred_sm103_tests": {
+    "native_projection_cases": 23,
+    "portable_staging_cases": 11,
+    "command": "python scripts/qualify_sm103.py --component trellis_projection --execute --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-trellis-projection --sanitizer /path/to/compute-sanitizer"
+  },
+  "benchmark": {
+    "status": "help_only; no SM103 execution or timings",
+    "command": "python benchmarks/benchmark_sm103_trellis_projection.py --codebook mcg --bits 3 --n 2304 --k 5120 --rows 1 4 8 128 --capacity 128 --device-uuid GPU-actual-B300-UUID --output /tmp/trellis-projection-k3.json",
+    "help": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-benchmark-help.log",
+      "sha256": "d23310224b8cd62b06c395abbf65de00ab0e9920da0242e37c00a17d0b0d8242"
+    },
+    "ratio_direction": "inline Trellis projection / per-route Torch FP16 projection; lower favors Trellis"
+  },
+  "remaining": [
+    "Complete expert scales, FP16 rounding, ordinary/coupled Hadamards, mixed-rate dispatch, activation, and top-k reduction in existing MoE plan/bind/run",
+    "Physical SM103 projection numerics, graph replay, synchronization, resource profiling, and timing",
+    "Compressed DeepSeek sparse attention, mHC/MTP/DFlash2, and complete GLM/V4.1 serving integration",
+    "Station direct HBM GPUDirect transport and remaining TP2 integration"
+  ]
+}

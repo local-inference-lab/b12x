@@ -11,7 +11,7 @@ numbers or measured B300 policy profile are included.
 | --- | --- | --- |
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
-| Trellis | Existing t256 SQG E4M3 K2/K3/K4 reconstruction; exact SM120 tests and SM103 compilation | Decoder execution; scale/rotation staging and UMMA expert implementation |
+| Trellis | Existing t256 MCG/SQG reconstruction and inline FP16 tcgen05 projection; exact decoder/staging tests on SM120 and SM103 compilation | Native projection numerics and graphs; complete expert rotations and mixed-rate MoE integration remain implementation work |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
@@ -88,11 +88,12 @@ python scripts/compile_sm103.py --component all --output-dir /tmp/sm103-compile
 The output directory must be empty. Optional `--nvdisasm /path/to/nvdisasm`
 and `--cuobjdump /path/to/cuobjdump` retain SASS and resource reports. The manifest
 records source/toolchain identity and per-file hashes. The representative corpus
-contains nine MoE launchers, eight TP2 communication launchers, three reconstruction
+contains nine MoE launchers, eight TP2 communication launchers, 20 reconstruction
+and 28 Trellis projection launchers,
 launchers, 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
-activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 327
+activation-quantizer launchers, and 58 FP6 projection/quantization launchers: 372
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -135,6 +136,12 @@ Native values are K-major, K is divisible by 128, and N by eight. Scale storage
 is F8_128x4. Grouped output is physical `[groups,M,N]` viewed as `[M,N,groups]`.
 Live M and group strides are runtime arguments; compile keys contain immutable
 weight geometry, recipe, dtype, and device/toolchain identity.
+
+The native block-scaled and Trellis epilogues explicitly wait for TMEM loads
+before consuming their register results and releasing TMEM. The compile
+auditor rejects emitted TMEM loads without a completion wait. This follows
+NVIDIA's [tcgen05 completion contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model);
+it remains subject to physical SM103 synchronization qualification.
 
 The precision generator races actual public A16 and native quantized calls.
 Its NVFP4 oracle independently rounds activations to E2M1/E4M3 and evaluates
@@ -556,20 +563,59 @@ the native SM103 GEMM. See the
 
 ## Trellis and V4.1
 
+Status: **reconstruction and quantizer-basis projection implemented and
+cross-compiled; complete Trellis MoE unsupported**. The native FP16 projection
+decodes existing t256 records directly into shared memory and accumulates with
+tcgen05/TMEM. It does not allocate a decoded weight matrix in global memory.
+Each CTA handles one route and 128 output columns, using one 128x64 operand
+stage. The schedule waits for MMA completion before reusing that stage; it
+does not overlap compressed loads, decoding, and MMA.
+
+The decoder preserves FP16 checkpoint values for MCG K2–K6, SQG E4M3 K2–K4,
+and SQG FP16 K5/K6. Diagnostic output may be FP16 or BF16. The projection
+consumes and returns FP16 quantizer-basis activations. Model boundary
+rotations, their FP16 rounding, coupled Hadamards, mixed per-expert/projection
+rates, activation, and weighted reduction still need integration through the
+existing MoE plan/bind/run API. That API continues to reject full Trellis
+execution on SM103.
+
 ```bash
 python -m pytest tests/moe/test_sm103_trellis.py -q
 python scripts/compile_sm103.py --component trellis --output-dir /tmp/sm103-trellis
+# Execute native projection qualification only on the selected B300.
+python scripts/qualify_sm103.py --component trellis_projection --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-trellis-projection \
+  --sanitizer /path/to/compute-sanitizer
+python benchmarks/benchmark_sm103_trellis_projection.py --codebook mcg --bits 3 \
+  --n 2304 --k 5120 --rows 1 4 8 128 --capacity 128 \
+  --device-uuid GPU-actual-B300-UUID --output /tmp/trellis-projection-k3.json
+# Separate diagnostic benchmarks measure reconstruction only.
 python benchmarks/benchmark_sm103_trellis.py --bits 3 --output /tmp/trellis-k3.json
 python benchmarks/benchmark_sm103_trellis.py --bits 4 --output /tmp/trellis-k4.json
 ```
 
-These commands qualify unscaled t256 reconstruction only, with exact equality.
-The offline capacity represents E=384, K=2304, N=5120 FC2 tile storage with
-64-bit offsets. It does not compile a complete Trellis expert GEMM. Use existing
-`TrellisConfig`, rate tables, codebooks, scale vectors and transform draws for
-subsequent mixed K3/K4 expert tests. Compare reconstructed scaled weights,
-per-expert outputs, routed sums and native-FP4 model quality; reconstruction
-equality alone cannot qualify activation rotations or final serving output.
+The compile corpus covers E=384 and both (N,K)=(2304,5120) and (5120,2304),
+plus K/N tails, all codebooks, both route ID widths, and runtime row strides.
+The native GPU suite checks numerical projections, invalid IDs, M1/M4/M8/M17
+reuse under frozen compilation, mutated graph inputs/weights/routes, stable
+addresses, no replay allocation, and weight/output offsets beyond 2^31.
+Portable staging tests execute the production decoder and shared-memory stores
+on SM120, including source and weight offsets beyond 2^31. Their exact equality
+does not qualify SM103 MMA ordering or arithmetic. See the
+[Trellis projection validation receipt](sm103-trellis-validation.json).
+
+The projection benchmark gates both arms against an independent FP32 oracle,
+then compares native compressed projection with per-route Torch FP16 GEMMs
+using decoded weights. It records source/artifact hashes, physical GPU UUID
+and mode, correctness, paired warm/cold graph samples, and the ratio as
+Trellis/Torch. This comparison excludes expert transformations and serving.
+P0, a zero throttle mask, stable memory clocks, and an SM-clock difference of
+at most 30 MHz are required. No B300 timing result is supplied.
+
+Use existing `TrellisConfig`, rate tables, codebooks, scale vectors and transform
+draws for complete mixed K3/K4 expert qualification. Compare reconstructed
+scaled weights, per-expert outputs, routed sums and native-FP4 model quality;
+projection equality alone cannot qualify activation rotations or serving.
 
 The published [V4.1 configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json)
 gives 40 text transformer layers, E=384, hidden=5120, intermediate=2304, top-k=6,
@@ -669,7 +715,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
-| Trellis experts | `sm103/trellis.py`, `fused_moe/trellis.py`: scale/rotation staging, mixed rates, compressed-to-SMEM pipeline and BF16/FP8 UMMA; no full-model BF16 repack |
+| Trellis experts | `sm103/trellis.py`, `sm103/trellis_gemm.py`, `fused_moe/trellis.py`: integrate the inline FP16 projection with scale/rotation staging, coupled Hadamards, mixed rates, and the MoE backend; no full-model repack |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |
 

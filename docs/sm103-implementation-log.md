@@ -585,3 +585,60 @@ Full Trellis expert execution, compressed DeepSeek sparse attention,
 mHC/MTP/DFlash2 and complete serving, and remaining Station transport work
 remain implementation gaps. The existing undefined Trellis rank-LUT decoder
 identified in the planned FP8 log also remains unresolved.
+
+## Inline Trellis projections and TMEM load completion
+
+The internal SM103 Trellis projection consumes the existing compressed t256
+representation and decodes weights directly into a 128x64 shared-memory tile.
+FP16 operands feed tcgen05 with FP32 accumulation and FP16 output. A CTA owns
+one route and 128 output columns. Invalid expert IDs and K/N padding produce
+zero; all global row, expert, and tile products use Int64. The schedule uses
+one operand stage and waits for MMA completion before reusing it.
+
+`sm103/trellis_decode.py` shares native FP16 reconstruction between diagnostic
+tiles and the projection. It handles the three-word circular spans at higher
+rates and preserves MCG K2–K6, SQG E4M3 K2–K4, and SQG FP16 K5/K6 codebooks.
+No model-sized FP16/BF16 repack enters the projection. The source weight-plan
+contract constructs gate, up, and down primitives without adding a public API.
+Full MoE planning remains unsupported until rotations, coupled transforms,
+mixed-rate dispatch, activation, and reduction are integrated.
+
+Compiler verification isolated an invalid TMEM readout fragment: sizing
+registers from the broadcast source partition produced a 4096-element load.
+The destination partition defines the per-thread register shape and emits a
+valid 128-element load. Synchronization review also identified absent explicit
+TMEM load-completion waits. Both the Trellis epilogue and the shared native
+block-scaled epilogue now wait before consuming registers or releasing TMEM.
+The compile auditor rejects TMEM loads without an emitted completion wait.
+No SM103 runtime failure or performance improvement is claimed from these
+source-level corrections.
+
+The [Trellis validation receipt](sm103-trellis-validation.json) binds the final
+source, artifact identities, resource comparison, and test logs. Host checks
+pass 422 tests, with 35 hardware/environment skips. Physical RTX PRO 4000
+Blackwell SM120 execution passes 34 reconstruction/staging tests, including
+graph mutation, live-count reuse, invalid IDs, and source/weight offsets past
+2^31. Kernel memcheck and synccheck pass the same corpus with API reporting
+disabled for the previously isolated CUDA Python/driver probe incompatibility.
+This qualifies portable kernel behavior, not driver API compatibility or SM103
+MMA execution.
+
+The expanded offline corpus contains 372 callables and 380 CUDA entries:
+20 Trellis reconstruction and 28 inline projection callables. The projection
+corpus includes E=384, gate/down V4.1 dimensions, K/N tails, and both route ID
+widths. All artifacts are verified against their manifest. Static resource
+reports do not establish occupancy or latency; the 32 KiB operand allocation
+is dynamic launch SMEM and is not the report's static-SMEM field.
+
+`tests/moe/test_sm103_trellis_gemm.py` adds 23 physical-SM103 cases covering
+independent FP32 oracles, changing route counts with frozen compilation,
+graphs, input/weight/route mutation, strided output, and high weight/output
+offsets. The qualification runner includes these with the portable staging
+suite. `benchmarks/benchmark_sm103_trellis_projection.py` prepares gated,
+paired warm/cold graph measurements against per-route Torch FP16 projections.
+Only its command-line help has run; no SM103 timing is supplied.
+
+Complete Trellis experts, compressed DeepSeek sparse attention, mHC/MTP and
+DFlash2 model integration, complete GLM/V4.1 serving, and remaining Station
+transport work remain implementation gaps. These are not resolved by the
+compiled projection or by portable reconstruction tests.
