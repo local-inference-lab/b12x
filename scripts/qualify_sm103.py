@@ -43,6 +43,7 @@ SUITES = {
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
     "blockscaled": ["tests/gemm/test_sm103_blockscaled.py"],
     "fp8": ["tests/gemm/test_sm103_fp8.py"],
+    "block_fp8_linear": ["tests/gemm/test_sm103_block_fp8_linear.py"],
 }
 
 
@@ -144,7 +145,7 @@ def main(argv=None):
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
             "compressed DeepSeek sparse MLA",
-            "tensor/block FP8 and MXFP6 linear backends",
+            "MXFP6 linear backend",
             "Trellis experts",
             "Grace memory",
             "Station RDMA",

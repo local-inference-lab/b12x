@@ -24,8 +24,8 @@ def bind(plan: Plan, **kwargs) -> Binding:
 
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
-    return default_is_supported(device, requires=META.requires)
+    """Check architecture and dependencies; planning validates the recipe."""
+    return default_is_supported(device, archs=META.archs, requires=META.requires)
 
 
 __all__ = [

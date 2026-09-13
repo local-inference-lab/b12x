@@ -242,7 +242,7 @@ def _ue8m0_output_scale_torch(byte: torch.Tensor) -> torch.Tensor:
     return torch.where(byte == 0, torch.zeros_like(inv), inv)
 
 
-def quant_dequant_mxfp8_torch(x: torch.Tensor) -> torch.Tensor:
+def quant_dequant_mxfp8_torch(x: torch.Tensor, *, min_amax: float = 0.0) -> torch.Tensor:
     """Per-32-block MXFP8 quantize-dequantize roundtrip (oracle helper).
 
     Matches the in-kernel ``quantize_block_fp8_mx`` numerics bit-for-bit:
@@ -254,6 +254,8 @@ def quant_dequant_mxfp8_torch(x: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"last dim must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
     blocked = x.to(torch.float32).reshape(-1, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
     block_max = blocked.abs().amax(dim=-1, keepdim=True)
+    if min_amax:
+        block_max = block_max.clamp_min(min_amax)
     rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
     inv = _ue8m0_output_scale_torch(byte)
     payload = (

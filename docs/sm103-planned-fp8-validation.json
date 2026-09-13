@@ -1,0 +1,226 @@
+{
+  "status": "implemented; cross-compiled; SM120 regression passed; no SM103 execution",
+  "runtime_qualified": false,
+  "scope": "planned BF16/FP16 block-FP8 linear and CuTe MXFP8 row quantization",
+  "source_revision": "ca2fe8f8ed24f0607f07a70cdbf1ac91c596f571",
+  "package_python_sha256": "c6e4e41c7bdacbcc5b424d705e8d713235789680481f0c77e7e1808d3d9133a3",
+  "worktree": "/home/jasonc/b12x-sm103",
+  "target": "sm_103a",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/home/jasonc/b12x-sm103-evidence/planned-fp8-complete-sm103",
+    "--nvdisasm",
+    "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+  ],
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "compile_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/planned-fp8-complete-sm103/manifest.json",
+    "sha256": "53943d4a38b97e06899ba7925a882c91f4e0e148f8a57b8a00f4a2d9cfe4b8fb"
+  },
+  "callables": 269,
+  "cuda_entries": 277,
+  "resource_audit": {
+    "path": "/home/jasonc/b12x-sm103-evidence/planned-fp8-resources.json",
+    "sha256": "dcc32654703ac6109c2e7eb12d2548227d55f2a16fbfdaff7bb238e2556e3500"
+  },
+  "resource_baseline": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp8-complete-sm103/manifest.json",
+    "sha256": "6bcc082fca7e589cf2415055d3ef1174abe8445c3fefd622f7351e793a807497"
+  },
+  "added_quantizer_callables": 28,
+  "added_quantizer_gpr_range": [
+    29,
+    95
+  ],
+  "added_quantizer_stack_bytes": 0,
+  "added_quantizer_local_bytes": 0,
+  "positive_existing_resource_deltas": [],
+  "retained_stack_flag_count": 31,
+  "host_tests": {
+    "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-host-final.log",
+    "sha256": "12f6071ba1d928ed55e7b821e37eb8a9cbf28d071af0ebd20090039a286defc4",
+    "result": "669 passed, 29 skipped",
+    "command": [
+      ".venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/architecture",
+      "tests/policy",
+      "tests/gemm/test_block_fp8_linear_scratch_bindings.py",
+      "tests/gemm/test_dense_gemm_expected_m.py",
+      "tests/gemm/test_sm103_block_fp8_linear.py",
+      "-q"
+    ]
+  },
+  "packaging_host_tests": {
+    "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-packaging-host.log",
+    "sha256": "8b9ac5bcb79e21f0637cba8a969b040a2caa0cf6e09447847910ebab516c7fa1",
+    "result": "17 passed",
+    "command": [
+      ".venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/architecture/test_sm103_qualification.py",
+      "tests/architecture/test_sm103_block_fp8_linear.py",
+      "tests/test_packaging.py",
+      "-q"
+    ]
+  },
+  "gpu": {
+    "host": "ripper",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "name": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "compute_mode": "Default",
+    "driver": "580.173.02",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "CUTE_DSL_ARCH": "sm_120a"
+    },
+    "package_python_sha256": "c6e4e41c7bdacbcc5b424d705e8d713235789680481f0c77e7e1808d3d9133a3",
+    "runs": [
+      {
+        "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-sm120-final-memcheck.log",
+        "sha256": "562c73cb771c3b59b6f37470e77702a13b6612c3ce5758fc4d80c5cf7ca664bb",
+        "result": "137 passed",
+        "command": [
+          ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          ".venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/gemm/test_sm103_block_fp8_linear.py",
+          "tests/gemm/test_gemm_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear_capacity.py",
+          "tests/gemm/test_cute_migration_gemm_corpus.py",
+          "tests/quantization/test_mxfp8.py",
+          "-x",
+          "-q"
+        ],
+        "sanitizer_errors": 0,
+        "test_scope_note": "The two appended profile-provider cases are covered by the supplemental memcheck run."
+      },
+      {
+        "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-sm120-synccheck.log",
+        "sha256": "92fda7d0282eaf225e72dc800ca23666900e00cb927f7787ce537d5a4c842c3e",
+        "result": "139 passed",
+        "command": [
+          ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "99",
+          ".venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/gemm/test_sm103_block_fp8_linear.py",
+          "tests/gemm/test_gemm_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear_capacity.py",
+          "tests/gemm/test_cute_migration_gemm_corpus.py",
+          "tests/quantization/test_mxfp8.py",
+          "-x",
+          "-q"
+        ],
+        "sanitizer_errors": 0
+      },
+      {
+        "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-provider-memcheck.log",
+        "sha256": "1ee397f4ac5a8fea760be1a76234bbaea4a3ec1577da83333dd5c59e0f3fc7ac",
+        "result": "2 passed, 26 deselected",
+        "command": [
+          ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          ".venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/gemm/test_sm103_block_fp8_linear.py",
+          "-k",
+          "profile_provider",
+          "-x",
+          "-q"
+        ],
+        "sanitizer_errors": 0
+      }
+    ]
+  },
+  "baseline_oracle_failure": {
+    "path": "/home/jasonc/b12x-sm103-evidence/logs/planned-fp8-baseline-nvfp4-oracle.log",
+    "sha256": "ffb1f61dd9759e94869308a5e111e52713062f536aa42ea39a2433c632d75ab0",
+    "result": "1 failed",
+    "command": [
+      "/home/jasonc/b12x-sm103-regression-20260912/.venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/gemm/test_cute_migration_gemm_corpus.py::test_cute_migration_dense_nvfp4_gpu_oracle_and_graph",
+      "-q"
+    ],
+    "revision": "ca2fe8f8ed24f0607f07a70cdbf1ac91c596f571",
+    "worktree": "/home/jasonc/b12x-sm103-planned-fp8-baseline",
+    "disposition": "Reference applies the supplied FP32 alpha after accumulation; exact equality retained."
+  },
+  "packaging": {
+    "path": "/home/jasonc/b12x-sm103-evidence/planned-fp8-package-receipt.json",
+    "sha256": "2b3593c3813500002e3ed96d4c04d449d0f6213b29d47e2b52f6d39789dfdd33",
+    "python_files": 447,
+    "compressed_profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": "6a3efdffebe222be34db6682daa6caa7aac63c684c959e1c936568af08793a06",
+      "b12x-1.3.0.tar.gz": "f9286f237065d0ab9a14df54b2d2676e497f0700f043d767ae92f67f452ce392"
+    },
+    "verification": "Wheel and sdist package Python and compressed profile bytes match the worktree."
+  },
+  "embedded_profiles": [
+    {
+      "path": "b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz",
+      "sha256": "5a5a4591a696d8dfd43917fb863dc1fd1d27fdb2bbf1292ade6dcbfc9583a34c"
+    },
+    {
+      "path": "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.json.gz",
+      "sha256": "a8351dea0656184ba3c2cd658e6d2982b6df4a1f718973552ad31cd8437febb6"
+    },
+    {
+      "path": "b12x/policy/_profiles/data/nvidia.rtx.pro.6000.blackwell.max-q.json.gz",
+      "sha256": "790c0bc7c0e1792fdd6559ab6a7ff10442fc431167f28e372e1e29706ef89926"
+    }
+  ],
+  "known_lint_failure": {
+    "path": "b12x/_lib/intrinsics.py",
+    "symbol": "decode_trellis_sqg_cheb_normal_e4m3_rank_lut",
+    "code": "F821",
+    "reproduces_on_parent": true,
+    "scope": "Existing Trellis rank-LUT decoder; unchanged by the activation oracle extension."
+  },
+  "remaining_implementation": [
+    "MXFP6 linears",
+    "complete Trellis experts",
+    "compressed DeepSeek sparse attention",
+    "mHC/MTP/DFlash2 and complete serving",
+    "direct HBM transport"
+  ]
+}

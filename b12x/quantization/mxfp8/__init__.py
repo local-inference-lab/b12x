@@ -26,6 +26,7 @@ META = OpMeta(
     ),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
+    archs=("sm103a", "sm120a", "sm121a"),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="6627d342",

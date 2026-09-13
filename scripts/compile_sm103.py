@@ -818,6 +818,48 @@ def compile_bf16_projection(out):
     return launches
 
 
+def compile_block_fp8_linear(out):
+    """Compile production activation quantizers used by planned block-FP8 GEMM."""
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+    from b12x._lib.quant import mxfp8_rows as quant
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    quant._get_compiled_mxfp8_rows_quant.cache_clear()
+    with (patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+          patch.object(quant, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(quant, "b12x_compile", capture)):
+        for dtype in (torch.bfloat16, torch.float16):
+            for k in (128, 256, 6144, 32768):
+                for floor in (0.0, 1e-4):
+                    case = f"mxfp8_rows_{dtype}_k{k}_floor{floor}"
+                    quant._get_compiled_mxfp8_rows_quant(
+                        k, dtype, 8, 128, "linear", floor, 0, "sm_103a",
+                    )
+            for subgroup, threads, order in ((0, 256, "linear"), (4, 256, "linear"),
+                                              (8, 256, "trellis_native_mma")):
+                for floor in (0.0, 1e-4):
+                    case = f"mxfp8_rows_{dtype}_lanes{subgroup}_{order}_floor{floor}"
+                    quant._get_compiled_mxfp8_rows_quant(
+                        8192, dtype, subgroup, threads, order, floor, 0, "sm_103a",
+                    )
+    return launches
+
+
 def compile_fp8(out):
     """Compile the production tensor and compact K128 FP8 launch factory."""
     import cutlass.cute as cute
@@ -948,6 +990,7 @@ def main():
             "projection",
             "blockscaled",
             "fp8",
+            "block_fp8_linear",
             "all",
         ),
         default="moe",
@@ -1054,6 +1097,8 @@ def main():
             launches.update(compile_blockscaled(out))
         if args.component in ("fp8", "all"):
             launches.update(compile_fp8(out))
+        if args.component in ("block_fp8_linear", "all"):
+            launches.update(compile_block_fp8_linear(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__

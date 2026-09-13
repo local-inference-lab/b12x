@@ -69,6 +69,7 @@ class BlockFP8LinearBinding:
     bias: torch.Tensor | None = None
     expected_m: int | None = None
     mma_tiler_mn: tuple[int, int] | None = None
+    backend: str = "mxfp8"
 
     def run(self, *, stream: object = None) -> torch.Tensor:
         return block_fp8_linear_mxfp8(binding=self, stream=stream)
@@ -152,6 +153,7 @@ class _BlockFP8LinearScratchPlan:
             output=output, workspace=workspace, bias=bias,
             expected_m=self.caps.max_tokens if expected_m is None else expected_m,
             mma_tiler_mn=self.mma_tiler_mn,
+            backend=self.backend,
         )
 
 
@@ -366,6 +368,7 @@ def build_block_fp8_linear_binding(
     bias: torch.Tensor | None = None,
     expected_m: int | None = None,
     mma_tiler_mn: tuple[int, int] | None = None,
+    backend: str = "mxfp8",
 ) -> BlockFP8LinearBinding:
     if not isinstance(packed_weight, BlockFP8LinearWeight):
         raise TypeError("packed_weight must be a BlockFP8LinearWeight")
@@ -382,6 +385,7 @@ def build_block_fp8_linear_binding(
         plan=plan, source=source, packed_weight=packed_weight, x_q=x_q,
         output=output, workspace=workspace, bias=bias, expected_m=expected_m,
         mma_tiler_mn=mma_tiler_mn,
+        backend=backend,
     )
 
 
@@ -415,7 +419,7 @@ def pack_block_fp8_linear_weight_mxfp8(
     """Pack serialized block-FP8 linear weights for the native b12x MXFP8 GEMM.
 
     The checkpoint weight stays in E4M3 for UE8M0 scales. The 128x128 DSV4 or
-    32x32 DSV4.1 scales expand once into the row/32-column SM120 MMA layout.
+    32x32 DSV4.1 scales expand once into the shared F8_128x4 MMA layout.
     """
 
     _check_gpu_tensor("weight", weight)
