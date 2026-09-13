@@ -628,6 +628,7 @@ class BlockscaledGemm:
         acc_full = acc_consumer.wait_and_advance()
 
         cute.copy(tiled_copy_t2r, tTR_tAcc, tTR_rAcc)
+        cute.arch.fence_view_async_tmem_load()
         identity = cute.make_identity_tensor(self.mma_tiler[:2])
         coords = thr_copy_t2r.partition_D(thr_mma.partition_C(identity))
         for idx in cutlass.range_constexpr(cute.size(tTR_rAcc)):

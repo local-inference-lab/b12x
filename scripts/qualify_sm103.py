@@ -27,6 +27,7 @@ from scripts._sm103_source import source_identity
 SUITES = {
     "moe": ["tests/moe/test_sm103_pointwise.py", "tests/moe/test_sm103_nvfp4.py"],
     "trellis_reconstruction": ["tests/moe/test_sm103_trellis.py"],
+    "trellis_projection": ["tests/moe/test_sm103_trellis_gemm.py", "tests/moe/test_sm103_trellis_staging.py"],
     "kda_decode": ["tests/sequence/test_gdn_decode_kda_cute.py"],
     "gdn_decode": ["tests/sequence/test_gdn_decode.py"],
     "kda_prefill": ["tests/sequence/test_kda_prefill.py"],

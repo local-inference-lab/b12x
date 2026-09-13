@@ -1,8 +1,7 @@
-"""Trellis reconstruction primitive and deferred SM103 projection contract.
+"""Trellis reconstruction and quantizer-basis SM103 projection contracts.
 
-The tile decoder consumes the existing t256 SQG E4M3 bitstream and codebook.
-Its BF16 output is in the quantizer basis, before scales and rotations. It
-does not execute a complete expert or substitute for a fused MoE backend.
+The decoder and inline FP16 projection consume existing t256 weights. Expert
+scale/rotation staging and mixed-rate MoE dispatch remain unsupported.
 """
 
 from dataclasses import dataclass
@@ -10,14 +9,10 @@ from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Uint32
+from cutlass import Int32, Int64
 
 from b12x._lib.architecture import UnsupportedArchitectureError
-from b12x._lib.intrinsics import (
-    cvt_e4m3_to_f32_via_f16,
-    packed_decode_trellis_sqg_direct_lut_to_e4m3x8,
-)
-from ..trellis_ring import trellis256_lane_geom_bits
+from .trellis_decode import decode_lane, decoder_contract, tile_coordinates
 
 
 @dataclass(frozen=True)
@@ -41,34 +36,44 @@ class TrellisPipeline:
         )
 
     def reconstruction(self, *, projection: str, bits: int):
-        if self.codebook != "sqg_e4m3":
-            raise UnsupportedArchitectureError(
-                "SM103 tile reconstruction implements SQG E4M3 only"
-            )
         if projection not in {"w13", "w2"}:
             raise ValueError("projection must be w13 or w2")
         tiles = self.experts * (self.hidden // 16) * (self.intermediate // 16)
-        return ReconstructTrellisTiles(bits, tiles * (2 if projection == "w13" else 1))
+        return ReconstructTrellisTiles(
+            bits, tiles * (2 if projection == "w13" else 1), codebook=self.codebook
+        )
 
     def require_execution(self):
         raise UnsupportedArchitectureError(
-            "SM103 Trellis has a t256 reconstruction primitive; expert scale/rotation "
-            "staging, mixed-rate dispatch, and tcgen05 projection are not implemented"
+            "SM103 Trellis has inline tcgen05 projection; expert scale/rotation "
+            "staging and mixed-rate MoE dispatch are not implemented"
+        )
+
+    def projection(self, *, projection: str, bits: int, capacity: int):
+        from .trellis_gemm import RoutedTrellisGemm
+
+        if projection in {"gate", "up"}:
+            n, k = self.intermediate, self.hidden
+        elif projection == "down":
+            n, k = self.hidden, self.intermediate
+        else:
+            raise ValueError("Trellis projection must be gate, up, or down")
+        return RoutedTrellisGemm(
+            n, k, self.experts, capacity, bits=bits, codebook=self.codebook
         )
 
 
 class ReconstructTrellisTiles:
-    """Decode native [tiles,16*bits] int16 payloads to [tiles,16,16] BF16.
+    """Decode native [tiles,16*bits] int16 payloads to [tiles,16,16] FP16/BF16.
 
     Output tile axes are (N,K), matching the logical GEMM weight. Capacity
     sizes pointer layouts; live_tiles changes only the launch grid.
     """
 
-    def __init__(self, bits: int, capacity: int):
-        if bits not in (2, 3, 4) or capacity <= 0:
-            raise ValueError(
-                "SQG tile reconstruction requires K2/K3/K4 and positive capacity"
-            )
+    def __init__(self, bits: int, capacity: int, *, codebook: str = "sqg_e4m3"):
+        self.codebook = decoder_contract(bits, codebook)
+        if capacity <= 0:
+            raise ValueError("tile reconstruction requires positive capacity")
         self.bits, self.capacity = bits, capacity
 
     @cute.jit
@@ -92,23 +97,11 @@ class ReconstructTrellisTiles:
             packed, cute.make_layout(self.capacity * 8 * self.bits)
         )
         output = cute.make_tensor(out, cute.make_layout(self.capacity * 256))
-        ia, ib, shift, _ = trellis256_lane_geom_bits(Int32(lane), 0, 8, self.bits)
-        base = Int64(tile) * Int64(8 * self.bits)
-        merged = (cutlass.Uint64(source[base + Int64(ia)]) << 32) | cutlass.Uint64(
-            source[base + Int64(ib)]
-        )
-        lo, hi = packed_decode_trellis_sqg_direct_lut_to_e4m3x8(
-            Uint32(merged >> cutlass.Uint64(shift)),
-            Uint32(merged >> cutlass.Uint64(shift + 4 * self.bits)),
-            lut.toint(),
-            self.bits,
-            rate_indexed=True,
+        decoded = decode_lane(
+            source, Int64(tile), Int32(lane), lut, self.bits, self.codebook
         )
         for j in cutlass.range_constexpr(8):
-            word = lo if cutlass.const_expr(j < 4) else hi
-            value = cvt_e4m3_to_f32_via_f16((word >> Uint32(8 * (j % 4))) & Uint32(255))
-            row = 2 * (lane // 8) + ((lane >> 2) & 1) + (8 if j >= 4 else 0)
-            col = 2 * (lane % 4) + (j % 2) + (8 if j % 4 >= 2 else 0)
-            output[Int64(tile) * 256 + Int64(row) * 16 + Int64(col)] = cutlass.BFloat16(
-                value
+            row, col = tile_coordinates(Int32(lane), j)
+            output[Int64(tile) * 256 + Int64(row) * 16 + Int64(col)] = decoded[j].to(
+                output.element_type
             )
