@@ -4,7 +4,7 @@ Status: implemented, awaiting B300 runtime qualification. The materialized
 pipeline owns no model-sized repack and resolves kernels only at prewarm.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -12,6 +12,7 @@ import torch
 from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x._lib.scratch import scratch_buffer_spec, scratch_tensor
 from b12x._lib.scratch_layout import align_up, materialize_scratch_view
+from b12x.policy import PolicyResolution
 from .._shared.execution import (
     MoEExecutionPlan,
     MoERegime,
@@ -55,6 +56,13 @@ def heuristic(query):
     )
     validate_policy(query, config)
     return config
+
+
+def independent_reference(a, experts, ids, weights):
+    """Evaluate the backend's numeric contract for offline qualification."""
+    from .._shared.kernels.materialized_nvfp4_reference import reference
+
+    return reference(a, experts, ids, weights)
 
 
 def validate_policy(query, config):
@@ -117,6 +125,7 @@ def plan_execution(
     swiglu_beta,
     apply_router_weight_on_input,
     policy_context,
+    policy_resolution=None,
 ):
     from ._impl import TPMoEPlan
 
@@ -143,7 +152,17 @@ def plan_execution(
         num_tokens=num_tokens,
         routed_rows=num_tokens * num_topk,
     )
-    resolution = policy_context.resolve(MOE_DECODE_POLICY, query)
+    if policy_resolution is None:
+        resolution = policy_context.resolve(MOE_DECODE_POLICY, query)
+    else:
+        if (
+            not isinstance(policy_resolution, PolicyResolution)
+            or policy_resolution.component_id != MOE_DECODE_POLICY.component_id
+            or policy_resolution.device != policy_context.device
+        ):
+            raise ValueError("MoE policy resolution must match the component and device")
+        validate_policy(query, policy_resolution.config)
+        resolution = policy_resolution
     spec = make_moe_spec(
         quant_mode="nvfp4",
         source_format=weight_plan.source_format,
@@ -219,6 +238,17 @@ class BackendPlan:
     buffers: tuple[Buffer, ...]
     launches: dict | None
     strategy: Strategy = Strategy.MATERIALIZED
+
+    def prewarm(self, plan):
+        """Compile the retained capacity plan without resolving policy again."""
+        if self.launches is not None:
+            return plan
+        from .._shared.kernels.sm103.launch import compile_launches
+
+        return replace(
+            plan,
+            _backend_plan=replace(self, launches=compile_launches(plan.caps)),
+        )
 
     def bind(
         self,
@@ -342,7 +372,7 @@ class BackendPlan:
         )
 
 
-def plan_scratch(caps, *, prewarm_launches):
+def plan_scratch(caps, *, prewarm_launches, policy_resolution=None):
     from ._impl import TPMoEArenaLayout, TPMoEScratchPlan
 
     if caps.collect_activation_amax or caps.route_logits_dtype is not None:
@@ -364,14 +394,10 @@ def plan_scratch(caps, *, prewarm_launches):
         swiglu_beta=caps.swiglu_beta,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         policy_context=caps.policy_context,
+        policy_resolution=policy_resolution,
     )
     buffers, nbytes = scratch_layout(caps.max_tokens, caps.num_topk, caps.k, caps.n)
-    launches = None
-    if prewarm_launches:
-        from .._shared.kernels.sm103.launch import compile_launches
-
-        launches = compile_launches(caps)
-    return TPMoEScratchPlan(
+    plan = TPMoEScratchPlan(
         caps=caps,
         layout=TPMoEArenaLayout(
             route_workspace_nbytes=0,
@@ -384,5 +410,6 @@ def plan_scratch(caps, *, prewarm_launches):
         _scratch_specs=(
             scratch_buffer_spec("tp_moe.scratch", nbytes=nbytes, device=caps.device),
         ),
-        _backend_plan=BackendPlan(buffers, launches),
+        _backend_plan=BackendPlan(buffers, launches=None),
     )
+    return plan._backend_plan.prewarm(plan) if prewarm_launches else plan

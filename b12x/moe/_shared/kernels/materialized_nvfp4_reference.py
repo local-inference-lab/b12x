@@ -1,4 +1,10 @@
-"""Torch oracle for the materialized NVFP4 numeric contract, never an execution fallback."""
+"""Qualification oracle for materialized NVFP4 with BF16 stage boundaries.
+
+FC1 is rounded before SiLU, SiLU's output is rounded before requantization,
+and FC2 is rounded before FP32 router weighting and accumulation. The final
+output is BF16. This oracle is used only by tests and offline qualification;
+production bind/run paths do not import it.
+"""
 
 import torch
 import torch.nn.functional as F
@@ -32,7 +38,8 @@ def quantize_dequantize(x, reciprocal_global):
     x = x.to(torch.bfloat16).float()
     groups = x.reshape(-1, 16)
     sf = (
-        (groups.abs().amax(-1, keepdim=True) * reciprocal_global / 6)
+        (reciprocal_global * (groups.abs().amax(-1, keepdim=True) / 6))
+        .clamp(max=448.0)
         .to(torch.float8_e4m3fn)
         .float()
     )

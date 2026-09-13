@@ -4,12 +4,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests._reference.sm103_moe import unpack, unswizzle, quantize_dequantize
+from b12x.moe._shared.kernels.materialized_nvfp4_reference import unpack, unswizzle, quantize_dequantize
 
 
 @pytest.mark.parametrize("activation", [False, True])
 @pytest.mark.parametrize("gate_first", [False, True])
-def test_routed_quantizer_matches_nvfp4_reference(activation, gate_first):
+@pytest.mark.parametrize("input_kind", ["random", "saturated", "zero"])
+def test_routed_quantizer_matches_nvfp4_reference(activation, gate_first, input_kind):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 3),
         (12, 0),
@@ -30,6 +31,10 @@ def test_routed_quantizer_matches_nvfp4_reference(activation, gate_first):
         device=device,
         dtype=torch.bfloat16,
     )
+    if input_kind == "saturated":
+        x.mul_(4096)
+    elif input_kind == "zero":
+        x.zero_()
     ids = torch.tensor(
         [0, 1, 2, 3, -1, e, 2**32 + 1, -(2**32)], device=device, dtype=torch.int64
     )

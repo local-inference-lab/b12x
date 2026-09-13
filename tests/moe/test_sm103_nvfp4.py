@@ -8,7 +8,7 @@ import b12x
 from b12x.moe import fused_moe
 from b12x._lib.intrinsics import swizzle_block_scale
 from tests.architecture.test_sm103 import make_experts
-from tests._reference.sm103_moe import reference
+from b12x.moe._shared.kernels.materialized_nvfp4_reference import reference
 
 
 def require_sm103():
@@ -28,9 +28,10 @@ def case(
     top_k=2,
     capacity=8,
     w13_layout="w13",
+    mode="a4",
 ):
     prepared = make_experts(
-        device=device, k=hidden, n=intermediate, e=experts, w13_layout=w13_layout
+        device=device, k=hidden, n=intermediate, e=experts, w13_layout=w13_layout, mode=mode
     )
     raw = prepared._impl
     for w in (raw.w1_fp4, raw.w2_fp4):
@@ -55,10 +56,10 @@ def case(
 
 
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("w13_layout", ["w13", "w31"])
-def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, w13_layout):
+@pytest.mark.parametrize("mode,w13_layout", [("a4", "w13"), ("a4", "w31"), ("auto", "w13")])
+def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_layout):
     device = require_sm103()
-    prepared, plan, scratch = case(device, w13_layout=w13_layout)
+    prepared, plan, scratch = case(device, w13_layout=w13_layout, mode=mode)
     initial_ptrs = (
         scratch.data_ptr(),
         prepared._impl.w1_fp4.data_ptr(),

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 import b12x
 from b12x.moe import fused_moe
-from tests._reference.sm103_moe import reference
+from b12x.moe._shared.kernels.materialized_nvfp4_reference import reference
 from tests.moe.test_sm103_nvfp4 import case
 from benchmarks.benchmark_roce_oneshot import _source_state
 

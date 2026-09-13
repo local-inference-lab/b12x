@@ -145,11 +145,11 @@ def sm103_context(monkeypatch):
     return PolicyContext.for_identity(B300)
 
 
-def make_experts(*, device="cpu", e=2, k=256, n=256, w13_layout="w13"):
+def make_experts(*, device="cpu", e=2, k=256, n=256, w13_layout="w13", mode="a4"):
     wp = fused_moe.plan_weights(
         source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout=w13_layout),
         activation=fused_moe.ActivationSpec(
-            mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16
+            mode=mode, nonlinearity="silu", io_dtype=torch.bfloat16
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=e, hidden_size=k, intermediate_size=n
@@ -259,6 +259,70 @@ def test_binding_capacity_reuse_no_policy_or_compile(sm103_context, monkeypatch)
     finally:
         b12x.unfreeze_kernel_resolution()
     assert not calls  # Binding only constructs views and launch arguments.
+
+
+@pytest.mark.parametrize("mode", ["a4", "auto"])
+@pytest.mark.parametrize("override", [False, True])
+def test_capacity_resolves_once_and_prewarm_retains_provenance(
+    sm103_context, monkeypatch, mode, override
+):
+    from b12x.moe._shared.kernels.sm103 import launch
+    from b12x.moe._shared.kernels.w4a16 import prepare
+
+    # AUTO preparation retains an A16 workspace. This host test exercises
+    # planning and provenance; CUDA allocation is qualified by the GPU tests.
+    monkeypatch.setattr(
+        prepare, "_make_workspace", lambda *args, **kwargs: torch.zeros(8, dtype=torch.int32)
+    )
+
+    policy = sm103_context
+    if override:
+        policy = policy.with_override("moe.decode", MoeDecodeConfig(BACKEND, "internal", None))
+    resolved = []
+    resolve = PolicyContext.resolve
+
+    def record(context, component, query, **kwargs):
+        result = resolve(context, component, query, **kwargs)
+        resolved.append((query, result))
+        return result
+
+    monkeypatch.setattr(PolicyContext, "resolve", record)
+    plan = fused_moe.plan_execution(
+        experts=make_experts(mode=mode),
+        capacity=fused_moe.ExecutionCapacity(
+            max_tokens=8, top_k=2, warmup_token_counts=(1, 4)
+        ),
+        policy=policy,
+    )
+    assert len(resolved) == 1
+    query, resolution = resolved[0]
+    assert (query.num_tokens, query.routed_rows) == (8, 16)
+    assert query.quant_mode == ("nvfp4_auto" if mode == "auto" else "nvfp4")
+    assert resolution.source is (PolicySource.OVERRIDE if override else PolicySource.HEURISTIC)
+    lowering = plan._impl.launch_plan
+    assert lowering.policy_resolution is resolution
+    assert all(variant._impl is lowering for variant in plan.variants)
+    if mode == "auto":
+        assert plan.precision_resolution is resolution
+
+    monkeypatch.setattr(
+        PolicyContext, "resolve", lambda *args, **kwargs: pytest.fail("prewarm resolved policy")
+    )
+    compilations = []
+    launches = {}
+
+    def compile_capacity(caps):
+        compilations.append(caps.max_tokens)
+        return launches
+
+    monkeypatch.setattr(launch, "compile_launches", compile_capacity)
+    specs = plan.scratch_specs()
+    fused_moe.prewarm(plan)
+    fused_moe.prewarm(plan)
+    assert compilations == [8]
+    assert plan._impl.launch_plan is lowering
+    assert plan.scratch_specs() == specs
+    assert plan._impl._backend_plan.launches is launches
 
 
 def test_compile_gate_rejects_sm120_kernel_before_compiler_resolution(monkeypatch):
