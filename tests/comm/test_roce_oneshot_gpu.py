@@ -49,7 +49,9 @@ def runtime():
     from b12x.comm import roce
     from b12x.comm.roce import _preparation
 
-    if not roce.is_supported():
+    transport = os.environ.get("B12X_TEST_ROCE_TRANSPORT", "auto")
+    experimental = os.environ.get("B12X_TEST_ROCE_EXPERIMENTAL") == "1"
+    if not roce.is_supported(transport=transport, experimental=experimental):
         pytest.skip(
             "RoCE all-reduce needs an integrated GPU with an active RDMA device"
         )
@@ -64,6 +66,8 @@ def runtime():
         device=device,
         max_size=1 << 20,
         max_gather_bytes=4 << 20,
+        transport=transport,
+        experimental=experimental,
     )
     query = roce.query_from_runtime(
         rt,

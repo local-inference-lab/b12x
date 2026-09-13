@@ -116,22 +116,17 @@ def discover_hcas(gid_index: Optional[int] = None) -> tuple[str, ...]:
     return tuple(found[:2])
 
 
-def is_supported(device: torch.device | int | str | None = None) -> bool:
-    """True on an integrated GPU with at least one active RDMA device.
-
-    The kernel reads pinned host memory in place, which needs an integrated
-    (unified-memory) GPU such as the DGX Spark GB10.
-    """
-
+def is_supported(device=None, *, transport="auto", experimental=False) -> bool:
+    """Probe platform eligibility; Station transport is explicit and unqualified."""
+    from ._transport import probe_platform, select_transport
     if not torch.cuda.is_available():
         return False
-    index = (
-        torch.cuda.current_device() if device is None else torch.device(device).index
-    )
-    props = torch.cuda.get_device_properties(index if index is not None else 0)
-    if not getattr(props, "is_integrated", False):
+    try:
+        select_transport(probe_platform(device), world_size=2,
+                         requested=transport, experimental=experimental)
+    except (RuntimeError, ValueError, NotImplementedError):
         return False
-    return len(discover_hcas()) > 0
+    return bool(discover_hcas())
 
 
 def _normalize_device(device: torch.device | int | str) -> torch.device:
@@ -199,11 +194,18 @@ class RoceOneshotAllReduce:
         gid_index: Optional[int] = None,
         threads: int = DEFAULT_THREADS,
         blocks: int = DEFAULT_BLOCKS,
+        transport: str = "auto",
+        experimental: bool = False,
     ) -> None:
         """Allocate the pinned region, build and connect the proxy, and start it."""
         self.device = _normalize_device(device)
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
+        from ._transport import probe_platform, select_transport
+        self.transport = select_transport(
+            probe_platform(self.device), world_size=self.world_size,
+            requested=transport, experimental=experimental,
+        )
         self._group = exchange_group
         self._closed = False
         self._lock = threading.Lock()
@@ -374,6 +376,8 @@ class RoceOneshotAllReduce:
         max_size: int = DEFAULT_MAX_SIZE,
         eager_buffer_bytes: Optional[int] = None,
         max_gather_bytes: int = DEFAULT_MAX_GATHER_BYTES,
+        transport: str = "auto",
+        experimental: bool = False,
         **_ignored: Any,
     ) -> "RoceOneshotAllReduce":
         """Mirror ``comm.pcie.AllReduce.from_exchange_group``; PCIe-only knobs are ignored."""
@@ -384,6 +388,8 @@ class RoceOneshotAllReduce:
             device=device,
             max_size=capacity,
             max_gather_bytes=max_gather_bytes,
+            transport=transport,
+            experimental=experimental,
         )
 
     @classmethod
@@ -394,11 +400,14 @@ class RoceOneshotAllReduce:
         device: torch.device | int | str,
         max_size: int = DEFAULT_MAX_SIZE,
         max_input_bytes: Optional[int] = None,
+        transport: str = "auto",
+        experimental: bool = False,
         **_ignored: Any,
     ) -> "RoceOneshotAllReduce":
         """Build a runtime from a process group used for both rank identity and the setup exchange."""
         capacity = max(int(max_size), int(max_input_bytes or 0))
-        return cls(exchange_group=process_group, device=device, max_size=capacity)
+        return cls(exchange_group=process_group, device=device, max_size=capacity,
+                   transport=transport, experimental=experimental)
 
     # -- policy -----------------------------------------------------------------
 
@@ -889,6 +898,10 @@ class RoceOneshotAllReduce:
     def stats(self) -> dict[str, Any]:
         """Runtime, control-record, and proxy counters for diagnostics."""
         info: dict[str, Any] = {
+            "transport": self.transport.backend,
+            "transport_memory": self.transport.memory,
+            "transport_experimental": self.transport.experimental,
+            "transport_qualification": self.transport.qualification,
             "world_size": self.world_size,
             "rank": self.rank,
             "hcas": list(self.hca_names),
