@@ -32,6 +32,8 @@ def main() -> None:
     assert manifest["release_tag"] == args.beta_tag
     for package in manifest["packages"]:
         wheel = args.directory / package["file"]
+        if not wheel.is_file():
+            wheel = args.directory / "wheels" / package["file"]
         assert wheel.is_file()
         assert sha256(wheel) == package["sha256"]
     if args.promotion:
