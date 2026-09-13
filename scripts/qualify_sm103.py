@@ -153,7 +153,6 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "compressed DeepSeek sparse MLA",
             "paired/grouped Trellis records and coupled mixed-rate transforms",
             "Grace memory",
             "Station RDMA",
