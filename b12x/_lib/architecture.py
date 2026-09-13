@@ -92,6 +92,9 @@ def require_kernel_architecture(
         "b12x.attention.dsa_indexer.mxfp4",
         "b12x.gemm.bf16_gemv._kernel",
         "b12x.gemm.bf16_gemv._prefill",
+        "b12x.gemm.blockscaled._a16_cute",
+        "b12x.gemm.blockscaled._sm103",
+        "b12x.gemm._shared.sm103_blockscaled",
     }:
         # Portable recurrent kernels have SM103 compilation evidence. Transport
         # construction additionally requires explicit Grace qualification.

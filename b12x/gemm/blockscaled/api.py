@@ -23,8 +23,8 @@ def workspace_size(plan: Plan) -> int:
 
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
-    return default_is_supported(device, requires=META.requires)
+    """Check architecture and dependencies; individual recipes validate their layouts."""
+    return default_is_supported(device, archs=META.archs, requires=META.requires)
 
 
 def _output_dtype_name(dtype: torch.dtype) -> str:

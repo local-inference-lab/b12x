@@ -1,0 +1,520 @@
+{
+  "source_sha256": "4245f86a2f8aaf041f000cf5572ad6f83ea95e5c6753208014a5433303582608",
+  "source_revision": "057e4e9752054aa25860538c693dbaeae429e06f",
+  "source_kind": "git",
+  "git_status": [
+    " M README.md",
+    " M b12x/_lib/architecture.py",
+    " M b12x/_lib/dense_gemm.py",
+    " M b12x/gemm/blockscaled/__init__.py",
+    " M b12x/gemm/blockscaled/_a16.py",
+    " M b12x/gemm/blockscaled/_linear.py",
+    " M b12x/gemm/blockscaled/_ops.py",
+    " M b12x/gemm/blockscaled/_policy.py",
+    " M b12x/gemm/blockscaled/api.py",
+    " M b12x/moe/_shared/kernels/sm103/nvfp4_gemm.py",
+    " M b12x/policy/generation/providers/blockscaled.py",
+    " M benchmarks/benchmark_blockscaled_precision.py",
+    " M docs/sm103-qualification.md",
+    " M scripts/compile_sm103.py",
+    " M scripts/qualify_sm103.py",
+    "?? b12x/gemm/_shared/sm103_blockscaled.py",
+    "?? b12x/gemm/blockscaled/_a16_cute.py",
+    "?? b12x/gemm/blockscaled/_sm103.py",
+    "?? tests/architecture/test_sm103_blockscaled.py",
+    "?? tests/gemm/test_sm103_blockscaled.py"
+  ],
+  "target": "sm_103a",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/home/jasonc/b12x-sm103-evidence/blockscaled-address-safe-sm103",
+    "--nvdisasm",
+    ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+  ],
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "callables": 222,
+  "status": "cross-compiled; SM120 regression passed; no SM103 execution",
+  "runtime_qualified": false,
+  "artifact_root": "/home/jasonc/b12x-sm103-evidence/blockscaled-address-safe-sm103",
+  "manifest_sha256": "b598a16e05fd9f84c425ae72a8de1f8d280e50970250c9a5f5adc420039081ad",
+  "cuda_entries": 230,
+  "resource_flags": [
+    {
+      "name": "dense_mla_bf16_d1088_q2_wNone",
+      "resources": "REG:168 STACK:160 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q1_w128",
+      "resources": "REG:255 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q2_wNone",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q4_wNone",
+      "resources": "REG:96 STACK:192 SHARED:1024 LOCAL:0 CONSTANT[0]:1108 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas1",
+      "resources": "REG:64 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas1",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas4",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas4",
+      "resources": "REG:64 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_fused_h64_k512_ctas192",
+      "resources": "REG:64 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1104 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_mxfp4_h32_candidates1",
+      "resources": "REG:128 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1096 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h16",
+      "resources": "REG:255 STACK:152 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h32",
+      "resources": "REG:255 STACK:312 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill512_h64",
+      "resources": "REG:255 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:1216 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h16",
+      "resources": "REG:255 STACK:64 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h32",
+      "resources": "REG:255 STACK:200 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "indexer_prefill_h64",
+      "resources": "REG:255 STACK:208 SHARED:1024 LOCAL:0 CONSTANT[0]:1280 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h16_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h32_prefill",
+      "resources": "REG:168 STACK:136 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h8_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model1_sf2_pts0_h32_prefill",
+      "resources": "REG:168 STACK:128 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h16_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h32_prefill",
+      "resources": "REG:168 STACK:8 SHARED:1024 LOCAL:0 CONSTANT[0]:1064 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    }
+  ],
+  "quantized_linear_resources": [
+    {
+      "name": "a16_mxfp8_n128_k128_s8_width1024_input1024_reciprocal0",
+      "REG": 64,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_mxfp8_n128_k64_s4_width1024_input1024_reciprocal0",
+      "REG": 81,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_mxfp8_n64_k128_s4_width1024_input1024_reciprocal0",
+      "REG": 48,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_mxfp8_n64_k64_s1_width1024_input1024_reciprocal0",
+      "REG": 55,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_mxfp8_n64_k64_s1_width96_input80_reciprocal0",
+      "REG": 47,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n128_k128_s8_width1024_input1024_reciprocal0",
+      "REG": 60,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n128_k64_s4_width1024_input1024_reciprocal0",
+      "REG": 79,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n128_k64_s4_width1024_input1024_reciprocal1",
+      "REG": 79,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n64_k128_s4_width1024_input1024_reciprocal0",
+      "REG": 48,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n64_k64_s1_width1024_input1024_reciprocal0",
+      "REG": 54,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_nvfp4_n64_k64_s1_width96_input80_reciprocal0",
+      "REG": 47,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_reduce_s2",
+      "REG": 14,
+      "STACK": 0,
+      "SHARED": 0,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_reduce_s4",
+      "REG": 16,
+      "STACK": 0,
+      "SHARED": 0,
+      "LOCAL": 0
+    },
+    {
+      "name": "a16_reduce_s8",
+      "REG": 24,
+      "STACK": 0,
+      "SHARED": 0,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n136_k384_g2_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n136_k384_g2_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n136_k384_g2_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n512_k1024_g1_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n512_k1024_g1_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n512_k1024_g1_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp4_n8_k128_g1_alpha_one",
+      "REG": 134,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n136_k384_g2_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n136_k384_g2_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n136_k384_g2_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n512_k1024_g1_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n512_k1024_g1_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n512_k1024_g1_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_mxfp8_n8_k128_g1_alpha_one",
+      "REG": 134,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_large_output_address",
+      "REG": 134,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n136_k384_g2_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n136_k384_g2_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n136_k384_g2_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n512_k1024_g1_bfloat16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n512_k1024_g1_float16",
+      "REG": 138,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n512_k1024_g1_float32",
+      "REG": 142,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    },
+    {
+      "name": "blockscaled_nvfp4_n8_k128_g1_alpha_one",
+      "REG": 134,
+      "STACK": 0,
+      "SHARED": 1024,
+      "LOCAL": 0
+    }
+  ],
+  "moe_resource_deltas": [
+    {
+      "name": "fc1_Int32",
+      "previous_reg": 138,
+      "reg": 142,
+      "delta": 4,
+      "disposition": "Shared dense/routed epilogue and Int64 output strides; no stack/local memory; target profiling required."
+    },
+    {
+      "name": "fc1_Int64",
+      "previous_reg": 140,
+      "reg": 142,
+      "delta": 2,
+      "disposition": "Shared dense/routed epilogue and Int64 output strides; no stack/local memory; target profiling required."
+    },
+    {
+      "name": "fc2_Int32",
+      "previous_reg": 138,
+      "reg": 142,
+      "delta": 4,
+      "disposition": "Shared dense/routed epilogue and Int64 output strides; no stack/local memory; target profiling required."
+    },
+    {
+      "name": "fc2_Int64",
+      "previous_reg": 140,
+      "reg": 142,
+      "delta": 2,
+      "disposition": "Shared dense/routed epilogue and Int64 output strides; no stack/local memory; target profiling required."
+    }
+  ],
+  "ptx_addressing": {
+    "representative": "blockscaled_nvfp4_n136_k384_g2_bfloat16",
+    "large_output": "blockscaled_nvfp4_large_output_address",
+    "result": "Output row and group products use mad.lo.s64; alpha-one cases contain tcgen05.mma and no ld.global alpha load."
+  },
+  "validation": {
+    "host": {
+      "log": "/home/jasonc/b12x-sm103-evidence/logs/blockscaled-address-safe-host.log",
+      "sha256": "a9f7ad7f1292746102a8a8c8d3f65638d96abe1fdbacafc63b4b71a7045cd47a",
+      "summary": [
+        "386 passed, 224 skipped, 1 warning in 27.40s"
+      ]
+    },
+    "memcheck": {
+      "log": "/home/jasonc/b12x-sm103-evidence/logs/blockscaled-address-safe-memcheck.log",
+      "sha256": "331359cc5e2758b2bad5f87fd5b1c8308ada2360212f16694e33568e665384e3",
+      "summary": [
+        "72 passed, 22 deselected in 13.70s",
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    },
+    "synccheck": {
+      "log": "/home/jasonc/b12x-sm103-evidence/logs/blockscaled-address-safe-synccheck.log",
+      "sha256": "c49ae46dcf4466e2abf4bcc62bf7152cbbd0f15e9ce1097fd3cf160a3a39ebc0",
+      "summary": [
+        "72 passed, 22 deselected, 438 warnings in 43.01s",
+        "========= ERROR SUMMARY: 0 errors"
+      ]
+    }
+  },
+  "host_command": ".venv/bin/python -m pytest tests/architecture tests/policy tests/gemm/test_blockscaled_a16.py tests/gemm/test_sm103_blockscaled.py -q",
+  "regression": {
+    "host": "ripper",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "compute_mode": "Default",
+    "package_source_sha256": "4245f86a2f8aaf041f000cf5572ad6f83ea95e5c6753208014a5433303582608",
+    "command": "CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool {memcheck|synccheck} --error-exitcode 86 .venv/bin/python -m pytest tests/gemm/test_sm103_blockscaled.py -k \"not test_native_dense and not test_native_scalar\" -q",
+    "native_sm103_cases_deselected": 22
+  },
+  "wheel": {
+    "wheel": "/home/jasonc/b12x-sm103-evidence/blockscaled-address-safe-dist/b12x-1.3.0-py3-none-any.whl",
+    "sha256": "b9099f39d99a2e7631b54ee809cd8d9886e7e1a6bfc2ea93710d05f794178a20",
+    "matched_package_files": 449,
+    "package_python_files": 446
+  },
+  "limitations": [
+    "No SM103 execution, performance measurement, or measured SM103 profile.",
+    "Resource reports show static SMEM only and do not establish achieved occupancy.",
+    "Tensor/block FP8, MXFP6, full Trellis experts, compressed DeepSeek sparse MLA, full serving, and HBM GDR remain unsupported."
+  ]
+}

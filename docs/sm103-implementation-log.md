@@ -381,3 +381,49 @@ of 8–312 bytes, with zero reported local storage. The
 [indexer receipt](sm103-indexer-validation.json) records source identity,
 resource flags, raw-log hashes, artifact paths, and package verification.
 No SM103 runtime qualification or performance claim is included.
+
+## Dense quantized projections and shared tcgen05 compute
+
+Status: **implemented, unqualified on SM103**. The public block-scaled GEMM
+API selects dense NVFP4, MXFP4, and MXFP8 TMA/tcgen05/TMEM kernels on SM103.
+W4A16 and W8A16 use the existing inline BF16 warp-MMA engine through admitted
+entry types. The general SM12x dense compiler entry remains gated. Packed
+weights, prewarm, precision resolution, and caller-owned output/workspace
+remain shared; SM103 precision defaults are unmeasured heuristics.
+
+`gemm/_shared/sm103_blockscaled.py` contains the shared dense/routed compute
+pipeline. Dense tiles use runtime row counts and group strides without route
+metadata. The routed NVFP4 wrapper retains its public launch ABI. Static
+inspection found a 32-bit output-row product; Int64 output strides produce
+64-bit PTX address products. A deferred test crosses 2^31 output elements with
+an approximately 4 GiB allocation. Calls without alpha use a constant-one
+epilogue and allocate no scalar tensor.
+
+The precision generator and benchmark use an independent NVFP4 activation
+rounding/GEMM oracle. Their previous oracle reused the GEMM under test.
+Generator candidate contract 4 includes SM103 and excludes its unimplemented
+fused activation-quantization candidate. SM103 timing qualification requires
+P0, zero throttling, stable memory clocks, and at most 30 MHz SM-clock drift.
+
+Evidence uses package SHA-256
+`4245f86a2f8aaf041f000cf5572ad6f83ea95e5c6753208014a5433303582608`
+over base revision `057e4e9752054aa25860538c693dbaeae429e06f` plus the recorded
+working-tree changes. The same package ran in the isolated SM120 checkout on
+ripper; the physical GPU was `GPU-47363510-b87a-13a5-4824-2542e97df76c` in
+Default compute mode.
+
+| Validation | Result |
+| --- | --- |
+| Architecture, policy, and selected linear tests without CUDA | 386 passed, 224 skipped |
+| Portable A16 and packed quantized tests on SM120 | 72 passed under memcheck; zero errors |
+| Same SM120 suite under synccheck | 72 passed; zero errors |
+| All-component SM103 compilation | 222 callables, 230 CUDA entries; retained artifact hashes verified |
+| Native SM103 execution cases | 22 deferred; not executed on SM120 |
+| Wheel/source distribution | Built; all 446 Python files and three embedded profiles match source |
+
+The 36 linear callables report no stack or local memory. Shared MoE projections
+increase allocated GPRs by four for Int32 route IDs and two for Int64 route IDs;
+these deltas require target profiling. Existing stack-resource flags remain
+visible in the [source-bound receipt](sm103-blockscaled-validation.json).
+Full Trellis experts, compressed DeepSeek sparse attention, tensor/block FP8,
+MXFP6, DFlash2/full serving, and HBM GDR remain implementation gaps.
