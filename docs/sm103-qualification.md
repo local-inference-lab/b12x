@@ -21,7 +21,8 @@ numbers or measured B300 policy profile are included.
 | DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
-| DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
+| DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
+| DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Implement capability routing, target/draft contracts and transport before physical qualification |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
 descriptor records 512 TMEM columns and a 227 KiB block SMEM limit for SM103,
@@ -96,8 +97,8 @@ four mixed-rate projection launchers and 30 projection-tiered MoE launchers,
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
 activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
-147 DeepSeek compressed attention/cache-writer launchers: 617
-callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+147 DeepSeek compressed attention/cache-writer launchers, and 131 mHC launchers:
+748 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
@@ -300,6 +301,68 @@ loads/stores. Keep those cases visible during B300 profiling. Static resources
 and SM120 execution do not establish SM103 performance or complete V4.1 serving.
 The [compressed-MLA validation receipt](sm103-compressed-mla-validation.json)
 records source, artifact, package, and regression identities.
+
+## DeepSeek mHC residual mixing
+
+Status: implemented and cross-compiled; unqualified on physical SM103.
+`norm.mhc` supports hidden sizes 4096, 5120 and 7168 with four residual streams.
+The normal plan/bind/run lifecycle covers broadcast or expanded pre, post,
+fused post/pre, V4.1 lagged input mixing, optional BF16/FP32 RMSNorm weights,
+and a standalone weighted or mean collapse. Sinkhorn normalization retains
+20 iterations. Scratch has fixed capacity, with `split_k = hidden_size / 64`.
+SM103 plans reject unsupported geometry and capacities above the CUDA grid
+Y/Z limit of 65535 before allocating scratch.
+
+The component policy retains the native partial/reduction geometry and prefill
+producer choices on the plan. Environment overrides are read during planning.
+Live token counts drive dynamic grids; they do not select compiled callables.
+Unbound native calls use a fixed default schedule. Warm each required phase,
+residual rank, normalization dtype and mixing mode before freezing resolution
+or capturing a CUDA graph. Caller-owned buffers support CUDA graphs; the
+functional API supports Dynamo tracing. Caller-owned Dynamo execution remains
+unsupported.
+
+SM103 plans select `projection_split_fp32=True`: explicit TF32 conversion and high/low
+FP32-weight decomposition preserve projection precision before mixing.
+V4.1 lagged projection uses this decomposition on every supported architecture.
+SM12x retains its existing non-lagged precision unless explicitly overridden.
+The [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#alternate-floating-point-data-formats)
+defines TF32 representation as implementation-defined; the SM103 path converts
+operands explicitly. Config schema 3 adds the precision field, with false as
+the legacy profile default. Candidate contract 3 qualifies the selected
+production precision before timing. Embedded SM12x measurements are unchanged.
+Use a plan for SM103 prefill; legacy unbound TF32 helpers retain their existing
+precision configuration and are outside this planned precision contract.
+
+```bash
+python scripts/compile_sm103.py --component mhc --output-dir /tmp/sm103-mhc-code
+python scripts/qualify_sm103.py --component mhc --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-mhc \
+  --sanitizer /path/to/compute-sanitizer
+CUDA_VISIBLE_DEVICES=GPU-actual-B300-UUID python scripts/generate_gpu_profile.py \
+  --device 0 --components norm.mhc --profile-id local.b300.mhc \
+  --work-dir /tmp/b300-mhc-profile --output /tmp/b300-mhc-profile.json --dry-run
+```
+
+The qualification suite contains 82 cases. It checks independent numerical
+oracles, lagged feedback across sublayers, broadcast and expanded inputs,
+FP32 projection accuracy, frozen resolution, mutable graph inputs, poisoned
+scratch and inactive output tails, stable addresses, and allocation-free replay.
+After correctness qualification, remove `--dry-run` to race the registered
+production plans. For a real checkpoint, use the existing DeepSeek mHC model
+profiles in `benchmarks/benchmark_residual.py` after qualifying the companion
+vLLM adapter. Operator tests do not establish complete GLM or V4.1 execution.
+
+Offline compilation supplies only the documented 228 KiB SM103 shared-memory
+capacity to CuTe's preferred-carveout calculation for minimum CTA residency.
+Every other device-attribute request fails. The value comes from the
+[CUDA compute-capability tables](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#features-and-technical-specifications)
+and is recorded in the compile manifest; it is not a physical device probe.
+The [mHC validation receipt](sm103-mhc-validation.json) records exact source,
+artifact, package and test identities. Five compiled mHC variants have stack
+frames: three high/low TF32 projections use 16 bytes, and two H=5120 block-prefill
+producers use 408/496 bytes. Keep these variants in the B300 resource and latency
+qualification corpus.
 
 ## Recurrent, dense MLA, and unquantized projection contracts
 
@@ -732,7 +795,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped or coupled mixed-rate formats, mHC and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped or coupled mixed-rate formats and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -821,7 +884,10 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and MCG projection-tiered execution, including 384-expert records; add paired/grouped or coupled mixed rates required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
-| Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |
+| mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
+| MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |
+| Full serving | LIL vLLM per-operation capability routing, plan retention, and warmup: complete target/draft execution and CUDA graph replay before enabling full GLM or V4.1 serving |
+| Station HBM transport | `comm/roce/_transport.py`: implement HBM registration, peer exchange, and ordering before admitting `hbm_gdr`; qualify registration and visibility on Station hardware |
 
 Highest-risk assumptions are TMA descriptor bounds on a single live M row,
 TMEM synchronization and lifetime, real-checkpoint calibration/gate order,

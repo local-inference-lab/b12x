@@ -1,4 +1,4 @@
-"""mHC residual for SM12x: fused RMSNorm + hyper-connection mixing +
+"""mHC residual for SM103 and SM12x: fused RMSNorm + hyper-connection mixing +
 projection (DeepSeek-style), BF16 with TF32 projection paths.
 
 Each declaration owns one operation and exact planned nonempty M:
@@ -52,6 +52,7 @@ META = OpMeta(
         "is_supported",
     ),
     dtypes=("bf16",),
+    archs=("sm103a", "sm120a", "sm121a"),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="6627d342",

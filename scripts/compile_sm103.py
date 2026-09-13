@@ -890,6 +890,246 @@ def compile_trellis(out):
     return launches
 
 
+
+def compile_mhc(out):
+    """Compile production mHC launch factories with nonexecuting tensor metadata.
+
+    CPU DLPack tensors preserve each factory's exact dynamic layout annotation.
+    Fake CUDA tensors exercise shape/dtype validation without a CUDA context.
+    """
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.base_dsl.runtime import cuda as cuda_helpers
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
+    from b12x.norm.mhc import _kernels as kernels
+    from b12x.norm.mhc import _pre_prefill as prepare
+    from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery, native_config_for
+    from b12x.policy import DeviceIdentity
+
+    launches = {}
+    case = ""
+    convert = kernels._to_kernel_tensor
+
+    def target_attribute(attribute, device_id=0):
+        # CuTe derives the preferred SMEM carveout from min_blocks_per_mp.
+        # CUDA Programming Guide table 32 specifies 228 KiB for CC 10.3.
+        if (
+            attribute
+            != cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        ):
+            raise RuntimeError(f"unreviewed offline CUDA attribute {attribute}")
+        return 228 * 1024
+
+    def prototype(value, dtype, **kwargs):
+        with unset_fake_temporarily():
+            cpu = torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
+            return convert(cpu, dtype, **kwargs)
+
+    def capture(kernel, *, compile_spec, compile_args, runtime_args):
+        directory = out / case
+        directory.mkdir()
+        with unset_fake_temporarily():
+            compiled = cute.compile(
+                kernel,
+                *compile_args,
+                no_jit_engine=True,
+                options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+            )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+
+    device = DeviceIdentity(
+        vendor="nvidia", product_name="B300", compute_capability=(10, 3), sm_count=148
+    )
+    with (
+        FakeTensorMode(),
+        patch.object(cuda_helpers, "get_device_attribute", target_attribute),
+        patch.object(kernels, "_to_kernel_tensor", prototype),
+        patch.object(prepare, "_to_kernel_tensor", prototype),
+        patch.object(kernels, "b12x_launch", capture),
+        patch.object(prepare, "launch", capture),
+        patch.object(kernels, "current_cuda_stream", lambda: cuda.CUstream(0)),
+        patch.object(prepare, "current_cuda_stream", lambda: cuda.CUstream(0)),
+        patch.object(torch.cuda, "is_available", lambda: False),
+    ):
+        for hidden in (4096, 5120, 7168):
+
+            def tensor(*shape, dtype=torch.float32):
+                return torch.empty(shape, dtype=dtype, device="cuda:0")
+
+            native = native_config_for(8, hidden, (10, 3))
+            residual = tensor(3, 4, hidden, dtype=torch.bfloat16)
+            output = tensor(3, 4, hidden, dtype=torch.bfloat16)
+            x = tensor(3, hidden, dtype=torch.bfloat16)
+            y = tensor(3, hidden, dtype=torch.bfloat16)
+            fn = tensor(24, 4 * hidden)
+            partials = tensor(3, hidden // 64, 25)
+            post, comb = tensor(3, 4), tensor(3, 4, 4)
+            scale, bias = tensor(3), tensor(24)
+            incoming, predicted = tensor(3, 4), tensor(3, 4)
+            for phase in ("broadcast", "pre", "post_pre"):
+                for gram, lagged in ((False, False), (True, False), (False, True)):
+                    case = f"mhc_h{hidden}_{phase}_gram{int(gram)}_lagged{int(lagged)}"
+                    kwargs = dict(
+                        fn=fn,
+                        partials=partials,
+                        out=output,
+                        compute_gram=gram,
+                        pre_mix=incoming if lagged else None,
+                        y=y if lagged else None,
+                        planned_tokens=8,
+                        native_config=native,
+                    )
+                    if phase == "post_pre":
+                        kernels._run_mhc_post_pre_partial_launch(
+                            x=x,
+                            residual=residual,
+                            prev_post=post,
+                            prev_comb=comb,
+                            **kwargs,
+                        )
+                    else:
+                        if phase == "broadcast":
+                            kwargs["fn"] = tensor(24, hidden)
+                        kernels._run_mhc_pre_partial_launch(
+                            residual=x if phase == "broadcast" else residual, **kwargs
+                        )
+            case = f"mhc_h{hidden}_post"
+            kernels._run_mhc_post_launch(
+                x=x, residual=residual, prev_post=post, prev_comb=comb, out=output
+            )
+            for gram in (False, True):
+                for block_m in (0, 2):
+                    case = f"mhc_h{hidden}_compact_b{block_m}_gram{int(gram)}"
+                    entry = (
+                        kernels._run_mhc_post_pre_prefill_block_m_partial_launch
+                        if block_m
+                        else kernels._run_mhc_post_pre_prefill_partial_launch
+                    )
+                    kwargs = (
+                        dict(block_m=block_m, tile_n=12 if hidden == 7168 else 24)
+                        if block_m
+                        else {}
+                    )
+                    entry(
+                        x=x,
+                        residual=residual,
+                        prev_post=post,
+                        prev_comb=comb,
+                        fn=fn,
+                        partials=partials,
+                        out=output,
+                        compute_gram=gram,
+                        **kwargs,
+                    )
+            case = f"mhc_h{hidden}_prefill_gram"
+            kernels._run_mhc_post_pre_prefill_gram_launch(
+                x=x,
+                residual=residual,
+                prev_post=post,
+                prev_comb=comb,
+                partials=partials,
+                out=output,
+            )
+            for tma in (False, True):
+                case = f"mhc_h{hidden}_bf16_tma{int(tma)}"
+                kernels._run_mhc_prefill_bf16_project_launch(
+                    out=output,
+                    fn_bf16=tensor(24, 4 * hidden, dtype=torch.bfloat16),
+                    partials=partials,
+                    use_tma=tma,
+                )
+            for splits, tile_n in ((4, 6), (8, 6)):
+                if hidden // splits % 256:
+                    continue
+                for gram in (False, True):
+                    case = f"mhc_h{hidden}_split{splits}_gram{int(gram)}"
+                    kernels._run_mhc_post_pre_partial_launch(
+                        x=x,
+                        residual=residual,
+                        prev_post=post,
+                        prev_comb=comb,
+                        fn=fn,
+                        out=output,
+                        partials=partials,
+                        planned_tokens=8,
+                        compute_gram=gram,
+                        decode_source_splits=splits,
+                        decode_tile_n=tile_n,
+                    )
+            for capacity in (
+                (384, 2304, 3072, 3584, 8192) if hidden == 4096 else (384, 4096)
+            ):
+                config = MHC_POLICY.heuristic(
+                    MhcQuery(
+                        dtype="bfloat16",
+                        max_tokens=capacity,
+                        hidden_size=hidden,
+                        split_k=hidden // 64,
+                    ),
+                    device,
+                )
+                for split in (False, True):
+                    case = f"mhc_h{hidden}_tf32_capacity{capacity}_split{int(split)}"
+                    kernels._run_mhc_prefill_tf32_project_launch(
+                        out=output,
+                        fn=fn,
+                        partials=partials,
+                        tile_m=config.projection_tile_m,
+                        tile_n=config.projection_tile_n,
+                        tile_k=config.projection_tile_k,
+                        num_stages=config.projection_num_stages,
+                        num_m_warps=config.projection_num_m_warps,
+                        num_n_warps=config.projection_num_n_warps,
+                        k_splits=config.projection_k_splits,
+                        split_fp32_fn=split,
+                    )
+            for compact, lagged, ready in (
+                (False, False, False),
+                (False, True, False),
+                (False, True, True),
+                (True, False, False),
+                (True, True, False),
+            ):
+                for norm in (False, True):
+                    for weight_type in (
+                        (torch.bfloat16, torch.float32) if norm else (torch.bfloat16,)
+                    ):
+                        case = f"mhc_h{hidden}_finalize_c{int(compact)}_l{int(lagged)}_r{int(ready)}_norm{int(norm)}_{weight_type}"
+                        kernels._run_mhc_finalize_gram_launch(
+                            residual=output,
+                            partials=partials,
+                            scale=scale,
+                            bias=bias,
+                            y=y,
+                            post=post,
+                            comb=comb,
+                            rms_eps=1e-20 if lagged else 1e-6,
+                            hc_eps=1e-6,
+                            sinkhorn_iters=20,
+                            norm_weight=tensor(hidden, dtype=weight_type),
+                            norm_eps=1e-20 if lagged else 1e-6,
+                            fuse_norm=norm,
+                            compact_partials=compact,
+                            compact_projection_splits=1,
+                            pre_mix=incoming if lagged else None,
+                            pre_out=predicted if lagged else None,
+                            lagged_prepared=ready,
+                            planned_tokens=384 if compact else 8,
+                            native_config=native,
+                        )
+            # Custom-op bodies are invoked directly so fake dispatch cannot skip compilation.
+            case = f"mhc_h{hidden}_lagged_prepare"
+            prepare.prepare_lagged_prefill._init_fn(residual, output, partials)
+            for weighted in (False, True):
+                case = f"mhc_h{hidden}_collapse_weighted{int(weighted)}"
+                kernels._mhc_collapse_op._init_fn(
+                    residual, incoming if weighted else None, y
+                )
+    return launches
+
+
 def compile_bf16_projection(out):
     """Compile SIMT and warp-MMA unquantized projection entry points."""
     import cuda.bindings.driver as cuda
@@ -1163,6 +1403,7 @@ def main():
             "dense_mla",
             "sparse_mla",
             "compressed_mla",
+            "mhc",
             "dsa_indexer",
             "projection",
             "blockscaled",
@@ -1216,6 +1457,11 @@ def main():
         "target": "sm_103a",
         "component": args.component,
         "command": sys.argv,
+        "mhc_offline_device_attributes": {
+            "MAX_SHARED_MEMORY_PER_MULTIPROCESSOR": 228 * 1024,
+            "source": "https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#shared-memory-capacity",
+            "use": "CuTe preferred-SMEM-carveout calculation for minimum CTA residency",
+        } if args.component in ("mhc", "all") else None,
         "trellis_geometry": {
             "experts": 384,
             "hidden": 5120,
@@ -1269,6 +1515,8 @@ def main():
             launches.update(compile_sparse_mla(out))
         if args.component in ("compressed_mla", "all"):
             launches.update(compile_compressed_mla(out))
+        if args.component in ("mhc", "all"):
+            launches.update(compile_mhc(out))
         if args.component in ("dsa_indexer", "all"):
             launches.update(compile_dsa_indexer(out))
         if args.component in ("projection", "all"):

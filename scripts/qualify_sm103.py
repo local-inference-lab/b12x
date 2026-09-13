@@ -39,6 +39,8 @@ SUITES = {
         "tests/attention/test_dense_mla_window.py",
     ],
     "sparse_mla": ["tests/attention/test_sm103_sparse_mla.py"],
+    "mhc": ["tests/norm/test_mhc.py", "tests/norm/test_residual_mhc.py",
+            "tests/norm/test_mhc_lagged_parallel.py", "tests/norm/test_sm103_mhc.py"],
     "compressed_mla": [
         "tests/attention/test_sm103_compressed_mla.py",
         "tests/attention/test_mla_kv_cache.py::test_v41_writer_recipes_odd_pages_and_int64_pool_offsets",
