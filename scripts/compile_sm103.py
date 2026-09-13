@@ -818,6 +818,46 @@ def compile_bf16_projection(out):
     return launches
 
 
+def compile_fp8(out):
+    """Compile the production tensor and compact K128 FP8 launch factory."""
+    import cutlass.cute as cute
+    import torch
+    from b12x.gemm.blockscaled import _fp8_cute as fp8
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    fp8.compile_kernel.cache_clear()
+    with (patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+          patch.object(fp8, "b12x_compile", capture)):
+        for block, n, k, groups in (
+            (False, 64, 128, 1), (False, 132, 256, 1),
+            (False, 16386, 1024, 1), (False, 136, 384, 2),
+            (True, 256, 384, 1),
+        ):
+            for c_dtype in ("bfloat16", "float16", "float32"):
+                case = f"fp8_block{int(block)}_n{n}_k{k}_g{groups}_{c_dtype}"
+                fp8.compile_kernel(n, k, groups, c_dtype, block, False, 0, 148, "sm_103a")
+        for block in (False, True):
+            case = f"fp8_block{int(block)}_alpha_one"
+            fp8.compile_kernel(128, 128, 1, "bfloat16", block, True, 0, 148, "sm_103a")
+        for block in (False, True):
+            case = f"fp8_block{int(block)}_large_output_address"
+            fp8.compile_kernel(524288, 128, 1, "bfloat16", block, True, 0, 148, "sm_103a")
+    return launches
+
+
 def compile_blockscaled(out):
     """Compile production dense tcgen05 and inline A16 launch factories."""
     import cuda.bindings.driver as cuda
@@ -907,6 +947,7 @@ def main():
             "dsa_indexer",
             "projection",
             "blockscaled",
+            "fp8",
             "all",
         ),
         default="moe",
@@ -1011,6 +1052,8 @@ def main():
             launches.update(compile_bf16_projection(out))
         if args.component in ("blockscaled", "all"):
             launches.update(compile_blockscaled(out))
+        if args.component in ("fp8", "all"):
+            launches.update(compile_fp8(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__

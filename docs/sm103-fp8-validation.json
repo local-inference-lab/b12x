@@ -1,0 +1,584 @@
+{
+  "source_sha256": "abf4889ae866cbff21dc1de411f3d0883567e4e3b737239f0873bcc00d7db9e4",
+  "source_revision": "03f3c611997ede6b05e0a3814a41e47e72318115",
+  "source_kind": "git",
+  "git_status": [
+    " M b12x/_lib/architecture.py",
+    " M b12x/_lib/dense_gemm.py",
+    " M b12x/gemm/blockscaled/_linear.py",
+    " M b12x/gemm/tensor_fp8_linear/__init__.py",
+    " M b12x/gemm/tensor_fp8_linear/api.py",
+    " M scripts/compile_sm103.py",
+    " M scripts/qualify_sm103.py",
+    " M tests/architecture/test_sm103_blockscaled.py",
+    "?? b12x/gemm/blockscaled/_fp8_cute.py",
+    "?? tests/architecture/test_sm103_fp8.py",
+    "?? tests/gemm/test_sm103_fp8.py"
+  ],
+  "target": "sm_103a",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/home/jasonc/b12x-sm103-evidence/fp8-complete-sm103",
+    "--nvdisasm",
+    "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+  ],
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "callables": 241,
+  "status": "cross-compiled; SM120 regression passed; no SM103 execution",
+  "runtime_qualified": false,
+  "scope": "tensor-scaled and compact K128 FP8; planned BF16 block-FP8 linear remains unsupported",
+  "compile_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp8-complete-sm103/manifest.json",
+    "sha256": "6bcc082fca7e589cf2415055d3ef1174abe8445c3fefd622f7351e793a807497"
+  },
+  "cuda_entries": 249,
+  "fp8_resources": [
+    {
+      "name": "fp8_block0_n64_k128_g1_bfloat16",
+      "registers": 56,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n64_k128_g1_float16",
+      "registers": 56,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n64_k128_g1_float32",
+      "registers": 85,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n132_k256_g1_bfloat16",
+      "registers": 64,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n132_k256_g1_float16",
+      "registers": 64,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n132_k256_g1_float32",
+      "registers": 95,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n16386_k1024_g1_bfloat16",
+      "registers": 56,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n16386_k1024_g1_float16",
+      "registers": 56,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n16386_k1024_g1_float32",
+      "registers": 56,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n136_k384_g2_bfloat16",
+      "registers": 55,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n136_k384_g2_float16",
+      "registers": 55,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_n136_k384_g2_float32",
+      "registers": 85,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block1_n256_k384_g1_bfloat16",
+      "registers": 88,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block1_n256_k384_g1_float16",
+      "registers": 88,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block1_n256_k384_g1_float32",
+      "registers": 128,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_alpha_one",
+      "registers": 55,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block1_alpha_one",
+      "registers": 63,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block0_large_output_address",
+      "registers": 55,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "fp8_block1_large_output_address",
+      "registers": 63,
+      "stack": 0,
+      "static_shared": 1024,
+      "local": 0
+    }
+  ],
+  "positive_existing_resource_deltas": [],
+  "retained_resource_flags": [
+    {
+      "name": "dense_mla_bf16_d1088_q2_wNone",
+      "registers": 168,
+      "stack": 160,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q1_w128",
+      "registers": 255,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q2_wNone",
+      "registers": 168,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "dense_mla_fp8_d1088_q4_wNone",
+      "registers": 96,
+      "stack": 192,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h8_prefill",
+      "registers": 168,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h16_prefill",
+      "registers": 168,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model1_sf1_pts0_h32_prefill",
+      "registers": 168,
+      "stack": 136,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model1_sf2_pts0_h32_prefill",
+      "registers": 168,
+      "stack": 128,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h16_prefill",
+      "registers": 168,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "sparse_mla_model2_sf1_pts0_h32_prefill",
+      "registers": 168,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas1",
+      "registers": 64,
+      "stack": 16,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h16_k512_ctas4",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas1",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas4",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h16_k2048_ctas192",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill_h16",
+      "registers": 255,
+      "stack": 64,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill512_h16",
+      "registers": 255,
+      "stack": 152,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas1",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas4",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k512_ctas192",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas1",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas4",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h32_k2048_ctas192",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill_h32",
+      "registers": 255,
+      "stack": 200,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill512_h32",
+      "registers": 255,
+      "stack": 312,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h64_k512_ctas192",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas4",
+      "registers": 64,
+      "stack": 16,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_fused_h64_k2048_ctas192",
+      "registers": 64,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill_h64",
+      "registers": 255,
+      "stack": 208,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_prefill512_h64",
+      "registers": 255,
+      "stack": 16,
+      "static_shared": 1024,
+      "local": 0
+    },
+    {
+      "name": "indexer_mxfp4_h32_candidates1",
+      "registers": 128,
+      "stack": 8,
+      "static_shared": 1024,
+      "local": 0
+    }
+  ],
+  "resource_baseline": {
+    "path": "/home/jasonc/b12x-sm103-evidence/blockscaled-address-safe-sm103/manifest.json",
+    "sha256": "b598a16e05fd9f84c425ae72a8de1f8d280e50970250c9a5f5adc420039081ad"
+  },
+  "host_tests": {
+    "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-qualified-host.log",
+    "sha256": "b61281fd47cc5ed08590947131719a345cd51e0f46014cd155260b9ec1d8c1e0",
+    "result": "690 passed, 66 skipped",
+    "command": [
+      ".venv/bin/python",
+      "-m",
+      "pytest",
+      "tests/architecture",
+      "tests/policy",
+      "tests/gemm/test_dense_gemm_expected_m.py",
+      "tests/gemm/test_tensor_fp8_linear.py",
+      "tests/gemm/test_sm103_fp8.py",
+      "tests/gemm/test_gemm_stack.py",
+      "-q"
+    ]
+  },
+  "gpu": {
+    "host": "ripper",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "name": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "compute_mode": "Default",
+    "driver": "580.173.02",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "CUTE_DSL_ARCH": "sm_120a"
+    },
+    "package_source_sha256": "abf4889ae866cbff21dc1de411f3d0883567e4e3b737239f0873bcc00d7db9e4",
+    "runs": [
+      {
+        "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-sm120-final-memcheck.log",
+        "sha256": "994c6c9a1dbfb46925838d3686313e0b52685675ed01e3b549513080fcfeb0a2",
+        "result": "190 passed, 14 skipped",
+        "command": [
+          ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          ".venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/gemm/test_sm103_fp8.py",
+          "tests/gemm/test_tensor_fp8_linear.py",
+          "tests/gemm/test_gemm_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear.py",
+          "tests/gemm/test_blockscaled_a16.py",
+          "-x",
+          "-q"
+        ],
+        "sanitizer_errors": 0,
+        "fp8_cases": 22,
+        "test_scope_note": "This run covers the 22 FP8 cases before the two serialized API cases were appended. The supplemental run covers both appended cases plus four NVFP4 epilogue regressions against the same package source."
+      },
+      {
+        "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-sm120-final-synccheck.log",
+        "sha256": "5ad91a3442d68993d53a582cbf59f65d6ec70335fc458cfbbbfad5879a64d61e",
+        "result": "190 passed, 14 skipped",
+        "command": [
+          ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "99",
+          ".venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/gemm/test_sm103_fp8.py",
+          "tests/gemm/test_tensor_fp8_linear.py",
+          "tests/gemm/test_gemm_block_fp8_linear.py",
+          "tests/gemm/test_block_fp8_linear.py",
+          "tests/gemm/test_blockscaled_a16.py",
+          "-x",
+          "-q"
+        ],
+        "sanitizer_errors": 0,
+        "fp8_cases": 22,
+        "test_scope_note": "This run covers the 22 FP8 cases before the two serialized API cases were appended. The supplemental run covers both appended cases plus four NVFP4 epilogue regressions against the same package source."
+      }
+    ],
+    "supplemental_api_epilogue": {
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-api-epilogue-final-sanitizers.log",
+      "sha256": "724c0e55ed83b3e6345d722f7b4d7f126d6ed675ece0058395e3fcd57daabed9",
+      "tools": [
+        "memcheck",
+        "synccheck"
+      ],
+      "result": "6 passed under each sanitizer; zero errors",
+      "selection": "serialized_compact or swapped_epilogue_independent",
+      "command_template": [
+        ".deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "{memcheck|synccheck}",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_gemm_stack.py",
+        "tests/gemm/test_sm103_fp8.py",
+        "-k",
+        "serialized_compact or swapped_epilogue_independent",
+        "-x",
+        "-q"
+      ]
+    }
+  },
+  "baseline_test_failures": [
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-baseline-policy-test.log",
+      "sha256": "4a51d24ff043f86a449bdd062acc8bacb9b8058e70888fd887fb76d7a03bc94c",
+      "result": "1 failed",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_tensor_fp8_linear.py::test_aligned_decode_uses_native_block_fp8_recipe",
+        "-q"
+      ]
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/logs/fp8-baseline-fp4-plan-test.log",
+      "sha256": "517ecab4fe95a1c04c187ad7a4f8234770aebf300e33fbedb8e6b2629a61efd9",
+      "result": "5 failed, 3 passed",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_gemm_stack.py",
+        "-k",
+        "default_dense_fp4_plan_handles_m1_probe_regimes",
+        "-q"
+      ]
+    }
+  ],
+  "baseline_archive": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp8-baseline.tar.gz",
+    "sha256": "5f5f9e533a4cd07409e71449f5a4ffaf09b968e3064a660d409245cef55c2c86",
+    "revision": "03f3c611997ede6b05e0a3814a41e47e72318115"
+  },
+  "packaging": {
+    "wheel": "/home/jasonc/b12x-sm103-evidence/fp8-dist/b12x-1.3.0-py3-none-any.whl",
+    "sdist": "/home/jasonc/b12x-sm103-evidence/fp8-dist/b12x-1.3.0.tar.gz",
+    "verified_package_files": 447,
+    "sha256": {
+      "b12x-1.3.0-py3-none-any.whl": "aec41baa3b28ec41a16c67aaf856c722e0f77d5a12a18ab3d2ab99c6399599ef",
+      "b12x-1.3.0.tar.gz": "1bdc92f8529400b82004bf08b42d30765a61f9b247a4f67558f4b9ccfbf5d313"
+    }
+  },
+  "prepared_qualification": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp8-accepted-prepared/qualification.json",
+    "sha256": "49ed6434e71800df5cce1dcf6f9c3ca7f4ff98d4685373c04abad56db8540a14"
+  },
+  "current_test_sources": [
+    {
+      "path": "/home/jasonc/b12x-sm103/tests/gemm/test_sm103_fp8.py",
+      "sha256": "a84f35eca6c28277a5aeb55b40fb818554cf9433489ba8521e21ff9561ed88af"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103/tests/architecture/test_sm103_fp8.py",
+      "sha256": "7f65158b97ffbee6636d8f905023760bb0fab8b1668bde644abedcab2682ee0f"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103/tests/gemm/test_tensor_fp8_linear.py",
+      "sha256": "da5d3a2aaa5b2f4ff65955107d29dba28550314b3b17219a37e3e76ee2e466f7"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103/tests/gemm/test_gemm_stack.py",
+      "sha256": "c34b156a91fd0b7ec56ff281b24622830a207fae8ed33dbe15f5bc8058ca034b"
+    }
+  ]
+}

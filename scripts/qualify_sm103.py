@@ -42,6 +42,7 @@ SUITES = {
     ],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
     "blockscaled": ["tests/gemm/test_sm103_blockscaled.py"],
+    "fp8": ["tests/gemm/test_sm103_fp8.py"],
 }
 
 
