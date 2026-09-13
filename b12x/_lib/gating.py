@@ -11,6 +11,8 @@ import importlib.metadata
 import importlib.util
 import re
 
+from .architecture import architecture_for, supports_architecture
+
 MIN_CUTLASS_DSL = "4.6.0"
 
 
@@ -26,9 +28,9 @@ def get_compute_capability(device=None) -> tuple[int, int] | None:
 
 
 def is_b12x(device=None) -> bool:
-    """True when the target device is consumer Blackwell (SM120/SM121)."""
-    cap = get_compute_capability(device)
-    return cap is not None and cap[0] == 12 and cap[1] in (0, 1)
+    """Recognize implemented architecture classes; query each op for coverage."""
+    architecture = architecture_for(get_compute_capability(device))
+    return architecture is not None and architecture.implemented
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -86,9 +88,12 @@ def _requirement_met(requirement: str) -> bool:
     raise ValueError(f"unknown op requirement {requirement!r}")
 
 
-def default_is_supported(device=None, *, requires: tuple[str, ...] = ()) -> bool:
+def default_is_supported(
+    device=None, *, requires: tuple[str, ...] = (),
+    archs: tuple[str, ...] = ("sm120a", "sm121a"),
+) -> bool:
     """The standard ``is_supported`` used by ops without extra constraints."""
-    if not is_b12x(device):
+    if not supports_architecture(get_compute_capability(device), archs):
         return False
     if not has_cutlass_dsl():
         return False

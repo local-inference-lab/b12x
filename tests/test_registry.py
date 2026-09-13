@@ -134,7 +134,7 @@ def test_every_op_meta_contract():
             or (name.startswith("is_") and name.endswith("_supported"))
             for name in meta.entry_points
         ), meta.qualname
-        assert meta.archs and set(meta.archs) <= {"sm120a", "sm121a"}, meta.qualname
+        assert meta.archs and set(meta.archs) <= {"sm103a", "sm120a", "sm121a"}, meta.qualname
         assert meta.provenance.commit, f"{meta.qualname} missing provenance commit"
         assert meta.test_path and (REPO / meta.test_path).is_file(), (
             f"{meta.qualname} META.test_path {meta.test_path!r} does not exist"

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import is_b12x
+from ..._lib.gating import get_compute_capability
+from ..._lib.architecture import supports_architecture
+from . import META
 from .pcie_allreduce import (
     PCIeAllReduce as AllReduce,
 )
@@ -52,7 +54,7 @@ def is_supported(device=None) -> bool:
     """
     import torch
 
-    return is_b12x(device) and torch.cuda.device_count() >= 2
+    return supports_architecture(get_compute_capability(device), META.archs) and torch.cuda.device_count() >= 2
 
 
 __all__ = [
