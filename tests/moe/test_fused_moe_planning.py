@@ -619,13 +619,32 @@ def test_vllm_flat_weight_preparation_contract() -> None:
     assert prepared.plan is plan
 
 
-def test_canonical_lifecycle_keeps_planning_axes_visible() -> None:
+@pytest.mark.parametrize(
+    ("mode", "packing", "quant_mode"),
+    [
+        (fused_moe.ActivationMode.A4, fused_moe.WeightPacking.SOURCE_NATIVE, "nvfp4"),
+        (fused_moe.ActivationMode.A16, fused_moe.WeightPacking.MMA_PACKED, "w4a16"),
+    ],
+)
+def test_canonical_lifecycle_keeps_planning_axes_visible(
+    mode: fused_moe.ActivationMode,
+    packing: fused_moe.WeightPacking,
+    quant_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A16 preparation needs an SM count to size counters; binding runs on CPU
+    # and does not compile or execute GPU kernels.
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=1),
+    )
     source = fused_moe.PackedSource(
         format=fused_moe.PackedSourceFormat.MODELOPT_NVFP4,
         w13_layout=fused_moe.W13Layout.W31,
     )
     activation = fused_moe.ActivationSpec(
-        mode=fused_moe.ActivationMode.A4,
+        mode=mode,
         nonlinearity="silu",
         io_dtype=torch.bfloat16,
     )
@@ -669,12 +688,41 @@ def test_canonical_lifecycle_keeps_planning_axes_visible() -> None:
     assert weight_plan.source is source
     assert weight_plan.activation is activation
     assert weight_plan.geometry is geometry
-    assert weight_plan.prepared_format.packing is fused_moe.WeightPacking.SOURCE_NATIVE
+    assert weight_plan.prepared_format.packing is packing
     assert execution.scratch.nbytes > 0
     assert [variant.tokens for variant in execution.variants] == [1, 4]
     assert not execution.is_prewarmed
     fused_moe.prewarm(execution)
     assert execution.is_prewarmed
+
+    def no_policy_resolution(*args, **kwargs):
+        raise AssertionError("binding must use the planned activation mode")
+
+    monkeypatch.setattr(PolicyContext, "resolve", no_policy_resolution)
+    spec, = execution.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    x = torch.ones((4, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    ids = torch.zeros((4, 1), dtype=torch.int32)
+    routes = torch.ones((4, 1), dtype=torch.float32)
+    for count in (1, 3, 4):
+        kwargs = dict(
+            scratch=scratch,
+            a=x[:count],
+            experts=experts,
+            output=output[:count],
+            topk_ids=ids[:count],
+            topk_weights=routes[:count],
+        )
+        binding = fused_moe.bind(execution, **kwargs)
+        assert binding.quant_mode == quant_mode
+        assert binding.unit_scale_contract is (mode is fused_moe.ActivationMode.A16)
+        assert binding.experts is experts._impl
+        assert binding.output.data_ptr() == output.data_ptr()
+        assert binding.output.shape == (count, 128)
+        for override in (False, True):
+            with pytest.raises(TypeError, match="derived from the canonical activation mode"):
+                fused_moe.bind(execution, **kwargs, unit_scale_contract=override)
 
 
 def test_canonical_plan_execution_carries_explicit_policy() -> None:
