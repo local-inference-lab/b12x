@@ -132,7 +132,10 @@ def compressed_sparse_mla_decode_forward(
             f"{COMPRESSED_SPARSE_MLA_HEAD_DIM}) by construction; got q_head_dim="
             f"{int(q3.shape[-1])}"
         )
-    if not _use_sm120_sparse_mla(backend=backend, device=q3.device):
+    uses_warp = getattr(scratch.execution_config, "backend", "native") == "warp"
+    if uses_warp and backend not in (None, "warp"):
+        raise ValueError("backend contradicts the planned compressed MLA warp backend")
+    if not uses_warp and not _use_sm120_sparse_mla(backend=backend, device=q3.device):
         raise RuntimeError(
             "compressed sparse MLA requires the active SM120 sparse MLA kernel path; "
             "legacy compressed sparse MLA kernels have been retired"
@@ -148,6 +151,7 @@ def compressed_sparse_mla_decode_forward(
         cache_format=cache_format,
         cache_kind="swa",
         allow_empty=swa_indices_2d.shape[1] == 0,
+        check_alignment=not uses_warp,
     )
 
     swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
@@ -194,6 +198,7 @@ def compressed_sparse_mla_decode_forward(
             cache_format=cache_format,
             cache_kind="indexed",
             allow_empty=indexed_indices_2d.shape[1] == 0,
+            check_alignment=not uses_warp,
         )
         indexed_indices_2d = _normalize_index_matrix(
             indexed_indices, name="indexed_indices"
@@ -210,7 +215,7 @@ def compressed_sparse_mla_decode_forward(
         if indexed_topk_lengths.device != q3.device:
             raise ValueError("indexed_topk_lengths must be on the same device as q_all")
         if indexed_page_table is not None:
-            if cache_format != "deepseek_v41":
+            if cache_format != "deepseek_v41" and not uses_warp:
                 raise ValueError(
                     "mapped indexed_page_table is only supported for deepseek_v41"
                 )
@@ -589,10 +594,11 @@ def _validate_compressed_cache_layout(
     cache_format: str = "deepseek_v4",
     cache_kind: str = "swa",
     allow_empty: bool = False,
+    check_alignment: bool = True,
 ) -> None:
     if int(cache.shape[0]) < 1 and not allow_empty:
         raise ValueError(f"{name} must contain at least one physical page")
-    if cache_format == "deepseek_v41" and (
+    if check_alignment and cache_format == "deepseek_v41" and (
         cache.data_ptr() % 16 or cache.stride(0) % 16
     ):
         raise ValueError(

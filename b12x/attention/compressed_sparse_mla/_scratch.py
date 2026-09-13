@@ -163,6 +163,7 @@ class _B12XCompressedSparseMLAScratchLayout:
     num_chunks_offset_bytes: int
     sm_scale_offset_bytes: int
     mapped_indices_offset_bytes: int
+    staged_selections_offset_bytes: int = 0
 
 
 @dataclass(kw_only=True)
@@ -209,6 +210,11 @@ class B12XCompressedSparseMLAScratch:
     _contract_output: torch.Tensor | None = None
     _contract_tmp_output: torch.Tensor | None = None
     _contract_tmp_lse: torch.Tensor | None = None
+    staged_swa_indices: torch.Tensor | None = None
+    staged_indexed_indices: torch.Tensor | None = None
+    staged_swa_lengths: torch.Tensor | None = None
+    staged_indexed_lengths: torch.Tensor | None = None
+    backend_key: str | None = None
 
     def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
@@ -264,6 +270,7 @@ class B12XCompressedSparseMLABinding:
 
 def _compressed_sparse_mla_scratch_layout(
     caps: B12XCompressedSparseMLAScratchCaps,
+    execution_config: SparseMlaConfig | None = None,
 ) -> _B12XCompressedSparseMLAScratchLayout:
     max_total_q = max(int(caps.max_q_rows), 1)
     max_chunks_per_row = max(int(caps.max_chunks_per_row), 1)
@@ -319,6 +326,7 @@ def _compressed_sparse_mla_scratch_layout(
         num_chunks_offset_bytes=num_chunks_offset_bytes,
         sm_scale_offset_bytes=sm_scale_offset_bytes,
         mapped_indices_offset_bytes=mapped_indices_offset_bytes,
+        staged_selections_offset_bytes=staged_selections_offset_bytes,
     )
 
 
@@ -477,6 +485,21 @@ def _materialize_compressed_sparse_mla_scratch(
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
     )
+    if execution_config.backend == "warp":
+        cursor = layout.staged_selections_offset_bytes
+        for name, width in (
+            ("staged_swa_indices", max(64, align_up(caps.swa_width, 64))),
+            ("staged_indexed_indices", max(64, align_up(caps.indexed_width, 64))),
+        ):
+            value, cursor = materialize_scratch_view(scratch_storage, offset_bytes=cursor,
+                                                shape=(max_total_q, width), dtype=torch.int32)
+            setattr(scratch, name, value)
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+        for name in ("staged_swa_lengths", "staged_indexed_lengths"):
+            value, _ = materialize_scratch_view(scratch_storage, offset_bytes=cursor,
+                                                shape=(max_total_q,), dtype=torch.int32)
+            setattr(scratch, name, value)
+            cursor += align_up(value.numel() * 4, SCRATCH_ALIGN_BYTES)
     _install_compressed_sparse_mla_contract_phantoms(scratch)
     split_cfg = compressed_sparse_mla_split_config_for_contract(
         rows=caps.max_q_rows,
@@ -720,6 +743,7 @@ class B12XCompressedSparseMLAScratchPlan:
             self.layout,
             self.execution_config,
         )
+        scratch_views.backend_key = self.backend_key
         return build_compressed_sparse_mla_binding(
             scratch=scratch_views,
             q=q,
@@ -759,6 +783,10 @@ def plan_compressed_sparse_mla_scratch(
             ),
         ),
     )
+    if execution_config.backend == "warp":
+        from ._warp import register_plan
+        result = register_plan(result)
+    return result
 
 
 __all__ = [

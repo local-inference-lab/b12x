@@ -460,25 +460,27 @@ def compressed_sparse_mla_reference(
     q_f32 = q3.float()
 
     for row in range(rows):
-        swa_len = _valid_prefix_length(
+        swa_selected = _selected_indices(
             swa_topk_lengths[row], swa_indices_2d[row], swa_indices_2d.shape[1]
         )
+        swa_len = swa_selected.numel()
         if (
             has_extra
             and extra_indices_2d is not None
             and extra_topk_lengths is not None
         ):
-            extra_len = _valid_prefix_length(
+            extra_selected = _selected_indices(
                 extra_topk_lengths[row],
                 extra_indices_2d[row],
                 extra_indices_2d.shape[1],
             )
+            extra_len = extra_selected.numel()
             if extra_len:
                 assert extra_k_cache is not None
                 assert extra_page_size is not None
                 extra_k, extra_v = _gather_cache_reference(
                     extra_k_cache,
-                    extra_indices_2d[row, :extra_len],
+                    extra_selected,
                     page_size=extra_page_size,
                     cache_format=cache_format,
                     cache_kind="indexed",
@@ -501,7 +503,7 @@ def compressed_sparse_mla_reference(
 
         if swa_len:
             swa_k, swa_v = _gather_cache_reference(
-                swa_k_cache, swa_indices_2d[row, :swa_len], page_size=swa_page_size,
+                swa_k_cache, swa_selected, page_size=swa_page_size,
                 cache_format=cache_format, cache_kind="swa",
             )
         else:
@@ -554,17 +556,13 @@ def _bounded_length(length: torch.Tensor, width: int) -> int:
     return min(value, width)
 
 
-def _valid_prefix_length(
+def _selected_indices(
     length: torch.Tensor, indices: torch.Tensor, width: int
-) -> int:
+) -> torch.Tensor:
+    """Mask invalid slots throughout the bounded selection, including holes."""
     limit = _bounded_length(length, width)
-    if limit == 0:
-        return 0
     active = indices[:limit].to(torch.int64)
-    negative = torch.nonzero(active < 0, as_tuple=False)
-    if negative.numel() == 0:
-        return limit
-    return int(negative[0, 0].item())
+    return active[active >= 0]
 
 
 def _normalize_q(q: torch.Tensor) -> torch.Tensor:

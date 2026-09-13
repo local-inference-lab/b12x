@@ -3109,7 +3109,9 @@ def s7_epilogue(
     # ── per-physical-row inverse normalizer (gid heads, gid+8 heads). ──
     if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
         # FINAL_BF16 + sink: il = 1/(l + exp2(sink_log2 - m)) (FlashInfer:494).
-        s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+        s0 = Float32(0.0)
+        if gid < Int32(valid_hpb):
+            s0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
         denom0 = global_sum[0] + _exp2_approx_ftz_f32(s0 - global_max[0])
         inv_g0 = Float32(0.0)
         if denom0 > Float32(0.0):
@@ -3119,7 +3121,9 @@ def s7_epilogue(
                 inv_g0 = Float32(1.0) / denom0
         inv_g1 = Float32(0.0)
         if cutlass.const_expr(valid_hpb > 8):
-            s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
+            s1 = Float32(0.0)
+            if gid + Int32(8) < Int32(valid_hpb):
+                s1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
             denom1 = global_sum[1] + _exp2_approx_ftz_f32(s1 - global_max[1])
             if denom1 > Float32(0.0):
                 if cutlass.const_expr(fast_rcp):
@@ -3175,12 +3179,13 @@ def s7_epilogue(
                         acc_nope[at][3] * inv_g1,
                     )
             elif cutlass.const_expr(_ot == cutlass.BFloat16):
-                store_bf16x2(
-                    get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
-                    acc_nope[at][0] * inv_g0,
-                    acc_nope[at][1] * inv_g0,
-                )
-                if cutlass.const_expr(valid_hpb > 8):
+                if gid < Int32(valid_hpb):
+                    store_bf16x2(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
+                        acc_nope[at][0] * inv_g0,
+                        acc_nope[at][1] * inv_g0,
+                    )
+                if gid + Int32(8) < Int32(valid_hpb):
                     store_bf16x2(
                         get_ptr_as_int64(
                             out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)
@@ -3189,9 +3194,10 @@ def s7_epilogue(
                         acc_nope[at][3] * inv_g1,
                     )
             else:
-                out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
-                out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
-                if cutlass.const_expr(valid_hpb > 8):
+                if gid < Int32(valid_hpb):
+                    out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
+                    out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
+                if gid + Int32(8) < Int32(valid_hpb):
                     out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
                     out_o[gid + Int32(8), d0 + Int32(1)] = (
                         acc_nope[at][3] * inv_g1
@@ -3227,12 +3233,13 @@ def s7_epilogue(
                         acc_rope[r + 3] * inv_g1,
                     )
             elif cutlass.const_expr(_ot == cutlass.BFloat16):
-                store_bf16x2(
-                    get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
-                    acc_rope[r + 0] * inv_g0,
-                    acc_rope[r + 1] * inv_g0,
-                )
-                if cutlass.const_expr(valid_hpb > 8):
+                if gid < Int32(valid_hpb):
+                    store_bf16x2(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
+                        acc_rope[r + 0] * inv_g0,
+                        acc_rope[r + 1] * inv_g0,
+                    )
+                if gid + Int32(8) < Int32(valid_hpb):
                     store_bf16x2(
                         get_ptr_as_int64(
                             out_o, cute.crd2idx((gid + Int32(8), rd0), out_o.layout)
@@ -3241,9 +3248,10 @@ def s7_epilogue(
                         acc_rope[r + 3] * inv_g1,
                     )
             else:
-                out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
-                out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
-                if cutlass.const_expr(valid_hpb > 8):
+                if gid < Int32(valid_hpb):
+                    out_o[gid, rd0] = (acc_rope[r + 0] * inv_g0).to(_ot)
+                    out_o[gid, rd0 + Int32(1)] = (acc_rope[r + 1] * inv_g0).to(_ot)
+                if gid + Int32(8) < Int32(valid_hpb):
                     out_o[gid + Int32(8), rd0] = (acc_rope[r + 2] * inv_g1).to(_ot)
                     out_o[gid + Int32(8), rd0 + Int32(1)] = (
                         acc_rope[r + 3] * inv_g1
@@ -3281,7 +3289,9 @@ def s7_epilogue(
         if cutlass.const_expr(epilogue_mode == EPILOGUE_FINAL_BF16 and has_attn_sink):
             # FlashMLA sink fold: lse += log2(1 + exp2(sink_log2 - lse)); empty ->
             # sink_log2 (prefill_kernel.cuh:548-560).
-            sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
+            sink0 = Float32(0.0)
+            if gid < Int32(valid_hpb):
+                sink0 = Float32(attn_sink[head_base + gid]) * Float32(LOG2_E)
             if lse0 > Float32(_NEG_INF):
                 lse0 = lse0 + _log2_approx_ftz_f32(
                     Float32(1.0) + _exp2_approx_ftz_f32(sink0 - lse0)
@@ -3289,15 +3299,19 @@ def s7_epilogue(
             else:
                 lse0 = sink0
             if cutlass.const_expr(valid_hpb > 8):
-                sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
+                sink1 = Float32(0.0)
+                if gid + Int32(8) < Int32(valid_hpb):
+                    sink1 = Float32(attn_sink[head_base + gid + Int32(8)]) * Float32(LOG2_E)
                 if lse1 > Float32(_NEG_INF):
                     lse1 = lse1 + _log2_approx_ftz_f32(
                         Float32(1.0) + _exp2_approx_ftz_f32(sink1 - lse1)
                     )
                 else:
                     lse1 = sink1
-        out_lse[gid] = lse0
-        if cutlass.const_expr(valid_hpb > 8):
+        # A partial head tile may end inside either eight-head MMA fragment.
+        if gid < Int32(valid_hpb):
+            out_lse[gid] = lse0
+        if gid + Int32(8) < Int32(valid_hpb):
             out_lse[gid + Int32(8)] = lse1
 
 

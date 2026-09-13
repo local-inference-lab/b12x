@@ -116,11 +116,25 @@ def test_sm120_override_never_selected_on_sm103():
             )
 
 
-def test_unimplemented_attention_rejects_before_query_or_profile_lookup():
-    from b12x.attention.compressed_sparse_mla._policy import COMPRESSED_SPARSE_MLA_POLICY
+@pytest.mark.parametrize("cache_format", ["deepseek_v4", "deepseek_v41"])
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_sm103_compressed_mla_public_plan(cache_format, mode, sm103_context):
+    from b12x.attention import compressed_sparse_mla as mla
+    from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
 
-    with pytest.raises(UnsupportedArchitectureError, match="compressed_sparse_mla"):
-        PolicyContext.for_identity(B300).resolve(COMPRESSED_SPARSE_MLA_POLICY, object())
+    caps = mla.Caps(
+        device="cuda:0", num_q_heads=20, max_q_rows=19, max_width=256,
+        swa_width=128, indexed_width=128, cache_format=cache_format, mode=mode,
+        swa_page_size=64, indexed_page_size=32,
+    )
+    plan = mla.plan(caps, policy=sm103_context)
+    assert plan.policy_resolution.source is PolicySource.HEURISTIC
+    assert plan.policy_resolution.config.backend == "warp"
+    assert plan.policy_resolution.config.max_chunks_per_row == (4 if mode == "decode" else 1)
+    assert plan.backend_key
+    assert plan.layout.staged_selections_offset_bytes > 0
+    with pytest.raises(ValueError, match="requires the warp backend"):
+        mla.plan(caps, policy=sm103_context, config=SparseMlaConfig(max_chunks_per_row=4))
 
 
 @pytest.mark.parametrize("cache_format", ["fp8", "mxfp4"])

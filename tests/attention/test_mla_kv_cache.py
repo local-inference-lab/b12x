@@ -31,6 +31,7 @@ from b12x.attention.sparse_mla._scratch import (
 
 from .._reference.helpers import E2M1_TO_FLOAT32
 from ..conftest import require_b12x as require_sm120
+from ..conftest import require_sm103_or_sm12x
 
 
 _RECORD_BYTES = 368
@@ -563,7 +564,7 @@ def _v41_writer_inputs(rows: int, device: torch.device) -> torch.Tensor:
 def test_v41_writer_recipes_odd_pages_and_int64_pool_offsets(
     cache_kind: str, slot_dtype: torch.dtype, high_page: bool,
 ) -> None:
-    device = require_sm120()
+    device = require_sm103_or_sm12x()
     page_size = 3
     page_bytes = compressed_sparse_mla.page_nbytes(
         page_size, cache_format="deepseek_v41", cache_kind=cache_kind

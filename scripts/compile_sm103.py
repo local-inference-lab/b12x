@@ -512,6 +512,81 @@ def compile_dsa_indexer(out):
     return launches
 
 
+def compile_compressed_mla(out):
+    """Compile planned native-cache decode, extend, metadata, and sink paths."""
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+    from b12x.attention.compressed_sparse_mla import _warp
+    from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
+    from b12x.attention.compressed_sparse_mla._scratch import (
+        B12XCompressedSparseMLAScratchCaps as Caps,
+        plan_compressed_sparse_mla_scratch,
+    )
+
+    launches = {}
+    for recipe, precision in (
+        ("deepseek_v4", "fp8"), ("deepseek_v41", "bf16"), ("deepseek_v41", "fp8"),
+    ):
+        for mode in ("decode", "extend"):
+            for heads, swa_width, index_width in ((20, 65, 65), (12, 65, 0), (8, 0, 65)):
+                caps = Caps(
+                    device="cpu", num_q_heads=heads, max_q_rows=19,
+                    max_width=swa_width + index_width, swa_width=swa_width,
+                    indexed_width=index_width, cache_format=recipe, mode=mode,
+                    max_chunks_per_row=4, swa_page_size=64, indexed_page_size=32,
+                )
+                plan = plan_compressed_sparse_mla_scratch(caps, execution_config=SparseMlaConfig(
+                    max_chunks_per_row=4, v41_compute_mode=precision, backend="warp",
+                ))
+                storage = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8)
+                q = torch.empty(3, heads, 512, dtype=torch.bfloat16)
+                selected = torch.empty(3, min(swa_width, 13), dtype=torch.int32)
+                index_selected = torch.empty(3, min(index_width, 13), dtype=torch.int32) if index_width else None
+                lengths = torch.empty(3, dtype=torch.int32)
+                binding = plan.bind(
+                    scratch=storage, q=q, swa_indices=selected, swa_lengths=lengths,
+                    indexed_indices=index_selected, indexed_lengths=lengths if index_width else None,
+                )
+                swa = torch.empty(2, 64 * (584 if recipe == "deepseek_v4" else 528), dtype=torch.uint8)
+                indexed = torch.empty(4, 32 * (584 if recipe == "deepseek_v4" else 288), dtype=torch.uint8) if index_width else None
+                specs = _warp.launch_specs(
+                    plan, binding.scratch, q, swa, selected, lengths,
+                    indexed, index_selected, lengths if index_width else None,
+                    None, None, torch.empty_like(q), 512**-0.5,
+                )
+                for entry, kernel, args in specs:
+                    name = f"compressed_mla_{recipe}_{precision}_{mode}_h{heads}_swa{swa_width}_idx{index_width}_{entry}"
+                    directory = out / name
+                    directory.mkdir()
+                    compiled = cute.compile(
+                        kernel, *args, cuda.CUstream(0), no_jit_engine=True,
+                        options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+                    )
+                    (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+                    launches[name] = compiled
+    from b12x.attention._shared.mla import kv_cache
+
+    for page_size in (3, 32, 64):
+        for kind in ("swa", "indexed"):
+            for slot_type in (torch.int32, torch.int64):
+                kv = torch.empty(5, 512, dtype=torch.bfloat16)
+                cache = torch.empty(7, page_size * (528 if kind == "swa" else 288), dtype=torch.uint8)
+                slots = torch.empty(5, dtype=slot_type)
+                with patch.object(kv_cache, "current_cuda_stream", lambda: cuda.CUstream(0)):
+                    kernel, args, _ = kv_cache._compressed_cache_writer_launch(kv, cache, slots, page_size, kind)
+                name = f"compressed_mla_writer_{kind}_page{page_size}_{str(slot_type).removeprefix('torch.')}"
+                directory = out / name
+                directory.mkdir()
+                compiled = cute.compile(
+                    kernel, *args, no_jit_engine=True,
+                    options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+                )
+                (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+                launches[name] = compiled
+    return launches
+
+
 def compile_sparse_mla(out):
     """Compile GLM cache recipes with ordinary FP8 or BF16 warp MMA."""
     import cuda.bindings.driver as cuda
@@ -1087,6 +1162,7 @@ def main():
             "sequence",
             "dense_mla",
             "sparse_mla",
+            "compressed_mla",
             "dsa_indexer",
             "projection",
             "blockscaled",
@@ -1191,6 +1267,8 @@ def main():
             launches.update(compile_dense_mla(out))
         if args.component in ("sparse_mla", "all"):
             launches.update(compile_sparse_mla(out))
+        if args.component in ("compressed_mla", "all"):
+            launches.update(compile_compressed_mla(out))
         if args.component in ("dsa_indexer", "all"):
             launches.update(compile_dsa_indexer(out))
         if args.component in ("projection", "all"):

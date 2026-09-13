@@ -450,6 +450,10 @@ class UnifiedDecodeKernel:
         # V4 uses two H8 groups per H16 CTA; V4.1 schedules independent H8 CTAs.
         self.native_dsv4_h16 = bool(native_dsv4_h16)
         self.native_dsv41_fp8 = bool(native_dsv41_fp8)
+        self.dsv41_fp8 = self.native_dsv41_fp8 or (
+            int(traits.model_type) == int(ModelType.DSV41)
+            and bool(traits.fp8_internal)
+        )
         self.native_h16 = self.native_dsv4_h16 or (
             self.native_dsv41_fp8 and int(valid_hpb) == 16
         )
@@ -1220,7 +1224,7 @@ class UnifiedDecodeKernel:
                     overlap_footer_gather=self.native_dsv4_h16,
                     per_token_latent_scale=t.latent_scale_per_token,
                     dsv41=t.model_type == ModelType.DSV41,
-                    dsv41_fp8=self.native_dsv41_fp8,
+                    dsv41_fp8=self.dsv41_fp8,
                 )
                 packed_kw = dict(
                     kv_smem_stride=staged_kv_stride,
@@ -1421,7 +1425,7 @@ class UnifiedDecodeKernel:
             if cutlass.const_expr(self.vector_q):
                 pass
             elif cutlass.const_expr(
-                t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8
+                t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.dsv41_fp8
             ):
                 s0_load_q_bf16_to_smem(
                     q_token, q_fp8_stage, q_rope_stage, head_base_stage,
@@ -1440,8 +1444,8 @@ class UnifiedDecodeKernel:
                     hpb=(8 if (self.native_h8 or self.native_h16) else t.hpb),
                     q_nope_stride=t.q_nope_stride, q_rope_stride=L.q_rope_stride,
                     num_threads=nt_stage, barrier_id=2, barrier_threads=bt_stage,
-                    fused_subgroup_quant=self.native_dsv4_h8 or self.native_dsv41_fp8,
-                    subgroup_amax=(self.native_dsv4_h8 or self.native_h16 or self.native_dsv41_fp8),
+                    fused_subgroup_quant=self.native_dsv4_h8 or self.dsv41_fp8,
+                    subgroup_amax=(self.native_dsv4_h8 or self.native_h16 or self.dsv41_fp8),
                     vectorized_rope_copy=(self.native_dsv4_h8 or self.native_h16),
                     packed_q_scale_words=self.native_h16 or self.native_dsv41_fp8,
                 )
@@ -1494,7 +1498,7 @@ class UnifiedDecodeKernel:
                 global_sum = [gsum_frag[0], gsum_frag[1]]
 
                 cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
-                if cutlass.const_expr(self.native_dsv41_fp8):
+                if cutlass.const_expr(self.dsv41_fp8):
                     s0_normalize_dsv41_kv_to_fp8(
                         kv_fp8_b,
                         kv_fp8_b + Int32(544),
@@ -1690,7 +1694,7 @@ class UnifiedDecodeKernel:
                         kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
                         scale_format=(
                             ScaleFormat.UE8M0_BYTE
-                            if self.native_dsv41_fp8 else t.scale_format
+                            if self.dsv41_fp8 else t.scale_format
                         ),
                         latent_scale_per_token=t.latent_scale_per_token,
                         block_scaled_mma=self.block_scaled_mma,
@@ -1799,7 +1803,7 @@ class UnifiedDecodeKernel:
                         scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
                         scale_format=(
                             ScaleFormat.UE8M0_BYTE
-                            if self.native_dsv41_fp8 else t.scale_format
+                            if self.dsv41_fp8 else t.scale_format
                         ),
                         num_threads=self.math_threads, barrier_id=3,
                         sm_p_full_addr=sm_p_full_addr, sm_p_stride=L.sm_p_full_stride,

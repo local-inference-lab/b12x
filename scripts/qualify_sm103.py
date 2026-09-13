@@ -39,6 +39,11 @@ SUITES = {
         "tests/attention/test_dense_mla_window.py",
     ],
     "sparse_mla": ["tests/attention/test_sm103_sparse_mla.py"],
+    "compressed_mla": [
+        "tests/attention/test_sm103_compressed_mla.py",
+        "tests/attention/test_mla_kv_cache.py::test_v41_writer_recipes_odd_pages_and_int64_pool_offsets",
+        "tests/attention/test_mla_kv_cache.py::test_v41_writer_precompile_dynamic_rows_and_graph_replay",
+    ],
     "dsa_indexer": [
         "tests/attention/test_sm103_dsa_indexer.py",
         "tests/attention/test_fused_indexer.py",

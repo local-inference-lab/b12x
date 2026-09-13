@@ -728,3 +728,46 @@ mutation and allocation checks. Compressed DeepSeek sparse MLA, checkpoint
 formats requiring paired/grouped or coupled mixed rates, mHC/MTP and DFlash2
 integration, complete GLM/V4.1 serving and Station direct-HBM transport remain
 implementation work.
+
+## Planned DeepSeek compressed MLA on SM103
+
+Status: implemented and cross-compiled; unqualified on physical SM103.
+The public compressed-MLA plan selects ordinary warp MMA over native V4 or
+V4.1 SWA and indexed records. Decode reserves fixed splits; extend uses the
+shared multigroup pipeline. Selection metadata, lengths, pool sizes and strides
+remain runtime arguments. Aligned plan-owned scratch includes padded selections
+and a zeroed record for masked reads from an empty pool. Int32 metadata slices
+need only four-byte alignment. Vectorized data accesses validate their alignment.
+
+The shared epilogue masks partial head fragments before output/LSE stores and
+sink reads. The compressed reference masks holes throughout a selection instead
+of stopping at its first invalid slot. The scratch layout accounts for alignment
+between both selection arrays and their length vectors. V4.1 FP8 decode uses
+canonical FP8 operands with ordinary MMA; the SM12x native schedules remain
+unchanged. Compressed LSE includes the sink, while GLM retains its selected-token
+convention. Config schema 3 and candidate contract 3 select the actual backend
+and fixed split geometry; embedded native measurements are unchanged.
+
+The frozen source passes 492 host tests with 40 hardware-dependent skips.
+SM120 passes 201 attention regression tests, 100 compressed-MLA/cache-writer
+cases under memcheck, and 201 cases under synccheck. Both sanitizer runs report
+zero kernel errors, with API reporting disabled under the previously documented
+CUDA Python/driver probe mismatch. Coverage includes head tails, all-invalid
+selections, empty pools, poisoned inactive pages, offsets beyond 2 GiB, live
+counts under frozen resolution, full-graph Torch tracing, stable pointers and
+allocation-free CUDA graph replay. V4.1 graph replay writes the SWA cache before
+attention consumes it. Native writer bytes match independent format oracles.
+
+The offline corpus contains 617 callables and 625 CUDA entry points, including
+147 compressed attention/cache-writer callables. Added callables use 12–168
+allocated GPRs. Four prefill callables report eight-byte stack frames with local
+loads/stores and remain flagged for B300 profiling. Existing resource, exact
+R/UR/P/UP register-count and instruction-count deltas are zero. All 104 TMEM
+readers retain completion waits. Wheel and sdist match all 457 package Python
+files and three profiles; an isolated wheel import selects the SM103 warp
+heuristic. `sm103-compressed-mla-validation.json` records commands and hashes.
+
+Physical SM103 correctness and performance remain deferred. Checkpoint-specific
+paired/grouped or coupled mixed-rate Trellis, mHC/MTP/DFlash2 and complete
+GLM/V4.1 serving integration, and Station direct-HBM transport remain
+implementation work.
