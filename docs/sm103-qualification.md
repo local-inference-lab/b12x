@@ -19,7 +19,7 @@ numbers or measured B300 policy profile are included.
 | Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
-| Quantized linears | Implemented NVFP4/MXFP4/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8 and compact K128 block-FP8 warp MMA | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs; planned BF16 block-FP8 linear and MXFP6 remain unsupported |
+| Quantized linears | Implemented NVFP4/MXFP4/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs; MXFP6 remains unsupported |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Integration after operator qualification |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
@@ -91,7 +91,8 @@ records source/toolchain identity and per-file hashes. The representative corpus
 contains nine MoE launchers, eight TP2 communication launchers, three reconstruction
 launchers, 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
-36 quantized-linear launchers, and 19 tensor/compact FP8 launchers: 241
+36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
+activation-quantizer launchers: 269
 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
@@ -114,7 +115,7 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, compressed DeepSeek sparse MLA, planned BF16 block-FP8 and MXFP6 linears, Trellis experts,
+Full-model serving, compressed DeepSeek sparse MLA, MXFP6 linears, Trellis experts,
 Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
@@ -160,7 +161,7 @@ Run synccheck after memcheck, then use the existing precision benchmark and
 profile generator. SM103 timing qualification requires P0, a zero throttle mask,
 stable memory clocks, and an SM-clock delta no greater than 30 MHz. Compile
 success and SM120 A16 regressions do not establish B300 correctness or latency.
-Planned BF16 block-FP8 linear, MXFP6, fused activation quantization, and
+MXFP6, fused activation quantization, and
 SM12x-specific launch overrides remain rejected. Complete draft/target serving
 remains unsupported.
 
@@ -410,8 +411,8 @@ Status: **implemented; awaiting physical SM103 qualification**.
 and packed tensor-scaled weights. `gemm.blockscaled.mm_block_fp8` consumes
 E4M3 inputs with compact FP32 activation scales `[M,K/128]` and weight scales
 `[N/128,K/128]`. It rescales each K128 partial sum before accumulation. This
-contract is distinct from the planned `gemm.block_fp8_linear` API, whose BF16
-activation quantization and prepared MXFP8 path still need SM103 admission.
+contract is distinct from the planned `gemm.block_fp8_linear` API, which
+quantizes BF16/FP16 activations and consumes prepared MXFP8 weights.
 
 The FP8 entry uses ordinary E4M3 warp MMA and the shared TMA pipeline. Tensor
 scaling uses only the scalar output multiplier; it allocates and transfers no
@@ -440,6 +441,51 @@ allocation. Two cases allocate about 4 GiB each to check output rows beyond
 2^31 elements. The shared entry runs on physical SM12x for regression without
 pretending that device is SM103. See the
 [FP8 validation receipt](sm103-fp8-validation.json) for source-bound evidence.
+
+## Planned BF16/FP16 block-FP8 projections
+
+Status: **implemented; awaiting physical SM103 qualification**.
+`gemm.block_fp8_linear` retains its public pack/plan/bind/run lifecycle. SM103
+planning selects `mxfp8_tcgen05` with a 128x128 tile. The 128x128 checkpoint
+recipe and the 32x32 V4.1 recipe expand weight scales once into F8_128x4
+storage. Logical K is divisible by 32 and pads to 128; N must be divisible by
+eight. V4.1 activation quantization floors each logical K32 group's amax at
+1e-4. Padded groups reconstruct as zero. SM12x keeps its existing warp-MMA
+tiles and tiny-M fused quantization path.
+
+The SM103 activation quantizer uses eight-lane groups and 128 threads for
+every live M. Its cache includes device and architecture identity. Row and
+scale-tile offsets use Int64. Bound calls use caller-owned scratch and output;
+an explicit stream governs quantization, GEMM, and bias addition. Public
+prewarm prepares bound and functional calls before frozen resolution or graph
+capture. Functional calls allocate during capture and retain their output
+address for replay.
+
+The component owns config schema 3 and candidate contract 2. Embedded SM12x
+profiles retain their measured configs with the updated schema; no B300 profile
+is fabricated. The generator selects one native candidate on SM103 and races
+the existing tiles on SM12x. Its independent Torch oracle quantizes activations
+and expands the checkpoint scales without using the production quantizer or
+weight packer. Finite/nonzero output, cosine, and relative L2 checks precede
+timing. A deliberately wrong reference test verifies that failures are rejected
+before timing.
+
+```bash
+python scripts/compile_sm103.py --component block_fp8_linear \
+  --output-dir /tmp/sm103-block-fp8-compile
+python scripts/qualify_sm103.py --component block_fp8_linear --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-block-fp8 \
+  --sanitizer /path/to/compute-sanitizer
+```
+
+The suite covers BF16/FP16, both checkpoint recipes, K padding, extreme finite
+values, zero/tiny groups, independent scale-layout checks, M1/M4/M8/M9/M65/M129
+reuse, poisoned output, graph mutation, stable addresses, allocation checks,
+stream ordering, and `torch.compile`. Large-offset tests allocate about 6 GiB
+and check the source row beginning at 2^31 elements. SM120 regression executes
+the shared quantizer and existing public SM12x GEMM path; it cannot qualify
+the native SM103 GEMM. See the
+[planned block-FP8 validation receipt](sm103-planned-fp8-validation.json).
 
 ## Trellis and V4.1
 
@@ -555,7 +601,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths; compressed DeepSeek sparse MLA remains a separate implementation gap |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
-| Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`: qualify implemented native block-scaled, A16, tensor/compact FP8; implement planned BF16 block-FP8 linear and MXFP6 |
+| Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `gemm/block_fp8_linear`: qualify implemented native block-scaled, A16, tensor/compact FP8, and planned BF16/FP16 block-FP8; implement MXFP6 |
 | Trellis experts | `sm103/trellis.py`, `fused_moe/trellis.py`: scale/rotation staging, mixed rates, compressed-to-SMEM pipeline and BF16/FP8 UMMA; no full-model BF16 repack |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | Full serving | existing LIL vLLM per-operation capability routing: complete target hot path before DFlash2 or V4.1 enables b12x globally |

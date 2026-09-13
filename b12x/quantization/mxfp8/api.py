@@ -8,8 +8,8 @@ from ._preparation import Mxfp8Config, Mxfp8Query, plan, query_from_call, quanti
 
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0."""
-    return default_is_supported(device, requires=META.requires)
+    """Check availability of the CuTe row quantizer for this architecture."""
+    return default_is_supported(device, archs=META.archs, requires=META.requires)
 
 
 

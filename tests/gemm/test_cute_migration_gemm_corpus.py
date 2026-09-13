@@ -119,15 +119,15 @@ def test_cute_migration_dense_nvfp4_gpu_oracle_and_graph() -> None:
 
     run()
     torch.cuda.synchronize()
+    # The kernel applies the supplied FP32 alpha once after accumulation.
+    # Scaling each input first changes rounding at BF16 output boundaries.
     a_dequant = _dequantize_nvfp4_dense_operand(
-        a, k=k, global_scale=a_global_scale
+        a, k=k, global_scale=torch.ones_like(a_global_scale)
     )
     b_dequant = _dequantize_nvfp4_dense_operand(
-        b, k=k, global_scale=b_global_scale
+        b, k=k, global_scale=torch.ones_like(b_global_scale)
     )
-    expected = torch.einsum("gmk,gnk->mng", a_dequant, b_dequant).to(
-        torch.bfloat16
-    )
+    expected = (torch.einsum("gmk,gnk->mng", a_dequant, b_dequant) * alpha).to(torch.bfloat16)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     graph = torch.cuda.CUDAGraph()

@@ -6,7 +6,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Uint8, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
@@ -68,15 +68,15 @@ class _MXFP8RowsQuantLaunch:
     ) -> None:
         source = cute.make_tensor(
             source_ptr,
-            cute.make_ordered_layout((m, source_k), order=(1, 0)),
+            cute.make_layout((Int64(m), source_k), stride=(Int64(source_k), 1)),
         )
         values_u32 = cute.make_tensor(
             values_ptr,
-            cute.make_ordered_layout((m, self._k // 4), order=(1, 0)),
+            cute.make_layout((Int64(m), self._k // 4), stride=(Int64(self._k // 4), 1)),
         )
         scale_rows = cute.make_tensor(
             scale_rows_ptr,
-            cute.make_ordered_layout((m, self._groups_k), order=(1, 0)),
+            cute.make_layout((Int64(m), self._groups_k), stride=(Int64(self._groups_k), 1)),
         )
         scale_mma = cute.make_tensor(
             scale_mma_ptr,
@@ -110,11 +110,11 @@ class _MXFP8RowsQuantLaunch:
             subgroup = lane // Int32(4)
             lane8 = lane % Int32(4)
             group_tiles = Int32((self._groups_k + 7) // 8)
-            task = Int32(bidx) * Int32(self._warps_per_cta) + warp
-            total_tasks = m * group_tiles
+            task = Int64(bidx) * self._warps_per_cta + warp
+            total_tasks = Int64(m) * group_tiles
             while task < total_tasks:
                 row = task // group_tiles
-                group = (task % group_tiles) * Int32(8) + subgroup
+                group = Int32(task % group_tiles) * Int32(8) + subgroup
                 if group < Int32(self._groups_k):
                     values = cute.make_rmem_tensor((8,), cutlass.Float32)
                     k0 = group * Int32(32) + lane8 * Int32(8)
@@ -159,7 +159,7 @@ class _MXFP8RowsQuantLaunch:
 
                     if lane8 == Int32(0):
                         self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
-                task += Int32(gdim) * Int32(self._warps_per_cta)
+                task += Int64(gdim) * self._warps_per_cta
         elif cutlass.const_expr(self._subgroup_width == 8):
             # Four 8-lane subgroups per warp each quantize one 32-value block.
             # Every lane owns four adjacent values, giving coalesced 128-value
@@ -169,11 +169,11 @@ class _MXFP8RowsQuantLaunch:
             subgroup = lane // Int32(8)
             lane4 = lane % Int32(8)
             group_tiles = Int32((self._groups_k + 3) // 4)
-            task = Int32(bidx) * Int32(self._warps_per_cta) + warp
-            total_tasks = m * group_tiles
+            task = Int64(bidx) * self._warps_per_cta + warp
+            total_tasks = Int64(m) * group_tiles
             while task < total_tasks:
                 row = task // group_tiles
-                group = (task % group_tiles) * Int32(4) + subgroup
+                group = Int32(task % group_tiles) * Int32(4) + subgroup
                 if group < Int32(self._groups_k):
                     values = cute.make_rmem_tensor((4,), cutlass.Float32)
                     k0 = group * Int32(32)
@@ -244,13 +244,13 @@ class _MXFP8RowsQuantLaunch:
 
                     if lane4 == Int32(0):
                         self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
-                task += Int32(gdim) * Int32(self._warps_per_cta)
+                task += Int64(gdim) * self._warps_per_cta
         else:
-            block = Int32(bidx) * Int32(self._threads) + Int32(tidx)
-            total_blocks = m * Int32(self._groups_k)
+            block = Int64(bidx) * self._threads + tidx
+            total_blocks = Int64(m) * self._groups_k
             while block < total_blocks:
                 row = block // Int32(self._groups_k)
-                group = block % Int32(self._groups_k)
+                group = Int32(block % self._groups_k)
                 k0 = group * Int32(32)
                 values = cute.make_rmem_tensor((32,), cutlass.Float32)
                 for elem in cutlass.range_constexpr(32):
@@ -268,14 +268,14 @@ class _MXFP8RowsQuantLaunch:
                 for word in cutlass.range_constexpr(8):
                     values_u32[row, word0 + Int32(word)] = payload[word]
                 self._store_scale(scale_rows, scale_mma, row, group, scale_byte)
-                block += Int32(gdim) * Int32(self._threads)
+                block += Int64(gdim) * self._threads
 
     @cute.jit
     def _store_scale(
         self,
         scale_rows: cute.Tensor,
         scale_mma: cute.Tensor,
-        row: Int32,
+        row: Int64,
         group: Int32,
         scale_byte: Uint32,
     ) -> None:
@@ -289,9 +289,9 @@ class _MXFP8RowsQuantLaunch:
         scale_mma_offset = (
             row32 * Int32(16)
             + row4 * Int32(4)
-            + tile_m * Int32(((self._groups_k + 3) // 4) * 512)
+            + tile_m * Int64(((self._groups_k + 3) // 4) * 512)
             + k4
-            + tile_k * Int32(512)
+            + Int64(tile_k) * Int64(512)
         )
         scale_mma[scale_mma_offset] = scale_u8
 
@@ -327,9 +327,9 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError(
             f"MXFP8 CuTe quantizer subgroup width must be 0, 4, or 8, got {subgroup_width}"
         )
-    if threads <= 0 or threads % 32 != 0:
+    if threads <= 0 or threads > 1024 or threads % 32 != 0:
         raise ValueError(
-            f"MXFP8 CuTe quantizer threads must be a positive multiple of 32, got {threads}"
+            f"MXFP8 CuTe quantizer threads must be a multiple of 32 in [32,1024], got {threads}"
         )
     if value_order not in {"linear", "trellis_native_mma"}:
         raise ValueError(
@@ -357,6 +357,8 @@ def _get_compiled_mxfp8_rows_quant(
         int(threads),
         value_order,
         min_amax,
+        device_ordinal,
+        architecture,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",
@@ -387,6 +389,8 @@ def _get_compiled_mxfp8_rows_quant(
         scale_rows: torch.Tensor,
         scale_mma: torch.Tensor,
     ) -> None:
+        if source.device.type != "cuda" or source.device.index != device_ordinal:
+            raise ValueError("MXFP8 quantizer callable must run on its compiled device")
         if subgroup_width:
             groups_per_warp = 32 // subgroup_width
             total_tasks = int(source.shape[0]) * (
@@ -448,6 +452,10 @@ def mxfp8_rows_quant_launch_options(
     return _WARP_SUBGROUP_WIDTH, _THREADS
 
 
+_get_compiled_mxfp8_rows_quant.cache_clear = _compile_mxfp8_rows_quant.cache_clear
+_get_compiled_mxfp8_rows_quant.cache_info = _compile_mxfp8_rows_quant.cache_info
+
+
 def quantize_mxfp8_rows_cute(
     source: torch.Tensor,
     values: torch.Tensor,
@@ -478,7 +486,7 @@ def quantize_mxfp8_rows_cute(
     planned_rows = int(source.shape[0]) if expected_m is None else expected_m
     subgroup_width, threads = mxfp8_rows_quant_launch_options(planned_rows, value_order)
     physical_k = int(source.shape[1]) if physical_k is None else int(physical_k)
-    if physical_k < int(source.shape[1]) or physical_k % 32:
+    if physical_k < int(source.shape[1]) or physical_k >= 2**31 or physical_k % 32:
         raise ValueError(
             "MXFP8 CuTe quantizer physical K must be a multiple of 32 no smaller "
             f"than source K, got physical={physical_k}, source={int(source.shape[1])}"

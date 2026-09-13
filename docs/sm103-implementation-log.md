@@ -472,7 +472,8 @@ pass 690 cases and skip 66 GPU cases. The FP8 suite
 includes independent numerical oracles, BF16/FP16/FP32 output, grouped capacity
 strides, frozen resolution over multiple live counts, scale/input mutation,
 graph replay, allocation checks, and output addresses beyond 2^31 elements.
-The wheel and sdist contain byte-identical package Python and profile files.
+Packaging verification covered byte-identical package Python files in the wheel
+and sdist. It did not compare the compressed embedded profiles.
 
 [FP8 validation receipt](sm103-fp8-validation.json) binds compilation,
 resource accounting, SM120 logs, and packaging to the package source hash.
@@ -480,3 +481,53 @@ No physical SM103 execution or performance qualification occurred. Planned
 BF16 block-FP8 linear, MXFP6, full Trellis experts, compressed DeepSeek sparse
 attention, mHC/MTP, full serving, and direct HBM transport remain implementation
 work.
+
+## Planned block-FP8 projections
+
+Status: **implemented; cross-compiled; unqualified on physical SM103**.
+The public block-FP8 planner selects the native tcgen05/TMEM dense GEMM on
+SM103. BF16/FP16 activations use the shared CuTe K32 quantizer. The 128x128
+checkpoint recipe preserves its unfloored activation scales, and the 32x32
+V4.1 recipe applies the 1e-4 amax floor. Logical K pads to 128; N is divisible
+by eight. SM12x retains its existing backend and tile selection.
+
+Quantizer cache identity includes device and architecture. SM103 uses one
+lane layout across live row counts, including calls without an expected row
+bound. Int64 source, payload, row-scale, and MMA-scale offsets cover large
+buffers. Explicit streams cover the full quantize/GEMM/bias sequence.
+The policy and generator use config schema 3; existing embedded profiles
+change only that schema value. Candidate contract 2 invalidates incompatible
+sweep checkpoints. An independent numerical oracle rejects incorrect candidates
+before timing.
+
+The full compile corpus contains 269 callables and 277 CUDA entry points.
+The 28 added quantizer callables use 29–95 allocated GPRs, with zero stack
+and local memory. Existing callables have no positive register, stack,
+static-SMEM, or local-memory deltas against the tensor/compact-FP8 receipt.
+The preceding 31 stack flags remain visible. Static resources establish
+neither dynamic-SMEM occupancy nor performance.
+
+The affected SM120 suite passes 137 tests under memcheck with zero errors.
+Two additional generator tests pass memcheck; all 139 pass synccheck.
+The tests cover independent arithmetic and scale-layout oracles, both half
+types, zero/tiny/extreme groups, K padding, frozen resolution, graph replay,
+stable addresses, allocation checks, stream ordering, public prewarm,
+`torch.compile`, and source rows beyond 2^31 elements. Host tests pass
+669 cases and skip 29 GPU-dependent cases; supplemental packaging and
+qualification checks pass 17 cases.
+
+An NVFP4 migration-corpus reference failed exact equality on the unchanged
+parent commit `ca2fe8f8`. It scaled each input separately, while the operation
+applies the supplied FP32 alpha after accumulation. The corrected reference
+preserves the kernel's scaling contract and exact-equality assertion.
+The pre-existing undefined Trellis rank-LUT decoder in `_lib/intrinsics.py`
+remains outside this change and remains visible as a lint failure. All other
+modified Python files pass Ruff.
+
+Wheel and sdist verification compares all 447 package Python files and all
+three compressed embedded profiles byte for byte. The
+[planned block-FP8 receipt](sm103-planned-fp8-validation.json) records source,
+compile artifacts, resources, regression logs, and package hashes. No SM103
+execution or performance claim is made. MXFP6, complete Trellis expert
+execution, compressed DeepSeek sparse attention, mHC/MTP/DFlash2 and complete
+serving, and direct HBM transport remain implementation work.
