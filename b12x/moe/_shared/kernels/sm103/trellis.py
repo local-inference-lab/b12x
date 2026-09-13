@@ -1,7 +1,7 @@
 """Trellis reconstruction and quantizer-basis SM103 projection contracts.
 
-The decoder and inline FP16 projection consume existing t256 weights. Expert
-scale/rotation staging and mixed-rate MoE dispatch remain unsupported.
+The decoder and inline FP16 projection consume existing t256 weights. Complete
+uniform-rate execution is owned by the fused MoE architecture backend.
 """
 
 from dataclasses import dataclass
@@ -11,7 +11,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 
-from b12x._lib.architecture import UnsupportedArchitectureError
 from .trellis_decode import decode_lane, decoder_contract, tile_coordinates
 
 
@@ -41,12 +40,6 @@ class TrellisPipeline:
         tiles = self.experts * (self.hidden // 16) * (self.intermediate // 16)
         return ReconstructTrellisTiles(
             bits, tiles * (2 if projection == "w13" else 1), codebook=self.codebook
-        )
-
-    def require_execution(self):
-        raise UnsupportedArchitectureError(
-            "SM103 Trellis has inline tcgen05 projection; expert scale/rotation "
-            "staging and mixed-rate MoE dispatch are not implemented"
         )
 
     def projection(self, *, projection: str, bits: int, capacity: int):

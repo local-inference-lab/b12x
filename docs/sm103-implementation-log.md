@@ -642,3 +642,42 @@ Complete Trellis experts, compressed DeepSeek sparse attention, mHC/MTP and
 DFlash2 model integration, complete GLM/V4.1 serving, and remaining Station
 transport work remain implementation gaps. These are not resolved by the
 compiled projection or by portable reconstruction tests.
+
+## Uniform Trellis expert execution
+
+The `tcgen05_trellis` backend implements uniform-rate materialized experts
+through the existing MoE plan/bind/run API. It retains compressed t256 weights,
+decodes into shared memory for FP16 tcgen05 projections, and implements ordinary
+scaled H128 or coupled H512/H128 expert transforms in CuTe. Routing maps,
+SiLU/SiTU, FP32 weighted reduction and caller FP16/BF16 output are supported.
+Capacity plans own stable scratch and precompiled callables; live row counts
+remain runtime launch arguments. All pool-scaled offsets use Int64.
+
+Canonical SQG E4M3 preparation accepts K2/K3/K4, records the loaded rate on the
+prepared weight plan and retains FP16 internal projection buffers for either
+public input dtype. The SM120 end-to-end diagnostic caught the prior BF16
+internal-buffer mismatch; all six rate/transform combinations pass independent
+numeric and graph checks after correction. The policy config schema is 5 and
+the MoE candidate contract is 20. Existing embedded profile measurements are
+unchanged; the SM103 generator qualifies the actual uniform SQG backend with
+an independent decoded-weight/transform oracle before timing.
+
+Validation: 501 host tests pass, with 42 hardware-dependent skips. SM120 passes
+61 tests under memcheck and synccheck, with 13 native SM103 cases skipped and
+zero reported kernel errors. The large-offset transform case indexes scale
+rows past 2^31 elements. CUDA API reporting is disabled only for the documented
+CUDA Python/driver probing mismatch on that regression host.
+
+The full offline corpus contains 436 callables and 444 CUDA entry points.
+The 64 added Trellis callables use 12–140 allocated GPRs, no stack or local
+memory, and all TMEM readers have explicit completion waits. Existing kernels
+have no positive register, stack, shared-memory or local-memory deltas. The
+31 existing stack-flagged callables remain recorded. Wheel and sdist builds
+contain byte-identical copies of 455 Python files and three embedded profiles.
+Exact commands and hashes are in `sm103-trellis-moe-validation.json`.
+
+Native SM103 correctness, graph replay and performance remain unqualified.
+The deferred suite includes V4.1 geometry with E=384, H=5120, I=2304 and top-k=6.
+Canonical MCG, mixed/paired rates and the mixed-rate descriptor limit of 256
+experts remain implementation work. Full V4.1/DFlash2 serving, compressed sparse
+MLA, mHC/MTP and Station direct-HBM transport remain separate gaps.
