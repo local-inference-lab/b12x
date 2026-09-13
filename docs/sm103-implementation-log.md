@@ -287,3 +287,11 @@ See the source-level work table and qualification order in
 Station TP2 serving remain unsupported. A model-wide vLLM capability gate is
 not enabled by this prototype; the b12x operation API remains the integration
 boundary. Serving changes depend on qualifying the required individual ops.
+# Source archive qualification
+
+The compile and qualification tools accept exported source trees without Git
+metadata. An exported `.git_archival.txt` records the base revision; package
+hashes identify the actual files under test. Source roots nested in unrelated
+checkouts do not inherit the enclosing repository's revision. Offline tests
+cover archive preparation, archived revision handling, and execution from a
+different directory.

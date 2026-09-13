@@ -19,6 +19,11 @@ import sys
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts._sm103_source import package_source_sha256 as _package_source_sha256
+from scripts._sm103_source import source_identity
+
 SUITES = {
     "moe": ["tests/moe/test_sm103_pointwise.py", "tests/moe/test_sm103_nvfp4.py"],
     "trellis_reconstruction": ["tests/moe/test_sm103_trellis.py"],
@@ -35,9 +40,7 @@ SUITES = {
 
 
 def package_source_sha256():
-    return hashlib.sha256(
-        b"".join(p.read_bytes() for p in sorted((ROOT / "b12x").rglob("*.py")))
-    ).hexdigest()
+    return _package_source_sha256(ROOT)
 
 
 def junit_counts(path):
@@ -120,18 +123,12 @@ def main(argv=None):
         "status": "prepared",
         "runtime_qualified": False,
         "scope": "implemented operators",
-        "source_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip(),
+        **source_identity(ROOT),
         "source_sha256": source_hash,
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "test_source_sha256": hashlib.sha256(
             b"".join(p.read_bytes() for p in sorted((ROOT / "tests").rglob("*.py")))
         ).hexdigest(),
-        "git_status": subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=ROOT, text=True
-        ).splitlines(),
-        "worktree": str(ROOT),
         "command": sys.argv if argv is None else argv,
         "compile_manifest": compile_identity,
         "components": components,

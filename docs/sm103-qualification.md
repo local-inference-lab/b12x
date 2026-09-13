@@ -56,6 +56,14 @@ Use a clean checkout and an isolated environment. The dependency pins in
 `pyproject.toml` select CUTLASS DSL 4.6.2. Install a CUDA-enabled Torch build that
 supports B300, plus `pytest`, `triton`, and profiling tools.
 
+Full source archives also support compilation and qualification. Git exports
+retain their base revision in `.git_archival.txt`; archives without that file
+record an unavailable revision. Both tools hash the actual package sources and
+resolve paths from their source root, including when launched from another
+directory. Archive receipts have no Git working-tree status. Use a full source
+archive or checkout for qualification because wheel installations omit the test
+and script directories.
+
 ```bash
 python -m pip install -e '.[dev]'
 nvidia-smi -L
