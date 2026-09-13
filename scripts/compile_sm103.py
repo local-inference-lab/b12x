@@ -297,6 +297,229 @@ def compile_dense_mla(out):
     return launches
 
 
+def compile_sparse_mla(out):
+    """Compile GLM cache recipes with ordinary FP8 or BF16 warp MMA."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor as tensor
+    from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
+    from b12x.attention._shared.mla.prefill_mg import UnifiedPrefillMGKernel
+    from b12x.attention._shared.mla.smem import make_smem_layout
+    from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg
+    from b12x.attention._shared.mla.traits import (
+        ComputeMode,
+        ModelType,
+        make_unified_traits,
+    )
+
+    launches = {}
+    for model in (ModelType.GLM_NSA, ModelType.GLM_NEXT):
+        for scale_format in (1, 2):
+            for per_token_scale in (False, True) if scale_format == 2 else (False,):
+                if (
+                    model == ModelType.GLM_NEXT
+                    and scale_format == 2
+                    and not per_token_scale
+                ):
+                    continue
+                for heads in (8, 16, 32):
+                    traits = make_unified_traits(
+                        model,
+                        ComputeMode.FP8,
+                        scale_format,
+                        fp8_rope=(model == ModelType.GLM_NSA and per_token_scale),
+                        latent_scale_per_token=per_token_scale,
+                    )
+                    width, splits = 256, 4
+                    dim = traits.d_nope + traits.d_rope
+                    rows = cute.sym_int()
+                    q = tensor(cutlass.BFloat16, (rows, heads, dim), assumed_align=16)
+                    kv = tensor(cutlass.Uint8, (cute.sym_int(),), assumed_align=16)
+                    indices = tensor(cutlass.Int32, (rows, width), assumed_align=4)
+                    lengths = tensor(cutlass.Int32, (rows,), assumed_align=4)
+                    for mode in ("decode", "prefill"):
+                        if mode == "decode":
+                            kernel = UnifiedDecodeKernel(
+                                traits,
+                                make_smem_layout(traits),
+                                64,
+                                1,
+                                h_blocks=max(1, heads // 16),
+                                num_splits=splits,
+                                num_heads=heads,
+                                q_head_dim=dim,
+                                topk=width,
+                                extra_topk=0,
+                                q_stride=(heads * dim, dim, 1),
+                                swa_indices_stride0=width,
+                                extra_indices_stride0=width,
+                                mid_out_stride=(
+                                    heads * splits * 512,
+                                    splits * 512,
+                                    512,
+                                    1,
+                                ),
+                                mid_lse_stride=(heads * splits, splits, 1),
+                                valid_hpb=min(16, heads),
+                                per_token_len=True,
+                                vector_q=True,
+                                block_scaled_mma=False,
+                            )
+                            entry = kernel.call_pertok
+                            args = [
+                                q,
+                                kv,
+                                indices,
+                                tensor(
+                                    cutlass.BFloat16,
+                                    (rows, heads, splits, 512),
+                                    assumed_align=16,
+                                ),
+                                tensor(
+                                    cutlass.Float32,
+                                    (rows, heads, splits),
+                                    assumed_align=4,
+                                ),
+                                cutlass.Float32(0.1),
+                                cutlass.Float32(1.0),
+                                lengths,
+                                cutlass.Int64(64 * traits.kv_gmem_stride),
+                                cutlass.Int32(1),
+                                cuda.CUstream(0),
+                            ]
+                        else:
+                            groups = 2 if heads == 32 else 1
+                            kernel = UnifiedPrefillMGKernel(
+                                traits,
+                                make_smem_layout_mg(traits, groups),
+                                64,
+                                width // 64,
+                                replicate_h=1,
+                                num_heads=heads,
+                                q_stride=(heads * dim, dim, 1),
+                                indices_stride0=width,
+                                output_stride=(heads * 512, 512, 1),
+                                out_lse_stride=(heads, 1),
+                                has_sink=False,
+                                topk=width,
+                                valid_hpb=min(16, heads),
+                                block_scaled_mma=False,
+                            )
+                            entry = kernel
+                            args = [
+                                q,
+                                kv,
+                                indices,
+                                lengths,
+                                tensor(cutlass.Float32, (heads,), assumed_align=4),
+                                tensor(
+                                    cutlass.BFloat16,
+                                    (rows, heads, 512),
+                                    assumed_align=16,
+                                ),
+                                tensor(cutlass.Float32, (rows, heads), assumed_align=4),
+                                cutlass.Float32(0.1),
+                                cutlass.Float32(1.0),
+                                cutlass.Int64(64 * traits.kv_gmem_stride),
+                                cutlass.Int32(1),
+                                cuda.CUstream(0),
+                            ]
+                        name = f"sparse_mla_model{model}_sf{scale_format}_pts{int(per_token_scale)}_h{heads}_{mode}"
+                        directory = out / name
+                        directory.mkdir()
+                        compiled = cute.compile(
+                            entry,
+                            *args,
+                            no_jit_engine=True,
+                            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+                        )
+                        (directory / (name + ".mlir")).write_text(
+                            str(compiled.ir_module)
+                        )
+                        launches[name] = compiled
+    from b12x.attention.sparse_mla._sm103 import SplitLse, ConvertLse
+    from b12x.attention._shared.mla.merge import (
+        SparseMLASplitDecodeMergeKernel,
+        SparseMLASplitDecodeSinkMergeKernel,
+    )
+    from b12x.attention._shared.mla.kv_cache import (
+        ConcatAndCacheGlmNextMlaKernel,
+        ConcatAndCacheNvfp4MlaFp8RopeKernel,
+    )
+
+    def emit(name, kernel, args):
+        directory = out / name
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel,
+            *args,
+            cuda.CUstream(0),
+            no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+
+    rows = cute.sym_int()
+    partial = tensor(cutlass.BFloat16, (rows, 16, 4, 512), assumed_align=16)
+    partial_lse = tensor(cutlass.Float32, (rows, 16, 4), assumed_align=4)
+    output = tensor(cutlass.BFloat16, (rows, 16, 512), assumed_align=16)
+    lse = tensor(cutlass.Float32, (rows, 16), assumed_align=4)
+    control = tensor(cutlass.Int32, (1,), assumed_align=4)
+    sink = tensor(cutlass.Float32, (16,), assumed_align=4)
+    emit(
+        "sparse_mla_merge",
+        SparseMLASplitDecodeMergeKernel(4),
+        [partial, partial_lse, control, output],
+    )
+    emit(
+        "sparse_mla_sink_merge",
+        SparseMLASplitDecodeSinkMergeKernel(4),
+        [partial, partial_lse, control, sink, output],
+    )
+    for natural in (False, True):
+        emit(
+            f"sparse_mla_lse_natural{int(natural)}",
+            SplitLse(4, natural),
+            [partial_lse, lse],
+        )
+    emit("sparse_mla_convert_lse", ConvertLse(), [lse])
+    for index_type in (cutlass.Int32, cutlass.Int64):
+        slots = tensor(index_type, (rows,), assumed_align=8)
+        values = tensor(cutlass.BFloat16, (rows, 512), assumed_align=16)
+        cache = tensor(cutlass.Uint8, (cute.sym_int(), 64, 528), assumed_align=16)
+        emit(
+            f"sparse_mla_fp8_writer_{index_type.__name__}",
+            ConcatAndCacheGlmNextMlaKernel(64),
+            [values, cache, slots, *([cutlass.Int64(1)] * 4), cutlass.Int32(1)],
+        )
+        for rope in (False, True):
+            for dtype in (cutlass.BFloat16, cutlass.Float16):
+                values = tensor(dtype, (rows, 512), assumed_align=16)
+                rope_values = tensor(dtype, (rows, 64), assumed_align=16)
+                cache = tensor(
+                    cutlass.Uint8,
+                    (cute.sym_int(), 64, 368 if rope else 304),
+                    assumed_align=16,
+                )
+                emit(
+                    f"sparse_mla_nvfp4_writer_rope{int(rope)}_{dtype.__name__}_{index_type.__name__}",
+                    ConcatAndCacheNvfp4MlaFp8RopeKernel(
+                        64, dtype == cutlass.BFloat16, True, rope
+                    ),
+                    [
+                        values,
+                        rope_values,
+                        cache,
+                        slots,
+                        *([cutlass.Int64(1)] * 5),
+                        cutlass.Int32(1),
+                    ],
+                )
+    return launches
+
+
 def compile_trellis(out):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -399,6 +622,7 @@ def main():
             "trellis",
             "sequence",
             "dense_mla",
+            "sparse_mla",
             "projection",
             "all",
         ),
@@ -496,6 +720,8 @@ def main():
             launches.update(compile_sequence(out))
         if args.component in ("dense_mla", "all"):
             launches.update(compile_dense_mla(out))
+        if args.component in ("sparse_mla", "all"):
+            launches.update(compile_sparse_mla(out))
         if args.component in ("projection", "all"):
             launches.update(compile_bf16_projection(out))
         artifacts = []
@@ -547,6 +773,13 @@ def main():
                     },
                 }
             )
+        if package_source_sha256(ROOT) != manifest["source_sha256"]:
+            raise RuntimeError("package source changed during compilation")
+        if (
+            hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+            != manifest["script_sha256"]
+        ):
+            raise RuntimeError("compile script changed during compilation")
         manifest.update(
             status="cross-compiled", callables=len(launches), artifacts=artifacts
         )

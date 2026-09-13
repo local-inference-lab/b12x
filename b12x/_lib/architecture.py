@@ -79,6 +79,11 @@ def require_kernel_architecture(
         "b12x.attention.dense_mla._forward",
         "b12x.attention.dense_mla._merge",
         "b12x.attention._shared.static_fp8_quant",
+        "b12x.attention._shared.mla.kernel",
+        "b12x.attention._shared.mla.prefill_mg",
+        "b12x.attention._shared.mla.merge",
+        "b12x.attention._shared.mla.kv_cache",
+        "b12x.attention.sparse_mla._sm103",
         "b12x.gemm.bf16_gemv._kernel",
         "b12x.gemm.bf16_gemv._prefill",
     }:

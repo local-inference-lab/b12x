@@ -27,7 +27,7 @@ def source_identity(root: Path) -> dict[str, object]:
     def git(*args: str) -> str:
         return subprocess.check_output(
             ["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        ).rstrip("\n")
 
     identity: dict[str, object] = {
         "source_revision": None,

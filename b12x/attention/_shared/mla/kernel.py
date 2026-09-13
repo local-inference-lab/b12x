@@ -404,7 +404,13 @@ class UnifiedDecodeKernel:
         native_dsv4_h16=False,
         native_dsv41_fp8=False,
         vector_q=False,
+        block_scaled_mma=True,
     ):
+        self.block_scaled_mma = bool(block_scaled_mma)
+        if not self.block_scaled_mma and (
+            native_glm_h8 or native_dsv4_h8 or native_dsv4_h16 or native_dsv41_fp8
+        ):
+            raise ValueError("ordinary FP8 MMA requires the generic head schedule")
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -1687,6 +1693,7 @@ class UnifiedDecodeKernel:
                             if self.native_dsv41_fp8 else t.scale_format
                         ),
                         latent_scale_per_token=t.latent_scale_per_token,
+                        block_scaled_mma=self.block_scaled_mma,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,

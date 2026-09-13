@@ -1,4 +1,4 @@
-"""Sparse MLA decode/extend for SM12x (DeepSeek-V3.2 DSV4, GLM NSA/Next).
+"""Sparse MLA decode/extend for packed GLM NSA and GLM Next caches.
 
 Multi-head latent attention over top-k-selected KV tokens from a paged
 cache (DSV4: head_dim 512 = 448 nope + 64 rope, v_head_dim 512), FP8-e4m3
@@ -16,6 +16,12 @@ collides with DSV4 by shape. Plan with ``model_type=ModelType.GLM_NEXT`` and
 use a 528-byte cache record: 512 E4M3 latent bytes followed by four FP32
 group-128 scales, with no RoPE suffix. Its physical attention scale remains
 ``256**-0.5``.
+
+SM103 selects the ordinary-MMA ``warp`` backend during planning. It retains
+packed FP8/NVFP4 cache recipes, with explicit FP32 group scaling for FP8 QK
+and inline BF16 dequantization for NVFP4 QK/PV. Its split count depends on
+planned capacity. SM120/SM121 retain the ``native`` backend; an explicit
+``SparseMlaConfig(backend="warp")`` selects the portable path for regression.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ META = OpMeta(
     name="sparse_mla",
     group="attention",
     api_style="planned",
+    archs=("sm103a", "sm120a", "sm121a"),
     entry_points=(
         "Caps",
         "ModelType",

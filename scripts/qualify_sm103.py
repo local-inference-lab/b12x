@@ -35,6 +35,7 @@ SUITES = {
         "tests/attention/test_dense_mla.py",
         "tests/attention/test_dense_mla_window.py",
     ],
+    "sparse_mla": ["tests/attention/test_sm103_sparse_mla.py"],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
 }
 
@@ -136,7 +137,7 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "sparse MLA/DSA",
+            "DSA indexer and compressed DeepSeek sparse MLA",
             "quantized linear backends",
             "Trellis experts",
             "Grace memory",

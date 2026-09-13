@@ -2142,7 +2142,9 @@ class UnifiedPrefillMGKernel:
         head_offset=0,
         valid_hpb=None,
         pack_hilo_rows=False,
+        block_scaled_mma=True,
     ):
+        self.block_scaled_mma = bool(block_scaled_mma)
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -2783,7 +2785,7 @@ class UnifiedPrefillMGKernel:
                                 kv_smem_stride=L.kv_smem_stride,
                                 io_threads=_PREFILL_IO_THREADS,
                             )
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.block_threads)
+                named_barrier_sync(Int32(1), Int32(self.block_threads))
 
         else:
             if cutlass.const_expr(self.use_h32_240_24_reg_budget):
@@ -3240,6 +3242,7 @@ class UnifiedPrefillMGKernel:
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
                         valid_hpb=self.valid_hpb,
+                        block_scaled_mma=self.block_scaled_mma,
                     )
                     if cutlass.const_expr(n_hg == 2):
                         qk1 = s1_qk_nope_block_scaled(
@@ -3258,6 +3261,7 @@ class UnifiedPrefillMGKernel:
                             scale_bytes_per_token=8,
                             scale_format=t.scale_format,
                             valid_hpb=t.hpb,
+                            block_scaled_mma=self.block_scaled_mma,
                         )
                     if cutlass.const_expr(is_glm and has_rope):
                         # GLM QK-RoPE: Q-rope A from preloaded registers, KV-rope B
@@ -3680,7 +3684,7 @@ class UnifiedPrefillMGKernel:
                     gsum1_frag[0] = gs1[0]
                     gsum1_frag[1] = gs1[1]
 
-                cute.arch.barrier(barrier_id=1, number_of_threads=self.block_threads)
+                named_barrier_sync(Int32(1), Int32(self.block_threads))
                 next_lc = ci + Int32(1)
                 if next_lc < loop_tiles:
                     next_phase = (next_lc >> Int32(1)) & Int32(1)
