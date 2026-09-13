@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
+    archs=("sm103a", "sm120a", "sm121a"),
     name="bf16_gemv",
     group="gemm",
     api_style="prepared",

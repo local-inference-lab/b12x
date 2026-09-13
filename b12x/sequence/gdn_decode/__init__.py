@@ -68,6 +68,7 @@ META = OpMeta(
         "run",
         "run_kda",
     ),
+    archs=("sm103a", "sm120a", "sm121a"),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("silu", "sigmoid", "lower_bounded_kda"),
     requires=("triton",),

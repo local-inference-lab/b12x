@@ -54,6 +54,7 @@ def _make_case(
     null_state_index: int | None = None,
     noncontiguous_beta: bool = False,
     recurrent_block_v: int | None = None,
+    qk_l2norm: bool = True,
 ) -> gdn.KdaBinding:
     max_seqs, live_tokens = len(query_lengths), sum(query_lengths)
     token_capacity = max_tokens if tensor_tokens is None else tensor_tokens

@@ -10,7 +10,7 @@ import torch
 from b12x.sequence import gdn_decode as gdn
 from b12x.preparation import PreparationSession, PreparedCall
 
-from ..conftest import require_b12x as require_sm120
+from ..conftest import require_sm103_or_sm12x as require_sm120
 
 
 _case_resources = ContextVar("gdn_case_resources")

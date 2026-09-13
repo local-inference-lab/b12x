@@ -10,7 +10,7 @@ import torch
 
 from b12x.attention import dense_mla
 
-from ..conftest import require_b12x
+from ..conftest import require_sm103_or_sm12x as require_b12x
 
 FP8 = torch.float8_e4m3fn
 HEADS = 8

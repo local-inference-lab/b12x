@@ -54,6 +54,7 @@ META = OpMeta(
         "reference",
         "run",
     ),
+    archs=("sm103a", "sm120a", "sm121a"),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("lower_bounded_kda",),
     provenance=Provenance(

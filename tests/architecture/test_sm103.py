@@ -123,6 +123,70 @@ def test_unimplemented_attention_rejects_before_query_or_profile_lookup():
         PolicyContext.for_identity(B300).resolve(DSA_INDEXER_POLICY, object())
 
 
+@pytest.mark.parametrize("recipe", ("kda_decode", "qwen_decode", "kda_prefill", "gdn_prefill", "dense_mla"))
+def test_portable_cute_public_plans_on_sm103(sm103_context, monkeypatch, recipe):
+    from b12x.sequence import gdn_decode, gdn_prefill, kda_prefill
+    from b12x.attention import dense_mla
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
+        multi_processor_count=B300.sm_count, shared_memory_per_block_optin=227 * 1024))
+    if recipe.endswith("decode"):
+        heads = 4 if recipe == "kda_decode" else 12
+        plan = gdn_decode.plan(gdn_decode.Caps(device="cuda:0", max_tokens=16,
+            max_seqs=4, max_state_slots=17, key_heads=4, value_heads=heads,
+            state_index_columns=4, gate_activation="sigmoid"), policy=sm103_context)
+        assert plan.config.backend == "cutedsl"
+    elif recipe == "dense_mla":
+        plan = dense_mla.plan(dense_mla.Caps(device="cuda:0", mode="decode",
+            kv_dtype=torch.bfloat16, num_q_heads=16, page_size=64, max_total_q=4,
+            max_batch=4, max_cache_tokens=4096, max_page_table_width=64,
+            num_cache_pages=128), policy=sm103_context)
+    else:
+        op = kda_prefill if recipe == "kda_prefill" else gdn_prefill
+        heads = dict(heads=16) if recipe == "kda_prefill" else dict(key_heads=4, value_heads=12)
+        plan = op.plan(op.Caps(device="cuda:0", max_tokens=4096, max_seqs=16,
+            max_state_slots=129, **heads), policy=sm103_context)
+    assert plan.policy_resolution.device == B300
+    assert plan.policy_resolution.source is PolicySource.HEURISTIC
+    assert plan.scratch_specs()
+
+
+def test_sm103_kda_policy_rejects_triton_override(sm103_context):
+    from b12x.sequence.gdn_decode._policy import GDN_POLICY, GdnQuery, GdnConfig
+
+    query = GdnQuery(gate_activation="sigmoid", qk_l2norm=True, state_dtype="float32",
+                     key_heads=16, value_heads=16, max_seqs=4, max_tokens=16,
+                     state_index_columns=4)
+    with pytest.raises(ValueError, match="SM103 recurrent compute requires"):
+        sm103_context.resolve(GDN_POLICY, query,
+                              override=GdnConfig(backend="triton", recurrent_block_v=32))
+
+
+def test_sm103_gdn_generator_uses_cute_candidates():
+    from b12x.policy.generation.attention_corpus import gdn_cases
+    from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
+
+    case = next(c for c in gdn_cases() if c.metadata["decay_recipe"] == "kda")
+    session = GdnBenchmarkFactory()(case.group_id, (case,), SimpleNamespace(device=B300))
+    candidates = tuple(c.config.to_dict() for c in session.candidates(case))
+    assert candidates == tuple(dict(backend="cutedsl", recurrent_block_v=v) for v in (16, 32))
+
+
+def test_kda_qualification_converts_legacy_case_override_before_sm103_validation(sm103_context, monkeypatch):
+    from b12x.policy import GDN_ATTENTION
+    from b12x.sequence import gdn_decode
+    from tests.sequence.test_gdn_decode_kda_cute import cute_backend
+
+    cute_backend.__wrapped__(monkeypatch)
+    caps = gdn_decode.Caps(device="cuda:0", max_tokens=16, max_seqs=4,
+        max_state_slots=17, key_heads=4, value_heads=4,
+        state_index_columns=4, gate_activation="sigmoid")
+    legacy = sm103_context.with_override(GDN_ATTENTION,
+        gdn_decode.GdnConfig(backend="triton", recurrent_block_v=16))
+    planned = gdn_decode.plan(caps, policy=legacy)
+    assert planned.config == gdn_decode.GdnConfig(backend="cutedsl", recurrent_block_v=16)
+
+
 def test_scratch_layout_disjoint_and_model_size_independent():
     buffers, nbytes = scratch_layout(8, 8, 4096, 2048)
     assert all(b.offset % 1024 == 0 for b in buffers)

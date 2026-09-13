@@ -467,10 +467,10 @@ def _mirror_trace(inputs: dict):
 )
 @pytest.mark.parametrize("lower_bound", [-5.0, -0.5])
 def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
     from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     checkpoint = [(0, 0)] * len(lengths)
     if lengths[-1] >= 32:
         checkpoint[-1] = (32, 3 * len(lengths))
@@ -556,9 +556,9 @@ def _assert_op_matches_oracle(binding, tensors, inputs, *, out_ratio=1e-2, state
 
 @pytest.mark.parametrize("tokens", [1, 15, 16, 17, 64, 1024, 4096])
 def test_op_matches_reference_single_sequence(tokens) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[tokens], heads=2, seed=61, device=device)
     binding, tensors = make_binding(inputs, max_tokens=4096, max_seqs=4)
     _run(binding, inputs)
@@ -568,9 +568,9 @@ def test_op_matches_reference_single_sequence(tokens) -> None:
 
 @pytest.mark.parametrize("heads", [16, 64])
 def test_op_serving_head_geometries(heads) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[256, 500, 244], heads=heads, seed=62, device=device)
     binding, tensors = make_binding(inputs, max_tokens=1024, max_seqs=4)
     _run(binding, inputs)
@@ -584,9 +584,9 @@ def test_op_serving_head_geometries(heads) -> None:
     ids=lambda v: "-".join(map(str, v)),
 )
 def test_op_varlen_packed_with_null_and_inplace_slots(lengths) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     count = len(lengths)
     slots = 3 * count + 2
     # Sequence 0 starts from the null slot, sequence 1 updates in place.
@@ -613,9 +613,9 @@ def test_op_varlen_packed_with_null_and_inplace_slots(lengths) -> None:
 @pytest.mark.parametrize("lower_bound", [-5.0, -3.0, -0.5])
 @pytest.mark.parametrize("gate_profile", ["random", "saturated"])
 def test_op_lower_bounds_and_saturated_gates(lower_bound, gate_profile) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(
         lengths=[64], heads=2, seed=64, device=device, lower_bound=lower_bound, gate_profile=gate_profile
     )
@@ -632,9 +632,9 @@ def test_op_lower_bounds_and_saturated_gates(lower_bound, gate_profile) -> None:
 
 
 def test_op_checkpoints_match_states_after_offset() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     lengths = [40, 1, 100]
     checkpoint = [(16, 9), (0, 0), (96, 10)]
     inputs = make_inputs(lengths=lengths, heads=2, seed=65, device=device, checkpoint=checkpoint, state_slots=12)
@@ -655,9 +655,9 @@ def test_op_checkpoints_match_states_after_offset() -> None:
 
 @pytest.mark.parametrize("tokens", [16384, 32768])
 def test_op_long_sequence_accumulation_long_memory(tokens) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[tokens], heads=2, seed=66, device=device, gate_profile="long_memory")
     binding, tensors = make_binding(inputs, max_tokens=tokens, max_seqs=1)
     _run(binding, inputs)
@@ -675,9 +675,9 @@ def test_op_near_collinear_long_sequence_remains_finite(high_state_slots) -> Non
     contract requires finite BF16 output and FP32 recurrent state for this
     supported input.
     """
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     tokens, heads = 16384, 1
     inputs = make_inputs(
         lengths=[tokens], heads=heads, seed=0, device=device, state_slots=2
@@ -750,9 +750,9 @@ def test_op_near_collinear_long_sequence_remains_finite(high_state_slots) -> Non
 
 @pytest.mark.parametrize("key_profile", ["repeated", "alternating"])
 def test_op_adversarial_keys(key_profile) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[256], heads=2, seed=67, device=device, key_profile=key_profile)
     binding, tensors = make_binding(inputs, max_tokens=256, max_seqs=1)
     _run(binding, inputs)
@@ -762,9 +762,9 @@ def test_op_adversarial_keys(key_profile) -> None:
 
 @pytest.mark.parametrize("tiles", [1, 2, 3, 5, 8, 64])
 def test_op_state_matches_mirror_per_tile_prefix(tiles) -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[1024], heads=2, seed=68, device=device)
     binding, tensors = make_binding(inputs, max_tokens=1024, max_seqs=1)
     tokens = 16 * tiles
@@ -783,9 +783,9 @@ def test_op_state_matches_mirror_per_tile_prefix(tiles) -> None:
 
 
 def test_op_cuda_graph_replay_is_allocation_free_with_poison() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[100, 30], heads=2, seed=69, device=device, checkpoint=[(32, 7), (0, 0)], state_slots=9)
     binding, tensors = make_binding(
         inputs,
@@ -818,7 +818,7 @@ def test_op_three_window_ring_reuse_is_capture_safe() -> None:
     from ..conftest import require_b12x
     from b12x.sequence.kda_prefill import KdaPrefillConfig
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[160], heads=2, seed=74, device=device, state_slots=4)
     config = KdaPrefillConfig(v_split=64, k_split=1, stages=3, window_tiles=4)
     binding, tensors = make_binding(inputs, max_tokens=160, max_seqs=1, config=config)
@@ -864,9 +864,9 @@ def test_op_three_window_ring_reuse_is_capture_safe() -> None:
 
 
 def test_op_cuda_graph_replay_uses_device_metadata() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     first = make_inputs(lengths=[100, 30], heads=2, seed=70, device=device, state_slots=9)
     binding, tensors = make_binding(first, max_tokens=256, max_seqs=4)
     _run(binding, first)
@@ -894,9 +894,9 @@ def test_op_cuda_graph_replay_uses_device_metadata() -> None:
 
 
 def test_op_read_only_inputs_are_immutable() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[50, 60], heads=2, seed=73, device=device)
     binding, tensors = make_binding(inputs, max_tokens=128, max_seqs=4)
     read_only = {
@@ -917,7 +917,7 @@ def test_op_accepts_strided_views() -> None:
     from ..conftest import require_b12x
     from b12x.sequence.kda_prefill import _impl as impl
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[40, 24], heads=2, seed=74, device=device)
     heads, tokens = 2, inputs["num_tokens"]
     packed = torch.zeros(tokens, 3 * heads * HEAD_DIM + 64, dtype=torch.bfloat16, device=device)
@@ -964,7 +964,7 @@ def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.sequence._shared.delta_prefill import _cute_kernels as kernels
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     small = make_inputs(lengths=[1], heads=2, seed=75, device=device, state_slots=8)
     binding, tensors = make_binding(small, max_tokens=128, max_seqs=4)
     _run(binding, small)
@@ -1003,7 +1003,7 @@ def test_op_state_slot_offset_past_int32_boundary() -> None:
     from ..conftest import require_b12x
     from b12x.sequence.kda_prefill import _impl as impl
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     heads = 1
     inputs = make_inputs(lengths=[40], heads=heads, seed=77, device=device, state_slots=3, checkpoint=[(16, 2)])
     slot_stride = HEAD_DIM * HEAD_DIM + 2048
@@ -1041,9 +1041,9 @@ def test_op_state_slot_offset_past_int32_boundary() -> None:
 
 
 def test_op_zero_tokens_copies_states_only() -> None:
-    from ..conftest import require_b12x
+    from ..conftest import require_sm103_or_sm12x
 
-    device = require_b12x()
+    device = require_sm103_or_sm12x()
     inputs = make_inputs(lengths=[0, 0], heads=2, seed=78, device=device)
     binding, tensors = make_binding(inputs, max_tokens=32, max_seqs=2)
     binding.output.fill_(float("nan"))

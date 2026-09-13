@@ -10,8 +10,150 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def compile_sequence(out):
+    """Compile production recurrent launch factories using pointer prototypes.
+
+    Binding descriptors supply static geometry and dtypes only. No device
+    allocation or kernel execution occurs, and these objects are not runtime
+    qualification evidence.
+    """
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+    from b12x.sequence._shared.delta_prefill import _cute_kernels as prefill
+    from b12x.sequence.gdn_decode import _cute_kernels as qwen, _cute_kda as kda
+    from b12x.sequence.kda_prefill import _impl as kp
+    from b12x.sequence.gdn_prefill import _impl as gp
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec):
+        name = case + "_" + compile_spec.kernel_id.rsplit(".", 1)[-1]
+        directory = out / name
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel,
+            *args,
+            no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+        return compiled
+
+    def descriptor(dtype):
+        return SimpleNamespace(
+            dtype=dtype,
+            device=torch.device("cuda:0"),
+            stride=lambda: (12 * 128 * 128, 128 * 128, 128, 1),
+        )
+
+    for index_type in (torch.int32, torch.int64):
+        suffix = str(index_type).removeprefix("torch.")
+        for recipe, impl in (("kda", kp), ("gdn", gp)):
+            for checkpoint in (False, True):
+                case = f"{recipe}_prefill_{suffix}_checkpoint{int(checkpoint)}"
+                geometry = (
+                    dict(heads=16)
+                    if recipe == "kda"
+                    else dict(key_heads=4, value_heads=12)
+                )
+                caps = impl.Caps(
+                    device="cuda:0",
+                    max_tokens=4096,
+                    max_seqs=16,
+                    max_state_slots=129,
+                    checkpoint_export=checkpoint,
+                    null_state_index=0,
+                    **geometry,
+                )
+                plan = impl._materialize_plan(
+                    caps,
+                    v_split=64,
+                    k_split=1,
+                    stages=3,
+                    window_tiles=128,
+                    policy_resolution=None,
+                )
+                binding = SimpleNamespace(
+                    plan=plan,
+                    output=descriptor(torch.bfloat16),
+                    initial_state_indices=descriptor(index_type),
+                    A_log=descriptor(torch.float32),
+                    dt_bias=descriptor(torch.float32),
+                )
+                prefill.clear_caches()
+                with (
+                    patch.object(prefill, "b12x_compile", capture),
+                    patch.object(
+                        prefill, "current_cuda_stream", lambda: cuda.CUstream(0)
+                    ),
+                ):
+                    prefill._compile_prologue(binding)
+                    prefill._compile_prepare(binding)
+                    prefill._compile_recurrence(binding)
+        for state_type in (torch.bfloat16, torch.float32):
+            case = f"kda_decode_{suffix}_{str(state_type).removeprefix('torch.')}"
+            key = (
+                0,
+                128,
+                32,
+                129,
+                4,
+                16,
+                32,
+                True,
+                0,
+                True,
+                state_type,
+                index_type,
+                torch.float32,
+                torch.float32,
+                torch.float32,
+            )
+            with (
+                patch.object(kda, "b12x_compile", capture),
+                patch.object(kda, "current_cuda_stream", lambda: cuda.CUstream(0)),
+            ):
+                kda.compile_kernels(key)
+            case = f"qwen_decode_{suffix}_{str(state_type).removeprefix('torch.')}"
+            caps = SimpleNamespace(
+                max_seqs=32,
+                state_index_columns=4,
+                key_heads=4,
+                value_heads=12,
+                key_head_dim=128,
+                value_head_dim=128,
+                qk_l2norm=True,
+                null_state_index=0,
+            )
+            binding = qwen.Binding.__new__(qwen.Binding)
+            fields = dict(
+                plan=SimpleNamespace(caps=caps),
+                output=descriptor(torch.bfloat16),
+                recurrent_state=descriptor(state_type),
+                state_indices=descriptor(index_type),
+                A_log=descriptor(torch.float32),
+                dt_bias=descriptor(torch.float32),
+            )
+            for field, value in fields.items():
+                object.__setattr__(binding, field, value)
+            qwen._KERNEL_CACHE.clear()
+            with (
+                patch.object(qwen, "b12x_compile", capture),
+                patch.object(qwen, "current_cuda_stream", lambda: cuda.CUstream(0)),
+            ):
+                qwen._compile(binding)
+    prefill.clear_caches()
+    qwen._KERNEL_CACHE.clear()
+    kda._CACHE.clear()
+    return launches
 
 
 def compile_roce(out):
@@ -46,6 +188,110 @@ def compile_roce(out):
     return launches
 
 
+def compile_dense_mla(out):
+    """Compile dense MLA math, split reduction, and query quantization."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor as tensor
+    from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
+    from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
+    from b12x.attention.dense_mla._layout import make_smem_layout
+
+    launches = {}
+
+    def compile_case(name, kernel, args):
+        directory = out / name
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel,
+            *args,
+            no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+
+    for fp8 in (False, True):
+        for qk_dim, value_dim in ((576, 512), (1088, 1024)):
+            for query_tile in (1, 2, 4) if fp8 else (1, 2):
+                for window in (None, 128):
+                    name = f"dense_mla_{'fp8' if fp8 else 'bf16'}_d{qk_dim}_q{query_tile}_w{window}"
+                    kernel = DenseMlaForwardKernel(
+                        layout=make_smem_layout(
+                            query_tile=query_tile, fp8=fp8, qk_dim=qk_dim
+                        ),
+                        page_size=64,
+                        num_heads=16,
+                        num_splits=4,
+                        chunks_per_split=16,
+                        query_tile=query_tile,
+                        fp8=fp8,
+                        qk_dim=qk_dim,
+                        value_dim=value_dim,
+                        window_size=window,
+                    )
+                    args = [
+                        tensor(cutlass.Uint8, (cute.sym_int(),), assumed_align=16)
+                        for _ in range(2)
+                    ]
+                    args += [
+                        tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
+                        for _ in range(3)
+                    ]
+                    args += [
+                        tensor(
+                            cutlass.BFloat16,
+                            (cute.sym_int(), 16, value_dim),
+                            assumed_align=16,
+                        ),
+                        tensor(cutlass.Float32, (128, 16), assumed_align=4),
+                        tensor(
+                            cutlass.BFloat16, (128, 16, 4, value_dim), assumed_align=16
+                        ),
+                        tensor(cutlass.Float32, (128, 16, 4), assumed_align=4),
+                    ]
+                    args += [
+                        tensor(cutlass.Float32, (1,), assumed_align=4) for _ in range(2)
+                    ]
+                    args += [
+                        cutlass.Float32(1.0),
+                        *([cutlass.Int64(1)] * 5),
+                        *([cutlass.Int32(1)] * 3),
+                        cuda.CUstream(0),
+                    ]
+                    compile_case(name, kernel, args)
+    for value_dim in (512, 1024):
+        compile_case(
+            f"dense_mla_merge_v{value_dim}",
+            DenseMlaMergeKernel(4, value_dim),
+            [
+                tensor(cutlass.BFloat16, (128, 16, 4, value_dim), assumed_align=16),
+                tensor(cutlass.Float32, (128, 16, 4), assumed_align=4),
+                tensor(
+                    cutlass.BFloat16, (cute.sym_int(), 16, value_dim), assumed_align=16
+                ),
+                tensor(cutlass.Float32, (128, 16), assumed_align=4),
+                cutlass.Int32(1),
+                cuda.CUstream(0),
+            ],
+        )
+    from b12x.attention._shared.static_fp8_quant import _StaticFp8QuantKernel
+
+    compile_case(
+        "dense_mla_query_quant",
+        _StaticFp8QuantKernel(128 * 16 * 1088),
+        [
+            tensor(cutlass.Uint8, (cute.sym_int(),), assumed_align=16),
+            tensor(cutlass.Uint8, (cute.sym_int(),), assumed_align=16),
+            tensor(cutlass.Float32, (cute.sym_int(),), assumed_align=4),
+            cutlass.Int32(4),
+            cuda.CUstream(0),
+        ],
+    )
+    return launches
+
+
 def compile_trellis(out):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -74,6 +320,61 @@ def compile_trellis(out):
     return launches
 
 
+def compile_bf16_projection(out):
+    """Compile SIMT and warp-MMA unquantized projection entry points."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_compact_tensor as tensor
+    from b12x.gemm.bf16_gemv._kernel import ProjectionKernel
+    from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel
+    from b12x.moe._shared.kernels.sm103.launch import pointer
+
+    launches = {}
+
+    def compile_case(name, kernel, args):
+        directory = out / name
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel,
+            *args,
+            no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+
+    for x_type in (cutlass.BFloat16, cutlass.Float32):
+        for w_type in (cutlass.BFloat16, cutlass.Float32):
+            for out_type in (cutlass.BFloat16, cutlass.Float32):
+                name = f"projection_{x_type.__name__}_{w_type.__name__}_{out_type.__name__}"
+                kernel = ProjectionKernel(
+                    512, 4096, x_type == w_type == cutlass.BFloat16, True
+                )
+                args = [pointer(t) for t in (x_type, w_type, cutlass.Float32, out_type)]
+                args += [
+                    cutlass.Int32(1),
+                    *([cutlass.Int64(1)] * 5),
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    cuda.CUstream(0),
+                ]
+                compile_case(name, kernel, args)
+    for out_type in (cutlass.BFloat16, cutlass.Float32):
+        compile_case(
+            f"projection_prefill_{out_type.__name__}",
+            Bf16PrefillKernel(512, 5120),
+            [
+                tensor(cutlass.BFloat16, (cute.sym_int(), 5120), assumed_align=16),
+                tensor(cutlass.BFloat16, (512, 5120), assumed_align=16),
+                tensor(out_type, (cute.sym_int(), 512), assumed_align=16),
+                cutlass.Int32(1),
+                cuda.CUstream(0),
+            ],
+        )
+    return launches
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -86,7 +387,17 @@ def main():
     parser.add_argument("--nvdisasm", type=Path)
     parser.add_argument("--cuobjdump", type=Path)
     parser.add_argument(
-        "--component", choices=("moe", "roce", "trellis", "all"), default="moe"
+        "--component",
+        choices=(
+            "moe",
+            "roce",
+            "trellis",
+            "sequence",
+            "dense_mla",
+            "projection",
+            "all",
+        ),
+        default="moe",
     )
     args = parser.parse_args()
     # CuTe must have an architecture even when the CUDA driver is unavailable.
@@ -183,6 +494,12 @@ def main():
             launches.update(compile_roce(out))
         if args.component in ("trellis", "all"):
             launches.update(compile_trellis(out))
+        if args.component in ("sequence", "all"):
+            launches.update(compile_sequence(out))
+        if args.component in ("dense_mla", "all"):
+            launches.update(compile_dense_mla(out))
+        if args.component in ("projection", "all"):
+            launches.update(compile_bf16_projection(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__

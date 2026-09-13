@@ -1,4 +1,4 @@
-"""Paged dense Multi-head Latent Attention on SM12x.
+"""Paged dense Multi-head Latent Attention on SM103 and SM12x.
 
 The operator consumes absorbed queries and combined compressed-cache records
 directly. Logical Q/K width, logical value width, and physical-record width
@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
+    archs=("sm103a", "sm120a", "sm121a"),
     name="dense_mla",
     group="attention",
     api_style="planned",
