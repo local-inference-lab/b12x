@@ -1,0 +1,151 @@
+{
+  "status": "cross-compiled; no B300 execution",
+  "source_sha256": "a50b0cd6e24e60ad566359e377c30fcdaff1410701ba68dcdb46cabe2c2df69f",
+  "matching_code_revision": "63d40fa35f114deaab3f0e20c254a57b939c1cff",
+  "manifest_sha256": "e0bd4ee06d885d541114eb054c7243ac8593941323f40d469f1bd554810b004d",
+  "artifact_root": "/home/jasonc/b12x-sm103-evidence/final-sm103",
+  "callables": 20,
+  "target": "sm_103a",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/home/jasonc/b12x-sm103-evidence/final-sm103",
+    "--nvdisasm",
+    ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+  ],
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "artifacts": [
+    {
+      "name": "fc1_Int32",
+      "native_mma": true,
+      "resource_summary": "REG:138 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1496 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "49734ebdd56735014100527aace9619e8094f11d83aa9b26decaf7f406f2e755"
+    },
+    {
+      "name": "fc2_Int32",
+      "native_mma": true,
+      "resource_summary": "REG:138 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1496 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "64111fcc4006490fc20b5f9c3fc904fe57727df3790274a66b75d3e1f4f6fe52"
+    },
+    {
+      "name": "q1_Int32",
+      "native_mma": false,
+      "resource_summary": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "f8bbf95115263421166cb322e79f136a1c9f2358b34f514f44ab46c387b4e2b2"
+    },
+    {
+      "name": "q2_Int32",
+      "native_mma": false,
+      "resource_summary": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "202610ae015b90bc421e09175e10780410954b9cd3060910df5e4d8f9c9e8244"
+    },
+    {
+      "name": "fc1_Int64",
+      "native_mma": true,
+      "resource_summary": "REG:140 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1496 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "8f0a749c03692c16d7db1ef34458121ea659d6ad3b9a90ab64949702285da631"
+    },
+    {
+      "name": "fc2_Int64",
+      "native_mma": true,
+      "resource_summary": "REG:140 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1496 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "0f8b72442b3c960bbfaa26a0cebd5607363c03db6aa67a4f8aa3e3be2b823e4c"
+    },
+    {
+      "name": "q1_Int64",
+      "native_mma": false,
+      "resource_summary": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "bc1c742124df8cc84b081ec800ef03bf4dc44ec89274389d5f46a4bd1639ac97"
+    },
+    {
+      "name": "q2_Int64",
+      "native_mma": false,
+      "resource_summary": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "9ad60fc79ee1ebbefa930665b90c9b4de552ef60a099a36567850cc3324ce00c"
+    },
+    {
+      "name": "sum",
+      "native_mma": false,
+      "resource_summary": "REG:27 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:948 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "f644b9ed346a687ea5ea92b7197d507ac46dc8bc63818ef91ecab1ea874d993c"
+    },
+    {
+      "name": "roce_bfloat16_rank0",
+      "native_mma": false,
+      "resource_summary": "REG:29 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "3b0f60303cd9951ac5ee866ad5b1235db19e863e10b2a07a9474e0d804889700"
+    },
+    {
+      "name": "roce_float16_rank0",
+      "native_mma": false,
+      "resource_summary": "REG:30 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "687f52cc563739a8c3cddbc8a2fbee84a4328beae9ab7e28308ca724339ffd77"
+    },
+    {
+      "name": "roce_float32_rank0",
+      "native_mma": false,
+      "resource_summary": "REG:22 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "6d4d720dee1f6fc1c9646b4a494d6bf02215a9d4175f8c7d917993347355fc54"
+    },
+    {
+      "name": "roce_gather_rank0",
+      "native_mma": false,
+      "resource_summary": "REG:24 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:1004 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "d47997d88388dc58b66ad434ded02ce8dee8c06d76fc0f044c58a37fa112c6ac"
+    },
+    {
+      "name": "roce_bfloat16_rank1",
+      "native_mma": false,
+      "resource_summary": "REG:30 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "201993d92753527c9586dabf03dc903ca270eed2caf097cd8c85f418595e4959"
+    },
+    {
+      "name": "roce_float16_rank1",
+      "native_mma": false,
+      "resource_summary": "REG:32 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "9199557facfc56c7374af3039c7e9dcb350b925d15ef8aa430c0d1d0631ae035"
+    },
+    {
+      "name": "roce_float32_rank1",
+      "native_mma": false,
+      "resource_summary": "REG:24 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:996 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "5a13216d90d910c1d3446912da906d8dcd000782707a9979c16cc85bc123990f"
+    },
+    {
+      "name": "roce_gather_rank1",
+      "native_mma": false,
+      "resource_summary": "REG:25 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:1004 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "f5385c610d1cd97d386c818f1c096729749cbdc8282cc8473cb5d7c7784760b6"
+    },
+    {
+      "name": "trellis_k2",
+      "native_mma": false,
+      "resource_summary": "REG:24 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:920 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "e61bab2954a4c017ac1c5c13e695b2dcd4524f42ef877dbf2811c80bdd0445f9"
+    },
+    {
+      "name": "trellis_k3",
+      "native_mma": false,
+      "resource_summary": "REG:20 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:920 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "4e6980042bcc6fb0181df989982ea42349d6fb7a858f770d69f61c0c74b69ab0"
+    },
+    {
+      "name": "trellis_k4",
+      "native_mma": false,
+      "resource_summary": "REG:21 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:920 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "7c201ff641d2ce058453906e1b96f461e71f8511f266f34ebcec4fb7fa13ef3a"
+    }
+  ]
+}

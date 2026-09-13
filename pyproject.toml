@@ -1,7 +1,7 @@
 [project]
 name = "b12x"
 version = "1.3.0"
-description = "DGX Spark and RTX 6000-focused inference kernel library."
+description = "Blackwell inference kernels with SM120/SM121 paths and an SM103 prototype."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "Luke Alonso" }]
