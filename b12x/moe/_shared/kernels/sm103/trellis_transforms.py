@@ -461,3 +461,50 @@ class OutputRotation:
                 dest[token * Int64(self.hidden) + column] = result[j].to(
                     dest.element_type
                 )
+
+
+class ComposeExpertMaps:
+    """Apply a prepared expert namespace to both compute and output-scale IDs."""
+
+    def __init__(self, capacity, experts):
+        if min(capacity, experts) <= 0 or capacity > 2**31 - 1:
+            raise ValueError(
+                "prepared expert mapping requires positive Int32 route capacity"
+            )
+        self.capacity, self.experts = capacity, experts
+
+    @cute.jit
+    def __call__(
+        self,
+        ids: cute.Pointer,
+        output_ids: cute.Pointer,
+        mapping: cute.Pointer,
+        live_routes: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(ids, output_ids, mapping, live_routes).launch(
+            grid=(cute.ceil_div(live_routes, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, ids, output_ids, mapping, live_routes: Int32):
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        row = Int64(block) * 128 + Int64(thread)
+        source = cute.make_tensor(ids, cute.make_layout(self.capacity))
+        output = cute.make_tensor(output_ids, cute.make_layout(self.capacity))
+        table = cute.make_tensor(mapping, cute.make_layout(self.experts))
+        if row < live_routes:
+            expert, output_expert = Int64(source[row]), Int64(output[row])
+            mapped, mapped_output = Int64(-1), Int64(-1)
+            if (expert >= 0) & (expert < self.experts):
+                mapped = Int64(table[expert])
+            if (output_expert >= 0) & (output_expert < self.experts):
+                mapped_output = Int64(table[output_expert])
+            if (mapped < 0) | (mapped >= self.experts):
+                mapped = Int64(-1)
+            if (mapped_output < 0) | (mapped_output >= self.experts) | (mapped < 0):
+                mapped_output = Int64(-1)
+            source[row], output[row] = mapped, mapped_output

@@ -158,8 +158,24 @@ def _moe_reference(
     output_expert_map=None,
 ):
     """Evaluate transforms and FP16 projection boundaries from compressed weights."""
-    state = prepared.trellis
     experts, hidden = prepared.num_experts, source.shape[1]
+    mixed = getattr(prepared, "weight_layout", None) == "trellis_mixed3"
+    internal_map, descriptor_rows = None, None
+    if mixed:
+        from types import SimpleNamespace
+
+        rotations = prepared.rotations
+        state = SimpleNamespace(
+            coupled_hadamard=False,
+            gate_suh=rotations.gate_suh[:experts],
+            up_suh=rotations.up_suh[:experts],
+            down_svh=rotations.down_svh[:experts],
+            intermediate_rotations=rotations.intermediate[:experts],
+        )
+        internal_map = prepared.global_to_combined.cpu().tolist()
+        descriptor_rows = prepared.descriptor_map.cpu().view(3, -1).tolist()
+    else:
+        state = prepared.trellis
     width = state.intermediate_rotations.shape[1] // (
         6 if state.coupled_hadamard else 3
     )
@@ -178,6 +194,12 @@ def _moe_reference(
             if output_map is None
             else (output_map[raw] if 0 <= raw < len(output_map) else -1)
         )
+        if internal_map is not None:
+            expert = internal_map[expert] if 0 <= expert < experts else -1
+            output_expert = (
+                internal_map[output_expert] if 0 <= output_expert < experts else -1
+            )
+            expert = expert if 0 <= expert < experts else -1
         ids.append(expert)
         output_ids.append(
             output_expert if expert >= 0 and 0 <= output_expert < experts else -1
@@ -194,22 +216,55 @@ def _moe_reference(
     )
     gate = torch.zeros((len(ids), width), device=source.device, dtype=torch.float16)
     up = torch.zeros_like(gate)
-    native13 = prepared.w13.view(torch.int16).view(
-        2, experts, hidden // 16, width // 16, 16 * state.bits
-    )
-    native2 = prepared.w2.view(torch.int16).view(
-        experts, width // 16, hidden // 16, 16 * state.bits
-    )
+
+    def projection_weight(projection, expert):
+        n, k = (width, hidden) if projection < 2 else (hidden, width)
+        if mixed:
+            descriptor = descriptor_rows[projection][expert]
+            tier = descriptor >> prepared.descriptor_local_bits
+            local = descriptor & ((1 << prepared.descriptor_local_bits) - 1)
+            if not 0 <= tier < 3:
+                return None
+            counts = (prepared.gate_counts, prepared.up_counts, prepared.down_counts)[
+                projection
+            ]
+            if not 0 <= local < counts[tier]:
+                return None
+            bits, codebook = tier + 3, "mcg"
+            payload = prepared.tiers[tier]
+            if projection < 2:
+                if projection == 1:
+                    local += prepared.gate_counts[tier]
+                native = payload.w13.view(torch.int16).view(
+                    -1, k // 16, n // 16, 16 * bits
+                )
+            else:
+                native = payload.w2.view(torch.int16).view(
+                    -1, k // 16, n // 16, 16 * bits
+                )
+        else:
+            bits, codebook, local = state.bits, state.codebook, expert
+            if projection < 2:
+                native = prepared.w13.view(torch.int16).view(
+                    2, experts, k // 16, n // 16, 16 * bits
+                )[projection]
+            else:
+                native = prepared.w2.view(torch.int16).view(
+                    experts, k // 16, n // 16, 16 * bits
+                )
+        return native_weight(native[local : local + 1], bits, codebook)[0].to(
+            source.device
+        )
+
     selected = sorted(set(ids) - {-1})
     for expert in selected:
         rows = torch.tensor(
             [i for i, value in enumerate(ids) if value == expert], device=source.device
         )
         for projection, inputs, outputs in ((0, gate_input, gate), (1, up_input, up)):
-            weight = native_weight(
-                native13[projection, expert : expert + 1], state.bits, state.codebook
-            )[0].to(source.device)
-            outputs[rows] = (inputs[rows].float() @ weight.float().T).half()
+            weight = projection_weight(projection, expert)
+            if weight is not None:
+                outputs[rows] = (inputs[rows].float() @ weight.float().T).half()
     middle = intermediate_rotation(
         gate,
         up,
@@ -223,10 +278,9 @@ def _moe_reference(
         rows = torch.tensor(
             [i for i, value in enumerate(ids) if value == expert], device=source.device
         )
-        weight = native_weight(
-            native2[expert : expert + 1], state.bits, state.codebook
-        )[0].to(source.device)
-        down[rows] = (middle[rows].float() @ weight.float().T).half()
+        weight = projection_weight(2, expert)
+        if weight is not None:
+            down[rows] = (middle[rows].float() @ weight.float().T).half()
     return output_rotation(
         down, final_ids, state.down_svh, topk_weights, state.coupled_hadamard
     )

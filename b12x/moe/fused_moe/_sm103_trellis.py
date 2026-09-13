@@ -1,4 +1,4 @@
-"""Planned native SM103 execution for uniform-rate Trellis experts.
+"""Planned native SM103 execution for uniform and projection-tiered Trellis.
 
 The materialized schedule retains compressed weights and FP16 transform
 boundaries. All kernels are resolved during prewarm; bind retains pointers
@@ -29,6 +29,13 @@ from .._shared.execution import (
 from ._policy import MOE_DECODE_POLICY, MoeDecodeConfig, MoeDecodeQuery
 
 BACKEND = "tcgen05_trellis"
+
+
+def projection_mixed(weight_plan):
+    return (
+        weight_plan.source_format == "b12x_trellis"
+        and weight_plan.trellis_codebook == "mcg"
+    )
 
 
 def projection_rates(weight_plan):
@@ -91,19 +98,21 @@ def validate_weight_plan(weight_plan):
         raise UnsupportedArchitectureError(
             "SM103 Trellis requires FP16 or BF16 activations"
         )
-    if weight_plan.trellis_pair_kinds or weight_plan.trellis_rate_granularity not in (
-        None,
-        "uniform",
-    ):
-        raise UnsupportedArchitectureError(
-            "SM103 Trellis MoE requires uniform projection rates; paired/mixed rates remain unsupported"
-        )
+    granularities = (
+        (None, "uniform", "per_layer", "per_expert", "per_expert_projection")
+        if projection_mixed(weight_plan)
+        else (None, "uniform", "per_layer")
+    )
     if (
-        weight_plan.source_format == "b12x_trellis"
-        and weight_plan.trellis_codebook == "mcg"
+        weight_plan.trellis_pair_kinds
+        or weight_plan.trellis_rate_granularity not in granularities
     ):
         raise UnsupportedArchitectureError(
-            "canonical MCG preparation uses mixed-rate descriptors; SM103 mixed-rate dispatch remains unsupported"
+            "SM103 Trellis requires uniform or MCG projection rates; paired/grouped records remain unsupported"
+        )
+    if projection_mixed(weight_plan) and weight_plan.coupled_hadamard:
+        raise UnsupportedArchitectureError(
+            "MCG projection-tiered Trellis requires ordinary expert transforms"
         )
     validate_codebook_bits(weight_plan.trellis_codebook, weight_plan.trellis_bits)
     if weight_plan.coupled_hadamard and (
@@ -236,11 +245,13 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from .._shared.kernels.sm103.launch import pointer
     from .._shared.kernels.sm103.trellis_gemm import RoutedTrellisGemm
+    from .._shared.kernels.sm103.trellis_mixed_gemm import RoutedMixedTrellisGemm
     from .._shared.kernels.sm103.trellis_transforms import (
         InputRotation,
         IntermediateRotation,
         OutputRotation,
         MapRoutes,
+        ComposeExpertMaps,
     )
 
     if not offline and torch.cuda.get_device_capability(caps.device) != (10, 3):
@@ -256,6 +267,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             "SM103 Trellis requires at least 33 KiB opt-in shared memory"
         )
     weight_plan = caps.weight_plan
+    mixed = projection_mixed(weight_plan)
     coupled, bits, codebook = (
         weight_plan.coupled_hadamard,
         weight_plan.trellis_bits,
@@ -276,7 +288,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            1,
+            2,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),
@@ -288,6 +300,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("coupled", coupled),
             ("activation", caps.activation),
             ("io_dtype", str(caps.dtype)),
+            ("projection_mixed", mixed),
         )
         if offline:
             fn = cute.compile(kernel, *args, options=options, no_jit_engine=True)
@@ -314,6 +327,13 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
                     (dtype, c.Int32, c.Int32, c.Int64, c.Int64),
                     (c.Int32(1),),
                 )
+    if mixed:
+        compile_case(
+            "compose_maps",
+            ComposeExpertMaps(routes, caps.weight_E),
+            (c.Int64, c.Int64, c.Int32),
+            (c.Int32(1),),
+        )
     compile_case(
         "input",
         InputRotation(caps.k, caps.weight_E, caps.num_topk, routes, coupled=coupled),
@@ -328,7 +348,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
         (c.Float16, c.Float16, c.Int64, c.Float16, c.Float16),
         (c.Int32(1),),
     )
-    for rate in projection_rates(weight_plan):
+    for rate in () if mixed else projection_rates(weight_plan):
         for name, n, k in (("fc1", caps.n, caps.k), ("fc2", caps.k, caps.n)):
             compile_case(
                 name + f"_k{rate}",
@@ -337,6 +357,32 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
                 ),
                 (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Float16),
                 (c.Int32(1), c.Int64(k), c.Int64(n)),
+            )
+    if mixed:
+        for name, n, k in (
+            ("fc1_mixed", caps.n, caps.k),
+            ("fc2_mixed", caps.k, caps.n),
+        ):
+            compile_case(
+                name,
+                RoutedMixedTrellisGemm(
+                    n,
+                    k,
+                    caps.weight_E,
+                    routes,
+                    descriptor_local_bits=24 if caps.weight_E > 256 else 8,
+                ),
+                (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Int32, c.Float16),
+                (
+                    c.Int32(0),
+                    c.Int64(3 * caps.weight_E),
+                    c.Int64(1),
+                    (c.Int64(0),) * 3,
+                    (c.Int32(0),) * 3,
+                    c.Int32(1),
+                    c.Int64(k),
+                    c.Int64(n),
+                ),
             )
     for dtype in (c.Float32, io_type):
         compile_case(
@@ -363,6 +409,118 @@ def _require_tensor(tensor, name, shape, dtype, device):
         )
     if tensor.data_ptr() % 16:
         raise ValueError(f"{name} must be 16-byte aligned")
+
+
+def _mixed_contract(caps, prepared):
+    from .trellis import PreparedProjectionTrellisWeights
+    from .._shared.kernels.w4a16.prepare import TrellisWeightState
+
+    if not isinstance(prepared, PreparedProjectionTrellisWeights):
+        raise ValueError(
+            "SM103 mixed Trellis requires canonical projection-tiered weights"
+        )
+    if (prepared.num_experts, prepared.hidden_size, prepared.intermediate_size) != (
+        caps.weight_E,
+        caps.k,
+        caps.n,
+    ):
+        raise ValueError(
+            "mixed Trellis prepared geometry differs from the capacity plan"
+        )
+    expected_bits = 24 if caps.weight_E > 256 else 8
+    if (
+        prepared.descriptor_local_bits != expected_bits
+        or prepared.trellis_codebook != "mcg"
+    ):
+        raise ValueError(
+            "mixed Trellis descriptor format or codebook differs from the plan"
+        )
+    _require_tensor(
+        prepared.descriptor_map,
+        "projection descriptors",
+        (9 * caps.weight_E,),
+        torch.int32,
+        caps.device,
+    )
+    _require_tensor(
+        prepared.global_to_combined,
+        "prepared expert map",
+        (caps.weight_E,),
+        torch.int32,
+        caps.device,
+    )
+    counts = (prepared.gate_counts, prepared.up_counts, prepared.down_counts)
+    if any(
+        row is None
+        or len(row) != 3
+        or any(not isinstance(v, int) or v < 0 for v in row)
+        or sum(row) != caps.weight_E
+        for row in counts
+    ):
+        raise ValueError(
+            "mixed Trellis projection counts must partition the model experts"
+        )
+    for name, value in (
+        ("gate/up payload", prepared.w13),
+        ("down payload", prepared.w2),
+    ):
+        _require_tensor(value, name, (value.numel(),), torch.int32, caps.device)
+    offsets = [[], [], []]
+    cursor13, cursor2 = 0, 0
+    if len(prepared.tiers) != 3:
+        raise ValueError("mixed Trellis requires three native rate tiers")
+    for tier, bit in enumerate((3, 4, 5)):
+        record_words = (caps.k // 16) * (caps.n // 16) * 8 * bit
+        payload = prepared.tiers[tier]
+        if payload.trellis_codebook != "mcg" or payload.trellis_bits != bit:
+            raise ValueError("mixed Trellis tier order must be MCG K3/K4/K5")
+        for value, owner, cursor, count in (
+            (payload.w13, prepared.w13, cursor13, counts[0][tier] + counts[1][tier]),
+            (payload.w2, prepared.w2, cursor2, counts[2][tier]),
+        ):
+            if (
+                value.dtype != torch.int32
+                or value.device != caps.device
+                or not value.is_contiguous()
+                or value.numel() != max(count, 1) * record_words
+                or value.untyped_storage().data_ptr()
+                != owner.untyped_storage().data_ptr()
+                or value.data_ptr() != owner.data_ptr() + 4 * cursor
+            ):
+                raise ValueError(
+                    "mixed Trellis tiers must be exact coalesced compressed payload views"
+                )
+        offsets[0].append(cursor13)
+        offsets[1].append(cursor13 + counts[0][tier] * record_words)
+        offsets[2].append(cursor2)
+        cursor13 += payload.w13.numel()
+        cursor2 += payload.w2.numel()
+    if cursor13 != prepared.w13.numel() or cursor2 != prepared.w2.numel():
+        raise ValueError(
+            "mixed Trellis payload lengths disagree with projection counts"
+        )
+    rotations = prepared.rotations
+
+    def prefix(value, width, *, broadcast=False):
+        rows = 1 if broadcast and value.shape[0] == 1 else 3 * caps.weight_E
+        _require_tensor(
+            value,
+            "mixed Trellis transform table",
+            (rows, width),
+            torch.float16,
+            caps.device,
+        )
+        return value[: min(rows, caps.weight_E)]
+
+    state = TrellisWeightState(
+        codebook="mcg",
+        bits=3,
+        gate_suh=prefix(rotations.gate_suh, caps.k, broadcast=True),
+        up_suh=prefix(rotations.up_suh, caps.k, broadcast=True),
+        down_svh=prefix(rotations.down_svh, caps.k, broadcast=True),
+        intermediate_rotations=prefix(rotations.intermediate, 3 * caps.n),
+    )
+    return state, tuple(tuple(row) for row in offsets), counts
 
 
 @dataclass(frozen=True)
@@ -418,10 +576,12 @@ class BackendPlan:
 
         if self.launches is None or self.lut is None:
             raise RuntimeError("SM103 Trellis plans must be prewarmed before binding")
-        if activation_amax is not None or unit_scale_contract:
+        if activation_amax is not None:
             raise UnsupportedArchitectureError(
-                "Trellis experts do not use activation calibration or unit-scale overrides"
+                "Trellis experts do not use activation calibration"
             )
+        # The public A16 binder sets unit_scale_contract. Trellis consumes
+        # FP16 activations directly and has no activation-scale arithmetic.
         caps = plan.caps
         if (
             not isinstance(experts, B12XFP4ExpertWeights)
@@ -429,25 +589,29 @@ class BackendPlan:
         ):
             raise ValueError("prepared Trellis experts do not match the plan")
         prepared = experts.representation_for("w4a16")
-        if (
-            not isinstance(prepared, PreparedW4A16MoeWeights)
-            or prepared.trellis is None
-        ):
-            raise ValueError(
-                "SM103 Trellis requires prepared native uniform-rate weights"
-            )
-        state = prepared.trellis
-        if (
-            state.bits not in projection_rates(caps.weight_plan)
-            or state.codebook != caps.weight_plan.trellis_codebook
-            or state.coupled_hadamard != caps.weight_plan.coupled_hadamard
-            or state.fc1_pair_kind is not None
-            or state.fc2_pair_kind is not None
-            or prepared.w13_layout != "trellis_t256_proj"
-        ):
-            raise ValueError(
-                "prepared Trellis layout, codebook, or transform differs from the plan"
-            )
+        mixed = projection_mixed(caps.weight_plan)
+        if mixed:
+            state, offsets, counts = _mixed_contract(caps, prepared)
+        else:
+            if (
+                not isinstance(prepared, PreparedW4A16MoeWeights)
+                or prepared.trellis is None
+            ):
+                raise ValueError(
+                    "SM103 Trellis requires prepared native uniform-rate weights"
+                )
+            state = prepared.trellis
+            if (
+                state.bits not in projection_rates(caps.weight_plan)
+                or state.codebook != caps.weight_plan.trellis_codebook
+                or state.coupled_hadamard != caps.weight_plan.coupled_hadamard
+                or state.fc1_pair_kind is not None
+                or state.fc2_pair_kind is not None
+                or prepared.w13_layout != "trellis_t256_proj"
+            ):
+                raise ValueError(
+                    "prepared Trellis layout, codebook, or transform differs from the plan"
+                )
         if a.ndim != 2 or not 0 < a.shape[0] <= caps.max_tokens:
             raise ValueError("Trellis activation rows exceed capacity")
         tokens, routes = a.shape[0], a.shape[0] * caps.num_topk
@@ -473,11 +637,15 @@ class BackendPlan:
                 _require_tensor(
                     tensor, name, (route_experts,), torch.int32, caps.device
                 )
-        words = caps.weight_E * (caps.k // 16) * (caps.n // 16) * 8 * state.bits
-        _require_tensor(
-            prepared.w13, "gate/up payload", (2 * words,), torch.int32, caps.device
-        )
-        _require_tensor(prepared.w2, "down payload", (words,), torch.int32, caps.device)
+        words = 0
+        if not mixed:
+            words = caps.weight_E * (caps.k // 16) * (caps.n // 16) * 8 * state.bits
+            _require_tensor(
+                prepared.w13, "gate/up payload", (2 * words,), torch.int32, caps.device
+            )
+            _require_tensor(
+                prepared.w2, "down payload", (words,), torch.int32, caps.device
+            )
         for name, tensor in (
             ("gate input scales", state.gate_suh),
             ("up input scales", state.up_suh),
@@ -551,6 +719,8 @@ class BackendPlan:
         inputs += tuple(
             t for t in (route_expert_map, output_expert_map) if t is not None
         )
+        if mixed:
+            inputs += (prepared.descriptor_map, prepared.global_to_combined)
         for tensor in inputs:
             if tensor.untyped_storage().data_ptr() in (
                 storage.untyped_storage().data_ptr(),
@@ -579,6 +749,57 @@ class BackendPlan:
                 ),
             )
         ]
+        if mixed:
+            calls.append(
+                (
+                    self.launches["compose_maps"],
+                    (
+                        pids,
+                        poutput_ids,
+                        pointer(c.Int32, prepared.global_to_combined),
+                        c.Int32(routes),
+                    ),
+                )
+            )
+
+        def projection_call(phase, source, target):
+            fc1 = phase < 2
+            if mixed:
+                payload = prepared.w13 if fc1 else prepared.w2
+                fn = self.launches["fc1_mixed" if fc1 else "fc2_mixed"]
+                args = (
+                    pointer(c.Float16, source),
+                    pointer(c.Uint32, payload),
+                    pointer(c.Uint8, self.lut),
+                    pids,
+                    pointer(c.Int32, prepared.descriptor_map),
+                    pointer(c.Float16, target),
+                    c.Int32(phase),
+                    c.Int64(prepared.descriptor_map.numel() // 3),
+                    c.Int64(payload.numel()),
+                    tuple(c.Int64(v) for v in offsets[phase]),
+                    tuple(c.Int32(v) for v in counts[phase]),
+                )
+            else:
+                payload = (
+                    (prepared.w13[:words] if phase == 0 else prepared.w13[words:])
+                    if fc1
+                    else prepared.w2
+                )
+                fn = self.launches[f"{'fc1' if fc1 else 'fc2'}_k{state.bits}"]
+                args = (
+                    pointer(c.Float16, source),
+                    pointer(c.Uint32, payload),
+                    pointer(c.Uint8, self.lut),
+                    pids,
+                    pointer(c.Float16, target),
+                )
+            return fn, args + (
+                c.Int32(routes),
+                c.Int64(caps.k if fc1 else caps.n),
+                c.Int64(caps.n if fc1 else caps.k),
+            )
+
         io_type = c.BFloat16 if caps.dtype == torch.bfloat16 else c.Float16
         for name, scales in (
             (("input_gate", state.gate_suh),)
@@ -598,29 +819,14 @@ class BackendPlan:
                     ),
                 )
             )
-        for name, payload, source in (
-            ("gate", prepared.w13[:words], views["input_gate"]),
-            (
-                "up",
-                prepared.w13[words:],
+        calls.append(projection_call(0, views["input_gate"], views["gate"]))
+        calls.append(
+            projection_call(
+                1,
                 views["input_gate"] if state.coupled_hadamard else views["input_up"],
-            ),
-        ):
-            calls.append(
-                (
-                    self.launches[f"fc1_k{state.bits}"],
-                    (
-                        pointer(c.Float16, source),
-                        pointer(c.Uint32, payload),
-                        pointer(c.Uint8, self.lut),
-                        pids,
-                        pointer(c.Float16, views[name]),
-                        c.Int32(routes),
-                        c.Int64(caps.k),
-                        c.Int64(caps.n),
-                    ),
-                )
+                views["up"],
             )
+        )
         calls.append(
             (
                 self.launches["intermediate"],
@@ -634,21 +840,7 @@ class BackendPlan:
                 ),
             )
         )
-        calls.append(
-            (
-                self.launches[f"fc2_k{state.bits}"],
-                (
-                    pointer(c.Float16, views["activated"]),
-                    pointer(c.Uint32, prepared.w2),
-                    pointer(c.Uint8, self.lut),
-                    pids,
-                    pointer(c.Float16, views["down"]),
-                    c.Int32(routes),
-                    c.Int64(caps.n),
-                    c.Int64(caps.k),
-                ),
-            )
-        )
+        calls.append(projection_call(2, views["activated"], views["down"]))
         out_type = c.Float32 if output.dtype == torch.float32 else io_type
         calls.append(
             (

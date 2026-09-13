@@ -57,6 +57,8 @@ class PreparedProjectionTrellisWeights:
     intermediate_size: int
     num_experts: int
     params_dtype: torch.dtype
+    descriptor_local_bits: int = 8
+    down_counts: tuple[int, int, int] | None = None
     source_format: str = "b12x_trellis"
     w13_layout: str = "trellis_t256_proj"
     weight_layout: str = "trellis_mixed3"
@@ -660,6 +662,7 @@ def _projection_prepared(
         down_tiers,
         tier_slots=(num_experts, num_experts, num_experts),
         device=weights.atoms.device,
+        local_index_bits=24 if num_experts > 256 else 8,
     )
     broadcast_input = int(gate_suh.shape[0]) == 1
     broadcast_output = int(down_svh.shape[0]) == 1
@@ -692,6 +695,8 @@ def _projection_prepared(
         rotations=rotations,
         gate_counts=gate_counts,
         up_counts=up_counts,
+        down_counts=tuple(len(tier[2]) for tier in memberships),
+        descriptor_local_bits=24 if num_experts > 256 else 8,
         w13=combined_w13,
         w2=combined_w2,
         w13_scale=dummy_scale,

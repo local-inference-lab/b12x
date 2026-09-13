@@ -681,3 +681,50 @@ The deferred suite includes V4.1 geometry with E=384, H=5120, I=2304 and top-k=6
 Canonical MCG, mixed/paired rates and the mixed-rate descriptor limit of 256
 experts remain implementation work. Full V4.1/DFlash2 serving, compressed sparse
 MLA, mHC/MTP and Station direct-HBM transport remain separate gaps.
+
+## Projection-tiered MCG expert execution
+
+The native `tcgen05_trellis` backend consumes canonical MCG K3/K4/K5 weights
+with independent rates for gate, up and down projections. Each projection
+selects its compressed record from the existing coalesced payload and decodes
+it into shared memory before FP16 tcgen05 MMA. The uniform and mixed kernels
+share TMEM allocation, completion waits and the FP16 epilogue. Ordinary H128
+transforms support SiLU/SiTU and FP16/BF16 public I/O. Paired/grouped records
+and coupled mixed-rate transforms remain unsupported.
+
+Canonical preparation uses 24 local-index bits above 256 experts, covering
+all 384 experts while retaining Int32 descriptors. SM12x retains its eight-bit
+format. Bind validates coalesced payload ownership and projection counts, and
+passes tier offsets, populated counts and payload lengths as runtime scalars.
+A fixed set of 15 callables serves all rate distributions and live counts.
+Nine launches include route mapping, prepared namespace composition, transforms,
+three projections and weighted reduction. The public A16 binder's unit-scale
+flag is accepted without activation-scale arithmetic; rejecting that flag had
+prevented canonical native Trellis binding, including uniform-rate execution.
+
+Validation: 515 host tests pass with 59 hardware-dependent skips. SM120 passes
+71 tests normally and under memcheck and synccheck, with 20 native SM103 cases
+skipped and zero reported kernel errors. Exact operand checks cover all three
+rates, projection rows, descriptor widths, route-ID widths, invalid metadata,
+K/N tails and graph mutation. A mostly uninitialized 8.64 GB payload places
+local expert record 205 beyond 2^31 Int32 words and validates its first operand
+tiles. Preparation preserves source records for mixed and uniform populations
+at E=5 and E=384. Existing SM120 uniform and mixed expert execution agrees with
+the independent decoded-weight/transform oracle.
+
+The offline corpus contains 470 callables and 478 CUDA entry points. The 34
+added callables use 12–140 allocated GPRs with no stack or local memory.
+Existing artifacts have no positive resource or R/UR/P/UP register-count
+deltas and no instruction-count changes. All 104 TMEM readers have explicit
+completion waits. The 31 existing stack-flagged callables remain recorded.
+Wheel and sdist contain identical copies of 456 Python files and three profiles.
+The MoE config schema is 6 and candidate contract is 21; embedded measurements
+are unchanged. `sm103-trellis-mixed-validation.json` records commands and hashes.
+
+Native mixed expert numerics and graphs remain unqualified on SM103. The
+`trellis_mixed` qualification suite includes seven native cases with 384-expert
+and V4.1 geometry, live counts 1/3/4/8, frozen resolution, descriptor/payload
+mutation and allocation checks. Compressed DeepSeek sparse MLA, checkpoint
+formats requiring paired/grouped or coupled mixed rates, mHC/MTP and DFlash2
+integration, complete GLM/V4.1 serving and Station direct-HBM transport remain
+implementation work.

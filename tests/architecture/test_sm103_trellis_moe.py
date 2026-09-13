@@ -15,11 +15,11 @@ from tests.architecture.test_sm103 import B300
 from tests.moe.test_trellis_config import _k3_config, _glm_config
 
 
-def weight_plan(coupled=True, mixed=False):
+def weight_plan(coupled=True, mixed=False, canonical=False):
     config = _glm_config() if mixed else _k3_config()
     if not coupled:
         config["transform"]["expert"] = {"kind": "none"}
-    return fused_moe.plan_weights(
+    result = fused_moe.plan_weights(
         source=fused_moe.TrellisConfig.from_dict(config),
         activation=fused_moe.ActivationSpec(
             mode="a16",
@@ -29,10 +29,40 @@ def weight_plan(coupled=True, mixed=False):
         geometry=fused_moe.MoEGeometry(
             num_experts=384, hidden_size=5120, intermediate_size=2304
         ),
-    )._impl
+    )
+    return result if canonical else result._impl
 
 
-def caps(monkeypatch, *, coupled=True, **kwargs):
+def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
+    public = weight_plan(coupled, mixed=mixed, canonical=True)
+    public = replace(
+        public,
+        _impl=capacity.weight_plan,
+        geometry=fused_moe.MoEGeometry(
+            num_experts=capacity.weight_E,
+            hidden_size=capacity.k,
+            intermediate_size=capacity.n,
+        ),
+    )
+    experts = fused_moe.PreparedExperts(plan=public, _impl=experts)
+    execution = fused_moe.plan_execution(
+        experts=experts,
+        policy=capacity.policy_context,
+        capacity=fused_moe.ExecutionCapacity(
+            max_tokens=capacity.max_tokens,
+            top_k=capacity.num_topk,
+            warmup_token_counts=(1, 4),
+            route_num_experts=capacity.route_num_experts,
+        ),
+    )
+    # Compiler stubs let the public host binding exercise the exact prepared
+    # native launch ABI without creating a CUDA context.
+    execution._impl = plan
+    execution._prewarmed = True
+    return execution, experts
+
+
+def caps(monkeypatch, *, coupled=True, mixed=False, **kwargs):
     import b12x.policy.context as context
 
     monkeypatch.setattr(
@@ -44,7 +74,7 @@ def caps(monkeypatch, *, coupled=True, **kwargs):
         max_tokens=8,
         num_topk=8,
         device="cpu",
-        weight_plan=weight_plan(coupled),
+        weight_plan=weight_plan(coupled, mixed=mixed),
         quant_mode="w4a16",
         core_token_counts=(1, 4, 8),
         route_num_experts=768,
@@ -97,9 +127,8 @@ def test_public_scratch_plan_and_policy(coupled, monkeypatch):
         plan._backend_plan.prewarm(plan)
 
 
-def test_unsupported_mixed_and_coupled_geometry_fail_before_compile():
-    with pytest.raises(NotImplementedError, match="uniform projection"):
-        backend.validate_weight_plan(weight_plan(coupled=False, mixed=True))
+def test_mixed_plan_is_supported_and_invalid_coupled_geometry_fails():
+    backend.validate_weight_plan(weight_plan(coupled=False, mixed=True))
     with pytest.raises(NotImplementedError, match="divisible by 512"):
         backend.validate_weight_plan(replace(weight_plan(), hidden_size=4992))
 
@@ -211,6 +240,18 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
     a = torch.empty(8, 512, dtype=torch.bfloat16)
     weights = torch.empty(8, 2)
     mapping = torch.tensor([0, 1, 2, -1, 0, 1], dtype=torch.int32)
+    execution, public_experts = canonical_execution(
+        capacity, plan, experts, coupled=coupled
+    )
+    public_bound = fused_moe.bind(
+        execution,
+        scratch=scratch,
+        a=a[:1],
+        experts=public_experts,
+        topk_ids=torch.zeros(1, 2, dtype=torch.int64),
+        topk_weights=weights[:1],
+    )
+    assert len(public_bound._backend_binding.calls) == (7 if coupled else 8)
     for live in (8, 1, 4, 3):
         for dtype in (torch.int32, torch.int64):
             ids = torch.empty(live, 2, dtype=dtype)

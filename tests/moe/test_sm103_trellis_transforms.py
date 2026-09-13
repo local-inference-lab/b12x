@@ -319,3 +319,70 @@ def test_large_expert_scale_offsets():
         atol=0.00001,
         rtol=0.001,
     )
+
+
+def test_prepared_expert_map_composition_live_counts_and_graph():
+    _require_gpu()
+    import cuda.bindings.driver as cuda
+    import cutlass as c
+    import cutlass.cute as cute
+    from b12x._lib.architecture import architecture_for
+    from b12x.moe._shared.kernels.sm103.launch import pointer
+    from b12x.moe._shared.kernels.sm103.trellis_transforms import ComposeExpertMaps
+
+    experts, capacity = 384, 259
+    mapping = (
+        torch.arange(experts, dtype=torch.int32, device="cuda").flip(0).contiguous()
+    )
+    mapping[1], mapping[3] = -1, experts
+    original = torch.arange(capacity, dtype=torch.int64, device="cuda") % experts
+    original[0], original[6], original[8] = experts - 1, -1, 2**32 + 1
+    original_output = original.flip(0).contiguous()
+    ids, out_ids = original.clone(), original_output.clone()
+    args = (pointer(c.Int64, ids), pointer(c.Int64, out_ids), pointer(c.Int32, mapping))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn = cute.compile(
+        ComposeExpertMaps(capacity, experts),
+        *args,
+        c.Int32(1),
+        stream,
+        options=f"--gpu-arch={architecture_for(torch.cuda.get_device_capability()).compilation_target}",
+    )
+
+    def expected(values):
+        result = mapping[values.clamp(0, experts - 1)].long()
+        return result.masked_fill(
+            (values < 0) | (values >= experts) | (result < 0) | (result >= experts), -1
+        )
+
+    with patch.object(
+        cute, "compile", side_effect=AssertionError("resolution is frozen")
+    ):
+        for live in (capacity, 1, 128, 129):
+            ids.copy_(original)
+            out_ids.copy_(original_output)
+            fn(*args, c.Int32(live), stream)
+            ei = expected(original[:live])
+            eo = expected(original_output[:live]).masked_fill(ei < 0, -1)
+            torch.testing.assert_close(ids[:live], ei)
+            torch.testing.assert_close(out_ids[:live], eo)
+            torch.testing.assert_close(ids[live:], original[live:])
+            torch.testing.assert_close(out_ids[live:], original_output[live:])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn(
+                *args,
+                c.Int32(capacity),
+                cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            )
+        mapping[4] = 0
+        ids.copy_(original)
+        out_ids.copy_(original_output)
+        ei = expected(original)
+        eo = expected(original_output).masked_fill(ei < 0, -1)
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        torch.testing.assert_close(ids, ei)
+        torch.testing.assert_close(out_ids, eo)
