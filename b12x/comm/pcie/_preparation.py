@@ -8,6 +8,7 @@ from ._tuning import PcieConfig, PcieQuery, TUNING
 
 
 _OWNER_SURFACES = frozenset((
+    "PagedKvReplica.replicate",
     "DcpTopKOwnerExchange.stage_candidates",
     "VocabParallelArgmax.fused_add_argmax",
     "PCIeHierarchicalAllReduce.all_reduce",

@@ -34,6 +34,7 @@ SURFACES = {
     "DcpAllToAllPool.all_gather_pair_kimi_topk": (2, 4, 8, 16),
     "DcpAllToAllPool.kimi_topk16": (2, 4, 8, 16),
     "DcpTopKOwnerExchange.stage_candidates": (2, 3, 4, 6, 8),
+    "PagedKvReplica.replicate": (4,),
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
     "PCIeHierarchicalAllReduce.all_reduce": (12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
@@ -78,8 +79,16 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(
             "PCIe collectives require caller-established CUDA IPC topology"
         )
+    if query.surface == "PagedKvReplica.replicate":
+        call = query.call
+        if (call["ratio"] not in (1, 2) or call["page_size"] not in (128, 256)
+                or type(call["stripe"]) is not int or call["stripe"] <= 0
+                or call["page_size"] % call["stripe"]):
+            raise ValueError("unsupported DS4.1 replica compression/page/stripe geometry")
+        if not 0 < call["max_tokens"] <= query.setup["max_tokens"]:
+            raise ValueError("replica declaration exceeds the channel's token capacity")
 
 
-TUNING = replace(TUNING, query_schema_version=3, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=4, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]
