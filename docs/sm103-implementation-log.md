@@ -933,3 +933,51 @@ Tensor/block FP8 serving capacity and workspace, DeepSeek output projection,
 remaining Trellis formats, GLM/DeepSeek speculative feedback, complete model
 execution and Station direct-HBM transport remain implementation or integration
 work. SM121 regression and physical SM103 qualification remain outstanding.
+
+## Tensor and compact block-FP8 serving workspace
+
+Status: implemented and cross-compiled; physical SM103 execution remains
+unqualified. Tensor-FP8 and compact K128 block-FP8 calls accept caller-owned
+output and scratch. Scratch covers input padding, unit activation scales and
+split-K partials. Tensor-FP8 prewarm prepares declared capacities without caching
+unit-scale tensors by live row count. Internally owned allocations use the
+requested launch stream so scratch cannot be recycled before that stream retires.
+The companion adapters retain configured capacities and native quantization
+buffers in shared workspace, including tensor FP8 with different BF16/FP16 input
+and output dtypes.
+
+Long-K FP16 regression exposed a shared SM12x policy error: FP16 output could
+select a BF16 atomic split-K epilogue. The policy now restricts BF16 atomics to
+BF16 output. FP16 retains its split count and uses FP32 partials plus a typed
+CuTe reduction. The reduction's compile contract is 2. Existing BF16 atomic
+accumulation and its rounding behavior remain unchanged.
+
+The native group quantizer and Torch division can select adjacent FP8 values at
+rounding midpoints because their FP32 scales differ by approximately one ULP.
+The independent oracle checks scales within relative 2^-22 and admits only
+adjacent codes within relative 2^-21 of the midpoint. It then checks GEMM using
+independently decoded quantized operands. BF16 relative L2 must remain below
+0.005, FP16 below 0.001, and cosine similarity above 0.99999. FP16 and physical
+SM103 replay require exact eager equality; SM12x BF16 retains numeric checks for
+unordered atomic sums.
+
+Validation: 519 b12x host tests pass with 173 hardware skips, and 193 SM120
+operator tests pass with 18 skips. Ten focused workspace tests pass both
+memcheck and synccheck with zero kernel errors. The companion passes 54 host
+tests and 58 GPU cases under both sanitizers with zero kernel errors, including
+all 38 FP4/MXFP8 regressions. API reporting is disabled only for the recorded
+CUDA-Python/SM120 driver probe mismatch. The
+[FP8 serving receipt](sm103-fp8-serving-validation.json) binds sources,
+commands and artifacts. The targeted SM103
+corpus covers 19 FP8 and 38 dense/reduction callables. Existing resources, exact
+register counts and instruction counts have no increases against the recorded
+baselines. All 22 dense TMEM readers retain completion waits. Two added FP16
+reductions have no stack/local-memory flags. Wheel and sdist match 459 package
+Python files and three embedded profiles. These are operator checks; complete
+model evaluation remains outstanding.
+
+DeepSeek output projection, paired/grouped or coupled mixed-rate Trellis,
+GLM/DeepSeek speculative feedback, complete model execution, and Station HBM
+transport remain implementation or integration work. SM121 regression and
+physical SM103 qualification remain outstanding. The companion still uses the
+recorded precompiled native libraries rather than a build of its Python revision.

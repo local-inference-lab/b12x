@@ -1430,6 +1430,9 @@ def compile_blockscaled(out):
                 for split in (2, 4, 8):
                     case = f"a16_reduce_s{split}"
                     a16._get_compiled_dense_split_k_reduce(136, split, 0)
+                for split in (2, 4):
+                    case = f"dense_reduce_float16_s{split}"
+                    a16._get_compiled_dense_split_k_reduce(136, split, 0, "float16")
     return launches
 
 

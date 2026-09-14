@@ -1610,3 +1610,15 @@ def test_expected_m_prefill_hint_for_narrow_n():
     assert small == base
     assert prefill == (64, 128)
     assert no_hint_decode == (16, 64)
+
+
+@pytest.mark.parametrize("c_dtype", (cutlass.BFloat16, cutlass.Float16, cutlass.Float32))
+def test_block_fp8_split_accumulation_matches_output_dtype(c_dtype, monkeypatch):
+    monkeypatch.setattr(dense_module, "_B12X_DENSE_SPLITK_TURBO", True)
+    policy = _dense_gemm_policy_for(
+        m=3, n=4096, k=4096, l=1, ab_dtype=cutlass.Float8E4M3FN,
+        c_dtype=c_dtype, mma_tiler_mn=(32, 64), cluster_shape_mn=(1, 1),
+        sm_count=LOW_SM, expected_m=4, generalize_block_fp8_split_k=True,
+    )
+    assert policy.split_k_slices == 4
+    assert policy.split_k_atomic_bf16 == (c_dtype == cutlass.BFloat16)

@@ -93,6 +93,8 @@ def mm_block_fp8(
     plan: Plan,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
+    out: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run compact 128x128 block-FP8 operands."""
     return mm(
@@ -105,6 +107,8 @@ def mm_block_fp8(
         sf_vec_size=128,
         block_fp8=True,
         stream=stream,
+        out=out,
+        workspace=workspace,
     )
 
 

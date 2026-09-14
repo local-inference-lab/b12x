@@ -1,0 +1,208 @@
+{
+  "schema": "b12x.sm103.fp8_serving.validation.v1",
+  "recorded_at_utc": "2026-09-14T12:06:53.534869+00:00",
+  "status": "implemented; host and SM120 operator regressions pass; physical SM103 and full-model execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claims": false,
+  "sanitizer_scope": "Kernel memcheck and synccheck; API reporting disabled only for the recorded SM120 CUDA-Python/driver probe mismatch. Enable API checks on SM103.",
+  "limitations": [
+    "Targeted 19 FP8 and 38 dense/reduction callables compiled; no full-corpus rebuild or physical SM103 execution",
+    "DeepSeek output projection, remaining Trellis formats, GLM/DeepSeek speculative feedback, full-model execution and Station direct-HBM transport remain implementation or integration work",
+    "SM121 runtime regression has not been rerun for this change",
+    "Companion native libraries come from the recorded official precompiled revision, not a build of the companion Python source"
+  ],
+  "base_revision": "070681c59ae024726572ee9bd21a7f2f3c973898",
+  "source_sha256": "4d80447c37ca35b9236c34f58d2af6ea38d1677f8c6532c6cc97896f96ab9516",
+  "compiled": [
+    {
+      "component": "blockscaled",
+      "callables": 38,
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-blockscaled-sm103-release/manifest.json",
+        "sha256": "a867949aab02b61a2c03f8dcf11c1fd420a76c4fbb3148793c71f032fafe5a95",
+        "bytes": 50295
+      },
+      "resources": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-blockscaled-resources-release.json",
+        "sha256": "0e48022e76c01cd5a930d05de8217c359880d38e66fa5375c8f1e8efa2129f03",
+        "bytes": 88881
+      }
+    },
+    {
+      "component": "fp8",
+      "callables": 19,
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-fp8-sm103-release/manifest.json",
+        "sha256": "973e4e6af7adb0a86c8a147bdb11bc4f2a55fc4a4b04f5aabc3a3c511ffd2b99",
+        "bytes": 25572
+      },
+      "resources": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-fp8-resources-release.json",
+        "sha256": "b6a9724c99bb125f73576cfdd4f10f615c03f5428d381739293336af579d1f90",
+        "bytes": 34687
+      }
+    }
+  ],
+  "validation": [
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/architecture",
+        "tests/policy/test_blockscaled_precision.py",
+        "tests/gemm/test_dense_gemm_expected_m.py",
+        "tests/gemm/test_sm103_fp8.py",
+        "tests/gemm/test_tensor_fp8_linear.py",
+        "tests/gemm/test_blockscaled_a16.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "passed": 519,
+      "skipped": 173,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-b12x-host-release.log",
+        "sha256": "7c412991ab84336ac040e55d1eed7c9179fe4a4627a4a8ae16608084bb7a90e1",
+        "bytes": 844
+      }
+    },
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_sm103_fp8.py",
+        "tests/gemm/test_tensor_fp8_linear.py",
+        "tests/gemm/test_blockscaled.py",
+        "tests/gemm/test_blockscaled_a16.py",
+        "tests/gemm/test_mxfp8_linear.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 193,
+      "skipped": 18,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-b12x-sm120-release.log",
+        "sha256": "b398d7badbc29f833fd2d0addfdd0840a114f1de30ba6a02bbef7813df63ad2a",
+        "bytes": 298
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_sm103_fp8.py",
+        "-k",
+        "caller_workspace or workspace_validation",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 10,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-b12x-memcheck-source-final.log",
+        "sha256": "4e64c7e255c9cf8c59467a1d5c80aa63d7f5d989899bc7444ff98b6e54050f9e",
+        "bytes": 177
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_sm103_fp8.py",
+        "-k",
+        "caller_workspace or workspace_validation",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 10,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-b12x-synccheck-source-final.log",
+        "sha256": "e3e20b4cec4ad8b059b18f0ce2337b8df2ff221d8b3caef6a2a0dc4386c51d93",
+        "bytes": 176
+      }
+    }
+  ],
+  "local_and_remote_sources_match": true,
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/fp8-serving-ripper-source-check.json",
+    "sha256": "89cb3de3763e54acf0fbd115816e975d5ba1fae3b51527c9377f8fbef0f08579",
+    "bytes": 655
+  },
+  "package": {
+    "files": 462,
+    "python_files": 459,
+    "profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "073cc1f5f360603b621f902f9ea0c788c765a57c952efa8f83add38e867cd707",
+        "bytes": 2586203
+      },
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "530a0ee05cf1c7810659dd2d07cc46a4150fbf5e15c07d4d5cca321c45c8efc7",
+        "bytes": 2358456
+      }
+    }
+  },
+  "changes": [
+    "Caller-owned tensor/compact block-FP8 output and workspace, including input padding, unit scales and split partials; owned allocations use the launch stream",
+    "Tensor-FP8 prewarm prepares declared capacities; serving no longer caches unit scales by live row counts",
+    "FP16 split-K uses FP32 partials and a typed CuTe reduction; BF16 atomic policy retained",
+    "Typed split reduction contract version 2; two added FP16 reductions cross-compile for SM103"
+  ],
+  "test_and_tool_sources": {
+    "scripts/compile_sm103.py": "a87fb6c50cdb68aac577d33ae44348ddec87ad8f617c277815915790d44cfcb3",
+    "scripts/qualify_sm103.py": "5da5383105267dfd747f92408af2e8e0622d302b277c405af3233a345de13377",
+    "tests/gemm/test_blockscaled.py": "07796c0cc5b2df48e22ef88b0422ac19b76b51013e25ccf652204a8f3883beab",
+    "tests/gemm/test_blockscaled_a16.py": "852d7cc0127e3deb1a7caa3ee4f273daa3c09b65139e8fe6b75c417ddf124f54",
+    "tests/gemm/test_dense_gemm_expected_m.py": "061ad5e6e3b1befa0b84e1b280f3a340f3b1f352cb372bf3b46f1bb0af313a83",
+    "tests/gemm/test_mxfp8_linear.py": "a023cf067d1bf79e60ec471812161f4198fe5e33cb8adde815689f6883116841",
+    "tests/gemm/test_sm103_fp8.py": "26923fe0b761529b5dd009bddb32c31cdb2e683338a0ed8ce19bae4206d7fc2b",
+    "tests/gemm/test_tensor_fp8_linear.py": "da5d3a2aaa5b2f4ff65955107d29dba28550314b3b17219a37e3e76ee2e466f7",
+    "tests/policy/test_blockscaled_precision.py": "df670c086bb8e5ece91aeb0d33e8c681f393cba94e0d3e82c2aa19867c26fd9d"
+  }
+}

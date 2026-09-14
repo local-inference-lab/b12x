@@ -545,7 +545,9 @@ def _dense_gemm_policy_for(
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
         split_k_slices=split_k_slices,
-        split_k_atomic_bf16=_B12X_DENSE_SPLITK_TURBO,
+        split_k_atomic_bf16=(
+            _B12X_DENSE_SPLITK_TURBO and c_dtype == cutlass.BFloat16
+        ),
         large_m_unroll=(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
         ),
@@ -7645,7 +7647,11 @@ def dense_gemm_fused_quant_a(
         cuda_stream_to_int(stream),
     )
     if split_storage is not None:
-        _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
+        if split_k_slices == 2:
+            _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
+        else:
+            dense_gemm_a16_reduce(split_storage, out, n=n, m=m,
+                                  slices=split_k_slices, stream=stream)
     return out
 
 
@@ -8186,6 +8192,7 @@ def dense_gemm(
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
                 _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                and c_cutlass_dtype == cutlass.BFloat16
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -8566,7 +8573,11 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        if split_k_slices == 2 and c_cutlass_dtype == cutlass.BFloat16:
+            _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        else:
+            dense_gemm_a16_reduce(split_storage, out, n=n, m=m,
+                                  slices=split_k_slices, stream=stream)
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()
