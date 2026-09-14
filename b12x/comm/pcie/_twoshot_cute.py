@@ -19,6 +19,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import (
@@ -895,6 +896,6 @@ def get_twoshot_launcher(
         )
         raw(*raw_args)
 
-    return run
+    return attach_programs(run, raw)
 
 __all__ = ["get_twoshot_launcher"]

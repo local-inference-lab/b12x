@@ -12,6 +12,7 @@ from typing import Mapping
 
 import torch
 
+from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x.preparation import (
     FrozenMapping, MemoryRequirements, PersistentMemory, Plan, PreparedCall,
@@ -275,7 +276,8 @@ def plan(query: PcieQuery, *, runtime, invocation: FrozenMapping = FrozenMapping
         required = int(query.setup["slab_nbytes"])
         return MemoryRequirements(persistent=(PersistentMemory((current_plan(), "pcie_twoshot_channel"), required, required),))
     def materialize(selection, device):
-        return _TwoShotExecutionState(query, runtime, MappingProxyType(compile_twoshot_surface(payload, device.ordinal)))
+        launchers = load_programs(compile_twoshot_surface(payload, device.ordinal))
+        return _TwoShotExecutionState(query, runtime, MappingProxyType(launchers))
     return Plan(contract=TUNING, query=query, invocation=FrozenMapping(invocation), override=override,
                 _compile_jobs=jobs, _memory_requirements=memory, _materialize=materialize, _device=runtime.device)
 
