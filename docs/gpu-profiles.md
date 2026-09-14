@@ -63,6 +63,13 @@ count when present and otherwise uses the prefill capacity, passing live M
 to the native launch. A live count within capacity does not declare another
 plan. Kernels with a static-M ABI still require their exact specialization.
 
+WO projection defaults to exact-M preparation. Its optional invocation
+`variable_tokens=True` permits live rows within a prepared capacity above 16.
+The ordinary native GEMMs and packing use the live count and group strides;
+small fused decode declarations remain exact. Preparing one large capacity
+therefore covers arbitrary prefix-replay suffixes without padding, changing
+precision, or declaring/JIT-compiling a serving-time plan.
+
 ## Selection and cache semantics
 
 Selection precedence is:
