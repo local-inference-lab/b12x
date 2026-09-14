@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Qwen and GLM MTP feedback through their public planned API.
+"""Benchmark Qwen, GLM and DeepSeek MTP feedback through the public planned API.
 
 The matrix covers single-token decode, a four-token speculative step, and
 four prefill sizes including a padded-row boundary. Every case validates the
@@ -118,7 +118,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--contract",
-        choices=("qwen_multistream", "rms_concat"),
+        choices=("qwen_multistream", "rms_concat", "rms_streams_fp8"),
         default="qwen_multistream",
     )
     parser.add_argument("--hidden-size", type=int)
@@ -219,7 +219,14 @@ def _make_binding(
 ) -> mtp.Binding:
     """Allocate and bind one case exclusively through the public lifecycle."""
 
-    hidden_size = hidden_size or (4096 if contract == "rms_concat" else _HIDDEN_SIZE)
+    hidden_size = (
+        hidden_size
+        or {
+            "qwen_multistream": _HIDDEN_SIZE,
+            "rms_concat": 4096,
+            "rms_streams_fp8": 5120,
+        }[contract]
+    )
     caps = mtp.Caps(
         device=device,
         max_tokens=capacity_tokens,
@@ -242,6 +249,40 @@ def _make_binding(
         dtype=_DTYPE,
         device=device,
     )
+    if contract == "rms_streams_fp8":
+
+        def randn(shape, scale):
+            return _randn_bf16(shape, scale=scale, generator=generator, device=device)
+
+        def weight_scale():
+            return (
+                torch.rand(
+                    (hidden_size // 128, hidden_size // 128),
+                    device=device,
+                    generator=generator,
+                )
+                * hidden_size**-0.5
+            )
+
+        return mtp.bind(
+            planned,
+            scratch=scratch,
+            token_embedding=randn((capacity_tokens, hidden_size), 0.4),
+            multi_state=randn((capacity_tokens, _STREAMS, hidden_size), 0.4),
+            token_norm_weight=1 + randn((hidden_size,), 0.05),
+            state_norm_weight=1 + randn((hidden_size,), 0.05),
+            embedding_fc_weight=randn((hidden_size, hidden_size), 2).to(
+                torch.float8_e4m3fn
+            ),
+            hidden_fc_weight=randn((hidden_size, hidden_size), 2).to(
+                torch.float8_e4m3fn
+            ),
+            embedding_fc_scale=weight_scale(),
+            hidden_fc_scale=weight_scale(),
+            positions=torch.arange(capacity_tokens, dtype=torch.int64, device=device),
+            output=output,
+            tokens=profile.tokens,
+        )
     if contract == "rms_concat":
 
         def randn(shape, scale):
@@ -417,7 +458,20 @@ def _benchmark_profile(
         contract=contract,
         hidden_size=hidden_size,
     )
-    if contract == "rms_concat":
+    if contract == "rms_streams_fp8":
+        reference = mtp.reference.rms_streams_fp8(
+            binding.token_embedding,
+            binding.multi_state,
+            binding.positions,
+            binding.token_norm_weight,
+            binding.state_norm_weight,
+            binding.embedding_fc_weight,
+            binding.hidden_fc_weight,
+            binding.embedding_fc_scale,
+            binding.hidden_fc_scale,
+            eps=eps,
+        )
+    elif contract == "rms_concat":
         reference = mtp.reference.rms_concat(
             binding.token_embedding,
             binding.multi_state,
@@ -616,7 +670,7 @@ def main(argv: list[str] | None = None) -> None:
         "kind": (
             _RESULT_KIND
             if args.contract == "qwen_multistream"
-            else "rms_concat_mtp_feedback_benchmark_v1"
+            else f"{args.contract}_mtp_feedback_benchmark_v1"
         ),
         "provenance": {
             "command": [sys.executable, *sys.argv],
@@ -628,22 +682,28 @@ def main(argv: list[str] | None = None) -> None:
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
         "contract": {
-            "model": "GLM RMS-concat"
-            if args.contract == "rms_concat"
-            else "Qwen3.8 Flash Next",
+            "model": {
+                "rms_concat": "GLM RMS-concat",
+                "rms_streams_fp8": "DeepSeek per-stream FP8",
+                "qwen_multistream": "Qwen3.8 Flash Next",
+            }[args.contract],
             "operator": "b12x.sequence.mtp_feedback",
             "api_lifecycle": ["Caps", "plan", "bind", "run"],
             "streams": 1 if args.contract == "rms_concat" else _STREAMS,
             "hidden_size": args.hidden_size
-            or (4096 if args.contract == "rms_concat" else _HIDDEN_SIZE),
+            or {
+                "rms_concat": 4096,
+                "rms_streams_fp8": 5120,
+                "qwen_multistream": _HIDDEN_SIZE,
+            }[args.contract],
             "dtype": "bfloat16",
             "recipe": args.contract,
             "reference": "b12x.sequence.mtp_feedback.reference."
-            + ("rms_concat" if args.contract == "rms_concat" else "feedback"),
+            + ("feedback" if args.contract == "qwen_multistream" else args.contract),
             "projection_backend": "cutedsl",
             "projection_specialization": "fixed_capacity_runtime_live_rows",
             "triton_role": None
-            if args.contract == "rms_concat"
+            if args.contract != "qwen_multistream"
             else "normalization_and_reduction_auxiliaries",
             "eager_timed": True,
             "cuda_graph_replay_timed": True,

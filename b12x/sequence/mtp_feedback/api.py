@@ -12,7 +12,7 @@ from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery
 
 def is_supported(device=None, *, contract="qwen_multistream") -> bool:
     """Check the architecture and toolchain for the selected feedback contract."""
-    if contract == "rms_concat":
+    if contract in {"rms_concat", "rms_streams_fp8"}:
         return default_is_supported(device, archs=("sm103a", "sm120a", "sm121a"))
     if contract == "qwen_multistream":
         return default_is_supported(

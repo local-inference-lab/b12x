@@ -5,6 +5,8 @@
 ``rms_concat`` masks zero-position embeddings, independently RMS-normalizes
 embedding and hidden state with ordinary learned weights, and projects their
 concatenation into BF16 ``[T,H]`` for GLM feedback.
+``rms_streams_fp8`` applies ordinary RMS independently to each hidden stream,
+then adds separate K128 block-FP8 projections into BF16 ``[T,S,H]`` for DeepSeek.
 
 ``plan(Caps(...), invocation=invocation_from_tensors(...))`` declares capacity
 and input alignment. ``PreparationSession`` compiles and primes the complete
@@ -48,9 +50,11 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Both contracts use CuTeDSL projections with runtime live-row grids. "
+        "All contracts use CuTeDSL projections with runtime live-row grids. "
         "Qwen S=4,H=2560 requires Triton normalization auxiliaries; RMS-concat "
         "uses CuTe normalization, S=1 and H divisible by 64 through 16384. "
+        "FP8 stream feedback uses CuTe normalization and activation quantization, "
+        "FP32 K128 scales, S<=16 and H divisible by 128 through 16384. "
         "SM103 runtime qualification requires physical B300 hardware."
     ),
 )
