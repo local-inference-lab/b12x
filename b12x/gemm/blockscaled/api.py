@@ -14,6 +14,7 @@ from ._linear import (
     blockscaled_mm as mm,
     pack_weight,
 )
+from ._packing import quantize_mxfp4
 from . import META
 from ._a16 import NVFP4LinearWeight, w4a16, w8a16
 

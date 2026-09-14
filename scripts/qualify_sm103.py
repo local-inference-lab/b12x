@@ -51,7 +51,7 @@ SUITES = {
         "tests/attention/test_fused_indexer.py",
     ],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
-    "blockscaled": ["tests/gemm/test_sm103_blockscaled.py"],
+    "blockscaled": ["tests/gemm/test_sm103_blockscaled.py", "tests/gemm/test_mxfp4_packing.py"],
     "fp8": ["tests/gemm/test_sm103_fp8.py"],
     "block_fp8_linear": ["tests/gemm/test_sm103_block_fp8_linear.py"],
     "fp6": ["tests/gemm/test_sm103_fp6.py", "tests/quantization/test_fp6_workspace.py", "tests/gemm/test_fp6_smem_packing.py"],

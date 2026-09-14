@@ -304,12 +304,14 @@ def test_mm_pair_replays_under_cuda_graph() -> None:
             graph.reset()
 
 
-def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None:
+@pytest.mark.parametrize("n,k", [(128, 256), (1024, 4096)])
+def test_mm_serialized_mxfp4_matches_independent_dequantized_reference(monkeypatch, n, k) -> None:
     """Non-unit E8M0 scales catch scale-fragment ordering regressions."""
 
     require_b12x()
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(20260823)
-    m, n, k = 6, 128, 256
+    m = 6
     lhs_source = torch.randn((m, k), device="cuda") * 0.3
     rhs_source = torch.randn((n, k), device="cuda") * 0.3
     lhs_values, lhs_scale_rows = _quantize_mxfp4_rows(lhs_source)
