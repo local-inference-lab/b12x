@@ -404,8 +404,13 @@ def _coupled_rows(
     *,
     intermediate_size: int,
     device: torch.device,
+    global_intermediate_size: int | None = None,
+    intermediate_offset: int = 0,
 ) -> torch.Tensor:
     draws_host = draws.detach().cpu()
+    global_size = (
+        intermediate_size if global_intermediate_size is None else global_intermediate_size
+    )
     signs = torch.empty(
         (int(values.shape[0]), 3 * intermediate_size), dtype=torch.float16
     )
@@ -413,8 +418,12 @@ def _coupled_rows(
         if not 0 <= draw < 8:
             raise ValueError("expert_transform_draws values must be in 0..7")
         rows = torch.nonzero(draws_host == draw, as_tuple=False).flatten()
-        pre = _coupled_rotation_signs(2 * intermediate_size, draw=draw, axis=1)
-        post = _coupled_rotation_signs(intermediate_size, draw=draw, axis=2)
+        pre = _coupled_rotation_signs(2 * global_size, draw=draw, axis=1)[
+            2 * intermediate_offset : 2 * (intermediate_offset + intermediate_size)
+        ]
+        post = _coupled_rotation_signs(global_size, draw=draw, axis=2)[
+            intermediate_offset : intermediate_offset + intermediate_size
+        ]
         signs.index_copy_(
             0,
             rows,
@@ -449,12 +458,63 @@ def _expert_transform_rows(
     )
     if tuple(draws.shape) != (num_experts,):
         raise ValueError(f"expert_transform_draws must be uint8[{num_experts}]")
-    if torch.count_nonzero(draws).item():
-        raise NotImplementedError(
-            "rank-local coupled_hadamard preparation requires all-zero expert_transform_draws"
+    if torch.any(draws > 7).item():
+        raise ValueError("expert_transform_draws values must be in 0..7")
+    if weights.global_intermediate_size is None and torch.count_nonzero(draws).item():
+        raise ValueError(
+            "nonzero expert_transform_draws require global_intermediate_size"
         )
     return True, _coupled_rows(
-        values, draws, intermediate_size=intermediate_size, device=weights.atoms.device
+        values,
+        draws,
+        intermediate_size=intermediate_size,
+        device=weights.atoms.device,
+        global_intermediate_size=weights.global_intermediate_size,
+        intermediate_offset=weights.intermediate_offset,
+    )
+
+
+def _validate_extent(
+    config: TrellisConfig, weights: TrellisWeights, intermediate_size: int
+) -> None:
+    global_size = weights.global_intermediate_size
+    if global_size is None:
+        return
+    begin = weights.intermediate_offset
+    end = begin + intermediate_size
+    if end > global_size:
+        raise ValueError("Trellis rank extent exceeds global_intermediate_size")
+    if config.transform.expert.kind == "coupled_hadamard":
+        block = config.transform.expert.post_block_size
+        if any(value % block for value in (global_size, begin, intermediate_size)):
+            raise ValueError(
+                "coupled Trellis rank extent must contain complete post-transform blocks"
+            )
+
+
+def _coupled_input_scales(
+    weights: TrellisWeights,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    intermediate_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if gate.data_ptr() == up.data_ptr():
+        return gate, gate
+    global_size = weights.global_intermediate_size
+    if global_size is None:
+        raise ValueError(
+            "coupled Trellis requires shared input scales or an explicit global extent"
+        )
+    begin = weights.intermediate_offset
+    end = begin + intermediate_size
+    # Coupled FC1 stores the global preactivation axis as two physical slots.
+    # A rank inside either half uses that half's input scale for both slots.
+    if 2 * end <= global_size:
+        return gate, gate
+    if 2 * begin >= global_size:
+        return up, up
+    raise NotImplementedError(
+        "coupled Trellis extents crossing the input-scale half boundary require shared input scales"
     )
 
 
@@ -760,6 +820,7 @@ def prepare_trellis_weights(
             "atoms first dimension must equal intermediate_size/32: "
             f"got {int(atoms.shape[0])} rows for I={intermediate_size}"
         )
+    _validate_extent(config, weights, intermediate_size)
     if config.transform.projection.kind != "scaled_hadamard" or (
         config.transform.projection.block_size != 128
     ):
@@ -793,6 +854,10 @@ def prepare_trellis_weights(
         hidden_size=hidden_size,
         device=device,
     )
+    if config.transform.expert.kind == "coupled_hadamard":
+        gate_suh, up_suh = _coupled_input_scales(
+            weights, gate_suh, up_suh, intermediate_size
+        )
     intermediate = _effective_intermediate_scales(
         weights.intermediate_scales,
         scale.intermediate_scales,

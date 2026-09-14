@@ -1189,3 +1189,37 @@ Paired/grouped records, nonzero transform draws, complete checkpoint and
 speculative execution, model evaluation, matching native/ARM64 builds,
 SM121 regression, the final full-source corpus and Station HBM transport
 remain open. No B300 runtime or performance result is claimed.
+
+
+## Global coordinates for coupled expert draws
+
+Status: implemented; complete SM103 expert execution remains unqualified.
+Canonical `TrellisWeights` carries the global intermediate width and rank
+channel offset. Nonzero expert draws require those coordinates. Preparation
+slices the global preactivation/postactivation sign sequences, validates draw
+IDs and aligned extents, and selects the shared input scale for extents inside
+either global FC1 half. Residual draws remain zero, matching the frozen encoder
+contract documented in [MoE execution](moe-execution-model.md).
+
+The [draw-extent receipt](sm103-trellis-draw-extents-validation.json) records
+641 host tests, 55 SM120 GPU tests, and 20 targeted cases passing both memcheck
+and synccheck with zero errors. Canonical SQG and MCG extents match BTX packed
+words, transform tables and reference outputs in both halves, with broadcast
+and per-expert scale tables. All eight draws match frozen encoder bytes under
+Torch 2.13 and 2.14. Uniform SQG execution and portable transform replay use
+nonzero prepared signs; 27 complete-expert SM103 cases remain deferred.
+
+The Trellis compile contains 176 callables with byte-identical PTX relative to
+the coupled mixed-rate receipt. Of their cubins, 147 are byte-identical. The
+29 changed cubins retain identical allocated resources, exact register sets
+and instruction counts: 28 differ only in register operands, while the private
+SQG FP16 K5 FC1 variant also differs in instruction order and operand reuse.
+Raw identities remain distinct. The component has no stack/local-memory flags
+or positive resource deltas, and all 56 TMEM readers retain completion waits.
+The wheel and sdist match 460 package Python files and three embedded profiles;
+the extracted wheel exposes the extent fields outside the checkout.
+
+Paired/grouped records, coupled extents crossing distinct input-scale halves,
+full checkpoint/speculative execution, model evaluation, matching native/ARM64
+builds, SM121 regression, the final full-source corpus and Station HBM transport
+remain open.
