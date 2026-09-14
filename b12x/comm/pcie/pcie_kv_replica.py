@@ -65,14 +65,32 @@ class PCIePagedKvReplica(_IPCChannel):
             exchange_group=process_group,
             ipc=ipc,
             owned_buffers=(slab,),
-            stream_affine=True,
+            # Serial startup/profiling phases may change logical streams.
+            # _bind_stream below preserves ordering across those handoffs.
+            stream_affine=False,
         )
         self.rank, self.world_size = rank, world
         self.max_requests, self.max_tokens = max_requests, max_tokens
         self.local_capacity, self.slab_bytes = local, slab_bytes
         self.signal_ptrs = tuple(slab.peer_ptrs)
         self.staging_ptrs = tuple(ptr + offset for ptr in slab.peer_ptrs)
+        self._serial_stream = None
         return self
+
+    def _bind_stream(self):
+        # Capture uses a torch-owned stream, rather than the logical stream
+        # warmed by the caller. Graphs must replay serially on that logical
+        # stream; independent overlapping replay remains unsupported.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        stream = torch.cuda.current_stream(self.device)
+        previous = self._serial_stream
+        if previous is not None and previous.cuda_stream != stream.cuda_stream:
+            # Records an event at the previous stream's current tail, including
+            # attention consumers enqueued after its last replica copy. This is
+            # a device dependency, not a global or serving-time host synchronize.
+            stream.wait_stream(previous)
+        self._serial_stream = stream
 
     def replicate(
         self, cache, table, positions, starts, out, *, plan, requests, max_tokens
@@ -133,6 +151,8 @@ class PCIePagedKvReplica(_IPCChannel):
                 )
         if (
             cache.stride(-1) != 1
+            or cache.data_ptr() % 16
+            or out.data_ptr() % 16
             or cache.stride(0) < page * 288
             or cache.stride(0) % 16
             or (cache.ndim == 3 and cache.stride(1) != 288)
