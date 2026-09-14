@@ -1,0 +1,838 @@
+{
+  "schema_version": 1,
+  "status": "x86-64 core build and SM120 component regression qualified; full-model parity unresolved",
+  "b12x_revision": "88ab17ae8886fb61ad328076c46ce3512bb37b61",
+  "b12x_package_source_sha256": "f0c9076894bda5aa8b42cefb592735d3765e7dc919b79b9b26a0f75126aed2d0",
+  "configuration": {
+    "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+    "build_dir": "/models/b12x-sm103-validation/vllm-native-build",
+    "cuda_arch_list": "10.0f;12.0f",
+    "dependencies": {
+      "cutlass-src": {
+        "revision": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+        "status": ""
+      },
+      "deepgemm-src": {
+        "revision": "8b1392b978f5a03c828dd1711090d7fb50958b8a",
+        "status": ""
+      },
+      "flashkda-src": {
+        "revision": "ee0be888cd0e972f9409bf53756f8c38c6652173",
+        "status": ""
+      },
+      "flashmla-src": {
+        "revision": "a8f794d1251cbfd88a5011445dd5582289c727e4",
+        "status": ""
+      },
+      "fmha_sm100-src": {
+        "revision": "087c161814d4d9c735b46c21212a09e5f8eb92fa",
+        "status": ""
+      },
+      "qutlass-src": {
+        "revision": "e74319e3405ce6d71965732880f5dc1f52371f64",
+        "status": ""
+      },
+      "tml_fa4-src": {
+        "revision": "b206834606ed5b5f21f8eed6b0683f528ea9cf7d",
+        "status": ""
+      },
+      "triton_kernels-src": {
+        "revision": "0add68262ab0a2e33b84524346cb27cbb2787356",
+        "status": ""
+      },
+      "vllm-flash-attn-src": {
+        "revision": "f3e1a4f74c99145c0717709860bf765de1703779",
+        "status": ""
+      }
+    },
+    "cmake_cache_sha256": "3e1d9ad3b0217677030cdac5680b9e3fff7d0bfe2135604c94f05494d276469a",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+    "parallel_jobs": 16,
+    "cuda_visible_devices": "",
+    "cxx_version": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Aug_20_01:58:59_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0\n"
+  },
+  "gpus": "index, uuid, name, compute_cap, compute_mode, pstate, memory.used [MiB], clocks.current.sm [MHz], clocks.current.memory [MHz], clocks_event_reasons.active\n0, GPU-47363510-b87a-13a5-4824-2542e97df76c, NVIDIA RTX PRO 4000 Blackwell, 12.0, Default, P8, 2 MiB, 180 MHz, 405 MHz, 0x0000000000000000\n1, GPU-cc109c01-9756-d0db-21ea-f1825d3f963f, NVIDIA RTX PRO 4000 Blackwell, 12.0, Default, P8, 2 MiB, 180 MHz, 405 MHz, 0x0000000000000000\n",
+  "runtime_source_delta": {
+    "build_source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+    "files": 3309,
+    "differences": [
+      {
+        "path": "vllm/model_executor/layers/logits_processor.py",
+        "build_source_sha256": "36c5a32a55ab0fbb061d9632962ccfb33322c5a24f3fb2b237bb05740f0b3ad1",
+        "runtime_sha256": "09267de4e07eb0167a99fbc875b6fd4c5dd7002ed0cab7a2de2ed43cd3e3cade"
+      }
+    ],
+    "native_source_changed": false,
+    "runtime_source_revision": "1e6b809f00b5235d7b1d6711070d3eae8d5c8a18"
+  },
+  "source_verification": {
+    "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+    "files": 3309,
+    "manifest_sha256": "c33abb27fbd5522f3a69c6620979caa671bb8f0919b6d95b9db64eea019b92ba",
+    "mismatches": []
+  },
+  "runtime_source_verification": {
+    "status": "passed",
+    "source_revision": "1e6b809f00b5235d7b1d6711070d3eae8d5c8a18",
+    "manifest_sha256": "e20a5118f4ebc2799a6de9e2c8beefbd7b6dbdc0ef10a06e2fb93b872b90b298",
+    "files": 3309,
+    "mismatches": []
+  },
+  "codegen": {
+    "targets": [
+      "_C_stable_libtorch",
+      "_moe_C_stable_libtorch",
+      "cumem_allocator",
+      "fs_io_C",
+      "spinloop"
+    ],
+    "command_lines": 128,
+    "gpu_codegen": [
+      "arch=compute_100f,code=sm_100f",
+      "arch=compute_120f,code=sm_120f",
+      "arch=compute_80,code=compute_80",
+      "arch=compute_80,code=sm_80",
+      "arch=compute_89,code=compute_89",
+      "arch=compute_89,code=sm_89",
+      "arch=compute_90,code=compute_90",
+      "arch=compute_90,code=sm_90"
+    ],
+    "commands_sha256": "0b27441af332864111d2f71c6beb60d8dd5cd6ad88da742879825d865bbfbb7d",
+    "unexpected_sm100_arch_specific": false
+  },
+  "libraries": {
+    "_C_stable_libtorch": {
+      "build_path": "/models/b12x-sm103-validation/vllm-native-build/_C_stable_libtorch.abi3.so",
+      "runtime_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/_C_stable_libtorch.abi3.so",
+      "sha256": "10c74e0b2302a7e6553a38f62c95a13950bc7ef17436817d86b6d9f7a876469f",
+      "bytes": 52078904,
+      "elf_list": {
+        "path": "/models/b12x-sm103-validation/qwen-dflash2/_C_stable_libtorch-elf-list.txt",
+        "sha256": "8bd4482e7605c70fbd22d36da83296bc18e961d969b5979484ccf356773cb895"
+      }
+    },
+    "_moe_C_stable_libtorch": {
+      "build_path": "/models/b12x-sm103-validation/vllm-native-build/_moe_C_stable_libtorch.abi3.so",
+      "runtime_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/_moe_C_stable_libtorch.abi3.so",
+      "sha256": "eba5421dca47e4119d6c81583acb851bcf4c9e076d7e23c5354c2cd272013ab5",
+      "bytes": 38956232,
+      "elf_list": {
+        "path": "/models/b12x-sm103-validation/qwen-dflash2/_moe_C_stable_libtorch-elf-list.txt",
+        "sha256": "2d9a2ade3e672976a07fa448a224048ae0878eb82d9f7eb50d6b0fba66fbc96d"
+      }
+    },
+    "cumem_allocator": {
+      "build_path": "/models/b12x-sm103-validation/vllm-native-build/cumem_allocator.abi3.so",
+      "runtime_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/cumem_allocator.abi3.so",
+      "sha256": "4450b63aab07313b14a711121f6c08dcb738bee5a36cea75a96c5a69d7b59466",
+      "bytes": 27120
+    },
+    "fs_io_C": {
+      "build_path": "/models/b12x-sm103-validation/vllm-native-build/fs_io_C.abi3.so",
+      "runtime_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/fs_io_C.abi3.so",
+      "sha256": "c9c7500a6bc54c9e91285a27143a3ae6615c2c9de00ac7c8bdb9c345d8c0dc5e",
+      "bytes": 27448
+    },
+    "spinloop": {
+      "build_path": "/models/b12x-sm103-validation/vllm-native-build/spinloop.abi3.so",
+      "runtime_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/spinloop.abi3.so",
+      "sha256": "58e333f6c4644ff30e0dc534dca7adb14defb7bfd3ee136d2a4088316e9f6d01",
+      "bytes": 16728
+    }
+  },
+  "cpu_loading": {
+    "status": "passed",
+    "vllm_path": "/models/b12x-sm103-validation/vllm-native-runtime/vllm/__init__.py",
+    "cuda_initialized": false,
+    "libraries": [
+      "/models/b12x-sm103-validation/vllm-native-runtime/vllm/_C_stable_libtorch.abi3.so",
+      "/models/b12x-sm103-validation/vllm-native-runtime/vllm/_moe_C_stable_libtorch.abi3.so",
+      "/models/b12x-sm103-validation/vllm-native-runtime/vllm/cumem_allocator.abi3.so",
+      "/models/b12x-sm103-validation/vllm-native-runtime/vllm/fs_io_C.abi3.so",
+      "/models/b12x-sm103-validation/vllm-native-runtime/vllm/spinloop.abi3.so"
+    ],
+    "nvfp4_out_op": "_C.scaled_fp4_quant.out"
+  },
+  "sm120_tests": {
+    "native_core": {
+      "tests": "185",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "146.507"
+    },
+    "native_core_files": [
+      "tests/kernels/quantization/test_nvfp4_quant.py",
+      "tests/kernels/moe/test_b12x.py",
+      "tests/models/test_glm5next_model.py",
+      "tests/models/test_deepseek_v4_mega_moe.py",
+      "tests/models/test_dspark_mla.py"
+    ],
+    "head_dtype": {
+      "tests": "12",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "3.631"
+    },
+    "head_dtype_selection": "tests/v1/sample/test_head_dtype.py -k \"not e2e\"",
+    "host_only_attempt": "The local fixture could not infer a device; all 12 focused cases subsequently passed on the selected SM120 host."
+  },
+  "generation_cases": [
+    {
+      "name": "native-b12x-eager-two-block",
+      "status": "passed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "model dtype",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "576bba8f1bb2ca4b0e289d64293577d174f214e9a233232411779f8962effd3c"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "metrics": [],
+      "reference_mismatches": [],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-two-block.json",
+        "sha256": "73e1ba5071d0a23e0821a6ccbd7e3e6ff98a9703b4c9a532bbf56cca4158d2fb"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-two-block-command.json",
+        "sha256": "07ba3fe0e691a7fe248595219419d2c3e62991b889903d857207b056b79a1bbf"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-two-block.log",
+        "sha256": "07c8f3e3949e5680a1819f8c238f3bdecf8a85c18f4d1f3c10bb8c5e58a6798c"
+      },
+      "reference_sha256": "b81af1d461e913179de88ef4404a7bad6192945707e3868c05cde8c0d1a0ab8a"
+    },
+    {
+      "name": "native-b12x-graphs-two-block",
+      "status": "failed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "model dtype",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "576bba8f1bb2ca4b0e289d64293577d174f214e9a233232411779f8962effd3c"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 69
+        },
+        {
+          "target.cudagraph_manager": 69
+        }
+      ],
+      "metrics": [],
+      "reference_mismatches": [
+        {
+          "run": 1,
+          "request": 3,
+          "field": "token_ids"
+        }
+      ],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-two-block.json",
+        "sha256": "edbc89fc71172c0138041e742bd8bf4658da220d6c7d3dd6f3bdc7ad2e997904"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-two-block-command.json",
+        "sha256": "26aa89193d5ba48f25acde42769ff1d4e586e913f449e926941f5bcd21301891"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-two-block.log",
+        "sha256": "4010a31152f29deaf4466d754e3aab9f505b487e4b8b85d93ca88ea3ec55ad32"
+      },
+      "reference_sha256": "73e1ba5071d0a23e0821a6ccbd7e3e6ff98a9703b4c9a532bbf56cca4158d2fb",
+      "error": "AssertionError: Generation differs from the reference receipt"
+    },
+    {
+      "name": "native-b12x-eager-head-fp32",
+      "status": "failed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "float32",
+      "requests": 0,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "576bba8f1bb2ca4b0e289d64293577d174f214e9a233232411779f8962effd3c"
+      },
+      "prompt_tokens": [],
+      "cached_tokens": [],
+      "graph_replays_by_rank": [],
+      "metrics": [],
+      "reference_mismatches": [],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32.json",
+        "sha256": "b93ce7fa950b56a874bceafd0d347a78c0de98258c646650fe35bfa58e295274"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32-command.json",
+        "sha256": "1dd4ad27325f723826df66922dac21fe4fac3d8ea717d4f6aedf61f08cdfd5a1"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32.log",
+        "sha256": "b499f241fdcc83d4e58b337ae1c6a438abefe22e449ce953723e071e601b406f"
+      },
+      "error": "RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}",
+      "initialization_failure": "head_dtype guard rejected UnquantizedLinearMethod; no generation completed"
+    },
+    {
+      "name": "native-b12x-eager-head-fp32-guard-fixed",
+      "status": "passed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "float32",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "22f37271b1ed57f0a95c5e3e4e35ffbc65c2c757959609dff635361613c1ce05"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "metrics": [],
+      "reference_mismatches": [],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32-guard-fixed.json",
+        "sha256": "d8bd40e7a9249719381f3bfce82e9fd54e69a8c9d6adca952f3b84eaa7f18fa5"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32-guard-fixed-command.json",
+        "sha256": "07201fb5ad42d5911fe801fb038958972b8158e018eaa394160281c02c1109ff"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-eager-head-fp32-guard-fixed.log",
+        "sha256": "7af45dfa78bfceef1ecef498e52df00116afa9fae8e892833f1f6e8ea1796de6"
+      }
+    },
+    {
+      "name": "native-b12x-graphs-head-fp32",
+      "status": "failed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "float32",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "22f37271b1ed57f0a95c5e3e4e35ffbc65c2c757959609dff635361613c1ce05"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 67
+        },
+        {
+          "target.cudagraph_manager": 67
+        }
+      ],
+      "metrics": [],
+      "reference_mismatches": [
+        {
+          "run": 1,
+          "request": 1,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "token_ids"
+        }
+      ],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-head-fp32.json",
+        "sha256": "8139bbdc3028a99759ae4756627f9c07ef51278f935e53e99c0f19782595d4ce"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-head-fp32-command.json",
+        "sha256": "c8a37172d33b762d1fb8ddc3090b28c65b9315ef495291f133c08c819654e0b2"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-graphs-head-fp32.log",
+        "sha256": "fb460c98874d1a2f41971aa0eb3cce4e9bc68fafd4504e21fe01b8d498680d11"
+      },
+      "reference_sha256": "d8bd40e7a9249719381f3bfce82e9fd54e69a8c9d6adca952f3b84eaa7f18fa5",
+      "error": "AssertionError: Generation differs from the reference receipt"
+    },
+    {
+      "name": "native-b12x-dflash2-two-block",
+      "status": "failed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "model dtype",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "22f37271b1ed57f0a95c5e3e4e35ffbc65c2c757959609dff635361613c1ce05"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1648
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 19,
+          "draft.query_cudagraph_manager": 63
+        },
+        {
+          "target.cudagraph_manager": 19,
+          "draft.query_cudagraph_manager": 63
+        }
+      ],
+      "metrics": [
+        {
+          "name": "vllm:spec_decode_num_drafts",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 26
+        },
+        {
+          "name": "vllm:spec_decode_num_draft_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 182
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 85
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "values": [
+            24,
+            18,
+            10,
+            10,
+            9,
+            7,
+            7
+          ]
+        }
+      ],
+      "reference_mismatches": [
+        {
+          "run": 1,
+          "request": 1,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "finish_reason"
+        }
+      ],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-dflash2-two-block.json",
+        "sha256": "028ffb2f31d8d8e457c58f45b30b4fce10097c9f9e2e5f228a39b10178d37194"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-dflash2-two-block-command.json",
+        "sha256": "48c1491f6cb756a95789960b879056521a47a991f9b3d0835fe3c4ef83e29eef"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-dflash2-two-block.log",
+        "sha256": "c669a0102229f15a8dd3455b969bcb7d133a705d7d5ad5619c7037608a809b4d"
+      },
+      "reference_sha256": "73e1ba5071d0a23e0821a6ccbd7e3e6ff98a9703b4c9a532bbf56cca4158d2fb",
+      "error": "AssertionError: Generation differs from the reference receipt"
+    },
+    {
+      "name": "native-b12x-compiled-no-graphs-head-fp32",
+      "status": "passed",
+      "harness_sha256": "b42ba3f92935a58494ab2cf074a8121b32337d809912a091505304eb47efe0fd",
+      "head_dtype": "float32",
+      "requests": 6,
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "22f37271b1ed57f0a95c5e3e4e35ffbc65c2c757959609dff635361613c1ce05"
+      },
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "metrics": [],
+      "reference_mismatches": [],
+      "receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-compiled-no-graphs-head-fp32.json",
+        "sha256": "53d02a21f49c67c694ac02d261ec437981b82c8845686e2baf24e1316906d087"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-compiled-no-graphs-head-fp32-command.json",
+        "sha256": "2d852b2badb835fb68ddc75c26e2c0196d048e8cd1fe9d5494a6af0122338b22"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-b12x-compiled-no-graphs-head-fp32.log",
+        "sha256": "b8f9961144ea8e36993635c993c332dbadbd4ab97454cde13e126a345a87510c"
+      }
+    }
+  ],
+  "artifacts": {
+    "native-build-configuration-final.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-build-configuration-final.json",
+      "sha256": "08c551a7d50a7c14d387baae97045da5ea464700604cb7b716dacbe0e056ecf0"
+    },
+    "native-build-core-parallel.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-build-core-parallel.log",
+      "sha256": "0477e1a80ed2eef2776f228b9032212cf5b005f69a65c240e993d3c415607ca5"
+    },
+    "native-build-commands.txt": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-build-commands.txt",
+      "sha256": "0b27441af332864111d2f71c6beb60d8dd5cd6ad88da742879825d865bbfbb7d"
+    },
+    "native-command-audit.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-command-audit.json",
+      "sha256": "6a13258086998d9eb8ab1d9e08d3a256a6be8198c9cb23cb8af0742bb8359eab"
+    },
+    "native-built-libraries.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-built-libraries.json",
+      "sha256": "acf91c914a841c46dba1961c7e337ad6d2c0ba6aca3afafb07b610306cc9f877"
+    },
+    "native-source-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-source-manifest.json",
+      "sha256": "c33abb27fbd5522f3a69c6620979caa671bb8f0919b6d95b9db64eea019b92ba"
+    },
+    "native-source-verification-complete.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-source-verification-complete.json",
+      "sha256": "6c809b8fdbfff8a0eeb1f521c3cb27395bf79c2cc3d03c5ca31de0d5db1e1b98"
+    },
+    "native-runtime-source-verification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-runtime-source-verification.json",
+      "sha256": "633a460fe005045904081fde0ec150c48e2598a61260ee9279c5d1941727be62"
+    },
+    "native-test-source-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-test-source-manifest.json",
+      "sha256": "7b6a3b9f58ec384f964a45f1489bb49faba73bde96ff4715ce7b67eb69c3203b"
+    },
+    "native-runtime-head-dtype-source-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-runtime-head-dtype-source-manifest.json",
+      "sha256": "e20a5118f4ebc2799a6de9e2c8beefbd7b6dbdc0ef10a06e2fb93b872b90b298"
+    },
+    "native-runtime-head-dtype-source-verification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-runtime-head-dtype-source-verification.json",
+      "sha256": "f0571c695c088745a4b684604274c4fdab7c34531dd6e7ef39873b3592454b15"
+    },
+    "native-head-dtype-source-delta.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-head-dtype-source-delta.json",
+      "sha256": "40bb3e435a87dc0c9684cad0b4179fb2962080152cf3f65b5489dc3ccffc4f82"
+    },
+    "native-library-load.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-library-load.json",
+      "sha256": "bc0227289a56962d5beae20b8db148bd6069dfa5d448d8550b04af354e28f9a1"
+    },
+    "native-cublas-headers.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-cublas-headers.json",
+      "sha256": "d661f2130e76a6273e906e925cec3aefdb8a0b8db478092f69be664464b1661a"
+    },
+    "native-core-gpu.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-core-gpu.xml",
+      "sha256": "5728dd138cad310b1ab3ea88c133bb7ecf05576b84641805ab010e80214c68e3"
+    },
+    "native-core-gpu.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-core-gpu.log",
+      "sha256": "50ebf606cda1eb9237dde1fb3686850f181c61ce07e798a71fef2577b163df40"
+    },
+    "native-core-gpu-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-core-gpu-command.json",
+      "sha256": "9290b5b9b498010a78f1fb8cd4fe2c4f8acc85429d79b4af0d3558677fc7f154"
+    },
+    "head-dtype-gpu-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-gpu-command.json",
+      "sha256": "eedfe882b02bbfaf7c5837c6024957dc044b23f6bbc29369a29c43e87d53abe0"
+    },
+    "head-dtype-gpu.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-gpu.xml",
+      "sha256": "3a4f02a68b40ca39014cf97a2a58015cdd147c8c8eadb9ae67ee51c245ccef55"
+    },
+    "head-dtype-gpu.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-gpu.log",
+      "sha256": "e365613a171d361b3c3455d8faeef778c54c9e37315715f50895bee96646f330"
+    },
+    "head-dtype-host.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-host.log",
+      "sha256": "e16dcf81e4eb91e829f4710e695fad8db1616c77490bd13a1ff04a6487456c2f"
+    },
+    "head-dtype-precommit.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-precommit.log",
+      "sha256": "f336bbe4ee88c50afa18dc42954a549bbffeb366c5bb144fa80e1435de3d4072"
+    },
+    "head-dtype-commit.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/head-dtype-commit.log",
+      "sha256": "009f881c43ede2c83d226fd76c98894c591b3dca2a9345881c74d49ea11132c9"
+    },
+    "native-dflash2-core-comparison.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/native-dflash2-core-comparison.json",
+      "sha256": "9d039d1257e1b318d65b4010fdc1058f623fc9ea5b0712d624f2bee49762a9c9"
+    },
+    "compiled-graph-comparison.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/compiled-graph-comparison.json",
+      "sha256": "26ac1f51e3599b022a2b5961e794494fab49a47e6f435c329487ddfa92bec74e"
+    }
+  },
+  "limitations": [
+    "Only the five listed core libraries were built and staged. External native modules retain their precompiled identities.",
+    "The core libraries are compiled from companion revision 5e040862e127518c1cf5248c8f5113ab6d2e0985. The head_dtype runtime revision changes one Python file and its tests; native source is identical.",
+    "An sm_100f build target covers the Blackwell 10.x family; it does not establish execution on physical SM103 hardware.",
+    "The Qwen checkpoint implements Qwen3.5 hybrid attention/GDN, not the GLM or DeepSeek target contracts.",
+    "Exact token parity, full model accuracy, complete warmup and allocation-free serving remain unqualified.",
+    "No physical SM103 execution or performance measurement is included."
+  ],
+  "arm64_core_build": {
+    "status": "pending; bounded compiler continuation active at the recorded snapshot",
+    "source_verification": {
+      "status": "passed",
+      "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+      "manifest_sha256": "c33abb27fbd5522f3a69c6620979caa671bb8f0919b6d95b9db64eea019b92ba",
+      "files": 3309,
+      "mismatches": []
+    },
+    "progress_snapshot": {
+      "observed_at": "2026-09-14T19:12:47.313698+00:00",
+      "host": "maxwell",
+      "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+      "cuda_arch_list": "10.0f",
+      "cuda_visible_devices": "",
+      "unit": "b12x-sm103-arm64-build-swap.scope",
+      "properties": {
+        "Result": "success",
+        "MemoryCurrent": "6405984256",
+        "MemorySwapCurrent": "6709248",
+        "CPUQuotaPerSecUSec": "1s",
+        "MemoryHigh": "infinity",
+        "MemoryMax": "6442450944",
+        "MemorySwapMax": "8589934592",
+        "ActiveState": "active"
+      },
+      "existing_service_health_http": 200,
+      "build_directory": "/home/jasonc/vllm-sm103-arm64-20260914-build"
+    },
+    "failed_attempts": "The 3 GiB and 6 GiB attempts hit their memory cgroup limits. The continuation retains a 6 GiB resident-memory cap and allows up to 8 GiB swap.",
+    "artifacts": {
+      "source-verification.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/source-verification.json",
+        "sha256": "b64c092ca0b1137536c65df98f3646fd698bcfd54790eb3b672701cdb48f5c4e"
+      },
+      "configure.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/configure.log",
+        "sha256": "be5852b66b7b7a109371421b47ebd9df12e5ce76407b696a6adaa5a4cc445ca4"
+      },
+      "build-3g-oom.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-3g-oom.log",
+        "sha256": "bd1e3928a17883213deaa29f42e15ce49b845e07c1c8b1f968203d114352f332"
+      },
+      "build-6g-oom.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-6g-oom.log",
+        "sha256": "9ee558c5359a953239d06953d93348ef76019ae3491f91dc93e6715cb607ef96"
+      },
+      "build-core-6g-command.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-core-6g-command.json",
+        "sha256": "cfe675a402044614e8c2501d16ac93e872292fb4340822505bc259ee81b7c826"
+      },
+      "build-core-swap-command.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-core-swap-command.json",
+        "sha256": "5ab9e38baf18abd80ff990fbf5669450847f577cb35e3c2ba4df2a474282fe61"
+      },
+      "build-swap-memory-high-adjustment.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-swap-memory-high-adjustment.log",
+        "sha256": "80859529fa471bcd7dc55d5683107dcbc7db487781f96e669f667be9e8511630"
+      },
+      "build-progress-20260914.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-progress-20260914.json",
+        "sha256": "01fedf1674f946e6c53ad55f91840053c3a5339005bbd65913b1e139127ce16a"
+      }
+    }
+  }
+}
