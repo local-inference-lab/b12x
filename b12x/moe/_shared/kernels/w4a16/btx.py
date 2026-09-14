@@ -383,16 +383,21 @@ def prepare_btx_moe_weights(
         layer, device
     )
     rotations = intermediate
+    input_scale_split = None
     if manifest.hadamard.coupled:
         rotations = _coupled_rotation_rows(layer, intermediate, device)
         # The coupled residual transform interleaves gate/up into one
         # length-2I axis whose two stored halves each carry one input-side
-        # table; both physical FC1 slots of a rank use the half its extent
-        # lies in.
+        # table. Both physical FC1 slots use the same column-wise split.
         pre_half_slots = manifest.geometry.atom_slots // 2
-        source_suh = gate_suh if layer.first_slot < pre_half_slots else up_suh
-        gate_suh = source_suh
-        up_suh = source_suh
+        if layer.first_slot < pre_half_slots < layer.first_slot + layer.slot_count:
+            input_scale_split = (
+                pre_half_slots - layer.first_slot
+            ) * manifest.geometry.atom_channels
+        else:
+            source_suh = gate_suh if layer.first_slot < pre_half_slots else up_suh
+            gate_suh = source_suh
+            up_suh = source_suh
 
     if manifest.rates.structure == RATE_STRUCTURE_UNIFORM:
         assert manifest.rates.bits is not None
@@ -400,7 +405,13 @@ def prepare_btx_moe_weights(
         if tile_config is None:
             tile_config = (
                 (128, 128, 128, 128)
-                if manifest.hadamard.coupled and manifest.rates.bits == 2
+                if manifest.hadamard.coupled and (
+                    manifest.rates.bits == 2
+                    or (
+                        input_scale_split is not None
+                        and layer.local_intermediate_size % 256
+                    )
+                )
                 else (64, 256, 64, 256)
             )
         prepared = prepare_trellis256_moe_weights(
@@ -434,6 +445,7 @@ def prepare_btx_moe_weights(
                 prepared.trellis,
                 coupled_hadamard=True,
                 intermediate_rotations=rotations,
+                input_scale_split=input_scale_split,
             ),
         )
 

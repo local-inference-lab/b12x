@@ -98,7 +98,7 @@ def test_public_scratch_plan_and_policy(coupled, monkeypatch):
         a.offset + a.nbytes <= b.offset
         for a, b in zip(buffers, buffers[1:], strict=False)
     )
-    assert ("input_up" in {b.name for b in buffers}) is not coupled
+    assert "input_up" in {b.name for b in buffers}
     assert fused_moe.required_nbytes(capacity) == plan.scratch_specs()[0].nbytes
     query = fused_moe.MoeDecodeQuery(
         "w4a16", "b12x_trellis", capacity.activation, 384, 5120, 2304, 8, 8, 64
@@ -153,18 +153,20 @@ def test_canonical_rates_are_all_precompiled(monkeypatch):
 
     with patch.object(cute, "compile", side_effect=compile_fake):
         launches = backend.compile_launches(capacity, offline=True)
-    assert len(launches) == 18
+    assert len(launches) == 21
     assert {name for name in launches if name.startswith("fc")} == {
         f"{stage}_k{rate}" for stage in ("fc1", "fc2") for rate in (2, 3, 4)
-    }
+    } | {f"fc1_k{rate}_dual" for rate in (2, 3, 4)}
     assert all(entry[2]["no_jit_engine"] for entry in recorded)
     assert all(entry[2]["options"] == "--gpu-arch=sm_103a" for entry in recorded)
 
 
-@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize(
+    "coupled,split", [(False, None), (True, None), (True, 64), (True, 192)]
+)
 @pytest.mark.parametrize("bits", [2, 3, 4])
 def test_native_binding_retains_capacity_launches_and_checks_aliases(
-    monkeypatch, coupled, bits
+    monkeypatch, coupled, split, bits
 ):
     import cutlass.cute as cute
     from b12x.moe._shared.execution import PreparedWeightLayout
@@ -217,12 +219,13 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
             codebook="sqg_e4m3",
             bits=bits,
             gate_suh=scales,
-            up_suh=scales if coupled else scales.clone(),
+            up_suh=scales if coupled and split is None else scales.clone(),
             down_svh=scales.clone(),
             intermediate_rotations=torch.ones(
                 3, 256 * (6 if coupled else 3), dtype=torch.float16
             ),
             coupled_hadamard=coupled,
+            input_scale_split=split,
         ),
     )
     experts = _impl.B12XFP4ExpertWeights(
@@ -259,7 +262,9 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
         topk_ids=torch.zeros(1, 2, dtype=torch.int64),
         topk_weights=weights[:1],
     )
-    assert len(public_bound._backend_binding.calls) == (7 if coupled else 8)
+    assert len(public_bound._backend_binding.calls) == (
+        7 if coupled and split is None else 8
+    )
     for live in (8, 1, 4, 3):
         for dtype in (torch.int32, torch.int64):
             ids = torch.empty(live, 2, dtype=dtype)
@@ -281,7 +286,19 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
                 assert all(
                     fn in launches.values() for fn, _ in bound._backend_binding.calls
                 )
-                assert len(bound._backend_binding.calls) == (7 if coupled else 8)
+                assert len(bound._backend_binding.calls) == (
+                    7 if coupled and split is None else 8
+                )
+                fc1_name = f"fc1_k{bits}" + ("_dual" if split is not None else "")
+                selected = [
+                    args
+                    for fn, args in bound._backend_binding.calls
+                    if fn is launches[fc1_name]
+                ]
+                assert len(selected) == 2
+                if split is not None:
+                    assert all(int(args[0][2]) == split for args in selected)
+                    assert all(int(args[-3]) == 2 * live for args in selected)
                 external = torch.empty_like(a)
                 rebound = fused_moe.bind(plan, output=external, **kwargs)
                 assert rebound.output.data_ptr() == external.data_ptr()
@@ -290,3 +307,13 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
                 with pytest.raises(ValueError, match="planned output"):
                     forged = bound.output.view(torch.bfloat16).reshape(-1, 512)[:live]
                     fused_moe.bind(plan, output=forged, **kwargs)
+
+    for invalid in (0, 256, True, 64.0):
+        malformed = replace(
+            payload, trellis=replace(payload.trellis, input_scale_split=invalid)
+        )
+        bad_owner = replace(
+            experts, representation=replace(experts.representation, value=malformed)
+        )
+        with pytest.raises(ValueError, match="input-scale split"):
+            fused_moe.bind(plan, **{**kwargs, "experts": bad_owner})

@@ -167,6 +167,7 @@ def _moe_reference(
         rotations = prepared.rotations
         state = SimpleNamespace(
             coupled_hadamard=prepared.coupled_hadamard,
+            input_scale_split=prepared.input_scale_split,
             gate_suh=rotations.gate_suh[:experts],
             up_suh=rotations.up_suh[:experts],
             down_svh=rotations.down_svh[:experts],
@@ -211,8 +212,10 @@ def _moe_reference(
     )
     up_input = (
         gate_input
-        if state.coupled_hadamard
-        else input_rotation(source, device_ids, state.up_suh, topk_ids.shape[1], False)
+        if state.coupled_hadamard and state.input_scale_split is None
+        else input_rotation(
+            source, device_ids, state.up_suh, topk_ids.shape[1], state.coupled_hadamard
+        )
     )
     gate = torch.zeros((len(ids), width), device=source.device, dtype=torch.float16)
     up = torch.zeros_like(gate)
@@ -264,7 +267,17 @@ def _moe_reference(
         for projection, inputs, outputs in ((0, gate_input, gate), (1, up_input, up)):
             weight = projection_weight(projection, expert)
             if weight is not None:
-                outputs[rows] = (inputs[rows].float() @ weight.float().T).half()
+                if state.input_scale_split is None:
+                    outputs[rows] = (inputs[rows].float() @ weight.float().T).half()
+                else:
+                    split = state.input_scale_split
+                    outputs[rows] = torch.cat(
+                        (
+                            gate_input[rows].float() @ weight[:split].float().T,
+                            up_input[rows].float() @ weight[split:].float().T,
+                        ),
+                        dim=1,
+                    ).half()
     middle = intermediate_rotation(
         gate,
         up,

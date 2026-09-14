@@ -43,7 +43,7 @@ def test_projection_descriptor_format_is_explicit(bits):
         )
 
 
-def host_prepared(experts, uniform, coupled=False):
+def host_prepared(experts, uniform, coupled=False, split=None):
     from b12x.moe.fused_moe.trellis import (
         PreparedProjectionTrellisWeights,
         _coalesce_payloads,
@@ -90,7 +90,10 @@ def host_prepared(experts, uniform, coupled=False):
                 fc1_tile_n=128,
                 fc2_tile_n=128,
                 trellis=TrellisWeightState(
-                    codebook="mcg", bits=rate, coupled_hadamard=coupled
+                    codebook="mcg",
+                    bits=rate,
+                    coupled_hadamard=coupled,
+                    input_scale_split=split,
                 ),
             )
         )
@@ -109,7 +112,7 @@ def host_prepared(experts, uniform, coupled=False):
                 3 * experts, (6 if coupled else 3) * width, dtype=torch.float16
             ),
             gate_suh=gate,
-            up_suh=gate if coupled else gate.clone(),
+            up_suh=gate if coupled and split is None else gate.clone(),
             down_svh=torch.ones(1, hidden, dtype=torch.float16),
         ),
         gate_counts=counts[0],
@@ -128,13 +131,14 @@ def host_prepared(experts, uniform, coupled=False):
         params_dtype=torch.bfloat16,
         descriptor_local_bits=bits,
         coupled_hadamard=coupled,
+        input_scale_split=split,
     )
 
 
 @pytest.mark.parametrize("experts", [5, 384])
-@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("coupled,split", [(False, None), (True, None), (True, 64)])
 def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
-    monkeypatch, experts, coupled
+    monkeypatch, experts, coupled, split
 ):
     from dataclasses import replace
     from unittest.mock import patch
@@ -160,8 +164,12 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
     with patch.object(cute, "compile", side_effect=lambda *a, **kw: object()):
         launches = backend.compile_launches(capacity, offline=True)
-    assert len(launches) == 15
-    assert {k for k in launches if k.startswith("fc")} == {"fc1_mixed", "fc2_mixed"}
+    assert len(launches) == (16 if coupled else 15)
+    assert {k for k in launches if k.startswith("fc")} == (
+        {"fc1_mixed", "fc2_mixed", "fc1_mixed_dual"}
+        if coupled
+        else {"fc1_mixed", "fc2_mixed"}
+    )
     plan = replace(
         plan,
         _backend_plan=replace(
@@ -176,7 +184,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
     source, router = torch.empty(8, hidden, dtype=torch.bfloat16), torch.empty(8, 2)
     observed_counts = []
     for uniform in (False, True):
-        payload = host_prepared(experts, uniform, coupled)
+        payload = host_prepared(experts, uniform, coupled, split)
         state, offsets, counts = backend._mixed_contract(capacity, payload)
         assert state.coupled_hadamard is coupled
         assert (
@@ -213,14 +221,25 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
                         topk_weights=router[:live],
                     )
                     calls = bound._backend_binding.calls
-                    assert len(calls) == (8 if coupled else 9) and all(
-                        fn in launches.values() for fn, _ in calls
-                    )
+                    assert len(calls) == (
+                        8 if coupled and split is None else 9
+                    ) and all(fn in launches.values() for fn, _ in calls)
                     projection_calls = [
                         (fn, args)
                         for fn, args in calls
-                        if fn in (launches["fc1_mixed"], launches["fc2_mixed"])
+                        if fn
+                        in (
+                            launches[
+                                "fc1_mixed_dual" if split is not None else "fc1_mixed"
+                            ],
+                            launches["fc2_mixed"],
+                        )
                     ]
+                    assert len(projection_calls) == 3
+                    if split is not None:
+                        assert all(
+                            int(args[0][2]) == split for _, args in projection_calls[:2]
+                        )
                     for phase, (_, args) in enumerate(projection_calls):
                         assert int(args[6]) == phase and int(args[7]) == 3 * experts
                         assert tuple(int(v) for v in args[9]) == offsets[phase]
@@ -242,8 +261,10 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
             topk_ids=torch.zeros(1, 2, dtype=torch.int64),
             topk_weights=router[:1],
         )
-        assert len(public_bound._backend_binding.calls) == (8 if coupled else 9)
-        if coupled:
+        assert len(public_bound._backend_binding.calls) == (
+            8 if coupled and split is None else 9
+        )
+        if coupled and split is None:
             for corrupted, error in (
                 (replace(payload, coupled_hadamard=False), "tier transforms"),
                 (

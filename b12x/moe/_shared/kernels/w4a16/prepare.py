@@ -150,6 +150,9 @@ class TrellisWeightState:
     down_svh: torch.Tensor | None = None
     coupled_hadamard: bool = False
     tile_config: tuple[int, int, int, int] | None = None
+    # Coupled FC1 columns below this local coordinate use gate_suh; columns
+    # at or above it use up_suh in both physical projection slots.
+    input_scale_split: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2341,6 +2344,7 @@ def _finalize_prepared_trellis_weights(
     fc1_pair_modes: torch.Tensor | None,
     fc2_pair_modes: torch.Tensor | None,
     coupled_hadamard: bool = False,
+    input_scale_split: int | None = None,
 ) -> PreparedW4A16MoeWeights:
     """Shared validation and construction tail of the trellis preparers."""
 
@@ -2438,6 +2442,7 @@ def _finalize_prepared_trellis_weights(
             down_svh=down_svh,
             coupled_hadamard=coupled_hadamard,
             tile_config=tile_config,
+            input_scale_split=input_scale_split,
         ),
     )
 

@@ -93,8 +93,17 @@ encoder bytes and compares canonical prepared extents with the BTX reader.
 
 When input scales carry separate vectors for the two global FC1 halves, an
 extent wholly within one half uses that half's vector for both physical
-gate/up slots. An extent crossing that boundary requires a shared input-scale
-vector. Nonzero draws without global extent metadata, invalid draw IDs and
+gate/up slots. For an extent crossing the boundary, preparation retains both
+vectors and
+records the local split coordinate. The SM103 FC1 kernels stage the two
+transformed inputs in separate MMA rows and select the result per output
+column. A split inside a 128-column tile is supported. Both physical FC1
+slots use the same split. Capacity plans reserve both input buffers and
+precompile both projection variants; the split is a runtime scalar and does
+not enter a compile key. SM120/SM121 reject execution with distinct input-scale
+halves before prewarm. Uniform BTX extents use the same split and continue to
+enforce the manifest's declared extent barriers. Nonzero draws without global
+extent metadata, invalid draw IDs and
 misaligned extents fail during preparation. Zero-draw callers with a shared
 input vector may omit the global extent metadata.
 

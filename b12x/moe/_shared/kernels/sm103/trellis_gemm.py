@@ -27,7 +27,15 @@ class RoutedTrellisGemm:
     """
 
     def __init__(
-        self, n: int, k: int, experts: int, capacity: int, *, bits: int, codebook: str
+        self,
+        n: int,
+        k: int,
+        experts: int,
+        capacity: int,
+        *,
+        bits: int,
+        codebook: str,
+        dual_input: bool = False,
     ):
         self.codebook = decoder_contract(bits, codebook)
         if min(n, k, experts, capacity) <= 0 or n % 16 or k % 16:
@@ -40,11 +48,12 @@ class RoutedTrellisGemm:
             )
         self.n, self.k, self.experts, self.capacity = n, k, experts, capacity
         self.bits = bits
+        self.dual_input = dual_input
 
     @cute.jit
     def __call__(
         self,
-        a: cute.Pointer,
+        a,
         packed: cute.Pointer,
         lut: cute.Pointer,
         ids: cute.Pointer,
@@ -84,7 +93,7 @@ class RoutedTrellisGemm:
         n_base = Int64(block % cute.ceil_div(self.n, 128)) * 128
         route_ids = cute.make_tensor(ids, cute.make_layout(self.capacity))
         expert = Int64(route_ids[route])
-        source = cute.make_tensor(a, cute.make_layout(Int64(self.capacity) * a_stride))
+        source = self.input_tensors(a, a_stride)
         weights = cute.make_tensor(
             packed,
             cute.make_layout(
@@ -196,7 +205,9 @@ class RoutedTrellisGemm:
         cute.arch.fence_view_async_tmem_load()
         for item in cutlass.range_constexpr(cute.size(values)):
             row, col = coordinates[item]
-            if (row == 0) & (n_base + col < self.n):
+            if self.output_row(source, row, n_base + Int64(col)) & (
+                n_base + col < self.n
+            ):
                 output[route * out_stride + n_base + Int64(col)] = values[item].to(
                     Float16
                 )
@@ -206,7 +217,7 @@ class RoutedTrellisGemm:
     @cute.jit
     def stage_operands(
         self,
-        source: cute.Tensor,
+        source,
         weights: cute.Tensor,
         lut: cute.Pointer,
         expert: Int64,
@@ -222,13 +233,7 @@ class RoutedTrellisGemm:
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = Int32(thread % 32)
         valid = (expert >= 0) & (expert < self.experts)
-        for item in cutlass.range(thread, 128 * 64, 128):
-            row, col = item // 64, item % 64
-            value = Float16(0)
-            kk = Int64(stage) * 64 + Int64(col)
-            if valid & (row == 0) & (kk < self.k):
-                value = source[route * a_stride + kk]
-            sA[row, col] = value
+        self.stage_inputs(source, valid, route, a_stride, stage, sA)
         # A warp reconstructs a native 16x16 tile with its original lane map.
         for tile in cutlass.range(warp, 32, 4):
             local_k, local_n = tile // 8, tile % 8
@@ -247,3 +252,46 @@ class RoutedTrellisGemm:
             for j in cutlass.range_constexpr(8):
                 nn, kk = tile_coordinates(lane, j)
                 sB[local_n * 16 + nn, local_k * 16 + kk] = decoded[j]
+
+    @cute.jit
+    def input_tensors(self, a, stride: Int64):
+        layout = cute.make_layout(Int64(self.capacity) * stride)
+        if cutlass.const_expr(self.dual_input):
+            source = (
+                cute.make_tensor(a[0], layout),
+                cute.make_tensor(a[1], layout),
+                a[2],
+            )
+        else:
+            source = cute.make_tensor(a, layout)
+        return source
+
+    @cute.jit
+    def stage_inputs(
+        self, source, valid, route: Int64, stride: Int64, stage: Int32, sA
+    ):
+        thread, _, _ = cute.arch.thread_idx()
+        for item in cutlass.range(thread, 128 * 64, 128):
+            row, col = item // 64, item % 64
+            value = Float16(0)
+            kk = Int64(stage) * 64 + Int64(col)
+            if cutlass.const_expr(self.dual_input):
+                if valid & (kk < self.k):
+                    if row == 0:
+                        value = source[0][route * stride + kk]
+                    elif row == 1:
+                        value = source[1][route * stride + kk]
+            else:
+                if valid & (row == 0) & (kk < self.k):
+                    value = source[route * stride + kk]
+            sA[row, col] = value
+
+    @cute.jit
+    def output_row(self, source, row, column: Int64):
+        # Both physical FC1 slots share this split. A boundary inside a CTA
+        # selects between two MMA rows separately for every output column.
+        if cutlass.const_expr(self.dual_input):
+            selected = row == Int32(column >= source[2])
+        else:
+            selected = row == 0
+        return selected

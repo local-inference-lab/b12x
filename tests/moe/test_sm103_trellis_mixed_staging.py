@@ -23,7 +23,7 @@ class InspectMixedOperands:
     @cute.jit
     def __call__(
         self,
-        a: cute.Pointer,
+        a,
         packed: cute.Pointer,
         lut: cute.Pointer,
         ids: cute.Pointer,
@@ -85,9 +85,7 @@ class InspectMixedOperands:
         sb = allocator.allocate_tensor(
             c.Float16, layout.outer, 128, swizzle=layout.inner
         )
-        source = cute.make_tensor(
-            a, cute.make_layout(self.projection.capacity * self.projection.k)
-        )
+        source = self.projection.input_tensors(a, c.Int64(self.projection.k))
         weights = cute.make_tensor(packed, cute.make_layout(packed_words))
         routes = cute.make_tensor(ids, cute.make_layout(self.projection.capacity))
         table = cute.make_tensor(descriptors, cute.make_layout(3 * descriptor_stride))
@@ -134,9 +132,12 @@ def _require_gpu():
         pytest.skip("physical Blackwell GPU required")
 
 
+@pytest.mark.parametrize("dual_input", [False, True])
 @pytest.mark.parametrize("local_bits", [8, 24])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_mixed_records_projection_rows_tails_and_graph(local_bits, id_dtype):
+def test_mixed_records_projection_rows_tails_and_graph(
+    local_bits, id_dtype, dual_input
+):
     _require_gpu()
     torch.manual_seed(992)
     experts, routes, n, k = 5, 9, 144, 80
@@ -204,8 +205,18 @@ def test_mixed_records_projection_rows_tails_and_graph(local_bits, id_dtype):
             c.Int64(n_base),
         ]
 
+    alternate = -source
+    if dual_input:
+        args[0] = (args[0], pointer(c.Float16, alternate), c.Int64(64))
     kernel = InspectMixedOperands(
-        RoutedMixedTrellisGemm(n, k, experts, routes, descriptor_local_bits=local_bits)
+        RoutedMixedTrellisGemm(
+            n,
+            k,
+            experts,
+            routes,
+            descriptor_local_bits=local_bits,
+            dual_input=dual_input,
+        )
     )
     fn = cute.compile(
         kernel,
@@ -221,6 +232,10 @@ def test_mixed_records_projection_rows_tails_and_graph(local_bits, id_dtype):
             if 0 <= expert < experts:
                 k_len, n_len = min(64, k - stage * 64), min(128, n - n_base)
                 result[row, 0, 0, :k_len] = source[row, stage * 64 : stage * 64 + k_len]
+                if dual_input:
+                    result[row, 0, 1, :k_len] = alternate[
+                        row, stage * 64 : stage * 64 + k_len
+                    ]
                 result[row, 1, :n_len, :k_len] = decoded[projection, expert][
                     n_base : n_base + n_len, stage * 64 : stage * 64 + k_len
                 ]
@@ -246,15 +261,16 @@ def test_mixed_records_projection_rows_tails_and_graph(local_bits, id_dtype):
                 cuda.CUstream(torch.cuda.current_stream().cuda_stream),
             )
         source[:5].neg_()
+        alternate[:5].mul_(0.5)
         ids[:5] = ids[:5].flip(0)
         changed = expected(2, routes, 0, 0)
         addresses = tuple(
             t.data_ptr() for t in (source, ids, descriptors, packed, output)
         )
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.cuda.memory_stats()["allocated_bytes.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
         assert (
             tuple(t.data_ptr() for t in (source, ids, descriptors, packed, output))
             == addresses
