@@ -604,8 +604,10 @@ def test_trellis_scratch_plan_preserves_exact_fixed_capacity(
     assert plan.layout.total_nbytes == plan.layout.core_workspace_nbytes
 
 
+@pytest.mark.parametrize("intermediate", (512, 1152))
 def test_trellis_scratch_plan_resolves_default_route_block(
     monkeypatch: pytest.MonkeyPatch,
+    intermediate: int,
 ) -> None:
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     monkeypatch.setattr(
@@ -621,9 +623,8 @@ def test_trellis_scratch_plan_resolves_default_route_block(
         params_dtype=torch.bfloat16,
         num_experts=256,
         hidden_size=6144,
-        intermediate_size=512,
+        intermediate_size=intermediate,
         trellis_bits=3,
-        trellis_tile_config=(64, 256, 64, 256),
     )
     caps = TPMoEScratchCaps(
         max_tokens=3072,
@@ -638,6 +639,8 @@ def test_trellis_scratch_plan_resolves_default_route_block(
     plan = plan_tp_moe_scratch(caps)
 
     assert plan._core_workspace_plan.route_block_size_m == 64
+    tile_n = 256 if intermediate % 256 == 0 else 128
+    assert plan._core_workspace_plan.trellis_tile_config == (64, tile_n, 64, tile_n)
     assert plan.layout.core_token_counts[0] == 3072
     assert 4096 not in plan.layout.core_token_counts
 

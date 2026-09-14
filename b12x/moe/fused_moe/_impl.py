@@ -81,6 +81,7 @@ from b12x.moe._shared.execution import (
     PreparedWeightLayout,
     WeightPreparationTransform,
     WorkScheduler,
+    default_trellis_tile_config,
     lower_moe_execution,
     make_moe_spec,
     plan_moe_weight_preparation,
@@ -3275,7 +3276,9 @@ def _plan_core_workspace(
                 )
             if int(trellis_bits) not in (2, 3, 4, 5, 6):
                 raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
-            trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
+            trellis_tile_config = trellis_tile_config or default_trellis_tile_config(
+                int(k), int(n)
+            )
             if trellis_pair_kinds and (int(trellis_bits) != 3 or int(n) != 256):
                 raise ValueError(
                     "per-expert-pair btx extents require n=256 and trellis_bits=3"
