@@ -394,9 +394,9 @@ class MoEWeightPreparationPlan:
                         f"or {{P33,P43}}; got {sorted(pair_kinds)}"
                     )
             elif granularity == "per_expert_projection":
-                if self.coupled_hadamard:
+                if self.coupled_hadamard and self.source_format != "b12x_trellis":
                     raise ValueError(
-                        "coupled-Hadamard trellis execution requires uniform rates"
+                        "projection-tiered coupled Trellis requires canonical b12x_trellis weights"
                     )
                 if self.trellis_codebook != _TRELLIS_MCG:
                     raise ValueError(
@@ -421,10 +421,12 @@ class MoEWeightPreparationPlan:
                 )
             )
             if self.coupled_hadamard:
-                if self.trellis_codebook != _TRELLIS_SQG_E4M3:
+                if self.trellis_codebook != _TRELLIS_SQG_E4M3 and not (
+                    self.source_format == "b12x_trellis"
+                    and self.trellis_codebook == _TRELLIS_MCG
+                ):
                     raise ValueError(
-                        "coupled-Hadamard Trellis execution is qualified only"
-                        " for the sqg_e4m3 codebook"
+                        "coupled Trellis requires SQG E4M3 or canonical MCG weights"
                     )
                 if blocks is None:
                     blocks = (512, 128)

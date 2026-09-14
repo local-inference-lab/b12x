@@ -136,12 +136,14 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
         )
     expert = source.transform.expert
     if expert.kind == "coupled_hadamard" and (
-        source.codebook.value != "sqg_e4m3"
-        or source.rate.granularity.value != "uniform"
+        source.codebook.value != "mcg"
+        and (
+            source.codebook.value != "sqg_e4m3"
+            or source.rate.granularity.value != "uniform"
+        )
     ):
         raise NotImplementedError(
-            "fused MoE coupled_hadamard execution currently requires the "
-            "sqg_e4m3 codebook with uniform rates"
+            "coupled_hadamard preparation requires MCG or uniform SQG E4M3 rates"
         )
     if expert.kind == "coupled_hadamard" and (
         expert.pre_block_size,

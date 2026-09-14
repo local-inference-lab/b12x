@@ -110,10 +110,6 @@ def validate_weight_plan(weight_plan):
         raise UnsupportedArchitectureError(
             "SM103 Trellis requires uniform or MCG projection rates; paired/grouped records remain unsupported"
         )
-    if projection_mixed(weight_plan) and weight_plan.coupled_hadamard:
-        raise UnsupportedArchitectureError(
-            "MCG projection-tiered Trellis requires ordinary expert transforms"
-        )
     validate_codebook_bits(weight_plan.trellis_codebook, weight_plan.trellis_bits)
     if weight_plan.coupled_hadamard and (
         weight_plan.hidden_size % 512 or weight_plan.activation != "situ"
@@ -474,6 +470,8 @@ def _mixed_contract(caps, prepared):
         payload = prepared.tiers[tier]
         if payload.trellis_codebook != "mcg" or payload.trellis_bits != bit:
             raise ValueError("mixed Trellis tier order must be MCG K3/K4/K5")
+        if payload.coupled_hadamard != prepared.coupled_hadamard:
+            raise ValueError("mixed Trellis tier transforms must match the prepared owner")
         for value, owner, cursor, count in (
             (payload.w13, prepared.w13, cursor13, counts[0][tier] + counts[1][tier]),
             (payload.w2, prepared.w2, cursor2, counts[2][tier]),
@@ -518,7 +516,10 @@ def _mixed_contract(caps, prepared):
         gate_suh=prefix(rotations.gate_suh, caps.k, broadcast=True),
         up_suh=prefix(rotations.up_suh, caps.k, broadcast=True),
         down_svh=prefix(rotations.down_svh, caps.k, broadcast=True),
-        intermediate_rotations=prefix(rotations.intermediate, 3 * caps.n),
+        intermediate_rotations=prefix(
+            rotations.intermediate, (6 if prepared.coupled_hadamard else 3) * caps.n
+        ),
+        coupled_hadamard=prepared.coupled_hadamard,
     )
     return state, tuple(tuple(row) for row in offsets), counts
 
@@ -592,6 +593,8 @@ class BackendPlan:
         mixed = projection_mixed(caps.weight_plan)
         if mixed:
             state, offsets, counts = _mixed_contract(caps, prepared)
+            if state.coupled_hadamard != caps.weight_plan.coupled_hadamard:
+                raise ValueError("prepared mixed Trellis transform differs from the plan")
         else:
             if (
                 not isinstance(prepared, PreparedW4A16MoeWeights)
