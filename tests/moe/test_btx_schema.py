@@ -203,6 +203,54 @@ def test_bundle_byte_arithmetic_matches_frozen_sizes() -> None:
     assert bundle_bytes(3584, rate_code(3, 3), rate_code(3, 3)) == 129_024
 
 
+def test_v41_pair_extents_partition_uneven_tp_without_splitting_records():
+    data = _per_expert_manifest_dict()
+    data["geometry"].update(intermediate_size=2304, atom_slots=72)
+    data["layout"].update(extent_alignment_slots=8, extent_barriers=[])
+    manifest = BtxManifest.from_dict(data)
+    assert manifest.partition_extents(2) == ((0, 40), (40, 32))
+    for world_size in range(1, 10):
+        extents = manifest.partition_extents(world_size)
+        assert len(extents) == world_size
+        assert sum(size for _, size in extents) == 72
+        assert [slot for start, size in extents for slot in range(start, start + size)] == list(range(72))
+        for start, size in extents:
+            manifest.validate_extent(start, size)
+    with pytest.raises(ValueError, match="nonempty aligned"):
+        manifest.partition_extents(10)
+
+
+def test_rank_partition_respects_multiple_unequal_barrier_segments():
+    data = _uniform_manifest_dict()
+    data["geometry"].update(intermediate_size=2304, atom_slots=72)
+    data["layout"].update(extent_alignment_slots=4, extent_barriers=[8, 48])
+    manifest = BtxManifest.from_dict(data)
+    assert manifest.partition_extents(3) == ((0, 8), (8, 40), (48, 24))
+    for world_size in range(3, 19):
+        extents = manifest.partition_extents(world_size)
+        assert len(extents) == world_size
+        assert [slot for start, size in extents for slot in range(start, start + size)] == list(range(72))
+        for start, size in extents:
+            manifest.validate_extent(start, size)
+    with pytest.raises(ValueError, match="barriers"):
+        manifest.partition_extents(2)
+
+
+@pytest.mark.parametrize("world_size", [0, -1, True, 2.5])
+def test_rank_partition_rejects_invalid_world_size(world_size):
+    manifest = BtxManifest.from_dict(_uniform_manifest_dict())
+    with pytest.raises(ValueError, match="positive integer"):
+        manifest.partition_extents(world_size)
+
+
+def test_rank_partition_rejects_barriers_inside_alignment_units():
+    data = _uniform_manifest_dict()
+    data["layout"]["extent_barriers"] = [6]
+    manifest = BtxManifest.from_dict(data)
+    with pytest.raises(ValueError, match="barriers must align"):
+        manifest.partition_extents(2)
+
+
 def _small_config(**overrides) -> BtxSynthConfig:
     defaults = dict(
         codebook="sqg_e4m3",
