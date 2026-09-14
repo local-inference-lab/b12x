@@ -1088,3 +1088,40 @@ from admitting the incomplete model route. Remaining checkpoint formats,
 GLM/DeepSeek speculative feedback, full model evaluation, Station direct-HBM
 transport, matching native/ARM64 builds, SM121 regression and the complete
 representative SM103 rebuild remain outstanding.
+
+
+## Compressed attention capacity ownership and public prewarm
+
+Status: implemented; physical SM103 and complete model execution remain
+unqualified. Compressed MLA exposes public capacity prewarm for optional
+indexed caches, sink, native V4.1 page mapping and both LSE scales. Native
+bound execution stages selections into fixed scratch and chooses split/head
+schedules from planned rows. SM121 dispatch uses semantic widths; optional
+SWA-only prefill has reserved container storage even when the indexed route
+uses decode. Binding still constructs views without device writes.
+
+The companion owner retains configured decode/extend plans, derives separate
+cache widths and page sizes, and reserves query/metadata/component scratch
+before capture. Each owner prepares state before warmup deduplication. Stride
+normalization handles singleton views that report contiguous storage with a
+noncanonical row stride. Graphs retain the binding and staging buffers; output
+belongs to the caller. The existing model attention boundary remains opaque to
+Torch compilation.
+
+The [compressed serving receipt](sm103-compressed-serving-validation.json)
+binds source, packaging, compile and runtime checks. Host coverage includes
+capacity preparation, rejected capture/frozen warmup, per-owner deduplication
+and optional Spark staging. GPU checks exercise independent reference math,
+poisoned scratch/output, input mutation, changing live rows/widths, fixed
+addresses, allocation counters and high page IDs. V4.1 freezes kernel resolution
+before the first real invocation after public prewarm. All 147 SM103 cubins
+remain byte-identical to the inspected component baseline, including four
+prefill stack/local-access flags.
+
+The indexer audit identifies both removed legacy DSA exports and live row/page
+width planning in the companion adapters. Those interfaces require public
+plan/bind/run migration and retained ownership before aggregate DeepSeek SM103
+admission. Model evaluation, checkpoint/speculative contracts, matching native
+and ARM64 packaging, final full-corpus compilation and Station HBM transport
+remain open. The inspected GB10 host has an active vLLM worker; SM121 GPU
+regression remains deferred without disrupting that service.

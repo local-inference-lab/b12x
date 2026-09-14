@@ -271,7 +271,7 @@ def test_indexer_common_plan_selects_sm12x_c4_decode_routes(
 
     plan = plan_indexer_scratch(
         B12XIndexerScratchCaps(
-            device="cuda",
+            device="cuda:0",
             source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=64,
             max_q_rows=rows,
@@ -557,6 +557,20 @@ def test_sparse_mla_scratch_plan_exposes_one_opaque_arena_spec() -> None:
     assert plan.layout.nbytes == specs[0].nbytes
 
 
+@pytest.mark.parametrize("indexed_width", [0, 256, 1024])
+def test_compressed_spark_staging_reserves_optional_swa_only_prefill(monkeypatch, indexed_width):
+    from b12x.attention.compressed_sparse_mla import _scratch
+    from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 1))
+    caps = _scratch.B12XCompressedSparseMLAScratchCaps(
+        device="cuda:0", num_q_heads=32, max_q_rows=19,
+        max_width=65 + indexed_width, swa_width=65, indexed_width=indexed_width,
+        swa_page_size=64, indexed_page_size=64,
+    )
+    assert _scratch._selection_widths(caps, SparseMlaConfig(max_chunks_per_row=4)) == (512, indexed_width)
+
+
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_sparse_mla_scratch_can_expose_head_major_output(mode: str) -> None:
     caps = B12XSparseMLAScratchCaps(
@@ -804,25 +818,18 @@ def test_indexer_contiguous_plan_bind_returns_common_binding_type() -> None:
     assert binding.lengths.shape == (3,)
 
 
-def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
-    monkeypatch,
-) -> None:
-    workspace = _workspace(max_total_q=1, topk=2, max_page_table_width=2)
-    workspace.fixed_capacity = False
-    workspace.use_cuda_graph = True
-    workspace.tmp_output = torch.empty((1, 2, 4, 512), dtype=torch.bfloat16)
-    workspace.tmp_lse = torch.empty((1, 2, 4), dtype=torch.float32)
-    workspace.output_buffer = workspace.tmp_output[:, :, 0, :]
-    workspace.final_lse = torch.empty((1, 2), dtype=torch.float32)
-    workspace.kv_chunk_size_ptr = torch.empty((1,), dtype=torch.int32)
-    workspace.num_chunks_ptr = torch.empty((1,), dtype=torch.int32)
-
+def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(monkeypatch) -> None:
+    plan = plan_compressed_sparse_mla_scratch(
+        B12XCompressedSparseMLAScratchCaps(
+            device="cpu", num_q_heads=2, max_q_rows=1, max_width=2,
+            swa_width=2, indexed_width=0,
+        )
+    )
     q = torch.zeros((1, 2, 512), dtype=torch.bfloat16)
     swa_indices = torch.zeros((1, 2), dtype=torch.int32)
     swa_lengths = torch.zeros((1,), dtype=torch.int32)
-    binding = workspace.bind_compressed_sparse_mla(
-        q=q,
-        swa_indices=swa_indices,
+    binding = plan.bind(
+        scratch=_one_scratch(plan), q=q, swa_indices=swa_indices,
         swa_lengths=swa_lengths,
     )
     swa_cache = torch.empty(
@@ -859,7 +866,8 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
     )
 
     assert calls["q_all"].data_ptr() == q.data_ptr()
-    assert calls["swa_indices"].data_ptr() == swa_indices.data_ptr()
+    assert calls["swa_indices"].data_ptr() == binding.scratch.staged_swa_indices.data_ptr()
+    torch.testing.assert_close(calls["swa_indices"], swa_indices)
     assert calls["swa_lengths"].data_ptr() == swa_lengths.data_ptr()
     assert out.shape == (1, 2, 512)
 
@@ -1056,3 +1064,49 @@ def test_indexer_contiguous_tiled_topk_binding_supplies_topk_and_metadata(
     assert calls["k_start"] is k_start
     assert calls["k_end"] is k_end
     assert indices.tolist() == [[1, 3], [0, 3], [2, 3]]
+
+
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+@pytest.mark.parametrize("recipe", ["deepseek_v4", "deepseek_v41"])
+def test_compressed_prewarm_reuses_declared_capacity_and_rejects_capture(monkeypatch, mode, recipe):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.compressed_sparse_mla import api
+
+    plan = api.plan(api.Caps(
+        device="cpu", num_q_heads=16, max_q_rows=19, max_width=384,
+        swa_width=128, indexed_width=256, swa_page_size=64, indexed_page_size=32,
+        mode=mode, cache_format=recipe,
+    ))
+    scratch = _one_scratch(plan)
+    calls = []
+    def run(**kwargs):
+        binding = kwargs["binding"]
+        assert binding.q.shape == (1, 16, 512)
+        assert binding.scratch.max_total_q == 19
+        assert binding.scratch.mode == mode
+        assert binding.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
+        assert binding.swa_indices.shape == (1, 128)
+        assert kwargs["swa_page_size"] == 64
+        if binding.indexed_indices is not None:
+            assert binding.indexed_indices.shape == (1, 256)
+            assert kwargs["indexed_page_size"] == 32
+        calls.append((binding.indexed_indices is not None, kwargs["attn_sink"] is not None,
+                      binding.indexed_page_table is not None, kwargs["lse_scale"]))
+        assert kwargs["return_lse"] is True
+    monkeypatch.setattr(api, "run", run)
+    api.prewarm(plan, scratch=scratch)
+    expected = {(extra, sink, False) for extra in (False, True) for sink in (False, True)}
+    if recipe == "deepseek_v41":
+        expected |= {(True, sink, True) for sink in (False, True)}
+    expected = {(*case, scale) for case in expected for scale in ("natural", "base2")}
+    assert set(calls) == expected
+    freeze_kernel_resolution("prewarm must precede serving")
+    try:
+        with pytest.raises(RuntimeError, match="frozen"):
+            api.prewarm(plan, scratch=scratch)
+    finally:
+        unfreeze_kernel_resolution()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="eager"):
+        api.prewarm(plan, scratch=scratch)

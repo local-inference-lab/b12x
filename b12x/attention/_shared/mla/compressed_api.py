@@ -334,6 +334,16 @@ def compressed_sparse_mla_decode_forward(
     )
 
 
+def _stage_native_selection(storage, selected, rows):
+    """Keep native selection widths fixed while live lengths remain device data."""
+    if storage is None:
+        raise RuntimeError("compressed MLA plan is missing selection staging")
+    output = storage[:rows]
+    output.fill_(-1)
+    output[:, : selected.shape[1]].copy_(selected)
+    return output
+
+
 def _validate_compressed_sparse_mla_out(out: torch.Tensor, *, q3: torch.Tensor) -> None:
     rows, heads, _ = q3.shape
     expected = (int(rows), int(heads), COMPRESSED_SPARSE_MLA_HEAD_DIM)
