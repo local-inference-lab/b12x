@@ -160,6 +160,7 @@ def _moe_reference(
     """Evaluate transforms and FP16 projection boundaries from compressed weights."""
     experts, hidden = prepared.num_experts, source.shape[1]
     mixed = getattr(prepared, "weight_layout", None) == "trellis_mixed3"
+    atoms = getattr(prepared, "weight_layout", None) == "trellis_atoms"
     internal_map, descriptor_rows = None, None
     if mixed:
         from types import SimpleNamespace
@@ -222,6 +223,35 @@ def _moe_reference(
 
     def projection_weight(projection, expert):
         n, k = (width, hidden) if projection < 2 else (hidden, width)
+        if atoms:
+            matrix = torch.empty(n, k, dtype=torch.float16)
+            data = prepared.w13.cpu()
+            rates = prepared.rates.cpu()
+            offsets = prepared.offsets.cpu()
+            for slot in range(width // 32):
+                group = slot * 32 // prepared.group_size
+                code = int(rates[group, expert, projection])
+                cursor = slot * prepared.row_stride_words + int(
+                    offsets[group, expert, projection]
+                )
+                for plane, bits in enumerate((code & 15, code >> 4)):
+                    count = (hidden // 16) * 8 * bits
+                    shape = (
+                        (1, hidden // 16, 1, 16 * bits)
+                        if projection < 2
+                        else (1, 1, hidden // 16, 16 * bits)
+                    )
+                    native = (
+                        data[cursor : cursor + count].view(torch.int16).reshape(shape)
+                    )
+                    decoded = native_weight(native, bits, state.codebook)[0]
+                    begin = slot * 32 + plane * 16
+                    if projection < 2:
+                        matrix[begin : begin + 16] = decoded
+                    else:
+                        matrix[:, begin : begin + 16] = decoded
+                    cursor += count
+            return matrix.to(source.device)
         if mixed:
             descriptor = descriptor_rows[projection][expert]
             tier = descriptor >> prepared.descriptor_local_bits

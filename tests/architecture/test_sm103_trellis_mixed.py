@@ -344,7 +344,8 @@ def test_mixed_binding_rejects_malformed_metadata(fault):
         )
 
 
-def test_generator_identifies_native_mixed_materialized_path():
+@pytest.mark.parametrize("layout", ["trellis_mixed3", "trellis_atoms"])
+def test_generator_identifies_native_mixed_materialized_path(layout):
     from dataclasses import asdict
     from types import SimpleNamespace
     from b12x.moe.fused_moe._policy import MoeDecodeConfig
@@ -367,7 +368,7 @@ def test_generator_identifies_native_mixed_materialized_path():
         case=SimpleNamespace(num_tokens=1),
         candidate=SimpleNamespace(config=asdict(config)),
         plan=SimpleNamespace(variant_for=lambda _: variant),
-        prepared_payload=SimpleNamespace(weight_layout="trellis_mixed3"),
+        prepared_payload=SimpleNamespace(weight_layout=layout),
     )
     assert (
         _concrete_candidate_path(
@@ -376,7 +377,7 @@ def test_generator_identifies_native_mixed_materialized_path():
                 implementation=config.backend, _backend_binding=object()
             ),
         )
-        == "w4a16.trellis_mixed3.tcgen05.materialized"
+        == f"w4a16.{layout}.tcgen05.materialized"
     )
     with pytest.raises(_CandidateContractError, match="compressed native"):
         _concrete_candidate_path(

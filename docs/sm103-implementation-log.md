@@ -1269,3 +1269,50 @@ unchanged at `a72cfdcf7b484ab395fdd4d2ee0843877a919f39`.
 Paired/grouped records, full-model speculative feedback and evaluation, a
 matching native vLLM build, ARM64 dependencies, SM121 regression, direct-HBM
 Station transport and the final full-project compile remain outstanding.
+
+## Canonical grouped atom rates
+
+Canonical MCG K2–K6 and SQG E4M3 K2–K4 preparation accepts grouped rates and
+independent low/high plane rates. The native atom layout retains the original
+compressed rows and uses group/expert/projection offset and rate tables.
+FC1 and FC2 select and decode each native tile into shared memory before
+tcgen05 MMA. Rates and offsets remain runtime operands; group size and planned
+capacity are static. Ordinary and coupled transforms, nonzero draw extents
+and distinct input-scale halves use the existing public MoE lifecycle.
+SM12x rejects the atom layout before execution. Per-expert input-scale vectors
+also retain their declared axes when the local expert count is one, and
+broadcast two-element input gains preserve both scale planes.
+
+The [validation receipt](sm103-trellis-atoms-validation.json) records 674 host
+tests, 136 tests in the SM120 regression suite, and 74 host tests under the
+companion Torch 2.13 environment. Fifteen atom preparation and operand tests
+pass memcheck and synccheck with zero errors. Exact decoding checks include
+group boundaries, unequal plane rates, malformed metadata, poisoned shared
+memory, graph mutation and a mostly uninitialized 16 GiB pool whose live rows
+start beyond 2^31 Uint32 words. Graph replay retains addresses and cumulative
+allocation counts. Six complete atom-MoE tests await physical SM103; these
+portable tests do not qualify native SM103 expert execution.
+
+The frozen Trellis compile contains 254 callables and CUDA entry points,
+including 58 atom-layout callables. All 196 existing PTX files are identical;
+166 existing cubins are identical. Thirty changed raw cubins retain identical
+allocated resources, exact register sets and instruction counts. No existing
+resource count increases. The atom projections allocate 140 registers with
+one input and 167 with two inputs, use 32,896 bytes of dynamic shared memory
+plus 1,024 static bytes, and emit no stack or local-memory traffic. All 74 TMEM
+readers retain load-completion waits. Grouped dispatch and dual-input resource
+costs require B300 occupancy and performance qualification.
+
+`scripts/audit_sm103_resources.py` verifies manifest-bound artifacts and
+compares allocated resources, register sets, instruction counts and local
+traffic. `scripts/qualify_sm103.py --component trellis_atoms` prepares or runs
+the complete atom suite with explicit physical GPU selection. The wheel and
+source distribution match all 462 Python files, three embedded profiles and
+six native C sources; extracted-wheel imports pass outside the checkout.
+The companion vLLM source remains unchanged at
+`a72cfdcf7b484ab395fdd4d2ee0843877a919f39`.
+
+Legacy BTX paired records, canonical SQG FP16 preparation, full-model
+speculative feedback and evaluation, a matching native vLLM build, ARM64
+dependencies, SM121 regression, Station direct-HBM transport and the final
+full-project compile remain outstanding.

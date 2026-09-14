@@ -892,6 +892,23 @@ def compile_trellis(out):
                      cutlass.Int32(1), cutlass.Int64(80), cutlass.Int64(144), cuda.CUstream(0)]
             compile_case(label + "tail_" + id_dtype.__name__,
                          RoutedMixedTrellisGemm(144, 80, experts, 128, descriptor_local_bits=local_bits), args)
+    for codebook, group_size, coupled in (
+        ("mcg", 32, False), ("mcg", 256, True),
+        ("sqg_e4m3", 32, False), ("sqg_e4m3", 256, True),
+    ):
+        label = f"trellis_atoms_{codebook}_g{group_size}_" + ("coupled_" if coupled else "")
+        caps = SimpleNamespace(
+            k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
+            route_num_experts=768, dtype=torch.bfloat16,
+            activation="situ" if coupled else "silu",
+            weight_plan=SimpleNamespace(
+                coupled_hadamard=coupled, source_format="b12x_trellis",
+                trellis_bits=3, trellis_codebook=codebook,
+                trellis_group_size=group_size,
+            ),
+        )
+        compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
+        launches.update({label + key: fn for key, fn in compiled.items()})
     return launches
 
 
@@ -1580,7 +1597,7 @@ def main():
             "experts": 384,
             "hidden": 5120,
             "intermediate": 2304,
-            "stage": "quantizer-basis tiles, inline FP16 projections, and uniform or MCG projection-tiered expert MoE",
+            "stage": "quantizer-basis tiles, inline FP16 projections, and uniform, MCG projection-tiered or grouped atom expert MoE",
         },
         "roce_geometry": {
             "world_size": 2,
