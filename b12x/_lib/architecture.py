@@ -106,6 +106,9 @@ def require_kernel_architecture(
         "b12x.quantization.mxfp6._rows",
         "b12x.norm.mhc._kernels",
         "b12x.norm.mhc._pre_prefill",
+        "b12x.norm.hyperconnection._cute",
+        "b12x.attention.mla_compress._cute",
+        "b12x.sequence.embedding._kernel",
     }:
         # Portable recurrent kernels have SM103 compilation evidence. Transport
         # construction additionally requires explicit Grace qualification.

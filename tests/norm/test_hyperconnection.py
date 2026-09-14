@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from b12x.norm import hyperconnection as hc
 
-from ..conftest import require_b12x as require_sm120
+from ..conftest import require_sm103_or_sm12x as require_sm120
 
 
 def _allocate_binding(
@@ -17,6 +17,7 @@ def _allocate_binding(
     hidden_size: int = 2560,
     streams: int = 4,
     lowrank: int = 320,
+    policy=None,
 ) -> hc.Binding:
     device = torch.device(device)
     capacity = tokens if max_tokens is None else max_tokens
@@ -27,7 +28,8 @@ def _allocate_binding(
             hidden_size=hidden_size,
             streams=streams,
             lowrank=lowrank,
-        )
+        ),
+        policy=policy,
     )
     width = streams * hidden_size
     return hc.bind(
@@ -1132,8 +1134,17 @@ def test_public_cute_combine_norm_rejects_cold_cuda_graph_capture() -> None:
         )
 
 
-def test_target_full_chain_cuda_graph_replay_uses_stable_outputs() -> None:
+@pytest.mark.parametrize("full_cute", [False, True])
+def test_target_full_chain_cuda_graph_replay_uses_stable_outputs(full_cute) -> None:
     device = require_sm120()
+    from b12x.policy import HYPERCONNECTION, PolicyContext
+
+    policy = PolicyContext.for_device(device)
+    if full_cute:
+        policy = policy.with_override(HYPERCONNECTION, hc.HyperConnectionConfig(
+            backend="cutedsl_full", reduction_block_h=4096,
+            pointwise_block=256, reduction_num_warps=8,
+        ))
     tokens, streams, hidden_size, lowrank = 3, 4, 2560, 320
     width = streams * hidden_size
 
@@ -1146,6 +1157,7 @@ def test_target_full_chain_cuda_graph_replay_uses_stable_outputs() -> None:
         hidden_size=hidden_size,
         streams=streams,
         lowrank=lowrank,
+        policy=policy,
     )
     state = randn((tokens, width))
     norm_weight = randn((width,)).div_(32)

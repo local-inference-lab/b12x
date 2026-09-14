@@ -79,10 +79,13 @@
     "serving_b12x_revision": "135c9715d20d8534638b57be8dcd634ab333e87a",
     "required_work": [
       "Port the distinct V4.1 model, config/tokenizer, CED, cache ownership and Engram integration with their existing tests.",
-      "Admit and qualify the required MLA compression, HyperConnection and embedding contracts on SM103; their public metadata currently admits SM12x only.",
       "Select and qualify a supported expert representation. The native checkpoint declares FP4 experts; the SM103 fused-MoE policy currently accepts ModelOpt NVFP4 and Trellis/BTX, not native MXFP4.",
       "Preserve the SM103 kernels and policy changes while incorporating required upstream API updates."
     ]
   },
-  "physical_sm103_qualified": false
+  "physical_sm103_qualified": false,
+  "supporting_components": {
+    "status": "implemented; SM120/SM121 component tests and SM103 compilation pass; physical SM103 execution unqualified",
+    "receipt": "docs/sm103-v41-components.json"
+  }
 }
