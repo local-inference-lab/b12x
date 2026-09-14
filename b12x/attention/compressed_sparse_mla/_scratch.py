@@ -164,6 +164,36 @@ class _B12XCompressedSparseMLAScratchLayout:
     sm_scale_offset_bytes: int
     mapped_indices_offset_bytes: int
     staged_selections_offset_bytes: int = 0
+    staged_swa_width: int = 0
+    staged_indexed_width: int = 0
+
+
+def _selection_widths(
+    caps: B12XCompressedSparseMLAScratchCaps,
+    execution_config: SparseMlaConfig | None,
+) -> tuple[int, int]:
+    if execution_config is not None and execution_config.backend == "warp":
+        return max(64, align_up(caps.swa_width, 64)), max(
+            64, align_up(caps.indexed_width, 64)
+        )
+    uses_prefill = caps.mode == "extend"
+    if caps.cache_format == "deepseek_v4" and caps.device.type == "cuda":
+        from .._shared.mla.compressed_api import _should_use_sm121_single_pass_decode
+
+        uses_prefill |= _should_use_sm121_single_pass_decode(
+            rows=caps.max_q_rows, heads=caps.num_q_heads,
+            swa_width=caps.swa_width, indexed_width=0,
+            swa_page_size=caps.swa_page_size, indexed_page_size=None,
+            compute_capability=torch.cuda.get_device_capability(caps.device),
+        )
+    if caps.cache_format == "deepseek_v4" and uses_prefill and caps.swa_width:
+        from .._shared.mla.prefill import _topk_container
+        from .._shared.mla.traits import ModelType
+
+        swa_width = _topk_container(ModelType.DSV4, caps.swa_width)
+    else:
+        swa_width = caps.swa_width
+    return swa_width, caps.indexed_width
 
 
 @dataclass(kw_only=True)
@@ -327,6 +357,8 @@ def _compressed_sparse_mla_scratch_layout(
         sm_scale_offset_bytes=sm_scale_offset_bytes,
         mapped_indices_offset_bytes=mapped_indices_offset_bytes,
         staged_selections_offset_bytes=staged_selections_offset_bytes,
+        staged_swa_width=swa_capacity,
+        staged_indexed_width=indexed_capacity,
     )
 
 
@@ -485,21 +517,25 @@ def _materialize_compressed_sparse_mla_scratch(
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
     )
-    if execution_config.backend == "warp":
-        cursor = layout.staged_selections_offset_bytes
-        for name, width in (
-            ("staged_swa_indices", max(64, align_up(caps.swa_width, 64))),
-            ("staged_indexed_indices", max(64, align_up(caps.indexed_width, 64))),
-        ):
-            value, cursor = materialize_scratch_view(scratch_storage, offset_bytes=cursor,
-                                                shape=(max_total_q, width), dtype=torch.int32)
-            setattr(scratch, name, value)
-        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
-        for name in ("staged_swa_lengths", "staged_indexed_lengths"):
-            value, _ = materialize_scratch_view(scratch_storage, offset_bytes=cursor,
-                                                shape=(max_total_q,), dtype=torch.int32)
-            setattr(scratch, name, value)
-            cursor += align_up(value.numel() * 4, SCRATCH_ALIGN_BYTES)
+    cursor = layout.staged_selections_offset_bytes
+    for name, width in zip(
+        ("staged_swa_indices", "staged_indexed_indices"),
+        (layout.staged_swa_width, layout.staged_indexed_width),
+        strict=True,
+    ):
+        value, cursor = materialize_scratch_view(
+            scratch_storage, offset_bytes=cursor,
+            shape=(max_total_q, width), dtype=torch.int32,
+        )
+        setattr(scratch, name, value)
+    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+    for name in ("staged_swa_lengths", "staged_indexed_lengths"):
+        value, _ = materialize_scratch_view(
+            scratch_storage, offset_bytes=cursor,
+            shape=(max_total_q,), dtype=torch.int32,
+        )
+        setattr(scratch, name, value)
+        cursor += align_up(value.numel() * 4, SCRATCH_ALIGN_BYTES)
     _install_compressed_sparse_mla_contract_phantoms(scratch)
     split_cfg = compressed_sparse_mla_split_config_for_contract(
         rows=caps.max_q_rows,

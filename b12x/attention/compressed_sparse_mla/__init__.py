@@ -30,6 +30,7 @@ META = OpMeta(
         "page_nbytes",
         "plan",
         "bind",
+        "prewarm",
         "run",
         "split_chunks_for_contract",
         "is_supported",

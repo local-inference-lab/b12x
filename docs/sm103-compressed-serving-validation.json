@@ -1,0 +1,260 @@
+{
+  "recorded_at_utc": "2026-09-14T13:41:21.762250+00:00",
+  "status": "implemented; host and SM120 operator checks pass; physical SM103 and full-model execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claims": false,
+  "sanitizer_scope": "CUDA 13.4.57 kernel memcheck/synccheck; API reports disabled only for the recorded SM120 CUDA-Python 13.4/driver 13.0 probe mismatch. Physical SM103 qualification enables API reporting.",
+  "remaining": [
+    "Indexer public API migration, retained capacities, schedules and capture ownership",
+    "Complete checkpoint loading, generation, prefix-cache reuse and target/draft model evaluation",
+    "Matching companion native build and ARM64 dependency validation",
+    "Complete representative SM103 corpus rebuild from final source",
+    "SM121 GPU regression when a host is available",
+    "Remaining Trellis checkpoint contracts and direct-HBM Station transport"
+  ],
+  "schema": "b12x.sm103.compressed_serving.validation.v1",
+  "base_revision": "9e32351d288d1c01350a193a0d30d6eb095f4f73",
+  "source_sha256": "4be45e21dbd62b6a15426246cd70f33e905b64830157d76314c0f63943a8185a",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-source-manifest.json",
+    "sha256": "e3a229326f074392f58f00a811fe9ee3147862dbd0b78bea957c49e22dfbf2f7",
+    "bytes": 54955
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-remote-sources.json",
+    "sha256": "dd9eaee431e052ff5ab6f68aea0544447de492942ba20e17dc76b5b204d46d7c",
+    "bytes": 168
+  },
+  "implementation": {
+    "prewarm": "One live row with planned capacity; optional indexed/sink/mapped routes and both LSE scales",
+    "native": "Fixed metadata staging; capacity-based split and head dispatch",
+    "sm121": "Plan reserves optional SWA-only prefill widening; semantic widths determine dispatch, independent of staging padding",
+    "runtime": "Live row counts drive dynamic grids; bindings and caller-owned output retain stable storage"
+  },
+  "compiled": {
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "compressed_mla",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/compressed-serving-sm103-release"
+    ],
+    "packages": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    },
+    "callables": 147,
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-sm103-release/manifest.json",
+      "sha256": "16190120701e2f621984aa0b32ce78e77cb1747ec432b7dc0344064f32230153",
+      "bytes": 143710
+    },
+    "comparison": {
+      "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-cubin-comparison-release.json",
+      "sha256": "4d35e0795c67fb5ebe6c3d730033e6594be8050ad8d07b309d0ba26b64e635a1",
+      "bytes": 11254
+    },
+    "byte_identical_cubins": 147,
+    "baseline_resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/compressed-mla-resources-frozen.json",
+      "sha256": "8fe0bde526b0b4343f30e4144ee3881c7d03f788c7de041b4f61ab00b7b435eb",
+      "bytes": 1080683
+    },
+    "allocated_gpr_range": [
+      12,
+      168
+    ],
+    "retained_stack_and_local_access_flags": {
+      "compressed_mla_deepseek_v4_fp8_extend_h12_swa65_idx0_prefill_h12_o0_sink0": [
+        {
+          "REG": 168,
+          "STACK": 8,
+          "SHARED": 1024,
+          "LOCAL": 0
+        }
+      ],
+      "compressed_mla_deepseek_v4_fp8_extend_h12_swa65_idx0_prefill_h12_o0_sink1": [
+        {
+          "REG": 168,
+          "STACK": 8,
+          "SHARED": 1024,
+          "LOCAL": 0
+        }
+      ],
+      "compressed_mla_deepseek_v41_fp8_extend_h8_swa0_idx65_prefill_h8_o0_sink0": [
+        {
+          "REG": 168,
+          "STACK": 8,
+          "SHARED": 1024,
+          "LOCAL": 0
+        }
+      ],
+      "compressed_mla_deepseek_v41_fp8_extend_h8_swa0_idx65_prefill_h8_o0_sink1": [
+        {
+          "REG": 168,
+          "STACK": 8,
+          "SHARED": 1024,
+          "LOCAL": 0
+        }
+      ]
+    },
+    "disposition": "Byte-identical cubins retain the baseline resource/SASS inspection, including four eight-byte prefill frames and local loads/stores. No performance or occupancy claim."
+  },
+  "validation": [
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/architecture",
+        "tests/policy",
+        "tests/attention/test_compressed_sparse_scratch_bindings.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "passed": 589,
+      "skipped": 1,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-host-release.log",
+        "sha256": "a8c31a1a1850cdd863cd904dd6cfc02f8546239b60081746b0a3b3a0ea6f8110",
+        "bytes": 752
+      }
+    },
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/attention/test_compressed_sparse_mla.py",
+        "tests/attention/test_sm103_compressed_mla.py",
+        "-x",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 141,
+      "skipped": 0,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-gpu-release.log",
+        "sha256": "24d7c7d1a7f83d27c607ec0def80d8d91955dc1358a5ec9219697d9fdd69083b",
+        "bytes": 205
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/attention/test_compressed_sparse_mla.py",
+        "-k",
+        "v41_heterogeneous and (8-decode-True or 8-extend-True or 16-decode-True or 16-extend-True)",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 6,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-memcheck-release.log",
+        "sha256": "c5b12a36ff5eabff50f1f8724f1af885a750fe50b79fb4874545e30d23998113",
+        "bytes": 176
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/attention/test_compressed_sparse_mla.py",
+        "-k",
+        "v41_heterogeneous and (8-decode-True or 8-extend-True or 16-decode-True or 16-extend-True)",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 6,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-b12x-synccheck-release.log",
+        "sha256": "0f74752ec78c22b9cdc9c31a6d63a1c4402934347601e2e1e7f470c753d1d0a7",
+        "bytes": 175
+      }
+    }
+  ],
+  "gpu": {
+    "name": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "uuid": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f",
+    "mode": "Default",
+    "driver": "580.173.02"
+  },
+  "runtime_packages": {
+    "torch": "2.14.0",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "triton": "3.8.0",
+    "cuda-python": "13.4.1"
+  },
+  "package_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-package.json",
+    "sha256": "58b4419f0c30456a70d1c594f00cf898cd9c055b0b1b0dfec7841231af44982b",
+    "bytes": 372
+  },
+  "wheel_import": {
+    "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-wheel-import.json",
+    "sha256": "9df560064ba0864249b7ecfd4d0715c1c8fbf2cd1cf91de6f66108997b24d257",
+    "bytes": 390
+  },
+  "deferred": {
+    "path": "/home/jasonc/b12x-sm103-evidence/compressed-serving-deferred-release/qualification.json",
+    "sha256": "e193e8461e9a9e0c1d87981e3c3ccee35f91756aa539375ff0da9fbe8c9fb0c9",
+    "bytes": 2483
+  },
+  "companion_source_sha256": "fd29b6f6b78e77553210e32f187e4fdfd33ac41ac357228d9cde5c75a1961618"
+}
