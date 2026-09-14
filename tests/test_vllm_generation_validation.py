@@ -1,11 +1,37 @@
 """Generation receipts reject changed checkpoints, missing requests and tokens."""
 
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from benchmarks.validate_vllm_generation import compare_runs, install_replay_counter
+from benchmarks.validate_vllm_generation import main
+
+
+def test_layer_comparison_rejects_graph_execution(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "engine.json"
+    config.write_text(json.dumps({"enforce_eager": False}))
+    output = tmp_path / "receipt.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "validate_vllm_generation",
+            "--engine-config",
+            str(config),
+            "--prompts",
+            str(tmp_path / "prompts.json"),
+            "--output",
+            str(output),
+            "--compare-nvfp4-layer",
+            "model.layers.0.mlp.gate_up_proj",
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        main()
+    assert "enforce_eager=true" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_replay_inspection_preserves_results_and_counts_only_successes():

@@ -1585,3 +1585,25 @@ inference service remains running during CPU-only validation. Matching native
 vLLM builds, available-SM121 GPU regression, complete GLM/DeepSeek checkpoints,
 frozen QSRT coupled high-rate conversion, the SM103 vocabulary projection
 fast path, Station HBM transport and final consolidated evidence remain open.
+
+## NVFP4 projection diagnosis
+
+The generation harness can compare selected eager NVFP4 calls with FlashInfer
+CUTLASS using identical loaded weights and live inputs. It retains the original
+b12x result and records the first five distinct row counts for each layer.
+Graph configurations are rejected. Six selected projections in Qwen layers
+0, 31 and 63 pass 60 exact comparisons across both ranks, covering 77,721,600
+BF16 output elements and row counts 1, 32, 52, 234 and 256. Generated tokens
+remain identical to the uninstrumented b12x reference. Sixteen host tests pass.
+
+A separate FlashInfer eager run on the 3,882-token corpus matches all six b12x
+eager request outputs. The short-prompt mismatch and speculative reference
+mismatches remain unresolved; these sampled projection results do not qualify
+all model layers or decoding modes.
+
+The FlashInfer DFlash2 control also fails exact equality with its target-only
+reference, on one prompt. It reuses 1,648 cached tokens, proposes 147 tokens,
+accepts 77 and records 16 target and 60 draft query graph replays per rank.
+Both speculative backends therefore have a failed exact-reference check;
+their speculative outputs differ from each other as well. The control narrows
+attribution but leaves the correctness investigation open.
