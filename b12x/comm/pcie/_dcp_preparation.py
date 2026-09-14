@@ -6,6 +6,7 @@ materialized state and no runtime path consults a compiler cache.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -88,6 +89,15 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     elif surface.endswith("all_gather_heads"):
         value = _call_value(call, "local_input")
         metadata.update(dtype=str(value.dtype), shape=tuple(value.shape), stride=tuple(value.stride()))
+        push = call.get("peer_write")
+        if push is None:
+            raw = os.getenv("B12X_PCIE_DCP_HEAD_GATHER_PUSH", "0")
+            if raw not in ("0", "1"):
+                raise ValueError("B12X_PCIE_DCP_HEAD_GATHER_PUSH must be 0 or 1")
+            push = raw == "1"
+        if type(push) is not bool:
+            raise ValueError("DCP head gather peer_write must be a bool")
+        metadata["peer_write"] = push
     elif surface.endswith("all_gather_pair"):
         first, second = _call_value(call, "local_first"), _call_value(call, "local_second")
         metadata.update(first_dtype=str(first.dtype), second_dtype=str(second.dtype), first_shape=tuple(first.shape), second_shape=tuple(second.shape))
@@ -110,7 +120,12 @@ def compile_dcp_surface(query_payload, ordinal):
         if surface.endswith("lse_reduce_scatter"):
             return {slot: cute._get_compiled_lse_reduce_scatter(query.world_size, query.rank, call["dtype"], int(call["threads"]), slot) for slot in (False, True)}
         if surface.endswith("all_gather_heads"):
-            return {slot: cute._get_compiled_all_gather_heads(query.world_size, query.rank, int(call["threads"]), slot) for slot in (False, True)}
+            return {
+                slot: cute._get_compiled_all_gather_heads(
+                    query.world_size, query.rank, int(call["threads"]), slot,
+                    bool(call.get("peer_write", False)),
+                ) for slot in (False, True)
+            }
         if surface.endswith("all_gather_pair_kimi_topk"):
             return {slot: cute._get_compiled_all_gather_pair(query.world_size, query.rank, 512, slot, True) for slot in (False, True)}
         if surface.endswith("all_gather_pair"):

@@ -295,6 +295,15 @@ These nested totals must not be added together.
 
 ## Native benchmark consumers
 
+`B12X_PCIE_DCP_HEAD_GATHER_PUSH=1` opts into the experimental native posted-write
+head gather for world4, BF16, 64 global heads and 512 head dimension. The default
+is `0` (existing pull transport). `query_from_runtime(..., call={..., "peer_write":
+True})` can pin this explicitly. The control is captured in declaration metadata
+and the compiled launcher identity; changing it after preparation does not change
+binding or graph replay. Other push geometry fails closed. The same IPC slab,
+system-scope barrier and graph slots are retained, with L1-bypassing incoming
+loads. Serialized launch/replay remains required; this is not a qualified default.
+
 `benchmarks/benchmark_startup_autotuner.py` uses the same declarations and
 session with explicit retained benchmark calls. Its optional group subsets are
 diagnostics, not full-model serving acceptance. `benchmarks/startup_quality.py`

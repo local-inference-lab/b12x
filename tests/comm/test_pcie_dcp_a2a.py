@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import sys
+from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -9,6 +10,8 @@ import pytest
 import torch
 
 from b12x.comm.pcie import kimi_topk16
+from b12x.comm.pcie._dcp_preparation import query_from_runtime
+from b12x.comm.pcie._tuning import TUNING
 from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
     PCIeDCPA2APool,
@@ -16,6 +19,32 @@ from b12x.comm.pcie.pcie_dcp_a2a import (
     _staging_layout,
     lse_reduce_scatter_reference,
 )
+from b12x.preparation import FrozenMapping
+
+
+def test_posted_write_head_gather_is_frozen_and_rejects_unqualified_geometry(monkeypatch):
+    """An opt-in transport is selected once and cannot silently serve another layout."""
+    runtime = SimpleNamespace(
+        device=torch.device("cuda", 0), rank=0, world_size=4,
+        max_batch_size=256, total_heads=64, head_dim=512, query_head_dim=512,
+        _slot_bytes=256 * 64 * 512 * 2, _signal_ptrs=range(16),
+        _resolve_launch_config=lambda **kwargs: (256, 16),
+    )
+    monkeypatch.setenv("B12X_PCIE_DCP_HEAD_GATHER_PUSH", "1")
+    query = query_from_runtime(
+        runtime, surface="DcpAllToAll.all_gather_heads",
+        call={"local_input": torch.empty(1, 16, 512, dtype=torch.bfloat16, device="meta")},
+    )
+    assert query.call["peer_write"] is True
+    monkeypatch.setenv("B12X_PCIE_DCP_HEAD_GATHER_PUSH", "0")
+    assert TUNING.configure(query, device=None).query.call["peer_write"] is True
+    for bad in (
+        replace(query, world_size=2),
+        replace(query, setup=FrozenMapping({**query.setup, "total_heads": 32})),
+        replace(query, call=FrozenMapping({**query.call, "dtype": "torch.float16"})),
+    ):
+        with pytest.raises(ValueError, match="posted-write DCP head gather"):
+            TUNING.configure(bad, device=None)
 
 
 class _FakeExt:

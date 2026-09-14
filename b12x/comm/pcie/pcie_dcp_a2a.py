@@ -954,6 +954,11 @@ class PCIeDCPA2A:
             )
         if not out.is_contiguous():
             raise ValueError("output must be contiguous")
+        if state.query.call.get("peer_write", False):
+            if local_input.dtype is not torch.bfloat16:
+                raise ValueError("posted-write DCP head gather requires BF16 input")
+            if local_input.data_ptr() % 16 or out.data_ptr() % 16:
+                raise ValueError("posted-write DCP head gather requires 16-byte alignment")
         if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
             raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(
@@ -975,6 +980,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                bool(state.query.call.get("peer_write", False)),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "

@@ -93,8 +93,19 @@ def _validate_query(query: PcieQuery, device) -> None:
             raise ValueError(
                 "replica stripe geometry exceeds the channel's owner capacity"
             )
+    if query.surface.endswith("all_gather_heads"):
+        push = query.call.get("peer_write", False)
+        if type(push) is not bool:
+            raise ValueError("DCP head gather peer_write must be a bool")
+        if push and (
+            query.world_size != 4
+            or query.call["dtype"] != "torch.bfloat16"
+            or query.setup["total_heads"] != 64
+            or query.setup["query_head_dim"] != 512
+        ):
+            raise ValueError("posted-write DCP head gather requires TP4 BF16 64x512 heads")
 
 
-TUNING = replace(TUNING, query_schema_version=4, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=5, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]
