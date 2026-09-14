@@ -1854,3 +1854,24 @@ and 4K-prefix reuse match the reference, and the bounded GSM8K check records
 28/32 versus 27/32 without invalid answers. The native-library compatibility
 image, source hashes and original-service restoration are recorded separately
 from BTX expert accuracy and SM103 hardware qualification.
+
+## Uniform BTX tensor-parallel projection tiles
+
+Status: implemented; synthetic SM120 TP2 eager/graph parity qualified;
+checkpoint accuracy and physical SM103 execution unqualified.
+
+Trellis weight planning, scratch planning and uniform BTX preparation share
+one geometry-derived tile default. When either projection width requires
+128-column tiles, both fused projections use K64/N128 to preserve projection
+boundaries and equal CTA thread counts. Explicit overrides remain available.
+V4.1's uniform TP2 partition has 1152 intermediate channels per rank.
+
+The [TP2 validation receipt](moe-trellis-tp2-validation.json) records 240 passing
+host checks, four passing SM120 preparation/numerical checks and one memcheck
+case with zero kernel memory errors. Six synthetic model sequences produce
+the same 48 tokens in eager and graph execution. Each rank completes 21 graph
+replays with frozen resolution and shared-expert overlap enabled.
+
+SM12x paired-rate execution remains limited to one 256-channel pair per rank.
+V4.1's wider paired extents use the separate SM103 atom implementation; the
+uniform SM120 result does not qualify that implementation or BTX model accuracy.
