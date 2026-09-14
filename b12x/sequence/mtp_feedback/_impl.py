@@ -62,8 +62,17 @@ class Caps:
         max_tokens = _positive("max_tokens", self.max_tokens)
         hidden_size = _positive("hidden_size", self.hidden_size)
         streams = _positive("streams", self.streams)
-        if self.contract not in {"qwen_multistream", "rms_concat"}:
+        if self.contract not in {"qwen_multistream", "rms_concat", "rms_streams_fp8"}:
             raise ValueError(f"unsupported MTP feedback contract {self.contract!r}")
+        if self.contract == "rms_streams_fp8" and (
+            hidden_size % 128
+            or hidden_size > 16384
+            or streams > 16
+            or max_tokens * streams * (hidden_size // 128) >= 2**31
+        ):
+            raise ValueError(
+                "FP8 stream feedback requires H divisible by 128 through 16384, S<=16 and a quantizer grid below 2^31"
+            )
         if self.contract == "rms_concat" and (
             streams != 1 or hidden_size % 64 or hidden_size > 16384
         ):
@@ -254,6 +263,8 @@ def _bind(
     tokens: int | None = None,
     combined_fc_weight: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    embedding_fc_scale: torch.Tensor | None = None,
+    hidden_fc_scale: torch.Tensor | None = None,
 ) -> Binding:
     """Bind fixed-capacity tensors without allocating runtime storage."""
     if not isinstance(plan, _Layout):

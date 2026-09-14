@@ -57,6 +57,252 @@ def _concat_reference(binding, eps=1e-6):
     )
 
 
+def _make_fp8_case(device, hidden=256, streams=4, capacity=17):
+    planned = mtp.plan(
+        mtp.Caps(
+            device=device,
+            max_tokens=capacity,
+            hidden_size=hidden,
+            streams=streams,
+            contract="rms_streams_fp8",
+        )
+    )
+    (spec,) = planned.scratch_specs()
+    tensors = {
+        "scratch": torch.empty(spec.shape, dtype=spec.dtype, device=device),
+        "token_embedding": _randn((capacity, hidden), device=device),
+        "multi_state": _randn((capacity, streams, hidden), device=device),
+        "token_norm_weight": 1 + _randn((hidden,), device=device),
+        "state_norm_weight": 1 + _randn((hidden,), device=device),
+        "embedding_fc_weight": _randn((hidden, hidden), device=device, scale=2).to(
+            torch.float8_e4m3fn
+        ),
+        "hidden_fc_weight": _randn((hidden, hidden), device=device, scale=2).to(
+            torch.float8_e4m3fn
+        ),
+        "embedding_fc_scale": torch.rand(hidden // 128, hidden // 128, device=device)
+        * hidden**-0.5,
+        "hidden_fc_scale": torch.rand(hidden // 128, hidden // 128, device=device)
+        * hidden**-0.5,
+        "positions": torch.arange(capacity, dtype=torch.int64, device=device),
+        "output": torch.full(
+            (capacity, streams, hidden), 7.0, dtype=torch.bfloat16, device=device
+        ),
+    }
+    return planned, tensors
+
+
+def _fp8_reference(binding):
+    return mtp.reference.rms_streams_fp8(
+        binding.token_embedding,
+        binding.multi_state,
+        binding.positions,
+        binding.token_norm_weight,
+        binding.state_norm_weight,
+        binding.embedding_fc_weight,
+        binding.hidden_fc_weight,
+        binding.embedding_fc_scale,
+        binding.hidden_fc_scale,
+    )
+
+
+def test_rms_streams_fp8_quantizer_rounding_boundaries_and_dynamic_rows():
+    import cutlass as c
+    from b12x._lib.compiler import run_compiled
+    from b12x._lib.utils import current_cuda_stream
+    from b12x.sequence.mtp_feedback import _fp8
+
+    device = require_sm103_or_sm12x()
+    major, minor = torch.cuda.get_device_capability(device)
+    quant, _ = _fp8.compile_aux(128, 1, device.index, f"sm_{major}{minor}a")
+    rows = 65537
+    source = torch.zeros(rows, 128, device=device, dtype=torch.bfloat16)
+    # 2.40625/448 is exactly representable. Multiplication by a rounded
+    # reciprocal changes the E4M3 tie at 0.408203125 from 80 to 72.
+    source[::3, 0] = 2.40625
+    source[::3, 1] = 0.408203125
+    source[::3, 2] = -0.408203125
+    source[1::3].fill_(1e-20)
+    output = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(rows, 1, device=device)
+    args = (
+        _fp8._pointer(source),
+        _fp8._pointer(output, c.Uint32),
+        _fp8._pointer(scales, c.Float32),
+    )
+    freeze_kernel_resolution("FP8 quantizer live rows use retained callable")
+    try:
+        for live in (1, 17, rows):
+            run_compiled(quant, (*args, c.Int32(live), current_cuda_stream()))
+            expected_scale = (
+                source[:live]
+                .float()
+                .abs()
+                .amax(-1, keepdim=True)
+                .clamp_min(1e-10)
+                .double()
+                / 448
+            ).float()
+            expected = (
+                (source[:live].float() / expected_scale)
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+            )
+            assert torch.equal(scales[:live], expected_scale)
+            assert torch.equal(
+                output[:live].view(torch.uint8), expected.view(torch.uint8)
+            )
+            assert output[0, 1].item() == 80
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_rms_streams_fp8_rejects_invalid_bindings_and_accepts_int32_positions():
+    device = require_sm103_or_sm12x()
+    planned, tensors = _make_fp8_case(device)
+    for changes, message in (
+        ({"output": tensors["multi_state"]}, "overlap"),
+        ({"hidden_fc_scale": None}, "hidden_fc_scale"),
+        (
+            {"hidden_fc_weight": tensors["hidden_fc_weight"].bfloat16()},
+            "hidden_fc_weight",
+        ),
+        ({"positions": tensors["positions"].float()}, "positions"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            mtp.bind(planned, **(tensors | changes), tokens=1)
+    with pytest.raises(ValueError, match="capacity"):
+        mtp.bind(planned, **tensors, tokens=18)
+    binding = mtp.bind(planned, **(tensors | {"positions": tensors["positions"].int()}))
+    mtp.run(binding)
+    torch.testing.assert_close(
+        binding.output, _fp8_reference(binding), rtol=0.02, atol=0.04
+    )
+
+
+def test_rms_streams_fp8_matches_optional_vllm_native_quantization():
+    from b12x._lib.scratch_layout import materialize_scratch_view
+
+    device = require_sm103_or_sm12x()
+    pytest.importorskip("vllm._custom_ops")
+    planned, tensors = _make_fp8_case(device, hidden=5120, streams=4)
+    binding = mtp.bind(planned, **tensors)
+    mtp.run(binding)
+    for path, source in (
+        ("embedding", binding.token_normalized),
+        ("state", binding.state_normalized),
+    ):
+        source = source.reshape(-1, 5120)
+        quant = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(source.shape[0], 40, device=device)
+        torch.ops._C.per_token_group_fp8_quant(
+            source,
+            quant,
+            scales,
+            128,
+            1e-10,
+            -448.0,
+            448.0,
+            False,
+            False,
+            False,
+        )
+        for name, expected in ((f"{path}_quant", quant), (f"{path}_scale", scales)):
+            offset, shape, dtype = planned._backend_plan.layout[name]
+            actual = materialize_scratch_view(
+                binding.scratch,
+                offset_bytes=offset,
+                shape=shape,
+                dtype=dtype,
+            )[0]
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("hidden,streams", [(128, 1), (256, 3), (5120, 4)])
+def test_rms_streams_fp8_projection_quantization_and_graph(hidden, streams):
+    from b12x._lib.scratch_layout import materialize_scratch_view
+    from b12x.sequence.mtp_feedback import _fp8
+
+    device = require_sm103_or_sm12x()
+    planned, tensors = _make_fp8_case(device, hidden, streams)
+    tensors["token_embedding"][0].fill_(float("nan"))
+    tensors["multi_state"].mul_(
+        torch.arange(1, streams + 1, device=device).view(1, streams, 1)
+    )
+    binding = mtp.bind(planned, **tensors, tokens=1)
+    mtp.run(binding)
+    cached = _fp8.compile_projection.cache_info()
+    freeze_kernel_resolution(
+        "FP8 feedback retains norm, quantization, projection and add kernels"
+    )
+    try:
+        for live in (1, 4, 17, 0):
+            tensors["output"].fill_(7)
+            binding = mtp.bind(planned, **tensors, tokens=live)
+            mtp.run(binding)
+            expected = _fp8_reference(binding)
+            torch.testing.assert_close(binding.output, expected, rtol=0.02, atol=0.04)
+            if live:
+                assert (
+                    torch.isfinite(binding.output).all()
+                    and binding.output.count_nonzero()
+                )
+                assert (
+                    F.cosine_similarity(
+                        binding.output.float().flatten(),
+                        expected.float().flatten(),
+                        dim=0,
+                    )
+                    > 0.9999
+                )
+                assert torch.equal(binding.output.argmax(-1), expected.argmax(-1))
+            for path, source in (
+                ("embedding", binding.token_normalized),
+                ("state", binding.state_normalized),
+            ):
+                groups = source.float().reshape(
+                    live * (streams if path == "state" else 1), hidden // 128, 128
+                )
+                scale = (groups.abs().amax(-1).clamp_min(1e-10).double() / 448).float()
+                quant = (
+                    (groups / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+                )
+                for name, reference in (
+                    (f"{path}_quant", quant.reshape(-1, hidden)),
+                    (f"{path}_scale", scale),
+                ):
+                    offset, shape, dtype = planned._backend_plan.layout[name]
+                    actual = materialize_scratch_view(
+                        binding.scratch, offset_bytes=offset, shape=shape, dtype=dtype
+                    )[0][: reference.shape[0]]
+                    if dtype == torch.float8_e4m3fn:
+                        assert torch.equal(
+                            actual.view(torch.uint8), reference.view(torch.uint8)
+                        )
+                    else:
+                        torch.testing.assert_close(actual, reference, rtol=1e-6, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                mtp.run(binding)
+            tensors["hidden_fc_scale"].mul_(0.75)
+            tensors["embedding_fc_scale"].mul_(1.125)
+            tensors["multi_state"].add_(0.15)
+            expected = _fp8_reference(binding)
+            tensors["scratch"].fill_(0xFF)
+            binding.output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated(device) == allocated
+            torch.testing.assert_close(binding.output, expected, rtol=0.02, atol=0.04)
+            assert torch.equal(
+                tensors["output"][live:], torch.full_like(tensors["output"][live:], 7)
+            )
+    finally:
+        unfreeze_kernel_resolution()
+    assert _fp8.compile_projection.cache_info() == cached
+
+
 @pytest.mark.parametrize("hidden", [256, 4096])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 def test_rms_concat_graph_reuses_capacity_and_reads_mutated_inputs(

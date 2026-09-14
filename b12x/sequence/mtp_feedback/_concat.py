@@ -24,13 +24,15 @@ def _add(left: c.Float32, right: c.Float32) -> c.Float32:
 
 
 class NormalizeConcat:
-    """Two independent RMS groups with zero-position masking on embeddings."""
+    """Independent RMS groups with zero-position masking on embeddings."""
 
-    def __init__(self, hidden: int, block_h: int, warps: int):
+    def __init__(self, hidden: int, block_h: int, warps: int, streams=1, capacity=0):
         self.hidden = hidden
         self.threads = warps * 32
         self.warps = warps
         self.items = cute.ceil_div(block_h, self.threads)
+        self.streams = streams
+        self.capacity = capacity
 
     @cute.jit
     def __call__(
@@ -48,7 +50,7 @@ class NormalizeConcat:
         self.kernel(
             embedding, state, e_weight, h_weight, positions, output, eps
         ).launch(
-            grid=(tokens, 2, 1),
+            grid=(tokens, self.streams + 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -61,6 +63,14 @@ class NormalizeConcat:
         thread, _, _ = cute.arch.thread_idx()
         base = c.Int64(token) * self.hidden
         output_base = c.Int64(token) * (2 * self.hidden) + c.Int64(group) * self.hidden
+        state_base = base
+        if c.const_expr(self.capacity > 0):
+            state_base = (
+                c.Int64(token) * self.streams + c.Int64(group) - 1
+            ) * self.hidden
+            output_base = base
+            if group > 0:
+                output_base = c.Int64(self.capacity) * self.hidden + state_base
         keep_embedding = positions[c.Int64(token)] != 0
         total = c.Float32(0)
         for item in c.range_constexpr(self.items):
@@ -71,7 +81,7 @@ class NormalizeConcat:
                     if keep_embedding:
                         value = c.Float32(embedding[base + c.Int64(column)])
                 else:
-                    value = c.Float32(state[base + c.Int64(column)])
+                    value = c.Float32(state[state_base + c.Int64(column)])
                 total += value * value
         allocator = c.utils.SmemAllocator()
         reduction = allocator.allocate_tensor(
@@ -96,7 +106,7 @@ class NormalizeConcat:
                         value = c.Float32(embedding[base + c.Int64(column)])
                     weight = c.Float32(e_weight[c.Int64(column)])
                 else:
-                    value = c.Float32(state[base + c.Int64(column)])
+                    value = c.Float32(state[state_base + c.Int64(column)])
                     weight = c.Float32(h_weight[c.Int64(column)])
                 output[output_base + c.Int64(column)] = c.BFloat16(
                     value * inverse[0] * weight
@@ -110,8 +120,17 @@ def _pointer(tensor, dtype=c.BFloat16):
 
 
 @lru_cache(maxsize=None)
-def compile_norm(hidden, block_h, warps, position_dtype, device_index, architecture):
-    kernel = NormalizeConcat(hidden, block_h, warps)
+def compile_norm(
+    hidden,
+    block_h,
+    warps,
+    position_dtype,
+    device_index,
+    architecture,
+    streams=1,
+    capacity=0,
+):
+    kernel = NormalizeConcat(hidden, block_h, warps, streams, capacity)
     position_type = c.Int64 if position_dtype == torch.int64 else c.Int32
 
     def ptr(dtype):
@@ -133,12 +152,14 @@ def compile_norm(hidden, block_h, warps, position_dtype, device_index, architect
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_facts(
                 "sequence.mtp_feedback.rms_concat",
-                1,
+                2,
                 ("hidden", hidden),
                 ("block_h", block_h),
                 ("warps", warps),
                 ("position_dtype", str(position_dtype)),
                 ("architecture", architecture),
+                ("streams", streams),
+                ("capacity", capacity),
             ),
         )
 
