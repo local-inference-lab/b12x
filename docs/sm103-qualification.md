@@ -24,6 +24,7 @@ numbers or measured B300 policy profile are included.
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
+| V4.1 supporting operators | Existing CSA compression, HyperConnection and embedding APIs admit SM103; HyperConnection selects CuTe for every stage; SM120/SM121 correctness and memcheck pass; 72 callables cross-compiled | Physical SM103 state, graph and numeric qualification; complete V4.1 integration |
 | MTP feedback | GLM ordinary RMS-concat, Qwen flattened Gemma multi-stream and DeepSeek per-stream FP8 contracts use existing planned APIs and CuTe projections; GLM and DeepSeek companion call-site, graph and Inductor checks pass on SM120; 51 SM103 callables compiled | Physical SM103 execution, actual sequence-parallel collectives, head collapse and full speculative model evaluation |
 | Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; 34 direct-loader tests pass on SM121 | Execute companion loader integration on SM121; qualify Grace placement on the Station |
 | DFlash2 | Qwen target/draft execution, accepted proposals, target/draft graphs and prefix reuse exercised on SM120 | Exact token equality with target-only execution remains unresolved; full GLM DFlash2 and physical SM103 execution remain unqualified |
@@ -953,9 +954,54 @@ draft on maxwell. Their configurations have recorded hashes. DeepSeek uses
 its routed experts use native MXFP4. This is a distinct contract from the
 registered DeepSeek V4 model. Companion revision `5c0857f9cd` lacks the V4.1
 model, CED and Engram integration. Its port must preserve the existing SM103
-work and qualify MLA compression, HyperConnection, embedding and a supported
-expert representation. Checkpoint availability does not establish model
+work and integrate a supported expert representation. MLA compression,
+HyperConnection and embedding have separate component qualification below.
+Checkpoint availability does not establish model
 support. GLM and V4.1 full-model and speculative correctness remain open.
+
+## V4.1 compression, HyperConnection and embedding
+
+Status: **implemented and cross-compiled; SM120/SM121 component regression
+qualified; physical SM103 execution unqualified**. The existing public APIs,
+metadata and compiler gates admit SM103. CSA compression retains caller-owned
+carry state and device-resident live counts. Embedding retains exact BF16/FP32
+row copies, device-count graph replay and Int64 row offsets. Neither operation
+introduces an architecture-specific public API.
+
+HyperConnection planning selects `cutedsl_full` on SM103. Every component
+stage uses CuTe, including zero-centered grouped normalization and gate
+reduction. SM120/SM121 keep their measured `cutedsl` selections. The plan
+retains the backend; binding and execution do not resolve policy or inspect
+device capabilities to select an implementation. Config schema version 2 and
+candidate contract version 2 bind the generator to this choice. SM103 has one
+candidate, which must qualify the real planned graph chain before emitting
+a profile. Existing embedded profile values are unchanged.
+
+The [component receipt](sm103-v41-components.json) binds four CSA callables
+(six CUDA entries), 56 HyperConnection callables and 12 embedding callables
+to one source hash. None has stack/local memory or local loads/stores. The
+same source compiles the actual V4.1 vocabulary geometry N129280/K5120; its
+cubin uses 48 allocated registers and 1,024 shared bytes, and all 16 existing
+projection PTX files and cubins remain identical.
+
+Both SM120 and SM121 pass 55 component tests with one explicit multiple-GPU
+skip, plus 12 memcheck cases with zero memory errors. Tests include the
+18-GiB high-state probe, embedding row offsets above Int32, carry reuse,
+mutated IDs/counts, stable graph outputs and the complete CuTe HyperConnection
+chain selected through policy. The sanitizer API-reporting exception is
+recorded. These are component results; complete V4.1 serving remains unqualified.
+
+Prepare each operator suite with its corresponding compile manifest:
+
+```bash
+python scripts/compile_sm103.py --component mla_compress --output-dir "$compile_dir"
+python scripts/qualify_sm103.py --component mla_compress \
+  --compile-manifest "$compile_dir/manifest.json" --output-dir "$qualification_dir"
+```
+
+Use `hyperconnection` or `embedding` for the other component names. Run the
+prepared suites on a physical SM103 device only after checking its identity
+and available memory.
 
 ## Companion native build
 

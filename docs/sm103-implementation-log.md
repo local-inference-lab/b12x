@@ -1739,3 +1739,31 @@ and native MXFP4 expert representation need implementation and qualification.
 The existing V4 integration does not satisfy that model contract. Full-model
 accuracy, speculative parity, complete serving warmup, Station HBM transport
 and frozen QSRT coupled high-rate conversion remain open.
+
+## V4.1 supporting operators on SM103
+
+MLA compression, HyperConnection and embedding now admit SM103 through their
+existing metadata, policy and compiler gates. The HyperConnection policy
+selects a complete CuTe backend on SM103; SM120/SM121 keep their selected
+normalization and gate-reduction routes. The backend is retained on the plan
+and does not require runtime device selection. Config and candidate contract
+versions advance to 2. Only the HyperConnection config schema changes in the
+three embedded profiles; measured configs remain unchanged.
+
+The [V4.1 component receipt](sm103-v41-components.json) binds 72 supporting
+callables and 74 CUDA entries to the tested source. None emits stack/local
+memory traffic. The actual N129280/K5120 vocabulary shape also compiles, with
+48 allocated GPRs and 1,024 shared bytes. All 16 existing projection PTX files
+and cubins remain byte-identical. The compiler and qualification launchers
+include the three component groups.
+
+Both SM120 and SM121 pass 55 tests with one explicit multiple-GPU skip.
+Each also passes 12 selected memcheck cases with zero memory errors, retaining
+the API-reporting exception. These include high state/row offsets beyond
+Int32, live counts and mutations during graph replay, and the complete CuTe
+HyperConnection chain selected through a policy override. Physical SM103
+execution and complete model serving remain unqualified. The distinct V4.1
+companion port is prepared in an isolated worktree; its cache/encoder/Engram
+integration and supported expert checkpoint representation remain separate work.
+The SM121 test window restores all four original inference containers and
+images, preserves their configuration hashes, and ends with HTTP 200 health.

@@ -261,6 +261,53 @@ def sm103_context(monkeypatch):
     return PolicyContext.for_identity(B300)
 
 
+def test_v41_component_admission_and_plan_policy(sm103_context, monkeypatch):
+    from b12x.attention import mla_compress
+    from b12x.attention.mla_compress import _cute as compressor
+    from b12x.norm import hyperconnection
+    from b12x.norm.hyperconnection._policy import HYPERCONNECTION_POLICY
+    from b12x.sequence import embedding
+
+    monkeypatch.setattr(gating, "get_compute_capability", lambda device=None: (10, 3))
+    monkeypatch.setattr(gating, "has_cutlass_dsl", lambda: True)
+    monkeypatch.setattr(gating, "has_triton", lambda: True)
+    for op in (mla_compress, hyperconnection, embedding):
+        assert op.is_supported("cuda:0")
+    compiled = object()
+    monkeypatch.setattr(compressor, "compile_compress", lambda *args: compiled)
+    plan = mla_compress.plan(mla_compress.Caps(
+        device="cuda:0", max_tokens=12, max_requests=4, max_states=8, ratio=2,
+    ), policy=sm103_context)
+    assert plan._compiled is compiled
+    hc_plan = hyperconnection.plan(hyperconnection.Caps(
+        device="cuda:0", max_tokens=16, hidden_size=5120, streams=4,
+    ), policy=sm103_context)
+    assert hc_plan.backend == "cutedsl_full"
+    assert hc_plan.policy_resolution.source is PolicySource.HEURISTIC
+    with pytest.raises(ValueError, match="complete CuTe backend"):
+        query = hyperconnection.HyperConnectionQuery(
+            dtype="bfloat16", max_tokens=16, hidden_size=5120, streams=4, lowrank=320,
+        )
+        HYPERCONNECTION_POLICY.validate_config(
+            query, replace(hc_plan.policy_resolution.config, backend="cutedsl"), B300,
+        )
+    monkeypatch.setattr(gating, "get_compute_capability", lambda device=None: (10, 0))
+    for op in (mla_compress, hyperconnection, embedding):
+        assert not op.is_supported("cuda:0")
+
+
+def test_sm103_hyperconnection_generator_qualifies_one_real_backend():
+    from b12x.policy.generation.providers.norm_sequence import (
+        _HyperConnectionSession, _hyperconnection_cases,
+    )
+
+    session = object.__new__(_HyperConnectionSession)
+    session._context = SimpleNamespace(device=B300)
+    candidates = session.candidates(_hyperconnection_cases()[0])
+    assert len(candidates) == 1
+    assert candidates[0].config["backend"] == "cutedsl_full"
+
+
 @pytest.mark.parametrize("model,dim", [(1, 576), (2, 512)])
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_sm103_sparse_mla_plan_retains_warp_policy(sm103_context, model, dim, mode):

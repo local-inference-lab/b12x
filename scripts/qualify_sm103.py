@@ -36,6 +36,9 @@ SUITES = {
     "kda_prefill": ["tests/sequence/test_kda_prefill.py"],
     "gdn_prefill": ["tests/sequence/test_gdn_prefill.py"],
     "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k", "not standalone_cute_norm"],
+    "mla_compress": ["tests/attention/test_mla_compress.py"],
+    "embedding": ["tests/sequence/test_embedding.py"],
+    "hyperconnection": ["tests/norm/test_hyperconnection.py"],
     "dense_mla": [
         "tests/attention/test_dense_mla.py",
         "tests/attention/test_dense_mla_window.py",

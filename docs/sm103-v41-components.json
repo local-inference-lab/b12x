@@ -1,0 +1,357 @@
+{
+  "schema": "b12x.sm103.v41_support_components.v1",
+  "status": "implemented and cross-compiled; SM120/SM121 component regression passed; physical SM103 execution unqualified",
+  "base_revision": "83d139cd769280680db2e1ec5cc312cb97e544f7",
+  "source_sha256": "7c743ee06d716623dac2b6e15d4d97f9221fd1cdf1a3d27134cf37fa9fa0d9ed",
+  "implementation": {
+    "components": [
+      "attention.mla_compress",
+      "norm.hyperconnection",
+      "sequence.embedding"
+    ],
+    "architecture_admission": "Existing public metadata, capability queries, catalog policy and compiler gates admit SM103; SM100 remains rejected.",
+    "hyperconnection": "SM103 planning selects cutedsl_full, which uses CuTe for every stage. SM120/SM121 retain their selected cutedsl configs and Triton normalization/gate stages. Bind/run use the retained plan backend without device heuristics or policy lookup.",
+    "policy_versions": {
+      "query": 1,
+      "config": 2,
+      "candidate_contract": 2
+    },
+    "profile_changes": "All three embedded profiles change only HyperConnection config schema 1 to 2; measured configs and all other entries are unchanged.",
+    "generator": "SM103 has one complete CuTe candidate. The existing GPU provider qualifies the actual planned graph chain before producing a measurement.",
+    "runtime_counts": "Existing CuTe launch keys contain static geometry/device/planned capacity; row/request counts and scaled Int64 offsets retain their existing runtime contracts."
+  },
+  "compile": {
+    "embedding": {
+      "source_sha256": "7c743ee06d716623dac2b6e15d4d97f9221fd1cdf1a3d27134cf37fa9fa0d9ed",
+      "callables": 12,
+      "entries": 12,
+      "max_gprs": 20,
+      "stack_local_flags": []
+    },
+    "hyperconnection": {
+      "source_sha256": "7c743ee06d716623dac2b6e15d4d97f9221fd1cdf1a3d27134cf37fa9fa0d9ed",
+      "callables": 56,
+      "entries": 56,
+      "max_gprs": 40,
+      "stack_local_flags": []
+    },
+    "mla_compress": {
+      "source_sha256": "7c743ee06d716623dac2b6e15d4d97f9221fd1cdf1a3d27134cf37fa9fa0d9ed",
+      "callables": 4,
+      "entries": 6,
+      "max_gprs": 32,
+      "stack_local_flags": []
+    },
+    "projection": {
+      "source_sha256": "7c743ee06d716623dac2b6e15d4d97f9221fd1cdf1a3d27134cf37fa9fa0d9ed",
+      "callables": 17,
+      "entries": 25
+    }
+  },
+  "v41_vocabulary": {
+    "n": 129280,
+    "k": 5120,
+    "allocated_gprs": 48,
+    "shared_bytes": 1024,
+    "stack_bytes": 0,
+    "local_bytes": 0,
+    "existing_projection_ptx_and_cubins_identical": 16
+  },
+  "sm120": {
+    "host": "ripper",
+    "gpu_name": "NVIDIA RTX PRO 4000 Blackwell",
+    "gpu_uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "gpu_mode": "Default",
+    "regression": {
+      "tests": "56",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "1",
+      "time": "18.961"
+    },
+    "memcheck": {
+      "tests": "12",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "5.365"
+    },
+    "memory_errors": 0
+  },
+  "sm121": {
+    "host": "maxwell",
+    "gpu_name": "NVIDIA GB10",
+    "gpu_uuid": "GPU-128ca980-53cf-6524-40c5-a861a7941888",
+    "compute_capability": [
+      12,
+      1
+    ],
+    "gpu_mode": "Default",
+    "regression": {
+      "tests": "56",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "1",
+      "time": "17.712"
+    },
+    "memcheck": {
+      "tests": "12",
+      "failures": "0",
+      "errors": "0",
+      "skipped": "0",
+      "time": "5.170"
+    },
+    "memory_errors": 0
+  },
+  "host_tests": {
+    "policy_architecture_qualification": 98,
+    "arch_lint": 1,
+    "ruff_F": "passed"
+  },
+  "test_scope": "Each GPU passes 5 CSA compression, 37 HyperConnection and 13 embedding cases. The one skipped HyperConnection case requires two visible GPUs. Both memcheck runs pass 12 selected cases, including the high-state/high-row addressing probes and mutated graph replay.",
+  "sanitizer_exception": "--report-api-errors no disables CUDA API error reporting only; kernel memory checks remain enabled.",
+  "preparation": "Three physical-SM103 suites are prepared against their source-matched manifests, without GPU execution.",
+  "service": {
+    "stop": {
+      "maxwell": {
+        "exit_code": 0,
+        "stdout": "62244918b6dc38e845ef0f270413b4499a89262d88d4915721bbd35ce307b69e\n",
+        "stderr": ""
+      },
+      "ampere": {
+        "exit_code": 0,
+        "stdout": "f8ecce2fa502a20c452f02bca98131879c97ffa4a44388ce89baff93d8cc56e3\n",
+        "stderr": ""
+      },
+      "faraday": {
+        "exit_code": 0,
+        "stdout": "ef7ec295b04d29a08de1fc53adcf0c6ddd43dc5360e00fd2a892efd9aca6ec1d\n",
+        "stderr": ""
+      },
+      "hertz": {
+        "exit_code": 0,
+        "stdout": "804f68b9d705636cc7cdb526e2e5a1e89e7608f9d6dbd15f562dba6b5fe4442b\n",
+        "stderr": ""
+      }
+    },
+    "regression_exit_code": 0,
+    "memcheck_exit_code": 0,
+    "start": {
+      "maxwell": {
+        "exit_code": 0,
+        "stdout": "62244918b6dc38e845ef0f270413b4499a89262d88d4915721bbd35ce307b69e\n",
+        "stderr": ""
+      },
+      "ampere": {
+        "exit_code": 0,
+        "stdout": "f8ecce2fa502a20c452f02bca98131879c97ffa4a44388ce89baff93d8cc56e3\n",
+        "stderr": ""
+      },
+      "faraday": {
+        "exit_code": 0,
+        "stdout": "ef7ec295b04d29a08de1fc53adcf0c6ddd43dc5360e00fd2a892efd9aca6ec1d\n",
+        "stderr": ""
+      },
+      "hertz": {
+        "exit_code": 0,
+        "stdout": "804f68b9d705636cc7cdb526e2e5a1e89e7608f9d6dbd15f562dba6b5fe4442b\n",
+        "stderr": ""
+      }
+    },
+    "restored_health_http": "200",
+    "original_container_and_image_identities_verified": true,
+    "original_configuration_unchanged": true
+  },
+  "limitations": [
+    "No physical SM103 execution, performance claims or measured SM103 profile.",
+    "This component receipt does not qualify complete V4.1 serving; companion model, CED/cache and Engram integration is being ported in an isolated worktree.",
+    "A supported Trellis/BTX checkpoint representation and complete model evaluation remain necessary for the primary V4.1 target.",
+    "The full source corpus must be rebuilt after remaining implementation work."
+  ],
+  "artifacts": {
+    "v41-support-20260914/source-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/source-manifest.json",
+      "bytes": 51886,
+      "sha256": "229e354389df30e19e4a5a6b49b09f481c86355cdaa6e1fb7d69744e6d71c771"
+    },
+    "v41-support-20260914/test-tool-profile-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/test-tool-profile-manifest.json",
+      "bytes": 1251,
+      "sha256": "d5ef62700c90d7b286dad2ca05bd30a0bab64e6af499431b9bb71bc7786c7e1b"
+    },
+    "v41-support-20260914/commands.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/commands.json",
+      "bytes": 1157,
+      "sha256": "58e41c78501ea31f8262d8f034e7662955fd866bb8fd6341203cbdb7a90b9b0f"
+    },
+    "v41-support-20260914/resources.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/resources.json",
+      "bytes": 110177,
+      "sha256": "77afc67ecd1d57f36ed9100869d7ceb65100e8bf1b966c827263482f66db2c4c"
+    },
+    "v41-support-20260914/regression.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/regression.xml",
+      "bytes": 8076,
+      "sha256": "3764a485723cb779374aecea9af231f863cc6e27426ceaa15ffada8e55943113"
+    },
+    "v41-support-20260914/memcheck.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/memcheck.xml",
+      "bytes": 1921,
+      "sha256": "40c4d08daada531afbe83824ffaf508dc77cbddb192b4a043f90725cef8797fe"
+    },
+    "v41-support-20260914/compile-embedding/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/compile-embedding/manifest.json",
+      "bytes": 16802,
+      "sha256": "7af219d4c19ce639df2e32858ae42edecdfc7746c5f1b01e3c99e98acbf2dcc9"
+    },
+    "v41-support-20260914/compile-hyperconnection/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/compile-hyperconnection/manifest.json",
+      "bytes": 70379,
+      "sha256": "a1fe9410031f497262ada44020e15317aea6d43227fbde2e66335f5b7589511a"
+    },
+    "v41-support-20260914/compile-mla_compress/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/compile-mla_compress/manifest.json",
+      "bytes": 7544,
+      "sha256": "9738f20d207d2cb8800612bd85f565b71ab768caf7da537666c9808f6196ee38"
+    },
+    "v41-support-20260914/compile-projection/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/compile-projection/manifest.json",
+      "bytes": 22545,
+      "sha256": "eb1dc022bbb704ca39da638c2526b5fff60a0908b97b893d6925e8a2d22eb8cd"
+    },
+    "v41-support-20260914/prepared-mla_compress/qualification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/prepared-mla_compress/qualification.json",
+      "bytes": 2758,
+      "sha256": "808049d90b601c8fcdf85f65e8a22606f3801d580fcf7b072f6b406d6ccd9de0"
+    },
+    "v41-support-20260914/prepared-hyperconnection/qualification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/prepared-hyperconnection/qualification.json",
+      "bytes": 2780,
+      "sha256": "5f117ed23fe6b06bd1825148184dc8705a9884fe8116e42ce8b7ee348b7e1f1c"
+    },
+    "v41-support-20260914/prepared-embedding/qualification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/prepared-embedding/qualification.json",
+      "bytes": 2730,
+      "sha256": "3c31c6aba4d7162b138a20bc5064950953b33a5d98f79dac83ba708f745ceec3"
+    },
+    "v41-support-compile.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-compile.log",
+      "bytes": 6773,
+      "sha256": "934684e35e4ac9f8f127f8cb04953d5f119c0f7a168257b042abe719b6814bbd"
+    },
+    "v41-support-projection-compile.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-projection-compile.log",
+      "bytes": 2252,
+      "sha256": "adf8ccf9cb3aedad1dda8177a866fcb906ca5296b2455fe9242a0b6004750e7e"
+    },
+    "v41-support-regression.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-regression.log",
+      "bytes": 1007,
+      "sha256": "4ff3ed2a454f17e943e50db2281d3d07a885d6e04163e9027553e2cacafd5fd8"
+    },
+    "v41-support-host-final.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-host-final.log",
+      "bytes": 179,
+      "sha256": "f56bd09af903b4ac525d6c299ca6ec3c80ca09109960d3467bd3ff3ec917bb11"
+    },
+    "v41-support-memcheck.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-memcheck.log",
+      "bytes": 176,
+      "sha256": "adeff0fe96d22c6d627489e7c7292e85fb715010cc43cff4029a5c10361e0f49"
+    },
+    "v41-support-memcheck-missing-path.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-memcheck-missing-path.log",
+      "bytes": 123,
+      "sha256": "74b653d4f25d0539168a1f1e4f386736f0056b5e66bd7a8e113d05730cc160e8"
+    },
+    "v41-support-lint.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-lint.log",
+      "bytes": 19,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "v41-support-arch-lint.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-arch-lint.log",
+      "bytes": 98,
+      "sha256": "d40f86cec22ce9eff8b5bcb1061ca911ae5ea7854fd90fa8be313cf1e0e05292"
+    },
+    "v41-support-20260914/sm121/run-regression.py": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/run-regression.py",
+      "bytes": 4853,
+      "sha256": "b3cb2740d550b7b7a5722078fb44ac631244ec207206e6db579ff1fab470b45b"
+    },
+    "v41-support-20260914/sm121/cluster-before.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/cluster-before.json",
+      "bytes": 5680,
+      "sha256": "c2b9e9185973e8c4da68073cd4ff7f39111b04dedf2336fe267b6b503c8f1e1f"
+    },
+    "v41-support-20260914/sm121/cluster-stop.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/cluster-stop.json",
+      "bytes": 564,
+      "sha256": "c6e0719348f1669db6652c9b61eaac164a482403ad0d65e5748d20c940d8dbdf"
+    },
+    "v41-support-20260914/sm121/gpu-identity.txt": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/gpu-identity.txt",
+      "bytes": 81,
+      "sha256": "aa72ef3723e5f1ee741c07b36c938e45a8ba2023e875d712532269e32e97f770"
+    },
+    "v41-support-20260914/sm121/regression-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/regression-command.json",
+      "bytes": 440,
+      "sha256": "70c347bc62df6defdbd42f4c561270d93d6e83197971c1c522b7d3ad8cb7d516"
+    },
+    "v41-support-20260914/sm121/regression.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/regression.log",
+      "bytes": 997,
+      "sha256": "b5be276842407a30b1cbb670216eca42efc5e6626d52fb3f3fc1da46890ff6c1"
+    },
+    "v41-support-20260914/sm121/regression.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/regression.xml",
+      "bytes": 8072,
+      "sha256": "5a1f57e862a087a08a3313ca3ae6e3b66cea089a3b0a5b1b6a8f57a967447a38"
+    },
+    "v41-support-20260914/sm121/memcheck-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/memcheck-command.json",
+      "bytes": 643,
+      "sha256": "6d707c8c9c81c031d5f83193f6d1f92c09a87f0a94cb8b3d8fba0f0b74f28d77"
+    },
+    "v41-support-20260914/sm121/memcheck.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/memcheck.log",
+      "bytes": 176,
+      "sha256": "eb10bbaf7c9391e96dd10792467db9e83583acd7f024d4620b2b82c307228e57"
+    },
+    "v41-support-20260914/sm121/memcheck.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/memcheck.xml",
+      "bytes": 1922,
+      "sha256": "1a799143ca0cf7ca7b430b44871447f744604ff913866294960c9d65a2bdba84"
+    },
+    "v41-support-20260914/sm121/cluster-start.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/cluster-start.json",
+      "bytes": 564,
+      "sha256": "c6e0719348f1669db6652c9b61eaac164a482403ad0d65e5748d20c940d8dbdf"
+    },
+    "v41-support-20260914/sm121/run-results.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/run-results.json",
+      "bytes": 1327,
+      "sha256": "6d78c1aed2a966ebfa6704d308b2d5efafee3ce1b803a97ff5c98d30a18e62d3"
+    },
+    "v41-support-20260914/sm121/restore-health.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/restore-health.json",
+      "bytes": 97,
+      "sha256": "c6393693ad11a21e1066ef71c2b233c34bbc9b623cdec888cbc3ac2240adb9b5"
+    },
+    "v41-support-20260914/sm121/cluster-after.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/sm121/cluster-after.json",
+      "bytes": 824,
+      "sha256": "b2bbc54c5e92c0ee860fb312b13b73d5f2756591cd9455a2472a16519868507c"
+    },
+    "v41-support-20260914/memcheck-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-support-20260914/memcheck-command.json",
+      "bytes": 688,
+      "sha256": "ec2f8dcff1fdad1b4d49f5b1eac603216037c071d5821bf386c15d0dc99f593c"
+    }
+  }
+}

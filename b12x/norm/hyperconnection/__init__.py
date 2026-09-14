@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
+    archs=("sm103a", "sm120a", "sm121a"),
     name="hyperconnection",
     group="norm",
     api_style="planned",
@@ -54,9 +55,9 @@ META = OpMeta(
     notes=(
         "The Qwen3.8 Flash Next S=4, H=2560, R=320 BF16 contract uses the "
         "CuTeDSL combine+norm kernel for every non-empty live token count. "
-        "Unsupported geometry or layout fails instead of falling back. Triton "
-        "is used only for the auxiliary normalization, "
-        "activation, gate-reduction, and final residual-injection stages."
+        "Unsupported geometry or layout fails instead of falling back. SM103 uses "
+        "CuTe for all stages. SM120/SM121 retain Triton for zero-centered "
+        "grouped normalization and gate reduction."
     ),
 )
 

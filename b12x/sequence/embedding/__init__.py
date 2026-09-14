@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 
 META = OpMeta(
+    archs=("sm103a", "sm120a", "sm121a"),
     name="embedding", group="sequence", api_style="oneshot",
     entry_points=("plan", "query_from_call", "run", "is_supported", "clear_caches", "EmbeddingQuery"),
     dtypes=("bfloat16", "float32", "int32", "int64"),
