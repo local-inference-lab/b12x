@@ -145,9 +145,12 @@ native MXFP8 GEMM. Inverse RoPE stays in FP32 until activation quantization.
 Packed 128x128 and 32x32 UE8M0 weight layouts remain shared with SM12x; SM103
 does not allocate the additional SM12x tiled weight copies.
 
-Reserve `plan.scratch_specs()` before capture and warm the binding with `run`
-or `run_inv_rope`. SM103 bindings retain the planned capacity and fixed scratch
-offsets. Live rows remain launch arguments, and quantization overwrites padded
+Reserve `plan.scratch_specs()` before capture. Use `prewarm_inv_rope` to resolve
+the inverse-RoPE plan's kernels, or warm a plain binding with `run`.
+Bindings retain the planned capacity and fixed scratch offsets on all supported
+architectures. Supply a separate contiguous BF16 `out` tensor when the result
+must survive scratch reuse. Live rows and input row strides remain launch
+arguments, and SM103 quantization overwrites padded
 scale bytes on every call. Values, weights, positions, cosine cache and scratch
 must share one device. Input and writable buffers must not overlap. Positions
 must index the cosine cache; invalid indices raise a device error. Pool-scaled
@@ -155,13 +158,18 @@ offsets use Int64, including cosine-cache addresses beyond 2^31 elements.
 SM103 inverse-RoPE execution requires a binding; the legacy allocating
 convenience call is not admitted on that architecture.
 
-The [WO validation receipt](sm103-wo-validation.json) records host contracts,
-SM120 quantizer and legacy projection regressions, and SM103 compilation.
-The CuTe quantizers use 28–40 allocated registers; the eight native GEMM
+The [WO serving validation receipt](sm103-wo-serving-validation.json) records
+host contracts, SM120 quantizer and bound projection regressions, and SM103
+compilation. Input columns are contiguous; an Int64 row stride supports sliced
+padded attention heads without a copy. The CuTe quantizers use 28–39 allocated
+registers; the eight native GEMM
 specializations use 134 registers, 1,024 bytes of static shared memory and
 67,712 bytes of dynamic shared memory. No stack or local-memory flags appear.
-These are static resource results, not occupancy or performance measurements.
-The complete corpus has not been rebuilt for this component addition.
+Forty quantizer variants have positive R, UR, or UP count deltas against the
+WO backend baseline; six increase allocated GPRs by two or four. The receipt
+retains every delta for B300 profiling. Native GEMM cubins are byte-identical
+to that baseline. These are static resource results; occupancy and performance
+remain unqualified. The complete SM103 corpus has not been rebuilt.
 
 ```bash
 python scripts/compile_sm103.py --component wo_projection \
@@ -175,10 +183,12 @@ both GEMM stages against independently decoded FP32 references, freezes kernel
 resolution across M1/M3/M8/M9/M16/M127/M128/M129, and checks input mutation,
 poisoned scratch, explicit streams, stable addresses and allocation-free replay.
 Stage relative L2 must remain below 0.005 and cosine above 0.9999. It also tests
-the 4 GiB cosine-cache boundary and isolates invalid-position tests in separate
-processes. Companion vLLM still needs a retained WO plan owner and warmup before
-its SM103 attention route can be enabled. SM12x retains its existing projection
-and quantization paths, including the legacy inverse-RoPE allocation behavior.
+both cosine and source row offsets beyond 2^31 elements and isolates invalid
+positions in separate processes. Companion vLLM still needs a retained WO plan
+owner and warmup before its SM103 attention route can be enabled. SM12x bound
+inverse-RoPE execution uses its supplied intermediates and output. Its functional
+convenience call continues to allocate; both entries share the same launch
+implementation. No complete model evaluation is established by these checks.
 
 Tensor-scaled and compact K128 block-FP8 linears accept caller-owned output
 and scratch through `gemm.blockscaled.mm` and `mm_block_fp8`. Reserve

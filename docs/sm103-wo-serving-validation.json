@@ -1,0 +1,225 @@
+{
+  "schema": "b12x.sm103.wo.serving.validation.v1",
+  "recorded_at_utc": "2026-09-14T12:50:48.631470+00:00",
+  "status": "implemented; host and SM120 regressions pass; physical SM103 execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claims": false,
+  "base_revision": "d74c04107e69463c58e4a519ce5cb78b13f4a46c",
+  "source_sha256": "0cd48e2ba80072c1ba97fd2ee567e1123827dfd6e10bd27580078d82a0d6b75b",
+  "implementation": {
+    "caller_owned_output": "aligned contiguous BF16 [M,H] or [M,H,1]",
+    "binding": "fixed capacity region offsets; no device writes; alias rejection includes strided input spans",
+    "sm12x": "bound inverse RoPE retains intermediates and output; functional entry shares the launch implementation",
+    "sm103": "grouped quantization accepts padded input rows through a runtime Int64 stride",
+    "quantizer_compile_contract": 4,
+    "prewarm": "public prewarm_inv_rope owns the backend warmup schedule; capture and frozen resolution are rejected"
+  },
+  "compiled": {
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "wo_projection",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/wo-serving-sm103-final"
+    ],
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-sm103-final/manifest.json",
+      "sha256": "ce96e4e53873d9adf8c60ea4885272f761d04468b571e52b3c8ea63bd1e7248f",
+      "bytes": 75460
+    },
+    "callables": 56,
+    "quantizers": 48,
+    "native_gemms": 8,
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-resources.json",
+      "sha256": "85ca18aab9e1abb9972762a262bd7430c142280e32ce93fc979332e10ae7cf0b",
+      "bytes": 107787
+    },
+    "quantizer_allocated_gpr_range": [
+      28,
+      39
+    ],
+    "native_gemm_cubins_unchanged": 8,
+    "positive_register_delta_variants": 40,
+    "positive_allocated_gpr_variants": 6,
+    "register_delta_disposition": "Runtime Int64 source row addressing changes quantizer allocation. All R/UR/P/UP deltas remain in the resource artifact. Six variants add two or four allocated GPRs. Native occupancy and latency require B300 profiling.",
+    "stack_or_local_flags": []
+  },
+  "validation": [
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/architecture",
+        "tests/policy",
+        "tests/gemm/test_wo_projection_scratch_bindings.py",
+        "tests/gemm/test_wo_projection_policy.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "passed": 533,
+      "skipped": 24,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-host.log",
+        "sha256": "f6764ea4c2879299fffa35619c04467a1f1d048ec337be66af358be67d15f384",
+        "bytes": 673
+      }
+    },
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_wo_projection.py",
+        "tests/gemm/test_gemm_wo_projection.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 47,
+      "skipped": 6,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-sm120.log",
+        "sha256": "88d0e784d6b0f4d64c9590dbd34b2e27e2940a9b0a02b10d1c6beba28ff630ff",
+        "bytes": 126
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_wo_projection.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "-k",
+        "not native and not invalid_cosine",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 18,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-memcheck.log",
+        "sha256": "286ba7d07068cab729b8c700439129e68d87a33e33fc8ad2437f4eb2dbcc2d59",
+        "bytes": 190
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_wo_projection.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "-k",
+        "not native and not invalid_cosine",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 18,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-synccheck.log",
+        "sha256": "e81738da9f61e140ee6cfb83b1143dee21373f860e57d6db0de7e2d8eaf54325",
+        "bytes": 175
+      }
+    }
+  ],
+  "device": {
+    "name": "NVIDIA RTX PRO 4000 Blackwell",
+    "sm_count": 70,
+    "capability": [
+      12,
+      0
+    ],
+    "packages": {
+      "torch": "2.14.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "cuda-python": "13.4.1",
+      "triton": "3.8.0"
+    }
+  },
+  "gpu_mode": "Default",
+  "driver_version": "580.173.02",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-source-manifest.json",
+    "sha256": "b0afe55fa7f2f34319ec21f055f32f1c17bd33cc24fc0ebff789b92f8b235d44",
+    "bytes": 52611
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-source-check.json",
+    "sha256": "81c466651894f310532085e29c5c4db8d7d727727ce56107c58e094513414381",
+    "bytes": 168
+  },
+  "package": {
+    "files": 463,
+    "python_files": 460,
+    "profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "a2afdcf69bdeb842e2cd386dedaba5e48f15cb9efc22c1cce825156d4e1b6618",
+        "bytes": 2592834
+      },
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "a34a960991f27a07bf43f878700db4051e18aaa94d47e55c68c25ee32a2bf36a",
+        "bytes": 2363460
+      }
+    }
+  },
+  "qualification_prepared": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-serving-qualification-prepared/qualification.json",
+    "sha256": "3d4bee32061615b51f6fc55b7bb14c3aa4f9d871c95e30bd06d36d8a0bdaef85",
+    "bytes": 2314
+  },
+  "sanitizer_scope": "Kernel memcheck/synccheck. API error reporting is disabled only for the recorded CUDA-Python 13.4/SM120 driver probe mismatch. Invalid-position subprocess tests run outside sanitizer. Enable API error reporting on SM103.",
+  "limitations": [
+    "Six native SM103 WO cases remain deferred, including strided inputs, caller-owned output, prewarm and graph mutation",
+    "Companion vLLM WO ownership, warmup, checkpoint scale metadata and architecture admission remain integration work",
+    "SM121 hardware is running an existing vLLM service; this receipt contains no SM121 runtime qualification",
+    "A four-case host test exercises the small-SM quantized epilogue selection, without claiming physical SM121 execution",
+    "Full target/draft model evaluation, complete representative SM103 recompilation, native companion build and Station transport remain outstanding"
+  ]
+}

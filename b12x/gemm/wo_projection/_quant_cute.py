@@ -114,13 +114,14 @@ class _WOQuantCuTeLaunch:
         scale_rows_ptr: cute.Pointer,
         scale_mma_ptr: cute.Pointer,
         m: Int32,
+        source_row_stride: Int64,
         cos_sin_len: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
         source = cute.make_tensor(
             source_ptr,
-            cute.make_layout((Int64(m) * self._total_k,)),
+            cute.make_layout((Int64(m) * source_row_stride,)),
         )
         positions = cute.make_tensor(positions_ptr, cute.make_layout((m,)))
         cos_sin = cute.make_tensor(cos_sin_ptr, cute.make_layout((cos_sin_len,)))
@@ -137,7 +138,7 @@ class _WOQuantCuTeLaunch:
             cute.make_layout((((Int64(m) + 127) // 128) * (self._total_k // 128) * 512,)),
         )
         self.kernel(
-            source, positions, cos_sin, values_u32, scale_rows, scale_mma, m
+            source, positions, cos_sin, values_u32, scale_rows, scale_mma, m, source_row_stride
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -155,6 +156,7 @@ class _WOQuantCuTeLaunch:
         scale_rows: cute.Tensor,
         scale_mma: cute.Tensor,
         m: Int32,
+        source_row_stride: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -181,7 +183,7 @@ class _WOQuantCuTeLaunch:
                 # Source physical [g, m, span]: regather group-major flat k.
                 src0 = Int64(g) * (Int64(m) * self._span) + row * self._span + Int64(inner0)
             else:
-                src0 = row * self._total_k + Int64(k0)
+                src0 = row * source_row_stride + Int64(k0)
 
             # Pure SSA scalars (no rmem array): divergent updates under the
             # rope branch then merge in registers instead of spilling.
@@ -464,12 +466,13 @@ def _compile_wo_quant(
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         Int32(1),
         Int64(1),
+        Int64(1),
         Int32(1),
         current_cuda_stream(),
         options=f"--gpu-arch={architecture}",
         compile_spec=KernelCompileSpec.from_key(
             "gemm.wo_quant_cute",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -528,6 +531,7 @@ def _compile_wo_quant(
                 assumed_align=16,
             ),
             Int32(m),
+            Int64(_grouped_source_stride(source, m, total_k) if mode == "grouped" else total_k),
             Int64(cos_sin.numel()),
             Int32(grid_x),
             current_cuda_stream() if stream is None else cuda.CUstream(cuda_stream_to_int(stream)),
@@ -612,6 +616,16 @@ def quantize_wo_group_major_rows_cute(
             )(source_gmr, source_gmr, source_gmr, values, scale_rows, scale_mma, m, stream)
 
 
+def _grouped_source_stride(source, m, total_k):
+    if source.is_contiguous():
+        return total_k
+    if (source.ndim in (2, 3) and source.shape[0] == m
+            and source.stride(-1) == 1 and source.stride(0) >= total_k
+            and (source.ndim == 2 or source.stride(1) == source.shape[2])):
+        return source.stride(0)
+    raise ValueError("WO input requires contiguous columns and nonoverlapping rows")
+
+
 def _validate_storage(source, values, scale_rows, scale_mma, *, m, total_k, span, mode):
     if (m < 0 or m >= 2**31 or total_k <= 0 or total_k >= 2**31
             or total_k % 128 or span <= 0 or total_k % span
@@ -621,7 +635,8 @@ def _validate_storage(source, values, scale_rows, scale_mma, *, m, total_k, span
     if source.dtype not in (torch.bfloat16, torch.float16) or source.numel() != m * total_k:
         raise ValueError("WO input must contain complete BF16/FP16 rows")
     if mode == "grouped":
-        source_layout = source.is_contiguous()
+        _grouped_source_stride(source, m, total_k)
+        source_layout = True
         physical_values = values.permute(2, 0, 1) if values.ndim == 3 else values
         value_groups, value_k = groups, span
     else:
@@ -651,7 +666,8 @@ def _validate_storage(source, values, scale_rows, scale_mma, *, m, total_k, span
 
 
 def _check_disjoint(tensors):
-    spans = [(t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors]
+    from ._execution import _span
+    spans = [_span(t) for t in tensors]
     for i, (lo, hi) in enumerate(spans):
         if any(lo < end and start < hi for start, end in spans[:i]):
             raise ValueError("WO input and output buffers must not overlap")
