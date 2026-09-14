@@ -329,6 +329,25 @@ def _make_cute_state(
     )
 
 
+def test_plain_tp4_push_plan_rejects_unsharded_storage(monkeypatch):
+    from b12x.comm.pcie import _oneshot_preparation as preparation
+    from b12x.comm.pcie._tuning import PcieQuery
+    from b12x.preparation import FrozenMapping
+
+    query = PcieQuery(
+        surface="OneshotAllReduce.all_reduce", world_size=4, rank=0,
+        topology="pcie_ipc", call=FrozenMapping({"transport": "tp4_remote_push"}),
+        setup=FrozenMapping(),
+    )
+    native = SimpleNamespace(
+        sharded_eager_storage=False, eager_tables=(300, 400),
+        eager_buffer_bytes=84 * 1024,
+    )
+    monkeypatch.setattr(preparation, "_state", lambda runtime: native)
+    with pytest.raises(ValueError, match="four-shard IPC storage"):
+        preparation.plan(query, runtime=SimpleNamespace(world_size=4))
+
+
 def test_plain_tp4_ds41_push_uses_frozen_policy_and_preserves_other_routes(monkeypatch):
     """Extend the opt-in TP4 storage contract only to supported DS4.1 BF16 shapes."""
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
