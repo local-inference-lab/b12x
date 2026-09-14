@@ -238,6 +238,52 @@ class BtxManifest:
             layers=layers,
         )
 
+    def partition_extents(self, world_size: int) -> tuple[tuple[int, int], ...]:
+        """Partition all slots into nonempty, aligned rank extents.
+
+        Barriers separate rank groups. Within each group, complete alignment
+        units are balanced across ranks; local intermediate widths may differ.
+        Kernel eligibility remains the execution planner's responsibility.
+        """
+        _require(
+            type(world_size) is int and world_size > 0,
+            "BTX world_size must be a positive integer",
+        )
+        alignment = self.layout.extent_alignment_slots
+        boundaries = (0, *self.layout.extent_barriers, self.geometry.atom_slots)
+        units = tuple(
+            (end - start) // alignment
+            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+        )
+        _require(
+            all(boundary % alignment == 0 for boundary in boundaries),
+            "BTX barriers must align to complete rank extent units",
+        )
+        _require(
+            len(units) <= world_size <= sum(units),
+            "BTX world_size cannot cover all barriers with nonempty aligned extents",
+        )
+        ranks = [1] * len(units)
+        for _ in range(world_size - len(units)):
+            segment = max(
+                (index for index, count in enumerate(units) if ranks[index] < count),
+                key=lambda index: (
+                    (units[index] + ranks[index] - 1) // ranks[index],
+                    units[index],
+                    -index,
+                ),
+            )
+            ranks[segment] += 1
+        extents = []
+        for start, count, rank_count in zip(boundaries[:-1], units, ranks, strict=True):
+            width, extra = divmod(count, rank_count)
+            for rank in range(rank_count):
+                size = (width + (rank < extra)) * alignment
+                self.validate_extent(start, size)
+                extents.append((start, size))
+                start += size
+        return tuple(extents)
+
     def validate_extent(self, first_slot: int, slot_count: int) -> None:
         """Reject rank extents the layout declarations make illegal."""
 

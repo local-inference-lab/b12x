@@ -144,6 +144,14 @@ knowing the reasons.
 A rank shorter than the serving kernel's minimum local width is padded at
 preparation time, exactly as any other legal extent.
 
+`BtxManifest.partition_extents(world_size)` plans complete storage ownership
+from alignment and barrier metadata. It returns ordered `(first_slot, slot_count)`
+pairs covering every slot exactly once. Local intermediate widths may differ:
+V4.1's 2,304 channels contain nine 256-channel records, so TP2 assigns five
+records (1,280 channels) to one rank and four (1,024 channels) to the other.
+Integrations must use those local widths rather than split a record at 1,152
+channels. The execution planner still validates each local kernel geometry.
+
 ## Support status
 
 - **Production**: uniform rate structures across the codebook bit ranges
