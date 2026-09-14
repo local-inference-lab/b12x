@@ -1,0 +1,256 @@
+{
+  "schema": "b12x.sm103.mtp_fp8.validation.v1",
+  "recorded_utc": "2026-09-14T17:22:04.178608+00:00",
+  "status": "Per-stream FP8 MTP operator implemented and cross-compiled; DeepSeek model integration incomplete",
+  "runtime_qualified_on_sm103": false,
+  "performance_claim": false,
+  "source_base_revision": "b0d7bcd8bc2878447326a79c77c2c5ec64c384cc",
+  "source_sha256": "f0c9076894bda5aa8b42cefb592735d3765e7dc919b79b9b26a0f75126aed2d0",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-source-manifest.json",
+    "bytes": 52141,
+    "sha256": "320652cb26f8ab50dd8e7c060b9b9b3088171c44582c27408e18aebfb585080b"
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-remote-source-check.json",
+    "bytes": 33,
+    "sha256": "1ae433915cf2903842a6485b9e76494cc8db755fb0d1f7fb61a93db791133a0f"
+  },
+  "implementation": [
+    "Public sequence.mtp_feedback rms_streams_fp8 contract uses per-stream ordinary RMS, K128 E4M3 activation quantization, separate compact block-FP8 projections and BF16 broadcast addition",
+    "Fixed scratch covers max_tokens times streams; both position dtypes compile at plan time; live rows remain runtime scalars with Int64 scaled offsets",
+    "Shared FP8 projection factory retains the existing conservative warp-MMA implementation and callable identity for public compact FP8 GEMM",
+    "Policy query schema 2 retains Qwen profile coverage; ordinary RMS contracts use AUTO heuristics; candidate contract version 3 races all three production contracts"
+  ],
+  "checks": {
+    "host": {
+      "result": "642 passed, 30 skipped",
+      "command": "TMPDIR=/home/jasonc/b12x-sm103-evidence/btx-pairs-tmp CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/sequence/test_mtp_feedback.py tests/sequence/test_benchmark_mtp_feedback.py --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-host-release.log",
+        "bytes": 1261,
+        "sha256": "b31ecca522bca072141987e7533d2387946d14f1a93ae0bffd49f9ff680635b6"
+      }
+    },
+    "sm120_regression": {
+      "result": "92 passed, 1 skipped",
+      "command": "CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest -q tests/sequence/test_mtp_feedback.py tests/sequence/test_benchmark_mtp_feedback.py tests/gemm/test_sm103_fp8.py tests/gemm/test_tensor_fp8_linear.py --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-regression-sm120.log",
+        "bytes": 4019,
+        "sha256": "f7015915c8c24f1f659f62d1f23c4bd622281507d9cf68cc228c6fa30704700c"
+      }
+    },
+    "sm120_native_parity": {
+      "result": "6 passed, 25 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ARCH=sm_120a /home/jasonc/vllm-sm103-regression-20260913/.venv/bin/python -m pytest -q tests/sequence/test_mtp_feedback.py -k rms_streams_fp8 --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-native-parity-sm120.log",
+        "bytes": 2547,
+        "sha256": "502a0c8870db19b478459232764ca1f6638544f5c7c980d2f331b14b595f63fc"
+      }
+    },
+    "final_host_mtp_and_packaging": {
+      "result": "3 passed, 29 skipped",
+      "command": "TMPDIR=/home/jasonc/b12x-sm103-evidence/btx-pairs-tmp .venv/bin/python -m pytest -q tests/sequence/test_mtp_feedback.py tests/test_packaging.py --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-host-final-tests.log",
+        "bytes": 538,
+        "sha256": "d18b7070c21c4a90e6cf8da69090fd54789b52f9d5b8bdf4419493d6bfe45113"
+      }
+    },
+    "memcheck": {
+      "result": "5 passed, 26 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/sequence/test_mtp_feedback.py -k \"rms_streams_fp8 and not optional_vllm\" --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-memcheck.log",
+        "bytes": 989,
+        "sha256": "84a4d667e3343129d80195e9527f1bf295219a76873bc5f07bb6b7e73c963c88"
+      }
+    },
+    "synccheck": {
+      "result": "5 passed, 26 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/sequence/test_mtp_feedback.py -k \"rms_streams_fp8 and not optional_vllm\" --tb=short",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "artifact": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-synccheck.log",
+        "bytes": 989,
+        "sha256": "966e7340ccab17c1680ae18ff328e78cfa147ea76b0be07df72678bb23b217bd"
+      }
+    },
+    "lint": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-lint.json",
+      "bytes": 1205,
+      "sha256": "0b21575ab94337730a280c10f19860503cb0684bb71619cbf90bf4e8a2acbe25"
+    }
+  },
+  "test_scope": "H128/S1, H256/S3 and H5120/S4; live counts 0/1/4/17; graph input and scale mutation, scratch poisoning, unchanged output tails, frozen kernel resolution, Int32/Int64 positions, alias/capacity rejection; quantizer also exercises 65537 rows",
+  "quantization_evidence": {
+    "native_parity": "Exact E4M3 activation bytes and FP32 scale bytes match vLLM _C.per_token_group_fp8_quant at H5120/S4",
+    "oracle_correction": "PyTorch division by Python scalar 448 can use rounded reciprocal multiplication. FP64 division followed by FP32 rounding reproduces the native scale; a permanent tie case distinguishes 80 from 72.",
+    "diagnostic": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-quant-diagnosis.log",
+      "bytes": 1357,
+      "sha256": "932b80c689687a6888f1528588f3c3549d9a139ace0e5862a75a9183a579959c"
+    },
+    "regression_scope": "The 92-case regression precedes addition of the optional native-parity test; the six-case companion-environment run covers the final FP8 test set."
+  },
+  "sm103_compile": [
+    {
+      "command": [
+        "scripts/compile_sm103.py",
+        "--component",
+        "mtp_feedback",
+        "--output-dir",
+        "/home/jasonc/b12x-sm103-evidence/mtp-fp8-final-sm103",
+        "--nvdisasm",
+        "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+        "--cuobjdump",
+        "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+      ],
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-final-sm103/manifest.json",
+        "bytes": 65422,
+        "sha256": "f3eac22957b5870b5526e287973e66cdfb0ad46b09ac1a8057df3869dbad5761"
+      },
+      "callables": 51,
+      "packages": {
+        "torch": "2.14.0",
+        "cuda-python": "13.4.1",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "nvidia-cutlass-dsl-libs-base": "4.6.2",
+        "nvidia-cutlass-dsl-libs-core": "4.6.2",
+        "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+        "triton": "3.8.0"
+      }
+    },
+    {
+      "command": [
+        "scripts/compile_sm103.py",
+        "--component",
+        "fp8",
+        "--output-dir",
+        "/home/jasonc/b12x-sm103-evidence/mtp-fp8-final-shared-gemm-sm103",
+        "--nvdisasm",
+        "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+        "--cuobjdump",
+        "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+      ],
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-final-shared-gemm-sm103/manifest.json",
+        "bytes": 25594,
+        "sha256": "76f9f3fe59bb8f87e9eb69173763fda5388398b4672d20b25af9052a686b3e16"
+      },
+      "callables": 19,
+      "packages": {
+        "torch": "2.14.0",
+        "cuda-python": "13.4.1",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "nvidia-cutlass-dsl-libs-base": "4.6.2",
+        "nvidia-cutlass-dsl-libs-core": "4.6.2",
+        "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+        "triton": "3.8.0"
+      }
+    }
+  ],
+  "resources": {
+    "mtp": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-resources.json",
+      "bytes": 55129,
+      "sha256": "dc94709f32aff4c3138d7aecff190bf75c320746405a5f55c750ba5091668ab6"
+    },
+    "shared_fp8": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-shared-resources.json",
+      "bytes": 84435,
+      "sha256": "5eac84798210e6dee88b781adfd4a352556dd744932df85be99a1d0cef449ec5"
+    },
+    "added_mtp_callables": 21,
+    "unchanged_mtp_ptx_and_cubins": 30,
+    "unchanged_shared_fp8_ptx_and_cubins": 19,
+    "positive_existing_deltas": {},
+    "stack_or_local_flags": {}
+  },
+  "sanitizer_limitation": "API reporting disabled only for the documented CUDA Python 13.4 / SM120 driver API-query mismatch. B300 commands retain API reporting.",
+  "benchmark_harness": {
+    "artifact": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-benchmark-sm120.json",
+      "bytes": 11542,
+      "sha256": "be96a46020d353a17ddbd007ab3ea24965f9af20ff047d55ac287e7091be406b"
+    },
+    "command": "CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ARCH=sm_120a .venv/bin/python -m benchmarks.benchmark_mtp_feedback --contract rms_streams_fp8 --hidden-size 5120 --profiles decode-t1,spec-t4,prefill-t17 --capacity-tokens 33 --warmup 3 --samples 5 --output /home/jasonc/mtp-fp8-benchmark-sm120.json",
+    "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+    "status": "Three correctness/storage/timing-harness cases pass; no performance claim"
+  },
+  "deferred_suite": {
+    "artifact": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-deferred/qualification.json",
+      "bytes": 2600,
+      "sha256": "b8277ef34361adabf61d6149a117f7f7571f7e9234915c47f8575efc34ca1722"
+    },
+    "collection": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-deferred-collection.log",
+      "bytes": 2725,
+      "sha256": "abf2b6366ef1342ec26c2d16729ebd68d8820fa6e4c2bc623852789004e0bfb1"
+    },
+    "selected_tests": 27
+  },
+  "packaging": {
+    "verification": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-package-verification.json",
+      "bytes": 349,
+      "sha256": "bf524f858921fd56f97cfc271518fe05429a50531332e90523085c430e1953d0"
+    },
+    "package_files_verified": 474,
+    "artifacts": {
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "4ae7ef0fda5d8e723bf959b0b14e5f68862e36699c20edab8c058f67ee42e8a2",
+        "bytes": 2389296
+      },
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "bbdea2808b1661178a4369cbb9e28a3d6a2f50f2f0539d1910b4ab363b4951eb",
+        "bytes": 2622426
+      }
+    },
+    "extracted_wheel_import": {
+      "path": "/home/jasonc/b12x-sm103-evidence/mtp-fp8-wheel-import.log",
+      "bytes": 138,
+      "sha256": "b15081b0c47eca54627756d09f3e1903facadf0705f5836f07611c912767f5cc"
+    }
+  },
+  "hardware": {
+    "host": "ripper",
+    "product": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "mode": "Default",
+    "gpu_0": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "gpu_1": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+  },
+  "companion_environment": {
+    "python_source_revision": "46611c3c2541f699c40bf180342e043cbcd23457",
+    "native_precompiled_revision": "299ebd094a9cea1a16077dc2a4419192b85a777c",
+    "native_matches_python_source": false,
+    "scope": "Existing native quantizer parity only; no DeepSeek forward integration or complete model execution"
+  },
+  "rejected_evidence": [
+    "mtp-fp8-component-tests.log and mtp-fp8-direct-div-tests.log use the inaccurate scalar-division oracle",
+    "mtp-fp8-host-tests.log exhausted the /tmp user quota; final host tests use the evidence temporary directory",
+    "mtp-fp8-sm103 and mtp-fp8-shared-gemm-sm103 were rejected by source-integrity checks after a final formatting edit"
+  ],
+  "remaining": [
+    "DeepSeek MTP companion plan ownership, weight-finalization lifecycle, sequence-parallel sharding and pre-head recycled residual integration",
+    "Complete GLM/DeepSeek checkpoint evaluation and DFlash2 target/draft execution",
+    "Frozen QSRT coupled high-rate Trellis conversion",
+    "Matching native vLLM build, ARM64 installation/native helper execution, available-host SM121 regression",
+    "Station direct-HBM registration and transport",
+    "Consolidated source-frozen compilation after remaining implementation work",
+    "Physical SM103 runtime correctness, sanitizer, graphs and performance qualification"
+  ]
+}

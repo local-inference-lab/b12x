@@ -1408,7 +1408,6 @@ model evaluation, matching native vLLM builds, ARM64 installation/native helpers
 available-host SM121 regression and Station direct-HBM transport remain open.
 Physical SM103 execution remains unqualified.
 
-
 ## BTX paired-record execution
 
 Declared BTX P22, P33, P24, P43 and P44 records use the native SM103 atom
@@ -1469,3 +1468,38 @@ Complete GLM checkpoint/model evaluation, DeepSeek per-stream FP8 feedback,
 DFlash2 execution, frozen QSRT coupled high-rate conversion, matching native
 vLLM/ARM64 builds, SM121 regression and Station HBM transport remain open.
 Physical SM103 execution remains unqualified.
+
+
+## DeepSeek per-stream FP8 MTP operator
+
+The public MTP API implements `rms_streams_fp8`: zero-position embedding
+masking, ordinary RMS per hidden stream, K128 E4M3 activation quantization,
+separate block-FP8 projections with FP32 scales, and BF16 broadcast addition.
+The plan owns fixed scratch for `max_tokens * streams` hidden rows, retains
+both position-dtype normalization callables and uses runtime live-row grids.
+The shared FP8 warp-MMA factory serves both compact GEMM and MTP feedback.
+Policy query schema 2 preserves existing contract meanings; generator candidate
+contract version 3 includes all three MTP contracts.
+
+The [FP8 MTP receipt](sm103-mtp-fp8-validation.json) binds frozen package source
+to 51 SM103 MTP callables and 19 shared FP8 GEMM callables. All 30 preceding MTP
+artifacts and all 19 shared FP8 artifacts retain identical PTX and cubins.
+The 21 added MTP entries have no stack/local-memory flags. Validation passes
+642 host tests, 92 SM120 regressions and six FP8 MTP cases in the companion
+environment, including exact activation-byte and scale-byte parity with the
+native vLLM quantizer. Memcheck and synccheck each pass five tests with zero
+kernel errors under the documented SM120 CUDA API reporting exception.
+Graph tests exercise input/scale mutation, scratch poisoning, fixed output
+addresses, unchanged tails and frozen kernel resolution. The quantizer also
+passes a 65,537-row boundary. Both distributions match all 474 package files.
+
+Initial quantization comparisons exposed an oracle error: division by the
+Python scalar 448 used reciprocal multiplication and shifted E4M3 rounding
+ties. The corrected oracle and a deterministic tie regression agree with the
+native quantizer. Compile attempts spanning a final formatting edit were
+rejected by source-integrity checks; release artifacts use frozen source.
+
+DeepSeek companion MTP integration, complete model/speculative evaluation,
+frozen QSRT coupled high-rate conversion, matching native vLLM/ARM64 builds,
+SM121 regression, Station direct-HBM transport and final consolidated evidence
+remain open. Physical SM103 runtime execution remains unqualified.

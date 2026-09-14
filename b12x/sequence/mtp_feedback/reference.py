@@ -149,3 +149,54 @@ def rms_concat(
 
 
 __all__.append("rms_concat")
+
+
+def rms_streams_fp8(
+    token_embedding,
+    multi_state,
+    positions,
+    token_norm_weight,
+    state_norm_weight,
+    embedding_fc_weight,
+    hidden_fc_weight,
+    embedding_fc_scale,
+    hidden_fc_scale,
+    *,
+    eps=1e-6,
+):
+    """Ordinary per-stream RMS, K128 FP8 quantization and BF16 broadcast sum."""
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+    hidden = token_embedding.shape[-1]
+
+    def norm(x, weight):
+        values = x.float()
+        return (
+            values
+            * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps)
+            * weight.float()
+        ).bfloat16()
+
+    def project(x, weight, scale):
+        shape = x.shape
+        groups = x.float().reshape(-1, hidden // 128, 128)
+        # Scalar division in PyTorch may multiply by a rounded reciprocal.
+        # Divide in FP64 then round to preserve native FP32 scale semantics.
+        scales = (groups.abs().amax(-1).clamp_min(1e-10).double() / 448).float()
+        quant = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+        values = (quant.float() * scales[..., None]).reshape(-1, hidden)
+        weights = weight.float() * scale.repeat_interleave(128, 0).repeat_interleave(
+            128, 1
+        )
+        return (values @ weights.T).bfloat16().view(shape)
+
+    embedding = norm(
+        token_embedding.masked_fill(positions.eq(0).unsqueeze(-1), 0), token_norm_weight
+    )
+    state = norm(multi_state, state_norm_weight)
+    e = project(embedding, embedding_fc_weight, embedding_fc_scale)
+    h = project(state, hidden_fc_weight, hidden_fc_scale)
+    return (h.float() + e.float().unsqueeze(-2)).bfloat16()
+
+
+__all__.append("rms_streams_fp8")

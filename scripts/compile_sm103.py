@@ -160,7 +160,7 @@ def compile_sequence(out):
 
 
 def compile_mtp_feedback(out):
-    """Compile the production GLM and Qwen feedback launch factories."""
+    """Compile production GLM, Qwen and DeepSeek feedback launch factories."""
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
     import torch
@@ -169,28 +169,39 @@ def compile_mtp_feedback(out):
     from triton.compiler import ASTSource
     from b12x.sequence.mtp_feedback import _concat as concat, _cute_prefill as gemm
     from b12x.sequence.mtp_feedback import _kernels as aux
+    from b12x.sequence.mtp_feedback import _fp8 as stream_fp8
+    from b12x._lib import fp8_gemm
 
     launches = {}
     case = ""
 
-    def capture(kernel, *args, compile_spec):
-        directory = out / case
+    def capture(kernel, *args, compile_spec, **kwargs):
+        name = case
+        if case.startswith("mtp_fp8_aux"):
+            name += "_" + compile_spec.kernel_id.rsplit(".", 1)[-1]
+        directory = out / name
         directory.mkdir()
         compiled = cute.compile(
             kernel, *args, no_jit_engine=True,
             options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
         )
-        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
-        launches[case] = compiled
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
         return compiled
 
     concat.compile_norm.cache_clear()
     gemm._KERNEL_CACHE.clear()
     gemm._WARMED.clear()
+    stream_fp8.compile_aux.cache_clear()
+    fp8_gemm.compile_kernel.cache_clear()
     with (patch.object(torch.cuda, "device"),
           patch.object(concat, "current_cuda_stream", lambda: cuda.CUstream(0)),
           patch.object(gemm, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(stream_fp8, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
           patch.object(concat, "compile_cute", capture),
+          patch.object(stream_fp8, "compile_cute", capture),
+          patch.object(fp8_gemm, "b12x_compile", capture),
           patch.object(gemm, "b12x_compile", capture)):
         for hidden in (256, 320, 4096):
             for warps in (4, 8):
@@ -198,6 +209,17 @@ def compile_mtp_feedback(out):
                     case = f"mtp_concat_norm_h{hidden}_w{warps}_{dtype}"
                     concat.compile_norm(hidden, 1 << (hidden - 1).bit_length(),
                                         warps, dtype, 0, (10, 3))
+        for hidden, streams in ((128, 1), (256, 3), (5120, 4)):
+            for warps in (4, 8):
+                for dtype in (torch.int32, torch.int64):
+                    case = f"mtp_fp8_norm_h{hidden}_s{streams}_w{warps}_{dtype}"
+                    concat.compile_norm(hidden, 1 << (hidden - 1).bit_length(),
+                                        warps, dtype, 0, (10, 3), streams, 20)
+            case = f"mtp_fp8_aux_h{hidden}_s{streams}"
+            stream_fp8.compile_aux(hidden, streams, 0, "sm_103a")
+            case = f"mtp_fp8_projection_h{hidden}"
+            fp8_gemm.compile_kernel(hidden, hidden, 1, "bfloat16", True, True,
+                                    0, 148, "sm_103a")
         for rows in (16, 32, 64, 128):
             for contract, hidden, streams, add in (
                 ("concat", 4096, 1, False),
@@ -1459,7 +1481,7 @@ def compile_fp8(out):
     """Compile the production tensor and compact K128 FP8 launch factory."""
     import cutlass.cute as cute
     import torch
-    from b12x.gemm.blockscaled import _fp8_cute as fp8
+    from b12x._lib import fp8_gemm as fp8
 
     launches = {}
     case = ""
