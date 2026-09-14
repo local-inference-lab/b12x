@@ -179,8 +179,8 @@ positive FP32 128x128 checkpoint scales and 32x32 UE8M0 scales, padded attention
 rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution.
 The companion `docs/design/b12x_wo_serving_validation.json` records source and
 native-library identities. Complete DeepSeek SM103 selection remains rejected
-because compressed attention and indexer still need retained capacity planning,
-warmup and capture ownership. The model selector honors the adapter's
+because the indexer still needs the public plan/bind/run API, retained capacity
+planning, warmup and capture ownership. The model selector honors the adapter's
 architecture gate even when individual b12x operators support SM103.
 
 ```bash
@@ -434,11 +434,28 @@ configurations. The generator checks finite/nonzero outputs and the numerical
 oracle before timing the production graph. It records the selected backend and
 the actual fixed split geometry. No SM103 measurements are embedded in this tree.
 
-Four added prefill callables report an eight-byte stack frame with local
+Four prefill callables report an eight-byte stack frame with local
 loads/stores. Keep those cases visible during B300 profiling. Static resources
 and SM120 execution do not establish SM103 performance or complete V4.1 serving.
 The [compressed-MLA validation receipt](sm103-compressed-mla-validation.json)
 records source, artifact, package, and regression identities.
+
+The companion compressed-attention owner retains decode and extend plans for
+configured scheduler and graph capacities. It derives SWA/indexed widths and
+page sizes from model/cache geometry, reserves fixed query and metadata staging,
+and retains bindings during capture. Canonical stride checks also stage singleton
+views whose strides differ despite reporting contiguous storage. Each layer
+prepares its own plans before warmup deduplicates matching kernel work.
+
+Public `compressed_sparse_mla.prewarm` resolves the plan with one live row,
+including optional indexed caches, sink, native V4.1 page mapping and both LSE
+scales. Native SM12x bound execution stages selections at planned widths and
+chooses split/head schedules from capacity. Live rows continue to drive launch
+grids. The [compressed serving receipt](sm103-compressed-serving-validation.json)
+records host, SM120 graph/sanitizer and SM103 compilation evidence. All 147
+compressed-attention cubins match the inspected component baseline, including
+its four retained stack/local-access flags. Full-model evaluation and aggregate
+DeepSeek SM103 admission still depend on the indexer integration.
 
 ## DeepSeek mHC residual mixing
 
@@ -1016,12 +1033,12 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | B300 MoE correctness | `sm103/nvfp4_gemm.py`, `pointwise.py`, `launch.py`: oracle, sanitizer, live-capacity and real-weight graph tests |
 | Tiny-M/prefill scheduling | `fused_moe/_sm103.py`, `_policy.py`: implement separate strategies, then race M1/M4/M8/prefill under native plans |
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths |
-| DeepSeek compressed attention | `attention/compressed_sparse_mla/_warp.py`, `attention/_shared/mla/kv_cache.py`: physical SM103 qualification of V4/V4.1 numerics, native cache writes, head tails, high page IDs, and graph replay; companion `vllm/models/deepseek_v4/nvidia/b12x.py`: retain capacity plans, pass decode/extend and cache geometry into planning, and prepare capture resources |
+| DeepSeek compressed attention | `attention/compressed_sparse_mla/_warp.py`, `attention/_shared/mla/kv_cache.py`: physical SM103 qualification of V4/V4.1 numerics, native cache writes, head tails, high page IDs, and graph replay; companion `vllm/models/deepseek_v4/nvidia/b12x.py`: exercise implemented capacity ownership and warmup through real checkpoint/model execution |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
-| Serving indexer ownership | Companion `vllm/models/deepseek_v4/nvidia/b12x_indexer.py` and `vllm/v1/attention/backends/mla/b12x_indexer.py`: replace live-row and page-table plan keys with configured capacities, retained scratch and eager warmup; prove reuse under frozen resolution |
+| Serving indexer ownership | Companion `vllm/models/deepseek_v4/nvidia/b12x_indexer.py` and `vllm/v1/attention/backends/mla/b12x_indexer.py`: use the public plan/bind/run API and replace live-row and page-table plan keys with configured capacities, retained scratch and eager warmup; prove reuse under frozen resolution |
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and MCG projection-tiered execution, including 384-expert records; add paired/grouped or coupled mixed rates required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
