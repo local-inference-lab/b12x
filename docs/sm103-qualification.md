@@ -103,6 +103,16 @@ capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
 
+Native MoE routes occupy the CUDA X grid dimension. Planning rejects route
+counts above the signed Int32 limit and projection-column grids above 65,535
+tiles. `--component moe --capacity 8193` compiles the eight-way routing path
+with 65,544 routes. The deferred native test reuses that plan for M1, M8192 and
+M8193, compares an independent repeating-input oracle, mutates graph inputs,
+and checks stable scratch and allocation-free replay. Portable quantization
+and reduction tests additionally execute 131,074 routes on SM120. The
+[route-grid receipt](sm103-route-grid-validation.json) records compilation,
+sanitizer results and resource deltas.
+
 `scripts/qualify_sm103.py` prepares an execution manifest without inspecting
 CUDA. With `--execute`, it requires an explicit physical GPU UUID and rejects
 any target other than SM103. It records package/test source identities,

@@ -108,7 +108,7 @@ def _compile(name, kernel, args, ids_dtype, caps, offline, artifact_dir):
         return compiled
     spec = KernelCompileSpec.from_facts(
         "moe.sm103." + name,
-        1,
+        2,
         ("hidden", caps.k),
         ("intermediate", caps.n),
         ("experts", caps.weight_E),

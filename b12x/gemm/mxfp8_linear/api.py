@@ -14,10 +14,9 @@ from . import META
 
 
 def is_supported(device=None) -> bool:
-    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0, triton, and
-    the kernel's own capability checks."""
+    """Check the packed MXFP8 architecture and compiler dependencies."""
     kernel_supported, _ = _kernel_is_supported()
-    return default_is_supported(device, requires=META.requires) and kernel_supported
+    return default_is_supported(device, archs=META.archs, requires=META.requires) and kernel_supported
 
 
 __all__ = ["Weight", "BlockscaledQuery", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"]

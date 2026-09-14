@@ -104,9 +104,13 @@ def validate_policy(query, config):
         or query.routed_rows != query.num_tokens * query.top_k
     ):
         raise ValueError("invalid SM103 MoE routing capacity")
-    if query.routed_rows > 65535:
+    if query.routed_rows > 2**31 - 1:
         raise UnsupportedArchitectureError(
-            "SM103 direct route grid supports at most 65535 planned routes"
+            "SM103 direct route grid exceeds the Int32 launch-count limit"
+        )
+    if max(query.hidden_size, 2 * query.intermediate_size) // 128 > 65535:
+        raise UnsupportedArchitectureError(
+            "SM103 NVFP4 projection exceeds the CUDA grid Y limit"
         )
     expected = MoeDecodeConfig(
         backend=BACKEND, route_planner="internal", max_active_clusters=None
