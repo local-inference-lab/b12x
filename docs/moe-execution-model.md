@@ -40,9 +40,9 @@ The canonical numeric recipes are:
 
 ## Coupled trellis transforms
 
-Trellis-coded expert weights arrive in the BTX container
-(``docs/btx-checkpoint-format.md``), which stores a fixed-rate trellis
-payload for each expert matrix. Its coupled transform declaration applies
+Trellis-coded expert weights use canonical `TrellisWeights` through public
+MoE preparation or the [BTX container](btx-checkpoint-format.md). Their
+coupled transform declaration applies
 the same exact activation-boundary coordinate change at K2, K3, and K4:
 
 ```text
@@ -72,6 +72,31 @@ The BTX manifest declares the transform explicitly (``hadamard.coupled``
 with its block widths). Ordinary per-matrix transforms remain valid only for
 artifacts whose metadata specifies them; the runtime does not infer transform
 type from the trellis bit rate.
+
+Canonical preparation accepts expert draws 0 through 7. A nonzero draw
+requires `TrellisWeights.global_intermediate_size`, the checkpoint's global
+intermediate width, and `intermediate_offset`, the rank's first channel
+(default zero). These describe checkpoint placement during loading; they
+do not enter kernel compile keys or replay. The extent must fit inside the
+global width and contain complete 128-channel post-transform blocks.
+
+Preparation generates the frozen preactivation sign sequence at length
+`2 * global_intermediate_size` and selects
+`[2 * intermediate_offset : 2 * (intermediate_offset + I_local)]`. The
+post-activation sequence uses the global intermediate width and the ordinary
+rank channel range. The residual draw remains zero. The
+[encoder contract](https://huggingface.co/brandonmusic/GLM-5.2-SQG-Coupled-H512-H128-K96Tail/blob/d3f9784c944732f72e51e3b6af357156bacf0dc1/reproduction/closure/sources/qsrt/qsrt/qsrt_coupled.py)
+fixes these draw roles and the seeded CPU sign generator. Its source SHA-256
+is `0243e9f8a2342a95fff2a28b93e876b78efd020b8425f6bfc12669014ab3a496`.
+`tests/moe/test_trellis_extents.py` checks all eight draws against frozen
+encoder bytes and compares canonical prepared extents with the BTX reader.
+
+When input scales carry separate vectors for the two global FC1 halves, an
+extent wholly within one half uses that half's vector for both physical
+gate/up slots. An extent crossing that boundary requires a shared input-scale
+vector. Nonzero draws without global extent metadata, invalid draw IDs and
+misaligned extents fail during preparation. Zero-draw callers with a shared
+input vector may omit the global extent metadata.
 
 The W4A16 path keeps BF16 activation operands. The W4A8 path evaluates the
 same transform contract, quantizes the FC1 and FC2 activation operands to

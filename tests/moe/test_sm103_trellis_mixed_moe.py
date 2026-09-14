@@ -21,6 +21,8 @@ def prepare_mixed(
     coupled=False,
     per_expert_scales=False,
     transform_draw=0,
+    global_intermediate_size=None,
+    intermediate_offset=0,
 ):
     config = _glm_config()
     if coupled:
@@ -87,15 +89,30 @@ def prepare_mixed(
             if coupled
             else None
         ),
+        global_intermediate_size=global_intermediate_size,
+        intermediate_offset=intermediate_offset,
     )
     return fused_moe.prepare_weights(plan=plan, weights=weights), native, rates
 
 
-def test_mixed_coupled_nonzero_draws_fail_closed():
+def test_mixed_coupled_nonzero_draws_require_global_extent():
     if not torch.cuda.is_available():
         pytest.skip("canonical preparation requires a GPU")
-    with pytest.raises(NotImplementedError, match="all-zero expert_transform_draws"):
+    with pytest.raises(ValueError, match="require global_intermediate_size"):
         prepare_mixed(coupled=True, hidden=512, activation="situ", transform_draw=1)
+
+
+def test_mixed_coupled_draws_reject_unknown_family():
+    if not torch.cuda.is_available():
+        pytest.skip("canonical preparation requires a GPU")
+    with pytest.raises(ValueError, match="values must be in 0..7"):
+        prepare_mixed(
+            coupled=True,
+            hidden=512,
+            activation="situ",
+            transform_draw=8,
+            global_intermediate_size=128,
+        )
 
 
 @pytest.mark.parametrize(
@@ -232,6 +249,9 @@ def _run_native_mixed(
         width=width,
         coupled=coupled,
         per_expert_scales=not uniform,
+        transform_draw=3 if coupled else 0,
+        global_intermediate_size=4 * width if coupled else None,
+        intermediate_offset=width if coupled else 0,
     )
     payload = weights._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(

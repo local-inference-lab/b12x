@@ -11,7 +11,7 @@ numbers or measured B300 policy profile are included.
 | --- | --- | --- |
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
-| Trellis | Native uniform and MCG K3/K4/K5 projection-tiered MoE with ordinary or zero-draw coupled transforms, inline FP16 tcgen05 projection, routing and weighted reduction; 384-expert descriptors; host and SM120 preparation/operand tests and SM103 compilation | Native complete-expert numerics and graphs; paired/grouped records and nonzero coupled draws remain unsupported |
+| Trellis | Native uniform and MCG K3/K4/K5 projection-tiered MoE with ordinary or coupled transforms, global draw coordinates, inline FP16 tcgen05 projection, routing and weighted reduction; 384-expert descriptors; host and SM120 preparation/operand tests and SM103 compilation | Native complete-expert numerics and graphs; paired/grouped records and coupled extents crossing distinct input-scale halves remain unsupported |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
@@ -885,7 +885,9 @@ schedule, not a claim of single-kernel fusion.
 Canonical MCG preparation supports uniform, per-layer, per-expert and per-projection
 K3/K4/K5 rates with ordinary H128 transforms and SiLU or SiTU. Coupled H512/H128
 transforms require SiTU, a hidden width divisible by 512, shared gate/up input
-scales and all-zero expert transform draws. Preparation retains the coupled
+scales. Expert draws 0 through 7 are supported; nonzero draws require explicit
+global intermediate width and rank offset in the canonical tensor bundle.
+Preparation retains the coupled
 flag on the owner and every compressed tier. Each gate, up
 and down projection reads its own descriptor row and decodes the selected
 coalesced compressed record directly into shared memory. No decoded global
@@ -899,7 +901,9 @@ launches, including prepared expert-map composition. Coupled bindings reuse
 one transformed input for gate and up and schedule eight launches.
 The canonical A16 unit-scale flag is accepted without activation-scale math.
 
-Paired/grouped records and nonzero coupled transform draws remain unsupported.
+Paired/grouped records remain unsupported. Coupled extents crossing the
+boundary between two distinct input-scale halves require further execution
+support; extents wholly inside either half select that half's shared vector.
 SM120/SM121 retain their rejection of coupled projection-tiered execution.
 The standalone decoder and projection support MCG K2 for diagnostics; the
 existing private MoE weight contract starts MCG at K3. See the
@@ -915,6 +919,12 @@ recorded mixed-rate baseline. Of their cubins, 125 are byte-identical and 21
 differ in SASS register operands with identical resource counts, register sets
 and instruction counts. Raw artifact hashes are preserved independently of
 these comparisons. Complete coupled expert execution requires B300.
+The [global draw-extent receipt](sm103-trellis-draw-extents-validation.json)
+records nonzero-draw preparation and canonical/BTX parity for both halves of
+the checkpoint. It also covers uniform SQG execution on SM120 and portable
+transform graphs with nonzero prepared signs. Frozen encoder sign bytes agree
+under Torch 2.13 and 2.14. See the [coupled transform contract](moe-execution-model.md#coupled-trellis-transforms)
+for global coordinates and shared-scale selection.
 
 ```bash
 python -m pytest tests/moe/test_sm103_trellis.py -q
@@ -987,7 +997,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped records, nonzero coupled draws and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped records, extents crossing distinct input-scale halves and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -1076,7 +1086,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
 | Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
-| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and ordinary/coupled MCG projection-tiered execution, including 384-expert records; add paired/grouped records or nonzero coupled draws required by the selected checkpoint |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and ordinary/coupled MCG projection-tiered execution, including 384-expert records and nonzero draw extents; add paired/grouped records or extents crossing distinct input-scale halves required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
 | MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |

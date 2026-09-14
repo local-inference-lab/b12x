@@ -8,7 +8,17 @@ from b12x.policy.generation.providers.trellis_reference import moe_reference
 from tests.moe.test_trellis_config import _k3_config
 
 
-def prepare_experts(*, coupled, bits, dtype, device, geometry=(3, 512, 256)):
+def prepare_experts(
+    *,
+    coupled,
+    bits,
+    dtype,
+    device,
+    geometry=(3, 512, 256),
+    transform_draw=0,
+    global_intermediate_size=None,
+    intermediate_offset=0,
+):
     experts, hidden, width = geometry
     config = _k3_config()
     if not coupled:
@@ -42,9 +52,13 @@ def prepare_experts(*, coupled, bits, dtype, device, geometry=(3, 512, 256)):
         input_scales=scales((experts, hidden)),
         intermediate_scales=scales((experts, 3, width)),
         output_scales=scales((experts, hidden)),
-        expert_transform_draws=torch.zeros(experts, dtype=torch.uint8, device=device)
+        expert_transform_draws=torch.full(
+            (experts,), transform_draw, dtype=torch.uint8, device=device
+        )
         if coupled
         else None,
+        global_intermediate_size=global_intermediate_size,
+        intermediate_offset=intermediate_offset,
     )
     return fused_moe.prepare_weights(plan=plan, weights=bundle)
 
@@ -58,7 +72,15 @@ def test_canonical_preparation_and_independent_oracle(coupled, bits):
         pytest.skip("CUDA preparation requires a GPU")
     torch.manual_seed(123)
     dtype = torch.float16 if coupled else torch.bfloat16
-    experts = prepare_experts(coupled=coupled, bits=bits, dtype=dtype, device="cuda")
+    experts = prepare_experts(
+        coupled=coupled,
+        bits=bits,
+        dtype=dtype,
+        device="cuda",
+        transform_draw=3 if coupled else 0,
+        global_intermediate_size=1024 if coupled else None,
+        intermediate_offset=256 if coupled else 0,
+    )
     payload = experts._impl.representation_for("w4a16")
     assert payload.trellis.bits == bits
     assert experts.plan._impl.trellis_bits == bits == experts._impl.plan.trellis_bits
@@ -164,7 +186,14 @@ def _run_native_moe(coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2)
     torch.manual_seed(813)
     dtype = torch.float16 if coupled else torch.bfloat16
     experts = prepare_experts(
-        coupled=coupled, bits=bits, dtype=dtype, device="cuda", geometry=geometry
+        coupled=coupled,
+        bits=bits,
+        dtype=dtype,
+        device="cuda",
+        geometry=geometry,
+        transform_draw=7 if coupled else 0,
+        global_intermediate_size=4 * geometry[2] if coupled else None,
+        intermediate_offset=geometry[2] if coupled else 0,
     )
     payload = experts._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
