@@ -1700,3 +1700,42 @@ service remains healthy. The local consolidated-corpus compiler is killed
 by global host OOM at 4,659,580 KiB anonymous RSS; the incomplete artifacts
 and kernel OOM record remain outside the repository. A separate build of the
 same source runs on the larger host and must pass before its corpus is accepted.
+
+## SM121 component regression and consolidated vocabulary source
+
+The [SM121 receipt](sm103-sm121-validation.json) records 126 passing tests,
+four explicit skips and two RMS-concat oracle failures on GB10. FP64 dot
+products establish that both disputed values round to BF16 1.0, as the CuTe
+kernel returns. The BF16 GEMM oracle changes this tie through reduced-precision
+partial reductions. The reference projection now accumulates in FP64; all
+five affected cases pass on both SM121 and SM120 with unchanged tolerances
+and exact top-1 assertions. Runtime kernels are unchanged.
+
+The suite includes 13 vocabulary tests, 48 BF16 GEMV tests, four NVFP4 loader
+tests and 34 direct-loader tests. Seven vocabulary memcheck cases report zero
+memory errors, with the API reporting exception retained explicitly. The
+direct-loader cases exercise high file offsets, TP slices, registered storage
+and write-combining storage. The four original vLLM containers are restored
+with their original image/container identities and configuration; the service
+returns HTTP 200.
+
+The [consolidated receipt](sm103-consolidated-validation.json) verifies all
+1,108 callables and 1,116 CUDA entries compiled from frozen source `7b697152`.
+The corpus adds 58 BTX paired-record, 51 MTP and six vocabulary callables to
+the preceding 993-callable manifest. It retains 976 identical PTX files and
+936 identical cubins for existing callables, with no removals. The nine
+positive register deltas add no stack/local traffic or static shared memory.
+All 44 existing stack/local flags remain visible. Source and Torch/Triton
+versions differ, so this is not an isolated compiler comparison. Twenty-three
+physical-SM103 suites are prepared from the same frozen source; none executes.
+The later oracle correction is not substituted into these raw source hashes.
+
+The [primary checkpoint inventory](sm103-primary-models.json) resolves the
+earlier checkpoint-location gap: both target families and the GLM DFlash2
+draft are on maxwell. It also identifies a separate implementation gap:
+companion `5c0857f9cd` does not register the actual V4.1 architecture. The
+V4.1 model, CED/cache/Engram integration, required SM103 component admissions
+and native MXFP4 expert representation need implementation and qualification.
+The existing V4 integration does not satisfy that model contract. Full-model
+accuracy, speculative parity, complete serving warmup, Station HBM transport
+and frozen QSRT coupled high-rate conversion remain open.
