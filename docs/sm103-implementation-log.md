@@ -1529,3 +1529,59 @@ locations. Qwen3.8 and DFlash2 checkpoints are available for a subsequent
 full-model regression. Other open work includes frozen QSRT coupled high-rate
 conversion, native/ARM64 builds, SM121 regression, Station direct-HBM transport
 and final consolidated evidence. Physical SM103 execution remains unqualified.
+
+## Checkpoint loading and full-model regression
+
+Companion revision `7d1e2df742bbf165c9335794cfc19be40b655d36` recognizes
+FlashInfer's CUDA compiler under `CUDA_HOME`. Revision
+`5e040862e127518c1cf5248c8f5113ab6d2e0985` restores scoped checkpoint
+allocation/copy hooks, immutable safetensors file ranges, source filtering,
+owned numerical-transform inputs and post-load completion. Indexed shard
+selection remains authoritative. b12x owns NVFP4 W4A16 expert row preparation.
+Host loader tests pass; SM120 validation passes 81 model/post-load tests and
+13 MoE numerical/graph tests. All 20 b12x direct-loader tests collect. Their
+execution requires host page-table access, which the inspected RTX GPUs lack.
+The occupied SM121 inference hosts are not used for GPU tests.
+
+`benchmarks.validate_vllm_generation` records real target/draft routes,
+checkpoint/source/native-library hashes, exact generated tokens, prefix reuse,
+speculative counters and successful graph replays. The
+[generation receipt](sm103-generation-validation.json) binds seven terminal
+TP2 cases on two RTX PRO 4000 Blackwell GPUs. The checkpoint directory named
+`Qwen3.8-27B-NVFP4` implements the Qwen3.5 H5120 hybrid attention/GDN contract.
+Target-only b12x graph output exactly matches eager output in all six requests
+of the 2,482-token corpus. Each rank records 67 target graph replays.
+FlashInfer versus b12x eager output differs on two distinct short prompts.
+
+DFlash2 executes target/draft graphs, proposes tokens and accepts proposals.
+A 3,882-token prompt permits 1,648-token cache reuse under the speculative
+last-block reservation. That run records 182 proposals, 85 accepted tokens,
+19 target graph replays and 63 draft query graph replays per rank. Its receipt
+remains failed: two prompts differ from target-only eager output. The cause
+of the reference mismatches remains unresolved. Inference-time JIT warnings
+also remain. These runs use precompiled native vLLM libraries from a different
+source revision and do not qualify full model accuracy, complete warmup,
+allocation-free replay or physical SM103 execution.
+
+Failed toolkit setup, repeated autotuning, RPC serialization and a graph
+inspection wrapper that discarded its return value remain in the raw evidence.
+The durable harness uses a named worker extension and preserves graph results;
+15 host tests pass, including the replay-wrapper regression and existing
+serving-evidence tests. Kernel package source remains unchanged.
+
+## ARM64 installation and offline compilation
+
+The [ARM64 receipt](sm103-arm64-validation.json) binds the hashed combined
+dependency lock, 205 installed distributions, matching b12x wheel files and
+the AArch64 native loader helper. Torch imports and the helper builds/loads
+with CUDA hidden and uninitialized. Nine SM103 MoE callables compile on
+ARM64 and have byte-identical PTX and cubins to an x86-64 build of the same
+frozen source and toolchain versions. All copied artifact hashes verify.
+
+The NVIDIA cuSPARSELt 0.8.1 library is AArch64 and loads without CUDA
+initialization. Its wheel's internal `manylinux2014_sbsa` tag still causes
+`uv pip check` to fail; the wheel metadata is unmodified. The existing
+inference service remains running during CPU-only validation. Matching native
+vLLM builds, available-SM121 GPU regression, complete GLM/DeepSeek checkpoints,
+frozen QSRT coupled high-rate conversion, the SM103 vocabulary projection
+fast path, Station HBM transport and final consolidated evidence remain open.

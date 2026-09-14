@@ -17,15 +17,17 @@ numbers or measured B300 policy profile are included.
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
 | Dense MLA | Implemented BF16/E4M3 compressed-cache attention for (QK,V) widths (576,512) and (1088,1024); SM120 tests and SM103 compilation | SM103 correctness, high-pid, split, query-quantization, and graph qualification |
-| Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
+| Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification; the separate BF16 vocabulary projection fast path remains SM12x-only |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
 | DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
-| MTP feedback | GLM ordinary RMS-concat and Qwen flattened Gemma multi-stream contracts use existing planned APIs and CuTe projections; GLM vLLM call-site, graph and Inductor checks pass on SM120; 30 SM103 callables compiled | Physical SM103 execution, full model evaluation, DeepSeek per-stream FP8 feedback and DFlash2 integration |
-| DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Implement capability routing, target/draft contracts and transport before physical qualification |
+| MTP feedback | GLM ordinary RMS-concat, Qwen flattened Gemma multi-stream and DeepSeek per-stream FP8 contracts use existing planned APIs and CuTe projections; GLM and DeepSeek companion call-site, graph and Inductor checks pass on SM120; 51 SM103 callables compiled | Physical SM103 execution, actual sequence-parallel collectives, head collapse and full speculative model evaluation |
+| Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; all 20 direct-loader tests collect | Execute direct-loader tests on an available GPU with host page-table access; qualify Grace placement on the Station |
+| DFlash2 | Qwen target/draft execution, accepted proposals, target/draft graphs and prefix reuse exercised on SM120 | Exact token equality with target-only execution remains unresolved; full GLM DFlash2 and physical SM103 execution remain unqualified |
+| Full GLM/V4.1, HBM GDR | Model components and experimental Grace transport are implemented; complete serving and direct HBM transport remain unsupported | Complete model/checkpoint evaluation and direct HBM transport implementation |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
 descriptor records 512 TMEM columns and a 227 KiB block SMEM limit for SM103,
@@ -123,9 +125,24 @@ That combined resolution selects Torch 2.13.0+cu130, Triton 3.7.1, CUTLASS DSL
 4.6.2 and FlashInfer 0.6.17. The standalone b12x resolution selects Torch
 2.14.0+cu130 and Triton 3.8.0. The
 [source-readiness receipt](sm103-source-readiness.json) records requirements
-with package hashes and the exact resolver commands. ARM64 installation, C helper
-builds, matching vLLM native libraries and native loading remain unqualified.
-Resolution alone does not establish an executable ARM64 environment.
+with package hashes and the exact resolver commands.
+
+The [ARM64 receipt](sm103-arm64-validation.json) records an installation of
+the combined dependencies and b12x on `maxwell` with Python 3.12.14. All 474
+wheel package files match the implementation source. Torch imports and the
+b12x loader C helper builds and loads as AArch64 without initializing CUDA.
+The nine SM103 MoE callables compile on ARM64; their PTX and cubins are
+byte-identical to a build of the same frozen source and toolchain versions on
+x86-64. The existing inference service remains running during this CPU-only
+validation. Matching ARM64 native vLLM libraries and GPU execution remain
+unqualified.
+
+The dependency check reports one packaging defect: the installed NVIDIA
+`nvidia-cusparselt-cu13==0.8.1` wheel declares an internal
+`manylinux2014_sbsa` tag. Its library is AArch64 and loads without CUDA
+initialization, but `uv pip check` rejects the tag. The receipt retains this
+failure; the wheel and its metadata are unmodified. This check does not
+qualify cuSPARSELt GPU operations.
 
 Native MoE routes occupy the CUDA X grid dimension. Planning rejects route
 counts above the signed Int32 limit and projection-column grids above 65,535
@@ -769,9 +786,9 @@ hidden 4096 and expert intermediate 2048 in the published text configuration;
 the first three layers are dense. MoE geometry support does not qualify its
 NSA, indexer, KDA, dense linears or draft model.
 
-The serving sequence is deferred until those backends pass their operation
-tests. Use the existing LIL vLLM model interfaces; do not turn on a global
-SM103 b12x model gate. No companion serving patch is included in this subset.
+Physical SM103 serving qualification follows per-operation correctness tests.
+Use the existing LIL vLLM model interfaces and capability-driven companion
+adapters. Complete GLM checkpoint execution remains unqualified.
 The established `plan_weights` / `prepare_weights` / `plan_execution` /
 `prewarm` / `bind` / `run` interface is unchanged. Once per-operation integration
 is qualified, record exact vLLM/b12x revisions and launch the real checkpoint:
@@ -789,6 +806,94 @@ verify M8 verifier batches, acceptance/rejection, committed state, MTP feedback
 and graph replay. Compare full verifier-step latency and acceptance rates with
 the same draft length and sampler. These serving commands are not a claim that
 the branch can execute the complete model today.
+
+### Full-model regression receipts
+
+`benchmarks.validate_vllm_generation` exercises the real vLLM engine with local
+safetensors checkpoints. Supply an engine JSON object containing the ordinary
+`LLM` constructor arguments and a prompt JSON array of user strings. Use
+`disable_log_stats=false` to expose speculative counters, and set
+`VLLM_USE_V2_MODEL_RUNNER=1` for DFlash2 and graph-replay instrumentation.
+Run each configuration in a separate process:
+
+```sh
+python -m benchmarks.validate_vllm_generation \
+  --engine-config /tmp/target-eager.json --prompts /tmp/prompts.json \
+  --counts 1 4 1 --require-repeat-equality \
+  --output /tmp/target-eager-result.json
+python -m benchmarks.validate_vllm_generation \
+  --engine-config /tmp/target-b12x-graphs.json --prompts /tmp/prompts.json \
+  --counts 1 4 1 --reference /tmp/target-eager-result.json \
+  --require-kernel B12xNvFp4LinearKernel --require-full-graphs \
+  --require-repeat-equality \
+  --output /tmp/target-b12x-graphs-result.json
+```
+
+The required kernel must correspond to a quantized linear present in the
+checkpoint. For a DFlash2 arm, add the checkpoint's `speculative_config` to
+the engine JSON and require `--require-speculator DFlash2Speculator`. Choose
+the speculative token count from that draft's declared block contract. The
+script uses a named worker extension and rejects empty/nonfinite outputs, absent required kernels, absent draft
+proposals, missing required target graph replays and mismatched reference
+token IDs. It records target/draft routes, actual full-graph replay counts,
+prefix-cache counts, source and native-library hashes, checkpoint hashes,
+toolchain versions and GPU snapshots. Source and native-library hashes must
+remain unchanged during generation. `--require-repeat-equality` checks repeated
+batches of the same size. For cache qualification, add
+`--require-prefix-cache` and use a prompt with enough complete blocks for the
+engine's retention policy. Speculative decoding may reserve the last matched
+block; one complete block can therefore produce no reusable prefix. Use a
+fresh output filename; failed
+receipts remain evidence. These checks do not establish model accuracy,
+allocation-free replay, complete warmup coverage or B300 qualification.
+
+Correctness-only configurations may set
+`kernel_config.enable_flashinfer_autotune=false` to use the backend's default
+tactic. Record that setting in the receipt. Such runs do not qualify the
+performance-tuning path or establish comparative performance.
+
+The serving environment needs a consistent CUDA compiler/header installation
+and an activated environment containing Ninja. A CUDA 13.4 NVCC paired with
+CUDA 13.0 runtime headers fails FlashInfer's compiler/header check. An isolated
+toolkit assembled from NVIDIA's `nvidia-cuda-nvcc==13.0.88`,
+`nvidia-cuda-crt==13.0.88`, `nvidia-nvvm==13.0.88` and
+`nvidia-cuda-runtime==13.0.96` wheels provides a matching compiler/header pair
+for the companion Torch CUDA 13.0 environment. Include
+`nvidia-curand==10.4.0.35` for FlashInfer sampling headers. Set `CUDA_HOME` to its
+`nvidia/cu13` directory. Within that isolated toolkit, add `lib64 -> lib` and
+`lib/libcudart.so -> libcudart.so.13` aliases for FlashInfer's linker search.
+Keep the independently recorded SM103 CuTe compilation
+toolchain intact. See the NVIDIA [NVCC package](https://pypi.org/project/nvidia-cuda-nvcc/13.0.88/)
+and [CRT package](https://pypi.org/project/nvidia-cuda-crt/13.0.88/).
+
+The [generation receipt](sm103-generation-validation.json) records TP2 runs
+on two RTX PRO 4000 Blackwell GPUs. The local checkpoint directory is named
+`Qwen3.8-27B-NVFP4`, but its model contract is
+`Qwen3_5ForConditionalGeneration`: H5120, 64 layers, BF16 attention/GDN and
+NVFP4 MLP weights. It does not qualify GLM, DeepSeek or Qwen Flash Next.
+
+| Comparison | Result |
+| --- | --- |
+| b12x target graphs versus b12x eager, 2,482-token prompt corpus | All six request outputs match exactly; 67 target graph replays per rank; prefix reuse observed |
+| b12x eager versus FlashInfer eager, short prompts | Exact output IDs differ on two of four distinct prompts; cause unresolved |
+| DFlash2 versus b12x target eager, 3,882-token prompt corpus | Target and draft execute; 1,648 cached tokens reused; 182 proposed tokens and 85 accepted; exact output IDs differ on two prompts |
+
+The DFlash2 run records 19 target and 63 draft query graph replays per rank.
+Its raw receipt remains failed because reference parity fails. An earlier
+2,482-token DFlash2 case records no prefix hit and also differs from the
+target-only reference. Neither case establishes full speculative correctness.
+The logs also retain inference-time JIT warnings. The native vLLM libraries
+used by these model runs come from a different source revision; matching
+native builds require separate acceptance.
+
+Companion revision `5e040862e127518c1cf5248c8f5113ab6d2e0985` supplies the
+b12x loader's file-range descriptors, source filtering, scoped allocation and
+copy hooks, and completion before derived-weight transforms. Ordinary
+safetensors loading preserves Torch allocation/copy behavior. All 81
+model/post-load tests and 13 MoE numerical/graph tests pass on SM120. Run
+`tests/loader/test_vllm.py` in the combined environment on a GPU with host
+page-table access; all 20 tests collect, but the inspected RTX GPUs lack that
+capability. The occupied SM121 hosts have not been used for GPU execution.
 
 ## Tensor-scaled and compact block-FP8 projections
 

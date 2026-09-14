@@ -1,0 +1,650 @@
+{
+  "schema_version": 1,
+  "status": "SM120 target eager/graph smoke passed; cross-backend and speculative token equality unresolved",
+  "b12x_revision": "d44599f9b87315c265f9c7ed1d9b5783da5099a6",
+  "b12x_package_source_sha256": "f0c9076894bda5aa8b42cefb592735d3765e7dc919b79b9b26a0f75126aed2d0",
+  "companion_revisions": {
+    "cuda_home_discovery": "7d1e2df742bbf165c9335794cfc19be40b655d36",
+    "scoped_loader": "5e040862e127518c1cf5248c8f5113ab6d2e0985"
+  },
+  "harness_sha256": "f1092404e4a7ce3c63954de576158d969d2d2ccf55213b54064905069d5c9b0b",
+  "host": "ripper",
+  "gpus": [
+    {
+      "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "model": "NVIDIA RTX PRO 4000 Blackwell",
+      "compute_capability": "12.0",
+      "mode": "Default"
+    },
+    {
+      "uuid": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f",
+      "model": "NVIDIA RTX PRO 4000 Blackwell",
+      "compute_capability": "12.0",
+      "mode": "Default"
+    }
+  ],
+  "target_contract": {
+    "directory": "/models/Qwen3.8-27B-NVFP4",
+    "model_class": "Qwen3_5ForConditionalGeneration",
+    "hidden_size": 5120,
+    "layers": 64,
+    "intermediate_size": 17408,
+    "tensor_parallel": 2,
+    "mlp": "ModelOpt NVFP4",
+    "attention_and_gdn": "BF16 weights",
+    "limitation": "Directory naming does not establish Qwen3.8 Flash Next, GLM or DeepSeek model qualification."
+  },
+  "draft_contract": {
+    "directory": "/models/Qwen3.8-27B-DFlash2",
+    "speculator": "DFlash2Speculator",
+    "layers": 5,
+    "block_size": 8,
+    "num_speculative_tokens": 7
+  },
+  "sampling": {
+    "temperature": 0,
+    "seed": 41,
+    "max_tokens": 64,
+    "logprobs": 5
+  },
+  "counts": [
+    1,
+    4,
+    1
+  ],
+  "versions": {
+    "torch": "2.13.0+cu130",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "cuda-python": "13.4.1",
+    "triton": "3.7.1",
+    "flashinfer-python": "0.6.17",
+    "transformers": "5.17.0"
+  },
+  "cases": [
+    {
+      "name": "auto-eager-rpc-fixed",
+      "status": "passed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "7988a37036febd3007e441c9945318eac4e6909d3936970f1a46823d5ba58596"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          28
+        ],
+        [
+          28,
+          24,
+          26,
+          23
+        ],
+        [
+          28
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "speculative_metrics": [],
+      "reference_mismatches": [],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/auto-eager-rpc-fixed.json",
+        "sha256": "a1358e66ab19e2d5b67f5f050d15579d81e2f50bd33fcf5c09010e9db89df6bd"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/auto-eager-rpc-fixed.log",
+        "sha256": "3c9a081032703a115f0a13c7c3e5d053845c20c76e9ae62ef7c947c67d639c2e"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/auto-eager-rpc-fixed-command.json",
+        "sha256": "63583dfc95231de3a763d3018583d892c07ff4c6999679c06c0b2f5467437dcd"
+      }
+    },
+    {
+      "name": "b12x-eager-correctness",
+      "status": "failed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "7988a37036febd3007e441c9945318eac4e6909d3936970f1a46823d5ba58596"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          28
+        ],
+        [
+          28,
+          24,
+          26,
+          23
+        ],
+        [
+          28
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "speculative_metrics": [],
+      "reference_mismatches": [
+        {
+          "run": 1,
+          "request": 1,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "finish_reason"
+        }
+      ],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-correctness.json",
+        "sha256": "d964d989565228020d660c42be22aa29209865d4ca912d441d725b16059ab737"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-correctness.log",
+        "sha256": "0e5f5c4915993d1d9a05f4932fc1301cde9ba7b3251e94a84cef9b34def23773"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-correctness-command.json",
+        "sha256": "a479b2318c307a5e2d37c9f896c6c8d1d9c0abd526522ac411cfd9757a1abc7e"
+      },
+      "error": "AssertionError: Generation differs from the reference receipt"
+    },
+    {
+      "name": "b12x-eager-long",
+      "status": "passed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "7988a37036febd3007e441c9945318eac4e6909d3936970f1a46823d5ba58596"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          2482
+        ],
+        [
+          2482,
+          24,
+          26,
+          23
+        ],
+        [
+          2482
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          1568,
+          0,
+          0,
+          0
+        ],
+        [
+          1568
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "speculative_metrics": [],
+      "reference_mismatches": [],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-long.json",
+        "sha256": "fb860006a13ad8607db90dd348f55730ab252a57f77715b41329fea0adef39f5"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-long.log",
+        "sha256": "b9a88c8948d6bf70a99e593f69354ae8d78f0d3b8938d29e9344eec50f0003e8"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-long-command.json",
+        "sha256": "9ed9007d072a0734d8f959575836eab0233f0af304b7159224160fc4136d0a36"
+      }
+    },
+    {
+      "name": "b12x-graphs-long-replay",
+      "status": "passed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "7988a37036febd3007e441c9945318eac4e6909d3936970f1a46823d5ba58596"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          2482
+        ],
+        [
+          2482,
+          24,
+          26,
+          23
+        ],
+        [
+          2482
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          1568,
+          0,
+          0,
+          0
+        ],
+        [
+          1568
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 67
+        },
+        {
+          "target.cudagraph_manager": 67
+        }
+      ],
+      "speculative_metrics": [],
+      "reference_mismatches": [],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-graphs-long-replay.json",
+        "sha256": "e5a71ae269367446ff84092b9ecaf995066c230ce1a4e6cc5e369a9fbee2af9d"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-graphs-long-replay.log",
+        "sha256": "37062f00916972c2d03c2c469a74c2507847c33a74c5a0de7a74217105215eeb"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-graphs-long-replay-command.json",
+        "sha256": "b324fb0d8c266d9dd6b6d49ac89e70d3b99d7139b24f5387785f870071a56f6c"
+      }
+    },
+    {
+      "name": "b12x-dflash2-long",
+      "status": "failed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "7988a37036febd3007e441c9945318eac4e6909d3936970f1a46823d5ba58596"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          2482
+        ],
+        [
+          2482,
+          24,
+          26,
+          23
+        ],
+        [
+          2482
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 20,
+          "draft.query_cudagraph_manager": 53
+        },
+        {
+          "target.cudagraph_manager": 20,
+          "draft.query_cudagraph_manager": 53
+        }
+      ],
+      "speculative_metrics": [
+        {
+          "name": "vllm:spec_decode_num_drafts",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 25
+        },
+        {
+          "name": "vllm:spec_decode_num_draft_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 175
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 88
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+          "labels": {
+            "engine": "0",
+            "model_name": "/models/Qwen3.8-27B-NVFP4"
+          },
+          "values": [
+            24,
+            20,
+            12,
+            9,
+            9,
+            8,
+            6
+          ]
+        }
+      ],
+      "reference_mismatches": [],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-long.json",
+        "sha256": "4bbe15491d09cae750ac7970d3ea8377e8fdeb98e1fbef80258c326a5bb4aa9c"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-long.log",
+        "sha256": "9b1115ad8b88b8ef91666c466e7c392c8fe982637c47524a6d757541158098d9"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-long-command.json",
+        "sha256": "4877274c52d224a9531229f413dea58ccdcc56b0c5177a3e878146ecce72e4e5"
+      },
+      "error": "AssertionError: No request reused cached prompt tokens"
+    },
+    {
+      "name": "b12x-eager-two-block",
+      "status": "passed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "576bba8f1bb2ca4b0e289d64293577d174f214e9a233232411779f8962effd3c"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          3136,
+          0,
+          0,
+          0
+        ],
+        [
+          3136
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 0
+        },
+        {
+          "target.cudagraph_manager": 0
+        }
+      ],
+      "speculative_metrics": [],
+      "reference_mismatches": [],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-two-block.json",
+        "sha256": "b81af1d461e913179de88ef4404a7bad6192945707e3868c05cde8c0d1a0ab8a"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-two-block.log",
+        "sha256": "f3681a8e19ef9f7058954a035e17d021bd0b87269b7d8d5dd66151250309bf41"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-eager-two-block-command.json",
+        "sha256": "e8d2fc08b67eccd9e89d40499b2bc26ad2c34d40f0bb01d4a6b2a79df218d6df"
+      }
+    },
+    {
+      "name": "b12x-dflash2-two-block",
+      "status": "failed",
+      "source_python_sha256": {
+        "b12x": "bfbf54fbcf1805510d01d8a035c1d9f516ea6748a70a23f0893f0c7e35d18a0f",
+        "vllm": "576bba8f1bb2ca4b0e289d64293577d174f214e9a233232411779f8962effd3c"
+      },
+      "requests": 6,
+      "prompt_tokens": [
+        [
+          3882
+        ],
+        [
+          3882,
+          24,
+          26,
+          23
+        ],
+        [
+          3882
+        ]
+      ],
+      "cached_tokens": [
+        [
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1648
+        ]
+      ],
+      "full_graph_replays_by_rank": [
+        {
+          "target.cudagraph_manager": 19,
+          "draft.query_cudagraph_manager": 63
+        },
+        {
+          "target.cudagraph_manager": 19,
+          "draft.query_cudagraph_manager": 63
+        }
+      ],
+      "speculative_metrics": [
+        {
+          "name": "vllm:spec_decode_num_drafts",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 26
+        },
+        {
+          "name": "vllm:spec_decode_num_draft_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 182
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens",
+          "labels": {
+            "model_name": "/models/Qwen3.8-27B-NVFP4",
+            "engine": "0"
+          },
+          "value": 85
+        },
+        {
+          "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+          "labels": {
+            "engine": "0",
+            "model_name": "/models/Qwen3.8-27B-NVFP4"
+          },
+          "values": [
+            24,
+            18,
+            10,
+            10,
+            9,
+            7,
+            7
+          ]
+        }
+      ],
+      "reference_mismatches": [
+        {
+          "run": 1,
+          "request": 1,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "token_ids"
+        },
+        {
+          "run": 1,
+          "request": 3,
+          "field": "finish_reason"
+        }
+      ],
+      "raw_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-two-block.json",
+        "sha256": "5d39baa4235b5f0d27a929d62ec29a7b68f96c1979097cacc248f7ed8016d5d5"
+      },
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-two-block.log",
+        "sha256": "d6e5d5a9c13671e0dc991c59fec5355a9ea76e596d4760e113ae063446483e4f"
+      },
+      "command": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/b12x-dflash2-two-block-command.json",
+        "sha256": "8bdd25fbfbcbbecfcf73ed49aec7aac6fb9a03b6e6bd83a6727775be3dd21fbd"
+      },
+      "error": "AssertionError: Generation differs from the reference receipt"
+    }
+  ],
+  "conclusions": [
+    "Target-only b12x graph outputs exactly match b12x eager outputs for all six requests in the 2482-token prompt corpus; each rank records 67 target graph replays.",
+    "FlashInfer versus b12x eager output IDs differ for two of four distinct short prompts. The cause remains unclassified.",
+    "DFlash2 with a 2482-token prompt records target/draft graphs and accepted proposals but no cache hit. An offline comparison also finds a target-only token mismatch.",
+    "DFlash2 with a 3882-token prompt reuses 1648 cached tokens, proposes 182 tokens and accepts 85. Each rank records 19 target and 63 draft query graph replays. Exact output IDs differ from target-only eager on two prompts.",
+    "The longer prompt demonstrates cache reuse with the speculative last-block reservation. Cache behavior in arbitrary mixed workloads remains unqualified.",
+    "The native vLLM libraries used by these runs are precompiled from a different source revision. A source-matched native build is separate work."
+  ],
+  "limitations": [
+    "No physical SM103 execution or performance evidence",
+    "Default FlashInfer tactics with autotuning disabled; the tuning/warmup path is unqualified",
+    "Inference-time JIT warnings remain visible in logs",
+    "No allocation-free full-model replay proof or model-accuracy evaluation",
+    "No full GLM, DeepSeek V4/V4.1 or MTP collective/head-collapse qualification"
+  ],
+  "loader_validation": {
+    "status": "implemented and regression-tested; direct shared-weight GPU execution unqualified",
+    "host_logs": [
+      "loader-port-host.log",
+      "loader-port-glm-host.log",
+      "loader-port-dspark-config-host.log"
+    ],
+    "sm120_model_tests": 81,
+    "sm120_moe_tests": 13,
+    "direct_loader_tests_collected": 20,
+    "unavailable_capability": "ripper reports host_page_tables=0; occupied SM121 hosts were not used for GPU testing",
+    "source_manifest_sha256": "c77d572f760444ad95695469c6562a7f522ef8be7fa3adf5de8ed22c7cb5eed9",
+    "source_manifest": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/loader-port-manifest.json",
+    "test_artifacts": {
+      "loader-port-moe.xml": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/loader-port-moe.xml",
+        "sha256": "099899fee87667b7e22c03cd9560ff441f28e82d1ba2bf48592c3a75246bde41"
+      },
+      "loader-port-models.xml": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/loader-port-models.xml",
+        "sha256": "8c559a99898e0260c9f269f26954d1cd8657e795d6a105c677879d7cd0cc1d82"
+      },
+      "loader-port-device.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/loader-port-device.json",
+        "sha256": "54a75fd913807aedf090088e85e8cd7b24877d97da36915f2c9a467c748429ba"
+      },
+      "loader-port-precommit-final.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/loader-port-precommit-final.log",
+        "sha256": "f336bbe4ee88c50afa18dc42954a549bbffeb366c5bb144fa80e1435de3d4072"
+      }
+    }
+  },
+  "retained_failures": {
+    "location": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2",
+    "description": "Compiler/header mismatch, missing toolkit pieces, repeated autotuning, harness RPC/graph-wrapper failures and interrupted launches are retained alongside terminal receipts."
+  }
+}

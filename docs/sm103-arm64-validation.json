@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "status": "host installation, native helper loading and offline compilation qualified; GPU execution unqualified",
+  "source_revision": "d44599f9b87315c265f9c7ed1d9b5783da5099a6",
+  "source_sha256": "f0c9076894bda5aa8b42cefb592735d3765e7dc919b79b9b26a0f75126aed2d0",
+  "host": {
+    "hostname": "maxwell",
+    "cpu": "aarch64",
+    "python": "3.12.14 (main, Aug 25 2026, 13:59:30) [Clang 22.1.3 ]",
+    "cuda_visible_devices": "",
+    "cuda_initialized": false,
+    "existing_inference_service": "left running; no GPU test launched"
+  },
+  "environment": {
+    "requirements": "/home/jasonc/b12x-sm103-evidence/arm64-a72cfdcf-glibc234-combined-requirements.txt",
+    "requirements_sha256": "53c5b42d61412a5764ed06b460546d5a363213b720c3483da8513d11c19ac393",
+    "installed_distributions": 205,
+    "versions": {
+      "torch": "2.13.0+cu130",
+      "b12x": "1.3.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "cuda-python": "13.4.1",
+      "triton": "3.7.1",
+      "flashinfer-python": "0.6.17"
+    },
+    "cuda_home": "/usr/local/cuda-13.0",
+    "nvcc": "13.0.88"
+  },
+  "wheel": {
+    "wheel_sha256": "bbdea2808b1661178a4369cbb9e28a3d6a2f50f2f0539d1910b4ab363b4951eb",
+    "files": 474,
+    "mismatches": []
+  },
+  "loader_native_helper": {
+    "native_path": "/home/jasonc/.cache/b12x/loader/957d53a29ab4ad5caecb1b0c/_b12x_loader_storage.cpython-312-aarch64-linux-gnu.so",
+    "native_sha256": "4e9fdc6540216169160fa75cbd688d8527b212454fc5fd03e56f615012a2f61b",
+    "native_abi": 1
+  },
+  "cusparselt": {
+    "distribution": "nvidia-cusparselt-cu13",
+    "version": "0.8.1",
+    "dependency_check": "uv pip check reports an incompatible internal py3-none-manylinux2014_sbsa wheel tag",
+    "elf_machine": "AArch64",
+    "dynamic_loading": "passed without CUDA initialization",
+    "library_sha256": "fbb03bbf8d2238670f24256c5452281c2a660162899b838bb4d0cc06dad027df",
+    "disposition": "Packaging metadata warning remains. The installed wheel and metadata are unmodified. No cuSPARSELt GPU operation was tested."
+  },
+  "offline_sm103": {
+    "target": "sm_103a",
+    "component": "moe",
+    "callables": 9,
+    "geometry": {
+      "k": 4096,
+      "n": 2048,
+      "weight_E": 288,
+      "max_tokens": 8,
+      "num_topk": 8,
+      "w13_layout": "w13",
+      "swiglu_limit": null
+    },
+    "identical_ptx": 9,
+    "identical_cubins": 9,
+    "comparison": "Identical frozen b12x package source compiled with the same Torch/CuTe versions on x86-64 and ARM64. Every retained artifact hash was verified after copying.",
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "moe",
+      "--output-dir",
+      "compile-moe-sm103"
+    ]
+  },
+  "artifacts": {
+    "install.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/install.log",
+      "sha256": "745c07f8fec68032e164d087aa345018a792385960e6dd4b2d799c4e88f909eb"
+    },
+    "installed-packages.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/installed-packages.json",
+      "sha256": "ad750e58d0e950930a30205fb2bdf6e31810c677fd17ad7b229eb77bd8c852f6"
+    },
+    "native-helper-build.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/native-helper-build.json",
+      "sha256": "5525b221b80afc8308c8963014965a4320bf927352350d941700f3f5fd8ce5a3"
+    },
+    "cusparselt-audit.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/cusparselt-audit.json",
+      "sha256": "2eb3062dd89e3cb4d79be06fb3b35a9c57a73d4094de51b7a6ca483ee2469b44"
+    },
+    "compile-moe-sm103/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/compile-moe-sm103/manifest.json",
+      "sha256": "8943ca15ae3dbd831992ef49e65bbb5fa9cae29085ef3e9d2f1b4602777e442a"
+    },
+    "x86-moe-sm103/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/x86-moe-sm103/manifest.json",
+      "sha256": "0a98bf1523f0d6bbe70f33f491fa4a6c71e2c98f073b119db8a2a5b269cb9407"
+    },
+    "compile-comparison.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/compile-comparison.json",
+      "sha256": "9bb70fdc533e172f1d76668aa13e74ef721c317238202565f2a5b1710422dea3"
+    },
+    "compile-cuda-context.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/compile-cuda-context.json",
+      "sha256": "6858d0a4a851e8ee8c18a7280c313cd9e1a89cbb5ce65cf96cb0689d3a517bda"
+    },
+    "wheel-integrity.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/arm64-install-20260914/wheel-integrity.json",
+      "sha256": "fcecc729a6a773d928454bec790e441bc500b203d88e0c002b3409127c6992d2"
+    }
+  },
+  "remaining": [
+    "Matching ARM64 native vLLM build and import",
+    "Available SM121 GPU loader/graph regression",
+    "Physical SM103 execution",
+    "Full dependency-check success pending the cuSPARSELt wheel metadata correction"
+  ]
+}
