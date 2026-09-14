@@ -1607,3 +1607,46 @@ accepts 77 and records 16 target and 60 draft query graph replays per rank.
 Both speculative backends therefore have a failed exact-reference check;
 their speculative outputs differ from each other as well. The control narrows
 attribution but leaves the correctness investigation open.
+
+## Source-matched companion core libraries
+
+The [native-build receipt](sm103-native-build-validation.json) binds the
+companion source at `5e040862e127518c1cf5248c8f5113ab6d2e0985`, 3,309
+verified source/build files, pinned external dependency revisions, compiler
+commands and five x86-64 core library hashes. The build uses CUDA 13.0.88,
+Torch 2.13.0+cu130, GCC 13.3 and the `10.0f;12.0f` architecture list. The
+selected commands contain family targets and generic legacy targets, with
+no `sm_100a` target. All five core libraries load with CUDA hidden and
+uninitialized. External native modules retain their precompiled identities.
+
+The source-matched core libraries pass 185 SM120 tests covering NVFP4
+quantization, b12x MoE and GLM/DeepSeek/DSpark integration. Qwen eager output
+matches all six prior eager outputs on the 3,882-token corpus. Target graphs
+execute 69 replays per rank but differ from eager output on one prompt.
+DFlash2 exactly reproduces the six outputs of the precompiled-core run,
+including its failed comparison with target-only eager output. Both DFlash2
+runs record 182 proposals and 85 accepted tokens. Rebuilding the core libraries
+does not resolve the speculative parity failure.
+
+Companion revision `1e6b809f00b5235d7b1d6711070d3eae8d5c8a18` permits
+`head_dtype` overrides for `UnquantizedLinearMethod`, which ModelOpt uses for
+excluded output heads. The quantized-head rejection remains. Twelve focused
+CPU/device tests pass on SM120, and all required hooks pass. Qwen FP32-head
+eager generation completes six requests with prefix reuse and repeat equality.
+Its graph run executes 67 replays per rank but differs on two prompts. The
+override fixes initialization and does not resolve exact-reference parity.
+Native source remains identical to the core build revision.
+
+The compiled FP32-head control disables CUDA graphs while retaining
+`torch.compile`, matching source/native identities and the request corpus.
+All six requests complete, but one prompt differs from the compiled graph
+run. Compilation alone does not explain the full mismatch. Padding, launch
+shape and numerical-path effects remain possible; the control does not
+establish a CUDA graph replay defect.
+
+The ARM64 core build uses the same verified source with CUDA hidden. Two
+compiler attempts hit their 3 GiB and 6 GiB cgroup limits. The kernel OOM
+records are retained outside the repository. The bounded continuation retains
+a 6 GiB resident-memory cap, allows up to 8 GiB swap and runs one compiler job.
+The existing inference service remains running and returns HTTP 200 on its
+health endpoint. ARM64 core-build acceptance remains pending.

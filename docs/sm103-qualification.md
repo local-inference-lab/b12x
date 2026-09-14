@@ -885,8 +885,9 @@ Its raw receipt remains failed because reference parity fails. An earlier
 2,482-token DFlash2 case records no prefix hit and also differs from the
 target-only reference. Neither case establishes full speculative correctness.
 The logs also retain inference-time JIT warnings. The native vLLM libraries
-used by these model runs come from a different source revision; matching
-native builds require separate acceptance.
+used by these model runs come from a different source revision. The separate
+[native-build receipt](sm103-native-build-validation.json) records validation
+with source-matched core libraries.
 
 The FlashInfer speculative control proposes 147 tokens, accepts 77 and records
 16 target and 60 draft query graph replays per rank. Its exact-reference check
@@ -916,6 +917,77 @@ model/post-load tests and 13 MoE numerical/graph tests pass on SM120. Run
 `tests/loader/test_vllm.py` in the combined environment on a GPU with host
 page-table access; all 20 tests collect, but the inspected RTX GPUs lack that
 capability. The occupied SM121 hosts have not been used for GPU execution.
+
+## Companion native build
+
+Status: **x86-64 core build and SM120 component regression qualified;
+full-model parity unresolved**.
+
+The [native-build receipt](sm103-native-build-validation.json) binds 3,309
+source/build files at companion revision
+`5e040862e127518c1cf5248c8f5113ab6d2e0985`, the compiler configuration,
+native library hashes and test results. Five targets build and load:
+`_C_stable_libtorch`, `_moe_C_stable_libtorch`, `cumem_allocator`, `fs_io_C`
+and `spinloop`. The selected build uses CUDA 13.0.88, Torch 2.13.0+cu130,
+GCC 13.3 and `TORCH_CUDA_ARCH_LIST='10.0f;12.0f'`. The command audit finds
+family targets and generic legacy targets, with no `sm_100a` entry.
+NVIDIA documents `sm_100f` as supporting compute capabilities 10.0 and 10.3
+in its [family-specific architecture guide](https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/).
+CuTe's b12x target remains `sm_103a`.
+
+Build in an isolated directory with the matching Python environment and a
+consistent toolkit. The CUDA headers must include CCCL, cuRAND and cuBLAS.
+For a split pip toolkit, both CMake cache variables `CUDA_nvrtc_LIBRARY` and
+`CUDA_NVRTC_LIB` must resolve the installed NVRTC library. Set the source,
+build directory, environment Python and job limit explicitly:
+
+```bash
+CUDA_VISIBLE_DEVICES='' TORCH_CUDA_ARCH_LIST='10.0f;12.0f' \
+cmake -S "$vllm_source_dir" -B "$native_build_dir" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_TARGET_DEVICE=cuda \
+  -DVLLM_PYTHON_EXECUTABLE="$native_python" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+  -DNVCC_THREADS=1 -DCMAKE_JOB_POOLS="compile=$build_jobs"
+CUDA_VISIBLE_DEVICES='' cmake --build "$native_build_dir" --target \
+  _C_stable_libtorch _moe_C_stable_libtorch cumem_allocator fs_io_C spinloop \
+  --parallel "$build_jobs"
+```
+
+Stage the resulting libraries in a separate runtime copy and verify their
+hashes before loading. The receipt records CPU loading with CUDA hidden and
+uninitialized, then 185 passing SM120 tests covering NVFP4 quantization,
+b12x MoE and GLM/DeepSeek/DSpark model integration. External native modules
+retain their precompiled identities; this receipt covers the five listed
+core targets.
+
+On the 3,882-token Qwen corpus, eager output matches the prior eager reference
+for all six requests. Target graphs execute 69 replays per rank, but one
+prompt differs from eager output. The default configuration therefore retains
+a failed exact-reference gate.
+
+DFlash2 with the source-matched core libraries exactly reproduces the six
+request outputs of the precompiled-core DFlash2 run. It records 182 proposals,
+85 accepted tokens, 1,648-token prefix reuse, 19 target graph replays and 63
+draft query graph replays per rank. Both runs fail comparison with target-only
+eager output on two prompts. Rebuilding the core libraries does not resolve
+that failure.
+
+The companion output-head precision override accepts both unquantized
+embedding and unquantized linear methods. ModelOpt uses the latter for an
+excluded output head. Twelve focused CPU/device tests pass, including
+quantized-head rejection. An explicit `hf_overrides={"head_dtype": "float32"}`
+Qwen eager run completes six requests with prefix reuse and repeat equality.
+The receipt retains the failed initialization before the guard correction.
+Graph/eager exact-reference equality also fails with the FP32 output head.
+The precision override does not resolve the observed parity failure or qualify
+default BF16 generation or speculative accuracy.
+
+A control keeps `torch.compile` enabled and disables CUDA graphs with the
+same FP32-head configuration and source/native identities. It completes six
+requests, but one prompt differs from the compiled graph run. Thus enabling
+`torch.compile` alone does not explain all observed token differences.
+Graph mode can also change padding and launch shapes; this control does not
+establish a CUDA graph replay defect.
 
 ## Tensor-scaled and compact block-FP8 projections
 
