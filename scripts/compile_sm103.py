@@ -1236,24 +1236,30 @@ def compile_activation_packing(out):
 
     launches = {}
     cases = [
-        (dtype, input_k, False, False)
+        (recipe, dtype, input_k, False)
+        for recipe in ("mxfp8", "mxfp4")
         for dtype in ("bf16", "fp16") for input_k in (128, 160, 1024)
     ] + [
-        ("bf16", input_k, True, reciprocal)
+        ("nvfp4", "bf16", input_k, reciprocal)
         for input_k in (128, 1024) for reciprocal in (False, True)
     ]
     options = {"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False}
-    for dtype, input_k, fp4, reciprocal in cases:
-        recipe = "nvfp4" if fp4 else "mxfp8"
+    for recipe, dtype, input_k, reciprocal in cases:
+        fp4 = recipe != "mxfp8"
         name = f"activation_pack_{recipe}_{dtype}_k{input_k}_reciprocal{int(reciprocal)}"
-        constants = dict(INPUT_K=input_k, K=(input_k + 127) // 128 * 128,
-                         FP4=fp4, RECIPROCAL=reciprocal, GROUP=16 if fp4 else 32,
+        padded_k = input_k if recipe == "mxfp4" else (input_k + 127) // 128 * 128
+        constants = dict(INPUT_K=input_k, K=padded_k,
+                         FP4=fp4, RECIPROCAL=reciprocal, GROUP=16 if recipe == "nvfp4" else 32,
                          CHUNKS=16)
         signature = dict(X=f"*{dtype}", Q="*u8" if fp4 else "*fp8e4nv", S="*u8",
                          AG="*fp32", WG="*fp32", ALPHA="*fp32", M="i32")
+        if recipe == "mxfp4":
+            for pointer in ("AG", "WG", "ALPHA"):
+                signature[pointer] = "constexpr"
+                constants[pointer] = None
         source = ASTSource(
             _quantize, signature, constexprs=constants,
-            attrs={(i,): [["tt.divisibility", 16]] for i in range(6)},
+            attrs={(i,): [["tt.divisibility", 16]] for i in range(3 if recipe == "mxfp4" else 6)},
         )
         compiled = triton.compile(source, target=GPUTarget("cuda", 103, 32), options=options)
         if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
