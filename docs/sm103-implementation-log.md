@@ -1223,3 +1223,49 @@ Paired/grouped records, coupled extents crossing distinct input-scale halves,
 full checkpoint/speculative execution, model evaluation, matching native/ARM64
 builds, SM121 regression, the final full-source corpus and Station HBM transport
 remain open.
+
+## Coupled input-scale halves
+
+Status: implemented and cross-compiled; physical SM103 expert execution remains
+unqualified.
+
+Canonical SQG and projection-tiered MCG preparation retain both input-scale
+vectors when a rank extent crosses the global FC1 half boundary. Uniform BTX
+preparation carries the same local column split and preserves manifest extent
+barriers. The synthetic BTX writer supports uniform extents ending within an
+eight-slot group. Canonical and BTX records agree for whole 384-channel layers
+and 256-channel subextents, including splits at columns 192 and 64.
+
+The native FC1 implementation stages two activation rows in its existing
+128-by-64 operand tile and selects the result per output column. Both physical
+FC1 slots use the same split. Capacity plans prewarm both variants and reserve
+both input buffers. Shared-input bindings retain their existing callable.
+SM12x rejects the distinct-half contract before canonical prewarm and at legacy
+bind. The public plan/bind/run interface and policy configuration are unchanged.
+
+The [validation receipt](sm103-trellis-input-halves-validation.json) records
+651 host tests, a 121-test SM120 suite, and 29 targeted cases passing memcheck
+and synccheck with zero errors. The companion Torch 2.13 environment passes
+51 host tests. Portable probes exercise the production operand staging and
+epilogue predicate, including invalid routes, tails, frozen resolution,
+mutated graph inputs and cumulative allocation checks. The native suite has
+32 deferred SM103 tests. These results do not qualify complete SM103 experts.
+
+The frozen Trellis corpus contains 196 callables and CUDA entry points. All
+176 existing PTX objects are byte-identical; 149 existing cubins are identical.
+The remaining 27 have identical allocated resources, exact register sets and
+instruction counts. Twenty-five differ only in register operands; SQG FP16
+FC1/FC2 K5 also differ in instruction ordering or reuse flags. Raw identities
+remain distinct. The six dual-input variants use 167 allocated registers versus
+140 in their single-input counterparts. This increase requires B300 occupancy
+and performance profiling. No stack or local-memory traffic is emitted, and
+all 64 TMEM readers retain load-completion waits.
+
+The wheel and source distribution match all 460 Python package files and three
+embedded profiles. An extracted-wheel import exercises the split metadata and
+kernel constructor outside the checkout. The companion vLLM source remains
+unchanged at `a72cfdcf7b484ab395fdd4d2ee0843877a919f39`.
+
+Paired/grouped records, full-model speculative feedback and evaluation, a
+matching native vLLM build, ARM64 dependencies, SM121 regression, direct-HBM
+Station transport and the final full-project compile remain outstanding.

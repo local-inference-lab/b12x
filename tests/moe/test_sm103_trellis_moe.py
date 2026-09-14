@@ -18,6 +18,7 @@ def prepare_experts(
     transform_draw=0,
     global_intermediate_size=None,
     intermediate_offset=0,
+    distinct_input_scales=False,
 ):
     experts, hidden, width = geometry
     config = _k3_config()
@@ -49,7 +50,9 @@ def prepare_experts(
             device=device,
         ),
         rate=torch.tensor([bits * 17], dtype=torch.uint8, device=device),
-        input_scales=scales((experts, hidden)),
+        input_scales=scales(
+            (experts, 2, hidden) if distinct_input_scales else (experts, hidden)
+        ),
         intermediate_scales=scales((experts, 3, width)),
         output_scales=scales((experts, hidden)),
         expert_transform_draws=torch.full(
@@ -161,10 +164,10 @@ def test_canonical_preparation_and_independent_oracle(coupled, bits):
         addresses = tuple(
             t.data_ptr() for t in (source, ids, binding.output, *scratch.values())
         )
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.cuda.memory_stats()["allocated_bytes.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
         assert (
             tuple(
                 t.data_ptr() for t in (source, ids, binding.output, *scratch.values())
@@ -176,7 +179,9 @@ def test_canonical_preparation_and_independent_oracle(coupled, bits):
         b12x.unfreeze_kernel_resolution()
 
 
-def _run_native_moe(coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2):
+def _run_native_moe(
+    coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native Trellis MoE")
     import b12x
@@ -192,8 +197,11 @@ def _run_native_moe(coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2)
         device="cuda",
         geometry=geometry,
         transform_draw=7 if coupled else 0,
-        global_intermediate_size=4 * geometry[2] if coupled else None,
-        intermediate_offset=geometry[2] if coupled else 0,
+        global_intermediate_size=(geometry[2] if cross_half else 4 * geometry[2])
+        if coupled
+        else None,
+        intermediate_offset=geometry[2] if coupled and not cross_half else 0,
+        distinct_input_scales=cross_half,
     )
     payload = experts._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -290,6 +298,8 @@ def _run_native_moe(coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2)
         before = binding.output.clone()
         source.mul_(0.75)
         payload.w13.bitwise_xor_(0x124)
+        if cross_half:
+            payload.trellis.up_suh.mul_(0.7)
         payload.trellis.down_svh.mul_(0.8)
         ids.fill_(4)
         route_map[4] = expert_count - 1
@@ -305,11 +315,11 @@ def _run_native_moe(coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2)
             *scratch.values(),
         )
         addresses = tuple(t.data_ptr() for t in owners)
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.cuda.memory_stats()["allocated_bytes.all.allocated"]
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
         assert tuple(t.data_ptr() for t in owners) == addresses
         assert (
             tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
@@ -332,3 +342,8 @@ def test_native_moe_oracle_capacity_binding_and_graph(coupled, bits, id_dtype):
 
 def test_v41_geometry_native_moe():
     _run_native_moe(True, 3, torch.int64, geometry=(384, 5120, 2304), top_k=6)
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_native_coupled_cross_half_moe(bits):
+    _run_native_moe(True, bits, torch.int64, geometry=(3, 512, 384), cross_half=True)

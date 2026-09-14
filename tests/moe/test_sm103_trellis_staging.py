@@ -26,7 +26,7 @@ class InspectOperands:
     @cute.jit
     def __call__(
         self,
-        a: cute.Pointer,
+        a,
         packed: cute.Pointer,
         lut: cute.Pointer,
         out: cute.Pointer,
@@ -70,9 +70,7 @@ class InspectOperands:
         sB = allocator.allocate_tensor(
             cutlass.Float16, layout.outer, 128, swizzle=layout.inner
         )
-        a_tensor = cute.make_tensor(
-            a, cute.make_layout(cutlass.Int64(self.projection.capacity) * stride)
-        )
+        a_tensor = self.projection.input_tensors(a, stride)
         packed_tensor = cute.make_tensor(
             packed,
             cute.make_layout(
@@ -134,7 +132,7 @@ def _require_gpu():
         pytest.skip("physical Blackwell GPU required")
 
 
-def _check_staging(codebook, bits, *, high_offsets=False):
+def _check_staging(codebook, bits, *, high_offsets=False, dual_input=False):
     _require_gpu()
     device = torch.device("cuda", torch.cuda.current_device())
     n, k = 144, 80
@@ -161,7 +159,9 @@ def _check_staging(codebook, bits, *, high_offsets=False):
     output = torch.full(
         (2, 2, 2, 128, 64), float("nan"), dtype=torch.float16, device=device
     )
-    projection = RoutedTrellisGemm(n, k, experts, 2, bits=bits, codebook=codebook)
+    projection = RoutedTrellisGemm(
+        n, k, experts, 2, bits=bits, codebook=codebook, dual_input=dual_input
+    )
     args = [
         pointer(t, v)
         for t, v in (
@@ -171,6 +171,9 @@ def _check_staging(codebook, bits, *, high_offsets=False):
             (cutlass.Float16, output),
         )
     ]
+    alternate = -a if dual_input else a
+    if dual_input:
+        args[0] = (args[0], pointer(cutlass.Float16, alternate), cutlass.Int64(64))
     args += [cutlass.Int64(experts - 1), cutlass.Int64(1), cutlass.Int64(stride)]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     target = architecture_for(torch.cuda.get_device_capability()).compilation_target
@@ -183,6 +186,10 @@ def _check_staging(codebook, bits, *, high_offsets=False):
         for kk in range(2):
             last_n, last_k = min(128, n - nn * 128), min(64, k - kk * 64)
             expected[nn, kk, 0, 0, :last_k] = a[1, kk * 64 : kk * 64 + last_k]
+            if dual_input:
+                expected[nn, kk, 0, 1, :last_k] = alternate[
+                    1, kk * 64 : kk * 64 + last_k
+                ]
             expected[nn, kk, 1, :last_n, :last_k] = expected_weight[
                 nn * 128 : nn * 128 + last_n, kk * 64 : kk * 64 + last_k
             ]
@@ -201,3 +208,8 @@ def test_production_operand_staging(codebook, bits):
 
 def test_production_operand_staging_above_int32_offsets():
     _check_staging("mcg", 3, high_offsets=True)
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_dual_input_operand_staging(bits):
+    _check_staging("sqg_e4m3", bits, dual_input=True)

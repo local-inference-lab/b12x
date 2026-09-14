@@ -179,7 +179,9 @@ position dtypes through the public b12x API, and binds an independent BF16 outpu
 that survives shared-scratch reuse. Its four eager/Inductor serving cases pass
 SM120 memcheck and synccheck with zero kernel errors. They exercise arbitrary
 positive FP32 128x128 checkpoint scales and 32x32 UE8M0 scales, padded attention
-rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution.
+rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution. Uniform BTX extents retain their manifest
+barrier checks; valid crossing extents carry the same split as canonical weights.
+See the [input-scale-half validation receipt](sm103-trellis-input-halves-validation.json).
 The companion `docs/design/b12x_wo_serving_validation.json` records source and
 native-library identities. Complete DeepSeek SM103 selection remains rejected
 because the indexer still needs the public plan/bind/run API, retained capacity
@@ -867,8 +869,8 @@ require subsequent profiling and tuning.
 CuTe kernels implement scaled H128 input/intermediate/output transforms,
 SiLU or SiTU, coupled H512/H128 transforms and router-weighted reduction.
 The default output is FP32; caller output may use FP32 or the public FP16/BF16
-input dtype. Ordinary gate/up input scales may differ. Coupled execution
-requires their shared input-scale tensor and SiTU. Runtime Int32/Int64 route
+input dtype. Ordinary gate/up input scales may differ. Coupled execution requires SiTU and either shared input scales or an explicit
+column split between the checkpoint's two input-scale halves. Runtime Int32/Int64 route
 IDs and optional route/output maps are supported. Every pool-scaled offset
 uses Int64 before multiplication. Invalid routes write zeros without reading
 invalid expert weights or scale rows.
@@ -884,26 +886,35 @@ schedule, not a claim of single-kernel fusion.
 
 Canonical MCG preparation supports uniform, per-layer, per-expert and per-projection
 K3/K4/K5 rates with ordinary H128 transforms and SiLU or SiTU. Coupled H512/H128
-transforms require SiTU, a hidden width divisible by 512, shared gate/up input
-scales. Expert draws 0 through 7 are supported; nonzero draws require explicit
+transforms require SiTU and a hidden width divisible by 512. Expert draws 0 through 7 are supported; nonzero draws require explicit
 global intermediate width and rank offset in the canonical tensor bundle.
-Preparation retains the coupled
-flag on the owner and every compressed tier. Each gate, up
+Preparation retains the coupled flag and input-scale split on the owner and
+every compressed tier. Each gate, up
 and down projection reads its own descriptor row and decodes the selected
 coalesced compressed record directly into shared memory. No decoded global
 weight buffer is created. The descriptor uses eight local-index bits through
 256 experts and 24 bits above that capacity, preserving Int32 storage and
 covering all 384 experts. SM12x retains its eight-bit descriptor contract.
 Tier offsets, populated counts and payload lengths are runtime scalar arguments.
-For each static transform configuration, 15 precompiled callables serve all
+Ordinary mixed plans precompile 15 callables; coupled plans precompile 16,
+including an FC1 variant for two input-scale halves. These callables serve all
 rate distributions and live counts. Each ordinary binding schedules nine
-launches, including prepared expert-map composition. Coupled bindings reuse
-one transformed input for gate and up and schedule eight launches.
+launches, including prepared expert-map composition. Coupled bindings with
+shared input scales reuse one transformed input for gate and up and schedule
+eight launches. Distinct input-scale halves require
+two input transforms and nine launches.
 The canonical A16 unit-scale flag is accepted without activation-scale math.
 
-Paired/grouped records remain unsupported. Coupled extents crossing the
-boundary between two distinct input-scale halves require further execution
-support; extents wholly inside either half select that half's shared vector.
+Paired/grouped records remain unsupported. Coupled extents crossing two
+distinct input-scale halves retain both scale vectors and select the result
+per output column, including splits inside an MMA tile. Extents wholly inside
+either half select that half's shared vector. Portable SM120 probes exercise
+operand staging and the epilogue predicate; complete native expert execution
+requires B300 qualification. The deferred uniform and mixed suites include
+whole-layer extents with a split at column 192, graph replay, input-scale
+mutation and frozen kernel resolution. Uniform BTX extents retain their manifest
+barrier checks; valid crossing extents carry the same split as canonical weights.
+See the [input-scale-half validation receipt](sm103-trellis-input-halves-validation.json).
 SM120/SM121 retain their rejection of coupled projection-tiered execution.
 The standalone decoder and projection support MCG K2 for diagnostics; the
 existing private MoE weight contract starts MCG at K3. See the
@@ -997,7 +1008,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped records, extents crossing distinct input-scale halves and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped records and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -1086,7 +1097,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
 | Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
-| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and ordinary/coupled MCG projection-tiered execution, including 384-expert records and nonzero draw extents; add paired/grouped records or extents crossing distinct input-scale halves required by the selected checkpoint |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and ordinary/coupled MCG projection-tiered execution, including 384-expert records, nonzero draw extents and distinct input-scale halves; add paired/grouped records required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
 | MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |

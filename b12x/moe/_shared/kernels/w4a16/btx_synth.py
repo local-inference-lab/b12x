@@ -97,6 +97,8 @@ def _layer_rate_codes(
 
     pairs = config.atom_slots // ATOMS_PER_PAIR
     if config.bits is not None:
+        # Uniform records can end in a partial group of eight atom slots.
+        pairs = (config.atom_slots + ATOMS_PER_PAIR - 1) // ATOMS_PER_PAIR
         code = rate_code(config.bits, config.bits)
         table = torch.full(
             (pairs, config.num_experts), code, dtype=torch.uint8

@@ -117,17 +117,23 @@ def test_coupled_input_scale_selection_uses_global_extent(offset, which):
     assert all(t.data_ptr() == (gate, up)[which].data_ptr() for t in selected)
     with pytest.raises(ValueError, match="explicit global extent"):
         _coupled_input_scales(bundle(), gate, up, 128)
-    with pytest.raises(NotImplementedError, match="half boundary"):
-        _coupled_input_scales(bundle(global_intermediate_size=512), gate, up, 512)
+    assert _coupled_input_scales(
+        bundle(global_intermediate_size=512), gate, up, 512
+    ) == (gate, up)
     assert _coupled_input_scales(
         bundle(global_intermediate_size=512), gate, gate, 512
     ) == (gate, gate)
 
 
 @pytest.mark.parametrize("codebook", ["sqg_e4m3", "mcg"])
-@pytest.mark.parametrize("offset", [0, 768])
+@pytest.mark.parametrize(
+    "global_width,width,offset",
+    [(1024, 256, 0), (1024, 256, 768), (384, 384, 0), (384, 256, 128)],
+)
 @pytest.mark.parametrize("per_expert", [False, True])
-def test_canonical_coupled_extent_matches_btx(tmp_path, codebook, offset, per_expert):
+def test_canonical_coupled_extent_matches_btx(
+    tmp_path, codebook, global_width, width, offset, per_expert
+):
     if not torch.cuda.is_available():
         pytest.skip("canonical weight preparation requires CUDA")
     from b12x.moe._shared.kernels.w4a16.btx import (
@@ -141,7 +147,7 @@ def test_canonical_coupled_extent_matches_btx(tmp_path, codebook, offset, per_ex
     from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
     from b12x.policy.generation.providers.trellis_reference import moe_reference
 
-    experts, hidden, width, global_width = 8, 512, 256, 1024
+    experts, hidden = 8, 512
     config = BtxSynthConfig(
         codebook=codebook,
         num_experts=experts,
@@ -154,7 +160,7 @@ def test_canonical_coupled_extent_matches_btx(tmp_path, codebook, offset, per_ex
         post_block=128,
         per_expert_input_rotations=per_expert,
         extent_alignment_slots=4,
-        extent_barriers=(16,),
+        extent_barriers=(16,) if global_width == 1024 else (),
         seed=39,
     )
     manifest = write_btx_checkpoint(tmp_path, config)
@@ -211,7 +217,13 @@ def test_canonical_coupled_extent_matches_btx(tmp_path, codebook, offset, per_ex
         payload = actual.tiers[0]
     else:
         state, payload = actual.trellis, actual
-    assert state.gate_suh.data_ptr() == state.up_suh.data_ptr()
+    crosses = 2 * offset < global_width < 2 * (offset + width)
+    assert (state.gate_suh.data_ptr() == state.up_suh.data_ptr()) is not crosses
+    assert (
+        state.input_scale_split
+        == expected.trellis.input_scale_split
+        == (global_width // 2 - offset if crosses else None)
+    )
     for name in ("w13", "w2"):
         torch.testing.assert_close(
             getattr(payload, name).reshape(-1),
@@ -235,3 +247,30 @@ def test_canonical_coupled_extent_matches_btx(tmp_path, codebook, offset, per_ex
         atol=0,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("codebook", ["sqg_e4m3", "mcg"])
+def test_uniform_btx_partial_pair_extent_roundtrip(tmp_path, codebook):
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+    from b12x.moe._shared.kernels.w4a16.btx_synth import (
+        BtxSynthConfig,
+        write_btx_checkpoint,
+    )
+
+    config = BtxSynthConfig(
+        codebook=codebook,
+        num_experts=2,
+        hidden_size=512,
+        intermediate_size=384,
+        moe_layer_indices=(0,),
+        bits=3,
+        coupled=True,
+        pre_block=512,
+        post_block=128,
+    )
+    manifest = write_btx_checkpoint(tmp_path, config)
+    whole = read_btx_layer(tmp_path, manifest, 0, first_slot=0, slot_count=12)
+    tail = read_btx_layer(tmp_path, manifest, 0, first_slot=4, slot_count=8)
+    assert whole.local_intermediate_size == 384 and tail.local_intermediate_size == 256
+    torch.testing.assert_close(tail.atoms, whole.atoms[4:], atol=0, rtol=0)
+    torch.testing.assert_close(tail.rotations, whole.rotations[4:], atol=0, rtol=0)

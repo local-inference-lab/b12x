@@ -65,6 +65,7 @@ class PreparedProjectionTrellisWeights:
     weight_layout: str = "trellis_mixed3"
     scale_format: str = "e4m3_k32"
     trellis_codebook: str = "mcg"
+    input_scale_split: int | None = None
 
 
 def _coalesce_payloads(
@@ -513,9 +514,14 @@ def _coupled_input_scales(
         return gate, gate
     if 2 * begin >= global_size:
         return up, up
-    raise NotImplementedError(
-        "coupled Trellis extents crossing the input-scale half boundary require shared input scales"
-    )
+    return gate, up
+
+
+def _input_scale_split(weights, gate, up):
+    if gate.data_ptr() == up.data_ptr():
+        return None
+    # Called after extent validation and half selection for coupled weights.
+    return weights.global_intermediate_size // 2 - weights.intermediate_offset
 
 
 def _uniform_prepared(
@@ -537,6 +543,12 @@ def _uniform_prepared(
     if len(unique) != 1:
         raise ValueError("uniform trellis preparation requires one K value")
     bit = int(unique[0])
+    split = (
+        _input_scale_split(weights, gate_suh, up_suh)
+        if config.transform.expert.kind == "coupled_hadamard"
+        else None
+    )
+    fc1_tile_n = 128 if split is not None and intermediate_size % 256 else 256
     offsets = _bundle_offsets(bits, hidden_size)
     experts = list(range(num_experts))
     gate = _projection_native(
@@ -573,7 +585,7 @@ def _uniform_prepared(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         activation=activation,
-        fc1_tile_n=256,
+        fc1_tile_n=fc1_tile_n,
         fc2_tile_n=256,
         # Trellis projections round in the FP16 quantizer basis independently
         # of the public activation dtype retained by the weight plan.
@@ -585,7 +597,7 @@ def _uniform_prepared(
         up_suh=up_suh,
         intermediate_rotations=intermediate.reshape(num_experts, -1),
         down_svh=down_svh,
-        tile_config=(64, 256, 64, 256),
+        tile_config=(64, fc1_tile_n, 64, 256),
     )
     coupled, rotations = _expert_transform_rows(
         config,
@@ -603,6 +615,7 @@ def _uniform_prepared(
             prepared.trellis,
             coupled_hadamard=True,
             intermediate_rotations=rotations,
+            input_scale_split=split,
         ),
     )
 
@@ -630,8 +643,7 @@ def _projection_prepared(
         num_experts=num_experts,
         intermediate_size=intermediate_size,
     )
-    if coupled and gate_suh.data_ptr() != up_suh.data_ptr():
-        raise ValueError("coupled Trellis requires a shared input scale vector")
+    split = _input_scale_split(weights, gate_suh, up_suh) if coupled else None
 
     offsets = _bundle_offsets(bits, hidden_size)
     memberships = tuple(
@@ -679,11 +691,7 @@ def _projection_prepared(
         )
         if gate_ids or up_ids:
             w13 = torch.cat(
-                tuple(
-                    value
-                    for value, ids in ((gate, gate_ids), (up, up_ids))
-                    if ids
-                )
+                tuple(value for value, ids in ((gate, gate_ids), (up, up_ids)) if ids)
             ).contiguous()
         else:
             w13 = gate
@@ -712,6 +720,7 @@ def _projection_prepared(
             fc1_pair_modes=None,
             fc2_pair_modes=None,
             coupled_hadamard=coupled,
+            input_scale_split=split,
         )
         if shared_workspace is None:
             shared_workspace = prepared.workspace
@@ -725,9 +734,7 @@ def _projection_prepared(
         )
         tiers.append(prepared)
 
-    combined_w13, tier_w13 = _coalesce_payloads(
-        tuple(tier.w13 for tier in tiers)
-    )
+    combined_w13, tier_w13 = _coalesce_payloads(tuple(tier.w13 for tier in tiers))
     combined_w2, tier_w2 = _coalesce_payloads(tuple(tier.w2 for tier in tiers))
     rebound = [
         replace(tier, w13=w13, w2=w2)
@@ -755,8 +762,10 @@ def _projection_prepared(
     )
     up_table = (
         gate_table
-        if coupled
-        else (up_suh if broadcast_input else torch.cat((up_suh,) * 3, dim=0).contiguous())
+        if coupled and split is None
+        else (
+            up_suh if broadcast_input else torch.cat((up_suh,) * 3, dim=0).contiguous()
+        )
     )
     rotations = MixedTrellisRotations(
         intermediate=torch.cat((transform_rows,) * 3, dim=0).contiguous(),
@@ -793,6 +802,7 @@ def _projection_prepared(
         num_experts=num_experts,
         params_dtype=params_dtype,
         coupled_hadamard=coupled,
+        input_scale_split=split,
     )
 
 

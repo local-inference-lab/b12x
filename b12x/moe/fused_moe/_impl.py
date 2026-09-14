@@ -992,6 +992,15 @@ class TPMoEScratchPlan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
             )
+        prepared = (
+            experts.representation_for("w4a16")
+            if experts.plan.coupled_hadamard else None
+        )
+        transform = getattr(prepared, "trellis", prepared)
+        if getattr(transform, "input_scale_split", None) is not None:
+            raise NotImplementedError(
+                "coupled Trellis extents with distinct input-scale halves require the SM103 backend"
+            )
         if int(a.shape[0]) > int(self.caps.max_tokens):
             raise ValueError(
                 f"input tokens {int(a.shape[0])} exceed TP MoE scratch capacity "
