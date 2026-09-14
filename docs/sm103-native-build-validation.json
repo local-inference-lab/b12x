@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "x86-64 core build and SM120 component regression qualified; full-model parity unresolved",
+  "status": "x86-64 and ARM64 core builds and CPU loading qualified; SM120 component regression qualified; full-model parity unresolved",
   "b12x_revision": "88ab17ae8886fb61ad328076c46ce3512bb37b61",
   "b12x_package_source_sha256": "f0c9076894bda5aa8b42cefb592735d3765e7dc919b79b9b26a0f75126aed2d0",
   "configuration": {
@@ -771,7 +771,69 @@
     "No physical SM103 execution or performance measurement is included."
   ],
   "arm64_core_build": {
-    "status": "pending; bounded compiler continuation active at the recorded snapshot",
+    "status": "build and CPU loading passed; GPU execution unqualified",
+    "validation": {
+      "status": "passed",
+      "observed_at": "2026-09-14T19:34:11.757856+00:00",
+      "host": "maxwell",
+      "platform": "aarch64",
+      "torch": "2.13.0+cu130",
+      "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+      "source_files_verified": 3309,
+      "source_mismatches": [],
+      "cuda_visible_devices": "",
+      "cuda_initialized": false,
+      "libraries": [
+        {
+          "name": "_C_stable_libtorch",
+          "path": "/home/jasonc/vllm-sm103-arm64-20260914-build/_C_stable_libtorch.abi3.so",
+          "bytes": 38489640,
+          "sha256": "49af4363558a5ce4ef1ae0e4e14644f21e38581ff65e2e9b86d1fb70253f6710",
+          "elf_machine": "AArch64"
+        },
+        {
+          "name": "_moe_C_stable_libtorch",
+          "path": "/home/jasonc/vllm-sm103-arm64-20260914-build/_moe_C_stable_libtorch.abi3.so",
+          "bytes": 26845216,
+          "sha256": "684bb30932a03473b4599df22ba336060571e8db9883ecfd46912e5aabb59f36",
+          "elf_machine": "AArch64"
+        },
+        {
+          "name": "cumem_allocator",
+          "path": "/home/jasonc/vllm-sm103-arm64-20260914-build/cumem_allocator.abi3.so",
+          "bytes": 73352,
+          "sha256": "2ecfe05cd8c7d8cba5b0b9ffc4ccc8ae783b215cfd4645cab56d7c90bf158758",
+          "elf_machine": "AArch64"
+        },
+        {
+          "name": "fs_io_C",
+          "path": "/home/jasonc/vllm-sm103-arm64-20260914-build/fs_io_C.abi3.so",
+          "bytes": 73592,
+          "sha256": "b5ee93da3d08821099c3cffb28a19822dc9a64e10aa38bd0e02d982f080971b5",
+          "elf_machine": "AArch64"
+        },
+        {
+          "name": "spinloop",
+          "path": "/home/jasonc/vllm-sm103-arm64-20260914-build/spinloop.abi3.so",
+          "bytes": 71096,
+          "sha256": "f6119efafdec1f47b8c7ba307d9d727e1224088148b456f6be77921db9056157",
+          "elf_machine": "AArch64"
+        }
+      ],
+      "nvfp4_out_op": "_C.scaled_fp4_quant.out",
+      "native_architectures": [
+        "compute_100f",
+        "compute_80",
+        "compute_89",
+        "compute_90",
+        "sm_100f",
+        "sm_80",
+        "sm_89",
+        "sm_90"
+      ],
+      "native_commands_sha256": "01f939aeded3e6897d3aac485e68e01a690eb63d057c53454197394d0eddfbf4",
+      "existing_service_health_http": 200
+    },
     "source_verification": {
       "status": "passed",
       "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
@@ -832,6 +894,34 @@
       "build-progress-20260914.json": {
         "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-progress-20260914.json",
         "sha256": "01fedf1674f946e6c53ad55f91840053c3a5339005bbd65913b1e139127ce16a"
+      },
+      "build-core-swap.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/build-core-swap.log",
+        "sha256": "a6d7d4087cdc387d02de13b1e0372cdf84488eafc66f95713644324aaa32afe1"
+      },
+      "core-validation.json": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/core-validation.json",
+        "sha256": "8ff3d0a63ba5803c7a06aa1b7f3cf9bb79e3a581b15ee8a9ba408e4393c7269d"
+      },
+      "core-validation.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/core-validation.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "core-commands.txt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/core-commands.txt",
+        "sha256": "01f939aeded3e6897d3aac485e68e01a690eb63d057c53454197394d0eddfbf4"
+      },
+      "core-codegen.txt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/core-codegen.txt",
+        "sha256": "bc8eec386b12778509e4ed03cc19c16d358af848fe080e24344f1384b2c47a99"
+      },
+      "terminal-state.log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/terminal-state.log",
+        "sha256": "d243d40bc2cf66a2793b0a0a65ed22313822513ba892a856bb42a21c3c3ac2e4"
+      },
+      "verify-core.py": {
+        "path": "/home/jasonc/b12x-sm103-evidence/arm64-native-20260914/verify-core.py",
+        "sha256": "46fd8f664818f623428688a87f2b0092f856b71db80a41676cc05c59d04a5e04"
       }
     }
   }

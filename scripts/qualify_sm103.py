@@ -53,6 +53,10 @@ SUITES = {
         "tests/attention/test_fused_indexer.py",
     ],
     "projection": ["tests/gemm/test_bf16_gemv.py", "-k", "not installed_plugins"],
+    "vocabulary_projection": [
+        "tests/gemm/test_bf16_vocab_projection.py", "-k",
+        "not planned_projection_matches_reference_and_replays_graph and not triton",
+    ],
     "blockscaled": ["tests/gemm/test_sm103_blockscaled.py", "tests/gemm/test_mxfp4_packing.py"],
     "fp8": ["tests/gemm/test_sm103_fp8.py"],
     "block_fp8_linear": ["tests/gemm/test_sm103_block_fp8_linear.py"],

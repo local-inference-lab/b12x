@@ -108,9 +108,13 @@
     }
   },
   "remaining": [
-    "Matching ARM64 native vLLM build and import",
     "Available SM121 GPU loader/graph regression",
     "Physical SM103 execution",
     "Full dependency-check success pending the cuSPARSELt wheel metadata correction"
-  ]
+  ],
+  "companion_native_build": {
+    "status": "Five core targets build and load on ARM64 with CUDA hidden; GPU execution unqualified",
+    "receipt": "sm103-native-build-validation.json",
+    "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985"
+  }
 }

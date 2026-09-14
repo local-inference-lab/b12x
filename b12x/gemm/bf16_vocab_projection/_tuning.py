@@ -16,6 +16,7 @@ MAX_IN_FEATURES = 8_192
 MIN_TRITON_OUT_FEATURES = 16_384
 _TRITON_WARPS = frozenset((1, 2, 4, 8))
 _LOOP_BLOCKS = frozenset((256, 512, 1_024))
+CUTE_CONFIG = dict(backend="cute", algorithm="gemv", block_k=8, num_warps=4)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -72,6 +73,8 @@ def _default_config(
     query: Bf16VocabProjectionQuery,
     device: DeviceIdentity | None,
 ) -> Bf16VocabProjectionConfig:
+    if device is not None and device.compute_capability == (10, 3):
+        return Bf16VocabProjectionConfig(**CUTE_CONFIG)
     supported_device = device is not None and device.compute_capability in {
         (12, 0),
         (12, 1),
@@ -124,6 +127,8 @@ def _validate_config(
         return
     if config.backend != "triton":
         raise ValueError(f"unsupported projection backend {config.backend!r}")
+    if device is not None and device.compute_capability == (10, 3):
+        raise ValueError("SM103 vocabulary projection uses the CuTe backend")
     if query.max_tokens != 1:
         raise ValueError("the Triton vocabulary GEMV requires max_tokens=1")
     if query.in_features > MAX_IN_FEATURES:
@@ -161,7 +166,7 @@ def _tuning_parameters(query, device):
 TUNING = TuningContract(
     component_id="gemm.bf16_vocab_projection",
     query_schema_version=1,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
     encode_query=_encode,

@@ -1648,5 +1648,55 @@ The ARM64 core build uses the same verified source with CUDA hidden. Two
 compiler attempts hit their 3 GiB and 6 GiB cgroup limits. The kernel OOM
 records are retained outside the repository. The bounded continuation retains
 a 6 GiB resident-memory cap, allows up to 8 GiB swap and runs one compiler job.
-The existing inference service remains running and returns HTTP 200 on its
-health endpoint. ARM64 core-build acceptance remains pending.
+The build completes all five core targets. All 3,309 source/build files
+match the declared revision; the libraries have AArch64 ELF identities and
+load with CUDA hidden and uninitialized. The command audit retains the
+`sm_100f` family target. The existing inference service remains running and
+returns HTTP 200 on its health endpoint. This qualifies compilation and CPU
+loading; GPU execution remains unqualified.
+
+## Planned CuTe vocabulary projection and companion warmup
+
+The vocabulary component implements an SM103 CuTe backend through its existing
+public plan/bind/run API. It reuses the BF16 GEMV reduction, compiles static
+geometry before capture and owns a fixed output buffer. Live row counts reuse
+the compiled callable; caller-owned output is supported with overlap guards.
+Both legacy Triton variants also use Int64 matrix-row offsets. The embedded
+SM120/SM121 configs retain their values; only the vocabulary config schema
+version changes. The generator qualifies SM103's actual CuTe plan and rejects
+nonfinite, zero, low-cosine or top-1-mismatched output before timing.
+
+The [vocabulary receipt](sm103-vocab-validation.json) binds the reviewed source,
+16 SM103 projection callables and six vocabulary specializations. The reviewed
+PTX and cubins are byte-identical to the pre-formatting source. Vocabulary
+specializations use 40 or 48 allocated registers and 1,024 bytes of shared
+memory, with no stack/local memory. Thirteen component tests pass on physical
+SM120, including frozen resolution across rows 1/4/8/9/17, graph mutation and
+poisoning, stable output storage, Inductor and matrix offsets above Int32.
+Seven selected memcheck tests report zero memory errors; the existing API
+reporting exception is explicit in the receipt. The selected host suites pass
+352 tests after rerunning 21 /tmp-quota failures on the evidence filesystem.
+
+Companion model constructors pass actual output heads to the logits processor.
+Its vocabulary warmup provider runs the selected plan before capture and
+preserves explicit output-head precision overrides. Ninety-four selected
+companion tests pass, including CuTe logits-processor capture/replay. This
+integration applies the vocabulary plan to one live row. Full-model accuracy,
+speculative parity and SM103 execution remain unqualified.
+
+Companion revision `5c0857f9cd` records the constructor and warmup integration.
+Qwen eager, graph and DFlash2 runs each preserve all six prior outputs. Eager
+generation passes its required gates. Graph generation retains one prompt
+mismatch against eager; DFlash2 retains two. Graph counters record 69 target
+replays per rank without speculation and 19 target/63 draft replays with
+speculation. DFlash2 accepts 85 of 182 proposed tokens. Raw failed receipts
+remain unchanged; regression equality does not qualify speculative accuracy
+or complete serving warmup.
+
+The frozen vocabulary source also compiles all 16 projection callables on
+ARM64. Every PTX file and cubin matches the x86-64 build byte-for-byte, with
+CUDA uninitialized before and after compilation. The existing inference
+service remains healthy. The local consolidated-corpus compiler is killed
+by global host OOM at 4,659,580 KiB anonymous RSS; the incomplete artifacts
+and kernel OOM record remain outside the repository. A separate build of the
+same source runs on the larger host and must pass before its corpus is accepted.
