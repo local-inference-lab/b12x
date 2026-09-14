@@ -31,6 +31,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
     allowed = {
         "operation", "heads_per_group", "nope_dim", "rope_dim", "return_3d",
         "positions_dtype", "cos_sin_dtype",
+        "variable_tokens",
     }
     if set(invocation) - allowed:
         raise ValueError("unknown WO invocation field")
@@ -53,6 +54,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
         return_3d=bool(invocation.get("return_3d", False)),
         positions_dtype=str(invocation.get("positions_dtype", "int64")),
         cos_sin_dtype=str(invocation.get("cos_sin_dtype", "bfloat16")),
+        variable_tokens=invocation.get("variable_tokens", False),
         codegen=FrozenMapping({
             "quant_chunks_per_program": _WO_QUANT_CHUNKS_PER_PROGRAM,
             "wo_b_fused_tile": _fused_tile_override(),
@@ -68,7 +70,7 @@ def _fused_b_tile(query: WoProjectionQuery, config):
 
 
 def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=None):
-    """Declare one exact-capacity native WO projection preparation."""
+    """Declare native WO, optionally allowing live rows within a large capacity."""
     if not isinstance(caps, WOProjectionScratchCaps):
         raise TypeError("caps must be WOProjectionScratchCaps")
     invocation = FrozenMapping(invocation)
@@ -216,6 +218,10 @@ class _PreparedWO:
         return self._scratch_state.bind_inv_rope(**kwargs)
 
     def _require_exact_tokens(self, tokens):
+        if self.query.variable_tokens:
+            if not 0 < int(tokens) <= self.query.max_tokens:
+                raise ValueError("WO tokens exceed the prepared capacity")
+            return
         if int(tokens) != self.query.max_tokens:
             raise ValueError("WO plan requires its exact prepared token count")
 
@@ -224,7 +230,7 @@ class _PreparedWO:
         self._require_exact_tokens(source_tgd.shape[0])
         if out is None:
             out = empty_mxfp8_rows_for_dense_gemm(
-                self.query.max_tokens, self.query.group_width, num_groups=self.query.groups,
+                source_tgd.shape[0], self.query.group_width, num_groups=self.query.groups,
                 device=source_tgd.device,
             )
         self.quantizers.quantize_a(source_tgd, out)
@@ -241,7 +247,7 @@ class _PreparedWO:
             raise ValueError("inverse-RoPE WO quantization differs from declaration")
         if out is None:
             out = empty_mxfp8_rows_for_dense_gemm(
-                self.query.max_tokens, self.query.group_width, num_groups=self.query.groups,
+                o.shape[0], self.query.group_width, num_groups=self.query.groups,
                 device=o.device,
             )
         self.quantizers.quantize_a_inv_rope(
@@ -255,19 +261,20 @@ class _PreparedWO:
         self._require_exact_tokens(tmp_trg.shape[0])
         if out is None:
             out = empty_mxfp8_rows_for_dense_gemm(
-                self.query.max_tokens, self.query.rank * self.query.groups, num_groups=1,
+                tmp_trg.shape[0], self.query.rank * self.query.groups, num_groups=1,
                 device=tmp_trg.device,
             )
         self.quantizers.quantize_b(tmp_trg, out)
         return out
 
     def run(self, binding, *, stream=None):
+        tokens = binding.source_tgd.shape[0]
         self.quantizers.quantize_a(binding.source_tgd, binding.x_q)
         a_values = binding.weights.wo_a.values
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
         self.ordinary_a.run(
-            (binding.x_q.values.view(self.query.max_tokens, self.query.group_width, self.query.groups),
+            (binding.x_q.values.view(tokens, self.query.group_width, self.query.groups),
              binding.x_q.scale_mma),
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,
@@ -292,6 +299,7 @@ class _PreparedWO:
             )
         return binding.output if binding.return_3d else binding.output[:, :, 0]
     def run_inv_rope(self, binding, *, stream=None):
+        tokens = binding.o.shape[0]
         self.quantizers.quantize_a_inv_rope(
             binding.o, binding.positions, binding.cos_sin_cache, binding.x_q,
             groups=binding.weights.groups, heads_per_group=binding.heads_per_group,
@@ -301,7 +309,7 @@ class _PreparedWO:
         if a_values.ndim == 2:
             a_values = a_values.unsqueeze(-1)
         self.ordinary_a.run(
-            (binding.x_q.values.view(self.query.max_tokens, self.query.group_width, self.query.groups),
+            (binding.x_q.values.view(tokens, self.query.group_width, self.query.groups),
              binding.x_q.scale_mma),
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,

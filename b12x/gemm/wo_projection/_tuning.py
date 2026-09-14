@@ -23,6 +23,7 @@ class WoProjectionQuery:
     return_3d: bool = False
     positions_dtype: str = "int64"
     cos_sin_dtype: str = "bfloat16"
+    variable_tokens: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "codegen", FrozenMapping(self.codegen))
@@ -52,6 +53,10 @@ def _validate_query(query, device):
         raise ValueError("WO geometry must contain positive integer dimensions")
     if query.operation not in ("plain", "inv_rope"):
         raise ValueError("WO operation must be plain or inv_rope")
+    if type(query.variable_tokens) is not bool or (
+        query.variable_tokens and query.max_tokens <= 16
+    ):
+        raise ValueError("variable WO tokens require a capacity above 16")
     if query.operation == "inv_rope" and (
         any(type(value) is not int or value <= 0 for value in (query.heads_per_group, query.nope_dim, query.rope_dim))
         or query.heads_per_group * (query.nope_dim + query.rope_dim) != query.group_width
@@ -92,7 +97,7 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=3,
+    query_schema_version=4,
     config_schema_version=2,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
