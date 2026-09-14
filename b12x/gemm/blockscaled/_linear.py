@@ -16,7 +16,7 @@ from b12x._lib.dense_gemm import (
     dense_gemm,
 )
 from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,
@@ -753,6 +753,8 @@ def tensor_fp8_linear(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
+    out: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run static per-tensor E4M3 operands through the prepared fixed route."""
 
@@ -851,8 +853,6 @@ def blockscaled_mm(
             raise ValueError("packed MXFP8 blockscaled.mm does not accept out")
         return mxfp8_linear(lhs, rhs, plan=plan, **kwargs)
     if isinstance(rhs, TensorFP8LinearWeight):
-        if out is not None:
-            raise ValueError("packed tensor-FP8 blockscaled.mm does not accept out")
         if isinstance(lhs, tuple):
             raise TypeError(
                 "tensor-scaled FP8 blockscaled.mm accepts its prequantized "
@@ -873,8 +873,19 @@ def blockscaled_mm(
                 "serialized blockscaled values must either both be 2D or both "
                 "use the native 3D dense-GEMM layout"
             )
+        if kwargs.get("block_fp8", False) and (out is not None or "workspace" in kwargs):
+            options = dict(kwargs)
+            if (options.pop("ab_dtype", None), options.pop("sf_dtype", None),
+                    options.pop("sf_vec_size", None)) != ("float8_e4m3fn", "float32", 128):
+                raise ValueError("block FP8 workspace requires E4M3/FP32/vec128")
+            options.pop("block_fp8")
+            out_dtype = _output_dtype(options.pop("c_dtype"))
+            from ._fp8_workspace import linear
+            return linear(lhs_values, rhs_values, lhs_scale, rhs_scale, None,
+                          options.pop("alpha", None), out=out, out_dtype=out_dtype,
+                          **options)
         if out is not None:
-            raise ValueError("serialized blockscaled.mm does not accept out")
+            raise ValueError("serialized FP4 blockscaled.mm does not accept out")
         recipe = dict(kwargs)
         try:
             ab_dtype = recipe.pop("ab_dtype")

@@ -110,7 +110,7 @@ def test_fp8_implicit_alpha_zero_scales_empty_and_stream(block, monkeypatch):
 
 
 @pytest.mark.parametrize("n,k", [(132, 128), (40, 160), (16386, 1024)])
-def test_packed_tensor_fp8_graph_and_scale_independence(n, k, monkeypatch):
+def test_packed_tensor_fp8_graph_and_scale_independence(n, k):
     a = torch.randn(33, k, device="cuda").clamp(-4, 4).to(torch.float8_e4m3fn)
     b = torch.randn(n, k, device="cuda").clamp(-4, 4).to(a.dtype)
     alpha = torch.tensor([.125], device="cuda")
@@ -119,9 +119,6 @@ def test_packed_tensor_fp8_graph_and_scale_independence(n, k, monkeypatch):
     native = torch.cuda.get_device_capability() == (10, 3)
     tensor_fp8_linear.prewarm(packed, (1, 33) if native else (1, 4, 8, 17, 33))
     if native:
-        from b12x.gemm.blockscaled import _linear
-        monkeypatch.setattr(_linear, "_activation_scale_mma", lambda *a: pytest.fail("live-count unit scale cache"))
-        monkeypatch.setattr(_linear, "_activation_block_scale", lambda *a: pytest.fail("live-count block scale cache"))
         freeze_kernel_resolution("packed tensor-FP8 reuse")
     try:
         def run(m):
@@ -172,3 +169,119 @@ def test_serialized_compact_block_fp8_public_graph(dtype):
     sfb.mul_(1.5)
     graph.replay()
     check(out, reference(a[..., None], b[..., None], sfa, sfb, True, None)[..., 0])
+
+
+@pytest.mark.parametrize("block,n,k", [(False, 132, 160), (False, 4096, 4096),
+                                      (True, 256, 384), (True, 4096, 4096)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp8_caller_workspace_capacity_reuse_and_replay(block, n, k, dtype, monkeypatch):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    a = (torch.randn(33, k, device="cuda") / 4).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, device="cuda") / 4).to(a.dtype)
+    alpha = torch.tensor([.125], device="cuda")
+    sfa = torch.rand(33, k // 128, device="cuda") + .125 if block else None
+    sfb = torch.rand(n // 128, k // 128, device="cuda") + .125 if block else None
+    weight = (b, sfb) if block else tensor_fp8_linear.pack_weight(b, alpha)
+    scratch = torch.empty(blockscaled.workspace_size(weight, 33), dtype=torch.uint8, device="cuda")
+    output = torch.empty(33, n, device="cuda", dtype=dtype)
+    caps = (1, 4, 8, 33)
+
+    def run(m, out=None):
+        capacity = next(c for c in caps if c >= m)
+        if block:
+            return blockscaled.mm_block_fp8(a[:m], sfa[:m], b, sfb, out_dtype=dtype,
+                expected_m=capacity, out=out, workspace=scratch)
+        return blockscaled.mm(a[:m], weight, out_dtype=dtype, expected_m=capacity,
+                              out=out, workspace=scratch)
+
+    if not block:
+        blockscaled.prewarm(weight, caps, out_dtype=dtype, workspace=scratch)
+    for m in caps:
+        run(m, output[:m])
+    freeze_kernel_resolution("FP8 caller-owned capacity and scratch")
+    try:
+        for m in (1, 3, 4, 7, 8, 9, 33):
+            actual = run(m, output[:m])
+            if dtype == torch.bfloat16 and torch.cuda.get_device_capability() != (10, 3):
+                # The retained SM12x policy uses unordered BF16 atomic split-K sums.
+                check(actual, run(m).float())
+            else:
+                torch.testing.assert_close(actual, run(m), rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(m, output[:m])
+            for _ in range(2):
+                a.copy_((torch.randn_like(a, dtype=torch.float32) / 4).to(a.dtype))
+                scratch.fill_(255)
+                output.fill_(float("nan"))
+                before = torch.cuda.memory_allocated()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == before
+                if block:
+                    expected = reference(a[:m, :, None], b[:, :, None], sfa[:m], sfb, True, None)[..., 0]
+                else:
+                    expected = (a[:m].float() @ b.float().T) * alpha
+                check(output[:m], expected)
+            graph.reset()
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_fp8_workspace_validation_empty_and_explicit_stream(block, monkeypatch):
+    m, n, k = 3, 256, 384 if block else 160
+    a = torch.ones(m, k, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.ones(n, k, device="cuda").to(a.dtype)
+    alpha = torch.tensor([.25], device="cuda")
+    sfa = torch.ones(m, k // 128, device="cuda") if block else None
+    sfb = torch.ones(n // 128, k // 128, device="cuda") if block else None
+    weight = (b, sfb) if block else tensor_fp8_linear.pack_weight(b, alpha)
+    size = blockscaled.workspace_size(weight, m)
+    scratch = torch.empty(size, dtype=torch.uint8, device="cuda")
+    out = torch.empty(m, n, dtype=torch.float16, device="cuda")
+
+    def run(source=a, output=out, workspace=scratch, hint=4, stream=None):
+        if block:
+            return blockscaled.mm_block_fp8(source, sfa[:source.shape[0]], b, sfb,
+                out_dtype=torch.float16, out=output, workspace=workspace,
+                expected_m=hint, stream=stream)
+        return blockscaled.mm(source, weight, out_dtype=torch.float16, out=output,
+                              workspace=workspace, expected_m=hint, stream=stream)
+
+    with pytest.raises(ValueError, match="at least"):
+        run(workspace=scratch[:-1])
+    with pytest.raises(ValueError, match="covering"):
+        run(hint=1)
+    with pytest.raises(ValueError, match="overlap"):
+        run(output=scratch[:m * n * 2].view(torch.float16).view(m, n))
+    with pytest.raises(ValueError, match="contiguous"):
+        run(workspace=torch.empty(size * 2, device="cuda", dtype=torch.uint8)[::2])
+    with pytest.raises(ValueError, match="dtype"):
+        run(workspace=scratch.float())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    run(stream=stream)
+    stream.synchronize()
+    torch.testing.assert_close(out, torch.full_like(out, k if block else k * .25), rtol=0, atol=0)
+    allocations = []
+    empty = torch.empty
+    def record_allocation(*args, **kwargs):
+        allocations.append(torch.cuda.current_stream().cuda_stream)
+        return empty(*args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", record_allocation)
+        owned = run(output=None, workspace=None, stream=stream)
+    assert len(allocations) >= 2 and all(s == stream.cuda_stream for s in allocations)
+    # Reuse default-stream allocations while the explicit-stream call owns its scratch.
+    churn = [torch.full((size,), 255, dtype=torch.uint8, device="cuda") for _ in range(4)]
+    stream.synchronize()
+    torch.testing.assert_close(owned, out, rtol=0, atol=0)
+    del churn
+    freeze_kernel_resolution("FP8 empty caller-owned execution")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", lambda *args, **kwargs: pytest.fail("empty launch allocation"))
+            assert run(source=a[:0], output=out[:0], workspace=scratch[:0]).numel() == 0
+    finally:
+        unfreeze_kernel_resolution()
