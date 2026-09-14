@@ -670,31 +670,32 @@ def test_trellis_launch_planner_compiles_fixed_launch_matrix() -> None:
         )
     )
 
-    assert tuple(tokens for tokens, _launch in plan._prewarmed_fused_launches) == (
-        1,
-        2,
-        3,
-        4,
+    assert tuple(broadcast for broadcast, _launch in plan._prewarmed_fused_launches) == (
+        False,
+        True,
     )
     assert {
-        (ids_dtype, mapped)
-        for ids_dtype, mapped, _launch in plan._prewarmed_topk_sum_launches
+        (ids_dtype, mapped, broadcast)
+        for ids_dtype, mapped, broadcast, _launch in plan._prewarmed_topk_sum_launches
     } == {
-        (torch.int32, False),
-        (torch.int32, True),
-        (torch.int64, False),
-        (torch.int64, True),
+        (dtype, mapped, broadcast)
+        for dtype in (torch.int32, torch.int64)
+        for mapped in (False, True)
+        for broadcast in (False, True)
     }
 
 
-def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
+@pytest.mark.parametrize("broadcast", (False, True))
+def test_trellis_binding_retains_capacity_launches_for_transform_layout(
     monkeypatch: pytest.MonkeyPatch,
+    broadcast: bool,
 ) -> None:
-    fused_launches = tuple((tokens, object()) for tokens in range(1, 5))
+    fused_launches = tuple((shared, object()) for shared in (False, True))
     sums = tuple(
-        (ids_dtype, mapped, object())
+        (ids_dtype, mapped, shared, object())
         for ids_dtype in (torch.int32, torch.int64)
         for mapped in (False, True)
+        for shared in (False, True)
     )
     monkeypatch.setattr(tp_moe_impl, "get_num_sm", lambda _device: 188)
     monkeypatch.setattr(
@@ -739,16 +740,32 @@ def test_trellis_scratch_plan_prewarms_without_forcing_runtime_dispatch(
         _capture_binding,
     )
     output_expert_map = torch.arange(8, dtype=torch.int32)
+    payload = SimpleNamespace(
+        gate_suh=torch.empty(128 if broadcast else (8, 128)),
+        down_svh=torch.empty(128 if broadcast else (8, 128)),
+    )
     plan.bind(
         scratch=_scratch_for_plan(plan),
-        **_binding_args(tensors, _experts(tensors, weight_plan)),
+        **_binding_args(tensors, _experts(tensors, weight_plan, payload)),
         output_expert_map=output_expert_map,
     )
 
     assert plan._prewarmed_fused_launches == fused_launches
     assert plan._prewarmed_topk_sum_launches == sums
-    assert captured["fused_launch"] is None
-    assert captured["topk_sum_launch"] is None
+    assert captured["fused_launch"] is dict(fused_launches)[broadcast]
+    expected_sum = next(
+        launch
+        for dtype, mapped, shared, launch in sums
+        if (dtype, mapped, shared) == (tensors["topk_ids"].dtype, True, broadcast)
+    )
+    assert captured["topk_sum_launch"] is expected_sum
+    with pytest.raises(ValueError, match="fast_math must match the planned"):
+        plan.bind(
+            scratch=_scratch_for_plan(plan),
+            **_binding_args(tensors, _experts(tensors, weight_plan, payload)),
+            output_expert_map=output_expert_map,
+            fast_math=False,
+        )
 
 
 @pytest.mark.parametrize("tokens", (1, 2))

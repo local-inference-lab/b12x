@@ -5922,10 +5922,13 @@ class W4A16FusedMoeKernel:
                 raise ValueError(
                     "intermediate_rotation is only supported for trellis_t256"
                 )
-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
+            if not is_gated or self.activation_is_swigluoai:
                 raise ValueError(
-                    "intermediate_rotation requires unclamped gated silu or situ "
-                    "(no swiglu limit/oai)"
+                    "intermediate_rotation requires gated silu or situ"
+                )
+            if self.has_swiglu_limit and (not full_rotation or coupled_hadamard):
+                raise ValueError(
+                    "clamped Trellis activation requires uncoupled full rotation"
                 )
             if int(intermediate_size) % 128 != 0:
                 raise ValueError(
@@ -7438,6 +7441,33 @@ class W4A16FusedMoeKernel:
                         * cute.math.tanh(iu3 / linear_beta, fastmath=self.fast_math)
                         * sd3
                     )
+                elif cutlass.const_expr(self.has_swiglu_limit):
+                    # BTX preserves FP16 boundaries around the unrotated
+                    # preactivation, SiLU product and FC2 input transform.
+                    ig0, iu0 = self._clamp_swiglu_inputs(
+                        cutlass.Float16(ig0).to(cutlass.Float32),
+                        cutlass.Float16(iu0).to(cutlass.Float32),
+                    )
+                    ig1, iu1 = self._clamp_swiglu_inputs(
+                        cutlass.Float16(ig1).to(cutlass.Float32),
+                        cutlass.Float16(iu1).to(cutlass.Float32),
+                    )
+                    ig2, iu2 = self._clamp_swiglu_inputs(
+                        cutlass.Float16(ig2).to(cutlass.Float32),
+                        cutlass.Float16(iu2).to(cutlass.Float32),
+                    )
+                    ig3, iu3 = self._clamp_swiglu_inputs(
+                        cutlass.Float16(ig3).to(cutlass.Float32),
+                        cutlass.Float16(iu3).to(cutlass.Float32),
+                    )
+                    a0 = cutlass.Float16(self._silu_f32(ig0) * iu0).to(cutlass.Float32)
+                    a1 = cutlass.Float16(self._silu_f32(ig1) * iu1).to(cutlass.Float32)
+                    a2 = cutlass.Float16(self._silu_f32(ig2) * iu2).to(cutlass.Float32)
+                    a3 = cutlass.Float16(self._silu_f32(ig3) * iu3).to(cutlass.Float32)
+                    a0 = cutlass.Float16(a0 * sd0).to(cutlass.Float32)
+                    a1 = cutlass.Float16(a1 * sd1).to(cutlass.Float32)
+                    a2 = cutlass.Float16(a2 * sd2).to(cutlass.Float32)
+                    a3 = cutlass.Float16(a3 * sd3).to(cutlass.Float32)
                 else:
                     a0 = self._silu_f32(ig0) * iu0 * sd0
                     a1 = self._silu_f32(ig1) * iu1 * sd1
@@ -9716,7 +9746,7 @@ def compile_w4a16_fused_moe(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe",
-            8,
+            9,
             cache_key,
         ),
         dsl_compile_options=OptLevel(2),
