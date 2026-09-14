@@ -7,6 +7,7 @@ so these assertions are load-bearing.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -380,3 +381,79 @@ def test_v6_semantic_payload_matches_independent_validators(monkeypatch):
         kernel_resources._semantic_payload_from_cache_payload(serialized_payload)
         == expected
     )
+
+
+@pytest.mark.parametrize("damage", [None, "object", "metadata", "digest"])
+def test_disk_load_verifies_launch_metadata_before_loader_can_patch_object(
+    tmp_path, monkeypatch, damage
+):
+    external_binary = pytest.importorskip(
+        "cutlass.base_dsl.export.external_binary_module"
+    )
+    monkeypatch.setenv("B12X_COMPILE_CACHE_DIR", str(tmp_path))
+    cache_key = "a" * 64
+    object_path = compiler._cache_object_path(cache_key)
+    object_path.parent.mkdir(parents=True)
+    object_bytes = b"canonical cache object"
+    object_path.write_bytes(object_bytes)
+    metadata = {
+        "status": "exact",
+        "source": "cutlass-final-llvm-launch-config-field-2",
+        "launch_dynamic_smem_bytes": {"kernel": [49152]},
+    }
+    monkeypatch.setattr(
+        compiler, "_extract_launch_dynamic_smem_bytes", lambda compiled: metadata
+    )
+    payload = (
+        "b12x_cute_compile_cache_v3",
+        ("function", ("test", "kernel")),
+        "package",
+        "toolchain",
+        ("device_uuid", "gpu-test"),
+        (),
+        (),
+        (),
+        (),
+    )
+    freshly_compiled = SimpleNamespace()
+    compiler._write_compile_manifest(
+        cache_key,
+        payload,
+        test_package_root_is_the_b12x_package,
+        object_bytes,
+        compiled=freshly_compiled,
+    )
+    assert freshly_compiled._b12x_launch_metadata == metadata
+    manifest_path = compiler._cache_manifest_path(cache_key)
+    if damage == "object":
+        object_path.write_bytes(b"changed object")
+    elif damage in ("metadata", "digest"):
+        manifest = json.loads(manifest_path.read_text())
+        if damage == "metadata":
+            manifest["launch_metadata"]["launch_dynamic_smem_bytes"]["kernel"] = [0]
+        else:
+            manifest["artifact_evidence_sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest))
+    canonical_before = object_path.read_bytes()
+    loaded = SimpleNamespace()
+    stages = []
+
+    def load_staged(path):
+        staged_path = Path(path)
+        stages.append(staged_path)
+        assert staged_path != object_path
+        assert staged_path.read_bytes() == object_bytes
+        staged_path.write_bytes(b"loader-patched object")
+        return SimpleNamespace(**{compiler._cache_prefix(cache_key): loaded})
+
+    monkeypatch.setattr(external_binary, "ExternalBinaryModule", load_staged)
+    result = compiler._load_cute_compile_from_disk(cache_key)
+    assert object_path.read_bytes() == canonical_before
+    if damage is None:
+        assert result is loaded
+        assert loaded._b12x_launch_metadata == metadata
+        assert len(stages) == 1
+        assert not stages[0].exists()
+    else:
+        assert result is None
+        assert not stages
