@@ -74,21 +74,23 @@ def test_native_binding_preserves_capacity_and_offsets_without_writes(monkeypatc
 
 
 @pytest.mark.parametrize("inverse", [False, True])
-def test_public_native_run_uses_bound_tensors(monkeypatch, inverse):
+@pytest.mark.parametrize("external_output", [False, True])
+def test_public_native_run_uses_bound_tensors(monkeypatch, inverse, external_output):
     from b12x.gemm.wo_projection import _execution
     plan = native_plan(monkeypatch)
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype)
-    source = torch.empty(3, 2, 128, dtype=torch.bfloat16)
+    source = torch.empty(3, 3, 128, dtype=torch.bfloat16)[:, :2]
     weights = _weights()
     positions = torch.arange(3)
     cache = torch.ones(8, 32, dtype=torch.bfloat16)
+    output = torch.empty(3, 256, dtype=torch.bfloat16) if external_output else None
     if inverse:
         binding = wo.bind_inv_rope(plan, scratch=scratch, o=source, positions=positions,
                                   cos_sin_cache=cache, weights=weights, heads_per_group=1,
-                                  nope_dim=96, rope_dim=32)
+                                  nope_dim=96, rope_dim=32, out=output)
     else:
-        binding = wo.bind(plan, scratch=scratch, source_tgd=source, weights=weights)
+        binding = wo.bind(plan, scratch=scratch, source_tgd=source, weights=weights, out=output)
     calls = []
     def execute(*args):
         calls.append(args)
@@ -101,6 +103,10 @@ def test_public_native_run_uses_bound_tensors(monkeypatch, inverse):
     assert args[-1] == 123 and args[14] is binding.output
     assert args[1] is (positions if inverse else None)
     assert args[2] is (cache if inverse else None)
+    if external_output:
+        assert out.data_ptr() == output.data_ptr()
+        scratch.zero_()
+        assert torch.all(out == 7)
 
 
 def test_quantizer_cache_tracks_device_and_architecture_without_live_rows(monkeypatch):
@@ -139,6 +145,34 @@ def test_generator_and_metadata_cover_native_wo():
     assert "sm103a" in wo.META.archs
     assert WoProjectionGenerator().config_schema_version == POLICY.config_schema_version == 2
     assert "tests/gemm/test_sm103_wo_projection.py" in SUITES["wo_projection"]
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_prewarm_owns_capacity_schedule_and_rejects_capture_or_freeze(monkeypatch, native):
+    from b12x.gemm.wo_projection import api
+    plan = native_plan(monkeypatch)
+    if not native:
+        plan = replace(plan, backend="mxfp8")
+    calls = []
+    monkeypatch.setattr(api, "run_inv_rope", lambda *, binding: calls.append(binding))
+    kwargs = dict(weights=_weights(), cos_sin_cache=torch.ones(8, 32),
+                  heads_per_group=1, nope_dim=96, rope_dim=32)
+    wo.prewarm_inv_rope(plan, **kwargs)
+    assert [binding.o.shape[0] for binding in calls] == ([1] if native else [*range(1, 17), 129])
+    assert all(binding.expected_m == 129 for binding in calls)
+    assert len({binding.x_q.values.data_ptr() for binding in calls}) == 1
+    assert all(binding.output.untyped_storage().data_ptr() != binding.tmp.untyped_storage().data_ptr()
+               for binding in calls)
+    freeze_kernel_resolution("prewarm must precede freeze")
+    try:
+        with pytest.raises(RuntimeError, match="frozen"):
+            wo.prewarm_inv_rope(plan, **kwargs)
+    finally:
+        unfreeze_kernel_resolution()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="eager"):
+        wo.prewarm_inv_rope(plan, **kwargs)
 
 
 def test_native_custom_op_accepts_disjoint_views_of_one_arena(monkeypatch):

@@ -77,7 +77,9 @@ def test_quantization_bytes_padding_frozen_counts_and_graph(dtype, mode, positio
             source.copy_(torch.randn_like(source) * .25)
             storage = empty_mxfp8_rows_for_dense_gemm(m, span * groups, device="cuda")
         else:
-            source = torch.randn(m, groups, span, device="cuda", dtype=dtype) * .25
+            padded = torch.full((m, groups + m % 2, span), float("nan"), device="cuda", dtype=dtype)
+            source = padded[:, :groups]
+            source.normal_().mul_(.25)
             storage = empty_mxfp8_rows_for_dense_gemm(m, span, num_groups=groups, device="cuda")
         source[0].zero_()
         if m > 1:
@@ -169,6 +171,23 @@ def test_inverse_rope_cosine_pool_offset_exceeds_int32():
         assert_rows(storage, rotate(source, positions, cache, 96, 32).permute(1, 0, 2))
 
 
+def test_grouped_input_row_stride_exceeds_int32():
+    row_stride = 2**31 + 8
+    pool = torch.empty(row_stride + 256, device="cuda", dtype=torch.bfloat16)
+    source = pool.as_strided((2, 2, 128), (row_stride, 128, 1))
+    source.copy_(torch.randn(2, 2, 128, device="cuda", dtype=torch.bfloat16))
+    positions = torch.arange(2, device="cuda")
+    cache = torch.randn(2, 32, device="cuda", dtype=torch.bfloat16)
+    storage = empty_mxfp8_rows_for_dense_gemm(2, 128, num_groups=2, device="cuda")
+    for inverse in (False, True):
+        quant.quantize_wo_grouped_rows_cute(source, storage.values, storage.scale_rows,
+            storage.scale_mma, m=2, groups=2, group_width=128,
+            positions=positions if inverse else None, cos_sin_cache=cache if inverse else None,
+            head_dim=128, nope_dim=96, rope_dim=32)
+        expected = rotate(source, positions, cache, 96, 32) if inverse else source
+        assert_rows(storage, expected.permute(1, 0, 2))
+
+
 @pytest.mark.parametrize("groups,width,rank,hidden", [(1, 128, 128, 136), (3, 512, 512, 2560), (4, 4096, 1024, 4096)])
 @pytest.mark.parametrize("inverse", [False, True])
 def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, rank, hidden, inverse, monkeypatch):
@@ -176,7 +195,9 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
     torch.manual_seed(8053)
     capacity = 129
     head, rope = (128, 32) if width == 128 else (512, 64)
-    source = torch.randn(capacity, groups * (width // head), head, device="cuda", dtype=torch.bfloat16).mul_(.25)
+    padded = torch.full((capacity, groups * (width // head) + 1, head), float("nan"), device="cuda", dtype=torch.bfloat16)
+    source = padded[:, :-1]
+    source.normal_().mul_(.25)
     positions = torch.arange(capacity, device="cuda")
     cache = torch.randn(capacity, rope, device="cuda", dtype=torch.bfloat16)
     wa = torch.randn(groups, rank, width, device="cuda", dtype=torch.bfloat16).mul_(.125)
@@ -187,17 +208,22 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
     assert plan.backend == "mxfp8_tcgen05"
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    output = torch.empty(capacity, hidden, device="cuda", dtype=torch.bfloat16)
     bindings = []
     for m in (1, 3, 8, 9, 16, 127, 128, 129):
         if inverse:
             binding = wo.bind_inv_rope(plan, scratch=scratch, o=source[:m], positions=positions[:m],
                 cos_sin_cache=cache, weights=weights, heads_per_group=width // head,
-                nope_dim=head - rope, rope_dim=rope)
+                nope_dim=head - rope, rope_dim=rope, out=output[:m])
         else:
-            binding = wo.bind(plan, scratch=scratch, source_tgd=source[:m].reshape(m, groups, width), weights=weights)
+            binding = wo.bind(plan, scratch=scratch, source_tgd=source[:m].reshape(m, groups, width), weights=weights, out=output[:m])
         bindings.append(binding)
     fn = wo.run_inv_rope if inverse else wo.run
-    fn(binding=bindings[0])
+    if inverse:
+        wo.prewarm_inv_rope(plan, scratch=scratch, weights=weights, cos_sin_cache=cache,
+                           heads_per_group=width // head, nope_dim=head-rope, rope_dim=rope)
+    else:
+        fn(binding=bindings[0])
     frozen_pointers = tuple(t.data_ptr() for t in (source, scratch, weights.wo_a.values, weights.wo_b.values))
     freeze_kernel_resolution("native WO retains geometry and capacity across live rows")
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -214,8 +240,9 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             check(binding.output[:, :, 0], expected)
         for binding in bindings:
             scratch.fill_(0xFF)
+            output.fill_(float("nan"))
             out = fn(binding=binding)
-            assert out.data_ptr() == binding.output.data_ptr() and binding.expected_m == capacity
+            assert out.data_ptr() == output.data_ptr() and binding.expected_m == capacity
             verify(binding)
         binding = bindings[-1]
         graph = torch.cuda.CUDAGraph()
@@ -225,6 +252,7 @@ def test_native_wo_planned_stages_frozen_counts_poison_and_graph(groups, width, 
             source.normal_().mul_(.25)
             eager = fn(binding=binding).clone()
             scratch.fill_(0xA5)
+            output.fill_(float("nan"))
             graph.replay()
             torch.testing.assert_close(binding.output[:, :, 0], eager, atol=0, rtol=0)
             verify(binding)
