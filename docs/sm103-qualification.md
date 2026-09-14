@@ -934,8 +934,9 @@ loader directly; companion loader integration still needs execution there.
 
 ## SM121 regression and primary checkpoint contracts
 
-Status: **selected component regression qualified on GB10; complete model
-serving unqualified**. The SM121 suite passes 126 tests initially, with four
+Status: **selected component and native V4.1 checkpoint regression qualified
+on GB10; primary SM103 model serving unqualified**. The SM121 suite passes 126
+tests initially, with four
 explicit skips and two RMS-concat oracle failures. The diagnostic compares
 the disputed output values with FP64 dot products: both round to BF16 `1.0`,
 matching the kernel, while the BF16 GEMM reference changes the tie through
@@ -952,12 +953,22 @@ DeepSeek-V4.1-Flash, both GLM-5.3-Flash NVFP4 variants and the GLM DFlash2 BF16
 draft on maxwell. Their configurations have recorded hashes. DeepSeek uses
 `DeepseekV41ForCausalLM`, 40 layers, H5120, 384 experts and vocabulary 129280;
 its routed experts use native MXFP4. This is a distinct contract from the
-registered DeepSeek V4 model. Companion revision `5c0857f9cd` lacks the V4.1
-model, CED and Engram integration. Its port must preserve the existing SM103
-work and integrate a supported expert representation. MLA compression,
-HyperConnection and embedding have separate component qualification below.
-Checkpoint availability does not establish model
-support. GLM and V4.1 full-model and speculative correctness remain open.
+registered DeepSeek V4 model. Companion revision `7add21cffd` implements the
+V4.1 model, CED, Engram, block32 projections and mHC warmup while preserving
+the SM103 component paths. Revision `99994e4b5e` records native-checkpoint
+qualification on four SM121 workers: three short prompts and 4K-prefix
+C1/C4/C1 reuse match the reference exactly. A 32-example GSM8K check scores
+28/32 against 27/32 for the reference, with no invalid answers. Kernel
+resolution is frozen on all four workers and the inference JIT monitor reports
+no compilation. The original TP4 service is restored with unchanged container,
+image and configuration identities.
+
+That qualification uses native MXFP4 experts and a compatibility image whose
+native libraries come from upstream `2ac48a52`; it does not qualify BTX weight
+accuracy, a matching ARM64 companion build, GLM target/draft execution or physical
+SM103 serving. The companion receipt is
+`docs/design/b12x_v41_mhc_validation.json`. MLA compression, HyperConnection
+and embedding have separate component qualification below.
 
 ## V4.1 compression, HyperConnection and embedding
 

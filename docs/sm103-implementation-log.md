@@ -1827,3 +1827,30 @@ large activation values, frozen compilation, graph replay and high offsets.
 The compiler emits 28 callables for V4.1 E384/H5120/I2304, top-6, K3 experts
 with limit 10 at TP1 and TP2. No stack/local traffic is emitted. Complete
 SM103 expert execution and V4.1 Trellis checkpoint loading remain unqualified.
+
+## Clamped Trellis capacity binding and V4.1 checkpoint qualification
+
+Status: implemented; SM120 component regression and native V4.1 SM121
+checkpoint qualification recorded; physical SM103 execution unqualified.
+
+SM12x uncoupled Trellis execution preserves FP16 boundaries around clamped
+SiLU preactivation, the activation product and the FC2 input transform. Plans
+retain capacity launches for shared and per-expert transform tables. Binding
+selects immutable layout metadata and rejects a conflicting math setting;
+live row counts do not resolve a different compiled callable. The component
+policy continues to select packed routing.
+
+The [Trellis capacity receipt](moe-trellis-capacity-validation.json) records
+131 passing host checks, 23 GPU-only skips and 75 passing SM120 tests. A
+clamped BTX fixture exercises live counts 1/3/7/8 under one compiled callable,
+with finite/nonzero output, an independent oracle and frozen resolution.
+Mapped-output cosine checks accumulate both operands in FP32, and cache-reuse
+checks follow the registered packed-routing policy.
+
+The [primary checkpoint inventory](sm103-primary-models.json) identifies the
+implemented V4.1 companion port and its native SM121 TP4 checkpoint receipt.
+All four workers freeze b12x kernel resolution after warmup. Short prompts
+and 4K-prefix reuse match the reference, and the bounded GSM8K check records
+28/32 versus 27/32 without invalid answers. The native-library compatibility
+image, source hashes and original-service restoration are recorded separately
+from BTX expert accuracy and SM103 hardware qualification.

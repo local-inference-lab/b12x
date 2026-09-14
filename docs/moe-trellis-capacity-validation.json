@@ -1,0 +1,106 @@
+{
+  "schema": "b12x.moe.trellis_capacity_validation.v1",
+  "status": "implemented; SM120 correctness and graph regression qualified; physical SM103 execution unqualified",
+  "base_revision": "fdfe284e85ef67bfa7d1beb51a586f5da5e8ea48",
+  "package_sha256": "4130110596cc30bd56c4fb0addf0de557e77accb76814ca6862c89b9507ac682",
+  "runtime_source_sha256": "6be1cd96a4737dbf7ef15c006239cea01af7f8b6dffc5fe084c2edabf4a38c7d",
+  "source_and_tests_sha256": "0217efb044eb154e072416e5789e8a08ce8487d0612419c1bf6d88447977c8f8",
+  "implementation": {
+    "activation": "SM12x uncoupled full-rotation Trellis preserves FP16 boundaries around clamped SiLU preactivation, product and FC2 input rotation; gate upper bound and symmetric up bound are 10 for V4.1.",
+    "binding": "Plans retain one fused callable per transform-table layout at planned token capacity. Bind selects only shared/per-expert table layout, route dtype and mapped-sum layout; live row counts remain runtime scalar arguments.",
+    "math_configuration": "Binding rejects a fast_math value that differs from the compiled plan.",
+    "compile_spec": "moe.w4a16.fused_moe version 9",
+    "policy": "Trellis uses the component policy's packed routing backend; no unregistered direct-routing heuristic is added."
+  },
+  "validation": {
+    "host": {
+      "passed": 131,
+      "gpu_only_skipped": 23,
+      "command": "env TMPDIR=/home/jasonc/b12x-sm103-evidence/btx-pairs-tmp .venv/bin/python -m pytest -q tests/moe/test_tp_moe_scratch_bindings.py tests/moe/test_fused_moe_planning.py tests/moe/test_trellis_config.py tests/moe/test_fused_moe_trellis.py --junitxml=/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-library-host.xml",
+      "worktree": "/home/jasonc/b12x-sm103"
+    },
+    "sm120": {
+      "passed": 75,
+      "skipped": 0,
+      "host": "ripper",
+      "worktree": "/models/b12x-sm103-validation/btx-b12x-reviewed",
+      "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+      "uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "compute_capability": [
+        12,
+        0
+      ],
+      "mode": "Default",
+      "torch": "2.14.0",
+      "triton": "3.8.0",
+      "cutlass_dsl": "4.6.2",
+      "python": "/home/jasonc/b12x-sm103-regression-20260912/.venv/bin/python",
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_HOME": "/models/b12x-sm103-validation/cuda-13.0/nvidia/cu13",
+        "PYTHONPATH": ".",
+        "OMP_NUM_THREADS": "1",
+        "TMPDIR": "/models/b12x-sm103-validation/btx-tmp"
+      },
+      "command": "-m pytest -q tests/moe/test_fused_moe_trellis.py tests/moe/test_tp_moe_scratch_bindings.py --junitxml=/models/b12x-sm103-validation/btx-final-library-gpu.xml"
+    },
+    "clamped_case": {
+      "experts": 4,
+      "hidden_size": 512,
+      "intermediate_size": 256,
+      "codebook": "MCG",
+      "bits": 3,
+      "capacity": 8,
+      "live_counts": [
+        1,
+        3,
+        7,
+        8
+      ],
+      "input_amplitude": 2.0,
+      "oracle": "Independent Trellis reference; finite/nonzero output, cosine at least 0.999 and relative L2 below 0.01. The unclamped reference overflows FP16 for this fixture.",
+      "frozen_resolution": true,
+      "one_compiled_callable_for_all_live_counts": true
+    },
+    "fixture_corrections": "Mapped-output cosine compares both operands in FP32, avoiding mixed BF16/FP32 norm rounding. Cache-reuse tests assert the actual packed-routing policy while retaining independent numerical, invalid-ID and graph checks."
+  },
+  "physical_sm103_qualified": false,
+  "performance_claims": false,
+  "artifacts": [
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-source.json",
+      "bytes": 686824,
+      "sha256": "0a2b9b52b6b19010d8b94dc1e011dd074ed296cdcab9456e4d0210e17126b1dc"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-remote-identity.json",
+      "bytes": 406,
+      "sha256": "5771cee197bdf4cbff2af03fd393f7df8002ab419582d831b726c271dd5a37d5"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-library-host.log",
+      "bytes": 272,
+      "sha256": "e7268e2103a8d975836b3041a5483a50ff37f47f60479014ba26c998f8b53230"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-library-host.xml",
+      "bytes": 25724,
+      "sha256": "b06e579d8d9788437853e79d9f9ec68084b194684e00eab8b0c0ef5274f46e6a"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-library-gpu.log",
+      "bytes": 190,
+      "sha256": "5001cec1757ce873ce8e12a8f549a072fe9e780cff7d129832776c83153c6c57"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-library-gpu.xml",
+      "bytes": 10590,
+      "sha256": "8dcb8e077451183b451b335f291440e56323fd41f12df1d4e3fed863aed6e95d"
+    },
+    {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/btx-final-b12x-source.tar",
+      "bytes": 12554240,
+      "sha256": "338a754a7a31053478180a7076269e38ebf0023966d3eacec3aa2b93c5f6baee"
+    }
+  ]
+}
