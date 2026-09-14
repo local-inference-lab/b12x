@@ -1281,8 +1281,10 @@ def compile_bf16_projection(out):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import torch
     from cutlass.cute.runtime import make_fake_compact_tensor as tensor
     from b12x.gemm.bf16_gemv._kernel import ProjectionKernel
+    from b12x.gemm.bf16_vocab_projection import _cute as vocab
     from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel
     from b12x.moe._shared.kernels.sm103.launch import pointer
 
@@ -1299,6 +1301,7 @@ def compile_bf16_projection(out):
         )
         (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
         launches[name] = compiled
+        return compiled
 
     for x_type in (cutlass.BFloat16, cutlass.Float32):
         for w_type in (cutlass.BFloat16, cutlass.Float32):
@@ -1328,6 +1331,20 @@ def compile_bf16_projection(out):
                 cuda.CUstream(0),
             ],
         )
+    vocab.compile_kernel.cache_clear()
+    with (
+        patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+        patch.object(
+            vocab, "b12x_compile",
+            lambda kernel, *args, **kwargs: compile_case(name, kernel, args),
+        ),
+    ):
+        for n, k in (
+            (97, 259), (248320, 2560), (124160, 5120),
+            (154880, 4096), (77440, 6144), (524297, 4096),
+        ):
+            name = f"vocabulary_n{n}_k{k}"
+            vocab.compile_kernel(n, k, 0, "sm_103a")
     return launches
 
 

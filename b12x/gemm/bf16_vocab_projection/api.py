@@ -10,8 +10,8 @@ from ._tuning import Bf16VocabProjectionConfig, Bf16VocabProjectionQuery
 
 
 def is_supported(device=None) -> bool:
-    """True on supported b12x devices with Triton available."""
-    return default_is_supported(device, requires=META.requires)
+    """True on implemented targets; SM103 awaits physical GPU qualification."""
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [

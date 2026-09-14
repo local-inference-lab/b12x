@@ -17,7 +17,7 @@ numbers or measured B300 policy profile are included.
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
 | Dense MLA | Implemented BF16/E4M3 compressed-cache attention for (QK,V) widths (576,512) and (1088,1024); SM120 tests and SM103 compilation | SM103 correctness, high-pid, split, query-quantization, and graph qualification |
-| Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths; SM120 tests and SM103 compilation | SM103 numeric and graph qualification; the separate BF16 vocabulary projection fast path remains SM12x-only |
+| Unquantized projections | Implemented BF16/FP32 SIMT and BF16 warp-MMA/TMA paths, plus planned CuTe BF16 vocabulary projection; SM120 tests and SM103 compilation | SM103 numeric and graph qualification |
 | GLM sparse NSA/MLA | Implemented planned FP8/BF16 warp-MMA path for packed GLM NSA and GLM Next FP8/NVFP4 caches; SM120 correctness and sanitizer checks; SM103 compilation | Physical SM103 numeric, high-pid, graph, and resource qualification |
 | DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
@@ -134,7 +134,9 @@ b12x loader C helper builds and loads as AArch64 without initializing CUDA.
 The nine SM103 MoE callables compile on ARM64; their PTX and cubins are
 byte-identical to a build of the same frozen source and toolchain versions on
 x86-64. The existing inference service remains running during this CPU-only
-validation. Matching ARM64 native vLLM libraries and GPU execution remain
+validation. The [native-build receipt](sm103-native-build-validation.json)
+also verifies five matching ARM64 vLLM core libraries, their AArch64 ELF
+identity and CPU loading with CUDA uninitialized. GPU execution remains
 unqualified.
 
 The dependency check reports one packaging defect: the installed NVIDIA
@@ -988,6 +990,76 @@ requests, but one prompt differs from the compiled graph run. Thus enabling
 `torch.compile` alone does not explain all observed token differences.
 Graph mode can also change padding and launch shapes; this control does not
 establish a CUDA graph replay defect.
+
+The ARM64 build uses the same verified native source, CUDA 13.0.88 and
+Torch 2.13.0+cu130 with `TORCH_CUDA_ARCH_LIST=10.0f`. All five core libraries
+build and load on `maxwell` with CUDA hidden and uninitialized. Their ELF
+headers identify AArch64, and the native command audit includes `sm_100f`.
+The existing inference service stays running and returns HTTP 200. The
+receipt retains both memory-limited compiler failures and the successful
+bounded continuation. This verifies the core build and CPU loading only;
+external native modules and GPU execution need separate qualification.
+
+## BF16 vocabulary projection
+
+Status: **implemented and cross-compiled; SM120 regression qualified; SM103
+execution unqualified**. The existing planned vocabulary API selects a CuTe
+backend on SM103. It reuses the BF16 reduction kernel, with FP32 accumulation,
+BF16 output and Int64 matrix offsets. Existing SM120/SM121 default policies
+retain their selected backends. No measured B300 profile is embedded.
+
+The plan compiles the callable and allocates a fixed output buffer before
+capture. Live row counts are runtime arguments and reuse that callable.
+`bind(..., out=...)` accepts independent caller-owned output; otherwise the
+next run overwrites the plan's output. Warm-run each specialization before
+capture. Independent streams require independent output storage. Bind and run
+perform no policy lookup.
+
+The [vocabulary receipt](sm103-vocab-validation.json) binds six vocabulary
+specializations within the 16-callable projection corpus, including uneven
+K, target-sized vocabulary shards and a weight row beyond the Int32 element
+offset limit. The vocabulary cubins allocate 40 or 48 registers and 1,024
+bytes of shared memory, with no stack, local memory, local loads or stores.
+These are static resource observations, without a performance claim.
+The same frozen source also cross-compiles all 16 projection callables on
+ARM64 with CUDA uninitialized before and after compilation. Every PTX file
+and cubin is byte-identical to the x86-64 build. The existing inference service
+remains healthy during that CPU-only check.
+
+Thirteen component tests pass on SM120. They exercise live rows 1, 4, 8, 9
+and 17 under frozen kernel resolution, FP32 reference math, exact top-1,
+finite/nonzero output, stable output addresses, input mutation, poisoned
+output, graph replay, caller-owned output and dynamic Inductor execution.
+High-offset tests cover CuTe and both legacy Triton algorithms. Seven selected
+tests pass compute-sanitizer memcheck with zero memory errors. The receipt
+records the existing API-error reporting exception explicitly.
+
+Companion Qwen3.5, GLM and DeepSeek constructors supply the actual output head
+to the existing logits processor. A warmup provider runs the selected plan
+before capture. Explicit output-head precision overrides retain their dtype
+path. This integration selects the vocabulary plan for one live row;
+multirow companion logits retain their existing route. Ninety-four selected
+companion tests pass, including a real CuTe graph test through the logits
+processor. Complete-model accuracy and speculative parity remain separate
+gates.
+
+On the Qwen/DFlash2 TP2 corpus, all six eager requests pass and match the
+prior eager outputs. Graph execution records 69 target replays per rank and
+retains its one-prompt mismatch against eager output. Speculative execution
+records 19 target and 63 draft replays per rank, with 85 of 182 proposed tokens
+accepted, and retains two prompt mismatches against eager output. Both routes
+match every prior token and finish reason. The vocabulary integration
+preserves these regression outputs; the graph/speculative correctness gates
+remain failed. Inference-time dense-GEMM compilation also remains visible in
+the logs, so complete serving warmup is unqualified.
+
+Prepare the physical-SM103 vocabulary suite without GPU execution:
+
+```bash
+python scripts/qualify_sm103.py --component vocabulary_projection \
+  --compile-manifest "$compile_dir/manifest.json" \
+  --output-dir "$qualification_dir"
+```
 
 ## Tensor-scaled and compact block-FP8 projections
 

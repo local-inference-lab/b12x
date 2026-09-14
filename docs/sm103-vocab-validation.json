@@ -1,0 +1,795 @@
+{
+  "schema": "b12x.sm103.vocabulary_validation.v1",
+  "status": "implemented and cross-compiled; SM120 component regression passed; SM103 execution unqualified",
+  "source_revision": "f8d05ec7a1343c2b941a0143a3b5e840b4e0e4c7",
+  "source_worktree": "/home/jasonc/b12x-sm103",
+  "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
+  "runtime_qualified_on_sm103": false,
+  "performance_claim": false,
+  "implementation": {
+    "backend": "cute",
+    "kernel": "b12x.gemm.bf16_gemv._kernel.SmallNGemvKernel",
+    "accumulator": "float32",
+    "input_weight_output_dtype": "bfloat16",
+    "row_tile": 8,
+    "threads": 128,
+    "row_and_matrix_offsets": "Int64",
+    "compile_key": "static N, K, device and architecture; compiler cache also binds source/toolchain identity",
+    "live_rows": "runtime scalar; tested 1, 4, 8, 9 and 17 under frozen kernel resolution",
+    "output": "fixed plan-owned capacity or caller-owned contiguous output; rejects input overlap",
+    "capture": "plan before capture and warm-run each specialization; no bind/run policy lookup",
+    "legacy_compatibility": "SM120/SM121 policies retain selected backends; both Triton row offset products use Int64",
+    "profile_change": "vocabulary config schema 2 and generator candidate contract 2; only the component schema version changes in the three embedded profiles"
+  },
+  "compilation": {
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "projection",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-reviewed",
+      "--nvdisasm",
+      ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "cuda_visible_devices": "",
+    "target": "sm_103a",
+    "packages": {
+      "torch": "2.13.0+cu130",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.7.1"
+    },
+    "callables": 16,
+    "cuda_entries": 24,
+    "vocabulary_callables": {
+      "vocabulary_n97_k259": {
+        "entries": [
+          {
+            "REG": 40,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 616,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 38,
+            "maximum": 37
+          },
+          "UR": {
+            "count": 20,
+            "maximum": 23
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 1,
+            "maximum": 0
+          }
+        }
+      },
+      "vocabulary_n248320_k2560": {
+        "entries": [
+          {
+            "REG": 48,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 1032,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 46,
+            "maximum": 45
+          },
+          "UR": {
+            "count": 22,
+            "maximum": 26
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 6,
+            "maximum": 5
+          }
+        }
+      },
+      "vocabulary_n124160_k5120": {
+        "entries": [
+          {
+            "REG": 48,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 1032,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 46,
+            "maximum": 45
+          },
+          "UR": {
+            "count": 22,
+            "maximum": 26
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 6,
+            "maximum": 5
+          }
+        }
+      },
+      "vocabulary_n154880_k4096": {
+        "entries": [
+          {
+            "REG": 48,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 1032,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 46,
+            "maximum": 45
+          },
+          "UR": {
+            "count": 22,
+            "maximum": 26
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 6,
+            "maximum": 5
+          }
+        }
+      },
+      "vocabulary_n77440_k6144": {
+        "entries": [
+          {
+            "REG": 48,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 1032,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 46,
+            "maximum": 45
+          },
+          "UR": {
+            "count": 22,
+            "maximum": 26
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 6,
+            "maximum": 5
+          }
+        }
+      },
+      "vocabulary_n524297_k4096": {
+        "entries": [
+          {
+            "REG": 48,
+            "STACK": 0,
+            "SHARED": 1024,
+            "LOCAL": 0
+          }
+        ],
+        "instructions": 1032,
+        "local_loads": 0,
+        "local_stores": 0,
+        "tmem_reader_with_wait": false,
+        "native_mma": false,
+        "register_usage": {
+          "R": {
+            "count": 46,
+            "maximum": 45
+          },
+          "UR": {
+            "count": 22,
+            "maximum": 26
+          },
+          "P": {
+            "count": 7,
+            "maximum": 6
+          },
+          "UP": {
+            "count": 6,
+            "maximum": 5
+          }
+        }
+      }
+    },
+    "reviewed_source_comparison": {
+      "identical_ptx": 16,
+      "identical_cubins": 16,
+      "positive_resource_deltas": {},
+      "meaning": "The reviewed-source build matches the pre-formatting build. This is an artifact-integrity comparison, not a compiler migration or performance result."
+    }
+  },
+  "host_validation": {
+    "result": "352 tests passed across the selected suite and quota-failure retry; 7 GPU/platform tests skipped",
+    "first_attempt": "331 passed, 7 skipped, 21 failed due to the full /tmp quota",
+    "retry": "All 21 affected tests pass with TMPDIR set to the evidence filesystem",
+    "qualification_harness": "15 passed"
+  },
+  "sm120_validation": {
+    "host": "ripper",
+    "gpu_uuid": "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+    "device": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "gpu_mode": "Default",
+    "command": [
+      ".venv/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/gemm/test_bf16_vocab_projection.py"
+    ],
+    "result": {
+      "tests": 13,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 0
+    },
+    "gates": [
+      "FP32 oracle and exact top-1",
+      "finite and nonzero output",
+      "live count reuse under frozen kernel resolution",
+      "stable output addresses and no replay memory growth",
+      "input mutation and NaN output poisoning before graph replay",
+      "caller-owned output, alias and capacity rejection",
+      "dynamic Inductor execution",
+      "weight rows beyond the Int32 element-offset boundary for CuTe and both Triton variants"
+    ],
+    "memcheck": {
+      "selection": "cute_vocabulary or weight_rows_past",
+      "result": {
+        "tests": 7,
+        "errors": 0,
+        "failures": 0,
+        "skipped": 0
+      },
+      "errors": 0,
+      "api_error_reporting": "--report-api-errors no retains the existing CUDA API reporting exception; CUDA kernel memory errors remain enabled",
+      "tool": "compute-sanitizer 13.4.57"
+    }
+  },
+  "companion_validation": {
+    "source_manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-source-manifest.json",
+      "bytes": 873,
+      "sha256": "5c40cbe101a0fda09d6f5caac3e1542e79d8584d8917f6b7eac817162cb45f36"
+    },
+    "parent_revision": "1e6b809f00b5235d7b1d6711070d3eae8d5c8a18",
+    "source_files_verified": 7,
+    "native_core_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+    "native_source_changes": false,
+    "result": {
+      "tests": 94,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 0
+    },
+    "scope": "13 focused output-head tests plus 81 GLM/DeepSeek/DSpark model tests",
+    "new_path": "Actual CuTe plan selected through a policy override on physical SM120; logits-processor constructor, warmup and graph replay; no simulated SM103 GPU",
+    "model_integration": "Qwen3.5, GLM and DeepSeek target/MTP constructors supply the real head; the selected vocabulary plan applies to one live row",
+    "precision": "Explicit differing head_dtype bypasses the BF16 plan",
+    "hooks": "all mandatory pre-commit hooks pass",
+    "command": [
+      ".venv/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/v1/sample/test_head_dtype.py",
+      "tests/models/test_glm5next_model.py",
+      "tests/models/test_deepseek_v4_mega_moe.py",
+      "tests/models/test_dspark_mla.py",
+      "-k",
+      "not e2e",
+      "--junitxml=/models/b12x-sm103-validation/vocab-companion.xml"
+    ],
+    "revision": "5c0857f9cd511c84f8e7f02ddf2a17198ebd3093"
+  },
+  "limitations": [
+    "No physical SM103 execution, numerical qualification or performance measurement.",
+    "CuTe multirow projection is tested directly; companion logits select this vocabulary plan only for one live row.",
+    "Full model accuracy, exact target/graph and speculative parity, complete serving warmup and allocation-free serving remain open.",
+    "Primary GLM-5.3 Flash and DeepSeek V4.1 Flash checkpoints are unavailable for complete model validation.",
+    "The source delta after the GPU run is formatting in the generator and compile launcher only; raw hashes and equal Python AST hashes are retained.",
+    "The consolidated full-source corpus is a separate validation gate."
+  ],
+  "artifacts": {
+    "source-final-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/source-final-manifest.json",
+      "bytes": 1528,
+      "sha256": "f157b52f589b64c56a1b66c6ad2575c088adb5c99c9d51d8605f143534264b7c"
+    },
+    "source-reviewed-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/source-reviewed-manifest.json",
+      "bytes": 1528,
+      "sha256": "cc9ebb0b1512d0b436a65397cc20b56794d27ef9ad57b5c34b19af3c257092c3"
+    },
+    "formatting-delta.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/formatting-delta.json",
+      "bytes": 663,
+      "sha256": "8717900ea60362d778b6e69a6f724ce921d02cff29b47d36bec080260b6fe5cf"
+    },
+    "profile-schema-audit.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/profile-schema-audit.json",
+      "bytes": 671,
+      "sha256": "85e2cf7f192795fe20dc4a03e71d331ac1c58232e40fe3e7079cf88751efc86b"
+    },
+    "compile-reviewed/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-reviewed/manifest.json",
+      "bytes": 22091,
+      "sha256": "2557c83920df09b390cb956c610d6e35742dd77c110f72c033b87d0ffe439aef"
+    },
+    "resource-audit-reviewed.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/resource-audit-reviewed.json",
+      "bytes": 36184,
+      "sha256": "5a1c0e1080ba2c94eedafd1d5fccfe0e4976cfe3e6469eeef7aa91efbb40e4f1"
+    },
+    "prepared-reviewed/qualification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/prepared-reviewed/qualification.json",
+      "bytes": 2631,
+      "sha256": "4329a55c1129f0ed6c8f033a2d530c956b5371d65d0bb2c00ab2bc9eb819dd9e"
+    },
+    "gpu-identity.txt": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/gpu-identity.txt",
+      "bytes": 198,
+      "sha256": "1d3355ff20aad819f322b6c48c3821053164a4d113930161ad139948e66e92ee"
+    },
+    "host.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/host.log",
+      "bytes": 58526,
+      "sha256": "d58d13fe5bd3b5a869f2896bb6b99e58a3cbc4da9d5ecf93d8a42e98bf3eadf2"
+    },
+    "host-quota-retry.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/host-quota-retry.log",
+      "bytes": 114,
+      "sha256": "886f156193b677c7fcf039bf63d3d7adafcce61eb4dfac53c92beb7647b81816"
+    },
+    "qualification-host.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/qualification-host.log",
+      "bytes": 99,
+      "sha256": "e54a618df53375a6cb9bd466d2a7dd896d961ff68d6151a171ee0194e974e8bc"
+    },
+    "gpu-final.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/gpu-final.log",
+      "bytes": 559,
+      "sha256": "f6bf1e2e9598e79a331a8e3a3c6e5baa7ad71ff6802079df565971dcfaefcb27"
+    },
+    "vocab-final-gpu.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/vocab-final-gpu.xml",
+      "bytes": 2102,
+      "sha256": "75dacb92db14f43954944c45988288a0b200e447d2ba4120166988ab7ef0efc6"
+    },
+    "memcheck-final.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/memcheck-final.log",
+      "bytes": 635,
+      "sha256": "6ba9fa32096f76ed0d1cadabbe8aa75a81c81caa009aead97e711e1bd5dffc5a"
+    },
+    "vocab-final-memcheck.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/vocab-final-memcheck.xml",
+      "bytes": 1288,
+      "sha256": "1a6bc9c0965ad805222bd231e13ae61a7859ba0bb81d4f0ca1fb6b6062d21a75"
+    },
+    "companion-source-manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-source-manifest.json",
+      "bytes": 873,
+      "sha256": "5c40cbe101a0fda09d6f5caac3e1542e79d8584d8917f6b7eac817162cb45f36"
+    },
+    "companion-source-verification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-source-verification.json",
+      "bytes": 51,
+      "sha256": "c7a44ed8c44fea3c0e8e8146f6982fa88b27be3956fa5179a47a89c1d0820bf9"
+    },
+    "companion-gpu.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-gpu.log",
+      "bytes": 3105,
+      "sha256": "e7d46c6bdf9c22dd024cecfe833609653e24a94762ee05fdde15af71c3289f8a"
+    },
+    "companion-gpu.xml": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-gpu.xml",
+      "bytes": 14007,
+      "sha256": "b95669290f999e20605c037abd47b21a6edcf9da58b96228d7f109845141ea49"
+    },
+    "companion-precommit-clean.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-precommit-clean.log",
+      "bytes": 3495,
+      "sha256": "f336bbe4ee88c50afa18dc42954a549bbffeb366c5bb144fa80e1435de3d4072"
+    },
+    "companion-native-source-delta.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-native-source-delta.json",
+      "sha256": "9c55d43da8c2960bf8ed1a197851dcf6b49c23e7fd8bfa8b9282cdc4ebe6ebf7"
+    },
+    "companion-commit.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/companion-commit.log",
+      "sha256": "a975ed1165fa83f0bcc0b61be99517154caf2811fe355e00118d0a9fffad8396"
+    },
+    "source-reviewed-verification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/source-reviewed-verification.json",
+      "sha256": "9331b4ee99acb31f32943b706e5d99a0899b19c77dcb00183e4d67e248048979"
+    },
+    "arm64-comparison.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/arm64-comparison.json",
+      "bytes": 725,
+      "sha256": "a68b7a43a2c80a61a5aef35af056e6f3e0ce222ff9ddbc6dbf88bfa01f57719c"
+    },
+    "compile-arm64.py": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-arm64.py",
+      "bytes": 760,
+      "sha256": "588165cab754cbf8fc7dc6112ee4c99bdd55e97716dff6f5449b0fd4fc796fe9"
+    },
+    "compile-arm64.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-arm64.log",
+      "bytes": 1697,
+      "sha256": "4dab95b9266ddfc521a3e9e686fbb599117cd0811618c570e0aa7f23ac8fab3a"
+    },
+    "compile-arm64/manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-arm64/manifest.json",
+      "bytes": 15094,
+      "sha256": "e1371340bfe63593ae0451decb21bddc9865d3caf751f5318a36a27755d2425c"
+    },
+    "compile-arm64-cuda-context.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-arm64-cuda-context.json",
+      "bytes": 335,
+      "sha256": "2d06db5f78d39abdebdefb033f7abcf98f4e5858489d1aee7a4f7f0aeabb0634"
+    },
+    "compile-arm64-terminal.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/vocab-20260914/compile-arm64-terminal.log",
+      "bytes": 40,
+      "sha256": "20af94ea6ad5a94ee8f1dd7c18df892ce9bca16f55cb30b9736e80179e6c84f7"
+    }
+  },
+  "generation": {
+    "host": "ripper",
+    "gpus": [
+      "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+    ],
+    "target": "/models/Qwen3.8-27B-NVFP4 (Qwen3.5 implementation)",
+    "draft": "/models/Qwen3.8-27B-DFlash2",
+    "harness": "benchmarks/validate_vllm_generation.py",
+    "counts": [
+      1,
+      4,
+      1
+    ],
+    "maximum_prompt_tokens": 3882,
+    "cases": [
+      {
+        "name": "vocab-b12x-eager-qualified",
+        "status": "passed",
+        "requests": 6,
+        "source_python_sha256": {
+          "b12x": "430af2af719451f81766bdecd8e25fd7cc97847eae13996555177619b4b5ed92",
+          "vllm": "9b02f7279f53113fb9c5bb64fa8d67a868a2a0df7196c582f3b81dca34337bc3"
+        },
+        "maximum_cached_tokens": 3136,
+        "graph_replays_by_rank": [
+          {
+            "target.cudagraph_manager": 0
+          },
+          {
+            "target.cudagraph_manager": 0
+          }
+        ],
+        "reference_mismatches": [],
+        "metrics": [],
+        "receipt": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-qualified.json",
+          "sha256": "6423c602d8e72b82f109f68c69f2c8bca3323b8ba138b5fd80d5190a8045d9cb"
+        },
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-qualified.log",
+          "sha256": "539b3aaeaf6396657cd5056b9e92d5a28cacf6a670623fdf10a7fc4292aa6a3e"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-qualified-command.json",
+          "sha256": "80f461f3a113003892eda785c2951f36b7c568ce6a070eb57858a37594189d82"
+        }
+      },
+      {
+        "name": "vocab-b12x-graphs",
+        "status": "failed",
+        "requests": 6,
+        "source_python_sha256": {
+          "b12x": "430af2af719451f81766bdecd8e25fd7cc97847eae13996555177619b4b5ed92",
+          "vllm": "9b02f7279f53113fb9c5bb64fa8d67a868a2a0df7196c582f3b81dca34337bc3"
+        },
+        "maximum_cached_tokens": 3136,
+        "graph_replays_by_rank": [
+          {
+            "target.cudagraph_manager": 69
+          },
+          {
+            "target.cudagraph_manager": 69
+          }
+        ],
+        "reference_mismatches": [
+          {
+            "run": 1,
+            "request": 3,
+            "field": "token_ids"
+          }
+        ],
+        "metrics": [],
+        "receipt": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-graphs.json",
+          "sha256": "704a92059264a24c47948720d692382e00234613b060e3ebd227faad580442a6"
+        },
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-graphs.log",
+          "sha256": "22f76e0d5c41c3ae9c5882cd73a4677e97321c411ba4e8df23b83121d982dadb"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-graphs-command.json",
+          "sha256": "5894ec1a72ccf5348b11707cb8e397caa3b603159d59ef6317cfacc5288f9055"
+        }
+      },
+      {
+        "name": "vocab-b12x-dflash2-qualified",
+        "status": "failed",
+        "requests": 6,
+        "source_python_sha256": {
+          "b12x": "430af2af719451f81766bdecd8e25fd7cc97847eae13996555177619b4b5ed92",
+          "vllm": "9b02f7279f53113fb9c5bb64fa8d67a868a2a0df7196c582f3b81dca34337bc3"
+        },
+        "maximum_cached_tokens": 1648,
+        "graph_replays_by_rank": [
+          {
+            "target.cudagraph_manager": 19,
+            "draft.query_cudagraph_manager": 63
+          },
+          {
+            "target.cudagraph_manager": 19,
+            "draft.query_cudagraph_manager": 63
+          }
+        ],
+        "reference_mismatches": [
+          {
+            "run": 1,
+            "request": 1,
+            "field": "token_ids"
+          },
+          {
+            "run": 1,
+            "request": 3,
+            "field": "token_ids"
+          },
+          {
+            "run": 1,
+            "request": 3,
+            "field": "finish_reason"
+          }
+        ],
+        "metrics": [
+          {
+            "name": "vllm:spec_decode_num_drafts",
+            "labels": {
+              "model_name": "/models/Qwen3.8-27B-NVFP4",
+              "engine": "0"
+            },
+            "value": 26
+          },
+          {
+            "name": "vllm:spec_decode_num_draft_tokens",
+            "labels": {
+              "model_name": "/models/Qwen3.8-27B-NVFP4",
+              "engine": "0"
+            },
+            "value": 182
+          },
+          {
+            "name": "vllm:spec_decode_num_accepted_tokens",
+            "labels": {
+              "model_name": "/models/Qwen3.8-27B-NVFP4",
+              "engine": "0"
+            },
+            "value": 85
+          },
+          {
+            "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+            "labels": {
+              "model_name": "/models/Qwen3.8-27B-NVFP4",
+              "engine": "0"
+            },
+            "values": [
+              24,
+              18,
+              10,
+              10,
+              9,
+              7,
+              7
+            ]
+          }
+        ],
+        "receipt": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-dflash2-qualified.json",
+          "sha256": "10da01d4921712964c0fc1aa8af8ab6d90d87683e99c68936ad1cbfa55814bf1"
+        },
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-dflash2-qualified.log",
+          "sha256": "42b6111eb6bad3f90e844b7502d8ec01849154a337276b1dc75b243e6d2f932a"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-dflash2-qualified-command.json",
+          "sha256": "9b1c637489bc11fd4c5c5c5cfd1458fea3ca00844b116df9fc1b556a96277d25"
+        }
+      }
+    ],
+    "regression_comparisons": {
+      "vocab-eager-comparison.json": {
+        "result": {
+          "status": "passed",
+          "reference": "native-b12x-eager-two-block.json",
+          "actual": "vocab-b12x-eager-qualified.json",
+          "source_changes": "Vocabulary constructor and warmup integration; native core unchanged",
+          "requests": 6,
+          "mismatches": []
+        },
+        "artifact": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-eager-comparison.json",
+          "sha256": "1e27b2a2f7494b67c0e976ce1ef7c65e7a7b2c32f21fa19f9a07f5cf94eb46ef"
+        }
+      },
+      "vocab-graph-regression-comparison.json": {
+        "result": {
+          "comparison_status": "passed",
+          "reference_qualification_status": "failed",
+          "actual_qualification_status": "failed",
+          "note": "Raw-output regression comparison only. Both graph runs retain failed eager-reference qualification.",
+          "requests": 6,
+          "mismatches": []
+        },
+        "artifact": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-graph-regression-comparison.json",
+          "sha256": "0c17b5030e01a2fa34341d207c80ad8233398680ab679253be6e8c8b0bbcdd13"
+        }
+      },
+      "vocab-dflash2-regression-comparison.json": {
+        "result": {
+          "comparison_status": "passed",
+          "reference_qualification_status": "failed",
+          "actual_qualification_status": "failed",
+          "note": "Raw-output regression comparison only. Both speculative runs retain failed target-eager-reference qualification.",
+          "requests": 6,
+          "mismatches": []
+        },
+        "artifact": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-dflash2-regression-comparison.json",
+          "sha256": "553fa157eff269f50118a0b5badcd6339d94593dd31a496311541d909b2eb10e"
+        }
+      }
+    },
+    "conclusion": "Eager generation passes. Graph and speculative generation retain their failed target-eager-reference gates. All three routes preserve every prior token and finish reason. This is regression evidence, not full-model accuracy qualification.",
+    "invalid_invocations": [
+      {
+        "name": "vocab-b12x-eager-two-block",
+        "reason": "Unrecognized harness option names; argument parsing failed before model execution.",
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-two-block.log",
+          "sha256": "52fc1119d693ec31961c21116e8d5276dee2369ba58a0f664f5e00afb1395c61"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-two-block-command.json",
+          "sha256": "8405b1a2f3ae39b7f3d178ab4053000b82c58fac2f9294e34b6f380ebe54dc7f"
+        }
+      },
+      {
+        "name": "vocab-b12x-eager",
+        "reason": "Required-kernel argument used a backend label instead of the concrete class; the gate failed before generation.",
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager.log",
+          "sha256": "0c5f9ec57cfd723aff71b76c5f8bbc2a665fa594c24e592ea8af8f63d112a22c"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-eager-command.json",
+          "sha256": "ab126b65dc0a1163185cfecc7afab29cec585546a1b53060fe9e0b347a5d2a0e"
+        }
+      },
+      {
+        "name": "vocab-b12x-dflash2",
+        "reason": "Interrupted during checkpoint hashing to correct the required speculator class; no model execution.",
+        "log": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-dflash2.log",
+          "sha256": "c9104620024788677dc085f297170a4802921e98989b2816b600d76e822265cd"
+        },
+        "command": {
+          "path": "/home/jasonc/b12x-sm103-evidence/qwen-dflash2/vocab-b12x-dflash2-command.json",
+          "sha256": "7ae9a9610237798ab50d7f88b9c8ead39236c393d7b5953c240acae492ae9c37"
+        }
+      }
+    ]
+  },
+  "arm64_compilation": {
+    "status": "passed",
+    "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
+    "arm64_manifest_sha256": "e1371340bfe63593ae0451decb21bddc9865d3caf751f5318a36a27755d2425c",
+    "x86_manifest_sha256": "2557c83920df09b390cb956c610d6e35742dd77c110f72c033b87d0ffe439aef",
+    "identical_ptx": 16,
+    "identical_cubins": 16,
+    "cuda_context": {
+      "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
+      "cuda_initialized_before": false,
+      "cuda_initialized_after": false,
+      "command": [
+        "scripts/compile_sm103.py",
+        "--component",
+        "projection",
+        "--output-dir",
+        "/home/jasonc/b12x-sm103-arm64-20260914/compile-vocab-sm103"
+      ]
+    },
+    "host": "maxwell",
+    "existing_service_health_http": 200
+  },
+  "consolidated_compile_retry": {
+    "status": "local attempt failed; retry on larger host pending",
+    "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
+    "local_failure": "Kernel global OOM killed compiler PID 1104908 at 4,659,580 KiB anonymous RSS; no complete manifest produced",
+    "local_oom": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-local-oom.log",
+      "bytes": 1124,
+      "sha256": "82a81fe01dede770cef4c67f5739a5a2fa5d7d814ddcf77c132f778e89e68b38"
+    },
+    "partial_directory": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-sm103",
+    "retry_command": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-ripper-command.json",
+      "bytes": 613,
+      "sha256": "564939602a72735a52d7a8d69df99066068f7a60bd86d32fe0c57a880fbe8fda"
+    }
+  }
+}
