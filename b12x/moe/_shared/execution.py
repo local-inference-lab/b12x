@@ -37,6 +37,14 @@ from .trellis_codebooks import (
 )
 
 
+def default_trellis_tile_config(
+    hidden_size: int, intermediate_size: int
+) -> tuple[int, int, int, int]:
+    """Preserve projection boundaries and equal FC1/FC2 CTA thread counts."""
+    tile_n = 256 if hidden_size % 256 == intermediate_size % 256 == 0 else 128
+    return (64, tile_n, 64, tile_n)
+
+
 class _StringEnum(str, Enum):
     def __str__(self) -> str:
         return self.value
@@ -346,7 +354,9 @@ class MoEWeightPreparationPlan:
             if codebook == "mcg" and bits == 2:
                 raise ValueError("MCG Trellis weights require trellis_bits>=3")
             object.__setattr__(self, "trellis_codebook", codebook)
-            tile_config = self.trellis_tile_config or (64, 256, 64, 256)
+            tile_config = self.trellis_tile_config or default_trellis_tile_config(
+                self.hidden_size, self.intermediate_size
+            )
             tile_config = tuple(int(value) for value in tile_config)
             if len(tile_config) != 4 or any(
                 value <= 0 or value % 16 != 0 for value in tile_config

@@ -31,6 +31,7 @@ from b12x.moe._shared.btx_schema import (
     rate_code,
     rate_code_bits,
 )
+from b12x.moe._shared.execution import default_trellis_tile_config
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
     _finalize_prepared_trellis_weights,
@@ -418,7 +419,9 @@ def prepare_btx_moe_weights(
                         and layer.local_intermediate_size % 256
                     )
                 )
-                else (64, 256, 64, 256)
+                else default_trellis_tile_config(
+                    manifest.geometry.hidden_size, layer.local_intermediate_size
+                )
             )
         prepared = prepare_trellis256_moe_weights(
             w13=w13,

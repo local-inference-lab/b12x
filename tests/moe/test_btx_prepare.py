@@ -66,8 +66,11 @@ def _naive_fc2_words(low_planes, high_planes) -> torch.Tensor:
 
 
 @requires_cuda
-def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
-    hidden, global_i, experts, bits = 256, 512, 3, 3
+@pytest.mark.parametrize("global_i,fc1_tile_n", ((512, 256), (1152, 128)))
+def test_btx_uniform_mcg_matches_direct_binder(
+    tmp_path, global_i: int, fc1_tile_n: int
+) -> None:
+    hidden, experts, bits = 256, 3, 3
     slots = global_i // 32
     config = BtxSynthConfig(
         codebook="mcg",
@@ -123,8 +126,8 @@ def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         intermediate_size=global_i,
         num_experts=experts,
         activation="silu",
-        fc1_tile_n=256,
-        fc2_tile_n=256,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_n=fc1_tile_n,
         params_dtype=torch.float16,
         w13_layout="trellis_t256_proj",
         trellis_bits=bits,
@@ -133,7 +136,7 @@ def test_btx_uniform_mcg_matches_direct_binder(tmp_path) -> None:
         up_suh=payloads.up_suh.to(device),
         intermediate_rotations=rotations,
         down_svh=payloads.down_svh.to(device),
-        tile_config=(64, 256, 64, 256),
+        tile_config=(64, fc1_tile_n, 64, fc1_tile_n),
     )
 
     assert torch.equal(btx_prepared.w13, binder_prepared.w13)
