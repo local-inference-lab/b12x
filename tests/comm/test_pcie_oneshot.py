@@ -329,6 +329,30 @@ def _make_cute_state(
     )
 
 
+def test_plain_tp4_ds41_push_uses_frozen_policy_and_preserves_other_routes(monkeypatch):
+    """Extend the opt-in TP4 storage contract only to supported DS4.1 BF16 shapes."""
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
+    state = _make_cute_state(4, eager_buffer_bytes=84 * 1024)
+    assert state.sharded_eager_storage
+    monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
+    for rows, hidden in ((1, 5120), (6, 5120), (8, 1280)):
+        inp = torch.empty(rows, hidden, dtype=torch.bfloat16)
+        assert _CuTeOneshotBackend._plain_launch_config(
+            state, inp
+        )[0] == "tp4_remote_push"
+    for rows, hidden, dtype in (
+        (9, 5120, torch.bfloat16), (6, 4096, torch.bfloat16),
+        (6, 5120, torch.float16), (6, 5120, torch.float32),
+    ):
+        assert _CuTeOneshotBackend._plain_launch_config(
+            state, torch.empty(rows, hidden, dtype=dtype)
+        )[0] == "pull"
+    disabled = _make_cute_state(4, eager_buffer_bytes=84 * 1024)
+    assert _CuTeOneshotBackend._plain_launch_config(
+        disabled, torch.empty(6, 5120, dtype=torch.bfloat16)
+    )[0] == "pull"
+
+
 @pytest.mark.parametrize(
     ("rows", "expected"),
     (

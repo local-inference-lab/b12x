@@ -304,6 +304,15 @@ binding or graph replay. Other push geometry fails closed. The same IPC slab,
 system-scope barrier and graph slots are retained, with L1-bypassing incoming
 loads. Serialized launch/replay remains required; this is not a qualified default.
 
+`B12X_PCIE_TP4_REMOTE_PUSH=1` also enables the experimental native plain BF16
+all-reduce for DS4.1 widths5120/1280 and1-8 rows within the declared eager slot
+capacity. Other plain shapes retain pull, and the default remains off. This
+reuses the already-declared four source shards, alternating graph slots and
+system barrier. Destinations are rank-staggered, incoming loads bypass L1, and
+the original rotating-rank FP32 sum and single BF16 rounding are retained.
+The factory snapshots the flag and checks agreement before allocating IPC;
+bind/replay does not reread it. Existing fused TP4 eligibility is unchanged.
+
 `benchmarks/benchmark_startup_autotuner.py` uses the same declarations and
 session with explicit retained benchmark calls. Its optional group subsets are
 diagnostics, not full-model serving acceptance. `benchmarks/startup_quality.py`
