@@ -115,12 +115,9 @@ class InspectAtomOperands:
 
 
 def compile_probe(payload, source, ids, output, *, fc1, dual_input=False):
-    if payload.trellis.codebook == "sqg_e4m3":
-        from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
+    from tests._reference.trellis_decode import codebook_tensor
 
-        lut = sqg_xor_cheb_t12_direct_lut_cpu().cuda()
-    else:
-        lut = torch.zeros(16, dtype=torch.uint8, device="cuda")
+    lut = codebook_tensor(payload.trellis.codebook, "cuda")
     args = [
         pointer(dtype, tensor)
         for dtype, tensor in (
@@ -175,7 +172,7 @@ def compile_probe(payload, source, ids, output, *, fc1, dual_input=False):
     return fn, args, scalars, stream, (lut, alternate)
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
 @pytest.mark.parametrize(
     "group_size,fc1,dual_input",
     [
@@ -275,7 +272,10 @@ def test_grouped_atom_planes_boundaries_graph_and_mutation(
         torch.testing.assert_close(output, reference, atol=0, rtol=0)
 
         saved_rates, saved_offsets = payload.rates.clone(), payload.offsets.clone()
-        for code in (0x13, 0x37, 0xFF):
+        invalid_rates = (0x13, 0x37, 0xFF)
+        if codebook == "sqg_fp16":
+            invalid_rates += (0x45, 0x54, 0x75, 0x57)
+        for code in invalid_rates:
             payload.rates.fill_(code)
             fn(*args, *scalars(phase, 8), stream)
             assert torch.count_nonzero(output[:, 1]) == 0

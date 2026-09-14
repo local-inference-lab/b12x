@@ -118,11 +118,6 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
 
 
 def _validate_trellis_runtime(source: TrellisConfig) -> None:
-    if source.codebook.value == "sqg_fp16":
-        raise NotImplementedError(
-            "sqg_fp16 is defined by the checkpoint schema but is not "
-            "implemented by the routed fused MoE runtime"
-        )
     if source.transform.projection.kind != "scaled_hadamard" or (
         source.transform.projection.block_size != 128
     ):
@@ -130,12 +125,6 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
             "fused MoE trellis execution requires scaled_hadamard(128)"
         )
     expert = source.transform.expert
-    if expert.kind == "coupled_hadamard" and source.codebook.value not in {
-        "mcg", "sqg_e4m3"
-    }:
-        raise NotImplementedError(
-            "coupled_hadamard preparation requires MCG or SQG E4M3 rates"
-        )
     if expert.kind == "coupled_hadamard" and (
         expert.pre_block_size,
         expert.post_block_size,
@@ -257,7 +246,7 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout="w31",
             w4a16_layout="trellis_native",
-            trellis_bits=3,
+            trellis_bits=5 if source.codebook.value == "sqg_fp16" else 3,
             trellis_tile_config=(
                 (128, 256, 64, 256)
                 if source.codebook.value == "mcg"

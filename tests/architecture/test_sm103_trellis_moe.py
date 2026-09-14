@@ -15,8 +15,10 @@ from tests.architecture.test_sm103 import B300
 from tests.moe.test_trellis_config import _k3_config, _glm_config
 
 
-def weight_plan(coupled=True, mixed=False, canonical=False):
+def weight_plan(coupled=True, mixed=False, canonical=False, codebook="sqg_e4m3"):
     config = _glm_config() if mixed else _k3_config()
+    if not mixed:
+        config["codebook"] = codebook
     config["transform"]["expert"] = (
         _k3_config()["transform"]["expert"] if coupled else {"kind": "none"}
     )
@@ -35,7 +37,10 @@ def weight_plan(coupled=True, mixed=False, canonical=False):
 
 
 def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
-    public = weight_plan(coupled, mixed=mixed, canonical=True)
+    public = weight_plan(
+        coupled, mixed=mixed, canonical=True,
+        codebook=capacity.weight_plan.trellis_codebook,
+    )
     public = replace(
         public,
         _impl=capacity.weight_plan,
@@ -63,7 +68,7 @@ def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
     return execution, experts
 
 
-def caps(monkeypatch, *, coupled=True, mixed=False, **kwargs):
+def caps(monkeypatch, *, coupled=True, mixed=False, codebook="sqg_e4m3", **kwargs):
     import b12x.policy.context as context
 
     monkeypatch.setattr(
@@ -75,7 +80,7 @@ def caps(monkeypatch, *, coupled=True, mixed=False, **kwargs):
         max_tokens=8,
         num_topk=8,
         device="cpu",
-        weight_plan=weight_plan(coupled, mixed=mixed),
+        weight_plan=weight_plan(coupled, mixed=mixed, codebook=codebook),
         quant_mode="w4a16",
         core_token_counts=(1, 4, 8),
         route_num_experts=768,
@@ -164,7 +169,7 @@ def test_canonical_rates_are_all_precompiled(monkeypatch):
 @pytest.mark.parametrize(
     "coupled,split", [(False, None), (True, None), (True, 64), (True, 192)]
 )
-@pytest.mark.parametrize("bits", [2, 3, 4])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 def test_native_binding_retains_capacity_launches_and_checks_aliases(
     monkeypatch, coupled, split, bits
 ):
@@ -175,7 +180,8 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
         TrellisWeightState,
     )
 
-    capacity = caps(monkeypatch, coupled=coupled)
+    codebook = "sqg_fp16" if bits >= 5 else "sqg_e4m3"
+    capacity = caps(monkeypatch, coupled=coupled, codebook=codebook)
     wp = replace(
         capacity.weight_plan,
         num_experts=3,
@@ -216,7 +222,7 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
         fc2_tile_n=256,
         w13_layout="trellis_t256_proj",
         trellis=TrellisWeightState(
-            codebook="sqg_e4m3",
+            codebook=codebook,
             bits=bits,
             gate_suh=scales,
             up_suh=scales if coupled and split is None else scales.clone(),

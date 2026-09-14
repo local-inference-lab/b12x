@@ -8,7 +8,7 @@ setting; three are defined:
   with a lop3 mask/or into two added fp16 halves.
 - ``sqg_e4m3``: XOR-Cheb-T12 bijection over the retained L16 history with a
   frozen E4M3 reconstruction staircase; defined for K2/K3/K4.
-- ``sqg_fp16``: D3L descriptor decode to fp16; defined for uniform K5/K6.
+- ``sqg_fp16``: D3L descriptor decode to fp16; defined for K5/K6 tiles.
 
 This module is torch-free. Kernel modules embed the ids as compile-time
 constants, so the ids participate in kernel cache keys.
@@ -59,4 +59,4 @@ def validate_codebook_bits(codebook: str, bits: int) -> None:
     if codebook == SQG_E4M3 and bits not in (2, 3, 4):
         raise ValueError("sqg_e4m3 is defined only for K2/K3/K4")
     if codebook == SQG_FP16 and bits not in (5, 6):
-        raise ValueError("sqg_fp16 is defined only for uniform K5/K6")
+        raise ValueError("sqg_fp16 is defined only for K5/K6")

@@ -157,7 +157,7 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "legacy BTX paired Trellis records and canonical SQG FP16 preparation",
+            "legacy BTX paired Trellis records",
             "Grace memory",
             "Station RDMA",
             "FlashInfer/vLLM plugin installation",

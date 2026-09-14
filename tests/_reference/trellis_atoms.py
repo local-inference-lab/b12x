@@ -20,6 +20,7 @@ def atom_fixture(
 ):
     generator = torch.Generator().manual_seed(413)
     config = _glm_config() if codebook == "mcg" else _k3_config()
+    config["codebook"] = codebook
     config["rate"] = {"granularity": granularity}
     if group_size is not None:
         config["rate"]["group_size"] = group_size
@@ -30,11 +31,11 @@ def atom_fixture(
         config["scale"][name] = {"vectors": "per_expert", "gains": "none"}
     config = fused_moe.TrellisConfig.from_dict(config)
     groups = width // (group_size or width)
-    palette = (
-        (0x42, 0x33, 0x25, 0x64, 0x56)
-        if codebook == "mcg"
-        else (0x42, 0x33, 0x24, 0x43)
-    )
+    palette = {
+        "mcg": (0x42, 0x33, 0x25, 0x64, 0x56),
+        "sqg_e4m3": (0x42, 0x33, 0x24, 0x43),
+        "sqg_fp16": (0x65, 0x55, 0x56, 0x66),
+    }[codebook]
     logical = torch.empty(groups, experts, 3, dtype=torch.uint8)
     for group in range(groups):
         for expert in range(experts):

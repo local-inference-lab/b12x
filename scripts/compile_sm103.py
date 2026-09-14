@@ -859,11 +859,13 @@ def compile_trellis(out):
         ("btx_mcg_coupled", "mcg", 3, True, "situ", torch.bfloat16),
         ("sqg", "sqg_e4m3", 4, False, "situ", torch.float16),
         ("sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
+        ("canonical_sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
+        ("canonical_sqg_fp16_coupled", "sqg_fp16", 5, True, "situ", torch.bfloat16),
     ):
         caps = SimpleNamespace(
             k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
             route_num_experts=768, dtype=dtype, activation=activation,
-            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis" if codebook == "sqg_e4m3" else "btx",
+            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis" if codebook == "sqg_e4m3" or label.startswith("canonical_") else "btx",
                                         trellis_bits=bits, trellis_codebook=codebook),
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix="trellis_moe_" + label + "_")
@@ -895,6 +897,7 @@ def compile_trellis(out):
     for codebook, group_size, coupled in (
         ("mcg", 32, False), ("mcg", 256, True),
         ("sqg_e4m3", 32, False), ("sqg_e4m3", 256, True),
+        ("sqg_fp16", 32, False), ("sqg_fp16", 256, True),
     ):
         label = f"trellis_atoms_{codebook}_g{group_size}_" + ("coupled_" if coupled else "")
         caps = SimpleNamespace(
@@ -903,7 +906,7 @@ def compile_trellis(out):
             activation="situ" if coupled else "silu",
             weight_plan=SimpleNamespace(
                 coupled_hadamard=coupled, source_format="b12x_trellis",
-                trellis_bits=3, trellis_codebook=codebook,
+                trellis_bits=5 if codebook == "sqg_fp16" else 3, trellis_codebook=codebook,
                 trellis_group_size=group_size,
             ),
         )

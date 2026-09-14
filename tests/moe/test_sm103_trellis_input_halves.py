@@ -30,21 +30,25 @@ class InspectColumnSelection:
 
     @cute.jit
     def __call__(
-        self, values, output, split: c.Int64, live: c.Int32, stream: cuda.CUstream
+        self, values, output, split: c.Int64, origin: c.Int64,
+        live: c.Int32, stream: cuda.CUstream
     ):
-        self.kernel(values, output, split).launch(
+        self.kernel(values, output, split, origin).launch(
             grid=(live * 3, 1, 1), block=(128, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, values, output, split: c.Int64):
+    def kernel(self, values, output, split: c.Int64, origin: c.Int64):
         lane, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         route, col = c.Int64(block // 3), c.Int64(block % 3) * 128 + c.Int64(lane)
         source = cute.make_tensor(values, cute.make_layout(8 * 2 * 384))
         target = cute.make_tensor(output, cute.make_layout(8 * 384))
+        cutoff = self.projection.output_split(
+            (None, None, split), origin + c.Int64(block % 3) * 128
+        )
         for row in c.range_constexpr(2):
-            if self.projection.output_row((None, None, split), row, col):
+            if self.projection.output_row(cutoff, row, c.Int32(lane)):
                 target[route * 384 + col] = source[(route * 2 + row) * 384 + col]
 
 
@@ -61,6 +65,7 @@ def test_coupled_column_selection_changes_inside_tiles_and_replays():
         InspectColumnSelection(),
         *args,
         c.Int64(192),
+        c.Int64(0),
         c.Int32(1),
         stream,
         options=f"--gpu-arch={target}",
@@ -70,19 +75,21 @@ def test_coupled_column_selection_changes_inside_tiles_and_replays():
         return torch.cat((values[:live, 0, :split], values[:live, 1, split:]), dim=1)
 
     with patch.object(cute, "compile", side_effect=AssertionError("resolution frozen")):
-        for split in (64, 128, 192, 256, 320):
-            for live in (8, 1, 4, 3):
-                output.fill_(float("nan"))
-                fn(*args, c.Int64(split), c.Int32(live), stream)
-                torch.testing.assert_close(
-                    output[:live], expected(split, live), atol=0, rtol=0
-                )
-                assert torch.isnan(output[live:]).all()
+        for origin in (0, 2**31 + 128, 2**40):
+            for split in (64, 128, 192, 256, 320):
+                for live in (8, 1, 4, 3):
+                    output.fill_(float("nan"))
+                    fn(*args, c.Int64(origin + split), c.Int64(origin), c.Int32(live), stream)
+                    torch.testing.assert_close(
+                        output[:live], expected(split, live), atol=0, rtol=0
+                    )
+                    assert torch.isnan(output[live:]).all()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             fn(
                 *args,
                 c.Int64(192),
+                c.Int64(0),
                 c.Int32(8),
                 cuda.CUstream(torch.cuda.current_stream().cuda_stream),
             )

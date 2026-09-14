@@ -437,10 +437,10 @@ class MoEWeightPreparationPlan:
             if self.coupled_hadamard:
                 if self.trellis_codebook != _TRELLIS_SQG_E4M3 and not (
                     self.source_format == "b12x_trellis"
-                    and self.trellis_codebook == _TRELLIS_MCG
+                    and self.trellis_codebook in {_TRELLIS_MCG, "sqg_fp16"}
                 ):
                     raise ValueError(
-                        "coupled Trellis requires SQG E4M3 or canonical MCG weights"
+                        "coupled Trellis requires SQG E4M3 or canonical MCG/SQG FP16 weights"
                     )
                 if blocks is None:
                     blocks = (512, 128)

@@ -19,9 +19,11 @@ def prepare_experts(
     global_intermediate_size=None,
     intermediate_offset=0,
     distinct_input_scales=False,
+    codebook="sqg_e4m3",
 ):
     experts, hidden, width = geometry
     config = _k3_config()
+    config["codebook"] = codebook
     if not coupled:
         config["transform"]["expert"] = {"kind": "none"}
     for field in config["scale"]:
@@ -67,10 +69,12 @@ def prepare_experts(
 
 
 @pytest.mark.parametrize(
-    "coupled,bits",
-    [(False, 2), (False, 3), (False, 4), (True, 2), (True, 3), (True, 4)],
+    "codebook,coupled,bits",
+    [(codebook, coupled, bits)
+     for codebook, rates in (("sqg_e4m3", (2, 3, 4)), ("sqg_fp16", (5, 6)))
+     for coupled in (False, True) for bits in rates],
 )
-def test_canonical_preparation_and_independent_oracle(coupled, bits):
+def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
     if not torch.cuda.is_available():
         pytest.skip("CUDA preparation requires a GPU")
     torch.manual_seed(123)
@@ -83,6 +87,7 @@ def test_canonical_preparation_and_independent_oracle(coupled, bits):
         transform_draw=3 if coupled else 0,
         global_intermediate_size=1024 if coupled else None,
         intermediate_offset=256 if coupled else 0,
+        codebook=codebook,
     )
     payload = experts._impl.representation_for("w4a16")
     assert payload.trellis.bits == bits
@@ -180,7 +185,8 @@ def test_canonical_preparation_and_independent_oracle(coupled, bits):
 
 
 def _run_native_moe(
-    coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False
+    coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False,
+    codebook="sqg_e4m3",
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native Trellis MoE")
@@ -202,6 +208,7 @@ def _run_native_moe(
         else None,
         intermediate_offset=geometry[2] if coupled and not cross_half else 0,
         distinct_input_scales=cross_half,
+        codebook=codebook,
     )
     payload = experts._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -347,3 +354,12 @@ def test_v41_geometry_native_moe():
 @pytest.mark.parametrize("bits", [2, 3, 4])
 def test_native_coupled_cross_half_moe(bits):
     _run_native_moe(True, bits, torch.int64, geometry=(3, 512, 384), cross_half=True)
+
+
+@pytest.mark.parametrize("bits", [5, 6])
+@pytest.mark.parametrize("coupled,cross_half", [(False, False), (True, False), (True, True)])
+def test_native_sqg_fp16_moe(bits, coupled, cross_half):
+    _run_native_moe(
+        coupled, bits, torch.int64, geometry=(3, 512, 384 if cross_half else 256),
+        cross_half=cross_half, codebook="sqg_fp16",
+    )

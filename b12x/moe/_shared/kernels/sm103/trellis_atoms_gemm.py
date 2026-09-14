@@ -14,7 +14,13 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
         self, n, k, experts, capacity, *, group_size, fc1, codebook, dual_input=False
     ):
         super().__init__(
-            n, k, experts, capacity, bits=3, codebook=codebook, dual_input=dual_input
+            n,
+            k,
+            experts,
+            capacity,
+            bits=5 if codebook == "sqg_fp16" else 3,
+            codebook=codebook,
+            dual_input=dual_input,
         )
         self.hidden = k if fc1 else n
         self.intermediate = n if fc1 else k
@@ -27,12 +33,11 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             raise ValueError(
                 "Trellis atom group size must be a positive multiple of 32 dividing I"
             )
-        if codebook not in {"mcg", "sqg_e4m3"}:
-            raise ValueError("Trellis atom projection requires MCG or SQG E4M3")
         self.group_size = group_size
         self.groups = self.intermediate // group_size
         self.fc1 = fc1
-        self.max_bits = 6 if codebook == "mcg" else 4
+        self.min_bits = 5 if codebook == "sqg_fp16" else 2
+        self.max_bits = 4 if codebook == "sqg_e4m3" else 6
 
     @cute.jit
     def __call__(
@@ -190,9 +195,9 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
         section = c.Int64(self.hidden // 16) * 8 * c.Int64(low + high)
         valid = (
             valid
-            & (low >= 2)
+            & (low >= self.min_bits)
             & (low <= self.max_bits)
-            & (high >= 2)
+            & (high >= self.min_bits)
             & (high <= self.max_bits)
         )
         valid = (
@@ -233,7 +238,7 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
                 record = cute.make_tensor(
                     weights.iterator + base, cute.make_layout(c.Int64(8) * rate)
                 )
-                for bits in c.range_constexpr(2, self.max_bits + 1):
+                for bits in c.range_constexpr(self.min_bits, self.max_bits + 1):
                     if rate == bits:
                         values = decode_lane(
                             record, c.Int64(0), lane, lut, bits, self.codebook

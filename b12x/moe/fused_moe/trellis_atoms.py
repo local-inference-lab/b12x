@@ -78,7 +78,11 @@ def normalize_rates(config, rate, *, experts, intermediate_size, device):
         rates = rate.reshape(experts, 3, groups).permute(2, 0, 1)
     host = rates.detach().cpu().to(torch.int64)
     low, high = host & 15, host >> 4
-    allowed = (2, 3, 4, 5, 6) if config.codebook.value == "mcg" else (2, 3, 4)
+    allowed = {
+        "mcg": (2, 3, 4, 5, 6),
+        "sqg_e4m3": (2, 3, 4),
+        "sqg_fp16": (5, 6),
+    }[config.codebook.value]
     observed = set(low.flatten().tolist()) | set(high.flatten().tolist())
     if not observed.issubset(allowed):
         raise ValueError(
@@ -88,7 +92,7 @@ def normalize_rates(config, rate, *, experts, intermediate_size, device):
         grouped
         or not torch.equal(low, high)
         or (config.codebook.value == "mcg" and not observed.issubset((3, 4, 5)))
-        or (config.codebook.value == "sqg_e4m3" and len(observed) != 1)
+        or (config.codebook.value != "mcg" and len(observed) != 1)
     )
     return rates.contiguous(), atom_layout
 
@@ -140,7 +144,7 @@ def prepare_atom_weights(
     )
     state = TrellisWeightState(
         codebook=config.codebook.value,
-        bits=3,
+        bits=5 if config.codebook.value == "sqg_fp16" else 3,
         gate_suh=gate_suh,
         up_suh=up_suh,
         intermediate_rotations=rotations,
