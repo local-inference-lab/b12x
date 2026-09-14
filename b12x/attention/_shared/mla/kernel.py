@@ -3075,7 +3075,12 @@ def run_unified_decode(
             record_bytes=288 if model_type == ModelType.DSV41 else None,
         )
         extra_kv_flat = _cache_base_tensor(indexed_k_cache)
-        extra_indices_t = indexed_indices.contiguous()
+        extra_indices_t = (
+            indexed_indices
+            if int(indexed_indices.stride(0)) == 0
+            and int(indexed_indices.stride(1)) == 1
+            else indexed_indices.contiguous()
+        )
     else:
         pbs_extra = 1
         stride_extra_kv_block = 0
