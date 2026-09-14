@@ -20,6 +20,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import ld_global_nc_v4_u32, ld_global_v4_u32, st_global_v4_u32
@@ -613,7 +614,7 @@ def get_twoshot_bf16_launcher(
         )
         raw(*raw_args)
 
-    return run
+    return attach_programs(run, raw)
 
 
 class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
@@ -1004,7 +1005,7 @@ def get_twoshot_bf16_allreduce_launcher(
             current_cuda_stream(),
         )
         raw(*raw_args)
-    return run
+    return attach_programs(run, raw)
 
 
 
