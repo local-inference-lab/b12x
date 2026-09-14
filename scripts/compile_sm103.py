@@ -1560,6 +1560,64 @@ def compile_wo_projection(out):
     return launches
 
 
+def compile_engram(out):
+    """Compile Engram hash metadata and packed gathers without allocating tables."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from b12x.sequence.engram import _kernels as kernels
+    from b12x.sequence.engram.geometry import build_geometry
+
+    geometry = build_geometry()
+    cases = [
+        ("engram_reset", kernels._reset_error_kernel,
+         dict(error_code_ptr="*i32"), {}, 1),
+        ("engram_requests", kernels._request_ids_kernel,
+         dict(query_start_loc_ptr="*i32", num_seqs_ptr="*i32", num_tokens_ptr="*i32",
+              request_ids_ptr="*i32", error_code_ptr="*i32"), dict(MAX_TOKENS=4096), 1),
+        ("engram_compress", kernels._compress_validate,
+         dict(ids="*i64", token_mask="*i1", token_map="*i64", starts="*i32",
+              slots="*i32", history="*i64", num_seqs="*i32", num_tokens="*i32",
+              compressed="*i64", error="*i32", prepared_tokens="i32"),
+         dict(T=4096, S=8, R=8, V=129280, CV=geometry.compressed_vocab_size), 1),
+        ("engram_hash", kernels._hash,
+         dict(compressed="*i64", starts="*i32", slots="*i32", history="*i64",
+              num_tokens="*i32", request_ids="*i32", multipliers="*i64",
+              primes="*i64", offsets="*i64", hashes="*i64", error="*i32"),
+         dict(PAD=2), 1),
+    ]
+    for layer, rows in zip(geometry.layer_ids, geometry.num_embeddings, strict=True):
+        for rank in (0, 1):
+            shard = (rows + 1) // 2
+            for compact, resident in ((False, False), (True, False), (True, True)):
+                name = f"engram_lookup_l{layer}_tp2r{rank}_compact{int(compact)}_resident{int(resident)}"
+                cases.append((name, kernels._lookup,
+                              dict(weight="*fp8e4nv", scales="*u8", hashes="*i64",
+                                   num_tokens="*i32", out="*bf16", prepared_tokens="i32"),
+                              dict(T=4096, ROWS=rows, START=rank * shard,
+                                   END=(rank + 1) * shard, COMPACT=compact,
+                                   RESIDENT_SCALES=resident), 4))
+    launches = {}
+    for name, kernel, signature, constants, warps in cases:
+        options = dict(num_warps=warps, num_stages=1)
+        compiled = triton.compile(ASTSource(kernel, signature, constexprs=constants),
+                                  target=GPUTarget("cuda", 103, 32), options=options)
+        if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
+            raise RuntimeError(f"{name}: implicit launch scratch is unsupported")
+        directory = out / name
+        directory.mkdir()
+        (directory / (name + ".ptx")).write_text(compiled.asm["ptx"])
+        (directory / (name + ".cubin")).write_bytes(compiled.asm["cubin"])
+        (directory / (name + ".mlir")).write_text(compiled.asm["ttgir"])
+        (directory / (name + ".metadata.json")).write_text(json.dumps({
+            "role": "supporting Engram hash metadata and packed FP8 gather",
+            "signature": signature, "constants": constants, "options": options,
+            "metadata": compiled.metadata._asdict(),
+        }, indent=2, default=str) + "\n")
+        launches[name] = compiled
+    return launches
+
+
 def compile_activation_packing(out):
     """Compile the supporting BF16/FP16 quantizer with runtime row counts."""
     import triton
@@ -1791,6 +1849,7 @@ def main():
             "mla_compress",
             "hyperconnection",
             "embedding",
+            "engram",
             "dense_mla",
             "sparse_mla",
             "compressed_mla",
@@ -1930,6 +1989,8 @@ def main():
             launches.update(compile_wo_projection(out))
         if args.component in ("activation_packing", "all"):
             launches.update(compile_activation_packing(out))
+        if args.component in ("engram", "all"):
+            launches.update(compile_engram(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__
