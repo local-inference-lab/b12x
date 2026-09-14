@@ -90,7 +90,7 @@ incoming `pre_mix` and caller-owned `pre_out` for lagged V4.1 mixing, while
 `run_collapse` supports the final weighted collapse and uniform stream mean.
 
 PLE and Engram share the bounded io_uring row cache in
-`sequence._shared.disk_table`: registered file regions, aligned O_DIRECT reads,
+`sequence._shared.disk_table`: registered file regions, aligned reads,
 block deduplication/coalescing, mapped-host staging, and stream-safe reuse.
 Their hashing and decoding stay separate. Engram's `DiskTable` reads the
 checkpoint's FP8 weight rows and separate E8M0 scale rows without conversion or
@@ -103,7 +103,15 @@ The reader registers immutable file descriptors, retires completions in batches,
 and radix-sorts large requests using its existing job allocation as scratch.
 Small requests retain the in-place sorter. Engram defaults to a fixed queue
 depth of 128 (8 MB of native I/O buffers per table); PLE retains 64. No table
-payload is cached between transactions, and live counts do not resize storage.
+payload is cached by the reader between transactions, and live counts do not
+resize storage.
+
+Disk table files use O_DIRECT by default. Set `B12X_DISK_TABLE_BUFFERED_IO=1`
+before starting the server to let Linux cache their immutable file pages.
+Other values retain direct I/O. This keeps io_uring, row/scatter layouts and
+weight/scale bytes unchanged; it does not preload full tables or offload KV.
+Gains depend on input locality and available host filesystem cache. The option
+applies to both PLE and Engram disk tables, not generic checkpoint loading.
 
 `benchmarks/benchmark_ngram_ssd.py --models engram --capacities 4096
 --tokens 4096 --seqs 1 --max-seqs 8 --engram-token-bound` measures checkpoint

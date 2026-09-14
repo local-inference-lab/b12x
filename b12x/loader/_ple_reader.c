@@ -259,7 +259,10 @@ static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
         snprintf(failure.message, sizeof(failure.message), "PLE source shard/plane is already registered");
     } else {
         /* Reject FIFOs via fstat without blocking waiting for a writer. */
-        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_DIRECT);
+        const char *buffered_io = getenv("B12X_DISK_TABLE_BUFFERED_IO");
+        int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+        if (!buffered_io || strcmp(buffered_io, "1") != 0) flags |= O_DIRECT;
+        int fd = open(path, flags);
         struct stat status;
         if (fd < 0) system_error(&failure, "open PLE source");
         else if (fstat(fd, &status) != 0) system_error(&failure, "fstat PLE source");

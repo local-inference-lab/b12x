@@ -7,8 +7,14 @@ import pytest
 from b12x.loader._native import load
 
 
-@pytest.fixture
-def reader_factory():
+@pytest.fixture(
+    params=[None, "0", "1"], ids=["default-direct", "explicit-direct", "buffered"]
+)
+def reader_factory(request, monkeypatch):
+    if request.param is None:
+        monkeypatch.delenv("B12X_DISK_TABLE_BUFFERED_IO", raising=False)
+    else:
+        monkeypatch.setenv("B12X_DISK_TABLE_BUFFERED_IO", request.param)
     native = load()
 
     def create(
