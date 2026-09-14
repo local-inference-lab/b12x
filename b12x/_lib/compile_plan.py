@@ -16,6 +16,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
+from types import FunctionType
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,11 @@ def program_keys(value: Any) -> tuple[ProgramKey, ...]:
     from triton.compiler.compiler import CompiledKernel
     if isinstance(value, CompiledKernel):
         return (ProgramKey("triton", value.hash, value.name),)
+    if isinstance(value, FunctionType):
+        # A launch closure produced outside a compile factory carries no
+        # program identity of its own; retain it rather than failing an
+        # unrelated sweep.
+        return ()
     raise TypeError(f"compile factory returned an unannotated {type(value).__name__}")
 
 
