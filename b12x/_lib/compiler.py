@@ -2484,6 +2484,8 @@ def _write_compile_manifest(
     manifest = _build_compile_manifest(
         cache_key, cache_payload, func, object_bytes, compiled=compiled
     )
+    if compiled is not None:
+        compiled._b12x_launch_metadata = manifest["launch_metadata"]
     tmp_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -2557,8 +2559,35 @@ def _load_cute_compile_from_disk(cache_key: str):
         ) as raw_stage:
             staged_object = Path(raw_stage) / object_path.name
             shutil.copy2(object_path, staged_object)
+            manifest_path = _cache_manifest_path(cache_key)
+            launch_metadata = None
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text())
+                object_hash = hashlib.sha256(staged_object.read_bytes()).hexdigest()
+                if manifest.get("object_sha256") != object_hash:
+                    raise ValueError("CuTe cache object does not match its manifest")
+                launch_metadata = manifest.get("launch_metadata")
+                evidence = {
+                    "cache_key": cache_key,
+                    "object_sha256": object_hash,
+                    "launch_metadata": launch_metadata,
+                }
+                evidence_hash = hashlib.sha256(
+                    json.dumps(
+                        evidence,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if manifest.get("artifact_evidence_sha256") != evidence_hash:
+                    raise ValueError("CuTe cache launch metadata does not match its digest")
             module = ExternalBinaryModule(str(staged_object))
-            return getattr(module, _cache_prefix(cache_key))
+            compiled = getattr(module, _cache_prefix(cache_key))
+            if launch_metadata is not None:
+                compiled._b12x_launch_metadata = launch_metadata
+            return compiled
     except Exception:
         return None
 
