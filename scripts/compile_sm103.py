@@ -1227,6 +1227,51 @@ def compile_block_fp8_linear(out):
     return launches
 
 
+def compile_activation_packing(out):
+    """Compile the supporting BF16/FP16 quantizer with runtime row counts."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from b12x.gemm.blockscaled._quantize import _quantize
+
+    launches = {}
+    cases = [
+        (dtype, input_k, False, False)
+        for dtype in ("bf16", "fp16") for input_k in (128, 160, 1024)
+    ] + [
+        ("bf16", input_k, True, reciprocal)
+        for input_k in (128, 1024) for reciprocal in (False, True)
+    ]
+    options = {"num_warps": 4, "num_stages": 1, "enable_fp_fusion": False}
+    for dtype, input_k, fp4, reciprocal in cases:
+        recipe = "nvfp4" if fp4 else "mxfp8"
+        name = f"activation_pack_{recipe}_{dtype}_k{input_k}_reciprocal{int(reciprocal)}"
+        constants = dict(INPUT_K=input_k, K=(input_k + 127) // 128 * 128,
+                         FP4=fp4, RECIPROCAL=reciprocal, GROUP=16 if fp4 else 32,
+                         CHUNKS=16)
+        signature = dict(X=f"*{dtype}", Q="*u8" if fp4 else "*fp8e4nv", S="*u8",
+                         AG="*fp32", WG="*fp32", ALPHA="*fp32", M="i32")
+        source = ASTSource(
+            _quantize, signature, constexprs=constants,
+            attrs={(i,): [["tt.divisibility", 16]] for i in range(6)},
+        )
+        compiled = triton.compile(source, target=GPUTarget("cuda", 103, 32), options=options)
+        if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
+            raise RuntimeError(f"{name}: implicit launch scratch is unsupported")
+        directory = out / name
+        directory.mkdir()
+        (directory / (name + ".ptx")).write_text(compiled.asm["ptx"])
+        (directory / (name + ".cubin")).write_bytes(compiled.asm["cubin"])
+        (directory / (name + ".mlir")).write_text(compiled.asm["ttgir"])
+        (directory / (name + ".metadata.json")).write_text(json.dumps({
+            "role": "supporting activation packing; core GEMM remains CuTe DSL",
+            "signature": signature, "constants": constants, "options": options,
+            "metadata": compiled.metadata._asdict(),
+        }, indent=2, default=str) + "\n")
+        launches[name] = compiled
+    return launches
+
+
 def compile_fp8(out):
     """Compile the production tensor and compact K128 FP8 launch factory."""
     import cutlass.cute as cute
@@ -1410,6 +1455,7 @@ def main():
             "fp8",
             "fp6",
             "block_fp8_linear",
+            "activation_packing",
             "all",
         ),
         default="moe",
@@ -1529,6 +1575,8 @@ def main():
             launches.update(compile_fp6(out))
         if args.component in ("block_fp8_linear", "all"):
             launches.update(compile_block_fp8_linear(out))
+        if args.component in ("activation_packing", "all"):
+            launches.update(compile_activation_packing(out))
         artifacts = []
         for key in launches:
             name = key if isinstance(key, str) else key[0] + "_" + key[1].__name__
@@ -1576,7 +1624,8 @@ def main():
                             "bytes": p.stat().st_size,
                             "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
                         }
-                        for p in [*ptxs, *cubins, *directory.glob("*.mlir"), *inspected]
+                        for p in [*ptxs, *cubins, *directory.glob("*.mlir"),
+                                  *directory.glob("*.metadata.json"), *inspected]
                     },
                 }
             )

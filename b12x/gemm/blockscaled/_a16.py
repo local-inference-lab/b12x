@@ -109,11 +109,11 @@ def _overlap(a, b):
             and b.data_ptr() < a.data_ptr() + a.numel() * a.element_size())
 
 
-def _validate_output(source, out, n):
+def _validate_output(source, out, n, dtype=torch.bfloat16):
     shape = (*source.shape[:-1], n)
     if out is None:
-        return torch.empty(shape, device=source.device, dtype=torch.bfloat16)
-    _check_tensor("out", out, source.device, torch.bfloat16)
+        return torch.empty(shape, device=source.device, dtype=dtype)
+    _check_tensor("out", out, source.device, dtype)
     if tuple(out.shape) != shape:
         raise ValueError(f"out must have shape {shape}")
     return out

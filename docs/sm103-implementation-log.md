@@ -854,3 +854,38 @@ profiles, and an isolated wheel import resolves the 65,544-route plan. The
 [route-grid receipt](sm103-route-grid-validation.json) binds commands, sources
 and artifacts. Companion vLLM integration is separate work in
 `feat/b12x-sm103` at `/home/jasonc/vllm-sm103`.
+
+## MXFP8 serving capacities and workspace
+
+Status: implemented and cross-compiled; physical SM103 execution remains
+unqualified. Packed MXFP8 calls accept caller-owned output and scratch for
+FP16 activations, using the existing activation quantizer and CuTe GEMM.
+BF16 activations retain b12x precision selection. Prewarm covers all selected
+precision configurations inside configured capacity buckets and preserves
+endpoint calls without a capacity hint. The companion vLLM adapter retains
+configured capacities, borrows shared workspace and uses an opaque Torch
+operator to select a covering capacity without tracing live counts into kernel
+resolution. Capture retains the borrowed scratch buffer.
+
+Validation: 51 b12x host tests pass, with 255 hardware skips. SM120 runs pass
+215 b12x tests, with 36 skips, and six focused b12x cases under both sanitizers.
+The companion passes 53 host tests and twelve BF16/FP16 eager/Inductor MXFP8
+serving cases under memcheck and synccheck. Sanitizers report zero kernel
+errors. Graph checks freeze kernel resolution, mutate inputs, poison scratch
+and output, compare independent quantization oracles, and require stable
+addresses with no replay allocation. These are operator checks, not model evals.
+
+Targeted SM103 compilation covers 36 dense callables and ten supporting
+activation-packing callables. Dense resources, exact register counts and
+instruction counts match the prior route-grid artifacts; all 22 TMEM readers
+retain completion waits. Four NVFP4 packing variants have eight-byte stack
+frames and FP32 division slow-path calls, with no SASS local loads/stores.
+Their math is unchanged; retain these flags for B300 profiling. MXFP8 packing
+has no stack/local-memory flags. Wheel and sdist match all 457 package Python
+files and three embedded profiles. The [validation receipt](sm103-linear-workspace-validation.json)
+binds commands, source identities, artifacts and limitations.
+
+NVFP4, MXFP4 and tensor/block FP8 serving adapters still need configured
+capacity and workspace integration. DeepSeek output projection, remaining
+Trellis formats, GLM/DeepSeek feedback, complete model evaluation and Station
+HBM transport remain implementation or integration work.

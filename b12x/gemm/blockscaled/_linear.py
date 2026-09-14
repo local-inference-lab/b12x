@@ -815,16 +815,16 @@ def blockscaled_mm(
 
     if isinstance(rhs, NVFP4LinearWeight) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
-        and lhs.dtype == torch.bfloat16
+        and lhs.dtype in (torch.bfloat16, torch.float16)
     ):
         if not isinstance(lhs, torch.Tensor):
             raise TypeError("packed NVFP4 linear requires a BF16 source tensor")
         options = dict(kwargs)
         bias = options.pop("bias", None)
         out_dtype = options.pop("out_dtype", None)
-        if out_dtype not in (None, torch.bfloat16):
-            raise ValueError("BF16 blockscaled linear output must be BF16")
-        _validate_bias(bias, out_features=rhs.out_features, out_dtype=torch.bfloat16,
+        if out_dtype not in (None, lhs.dtype):
+            raise ValueError("packed blockscaled output dtype must match its source")
+        _validate_bias(bias, out_features=rhs.out_features, out_dtype=lhs.dtype,
                        device=lhs.device)
         if bias is not None and out is not None:
             from ._a16 import _overlap
