@@ -31,8 +31,19 @@ from ._policy import MOE_DECODE_POLICY, MoeDecodeConfig, MoeDecodeQuery
 BACKEND = "tcgen05_trellis"
 
 
+def paired_records(weight_plan):
+    return (
+        weight_plan.source_format == "btx"
+        and getattr(weight_plan, "trellis_rate_granularity", None) == "per_expert_pair"
+    )
+
+
+def atom_group_size(weight_plan):
+    return 256 if paired_records(weight_plan) else getattr(weight_plan, "trellis_group_size", None)
+
+
 def atom_layout(weight_plan):
-    return getattr(weight_plan, "trellis_group_size", None) is not None
+    return getattr(weight_plan, "trellis_group_size", None) is not None or paired_records(weight_plan)
 
 
 def projection_mixed(weight_plan):
@@ -106,15 +117,17 @@ def validate_weight_plan(weight_plan):
     granularities = (
         (None, "uniform", "per_layer", "per_expert", "per_expert_projection")
         if weight_plan.source_format == "b12x_trellis"
-        else (None, "uniform", "per_layer")
+        else (None, "uniform", "per_layer", "per_expert_pair")
     )
     if (
-        weight_plan.trellis_pair_kinds
+        (weight_plan.trellis_pair_kinds and not paired_records(weight_plan))
         or weight_plan.trellis_rate_granularity not in granularities
     ):
         raise UnsupportedArchitectureError(
-            "SM103 Trellis requires canonical atom rates or uniform/projection-tiered records; legacy BTX paired records remain unsupported"
+            "SM103 Trellis requires canonical atom rates, BTX paired records or uniform/projection-tiered records"
         )
+    if paired_records(weight_plan) and weight_plan.intermediate_size % 256:
+        raise UnsupportedArchitectureError("BTX paired execution requires whole 256-channel pairs")
     validate_codebook_bits(weight_plan.trellis_codebook, weight_plan.trellis_bits)
     if weight_plan.coupled_hadamard and (
         weight_plan.hidden_size % 512 or weight_plan.activation != "situ"
@@ -292,7 +305,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            5,
+            6,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),
@@ -306,7 +319,8 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("io_dtype", str(caps.dtype)),
             ("projection_mixed", mixed),
             ("dual_input", getattr(kernel, "dual_input", False)),
-            ("atom_group_size", getattr(weight_plan, "trellis_group_size", None)),
+            ("atom_group_size", atom_group_size(weight_plan)),
+            ("paired_records", paired_records(weight_plan)),
         )
         if offline:
             fn = cute.compile(kernel, *args, options=options, no_jit_engine=True)
@@ -412,10 +426,11 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
                         k,
                         caps.weight_E,
                         routes,
-                        group_size=weight_plan.trellis_group_size,
+                        group_size=atom_group_size(weight_plan),
                         fc1=fc1,
                         codebook=codebook,
                         dual_input=dual,
+                        paired_records=paired_records(weight_plan),
                     ),
                     (
                         c.Float16,
@@ -590,14 +605,19 @@ def _atom_contract(caps, prepared):
     from .trellis_atoms import PreparedAtomTrellisWeights
 
     if not isinstance(prepared, PreparedAtomTrellisWeights):
-        raise ValueError("SM103 atom rates require prepared canonical atom weights")
+        raise ValueError("SM103 atom rates require prepared atom weights")
     if (
         prepared.hidden_size,
         prepared.intermediate_size,
         prepared.num_experts,
         prepared.group_size,
-    ) != (caps.k, caps.n, caps.weight_E, caps.weight_plan.trellis_group_size):
+    ) != (caps.k, caps.n, caps.weight_E, atom_group_size(caps.weight_plan)):
         raise ValueError("prepared Trellis atom geometry differs from the plan")
+    if (
+        prepared.paired_records != paired_records(caps.weight_plan)
+        or prepared.source_format != caps.weight_plan.source_format
+    ):
+        raise ValueError("prepared Trellis atom record order differs from the plan")
     stride = prepared.row_stride_words
     if type(stride) is not int or stride <= 0 or stride % 4:
         raise ValueError(

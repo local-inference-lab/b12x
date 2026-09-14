@@ -1,4 +1,4 @@
-"""SM103 projection directly from grouped canonical Trellis atom planes."""
+"""SM103 projection directly from canonical or BTX paired Trellis atom planes."""
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -11,7 +11,8 @@ from .trellis_gemm import RoutedTrellisGemm
 
 class RoutedAtomTrellisGemm(RoutedTrellisGemm):
     def __init__(
-        self, n, k, experts, capacity, *, group_size, fc1, codebook, dual_input=False
+        self, n, k, experts, capacity, *, group_size, fc1, codebook,
+        dual_input=False, paired_records=False,
     ):
         super().__init__(
             n,
@@ -34,10 +35,15 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
                 "Trellis atom group size must be a positive multiple of 32 dividing I"
             )
         self.group_size = group_size
+        if paired_records and group_size != 256:
+            raise ValueError("BTX paired records require 256-channel rate groups")
+        self.paired_records = paired_records
         self.groups = self.intermediate // group_size
         self.fc1 = fc1
         self.min_bits = 5 if codebook == "sqg_fp16" else 2
-        self.max_bits = 4 if codebook == "sqg_e4m3" else 6
+        if paired_records and codebook not in {"mcg", "sqg_e4m3"}:
+            raise ValueError("BTX paired records require MCG or SQG E4M3")
+        self.max_bits = 4 if codebook == "sqg_e4m3" or paired_records else 6
 
     @cute.jit
     def __call__(
@@ -179,6 +185,10 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             slot, plane, hidden_tile = global_n // 2, global_n % 2, global_k
         else:
             slot, plane, hidden_tile = global_k // 2, global_k % 2, global_n
+        if c.const_expr(self.paired_records):
+            intermediate_tile = global_n if c.const_expr(self.fc1) else global_k
+            slot = (intermediate_tile // 16) * 8 + intermediate_tile % 8
+            plane = (intermediate_tile // 8) % 2
         valid = valid & (slot >= 0) & (slot < self.intermediate // 32)
         valid = valid & (hidden_tile >= 0) & (hidden_tile < self.hidden // 16)
         offset, code = c.Int64(-1), c.Int32(0)
@@ -200,6 +210,12 @@ class RoutedAtomTrellisGemm(RoutedTrellisGemm):
             & (high >= self.min_bits)
             & (high <= self.max_bits)
         )
+        if c.const_expr(self.paired_records):
+            # Internal nibbles are reversed from the BTX rate-byte convention.
+            valid = valid & (
+                (code == 0x22) | (code == 0x33) | (code == 0x42)
+                | (code == 0x34) | (code == 0x44)
+            )
         valid = (
             valid & (offset >= 0) & (offset <= stride) & (section <= stride - offset)
         )

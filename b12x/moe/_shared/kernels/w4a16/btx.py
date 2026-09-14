@@ -15,6 +15,7 @@ import hashlib
 import json
 import pathlib
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -37,6 +38,9 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
     _restore_plane_words,
     prepare_trellis256_moe_weights,
 )
+
+if TYPE_CHECKING:
+    from b12x.moe.fused_moe.trellis_atoms import PreparedAtomTrellisWeights
 
 _EXPERT_CHUNK = 64
 
@@ -374,11 +378,21 @@ def prepare_btx_moe_weights(
     tile_config: tuple[int, int, int, int] | None = None,
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
-) -> PreparedW4A16MoeWeights:
+) -> PreparedW4A16MoeWeights | PreparedAtomTrellisWeights:
     """Prepare one BTX rank extent for the fused W4A16 serving path."""
 
     manifest = layer.manifest
     device = torch.device(device)
+    if manifest.rates.structure == RATE_STRUCTURE_PER_EXPERT_PAIR:
+        from b12x._lib.architecture import supports_architecture
+
+        if supports_architecture(torch.cuda.get_device_capability(device), ("sm103a",)):
+            from b12x.moe.fused_moe.trellis_atoms import prepare_btx_atom_weights
+
+            return prepare_btx_atom_weights(
+                layer, activation=activation, device=device, params_dtype=params_dtype,
+                dummy_scale=dummy_scale, workspace=workspace,
+            )
     gate_suh, up_suh, down_svh, intermediate = _extent_rotation_tables(
         layer, device
     )
@@ -389,15 +403,7 @@ def prepare_btx_moe_weights(
         # The coupled residual transform interleaves gate/up into one
         # length-2I axis whose two stored halves each carry one input-side
         # table. Both physical FC1 slots use the same column-wise split.
-        pre_half_slots = manifest.geometry.atom_slots // 2
-        if layer.first_slot < pre_half_slots < layer.first_slot + layer.slot_count:
-            input_scale_split = (
-                pre_half_slots - layer.first_slot
-            ) * manifest.geometry.atom_channels
-        else:
-            source_suh = gate_suh if layer.first_slot < pre_half_slots else up_suh
-            gate_suh = source_suh
-            up_suh = source_suh
+        gate_suh, up_suh, input_scale_split = _coupled_input_tables(layer, gate_suh, up_suh)
 
     if manifest.rates.structure == RATE_STRUCTURE_UNIFORM:
         assert manifest.rates.bits is not None
@@ -461,6 +467,15 @@ def prepare_btx_moe_weights(
         dummy_scale=dummy_scale,
         workspace=workspace,
     )
+
+
+def _coupled_input_tables(layer, gate_suh, up_suh):
+    pre_half_slots = layer.manifest.geometry.atom_slots // 2
+    if layer.first_slot < pre_half_slots < layer.first_slot + layer.slot_count:
+        split = (pre_half_slots - layer.first_slot) * layer.manifest.geometry.atom_channels
+        return gate_suh, up_suh, split
+    source = gate_suh if layer.first_slot < pre_half_slots else up_suh
+    return source, source, None
 
 
 def _prepare_btx_pair_extent(

@@ -7010,6 +7010,16 @@ def plan_tp_moe_execution(
         raise UnsupportedArchitectureError(
             "Trellis atom-plane rates require the SM103 backend"
         )
+    if weight_plan.trellis_pair_kinds and (
+        weight_plan.coupled_hadamard
+        or weight_plan.intermediate_size != 256
+        or weight_plan.trellis_pair_kinds not in (
+            frozenset({"P33"}), frozenset({"P33", "P24"}), frozenset({"P33", "P43"}),
+        )
+    ):
+        raise UnsupportedArchitectureError(
+            "SM12x BTX paired execution requires one ordinary 256-channel pair with {P33}, {P33,P24} or {P33,P43}"
+        )
     k = weight_plan.hidden_size
     n = weight_plan.intermediate_size
     source_format = weight_plan.source_format

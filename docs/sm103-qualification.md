@@ -1,7 +1,7 @@
 # SM103 / B300 qualification
 
 Status: **implemented prototype, unqualified on B300**. The normal b12x API
-selects native NVFP4 and uniform, projection-tiered or grouped atom Trellis MoE
+selects native NVFP4 and uniform, projection-tiered, grouped atom or BTX paired Trellis MoE
 backends for SM103. Physical SM103 execution, complete GLM serving, V4.1 serving
 and Station RDMA remain unqualified. No B300 performance
 numbers or measured B300 policy profile are included.
@@ -12,7 +12,7 @@ numbers or measured B300 policy profile are included.
 | --- | --- | --- |
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
-| Trellis | Native uniform, projection-tiered and grouped atom MoE with MCG, SQG E4M3 or SQG FP16 codebooks; ordinary/coupled transforms, global draw coordinates and distinct input-scale halves; inline FP16 tcgen05 projections, routing and weighted reduction; host and SM120 tests and SM103 compilation | Native complete-expert numerics and graphs; legacy BTX paired records remain unsupported |
+| Trellis | Native uniform, projection-tiered, grouped atom and BTX paired MoE with MCG, SQG E4M3 or SQG FP16 codebooks; ordinary/coupled transforms, global draw coordinates and distinct input-scale halves; inline FP16 tcgen05 projections, routing and weighted reduction; host and SM120 tests and SM103 compilation | Native complete-expert numerics and graphs; frozen QSRT coupled high-rate conversion remains unsupported |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
@@ -153,9 +153,9 @@ python scripts/qualify_sm103.py --execute --device-uuid GPU-actual-B300-UUID \
 
 Use `--component kda_decode --sanitizer /path/to/compute-sanitizer` to run the
 same suite under memcheck; `--sanitizer-tool synccheck` checks synchronization.
-Full-model serving, paired/grouped Trellis records,
-Grace/Station behavior, and plugin installation are explicitly outside this
-operator suite. Passing it does not enable a model-wide serving route.
+Full-model serving, Grace/Station behavior, and plugin installation are
+explicitly outside this operator suite. Trellis atom and BTX pair tests are
+included in the `trellis_atoms` suite. Passing it does not enable a model-wide serving route.
 
 ## Quantized projections
 
@@ -874,7 +874,7 @@ the native SM103 GEMM. See the
 
 ## Trellis and V4.1
 
-Status: **uniform, projection-tiered and grouped atom MoE implemented and cross-compiled; B300 execution
+Status: **uniform, projection-tiered, grouped atom and BTX paired MoE implemented and cross-compiled; B300 execution
 unqualified**. The existing MoE plan/bind/run API selects `tcgen05_trellis`.
 The native FP16 projection decodes t256 records directly into shared memory
 and accumulates with tcgen05/TMEM. Each CTA handles one route and 128 output
@@ -941,8 +941,25 @@ compiled callables. Portable SM120 tests cover exact plane decoding, malformed
 metadata, group boundaries, graph mutation and atom rows beyond 2^31 words.
 SM120/SM121 reject this layout before execution. The
 [grouped atom validation receipt](sm103-trellis-atoms-validation.json) records
-the source, compile artifacts and regression evidence. Legacy BTX paired
-records remain unsupported.
+the source, compile artifacts and regression evidence.
+
+BTX `per_expert_pair` preparation retains the compressed atom rows and supports
+P22, P33, P24, P43 and P44 with MCG or SQG E4M3, including coupled H512/H128
+transforms. Local intermediate widths are positive multiples of 256. Each pair
+contains two separate 128-channel records: the kernel selects the atom and
+plane for that record, while preparation restores the record order of the
+scale vectors and normalizes the rate-byte nibbles. These are static layout
+facts; live counts and rate/offset tables remain runtime arguments. Preparation
+uses the existing BTX reader and compatibility API, and the native plan retains
+the same scratch and prewarm lifecycle as canonical atom plans.
+
+The [BTX pair validation receipt](sm103-btx-pairs-validation.json) records host
+binding checks, independent SM120 operand reconstruction, graph mutation,
+large offsets, sanitizer results and SM103 compilation. Complete expert
+execution remains unqualified on SM103. SM120/SM121 retain the coalesced
+single-pair implementation and its narrower rate/transform restrictions.
+Frozen QSRT coupled high-rate containers still require a reviewed conversion
+into the declared BTX layout.
 
 SQG FP16 uses the existing 416-byte D3L descriptor and preserves its FP16
 reconstruction law for uniform and grouped K5/K6 planes. Ordinary and coupled
@@ -953,8 +970,8 @@ preparation also passes complete SM120 expert execution and graph replay.
 Grouped execution remains specific to the SM103 backend. See the
 [SQG FP16 validation receipt](sm103-trellis-fp16-validation.json).
 The shared dual-input epilogue computes a bounded tile cutoff in Int64 before
-narrowing and selects the contributing row with boolean predicates. All eleven
-compiled dual-input variants use 138 registers with no stack or local traffic.
+narrowing and selects the contributing row with boolean predicates. The eleven dual-input variants
+in that receipt use 138 registers with no stack or local traffic.
 This is compile evidence; runtime occupancy and performance await B300.
 
 Coupled extents crossing two
@@ -1060,8 +1077,8 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Legacy BTX paired records and complete MTP
-execution remain model blockers.
+fit. Preserve HBM for KV, scratch and graph pools. Frozen QSRT coupled high-rate
+conversion and complete MTP execution remain model blockers.
 
 ## Engram placement
 
@@ -1149,7 +1166,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
 | Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
-| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including SQG FP16, unequal plane rates, 384-expert records, nonzero draw extents and distinct input-scale halves; implement legacy BTX paired records where required |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including SQG FP16, unequal plane rates, 384-expert records, nonzero draw extents, distinct input-scale halves and BTX paired records; implement frozen QSRT coupled high-rate conversion where required |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
 | MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |

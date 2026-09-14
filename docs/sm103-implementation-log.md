@@ -1407,3 +1407,39 @@ Legacy BTX paired records, complete GLM/DeepSeek speculative integration and
 model evaluation, matching native vLLM builds, ARM64 installation/native helpers,
 available-host SM121 regression and Station direct-HBM transport remain open.
 Physical SM103 execution remains unqualified.
+
+
+## BTX paired-record execution
+
+Declared BTX P22, P33, P24, P43 and P44 records use the native SM103 atom
+backend through the existing compatibility preparation and plan/bind/run APIs.
+MCG and SQG E4M3 support ordinary or coupled transforms and multiple complete
+256-channel pairs per rank. Preparation retains compressed rows, normalizes
+rate nibbles, restores record-major scale order and retains global coupled
+draw/input-scale-half coordinates. Runtime metadata guards reject unknown pair
+codes. SM12x keeps its coalesced single-pair implementation and existing limits.
+
+The [BTX validation receipt](sm103-btx-pairs-validation.json) binds package
+source `eacb5a7d5d2e6192c0a997769eff80ea68b6a47328252dc70cfb0d3ffeb5f411`
+to 375 SM103 Trellis callables, including 58 paired-record specializations.
+All 317 preceding callables retain identical PTX; 287 retain identical cubins,
+and the remaining 30 retain identical resource metrics. No existing resource
+metric increases, no stack/local-traffic flags appear, and all 99 TMEM readers
+retain completion waits. Paired single-input projections use 140 allocated
+registers; the two dual-input variants use 138. These are static measurements.
+
+Validation passes 734 host tests, 158 SM120 tests and 122 host tests with the
+companion Torch 2.13 environment. Memcheck and synccheck each pass eight
+portable staging tests with zero kernel errors, including the atom-row offset
+case beyond 2^31 words. The documented SM120 CUDA API reporting exception
+remains explicit. Six complete BTX MoE cases require physical SM103; the atom
+qualification suite collects 74 cases. Wheel and sdist contents match all 471
+package files, and extracted-wheel imports pass outside the checkout.
+
+An initial compile attempt was rejected because package source changed during
+compilation. A subsequent build lacked the explicit runtime pair-vocabulary
+guard and is retained as diagnostic evidence. The release build uses frozen
+source and fresh caches. Frozen QSRT coupled high-rate conversion, complete
+GLM/DeepSeek speculative integration and model evaluation, matching native
+vLLM/ARM64 builds, available-host SM121 regression and Station direct-HBM
+transport remain open. Physical SM103 execution remains unqualified.
