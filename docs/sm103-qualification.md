@@ -21,7 +21,7 @@ numbers or measured B300 policy profile are included.
 | DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
-| DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables | Native two-stage numerics and graphs; companion vLLM plan retention and warmup remain source work |
+| DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Implement capability routing, target/draft contracts and transport before physical qualification |
 
@@ -170,6 +170,18 @@ WO backend baseline; six increase allocated GPRs by two or four. The receipt
 retains every delta for B300 profiling. Native GEMM cubins are byte-identical
 to that baseline. These are static resource results; occupancy and performance
 remain unqualified. The complete SM103 corpus has not been rebuilt.
+
+The companion vLLM adapter retains configured WO capacity plans, prewarms both
+position dtypes through the public b12x API, and binds an independent BF16 output
+that survives shared-scratch reuse. Its four eager/Inductor serving cases pass
+SM120 memcheck and synccheck with zero kernel errors. They exercise arbitrary
+positive FP32 128x128 checkpoint scales and 32x32 UE8M0 scales, padded attention
+rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution.
+The companion `docs/design/b12x_wo_serving_validation.json` records source and
+native-library identities. Complete DeepSeek SM103 selection remains rejected
+because compressed attention and indexer still need retained capacity planning,
+warmup and capture ownership. The model selector honors the adapter's
+architecture gate even when individual b12x operators support SM103.
 
 ```bash
 python scripts/compile_sm103.py --component wo_projection \
@@ -1004,11 +1016,12 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | B300 MoE correctness | `sm103/nvfp4_gemm.py`, `pointwise.py`, `launch.py`: oracle, sanitizer, live-capacity and real-weight graph tests |
 | Tiny-M/prefill scheduling | `fused_moe/_sm103.py`, `_policy.py`: implement separate strategies, then race M1/M4/M8/prefill under native plans |
 | GLM NSA/MLA | `attention/sparse_mla`: physical SM103 qualification of implemented GLM warp paths |
-| DeepSeek compressed attention | `attention/compressed_sparse_mla/_warp.py`, `attention/_shared/mla/kv_cache.py`: physical SM103 qualification of V4/V4.1 numerics, native cache writes, head tails, high page IDs, and graph replay |
+| DeepSeek compressed attention | `attention/compressed_sparse_mla/_warp.py`, `attention/_shared/mla/kv_cache.py`: physical SM103 qualification of V4/V4.1 numerics, native cache writes, head tails, high page IDs, and graph replay; companion `vllm/models/deepseek_v4/nvidia/b12x.py`: retain capacity plans, pass decode/extend and cache geometry into planning, and prepare capture resources |
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
-| DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; add the companion vLLM WO plan owner, retained scratch and warmup before enabling its SM103 attention route |
+| DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
+| Serving indexer ownership | Companion `vllm/models/deepseek_v4/nvidia/b12x_indexer.py` and `vllm/v1/attention/backends/mla/b12x_indexer.py`: replace live-row and page-table plan keys with configured capacities, retained scratch and eager warmup; prove reuse under frozen resolution |
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and MCG projection-tiered execution, including 384-expert records; add paired/grouped or coupled mixed rates required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
