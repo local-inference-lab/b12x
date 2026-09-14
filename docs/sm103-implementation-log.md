@@ -824,3 +824,33 @@ Qwen tensor contract; GLM and DeepSeek feedback require their own contract
 validation. These are source-level integration tasks. Paired/grouped or coupled
 mixed-rate Trellis, complete MTP/DFlash2 and GLM/V4.1 serving, and Station
 HBM registration/transport remain implementation work.
+
+
+## Native MoE prefill route capacity
+
+Status: implemented and cross-compiled; native execution remains unqualified
+on physical SM103. Routed projection, input quantization and output reduction
+place the route or token count on the CUDA X grid axis. The public planner
+admits 8,192 tokens with eight selected experts and rejects Int32 count
+overflow or excessive projection-column grids. Compile contract 2 and MoE
+candidate contract 22 invalidate incompatible cached artifacts and sweeps.
+The public architecture-capability helper is exported, and the MXFP8
+compatibility API advertises its implemented SM103 backend.
+
+Validation: 345 host tests pass with 21 hardware-dependent skips. All 13
+portable pointwise tests pass under SM120 memcheck and synccheck with zero
+kernel errors. The large case executes 131,074 routes and captures reduction
+for 65,537 tokens with input mutation and no replay allocation. Its dyadic
+operands permit an exact FP32 reference despite fused arithmetic. The native
+MoE suite adds M1/M8192/M8193 replay under frozen kernel resolution with one
+capacity plan; those cases remain deferred to B300.
+
+The source-bound corpus contains 748 callables and 756 CUDA entries; an
+additional nine-callable compilation covers capacity 8193. Input quantizers
+gain three allocated GPRs. Exact R/UR register-count increases remain recorded,
+with no additional stack or local-memory flags. All 104 TMEM readers retain
+completion waits. Wheel and sdist match 457 package Python files and three
+profiles, and an isolated wheel import resolves the 65,544-route plan. The
+[route-grid receipt](sm103-route-grid-validation.json) binds commands, sources
+and artifacts. Companion vLLM integration is separate work in
+`feat/b12x-sm103` at `/home/jasonc/vllm-sm103`.

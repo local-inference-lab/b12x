@@ -85,7 +85,7 @@ def test_identity_normalizes_and_preserves_sm103():
     assert resolution.device == B300
 
 
-@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 256])
+@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 256, 8192, 65536])
 def test_policy_capacity_arms(tokens):
     q = query(num_tokens=tokens, routed_rows=tokens * 8)
     result = PolicyContext.for_identity(B300).resolve(MOE_DECODE_POLICY, q)
@@ -542,3 +542,23 @@ def test_sm103_generator_filters_unsupported_recipes_and_route_capacities():
         )
         expected = BACKEND if g.recipe.quant_mode == "nvfp4" else "tcgen05_trellis"
         assert len(candidates) == 1 and candidates[0].config["backend"] == expected
+
+
+def test_sm103_route_count_rejects_int32_overflow():
+    with pytest.raises(UnsupportedArchitectureError, match="Int32 launch-count"):
+        PolicyContext.for_identity(B300).resolve(
+            MOE_DECODE_POLICY, query(num_tokens=2**28, routed_rows=2**31)
+        )
+
+
+def test_public_capability_queries_keep_operation_coverage(monkeypatch):
+    import b12x
+    from b12x._lib import gating
+    from b12x.gemm import mxfp8_linear
+
+    assert b12x.supports_architecture((10, 3), mxfp8_linear.META.archs)
+    assert not b12x.supports_architecture((10, 3), b12x.find_op('attention.paged').archs)
+    monkeypatch.setattr(gating, 'get_compute_capability', lambda *args: (10, 3))
+    monkeypatch.setattr(gating, 'has_cutlass_dsl', lambda: True)
+    monkeypatch.setattr(gating, 'has_triton', lambda: True)
+    assert mxfp8_linear.is_supported()

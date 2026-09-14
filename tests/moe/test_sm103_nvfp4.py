@@ -112,3 +112,54 @@ def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_lay
             )
     finally:
         b12x.unfreeze_kernel_resolution()
+
+
+def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
+    """An eight-expert prefill reuses decode callables past 65,535 routes."""
+    device = require_sm103()
+    capacity, top_k, period = 8193, 8, 8
+    prepared, plan, scratch = case(
+        device, experts=8, top_k=top_k, capacity=capacity
+    )
+    rows = torch.arange(capacity, device=device) % period
+    source = torch.randn((period, 256), device=device, dtype=torch.bfloat16) * 0.1
+    source_ids = torch.arange(period * top_k, device=device).reshape(period, top_k)
+    source_ids = (source_ids + torch.arange(period, device=device)[:, None]) % 8
+    source_weights = torch.rand((period, top_k), device=device)
+    a, ids, weights = source[rows], source_ids[rows], source_weights[rows]
+    scratch_ptr = scratch.data_ptr()
+    b12x.freeze_kernel_resolution("SM103 prefill route boundary")
+    try:
+        for live in (1, 8192, capacity):
+            binding = fused_moe.bind(
+                plan,
+                scratch=scratch,
+                experts=prepared,
+                a=a[:live],
+                topk_ids=ids[:live],
+                topk_weights=weights[:live],
+            )
+            actual = fused_moe.run(binding=binding)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fused_moe.run(binding=binding)
+            source.mul_(0.75)
+            source_weights.mul_(0.5)
+            a.copy_(source[rows])
+            weights.copy_(source_weights[rows])
+            expected = reference(
+                source, prepared._impl, source_ids, source_weights
+            )[rows[:live]]
+            actual.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            assert scratch.data_ptr() == scratch_ptr
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
+            assert F.cosine_similarity(
+                actual.float().flatten(), expected.float().flatten(), dim=0
+            ) > 0.999
+    finally:
+        b12x.unfreeze_kernel_resolution()

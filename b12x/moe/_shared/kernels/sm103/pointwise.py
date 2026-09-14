@@ -53,7 +53,7 @@ class RoutedQuantize:
             sf, cute.make_layout(Int64(live_routes) * 128 * (self.k // 16))
         )
         self.kernel(x, ids, gs, q, sf, live_routes, scale_stride).launch(
-            grid=(cute.ceil_div(self.k // 16, 128), live_routes, 1),
+            grid=(live_routes, cute.ceil_div(self.k // 16, 128), 1),
             block=(128, 1, 1),
             stream=stream,
         )
@@ -70,7 +70,7 @@ class RoutedQuantize:
         scale_stride: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        block, route, _ = cute.arch.block_idx()
+        route, block, _ = cute.arch.block_idx()
         group = block * 128 + tid
         route64 = Int64(route)
         if group < self.k // 16:
@@ -148,7 +148,7 @@ class TopKSum:
         )
         output = cute.make_tensor(output, cute.make_layout(Int64(tokens) * self.hidden))
         self.kernel(routes, weights, output, tokens).launch(
-            grid=(cute.ceil_div(self.hidden, 128), tokens, 1),
+            grid=(tokens, cute.ceil_div(self.hidden, 128), 1),
             block=(128, 1, 1),
             stream=stream,
         )
@@ -162,7 +162,7 @@ class TopKSum:
         tokens: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        block, token, _ = cute.arch.block_idx()
+        token, block, _ = cute.arch.block_idx()
         col = block * 128 + tid
         if col < self.hidden:
             value = Float32(0.0)

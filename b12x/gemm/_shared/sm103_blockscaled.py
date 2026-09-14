@@ -266,9 +266,10 @@ class BlockscaledGemm:
         ) * atom_thr_size
 
         grid = (
+            live_rows if cutlass.const_expr(self.routed) else
             cute.ceil_div(c_tensor.shape[0], self.cta_tile_shape_mnk[0]),
             cute.ceil_div(c_tensor.shape[1], self.cta_tile_shape_mnk[1]),
-            live_rows if cutlass.const_expr(self.routed) else self.experts,
+            1 if cutlass.const_expr(self.routed) else self.experts,
         )
 
         self.kernel(
@@ -326,6 +327,10 @@ class BlockscaledGemm:
         tidx, _, _ = cute.arch.thread_idx()
 
         bidx, bidy, bidz = cute.arch.block_idx()
+        if cutlass.const_expr(self.routed):
+            # Routed matrices have one M tile; X carries the runtime route count.
+            bidz = bidx
+            bidx = cutlass.Int32(0)
 
         valid = cutlass.Boolean(True)
         safe_expert = bidz

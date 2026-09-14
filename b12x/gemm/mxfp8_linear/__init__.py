@@ -19,6 +19,7 @@ META = OpMeta(
     entry_points=("Weight", "BlockscaledQuery", "FixedBlockscaledQuery", "plan", "query_from_call", "mm", "pack_weight", "is_supported"),
     dtypes=("bf16", "fp16"),
     recipes=("mxfp8",),
+    archs=("sm103a", "sm120a", "sm121a"),
     requires=("triton",),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
