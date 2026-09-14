@@ -87,6 +87,12 @@ def _validate_query(query: PcieQuery, device) -> None:
             raise ValueError("unsupported DS4.1 replica compression/page/stripe geometry")
         if not 0 < call["max_tokens"] <= query.setup["max_tokens"]:
             raise ValueError("replica declaration exceeds the channel's token capacity")
+        cycles, tail = divmod(call["max_tokens"], call["stripe"] * query.world_size)
+        max_owned = cycles * call["stripe"] + min(tail, call["stripe"])
+        if max_owned > query.setup["local_capacity"]:
+            raise ValueError(
+                "replica stripe geometry exceeds the channel's owner capacity"
+            )
 
 
 TUNING = replace(TUNING, query_schema_version=4, validate_query=_validate_query)
