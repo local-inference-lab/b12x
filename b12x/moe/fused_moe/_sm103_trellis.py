@@ -31,10 +31,15 @@ from ._policy import MOE_DECODE_POLICY, MoeDecodeConfig, MoeDecodeQuery
 BACKEND = "tcgen05_trellis"
 
 
+def atom_layout(weight_plan):
+    return getattr(weight_plan, "trellis_group_size", None) is not None
+
+
 def projection_mixed(weight_plan):
     return (
         weight_plan.source_format == "b12x_trellis"
         and weight_plan.trellis_codebook == "mcg"
+        and not atom_layout(weight_plan)
     )
 
 
@@ -100,7 +105,7 @@ def validate_weight_plan(weight_plan):
         )
     granularities = (
         (None, "uniform", "per_layer", "per_expert", "per_expert_projection")
-        if projection_mixed(weight_plan)
+        if weight_plan.source_format == "b12x_trellis"
         else (None, "uniform", "per_layer")
     )
     if (
@@ -108,7 +113,7 @@ def validate_weight_plan(weight_plan):
         or weight_plan.trellis_rate_granularity not in granularities
     ):
         raise UnsupportedArchitectureError(
-            "SM103 Trellis requires uniform or MCG projection rates; paired/grouped records remain unsupported"
+            "SM103 Trellis requires canonical atom rates or uniform/projection-tiered records; legacy BTX paired records remain unsupported"
         )
     validate_codebook_bits(weight_plan.trellis_codebook, weight_plan.trellis_bits)
     if weight_plan.coupled_hadamard and (
@@ -241,6 +246,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     from .._shared.kernels.sm103.launch import pointer
     from .._shared.kernels.sm103.trellis_gemm import RoutedTrellisGemm
     from .._shared.kernels.sm103.trellis_mixed_gemm import RoutedMixedTrellisGemm
+    from .._shared.kernels.sm103.trellis_atoms_gemm import RoutedAtomTrellisGemm
     from .._shared.kernels.sm103.trellis_transforms import (
         InputRotation,
         IntermediateRotation,
@@ -263,6 +269,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
         )
     weight_plan = caps.weight_plan
     mixed = projection_mixed(weight_plan)
+    atoms = atom_layout(weight_plan)
     coupled, bits, codebook = (
         weight_plan.coupled_hadamard,
         weight_plan.trellis_bits,
@@ -285,7 +292,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            3,
+            4,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),
@@ -299,6 +306,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("io_dtype", str(caps.dtype)),
             ("projection_mixed", mixed),
             ("dual_input", getattr(kernel, "dual_input", False)),
+            ("atom_group_size", getattr(weight_plan, "trellis_group_size", None)),
         )
         if offline:
             fn = cute.compile(kernel, *args, options=options, no_jit_engine=True)
@@ -346,7 +354,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
         (c.Float16, c.Float16, c.Int64, c.Float16, c.Float16),
         (c.Int32(1),),
     )
-    for rate in () if mixed else projection_rates(weight_plan):
+    for rate in () if mixed or atoms else projection_rates(weight_plan):
         for name, n, k in (("fc1", caps.n, caps.k), ("fc2", caps.k, caps.n)):
             for dual in (False, True) if coupled and name == "fc1" else (False,):
                 compile_case(
@@ -386,6 +394,42 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
                         c.Int64(1),
                         (c.Int64(0),) * 3,
                         (c.Int32(0),) * 3,
+                        c.Int32(1),
+                        c.Int64(k),
+                        c.Int64(n),
+                    ),
+                )
+    if atoms:
+        for name, n, k, fc1 in (
+            ("fc1_atoms", caps.n, caps.k, True),
+            ("fc2_atoms", caps.k, caps.n, False),
+        ):
+            for dual in (False, True) if coupled and fc1 else (False,):
+                compile_case(
+                    name + ("_dual" if dual else ""),
+                    RoutedAtomTrellisGemm(
+                        n,
+                        k,
+                        caps.weight_E,
+                        routes,
+                        group_size=weight_plan.trellis_group_size,
+                        fc1=fc1,
+                        codebook=codebook,
+                        dual_input=dual,
+                    ),
+                    (
+                        c.Float16,
+                        c.Uint32,
+                        c.Uint8,
+                        c.Int64,
+                        c.Int64,
+                        c.Uint8,
+                        c.Float16,
+                    ),
+                    (
+                        c.Int32(0 if fc1 else 2),
+                        c.Int64(1),
+                        c.Int64(1),
                         c.Int32(1),
                         c.Int64(k),
                         c.Int64(n),
@@ -542,6 +586,40 @@ def _mixed_contract(caps, prepared):
     return state, tuple(tuple(row) for row in offsets), counts
 
 
+def _atom_contract(caps, prepared):
+    from .trellis_atoms import PreparedAtomTrellisWeights
+
+    if not isinstance(prepared, PreparedAtomTrellisWeights):
+        raise ValueError("SM103 atom rates require prepared canonical atom weights")
+    if (
+        prepared.hidden_size,
+        prepared.intermediate_size,
+        prepared.num_experts,
+        prepared.group_size,
+    ) != (caps.k, caps.n, caps.weight_E, caps.weight_plan.trellis_group_size):
+        raise ValueError("prepared Trellis atom geometry differs from the plan")
+    stride = prepared.row_stride_words
+    if type(stride) is not int or stride <= 0 or stride % 4:
+        raise ValueError(
+            "Trellis atom row stride must be a positive multiple of four words"
+        )
+    _require_tensor(
+        prepared.w13,
+        "atom payload",
+        ((caps.n // 32) * stride,),
+        torch.int32,
+        caps.device,
+    )
+    shape = (caps.n // prepared.group_size, caps.weight_E, 3)
+    _require_tensor(
+        prepared.offsets, "atom group offsets", shape, torch.int64, caps.device
+    )
+    _require_tensor(prepared.rates, "atom group rates", shape, torch.uint8, caps.device)
+    if prepared.w13.data_ptr() % 16:
+        raise ValueError("Trellis atom payload must be aligned to 16 bytes")
+    return prepared.trellis
+
+
 @dataclass(frozen=True)
 class BackendPlan:
     buffers: tuple
@@ -609,7 +687,19 @@ class BackendPlan:
             raise ValueError("prepared Trellis experts do not match the plan")
         prepared = experts.representation_for("w4a16")
         mixed = projection_mixed(caps.weight_plan)
-        if mixed:
+        atoms = atom_layout(caps.weight_plan)
+        if atoms:
+            state = _atom_contract(caps, prepared)
+            if (
+                state.codebook != caps.weight_plan.trellis_codebook
+                or state.coupled_hadamard != caps.weight_plan.coupled_hadamard
+                or state.fc1_pair_kind is not None
+                or state.fc2_pair_kind is not None
+            ):
+                raise ValueError(
+                    "prepared atom codebook or transform differs from the plan"
+                )
+        elif mixed:
             state, offsets, counts = _mixed_contract(caps, prepared)
             if state.coupled_hadamard != caps.weight_plan.coupled_hadamard:
                 raise ValueError(
@@ -661,7 +751,7 @@ class BackendPlan:
                     tensor, name, (route_experts,), torch.int32, caps.device
                 )
         words = 0
-        if not mixed:
+        if not mixed and not atoms:
             words = caps.weight_E * (caps.k // 16) * (caps.n // 16) * 8 * state.bits
             _require_tensor(
                 prepared.w13, "gate/up payload", (2 * words,), torch.int32, caps.device
@@ -754,6 +844,8 @@ class BackendPlan:
         )
         if mixed:
             inputs += (prepared.descriptor_map, prepared.global_to_combined)
+        if atoms:
+            inputs += (prepared.offsets, prepared.rates)
         for tensor in inputs:
             if tensor.untyped_storage().data_ptr() in (
                 storage.untyped_storage().data_ptr(),
@@ -808,7 +900,21 @@ class BackendPlan:
                 else pointer(c.Float16, source)
             )
             suffix = "_dual" if dual else ""
-            if mixed:
+            if atoms:
+                fn = self.launches[("fc1_atoms" if fc1 else "fc2_atoms") + suffix]
+                args = (
+                    source_pointer,
+                    pointer(c.Uint32, prepared.w13),
+                    pointer(c.Uint8, self.lut),
+                    pids,
+                    pointer(c.Int64, prepared.offsets),
+                    pointer(c.Uint8, prepared.rates),
+                    pointer(c.Float16, target),
+                    c.Int32(phase),
+                    c.Int64(prepared.row_stride_words),
+                    c.Int64(prepared.w13.numel()),
+                )
+            elif mixed:
                 payload = prepared.w13 if fc1 else prepared.w2
                 fn = self.launches[("fc1_mixed" if fc1 else "fc2_mixed") + suffix]
                 args = (

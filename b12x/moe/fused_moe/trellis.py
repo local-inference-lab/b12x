@@ -18,12 +18,12 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 )
 
 from .config import (
-    RateGranularity,
     ScaleGranularity,
     TrellisCodebook,
     TrellisConfig,
     TrellisScaleFactorsConfig,
 )
+from .trellis_atoms import PreparedAtomTrellisWeights
 from .weights import ScaleFactors, TrellisWeights
 
 
@@ -141,8 +141,7 @@ def _effective_input_scales(
     vectors = _selected_scale_tensor(
         factors.vectors, name="input_scales.vectors", device=device
     )
-    vector_experts = num_experts if _expert_axis(declaration.vectors) else 1
-    if vector_experts == 1:
+    if not _expert_axis(declaration.vectors):
         if tuple(vectors.shape) == (hidden_size,):
             vectors = vectors.reshape(1, 1, hidden_size)
         elif tuple(vectors.shape) == (2, hidden_size):
@@ -169,7 +168,7 @@ def _effective_input_scales(
         gain_experts = num_experts if _expert_axis(declaration.gains) else 1
         allowed = (
             {(), (1,), (2,)}
-            if gain_experts == 1
+            if not _expert_axis(declaration.gains)
             else {(num_experts,), (num_experts, 2)}
         )
         if tuple(gains.shape) not in allowed:
@@ -179,7 +178,7 @@ def _effective_input_scales(
         if gains.ndim == 0:
             gains = gains.reshape(1, 1)
         elif gains.ndim == 1:
-            gains = gains.reshape(gain_experts, 1)
+            gains = gains.reshape(gain_experts, -1)
         effective = vectors * gains.unsqueeze(-1)
 
     if int(effective.shape[0]) not in (1, num_experts):
@@ -280,36 +279,6 @@ def _effective_output_scales(
             gains = gains.reshape(1, 1)
         vectors = vectors * gains
     return vectors.contiguous()
-
-
-def _local_rate_matrix(
-    config: TrellisConfig,
-    rate: torch.Tensor,
-    *,
-    num_experts: int,
-    device: torch.device,
-) -> torch.Tensor:
-    _require_cuda_tensor(rate, name="rate", dtype=torch.uint8, device=device)
-    if config.rate.group_size is not None:
-        raise NotImplementedError(
-            "grouped trellis rates are represented by the format but are not "
-            "implemented by the fused MoE runtime"
-        )
-    granularity = config.rate.granularity
-    if granularity in (RateGranularity.UNIFORM, RateGranularity.PER_LAYER):
-        if rate.numel() != 1:
-            raise ValueError("selected uniform/per-layer rate must contain one byte")
-        return rate.reshape(1, 1).expand(num_experts, _PROJECTIONS)
-    if granularity is RateGranularity.PER_EXPERT:
-        if tuple(rate.shape) != (num_experts,):
-            raise ValueError(f"selected per-expert rate must be uint8[{num_experts}]")
-        return rate.reshape(num_experts, 1).expand(-1, _PROJECTIONS)
-    expected = (num_experts, _PROJECTIONS)
-    if tuple(rate.shape) != expected:
-        raise ValueError(
-            f"selected per-expert-projection rate must be uint8{expected}"
-        )
-    return rate
 
 
 def _symmetric_bits(config: TrellisConfig, rates: torch.Tensor) -> torch.Tensor:
@@ -815,8 +784,11 @@ def prepare_trellis_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
-) -> PreparedW4A16MoeWeights | PreparedProjectionTrellisWeights:
+) -> (
+    PreparedW4A16MoeWeights | PreparedProjectionTrellisWeights | PreparedAtomTrellisWeights
+):
     """Prepare one rank-local canonical Trellis MoE layer."""
+    from .trellis_atoms import normalize_rates, prepare_atom_weights
 
     atoms = weights.atoms
     if atoms.dtype != torch.uint8:
@@ -839,22 +811,26 @@ def prepare_trellis_weights(
         )
 
     device = atoms.device
-    rates = _local_rate_matrix(
-        config, weights.rate, num_experts=num_experts, device=device
+    rates, atom_layout = normalize_rates(
+        config,
+        weights.rate,
+        experts=num_experts,
+        intermediate_size=intermediate_size,
+        device=device,
     )
-    bits = _symmetric_bits(config, rates)
-    offsets = _bundle_offsets(bits, hidden_size)
-    required_row_bytes = max(
-        offset
-        + _matrix_section_bytes(hidden_size, int(bits[expert, projection]))
-        for expert, expert_offsets in enumerate(offsets)
-        for projection, offset in enumerate(expert_offsets)
-    )
-    if int(atoms.shape[1]) != required_row_bytes:
-        raise ValueError(
-            f"atoms row_stride={int(atoms.shape[1])} does not match the "
-            f"canonical projection payload ({required_row_bytes} bytes)"
+    if not atom_layout:
+        bits = _symmetric_bits(config, rates[0])
+        offsets = _bundle_offsets(bits, hidden_size)
+        required_row_bytes = max(
+            offset + _matrix_section_bytes(hidden_size, int(bits[expert, projection]))
+            for expert, expert_offsets in enumerate(offsets)
+            for projection, offset in enumerate(expert_offsets)
         )
+        if int(atoms.shape[1]) != required_row_bytes:
+            raise ValueError(
+                f"atoms row_stride={int(atoms.shape[1])} does not match the "
+                f"canonical projection payload ({required_row_bytes} bytes)"
+            )
 
     scale = config.scale
     gate_suh, up_suh = _effective_input_scales(
@@ -883,6 +859,20 @@ def prepare_trellis_weights(
         device=device,
     )
 
+    if atom_layout:
+        return prepare_atom_weights(
+            config,
+            weights,
+            rates,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            intermediate=intermediate,
+            down_svh=down_svh,
+            params_dtype=params_dtype,
+        )
     if config.codebook is not TrellisCodebook.MCG:
         return _uniform_prepared(
             config,

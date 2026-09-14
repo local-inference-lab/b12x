@@ -6344,6 +6344,7 @@ def plan_b12x_fp4_moe_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    trellis_group_size: int | None = None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -6376,6 +6377,7 @@ def plan_b12x_fp4_moe_weights(
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=trellis_pair_kinds,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
+        trellis_group_size=trellis_group_size,
     )
 
 
@@ -6711,6 +6713,7 @@ def prepare_b12x_trellis_v2_weights(
 
     from b12x.moe.fused_moe.config import TrellisConfig
     from b12x.moe.fused_moe.trellis import prepare_trellis_weights
+    from b12x.moe.fused_moe.trellis_atoms import PreparedAtomTrellisWeights
     from b12x.moe.fused_moe.weights import TrellisWeights
     from b12x.moe._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
 
@@ -6737,6 +6740,8 @@ def prepare_b12x_trellis_v2_weights(
         # The canonical rate tensor supplies this static checkpoint fact at
         # preparation. Capacity plans must prewarm its actual codebook rate.
         plan = replace(plan, trellis_bits=value.trellis.bits)
+    elif isinstance(value, PreparedAtomTrellisWeights):
+        plan = replace(plan, trellis_group_size=value.group_size)
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",
         layout=PreparedWeightLayout.TRELLIS_NATIVE,
@@ -7000,6 +7005,10 @@ def plan_tp_moe_execution(
             swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta, apply_router_weight_on_input=apply_router_weight_on_input,
             policy_context=policy_context,
+        )
+    if weight_plan.trellis_group_size is not None:
+        raise UnsupportedArchitectureError(
+            "Trellis atom-plane rates require the SM103 backend"
         )
     k = weight_plan.hidden_size
     n = weight_plan.intermediate_size

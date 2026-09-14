@@ -858,7 +858,7 @@ the native SM103 GEMM. See the
 
 ## Trellis and V4.1
 
-Status: **uniform and projection-tiered MoE implemented and cross-compiled; B300 execution
+Status: **uniform, projection-tiered and grouped atom MoE implemented and cross-compiled; B300 execution
 unqualified**. The existing MoE plan/bind/run API selects `tcgen05_trellis`.
 The native FP16 projection decodes t256 records directly into shared memory
 and accumulates with tcgen05/TMEM. Each CTA handles one route and 128 output
@@ -905,7 +905,28 @@ eight launches. Distinct input-scale halves require
 two input transforms and nine launches.
 The canonical A16 unit-scale flag is accepted without activation-scale math.
 
-Paired/grouped records remain unsupported. Coupled extents crossing two
+Canonical grouped rates and unequal low/high plane rates use the original
+compressed atom rows. Preparation builds uint8 rate and Int64 word-offset
+tables indexed by group, expert and projection. MCG supports K2 through K6;
+SQG E4M3 supports K2 through K4. Each nibble selects its plane independently.
+The group size is a positive multiple of 32 that divides the local intermediate
+width; rank extents start on group boundaries. Atom storage and row pitch
+are aligned to 16 bytes, and row padding is zero. Rates, offsets, physical
+row pitch and payload length remain runtime operands. The kernels decode
+each selected native tile directly into shared memory.
+
+Grouped atom plans reserve fixed scratch and prewarm 14 ordinary or 15 coupled
+callables, including the coupled FC1 variant for distinct input-scale halves.
+Ordinary and distinct-half bindings schedule eight launches; coupled bindings
+with shared input scales schedule seven. Live route counts do not change
+compiled callables. Portable SM120 tests cover exact plane decoding, malformed
+metadata, group boundaries, graph mutation and atom rows beyond 2^31 words.
+SM120/SM121 reject this layout before execution. The
+[grouped atom validation receipt](sm103-trellis-atoms-validation.json) records
+the source, compile artifacts and regression evidence. Legacy BTX paired
+records and canonical SQG FP16 preparation remain unsupported.
+
+Coupled extents crossing two
 distinct input-scale halves retain both scale vectors and select the result
 per output column, including splits inside an MMA tile. Extents wholly inside
 either half select that half's shared vector. Portable SM120 probes exercise
@@ -1008,7 +1029,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Checkpoint-specific paired/grouped records and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Legacy BTX paired records, canonical SQG FP16 preparation and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -1097,7 +1118,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
 | Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
-| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and ordinary/coupled MCG projection-tiered execution, including 384-expert records, nonzero draw extents and distinct input-scale halves; add paired/grouped records required by the selected checkpoint |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including unequal plane rates, 384-expert records, nonzero draw extents and distinct input-scale halves; implement legacy BTX paired records and canonical SQG FP16 where required |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
 | MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |

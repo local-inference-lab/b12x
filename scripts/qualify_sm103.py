@@ -29,6 +29,7 @@ SUITES = {
     "trellis_reconstruction": ["tests/moe/test_sm103_trellis.py"],
     "trellis_projection": ["tests/moe/test_sm103_trellis_gemm.py", "tests/moe/test_sm103_trellis_staging.py"],
     "trellis_moe": ["tests/moe/test_sm103_trellis_moe.py", "tests/moe/test_sm103_trellis_transforms.py", "tests/moe/test_trellis_extents.py", "tests/moe/test_sm103_trellis_input_halves.py"],
+    "trellis_atoms": ["tests/moe/test_sm103_trellis_atoms_moe.py", "tests/moe/test_sm103_trellis_atoms_staging.py", "tests/moe/test_sm103_trellis_transforms.py"],
     "trellis_mixed": ["tests/moe/test_sm103_trellis_mixed_moe.py", "tests/moe/test_sm103_trellis_mixed_staging.py", "tests/moe/test_sm103_trellis_transforms.py", "tests/moe/test_trellis_extents.py", "tests/moe/test_sm103_trellis_input_halves.py", "-k", "mixed or prepared_expert_map or extent or cross_half or column_selection"],
     "kda_decode": ["tests/sequence/test_gdn_decode_kda_cute.py"],
     "gdn_decode": ["tests/sequence/test_gdn_decode.py"],
@@ -156,7 +157,7 @@ def main(argv=None):
         "excluded": [
             "complete GLM/V4.1 serving",
             "DFlash2 integration",
-            "paired/grouped Trellis records and coupled mixed-rate transforms",
+            "legacy BTX paired Trellis records and canonical SQG FP16 preparation",
             "Grace memory",
             "Station RDMA",
             "FlashInfer/vLLM plugin installation",

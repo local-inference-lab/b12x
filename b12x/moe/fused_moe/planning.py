@@ -123,11 +123,6 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
             "sqg_fp16 is defined by the checkpoint schema but is not "
             "implemented by the routed fused MoE runtime"
         )
-    if source.rate.group_size is not None:
-        raise NotImplementedError(
-            "grouped trellis rates are defined by the checkpoint schema but "
-            "are not implemented by the fused MoE runtime"
-        )
     if source.transform.projection.kind != "scaled_hadamard" or (
         source.transform.projection.block_size != 128
     ):
@@ -135,15 +130,11 @@ def _validate_trellis_runtime(source: TrellisConfig) -> None:
             "fused MoE trellis execution requires scaled_hadamard(128)"
         )
     expert = source.transform.expert
-    if expert.kind == "coupled_hadamard" and (
-        source.codebook.value != "mcg"
-        and (
-            source.codebook.value != "sqg_e4m3"
-            or source.rate.granularity.value != "uniform"
-        )
-    ):
+    if expert.kind == "coupled_hadamard" and source.codebook.value not in {
+        "mcg", "sqg_e4m3"
+    }:
         raise NotImplementedError(
-            "coupled_hadamard preparation requires MCG or uniform SQG E4M3 rates"
+            "coupled_hadamard preparation requires MCG or SQG E4M3 rates"
         )
     if expert.kind == "coupled_hadamard" and (
         expert.pre_block_size,
@@ -275,6 +266,7 @@ def plan_weights(
             coupled_hadamard=expert.kind == "coupled_hadamard",
             trellis_codebook=source.codebook.value,
             trellis_rate_granularity=source.rate.granularity.value,
+            trellis_group_size=source.rate.group_size,
             coupled_hadamard_blocks=(
                 None
                 if expert.kind == "none"
