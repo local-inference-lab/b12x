@@ -95,10 +95,10 @@ and 28 uniform Trellis projection launchers, 64 uniform Trellis MoE launchers,
 four mixed-rate projection launchers and 30 projection-tiered MoE launchers,
 36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
-36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
+38 quantized-linear and reduction launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
 activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
 147 DeepSeek compressed attention/cache-writer launchers, and 131 mHC launchers:
-748 CuTe callables plus ten supporting activation-packing callables. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+750 CuTe callables plus sixteen supporting activation-packing callables. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
@@ -135,6 +135,21 @@ Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
 ## Quantized projections
+
+Tensor-scaled and compact K128 block-FP8 linears accept caller-owned output
+and scratch through `gemm.blockscaled.mm` and `mm_block_fp8`. Reserve
+`gemm.blockscaled.workspace_size(weight, max_tokens)` bytes before capture and
+prewarm each declared `expected_m` capacity. The companion vLLM adapters retain
+these capacities and reserve native FP8 quantization buffers in shared workspace.
+Tensor FP8 permits different BF16/FP16 input and output dtypes. Block FP8 keeps
+matching input/output dtypes.
+
+SM12x FP16 split-K writes FP32 partials and uses a typed CuTe reduction;
+BF16 retains its atomic accumulation policy and its rounding behavior. The
+workspace tests freeze kernel resolution, poison scratch/output, mutate inputs,
+and check graph replay, empty requests, explicit streams, and alias rejection.
+The current targeted compilation covers 19 FP8 and 38 dense/reduction callables;
+the complete corpus has not been rebuilt for this workspace change.
 
 `gemm.blockscaled.mm` selects the dense SM103 tcgen05/TMEM implementation for
 NVFP4, MXFP4, and MXFP8. W4A16 and W8A16 preserve BF16 activations and inline
