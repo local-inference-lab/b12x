@@ -16,8 +16,12 @@ from .trellis_gemm import RoutedTrellisGemm
 
 
 class RoutedMixedTrellisGemm(RoutedTrellisGemm):
-    def __init__(self, n, k, experts, capacity, *, descriptor_local_bits):
-        super().__init__(n, k, experts, capacity, bits=3, codebook="mcg")
+    def __init__(
+        self, n, k, experts, capacity, *, descriptor_local_bits, dual_input=False
+    ):
+        super().__init__(
+            n, k, experts, capacity, bits=3, codebook="mcg", dual_input=dual_input
+        )
         if descriptor_local_bits not in (8, 24):
             raise ValueError(
                 "mixed Trellis requires eight- or 24-bit local descriptors"
@@ -27,7 +31,7 @@ class RoutedMixedTrellisGemm(RoutedTrellisGemm):
     @cute.jit
     def __call__(
         self,
-        a: cute.Pointer,
+        a,
         packed: cute.Pointer,
         lut: cute.Pointer,
         ids: cute.Pointer,
@@ -141,7 +145,7 @@ class RoutedMixedTrellisGemm(RoutedTrellisGemm):
         route = Int64(block // cute.ceil_div(self.n, 128))
         n_base = Int64(block % cute.ceil_div(self.n, 128)) * 128
         route_ids = cute.make_tensor(ids, cute.make_layout(self.capacity))
-        source = cute.make_tensor(a, cute.make_layout(Int64(self.capacity) * a_stride))
+        source = self.input_tensors(a, a_stride)
         weights = cute.make_tensor(packed, cute.make_layout(packed_words))
         table = cute.make_tensor(
             descriptors, cute.make_layout(Int64(3) * descriptor_stride)
@@ -181,7 +185,7 @@ class RoutedMixedTrellisGemm(RoutedTrellisGemm):
     @cute.jit
     def stage_operands(
         self,
-        source: cute.Tensor,
+        source,
         weights: cute.Tensor,
         lut: cute.Pointer,
         selection: tuple[Int64, Int32, Boolean],
@@ -196,13 +200,7 @@ class RoutedMixedTrellisGemm(RoutedTrellisGemm):
         thread, _, _ = cute.arch.thread_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = Int32(thread % 32)
-        for item in cutlass.range(thread, 128 * 64, 128):
-            row, col = item // 64, item % 64
-            value = Float16(0)
-            kk = Int64(stage) * 64 + Int64(col)
-            if valid & (row == 0) & (kk < self.k):
-                value = source[route * a_stride + kk]
-            sA[row, col] = value
+        self.stage_inputs(source, valid, route, a_stride, stage, sA)
         record_words = (
             Int64(self.k // 16) * Int64(self.n // 16) * Int64(8) * Int64(rate)
         )

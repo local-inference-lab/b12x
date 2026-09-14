@@ -1,0 +1,183 @@
+{
+  "schema": "b12x.sm103.trellis_input_halves.validation.v1",
+  "status": "Implemented canonical and uniform BTX input-scale halves; host and portable SM120 checks passed; complete SM103 expert execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claim": false,
+  "source_sha256": "089c90a526fd888f4f8dd40cbca05294eff3df2bb600edc0fd3a81c069d82777",
+  "source_revision": "3e1e77dbe33802481cb068ff0c05f02b13d07113",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-source-manifest.json",
+    "sha256": "a9f3f2c70b9b28452a3b4739183fa267c738a259d4c064b1b1f9998cea33d7c2",
+    "bytes": 54321
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-remote-sources.json",
+    "sha256": "58cb1d9b90140c1117ff94c02ab08c52a5af2abce27b0ead3e22dc71c8baeaad",
+    "bytes": 127
+  },
+  "implementation": [
+    "Canonical uniform SQG and projection-tiered MCG preparation retain distinct global FC1 input-scale halves and the local column split",
+    "Uniform BTX preparation retains the same split while its reader enforces manifest extent barriers; the synthetic writer handles uniform partial eight-slot groups",
+    "Native FC1 stages two activation rows in the existing MMA tile and selects output per column, including boundaries inside a tile",
+    "Capacity plans reserve both input buffers and prewarm dual-input FC1 variants; live counts and the split remain runtime scalars",
+    "Shared-input bindings retain the existing single-input projection callable; SM12x rejects distinct coupled input halves before canonical prewarm and at legacy bind"
+  ],
+  "contracts": [
+    "Canonical and BTX packed words, scales, nonzero draw signs and oracle outputs agree for full I384 and partial I256 extents with local splits 192 and 64",
+    "Broadcast and per-expert input scales are covered; substituted single-input oracle fails for unequal scales",
+    "Portable production staging covers both activation rows, native weights, tails and invalid routes; existing high-offset staging still passes",
+    "Portable production epilogue predicate covers splits 64,128,192,256,320 and live counts 1,3,4,8 under frozen compilation",
+    "Public host bindings retain the prewarmed callable across rate distributions and live counts, and reject malformed splits",
+    "Deferred native complete-expert tests exercise whole-layer splits, scale and weight mutation, expert maps, graph replay, stable addresses and cumulative allocation counts"
+  ],
+  "checks": {
+    "host-frozen": {
+      "result": "651 passed, 18 skipped",
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/moe/test_trellis_config.py tests/moe/test_trellis_extents.py tests/moe/test_fused_moe_planning.py tests/moe/test_btx_schema.py --disable-warnings --tb=short",
+      "host": "local",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-host-frozen.log",
+        "sha256": "263753e84eb0dd7ee708847bb128191fc1a2f7347b7e02957dab8e46a77779bd",
+        "bytes": 833
+      }
+    },
+    "torch213-host": {
+      "result": "51 passed, 16 skipped",
+      "command": "CUTE_DSL_ARCH=sm_103a /home/jasonc/vllm-sm103/.venv/bin/python -m pytest -q tests/architecture/test_sm103_trellis_moe.py tests/architecture/test_sm103_trellis_mixed.py tests/moe/test_trellis_extents.py --disable-warnings --tb=short",
+      "host": "local",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-torch213-host.log",
+        "sha256": "33b2c66acd09b1876586c99e2b99bff5f8f1ed4dc06744c23dff6a82ebeac363",
+        "bytes": 111
+      }
+    },
+    "gpu-frozen": {
+      "result": "121 passed, 32 skipped",
+      "command": "CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_input_halves.py tests/moe/test_sm103_trellis_staging.py tests/moe/test_sm103_trellis_mixed_staging.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis_mixed_moe.py tests/moe/test_sm103_trellis_transforms.py tests/moe/test_trellis_extents.py tests/moe/test_btx_prepare.py tests/moe/test_btx_compat.py --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-gpu-frozen.log",
+        "sha256": "51ee3d304252417a7d980d41d8752dc00b1c1817d6418c236390b2be6291c091",
+        "bytes": 273
+      }
+    },
+    "memcheck-frozen": {
+      "result": "29 passed, 36 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=0 CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_input_halves.py tests/moe/test_sm103_trellis_staging.py tests/moe/test_sm103_trellis_mixed_staging.py tests/moe/test_trellis_extents.py -k \"cross_half or column_selection or dual_input or True or 384\" --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-memcheck-frozen.log",
+        "sha256": "137cc5334099b9df8377824f83494769716f7f7e3c752491744ce9c052a9ebb8",
+        "bytes": 177
+      }
+    },
+    "synccheck-frozen": {
+      "result": "29 passed, 36 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=1 CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_input_halves.py tests/moe/test_sm103_trellis_staging.py tests/moe/test_sm103_trellis_mixed_staging.py tests/moe/test_trellis_extents.py -k \"cross_half or column_selection or dual_input or True or 384\" --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-synccheck-frozen.log",
+        "sha256": "34ac3abe8aed379c1ae2046c6a54060aa8fa97f35ba1f1f6711be8bb95f33819",
+        "bytes": 177
+      }
+    }
+  },
+  "gpu_identity": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-gpu-identity.txt",
+    "sha256": "5e4c5ac855eae8dc982968767ada3ecff1c1d47c4d2753b604371cca76c63247",
+    "bytes": 374
+  },
+  "sanitizer_api_scope": "Kernel diagnostics enabled. API diagnostics disabled only for the previously recorded SM120 CUDA-Python 13.4/driver 13.0 capability-probe mismatch. Physical SM103 qualification must enable API diagnostics.",
+  "compiled": {
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-sm103-frozen/manifest.json",
+      "sha256": "d473e67de309580a45145ebacdc46021808733bb0683290f4693496130d95563",
+      "bytes": 239401
+    },
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "trellis",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-sm103-frozen",
+      "--nvdisasm",
+      ".venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      ".venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "packages": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    },
+    "callables": 196,
+    "cuda_entries": 196,
+    "added_callables": 20,
+    "resource_audit": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-resources-final.json",
+      "sha256": "49def1d832b77adc7216a57e2ac79093089430dc731dcedd5639f33db4bf91bd",
+      "bytes": 340414
+    },
+    "identical_existing_ptx": 176,
+    "identical_existing_cubins": 149,
+    "changed_existing_cubins": 27,
+    "changed_cubin_disposition": "All 27 retain identical PTX, allocated resources, exact register sets and instruction counts. Twenty-five differ only in SASS register operands. SQG FP16 FC1/FC2 K5 additionally differ in instruction ordering or reuse flags. Raw identities remain distinct.",
+    "positive_existing_resource_deltas": {},
+    "dual_input_allocated_gprs": 167,
+    "single_input_allocated_gprs": 140,
+    "dual_input_resource_disposition": "The six dual-input variants add 27 allocated registers each versus their corresponding single-input kernels. No stack/local traffic is emitted. Physical SM103 correctness, occupancy and performance remain unqualified.",
+    "stack_or_local_flags": {},
+    "tmem_readers_with_completion_waits": 64,
+    "full_project_source_rebuild": false
+  },
+  "packaging": {
+    "command": "uv build --out-dir /home/jasonc/b12x-sm103-evidence/trellis-input-halves-dist-frozen",
+    "verified": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-package.json",
+      "sha256": "240067aaaeb791b3c7d14002a7ea133ef3dbff0d5dbe887f999bd38199c5a460",
+      "bytes": 372
+    },
+    "wheel_import": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-wheel-import.json",
+      "sha256": "501343c5f02e94c291785e85ae659a8aae014a841b534ddefe5d0e8b97604db1",
+      "bytes": 137
+    }
+  },
+  "deferred": {
+    "uniform": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-deferred-uniform/qualification.json",
+      "sha256": "2dc4446e483082460beedb6bdba5b1d88d0b33c8d1c19885e07a832d9d419293",
+      "bytes": 3040
+    },
+    "mixed": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-deferred-mixed/qualification.json",
+      "sha256": "a42ee284060b0f0af9283596454f756cd2269ef66cb3e01d97607475c41adbfc",
+      "bytes": 3205
+    }
+  },
+  "lint": {
+    "log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-input-halves-lint.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "scope": "Changed kernel, preparation, planner and test files, excluding pre-existing findings in _impl.py and w4a16/prepare.py; git diff --check passed"
+  },
+  "remaining": [
+    "Paired/grouped checkpoint records",
+    "Complete GLM/DeepSeek speculative contracts and real-checkpoint model evaluation",
+    "Matching companion vLLM native build, ARM64 dependencies and available-host SM121 regression",
+    "Station HBM registration and direct-HBM transport",
+    "Complete representative compilation from final project source",
+    "Physical SM103 correctness, graph replay and profiling of dual-input register use"
+  ]
+}

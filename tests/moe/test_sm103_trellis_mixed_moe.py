@@ -23,6 +23,7 @@ def prepare_mixed(
     transform_draw=0,
     global_intermediate_size=None,
     intermediate_offset=0,
+    distinct_input_scales=False,
 ):
     config = _glm_config()
     if coupled:
@@ -68,7 +69,10 @@ def prepare_mixed(
                 0.875
                 + 0.25
                 * torch.rand(
-                    (experts, hidden) if per_expert_scales else (hidden,), device=device
+                    ((experts, 2, hidden) if per_expert_scales else (2, hidden))
+                    if distinct_input_scales
+                    else ((experts, hidden) if per_expert_scales else (hidden,)),
+                    device=device,
                 )
             ).half()
         ),
@@ -234,6 +238,7 @@ def _run_native_mixed(
     width=128,
     top_k=2,
     coupled=False,
+    cross_half=False,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native mixed Trellis MoE")
@@ -250,8 +255,11 @@ def _run_native_mixed(
         coupled=coupled,
         per_expert_scales=not uniform,
         transform_draw=3 if coupled else 0,
-        global_intermediate_size=4 * width if coupled else None,
-        intermediate_offset=width if coupled else 0,
+        global_intermediate_size=(width if cross_half else 4 * width)
+        if coupled
+        else None,
+        intermediate_offset=width if coupled and not cross_half else 0,
+        distinct_input_scales=cross_half,
     )
     payload = weights._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -267,7 +275,7 @@ def _run_native_mixed(
     assert all(v.implementation == "tcgen05_trellis" for v in plan.variants)
     assert len({id(v._impl) for v in plan.variants}) == 1
     launches = tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
-    assert len(launches) == 15
+    assert len(launches) == (16 if coupled else 15)
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
@@ -328,7 +336,9 @@ def _run_native_mixed(
             for target in (None, external):
                 external.fill_(float("nan"))
                 bound = bind(live, target)
-                assert len(bound._backend_binding.calls) == (8 if coupled else 9)
+                assert len(bound._backend_binding.calls) == (
+                    8 if coupled and not cross_half else 9
+                )
                 check(fused_moe.run(binding=bound), references[live])
                 if target is not None:
                     assert torch.isnan(external[live:]).all()
@@ -340,6 +350,8 @@ def _run_native_mixed(
         before = bound.output.clone()
         source.mul_(0.8)
         payload.w13.bitwise_xor_(0x124)
+        if cross_half:
+            payload.rotations.up_suh.mul_(0.7)
         payload.rotations.down_svh.mul_(0.75)
         # Changing valid descriptors must affect the captured compressed path.
         rows = payload.descriptor_map.view(3, -1)
@@ -359,11 +371,11 @@ def _run_native_mixed(
             *scratch.values(),
         )
         addresses = tuple(t.data_ptr() for t in owners)
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.cuda.memory_stats()["allocated_bytes.all.allocated"]
         allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
         assert tuple(t.data_ptr() for t in owners) == addresses
         assert (
@@ -426,4 +438,18 @@ def test_native_coupled_mixed_moe_v41_geometry():
         width=2304,
         top_k=6,
         coupled=True,
+    )
+
+
+@pytest.mark.parametrize("experts,uniform", [(5, False), (384, True)])
+def test_native_mixed_coupled_cross_half_moe(experts, uniform):
+    _run_native_mixed(
+        experts=experts,
+        uniform=uniform,
+        dtype=torch.bfloat16,
+        activation="situ",
+        hidden=512,
+        width=384,
+        coupled=True,
+        cross_half=True,
     )

@@ -216,14 +216,13 @@ def scratch_layout(caps):
         ("ids", (routes,), torch.int64),
         ("output_ids", (routes,), torch.int64),
         ("input_gate", (routes, caps.k), torch.float16),
+        ("input_up", (routes, caps.k), torch.float16),
         ("gate", (routes, caps.n), torch.float16),
         ("up", (routes, caps.n), torch.float16),
         ("activated", (routes, caps.n), torch.float16),
         ("down", (routes, caps.k), torch.float16),
         ("output", (caps.max_tokens, caps.k), torch.float32),
     ]
-    if not caps.weight_plan.coupled_hadamard:
-        shapes.append(("input_up", (routes, caps.k), torch.float16))
     buffers, offset = [], 0
     for name, shape, dtype in shapes:
         offset = align_up(offset, 1024)
@@ -276,6 +275,8 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
 
     def compile_case(name, kernel, types, scalars):
         args = [pointer(t) for t in types] + list(scalars) + [cuda.CUstream(0)]
+        if getattr(kernel, "dual_input", False):
+            args[0] = (args[0], pointer(c.Float16), c.Int64(caps.n // 2))
         options = "--gpu-arch=sm_103a"
         directory = None
         if artifact_dir is not None:
@@ -284,7 +285,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            2,
+            3,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),
@@ -297,6 +298,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("activation", caps.activation),
             ("io_dtype", str(caps.dtype)),
             ("projection_mixed", mixed),
+            ("dual_input", getattr(kernel, "dual_input", False)),
         )
         if offline:
             fn = cute.compile(kernel, *args, options=options, no_jit_engine=True)
@@ -346,40 +348,49 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     )
     for rate in () if mixed else projection_rates(weight_plan):
         for name, n, k in (("fc1", caps.n, caps.k), ("fc2", caps.k, caps.n)):
-            compile_case(
-                name + f"_k{rate}",
-                RoutedTrellisGemm(
-                    n, k, caps.weight_E, routes, bits=rate, codebook=codebook
-                ),
-                (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Float16),
-                (c.Int32(1), c.Int64(k), c.Int64(n)),
-            )
+            for dual in (False, True) if coupled and name == "fc1" else (False,):
+                compile_case(
+                    name + f"_k{rate}" + ("_dual" if dual else ""),
+                    RoutedTrellisGemm(
+                        n,
+                        k,
+                        caps.weight_E,
+                        routes,
+                        bits=rate,
+                        codebook=codebook,
+                        dual_input=dual,
+                    ),
+                    (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Float16),
+                    (c.Int32(1), c.Int64(k), c.Int64(n)),
+                )
     if mixed:
         for name, n, k in (
             ("fc1_mixed", caps.n, caps.k),
             ("fc2_mixed", caps.k, caps.n),
         ):
-            compile_case(
-                name,
-                RoutedMixedTrellisGemm(
-                    n,
-                    k,
-                    caps.weight_E,
-                    routes,
-                    descriptor_local_bits=24 if caps.weight_E > 256 else 8,
-                ),
-                (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Int32, c.Float16),
-                (
-                    c.Int32(0),
-                    c.Int64(3 * caps.weight_E),
-                    c.Int64(1),
-                    (c.Int64(0),) * 3,
-                    (c.Int32(0),) * 3,
-                    c.Int32(1),
-                    c.Int64(k),
-                    c.Int64(n),
-                ),
-            )
+            for dual in (False, True) if coupled and name == "fc1_mixed" else (False,):
+                compile_case(
+                    name + ("_dual" if dual else ""),
+                    RoutedMixedTrellisGemm(
+                        n,
+                        k,
+                        caps.weight_E,
+                        routes,
+                        descriptor_local_bits=24 if caps.weight_E > 256 else 8,
+                        dual_input=dual,
+                    ),
+                    (c.Float16, c.Uint32, c.Uint8, c.Int64, c.Int32, c.Float16),
+                    (
+                        c.Int32(0),
+                        c.Int64(3 * caps.weight_E),
+                        c.Int64(1),
+                        (c.Int64(0),) * 3,
+                        (c.Int32(0),) * 3,
+                        c.Int32(1),
+                        c.Int64(k),
+                        c.Int64(n),
+                    ),
+                )
     for dtype in (c.Float32, io_type):
         compile_case(
             "output_" + dtype.__name__,
@@ -471,7 +482,13 @@ def _mixed_contract(caps, prepared):
         if payload.trellis_codebook != "mcg" or payload.trellis_bits != bit:
             raise ValueError("mixed Trellis tier order must be MCG K3/K4/K5")
         if payload.coupled_hadamard != prepared.coupled_hadamard:
-            raise ValueError("mixed Trellis tier transforms must match the prepared owner")
+            raise ValueError(
+                "mixed Trellis tier transforms must match the prepared owner"
+            )
+        if payload.trellis.input_scale_split != prepared.input_scale_split:
+            raise ValueError(
+                "mixed Trellis tier input-scale splits must match the prepared owner"
+            )
         for value, owner, cursor, count in (
             (payload.w13, prepared.w13, cursor13, counts[0][tier] + counts[1][tier]),
             (payload.w2, prepared.w2, cursor2, counts[2][tier]),
@@ -520,6 +537,7 @@ def _mixed_contract(caps, prepared):
             rotations.intermediate, (6 if prepared.coupled_hadamard else 3) * caps.n
         ),
         coupled_hadamard=prepared.coupled_hadamard,
+        input_scale_split=prepared.input_scale_split,
     )
     return state, tuple(tuple(row) for row in offsets), counts
 
@@ -594,7 +612,9 @@ class BackendPlan:
         if mixed:
             state, offsets, counts = _mixed_contract(caps, prepared)
             if state.coupled_hadamard != caps.weight_plan.coupled_hadamard:
-                raise ValueError("prepared mixed Trellis transform differs from the plan")
+                raise ValueError(
+                    "prepared mixed Trellis transform differs from the plan"
+                )
         else:
             if (
                 not isinstance(prepared, PreparedW4A16MoeWeights)
@@ -670,8 +690,18 @@ class BackendPlan:
             torch.float16,
             caps.device,
         )
+        split = state.input_scale_split
+        if split is not None and (
+            type(split) is not int
+            or not state.coupled_hadamard
+            or not 0 < split < caps.n
+        ):
+            raise ValueError(
+                "coupled input-scale split must be an integer inside the local extent"
+            )
         if (
             state.coupled_hadamard
+            and split is None
             and state.gate_suh.data_ptr() != state.up_suh.data_ptr()
         ):
             raise ValueError(
@@ -767,11 +797,22 @@ class BackendPlan:
 
         def projection_call(phase, source, target):
             fc1 = phase < 2
+            dual = fc1 and split is not None
+            source_pointer = (
+                (
+                    pointer(c.Float16, views["input_gate"]),
+                    pointer(c.Float16, views["input_up"]),
+                    c.Int64(split),
+                )
+                if dual
+                else pointer(c.Float16, source)
+            )
+            suffix = "_dual" if dual else ""
             if mixed:
                 payload = prepared.w13 if fc1 else prepared.w2
-                fn = self.launches["fc1_mixed" if fc1 else "fc2_mixed"]
+                fn = self.launches[("fc1_mixed" if fc1 else "fc2_mixed") + suffix]
                 args = (
-                    pointer(c.Float16, source),
+                    source_pointer,
                     pointer(c.Uint32, payload),
                     pointer(c.Uint8, self.lut),
                     pids,
@@ -789,9 +830,9 @@ class BackendPlan:
                     if fc1
                     else prepared.w2
                 )
-                fn = self.launches[f"{'fc1' if fc1 else 'fc2'}_k{state.bits}"]
+                fn = self.launches[f"{'fc1' if fc1 else 'fc2'}_k{state.bits}" + suffix]
                 args = (
-                    pointer(c.Float16, source),
+                    source_pointer,
                     pointer(c.Uint32, payload),
                     pointer(c.Uint8, self.lut),
                     pids,
@@ -806,7 +847,7 @@ class BackendPlan:
         io_type = c.BFloat16 if caps.dtype == torch.bfloat16 else c.Float16
         for name, scales in (
             (("input_gate", state.gate_suh),)
-            if state.coupled_hadamard
+            if state.coupled_hadamard and split is None
             else (("input_gate", state.gate_suh), ("input_up", state.up_suh))
         ):
             calls.append(

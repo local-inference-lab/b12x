@@ -856,6 +856,7 @@ def compile_trellis(out):
     for label, codebook, bits, coupled, activation, dtype in (
         ("v41", "sqg_e4m3", 3, True, "situ", torch.float16),
         ("mcg", "mcg", 3, False, "silu", torch.bfloat16),
+        ("btx_mcg_coupled", "mcg", 3, True, "situ", torch.bfloat16),
         ("sqg", "sqg_e4m3", 4, False, "situ", torch.float16),
         ("sqg_fp16", "sqg_fp16", 5, False, "silu", torch.bfloat16),
     ):
