@@ -1033,8 +1033,32 @@ def compile_trellis(out):
             )
             compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
             launches.update({label + key: fn for key, fn in compiled.items()})
+    launches.update(compile_trellis_clamped(out))
     return launches
 
+
+def compile_trellis_clamped(out):
+    """Compile V4.1 SiLU-clamped K3 expert geometry for TP1 and TP2."""
+    import torch
+    from b12x.moe.fused_moe._sm103_trellis import compile_launches
+
+    launches = {}
+    for tp in (1, 2):
+        label = f"trellis_clamped_v41_tp{tp}_"
+        caps = SimpleNamespace(
+            k=5120, n=2304 // tp, weight_E=384, max_tokens=128, num_topk=6,
+            route_num_experts=384, dtype=torch.bfloat16, activation="silu",
+            swiglu_limit=10.0,
+            weight_plan=SimpleNamespace(
+                coupled_hadamard=False, source_format="btx",
+                trellis_bits=3, trellis_codebook="mcg",
+            ),
+        )
+        compiled = compile_launches(
+            caps, offline=True, artifact_dir=out, artifact_prefix=label
+        )
+        launches.update({label + key: fn for key, fn in compiled.items()})
+    return launches
 
 
 def compile_mhc(out):
@@ -1844,6 +1868,7 @@ def main():
             "moe",
             "roce",
             "trellis",
+            "trellis_clamped",
             "sequence",
             "mtp_feedback",
             "mla_compress",
@@ -1959,6 +1984,8 @@ def main():
             launches.update(compile_roce(out))
         if args.component in ("trellis", "all"):
             launches.update(compile_trellis(out))
+        if args.component == "trellis_clamped":
+            launches.update(compile_trellis_clamped(out))
         if args.component in ("sequence", "all"):
             launches.update(compile_sequence(out))
         if args.component in ("mtp_feedback", "all"):

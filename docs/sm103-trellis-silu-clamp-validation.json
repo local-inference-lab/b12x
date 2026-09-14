@@ -1,0 +1,122 @@
+{
+  "schema": "b12x.sm103.trellis_silu_clamp.validation.v1",
+  "status": "Implemented; portable SM120 transforms and SM103 compilation passed; complete SM103 expert execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claim": false,
+  "base_revision": "172438b8b48c50b23c86d6e849a66f78494928f3",
+  "package_source_sha256": "2aeca38e062a0759689ae2c70e459bf85a1ad0b099921f8889dc738dcb97e6ea",
+  "b12x_package_fingerprint": "f602489241754c0e0ce2a56d5c0ab922ba2ac19f6f1d8c73cfd7f73d564ea77a",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-source-reviewed.json",
+    "sha256": "53a110d9b85b00c232fd80d005eb78e5fe28513ace9debf743f77de6a5bf4492",
+    "bytes": 52626
+  },
+  "commands": {
+    "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-reproduction.json",
+    "sha256": "8e7763d6756748fa650a847db0d100e560b708df3c1b009f822393bdeab0149e",
+    "bytes": 2680
+  },
+  "contract": {
+    "activation": "SiLU with gate upper clamp and symmetric up clamp before activation",
+    "limit": 10.0,
+    "coupled_situ_clamp": "unsupported",
+    "weight_transform_rounding": "Existing FP16 transform boundaries retained",
+    "cache_key": "Static activation limit; live route and token counts remain runtime scalars",
+    "native_expert_geometry": {
+      "experts": 384,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "top_k": 6,
+      "tp_sizes": [
+        1,
+        2
+      ],
+      "capacity": 128,
+      "codebook": "mcg",
+      "bits": 3
+    }
+  },
+  "checks": {
+    "host-reviewed": {
+      "passed": 119,
+      "skipped": 1,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-host-reviewed.log",
+        "sha256": "fee432884a203354c013441ed0dd161a2e6d731ee8e75b7faf1b547ea091bede",
+        "bytes": 192
+      },
+      "junit": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-host-reviewed.xml",
+        "sha256": "7d730182c702f341f5c8dc903f4c7d090898eeda134c0b4d90f6c48074259321",
+        "bytes": 19234
+      }
+    },
+    "gpu": {
+      "passed": 30,
+      "skipped": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-gpu.log",
+        "sha256": "2d44ef0470751b537a67361fcb168fc941afdf8f0bd1b1abc0f2fb916582dc69",
+        "bytes": 100
+      },
+      "junit": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-gpu.xml",
+        "sha256": "865e82d1babab5831b89dcb54cd6f7a30d579b4eb6ec5db0e069570ada6b798c",
+        "bytes": 4977
+      }
+    },
+    "memcheck": {
+      "passed": 5,
+      "skipped": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-memcheck.log",
+        "sha256": "780813051041aeb63cfa4161ddc3100e173f3d4596d373bd69de2235f617c000",
+        "bytes": 176
+      },
+      "junit": {
+        "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-memcheck.xml",
+        "sha256": "45509c3dbe93cad0e24ebcf7cbfb4fe0a0b9fa5a9ed60d0522d82c09117d82f9",
+        "bytes": 993
+      },
+      "kernel_memory_errors": 0,
+      "api_error_reporting": false
+    }
+  },
+  "portable_coverage": [
+    "BF16 and FP16 inputs; broadcast and per-expert scales",
+    "Large gate/up values distinguish clamped and unclamped oracles",
+    "Frozen kernel resolution across live counts, graph replay, mutations, stable addresses and allocation checks",
+    "High expert-scale offset beyond Int32"
+  ],
+  "compiled": {
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-sm103-reviewed/manifest.json",
+      "sha256": "d71cca10bc9bf261cc160e02924dc163c411b9096cd90e51ecf558f0aff8d5ab",
+      "bytes": 36104
+    },
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/v41-port-20260914/trellis-clamp-resources.json",
+      "sha256": "e00ae72921efb2a469fac32bc852ca848fd0b288f2c32ec3fe64db8dbea10955",
+      "bytes": 3557
+    },
+    "callables": 28,
+    "maximum_allocated_gprs": 140,
+    "stack_or_local_cases": [],
+    "packages": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    },
+    "full_project_rebuild": false
+  },
+  "limitations": [
+    "No physical SM103 execution or performance measurement",
+    "No complete Trellis V4.1 model loading or accuracy qualification",
+    "Full native expert oracle is prepared as a physical-SM103 test; host collection skips it",
+    "SM120 memcheck API-error reporting is explicitly disabled"
+  ]
+}

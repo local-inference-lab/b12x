@@ -152,11 +152,14 @@ def plan_execution(
     policy_resolution=None,
 ):
     from ._impl import TPMoEPlan
+    from .._shared.kernels.activations import normalize_swiglu_limit_for_activation
 
     validate_weight_plan(weight_plan)
+    swiglu_limit = normalize_swiglu_limit_for_activation(
+        weight_plan.activation, swiglu_limit
+    )
     if (
         apply_router_weight_on_input
-        or swiglu_limit is not None
         or swiglu_alpha not in (None, 1.0)
         or swiglu_beta not in (None, 0.0)
     ):
@@ -222,6 +225,7 @@ def plan_execution(
         device=torch.device(device),
         dtype=getattr(torch, weight_plan.io_dtype),
         max_tokens_per_launch=num_tokens,
+        swiglu_limit=swiglu_limit,
         policy_resolution=resolution,
     )
 
@@ -290,6 +294,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     )
     routes = caps.max_tokens * caps.num_topk
     route_experts = caps.route_num_experts or caps.weight_E
+    swiglu_limit = getattr(caps, "swiglu_limit", None)
     launches = {}
     io_type = c.BFloat16 if caps.dtype == torch.bfloat16 else c.Float16
 
@@ -305,7 +310,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            6,
+            7,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),
@@ -316,6 +321,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             ("codebook", codebook),
             ("coupled", coupled),
             ("activation", caps.activation),
+            ("swiglu_limit", swiglu_limit if name == "intermediate" else None),
             ("io_dtype", str(caps.dtype)),
             ("projection_mixed", mixed),
             ("dual_input", getattr(kernel, "dual_input", False)),
@@ -363,7 +369,8 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
     compile_case(
         "intermediate",
         IntermediateRotation(
-            caps.n, caps.weight_E, routes, coupled=coupled, activation=caps.activation
+            caps.n, caps.weight_E, routes, coupled=coupled,
+            activation=caps.activation, swiglu_limit=swiglu_limit,
         ),
         (c.Float16, c.Float16, c.Int64, c.Float16, c.Float16),
         (c.Int32(1),),
@@ -1046,6 +1053,7 @@ class BackendPlan:
             execution_plan=plan.launch_plan,
             output=output,
             quant_mode="w4a16",
+            swiglu_limit=caps.swiglu_limit,
             deterministic_output=True,
             _backend_binding=bound,
         )

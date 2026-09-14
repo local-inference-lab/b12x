@@ -99,13 +99,22 @@ def input_rotation(source, ids, scales, top_k, coupled):
     return output
 
 
-def activation(gate, up, kind):
+def activation(gate, up, kind, swiglu_limit=None):
+    if swiglu_limit is not None:
+        if kind != "silu":
+            raise ValueError("Trellis input clamping requires SiLU")
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
     if kind == "situ":
         return 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(up / 25)
     return gate * torch.sigmoid(gate) * up
 
 
-def intermediate_rotation(gate, up, ids, rotations, coupled, kind):
+def intermediate_rotation(
+    gate, up, ids, rotations, coupled, kind, swiglu_limit=None
+):
+    if coupled and swiglu_limit is not None:
+        raise ValueError("Coupled Trellis does not declare a SwiGLU input clamp")
     width = gate.shape[1]
     result = torch.zeros_like(gate)
     for row, expert in enumerate(ids.cpu().tolist()):
@@ -129,7 +138,7 @@ def intermediate_rotation(gate, up, ids, rotations, coupled, kind):
         else:
             g = (had128(gate[row]) * gscale).half().float()
             u = (had128(up[row]) * uscale).half().float()
-            activated = activation(g, u, kind).half().float()
+            activated = activation(g, u, kind, swiglu_limit).half().float()
             result[row] = had128((activated * down).half())
     return result
 
@@ -154,6 +163,7 @@ def _moe_reference(
     topk_weights,
     *,
     activation_kind,
+    swiglu_limit=None,
     route_expert_map=None,
     output_expert_map=None,
 ):
@@ -317,6 +327,7 @@ def _moe_reference(
         state.intermediate_rotations,
         state.coupled_hadamard,
         activation_kind,
+        swiglu_limit,
     )
     down = torch.zeros((len(ids), hidden), device=source.device, dtype=torch.float16)
     for expert in selected:

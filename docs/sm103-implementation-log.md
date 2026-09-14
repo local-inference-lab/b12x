@@ -1785,3 +1785,45 @@ The test host uses task-local liburing development headers and its existing
 liburing runtime. Earlier missing-library and incomplete-port failures remain
 in external evidence. Physical SM103 execution and SM121 coverage of these
 disk additions remain unqualified.
+
+## Cooperative MoE residency and planned capacity
+
+Compact repacked W4A8 launches cap their grid using the compiled CUDA
+function's occupancy, actual block thread count and launch shared memory.
+The bound is cached before capture. Specializations that support two resident
+CTAs retain that grid capacity. Disk-cache loads verify object and launch
+metadata integrity before loading a temporary object copy.
+
+Shared-input and intermediate-materialization choices use planned capacity.
+The [cooperative MoE receipt](moe-cooperative-validation.json) records four
+SM120 cases with capacities 8 and 16, multiple live counts, independent
+numerical oracles, poisoned outputs and frozen kernel resolution. Those cases
+also pass memcheck; ten compatibility cases and 116 host cases pass.
+
+SM121 passes all four cooperative cases and 24 Engram cases. Twelve selected
+cases pass memcheck with zero memory errors and API-error reporting explicitly
+disabled. The Engram coverage includes disk prefetch, resident scales, fresh
+graph replay and high global row offsets. These results extend the Engram
+receipt's SM120 coverage without implying physical SM103 qualification.
+
+A reduced V4.1 model produces identical eager and graph output tokens across
+six synthetic sequences. The graph arm records 21 replays; both arms freeze
+b12x kernel resolution after warmup and use JIT monitor error mode. Synthetic
+weights do not establish checkpoint accuracy.
+
+## Trellis SiLU input clamps
+
+Uncoupled SM103 Trellis execution accepts a finite positive SiLU input clamp.
+The intermediate transform clamps gate values above the limit and up values
+to its signed range before SiLU, retaining FP16 transform rounding. Coupled
+SiTU execution rejects this option. The activation limit is static compile
+metadata; live counts remain runtime arguments.
+
+The [SiLU clamp receipt](sm103-trellis-silu-clamp-validation.json) records
+119 passing host checks and one physical-SM103 skip, 30 passing portable
+SM120 transform checks, and five passing memcheck cases with zero kernel
+memory errors. API-error reporting is explicitly disabled. The checks include
+large activation values, frozen compilation, graph replay and high offsets.
+The compiler emits 28 callables for V4.1 E384/H5120/I2304, top-6, K3 experts
+with limit 10 at TP1 and TP2. No stack/local traffic is emitted. Complete
+SM103 expert execution and V4.1 Trellis checkpoint loading remain unqualified.
