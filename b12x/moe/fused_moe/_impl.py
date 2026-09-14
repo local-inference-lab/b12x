@@ -10717,6 +10717,7 @@ def _get_dynamic_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
+    planned_num_tokens: int | None = None,
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -10755,11 +10756,12 @@ def _get_dynamic_kernel(
         activation=activation_spec.activation,
         planned_tile_m=planned_tile_m,
     )
+    specialization_tokens = m if planned_num_tokens is None else planned_num_tokens
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation_spec.activation,
-        num_tokens=m,
-        routed_rows=m * num_topk,
+        num_tokens=specialization_tokens,
+        routed_rows=specialization_tokens * num_topk,
         num_experts=E,
         k=k,
         n=n,
@@ -11156,6 +11158,7 @@ def _get_dynamic_kernel(
         dsl_compile_options=dsl_compile_options,
     )
 
+    compiled._b12x_block_threads = kernel.threads_per_cta
     if reuse_compiled:
         _DYNAMIC_KERNEL_CACHE[cache_key] = compiled
     return compiled, mac
@@ -11231,6 +11234,7 @@ def _launch_dynamic_flat(
     policy_max_active_clusters: int,
     volatile_launch_state: bool,
     planned_tile_m: int,
+    planned_num_tokens: int,
     planned_direct_routing: bool,
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -11310,8 +11314,8 @@ def _launch_dynamic_flat(
     materialize_intermediate = _w4a8_dynamic_materialized_enabled(
         quant_mode=quant_mode,
         activation=activation,
-        num_tokens=m,
-        routed_rows=routed_rows,
+        num_tokens=planned_num_tokens,
+        routed_rows=planned_num_tokens * num_topk,
         num_experts=E,
         k=k,
         n=n,
@@ -11323,7 +11327,7 @@ def _launch_dynamic_flat(
     external_route_plan_supported = _dynamic_external_route_plan_supported(
         quant_mode=quant_mode,
         activation=activation,
-        routed_rows=routed_rows,
+        routed_rows=planned_num_tokens * num_topk,
         planned_tile_m=selected_tile_m,
         dynamic_route_mode=("direct" if direct_routing else "grouped"),
         deterministic_output=deterministic_output,
@@ -11361,13 +11365,9 @@ def _launch_dynamic_flat(
         # but those CTAs do not join the front-end's grid-wide barrier.
         effective_mac = min(effective_mac, get_num_sm(torch.device("cuda")))
     elif w4a8_repacked and selected_tile_m <= 32:
-        # The compact repacked-W4A8 storage specialization is deliberately
-        # sized for two resident CTAs/SM (49.15 KiB and a two-block register
-        # limit).  The generic resident-grid cap is one CTA/SM because its
-        # barrier must never over-launch.  This specialization has a proven-
-        # resident second wave, so expose it to the same materialized work
-        # queue.  Preserve routed-row MAC tuning proportionally and cap at the
-        # physical two-wave grid.
+        # Compact repacked W4A8 can use two resident CTAs per SM. Preserve
+        # routed-row MAC tuning proportionally; compiled register and SMEM
+        # usage impose the final residency bound below.
         effective_mac = min(
             effective_mac * 2,
             get_num_sm(torch.device("cuda")) * 2,
@@ -11433,7 +11433,12 @@ def _launch_dynamic_flat(
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
         planned_tile_m=planned_tile_m,
+        planned_num_tokens=planned_num_tokens,
     )
+    if w4a8_repacked and not w4a8_n64_repacked and selected_tile_m <= 32:
+        from b12x._lib.cooperative import cooperative_grid_limit
+
+        mac = min(mac, cooperative_grid_limit(compiled, compiled._b12x_block_threads))
     if volatile_launch_state:
         barrier_count.zero_()
         barrier_epoch.zero_()
@@ -11697,6 +11702,7 @@ def _tp_moe_dynamic_launch_op(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    planned_num_tokens: int,
 ) -> None:
     (
         volatile_launch_state,
@@ -11776,6 +11782,7 @@ def _tp_moe_dynamic_launch_op(
         policy_max_active_clusters=policy_max_active_clusters,
         volatile_launch_state=volatile_launch_state,
         planned_tile_m=planned_tile_m,
+        planned_num_tokens=planned_num_tokens,
         planned_direct_routing=planned_direct_routing,
     )
 
@@ -11845,6 +11852,7 @@ def _tp_moe_dynamic_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
+    planned_num_tokens: int,
 ) -> None:
     del launch_policy
     return None
@@ -11881,6 +11889,7 @@ def _launch_dynamic(
     external_route_plan_requested: bool = False,
     policy_max_active_clusters: int = -1,
     planned_tile_m: int = 128,
+    planned_num_tokens: int,
     dynamic_route_mode: str = "grouped",
 ) -> None:
     del stream
@@ -11995,6 +12004,7 @@ def _launch_dynamic(
         float(swiglu_alpha),
         float(swiglu_beta),
         launch_policy,
+        planned_num_tokens,
     )
 
 
@@ -13204,7 +13214,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         dense_w4a8_candidate = _w4a8_dynamic_dense_candidate(
             quant_mode=quant_mode,
             activation=activation,
-            routed_rows=routed_rows,
+            routed_rows=plan.routed_rows,
             num_experts=weight_E,
             k=k,
             n=n,
@@ -13214,7 +13224,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         decode_w4a8_candidate = _w4a8_dynamic_decode_candidate(
             quant_mode=quant_mode,
             activation=activation,
-            routed_rows=routed_rows,
+            routed_rows=plan.routed_rows,
             num_experts=weight_E,
             n=n,
             deterministic_output=deterministic_output,
@@ -13267,6 +13277,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 else decode_config.max_active_clusters
             ),
             planned_tile_m=planned_tile_m,
+            planned_num_tokens=plan.max_tokens_per_launch,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
                 (
