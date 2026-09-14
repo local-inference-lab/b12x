@@ -46,11 +46,11 @@ def projection_mixed(weight_plan):
 def projection_rates(weight_plan):
     # Canonical rate tensors are loaded after weight planning. Resolve every
     # uniform SQG rate before capture; binding selects the prepared rate.
-    if (
-        weight_plan.source_format == "b12x_trellis"
-        and weight_plan.trellis_codebook == "sqg_e4m3"
-    ):
-        return (2, 3, 4)
+    if weight_plan.source_format == "b12x_trellis":
+        if weight_plan.trellis_codebook == "sqg_e4m3":
+            return (2, 3, 4)
+        if weight_plan.trellis_codebook == "sqg_fp16":
+            return (5, 6)
     return (weight_plan.trellis_bits,)
 
 
@@ -292,7 +292,7 @@ def compile_launches(caps, *, offline=False, artifact_dir=None, artifact_prefix=
             options += f" --keep-ptx --keep-cubin --dump-dir={directory}"
         spec = KernelCompileSpec.from_facts(
             "moe.sm103.trellis." + name,
-            4,
+            5,
             ("hidden", caps.k),
             ("intermediate", caps.n),
             ("expert_capacity", caps.weight_E),

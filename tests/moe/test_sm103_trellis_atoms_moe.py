@@ -11,7 +11,7 @@ from b12x.policy.generation.providers.trellis_reference import moe_reference
 from tests._reference.trellis_atoms import atom_fixture
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
 @pytest.mark.parametrize("coupled", [False, True])
 def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
     if not torch.cuda.is_available():
@@ -67,7 +67,7 @@ def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
         )
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
 @pytest.mark.parametrize(
     "coupled,group_size,width",
     [

@@ -294,10 +294,7 @@ def _symmetric_bits(config: TrellisConfig, rates: torch.Tensor) -> torch.Tensor:
     elif config.codebook is TrellisCodebook.SQG_E4M3:
         allowed = (2, 3, 4)
     else:
-        raise NotImplementedError(
-            "sqg_fp16 is represented by the v2 format but is not implemented "
-            "by the config-only fused MoE planner"
-        )
+        allowed = (5, 6)
     if any(int(value) not in allowed for value in low.reshape(-1).tolist()):
         raise ValueError(
             f"{config.codebook.value} fused MoE rates must use K{allowed}; "

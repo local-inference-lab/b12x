@@ -1,0 +1,317 @@
+{
+  "schema": "b12x.sm103.trellis_fp16.validation.v1",
+  "recorded_utc": "2026-09-14T15:49:02.341142+00:00",
+  "status": "Canonical uniform and grouped SQG FP16 implemented; complete SM103 expert execution unqualified",
+  "runtime_qualified_on_sm103": false,
+  "performance_claim": false,
+  "source_sha256": "61001cf402dd6a917a21410f095090700547766bb59cba31c0dba5efba00d0dc",
+  "source_revision": "e92096ee7fc7b584f0b6026243d2a33e8e27527c",
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-source-manifest.json",
+    "sha256": "cac00986a8c24833843a14566faeb8e62de73b4877fcbb8079d8a494966b78f6",
+    "bytes": 97642
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-remote-sources-final.json",
+    "sha256": "55bd648ce61010a8fb83d00564fd2724f0fb1cf2908e1fe45929b7dfe762058e",
+    "bytes": 195
+  },
+  "implementation": [
+    "Canonical uniform K5/K6, grouped K5/K6 and unequal-plane SQG FP16 rates use the existing native Trellis execution paths",
+    "The 416-byte D3L descriptor and FP16 reconstruction law are unchanged; grouped decode selects K5 or K6 for each compressed plane",
+    "Ordinary and coupled transforms retain global draw extents, distinct input-scale halves and the existing public plan/bind/run lifecycle",
+    "Uniform SM103 plans prewarm 16 ordinary or 18 coupled callables; grouped plans prewarm 14 or 15, respectively",
+    "Live counts, grouped rates and offsets remain runtime operands; no decoded global weight buffer is introduced",
+    "Canonical uniform SQG FP16 also executes through the existing SM120 backend; grouped layouts retain explicit SM12x rejection",
+    "The shared dual-input epilogue uses a bounded tile cutoff and boolean row predicates; no quantization, synchronization, launch geometry or planner policy changes"
+  ],
+  "descriptor": {
+    "bytes": 416,
+    "sha256": "17cf4ca9ef1e3a07c3354c12f7ac887b4e081b1668bea61eb37d8f2b410bb968",
+    "unchanged": true
+  },
+  "checks": {
+    "host-frozen": {
+      "result": "710 passed, 18 skipped",
+      "command": "CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest -q tests/architecture tests/policy tests/moe/test_trellis_config.py tests/moe/test_trellis_extents.py tests/moe/test_fused_moe_planning.py tests/moe/test_btx_schema.py tests/quantization/test_sqg_fp16_d3l.py --disable-warnings --tb=short",
+      "host": "local",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "exit_code": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-host-frozen.log",
+        "sha256": "a5967cb852bf276d09289ca769ebe9829cb0d7997c727bbcc7f63387b981f948",
+        "bytes": 913
+      }
+    },
+    "gpu-frozen": {
+      "result": "147 passed, 47 skipped",
+      "command": "CUDA_VISIBLE_DEVICES=GPU-47363510-b87a-13a5-4824-2542e97df76c CUTE_DSL_ARCH=sm_120a .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_atoms_moe.py tests/moe/test_sm103_trellis_atoms_staging.py tests/moe/test_sm103_trellis_input_halves.py tests/moe/test_sm103_trellis_staging.py tests/moe/test_sm103_trellis_mixed_staging.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis_mixed_moe.py tests/moe/test_sm103_trellis_transforms.py tests/moe/test_trellis_extents.py tests/moe/test_btx_prepare.py tests/moe/test_btx_compat.py --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "exit_code": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-gpu-frozen.log",
+        "sha256": "67bc2927c6e4b61e905710a36ef70526f9f008e28fd1148d74c77e7e4b9978dd",
+        "bytes": 283
+      }
+    },
+    "memcheck-frozen": {
+      "result": "12 passed, 9 skipped, 51 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=GPU-cc109c01-9756-d0db-21ea-f1825d3f963f CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool memcheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_atoms_moe.py tests/moe/test_sm103_trellis_atoms_staging.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis_input_halves.py -k \"sqg_fp16 or column_selection\" --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "exit_code": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-memcheck-frozen.log",
+        "sha256": "591c14d6fb99088680985258666ef1e30c735f152d57002b7fb69987ddac7229",
+        "bytes": 188
+      },
+      "sanitizer_errors": 0
+    },
+    "synccheck-frozen": {
+      "result": "12 passed, 9 skipped, 51 deselected",
+      "command": "CUDA_VISIBLE_DEVICES=GPU-cc109c01-9756-d0db-21ea-f1825d3f963f CUTE_DSL_ARCH=sm_120a .deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer --tool synccheck --report-api-errors no --error-exitcode 99 .venv/bin/python -m pytest -q tests/moe/test_sm103_trellis_atoms_moe.py tests/moe/test_sm103_trellis_atoms_staging.py tests/moe/test_sm103_trellis_moe.py tests/moe/test_sm103_trellis_input_halves.py -k \"sqg_fp16 or column_selection\" --disable-warnings --tb=short",
+      "host": "ripper",
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "exit_code": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-synccheck-frozen.log",
+        "sha256": "7bcf8283b69e090b9e0dfd68a4b6a7eae90dc63b79ba80801b6230818d54067b",
+        "bytes": 187
+      },
+      "sanitizer_errors": 0
+    },
+    "torch213-host": {
+      "result": "105 passed, 16 skipped",
+      "command": "CUTE_DSL_ARCH=sm_103a /home/jasonc/vllm-sm103/.venv/bin/python -m pytest -q tests/architecture/test_sm103_trellis_atoms.py tests/architecture/test_sm103_trellis_moe.py tests/architecture/test_sm103_trellis_mixed.py tests/moe/test_trellis_extents.py tests/quantization/test_sqg_fp16_d3l.py --disable-warnings --tb=short",
+      "host": "local",
+      "worktree": "/home/jasonc/b12x-sm103",
+      "exit_code": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-torch213-host.log",
+        "sha256": "0cd941229c89d89029793b39cd38df4d5088320d1b4a729a230b220220973ba2",
+        "bytes": 192
+      }
+    }
+  },
+  "contracts": [
+    "Host tests cover all rate granularities, grouped and ungrouped axes, independent plane nibbles, and rejection below K5 or above K6",
+    "Portable production staging exactly matches independently assembled projection matrices, including group boundaries, tails and two activation rows",
+    "Graph replay observes changed rates, offsets, IDs and inputs without address changes or cumulative allocations",
+    "Uniform canonical K5/K6 passes complete SM120 expert oracles and graph replay with ordinary and coupled transforms",
+    "Frozen descriptor identity, finite symmetric rank law and all 65536 codeword permutations remain valid",
+    "Nine additional complete SM103 tests cover uniform, grouped and unequal-plane K5/K6, coupled extents and input-scale halves; execution is deferred"
+  ],
+  "compile": {
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-sm103-frozen/manifest.json",
+      "sha256": "dd238fdf76c889e8b9da4970a34358f1a6f69e957ad3e1233045b94b71c74757",
+      "bytes": 389486
+    },
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "trellis",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-sm103-frozen",
+      "--nvdisasm",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "target": "sm_103a",
+    "callables": 317,
+    "cuda_entries": 317,
+    "added_callables": 63,
+    "geometry": {
+      "experts": 384,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "max_tokens": 128,
+      "top_k": 8,
+      "group_sizes": [
+        32,
+        256
+      ]
+    },
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-resources-frozen.json",
+      "sha256": "9b125012ef24c7e94ad11dbb390c85ac0c416bd2e0881067150d9756392d2988",
+      "bytes": 475695
+    },
+    "audit_tool": {
+      "path": "/home/jasonc/b12x-sm103/scripts/audit_sm103_resources.py",
+      "sha256": "b238fe850e792a1619891a8b6004ceaf38cda36c3a92b1134c364d7dde6e9b08",
+      "bytes": 6583
+    },
+    "identical_existing_ptx": 246,
+    "identical_existing_cubins": 220,
+    "changed_existing_cubins": 34,
+    "changed_existing_cubins_with_identical_metrics": 26,
+    "positive_existing_resource_deltas": {},
+    "stack_or_local_flags": {},
+    "tmem_readers_with_wait": 89,
+    "added_projection_allocated_registers": {
+      "trellis_moe_canonical_sqg_fp16_fc1_k5": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_fc2_k5": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_fc1_k6": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_fc2_k6": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc1_k5": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc1_k5_dual": [
+        138
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc2_k5": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc1_k6": [
+        140
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc1_k6_dual": [
+        138
+      ],
+      "trellis_moe_canonical_sqg_fp16_coupled_fc2_k6": [
+        140
+      ],
+      "trellis_atoms_sqg_fp16_g32_fc1_atoms": [
+        140
+      ],
+      "trellis_atoms_sqg_fp16_g32_fc2_atoms": [
+        140
+      ],
+      "trellis_atoms_sqg_fp16_g256_coupled_fc1_atoms": [
+        140
+      ],
+      "trellis_atoms_sqg_fp16_g256_coupled_fc1_atoms_dual": [
+        138
+      ],
+      "trellis_atoms_sqg_fp16_g256_coupled_fc2_atoms": [
+        140
+      ]
+    },
+    "limitations": [
+      "Raw artifacts retain distinct hashes",
+      "Physical SM103 occupancy and timing remain unqualified"
+    ]
+  },
+  "hardware": {
+    "host": "ripper",
+    "product": "NVIDIA RTX PRO 4000 Blackwell",
+    "compute_capability": [
+      12,
+      0
+    ],
+    "sm_count": 70,
+    "mode": "Default",
+    "driver": "580.173.02",
+    "gpu_uuids": [
+      "GPU-47363510-b87a-13a5-4824-2542e97df76c",
+      "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+    ],
+    "health_after_checks": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-gpu-health.txt",
+      "sha256": "0f671851089942ad8ff64d9bc77b670fc9d3562df86c3b1dc95adc2d7a4a10ac",
+      "bytes": 349
+    },
+    "sanitizer_api_exception": "SM120 checks disable API capability-query reporting for the documented CUDA Python 13.4/driver 13.0 mismatch; native SM103 qualification must enable API error reporting"
+  },
+  "packages": {
+    "torch": "2.14.0",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.8.0"
+  },
+  "distribution": {
+    "status": "verified",
+    "package_files": 471,
+    "python_files": 462,
+    "embedded_profiles": 3,
+    "native_c_sources": 6,
+    "wheel": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-dist-frozen/b12x-1.3.0-py3-none-any.whl",
+      "sha256": "d1703751304cbb0980c4a9b057ce9dfa4840babf97584a26484a2570a8fa51d3",
+      "bytes": 2603360
+    },
+    "sdist": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-dist-frozen/b12x-1.3.0.tar.gz",
+      "sha256": "e06a17fbb7683ac601e5dea34d9128d114cfb2cf7df97a957ca64608842e9e13",
+      "bytes": 2372607
+    }
+  },
+  "wheel_import": {
+    "result": "passed",
+    "cwd": "/tmp",
+    "log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-wheel-import.log",
+      "sha256": "fec1f35f9a00fae800b45c98942704a8404ca154988cb5361ccdbbd8094917c4",
+      "bytes": 190
+    }
+  },
+  "prepared_qualification": {
+    "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-qualification-prepared/qualification.json",
+    "sha256": "6c7635313073e4085c73a191516c1f61492cf51dbe096ab045b9d4bc87dad82b",
+    "bytes": 2861
+  },
+  "native_commands": [
+    "CUTE_DSL_ARCH=sm_103a .venv/bin/python scripts/qualify_sm103.py --component trellis_moe --execute --device-uuid GPU-actual-B300-UUID --compile-manifest /path/to/trellis-fp16-final-sm103-frozen/manifest.json --output-dir /tmp/sm103-trellis-uniform --sanitizer /path/to/compute-sanitizer",
+    "CUTE_DSL_ARCH=sm_103a .venv/bin/python scripts/qualify_sm103.py --component trellis_atoms --execute --device-uuid GPU-actual-B300-UUID --compile-manifest /path/to/trellis-fp16-final-sm103-frozen/manifest.json --output-dir /tmp/sm103-trellis-atoms --sanitizer /path/to/compute-sanitizer"
+  ],
+  "companion": {
+    "vllm_revision": "a72cfdcf7b484ab395fdd4d2ee0843877a919f39",
+    "changed": false,
+    "native_build_matches_python_revision": false
+  },
+  "remaining": [
+    "Legacy BTX paired records",
+    "Complete GLM/DeepSeek speculative feedback contracts and real-checkpoint model evaluation",
+    "Matching companion vLLM native build, ARM64 dependencies and available-host SM121 regression",
+    "Station HBM registration and direct-HBM transport",
+    "Complete representative compilation from final project source",
+    "Physical SM103 correctness, graph replay and performance qualification"
+  ],
+  "epilogue_resource_fix": {
+    "implementation": "Compute the CTA-relative cutoff in Int64, clamp to 0..128, then select rows with boolean predicates instead of materialized integer row choices",
+    "before_manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-sm103-frozen/manifest.json",
+      "sha256": "969eb32caec3b3fbfbed8e72598b4cac8bdf8bc21d99b1796d64bd8a49d598d2",
+      "bytes": 389329
+    },
+    "comparison": {
+      "path": "/home/jasonc/b12x-sm103-evidence/trellis-fp16-final-resources-vs-before-epilogue.json",
+      "sha256": "530756dd70f36dad027c144666bb1dada3ca623baed5072dbecda560068a819e",
+      "bytes": 477972
+    },
+    "sqg_fp16_uniform_dual_before": {
+      "allocated_registers": 168,
+      "stack_bytes": 8,
+      "local_loads": 1,
+      "local_stores": 1
+    },
+    "all_dual_variants_after": {
+      "count": 11,
+      "allocated_registers": 138,
+      "stack_bytes": 0,
+      "local_loads": 0,
+      "local_stores": 0
+    },
+    "existing_dual_variants": {
+      "count": 8,
+      "before_allocated_registers": 167,
+      "after_allocated_registers": 138
+    },
+    "validation": "Portable production cutoff and row predicates match exact selection across tile boundaries and origins 0, 2^31+128 and 2^40; graph replay and both sanitizers pass",
+    "performance_claim": false
+  }
+}

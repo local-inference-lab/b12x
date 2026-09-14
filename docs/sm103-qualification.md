@@ -875,7 +875,8 @@ IDs and optional route/output maps are supported. Every pool-scaled offset
 uses Int64 before multiplication. Invalid routes write zeros without reading
 invalid expert weights or scale rows.
 
-Canonical uniform SQG E4M3 K2/K3/K4 weights use the existing checkpoint loader.
+Canonical uniform SQG preparation accepts E4M3 K2/K3/K4 and FP16 K5/K6
+through the existing `TrellisWeights` tensor bundle.
 Preparation records the loaded rate in the immutable prepared weight plan and
 uses FP16 internal projection buffers independently of public I/O dtype.
 Private native BTX layouts also support uniform MCG K3–K6 and SQG FP16 K5/K6.
@@ -908,7 +909,8 @@ The canonical A16 unit-scale flag is accepted without activation-scale math.
 Canonical grouped rates and unequal low/high plane rates use the original
 compressed atom rows. Preparation builds uint8 rate and Int64 word-offset
 tables indexed by group, expert and projection. MCG supports K2 through K6;
-SQG E4M3 supports K2 through K4. Each nibble selects its plane independently.
+SQG E4M3 supports K2 through K4, and SQG FP16 supports K5/K6. Each nibble
+selects its plane independently.
 The group size is a positive multiple of 32 that divides the local intermediate
 width; rank extents start on group boundaries. Atom storage and row pitch
 are aligned to 16 bytes, and row padding is zero. Rates, offsets, physical
@@ -924,7 +926,20 @@ metadata, group boundaries, graph mutation and atom rows beyond 2^31 words.
 SM120/SM121 reject this layout before execution. The
 [grouped atom validation receipt](sm103-trellis-atoms-validation.json) records
 the source, compile artifacts and regression evidence. Legacy BTX paired
-records and canonical SQG FP16 preparation remain unsupported.
+records remain unsupported.
+
+SQG FP16 uses the existing 416-byte D3L descriptor and preserves its FP16
+reconstruction law for uniform and grouped K5/K6 planes. Ordinary and coupled
+transforms, including distinct input-scale halves, use the same native expert
+schedule. Uniform SQG FP16 plans prewarm 16 ordinary or 18 coupled callables;
+binding selects the prepared rate without compilation. Canonical uniform
+preparation also passes complete SM120 expert execution and graph replay.
+Grouped execution remains specific to the SM103 backend. See the
+[SQG FP16 validation receipt](sm103-trellis-fp16-validation.json).
+The shared dual-input epilogue computes a bounded tile cutoff in Int64 before
+narrowing and selects the contributing row with boolean predicates. All eleven
+compiled dual-input variants use 138 registers with no stack or local traffic.
+This is compile evidence; runtime occupancy and performance await B300.
 
 Coupled extents crossing two
 distinct input-scale halves retain both scale vectors and select the result
@@ -1029,7 +1044,7 @@ The two Engram tables contain 384,006,168 and 384,016,682 rows. Their 256-byte
 FP8 values plus eight scale bytes per row total **202.76 decimal GB**, before
 allocator overhead. Inspect actual checkpoint tensor byte counts, mixed-rate
 metadata, padding, repacks and allocator peaks before claiming a single-Station
-fit. Preserve HBM for KV, scratch and graph pools. Legacy BTX paired records, canonical SQG FP16 preparation and complete MTP
+fit. Preserve HBM for KV, scratch and graph pools. Legacy BTX paired records and complete MTP
 execution remain model blockers.
 
 ## Engram placement
@@ -1118,7 +1133,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
 | Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
-| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including unequal plane rates, 384-expert records, nonzero draw extents and distinct input-scale halves; implement legacy BTX paired records and canonical SQG FP16 where required |
+| Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including SQG FP16, unequal plane rates, 384-expert records, nonzero draw extents and distinct input-scale halves; implement legacy BTX paired records where required |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
 | MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |
