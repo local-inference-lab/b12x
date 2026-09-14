@@ -79,6 +79,14 @@ jobs:
             "${output}"/b12x-cu134-*.tar.zst \
             "${output}"/b12x-cu134-*.tar.zst.sha256
 
+  notify-container:
+    needs: build-beta
+    if: github.ref == 'refs/heads/master'
+    permissions: {}
+    uses: local-inference-lab/blackwell-llm-docker/.github/workflows/component-container-dispatch.yml@7eebe3ba39a1a15e06ffdc6d3df7b00a814a8364
+    secrets:
+      container_dispatch_token: ${{ secrets.LIL_CONTAINER_DISPATCH_TOKEN }}
+
   promote-stable:
     if: github.repository == 'local-inference-lab/b12x' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
