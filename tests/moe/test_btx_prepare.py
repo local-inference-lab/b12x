@@ -173,6 +173,8 @@ def _per_expert_config(kinds: dict[int, tuple[int, int]]) -> BtxSynthConfig:
 def test_btx_per_expert_pair_matches_naive_assembly(
     tmp_path, high_rates, expected_kind
 ) -> None:
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("SM12x coalesced pair preparation; SM103 uses compressed atom rows")
     kinds = {0: (3, 3), 1: high_rates, 2: (3, 3)}
     config = _per_expert_config(kinds)
     manifest = write_btx_checkpoint(tmp_path, config)

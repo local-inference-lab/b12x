@@ -245,3 +245,124 @@ def test_atom_binding_reuses_capacity_kernels(
     ):
         with pytest.raises(ValueError):
             backend._atom_contract(capacity, corrupted)
+
+
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("first,width,global_width", [(0, 512, 768), (8, 256, 1024), (16, 256, 1024)])
+def test_btx_pair_records_retain_public_binding_and_scale_order(
+    tmp_path, monkeypatch, codebook, coupled, first, width, global_width
+):
+    import cutlass.cute as cute
+    from tests._reference.trellis_atoms import btx_atom_fixture
+    from tests.architecture.test_sm103_trellis_moe import caps
+
+    weight_plan, layer, _ = btx_atom_fixture(
+        tmp_path, codebook=codebook, coupled=coupled,
+        first_slot=first, width=width, global_width=global_width,
+    )
+    with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
+        owner = fused_moe.prepare_weights(
+            plan=weight_plan, params_dtype=torch.bfloat16,
+            btx_layer=layer, btx_device="cpu",
+        )
+    payload = owner.representation_for("w4a16")
+    assert payload.paired_records and payload.source_format == "btx"
+    assert payload.w13.data_ptr() == layer.atoms.data_ptr()
+    assert payload.group_size == 256
+    columns = []
+    for projection in range(3):
+        records = []
+        for pair in range(width // 256):
+            for plane in range(2):
+                records.append(torch.cat([
+                    layer.rotations[pair * 8 + atom, :, projection, plane * 16 : (plane + 1) * 16]
+                    for atom in range(8)
+                ], dim=1))
+        columns.append(torch.cat(records, dim=1))
+    torch.testing.assert_close(payload.trellis.intermediate_rotations[:, :3 * width], torch.cat(columns, dim=1), atol=0, rtol=0)
+    for projection, table in enumerate((layer.rates_fc1, layer.rates_fc1, layer.rates_fc2)):
+        assert torch.equal(payload.rates[:, :, projection] & 15, table >> 4)
+        assert torch.equal(payload.rates[:, :, projection] >> 4, table & 15)
+    capacity = replace(
+        caps(monkeypatch, coupled=coupled), weight_plan=weight_plan,
+        num_topk=2, route_num_experts=6,
+    )
+    plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
+    kernels = []
+    def capture(kernel, *args, **kwargs):
+        kernels.append(kernel)
+        return object()
+    with patch.object(cute, "compile", side_effect=capture):
+        launches = backend.compile_launches(capacity, offline=True)
+    assert len(launches) == (15 if coupled else 14)
+    assert all(kernel.paired_records for kernel in kernels if hasattr(kernel, "paired_records"))
+    plan = replace(plan, _backend_plan=replace(plan._backend_plan, launches=launches, lut=torch.zeros(16, dtype=torch.uint8)))
+    scratch = {s.name: torch.empty(s.shape, dtype=s.dtype) for s in plan.scratch_specs()}
+    source = torch.empty(8, 512, dtype=torch.bfloat16)
+    ids, router = torch.zeros(8, 2, dtype=torch.int64), torch.ones(8, 2)
+    with patch.object(cute, "compile", side_effect=AssertionError("resolution frozen")):
+        for live in (8, 1, 4, 3):
+            bound = fused_moe.bind(plan, scratch=scratch, experts=owner, a=source[:live], topk_ids=ids[:live], topk_weights=router[:live])
+            calls = bound._backend_binding.calls
+            assert len(calls) == (7 if coupled and payload.trellis.input_scale_split is None else 8)
+            fc1 = launches["fc1_atoms_dual" if payload.trellis.input_scale_split else "fc1_atoms"]
+            selected = [args for fn, args in calls if fn in (fc1, launches["fc2_atoms"])]
+            assert [int(args[7]) for args in selected] == [0, 1, 2]
+            assert all(int(args[10]) == 2 * live for args in selected)
+    with pytest.raises(ValueError, match="record order"):
+        backend._atom_contract(capacity, replace(payload, paired_records=False))
+
+
+@pytest.mark.parametrize("coupled", [False, True])
+def test_btx_pair_preparation_fails_closed(tmp_path, coupled):
+    from tests._reference.trellis_atoms import btx_atom_fixture
+    from b12x.moe.fused_moe.trellis_atoms import prepare_btx_atom_weights
+
+    _, layer, _ = btx_atom_fixture(tmp_path, coupled=coupled)
+    poisoned = layer.atoms.clone()
+    poisoned[0, -1] = 1
+    failures = [
+        (replace(layer, rates_fc1=None), "rates"),
+        (replace(layer, rates_fc2=layer.rates_fc2.int()), "rates"),
+        (replace(layer, rates_fc1=torch.full_like(layer.rates_fc1, 0x53)), "pair kinds"),
+        (replace(layer, atoms=layer.atoms[:, :16].contiguous()), "shorter"),
+        (replace(layer, atoms=layer.atoms[:1]), "extent"),
+        (replace(layer, atoms=poisoned), "padding"),
+        (replace(layer, rotations=layer.rotations.flatten()), "rotations"),
+        (replace(layer, gate_suh=layer.gate_suh.float()), "side tables"),
+    ]
+    if coupled:
+        failures.extend([
+            (replace(layer, rotation_draws=None), "draws"),
+            (replace(layer, rotation_draws=torch.full_like(layer.rotation_draws, 8)), "draws"),
+        ])
+    for invalid, message in failures:
+        with pytest.raises(ValueError, match=message):
+            prepare_btx_atom_weights(invalid, activation="situ" if coupled else "silu", device="cpu")
+
+
+@pytest.mark.parametrize("coupled,width,kinds", [
+    (True, 256, ("P33",)), (False, 512, ("P33",)),
+    (False, 256, ("P22", "P44")),
+])
+def test_btx_pair_expansion_does_not_enable_sm12x(monkeypatch, coupled, width, kinds):
+    from b12x._lib.architecture import UnsupportedArchitectureError
+    from b12x.policy import DeviceIdentity, PolicyContext
+
+    plan = fused_moe.plan_weights(
+        quant_modes="w4a16", source_format="btx", activation="situ",
+        params_dtype=torch.bfloat16, num_experts=3, hidden_size=512,
+        intermediate_size=width, trellis_codebook="sqg_e4m3", trellis_bits=3,
+        trellis_rate_granularity="per_expert_pair", trellis_pair_kinds=kinds,
+        coupled_hadamard=coupled, coupled_hadamard_blocks=(512, 128) if coupled else None,
+    )
+    identity = DeviceIdentity(vendor="nvidia", product_name="Synthetic SM120", compute_capability=(12, 0), sm_count=70)
+    from types import SimpleNamespace
+    import b12x.policy.context as context
+    monkeypatch.setattr(context, "detect_device", lambda device: SimpleNamespace(identity=identity, ordinal=None))
+    with pytest.raises(UnsupportedArchitectureError, match="SM12x BTX paired"):
+        _impl.plan_tp_moe_execution(
+            num_tokens=1, num_topk=2, device="cpu", weight_plan=plan,
+            quant_mode="w4a16", policy_context=PolicyContext.for_identity(identity),
+        )

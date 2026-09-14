@@ -149,17 +149,16 @@ preparation time, exactly as any other legal extent.
 - **Production**: uniform rate structures across the codebook bit ranges
   (K2–K6), coupled and uncoupled, on the fused W4A16 serving path. The
   qualified production deployment is uniform coupled K2 with `sqg_e4m3`.
-- **Supported, non-production**: `per_expert_pair` rate structures. A
-  declared pair-kind set of `{P33, P43}` or `{P33, P24}` (with the
-  kernel's bits-3 base specialization) executes through the fused kernel's
-  expert-static dynamic dispatch.
-- **Declared, unfused**: pair-kind sets containing `P44` (whole-expert K4
-  tiers mixed with K3 experts). The container expresses them; single-launch
-  fused execution has no dynamic P44 arm, so planning fails closed with a
-  status message. Two serial launches or the mixed-tier benchmark kernel
-  (`b12x/moe/_shared/kernels/w4a16/mixed_trellis.py`) are the execution
-  vehicles.
-- A `per_expert_pair` checkpoint is TP-degree-sensitive on FC2: the fused
-  kernel's K-axis pair decode requires a 256-channel local intermediate,
-  so some legal checkpoints are unservable at a given TP degree; planning
-  reports this fail-closed.
+- **Implemented on SM103; hardware-unqualified**: `per_expert_pair` with MCG
+  or SQG E4M3 and P22, P33, P24, P43 or P44. Ordinary and coupled execution
+  retain compressed atom rows, and local intermediate widths may contain
+  multiple complete 256-channel pairs. Coupled execution requires SiTU and
+  H512/H128 transforms. See the [SM103 qualification runbook](sm103-qualification.md).
+- **Supported on SM120/SM121, non-production**: one ordinary 256-channel
+  `per_expert_pair` extent with `{P33}`, `{P33, P43}` or `{P33, P24}` and the
+  bits-3 base specialization. The fused kernel uses expert-static dispatch.
+  P22, P44, coupled pairs and multiple local pairs fail closed on this backend.
+- Checkpoint extent alignment and barriers remain authoritative for every
+  backend. The SM12x FC2 implementation additionally requires a 256-channel
+  local intermediate width, so some legal checkpoints are unservable at a
+  given TP degree on SM12x.

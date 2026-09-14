@@ -912,6 +912,21 @@ def compile_trellis(out):
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
         launches.update({label + key: fn for key, fn in compiled.items()})
+    for codebook in ("mcg", "sqg_e4m3"):
+        for coupled in (False, True):
+            label = f"trellis_btx_pairs_{codebook}_" + ("coupled_" if coupled else "")
+            caps = SimpleNamespace(
+                k=5120, n=2304, weight_E=384, max_tokens=128, num_topk=8,
+                route_num_experts=768, dtype=torch.bfloat16,
+                activation="situ" if coupled else "silu",
+                weight_plan=SimpleNamespace(
+                    coupled_hadamard=coupled, source_format="btx",
+                    trellis_bits=3, trellis_codebook=codebook,
+                    trellis_rate_granularity="per_expert_pair",
+                ),
+            )
+            compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
+            launches.update({label + key: fn for key, fn in compiled.items()})
     return launches
 
 

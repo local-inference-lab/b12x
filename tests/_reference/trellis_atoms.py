@@ -135,3 +135,65 @@ def atom_fixture(
         ),
     )
     return plan, weights, logical, expected
+
+
+def btx_atom_fixture(
+    path, *, codebook="sqg_e4m3", coupled=False, experts=3,
+    hidden=512, width=512, global_width=768, first_slot=0,
+):
+    from dataclasses import replace
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+    from b12x.moe._shared.kernels.w4a16.btx_synth import (
+        BtxSynthConfig, synth_layer_payloads, write_btx_checkpoint,
+    )
+
+    palette = (0x22, 0x33, 0x24, 0x43, 0x44)
+    fc1 = torch.empty(global_width // 256, experts, dtype=torch.uint8)
+    fc2 = torch.empty_like(fc1)
+    for pair in range(global_width // 256):
+        for expert in range(experts):
+            fc1[pair, expert] = palette[(pair + expert) % len(palette)]
+            fc2[pair, expert] = palette[(pair + expert + 3) % len(palette)]
+    config = BtxSynthConfig(
+        codebook=codebook, num_experts=experts, hidden_size=hidden,
+        intermediate_size=global_width, moe_layer_indices=(0,),
+        rate_tables={0: (fc1, fc2)}, coupled=coupled,
+        pre_block=512 if coupled else None, post_block=128 if coupled else None,
+        per_expert_input_rotations=True, extent_alignment_slots=8, seed=819,
+    )
+    manifest = write_btx_checkpoint(path, config)
+    layer = read_btx_layer(path, manifest, 0, first_slot=first_slot, slot_count=width // 32)
+    # Safetensors CPU mappings need not share the CUDA allocator's alignment.
+    layer = replace(
+        layer, atoms=layer.atoms.clone(), gate_suh=layer.gate_suh.clone(),
+        up_suh=layer.up_suh.clone(), down_svh=layer.down_svh.clone(),
+    )
+    plan = fused_moe.plan_weights(
+        quant_modes="w4a16", source_format="btx",
+        activation="situ" if coupled else "silu", params_dtype=torch.bfloat16,
+        num_experts=experts, hidden_size=hidden, intermediate_size=width,
+        trellis_codebook=codebook, trellis_bits=3,
+        trellis_rate_granularity="per_expert_pair",
+        trellis_pair_kinds=manifest.rates.pair_kinds, coupled_hadamard=coupled,
+        coupled_hadamard_blocks=(512, 128) if coupled else None,
+    )
+    payloads = synth_layer_payloads(config, 0)
+    expected = {}
+    for expert in range(experts):
+        for projection in range(3):
+            records = []
+            for pair in range(width // 256):
+                for plane in range(2):
+                    tiles = []
+                    for atom in range(8):
+                        slot = first_slot + pair * 8 + atom
+                        record = payloads.planes[expert, slot, projection][plane]
+                        bits = record.shape[-1] // 16
+                        shape = (
+                            (1, hidden // 16, 1, 16 * bits)
+                            if projection < 2 else (1, 1, hidden // 16, 16 * bits)
+                        )
+                        tiles.append(native_weight(record.reshape(shape), bits, codebook)[0])
+                    records.append(torch.cat(tiles, dim=0 if projection < 2 else 1))
+            expected[projection, expert] = torch.cat(records, dim=0 if projection < 2 else 1)
+    return plan, layer, expected

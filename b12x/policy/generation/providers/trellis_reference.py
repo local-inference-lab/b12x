@@ -246,6 +246,8 @@ def _moe_reference(
                     )
                     decoded = native_weight(native, bits, state.codebook)[0]
                     begin = slot * 32 + plane * 16
+                    if prepared.paired_records:
+                        begin = (slot // 8) * 256 + plane * 128 + (slot % 8) * 16
                     if projection < 2:
                         matrix[begin : begin + 16] = decoded
                     else:
