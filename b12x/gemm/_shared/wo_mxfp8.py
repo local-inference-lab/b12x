@@ -22,6 +22,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from b12x._lib.gating import get_compute_capability
 from b12x._lib.utils import cuda_stream_to_int, get_num_sm
 from b12x.gemm.wo_projection._tuning import WoProjectionConfig
 from b12x._lib.compile_plan import attach_programs
@@ -173,11 +174,11 @@ class WOProjectionScratchCaps:
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
         object.__setattr__(self, "device", device)
-        object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
-        object.__setattr__(self, "groups", max(int(self.groups), 1))
-        object.__setattr__(self, "group_width", max(int(self.group_width), 1))
-        object.__setattr__(self, "rank", max(int(self.rank), 1))
-        object.__setattr__(self, "hidden", max(int(self.hidden), 1))
+        for name in ("max_tokens", "groups", "group_width", "rank", "hidden"):
+            value = int(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"WO projection {name} must be positive")
+            object.__setattr__(self, name, value)
         if self.dtype != torch.bfloat16:
             raise ValueError(
                 "WO projection scratch currently supports torch.bfloat16 outputs, "
@@ -220,7 +221,8 @@ class _WOProjectionState:
             source_tgd=source_tgd,
             weights=weights,
             return_3d=return_3d,
-            expected_m=expected_m,
+            expected_m=self.caps.max_tokens if expected_m is None else expected_m,
+            backend=self.backend,
         )
 
     def bind_inv_rope(
@@ -259,7 +261,8 @@ class _WOProjectionState:
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             return_3d=return_3d,
-            expected_m=expected_m,
+            expected_m=self.caps.max_tokens if expected_m is None else expected_m,
+            backend=self.backend,
         )
 
     def _views_from_scratch(
@@ -283,7 +286,7 @@ class _WOProjectionState:
         group_width = int(self.caps.group_width)
         rank = int(self.caps.rank)
         hidden = int(self.caps.hidden)
-        layout = _layout_wo_projection(
+        layout = self.layout if self.backend == "mxfp8_tcgen05" else _layout_wo_projection(
             offset_bytes=0,
             tokens=tokens,
             groups=groups,
@@ -337,7 +340,7 @@ class _WOProjectionState:
                 ),
                 dtype=torch.uint8,
             )
-            if m % MXFP8_SCALE_ROW_TILE:
+            if self.backend != "mxfp8_tcgen05" and m % MXFP8_SCALE_ROW_TILE:
                 scale_physical_u8.fill_(127)
             scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
                 3,
@@ -1371,7 +1374,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
         tile_n = 64
     elif (num_groups, m, k) == (1, 4096, 4096):
         tile_n = 128
-    if tile_n:
+    if tile_n and get_compute_capability(weight.device) != (10, 3):
         # Physical [L, Ntile, Ktile, Ninner, Kinner], specialized for the
         # production decode WO Ntile/BK128 GEMMs. Keep `values` in its logical
         # layout for all other schedules and callers.
@@ -1530,10 +1533,17 @@ def quantize_wo_a_input_mxfp8(
         )
     else:
         _check_mxfp8_rows_storage(out, m=tokens, k=group_width, num_groups=groups)
+    if get_compute_capability(source_tgd.device) == (10, 3):
+        from b12x.gemm.wo_projection._quant_cute import quantize_wo_grouped_rows_cute
+        quantize_wo_grouped_rows_cute(
+            source_tgd, out.values, out.scale_rows, out.scale_mma,
+            m=tokens, groups=groups, group_width=group_width,
+        )
+        return out
     # Measured on RTX PRO 6000 at M=8192, gw=4096, groups=4: this Triton
     # kernel (232.8us) beats the CuTe grouped port (250.1us) -- unlike the old
     # per-32-group dense quantizer, it is already tiled and bandwidth-bound.
-    # quantize_wo_grouped_rows_cute stays available but is not routed.
+    # SM12x retains this Triton packing path.
     values_stride_g = out.values.stride(2) if out.values.ndim == 3 else 0
     chunks_per_program = _wo_quant_chunks_per_program(group_width)
     _quantize_grouped_tgd_to_tdg_kernel[
@@ -1854,6 +1864,16 @@ def quantize_wo_a_input_inv_rope_mxfp8(
 
     group_width = heads_per_group * head_dim
     _check_mxfp8_k(group_width)
+    if get_compute_capability(o.device) == (10, 3):
+        from b12x.gemm.wo_projection._quant_cute import quantize_wo_grouped_rows_cute
+        if out is None:
+            out = empty_mxfp8_rows_for_dense_gemm(tokens, group_width, num_groups=groups, device=o.device)
+        quantize_wo_grouped_rows_cute(
+            o, out.values, out.scale_rows, out.scale_mma, m=tokens, groups=groups,
+            group_width=group_width, positions=positions, cos_sin_cache=cos_sin_cache,
+            head_dim=head_dim, nope_dim=nope_dim, rope_dim=rope_dim,
+        )
+        return out
     if out is None:
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.b12x.quantize_wo_a_input_inv_rope_mxfp8_alloc(
@@ -2052,6 +2072,15 @@ def quantize_wo_b_input_mxfp8(
     tokens, rank, groups = source_trg.shape
     width = rank * groups
     _check_mxfp8_k(width)
+    if get_compute_capability(source_trg.device) == (10, 3):
+        from b12x.gemm.wo_projection._quant_cute import quantize_wo_group_major_rows_cute
+        if out is None:
+            out = empty_mxfp8_rows_for_dense_gemm(tokens, width, device=source_trg.device)
+        quantize_wo_group_major_rows_cute(
+            source_trg, out.values, out.scale_rows, out.scale_mma,
+            m=tokens, groups=groups, rank=rank,
+        )
+        return out
     if out is None:
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.b12x.quantize_wo_b_input_mxfp8_alloc(
@@ -2348,6 +2377,7 @@ def _build_wo_projection_binding_from_views(
     weights: WOProjectionMXFP8Weights,
     return_3d: bool = False,
     expected_m: int | None = None,
+    backend: str = "mxfp8",
 ) -> WOProjectionBinding:
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     _check_wo_projection_views(
@@ -2358,6 +2388,9 @@ def _build_wo_projection_binding_from_views(
         tokens=tokens,
         weights=weights,
     )
+    if backend == "mxfp8_tcgen05":
+        from b12x.gemm.wo_projection._execution import validate_binding
+        validate_binding(source_tgd, weights, x_q, tmp, tmp_q, output)
     return WOProjectionBinding(
         source_tgd=source_tgd,
         weights=weights,
@@ -2367,6 +2400,7 @@ def _build_wo_projection_binding_from_views(
         output=output,
         return_3d=bool(return_3d),
         expected_m=expected_m,
+        backend=backend,
     )
 
 
@@ -2435,6 +2469,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
     rope_dim: int = 64,
     return_3d: bool = False,
     expected_m: int | None = None,
+    backend: str = "mxfp8",
 ) -> WOProjectionInvRopeBinding:
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
@@ -2453,6 +2488,13 @@ def _build_wo_projection_inv_rope_binding_from_views(
         tokens=tokens,
         weights=weights,
     )
+    if backend == "mxfp8_tcgen05":
+        from b12x.gemm.wo_projection._execution import validate_binding
+        from b12x.gemm.wo_projection._quant_cute import _validate_rope
+        validate_binding(o, weights, x_q, tmp, tmp_q, output,
+                         extra_reads=(positions, cos_sin_cache))
+        _validate_rope(o, positions, cos_sin_cache, tokens,
+                       nope_dim + rope_dim, nope_dim, rope_dim)
     return WOProjectionInvRopeBinding(
         o=o,
         positions=positions,
@@ -2467,6 +2509,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
         rope_dim=int(rope_dim),
         return_3d=bool(return_3d),
         expected_m=expected_m,
+        backend=backend,
     )
 
 
@@ -2853,6 +2896,9 @@ def wo_projection_mxfp8(
         output = binding.output
         return_3d = binding.return_3d
         expected_m = binding.expected_m
+        if binding.backend == "mxfp8_tcgen05":
+            from b12x.gemm.wo_projection._execution import run
+            return run(binding, stream=stream)
     else:
         x_q = None
         tmp = None
@@ -3184,6 +3230,9 @@ def wo_projection_inv_rope_mxfp8(
         rope_dim = binding.rope_dim
         return_3d = binding.return_3d
         expected_m = binding.expected_m
+        if binding.backend == "mxfp8_tcgen05":
+            from b12x.gemm.wo_projection._execution import run
+            return run(binding, stream=stream)
     if (
         o is None
         or positions is None
@@ -3195,6 +3244,8 @@ def wo_projection_inv_rope_mxfp8(
             "wo_projection_inv_rope_mxfp8 requires o, positions, cos_sin_cache, "
             "weights, and heads_per_group or binding"
         )
+    if get_compute_capability(o.device) == (10, 3):
+        raise TypeError("SM103 WO inverse RoPE requires a prewarmed binding with caller-owned scratch")
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
         weights=weights,

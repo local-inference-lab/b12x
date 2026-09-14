@@ -981,3 +981,45 @@ GLM/DeepSeek speculative feedback, complete model execution, and Station HBM
 transport remain implementation or integration work. SM121 regression and
 physical SM103 qualification remain outstanding. The companion still uses the
 recorded precompiled native libraries rather than a build of its Python revision.
+
+## Planned DeepSeek WO projection
+
+Status: implemented and cross-compiled; physical SM103 execution remains
+unqualified. The WO component resolves a typed `mxfp8_tcgen05` configuration
+on SM103 and retains it on plans and bindings. Its native bound execution uses
+caller-owned activation, intermediate and output storage around two MXFP8
+GEMMs. Inverse RoPE executes in FP32 inside the first quantizer. SM103 bindings
+retain capacity and fixed scratch offsets without initializing device memory
+at bind time. The native path does not use the legacy allocating inverse-RoPE
+operator or SM12x fused-GEMM overrides.
+
+The CuTe quantizer uses Int64 row/group/cache offsets, runtime row grids,
+device/architecture cache identity and a prewarm guard. Each call writes all
+logical and padded scale bytes. Negative or out-of-range cosine positions raise
+a device error. BF16 and FP16 inputs, BF16/FP32 cosine caches and Int32/Int64
+positions have byte-level oracle coverage. Int32 positions may have four-byte
+alignment; multiplying a position by its cache stride still uses Int64.
+
+Validation: 523 host checks pass with 23 skips. The SM120 WO suite passes 44
+checks with six native-SM103 skips. Thirteen quantizer cases pass memcheck and
+synccheck with zero kernel errors, including a mostly uninitialized 4 GiB cosine
+cache addressed at its tail. Tests cover M1/M3/M8/M9/M16/M127/M128/M129 under
+frozen resolution, poisoned padding, input mutation, explicit streams, stable
+addresses and allocation-free replay. Invalid-position tests use isolated CUDA
+processes. The four-case production profile probe passes SM120 graph checks;
+its diagnostic samples do not establish a performance claim.
+
+The SM103 compilation contains 48 quantizers and eight native GEMMs. All eight
+GEMMs emit MXFP8 UMMA and retain TMEM load completion waits. Static inspection
+finds no stack or local-memory flags. Quantizers use 28–40 allocated registers;
+GEMMs use 134 registers, 1,024 bytes of static shared memory and 67,712 bytes of
+dynamic shared memory. Wheel and sdist match 460 package Python files and three
+embedded profiles. The [WO receipt](sm103-wo-validation.json) binds commands,
+sources and artifacts. The complete SM103 corpus has not been rebuilt.
+
+Companion vLLM WO plan retention, shared scratch, warmup and architecture
+admission remain integration work. SM12x retains its legacy projection paths;
+its allocating inverse-RoPE behavior requires separate lifecycle work. Remaining
+Trellis formats, GLM/DeepSeek feedback, complete model execution and Station HBM
+transport remain open, along with SM121 regression and physical SM103
+qualification.

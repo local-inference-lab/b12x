@@ -37,6 +37,7 @@ META = OpMeta(
         "is_supported",
     ),
     dtypes=("bf16",),
+    archs=("sm103a", "sm120a", "sm121a"),
     recipes=("mxfp8",),
     requires=("triton",),
     provenance=Provenance(
@@ -47,8 +48,9 @@ META = OpMeta(
     test_path="tests/gemm/test_wo_projection.py",
     since="0.7.0",
     notes=(
-        "The planned run path is BF16-only; the standalone quantize_input* "
-        "facet also compiles for fp16."
+        "SM103 uses a bound CuTe quantize/GEMM chain with caller-owned scratch; "
+        "physical SM103 execution remains unqualified. The planned run path is "
+        "BF16-only; standalone quantize_input* also supports FP16."
     ),
 )
 
