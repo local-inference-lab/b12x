@@ -1057,3 +1057,34 @@ checkpoint scale metadata and TP reduction must remain correct. The attention
 planning audit, target/draft model execution, remaining Trellis contracts and
 Station HBM transport remain open. SM121 runtime regression is outstanding;
 the inspected GB10 host was running a vLLM worker and was left undisturbed.
+
+## Companion WO serving ownership and architecture admission
+
+Status: implemented; host and SM120 operator checks pass. Physical SM103 and
+complete model execution remain unqualified. Companion vLLM revision
+`1441ad1edc0018c87bdd3db77c5c3d444965b113` retains configured WO capacity plans,
+reserves shared workspace, prewarms both position dtypes through public b12x,
+and binds a separate BF16 output through an opaque Torch operator. Capture
+retains its binding. Every attention owner prepares state before matching
+owners deduplicate compilation. Checkpoint metadata selects 128x128 or 32x32
+weight blocks, and tensor-parallel reduction remains outside the projection.
+
+The companion host suites pass 72 cases with four GPU skips. Four real WO
+serving cases pass both SM120 memcheck and synccheck with zero kernel errors.
+They exercise eager/Inductor execution, independent quantization and inverse
+RoPE references, arbitrary positive FP32 128x128 scales, 32x32 UE8M0 scales,
+padded input rows, changing live counts, frozen resolution, graph mutation,
+poisoned output/workspace, stable addresses and unchanged cumulative allocation
+counters. Companion `docs/design/b12x_wo_serving_validation.json` binds the
+evidence to 2,307 Python/test source hashes and records the separately versioned
+native libraries. Pre-commit checks pass.
+
+Source review identifies live-row and page-table planning in the companion
+compressed attention and indexer adapters. Compressed attention also omits
+decode/extend mode from its plan and does not retain capture bindings. Those
+contracts still require implementation. Aggregate DeepSeek selection now honors
+the adapter architecture gate, preventing individual SM103 operation support
+from admitting the incomplete model route. Remaining checkpoint formats,
+GLM/DeepSeek speculative feedback, full model evaluation, Station direct-HBM
+transport, matching native/ARM64 builds, SM121 regression and the complete
+representative SM103 rebuild remain outstanding.
