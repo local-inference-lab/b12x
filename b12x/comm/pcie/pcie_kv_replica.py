@@ -125,10 +125,21 @@ class PCIePagedKvReplica(_IPCChannel):
                 "replica page table does not cover the declared local capacity"
             )
         for tensor in (cache, table, positions, starts, out):
-            if tensor.device != self.device or not tensor.is_contiguous():
+            if tensor.device != self.device or (
+                tensor is not cache and not tensor.is_contiguous()
+            ):
                 raise ValueError(
                     "replica tensors must be contiguous on the channel device"
                 )
+        if (
+            cache.stride(-1) != 1
+            or cache.stride(0) < page * 288
+            or cache.stride(0) % 16
+            or (cache.ndim == 3 and cache.stride(1) != 288)
+        ):
+            raise ValueError(
+                "replica requires packed records within aligned byte pages"
+            )
         for tensor in (table, starts):
             if tensor.dtype != torch.int32:
                 raise ValueError("replica page and request metadata must use int32")

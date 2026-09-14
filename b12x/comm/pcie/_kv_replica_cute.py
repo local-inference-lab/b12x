@@ -52,6 +52,7 @@ class _ReplicaCopy:
         requests: Int32,
         max_tokens: Int32,
         table_stride: Int64,
+        cache_stride: Int64,
         cache_pages: Int64,
         local_capacity: Int64,
         output_pages_per_request: Int64,
@@ -68,6 +69,7 @@ class _ReplicaCopy:
             requests,
             max_tokens,
             table_stride,
+            cache_stride,
             cache_pages,
             local_capacity,
             output_pages_per_request,
@@ -85,6 +87,7 @@ class _ReplicaCopy:
         requests: Int32,
         max_tokens: Int32,
         table_stride: Int64,
+        cache_stride: Int64,
         cache_pages: Int64,
         local_capacity: Int64,
         output_pages_per_request: Int64,
@@ -120,8 +123,8 @@ class _ReplicaCopy:
                                 Int32,
                             )
                         )
-                        source = (
-                            page * Int64(self.page_size) + local % Int64(self.page_size)
+                        source = page * cache_stride + local % Int64(
+                            self.page_size
                         ) * Int64(72)
                         if lane < Int32(18):
                             target = staging[self.rank] + staged_record * Int64(72)
@@ -191,10 +194,11 @@ def get_kv_replica_launchers(world, rank, page_size, stripe, ratio):
             1,
             1,
             1,
+            1,
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "comm.pcie.kv_replica.copy",
-                1,
+                2,
                 (*identity, stage),
                 labels=("world", "rank", "page_size", "stripe", "ratio", "stage"),
             ),
@@ -239,6 +243,7 @@ def run_kv_replica(
         requests,
         max_tokens,
         table.stride(0),
+        cache.stride(0) // 4,
         cache.shape[0],
         runtime.local_capacity,
         output_pages_per_request,
