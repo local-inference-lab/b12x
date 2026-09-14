@@ -13,6 +13,7 @@ from b12x._lib.program_cache import program_cache
 from collections.abc import Callable, Sequence
 from typing import Tuple
 
+from b12x._lib.compile_plan import attach_programs
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -677,7 +678,7 @@ def get_island_rs_launcher(
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["HEADER_BYTES", "MAX_BLOCKS", "get_island_rs_launcher", "island_rs_peers"]
