@@ -1125,3 +1125,30 @@ admission. Model evaluation, checkpoint/speculative contracts, matching native
 and ARM64 packaging, final full-corpus compilation and Station HBM transport
 remain open. The inspected GB10 host has an active vLLM worker; SM121 GPU
 regression remains deferred without disrupting that service.
+
+
+## FP8 indexer serving ownership
+
+Status: implemented; physical SM103 and complete model execution remain
+unqualified. Public FP8 prewarm uses planned capacity with one live row and
+preserves physical page pitch. Bound prefill and indices-only fused selection
+use reserved storage for unused outputs and local scores.
+
+Both companion FP8 adapters use public plan/bind/run calls with retained
+capacity plans and staging. Metadata budgets come from the public plan.
+GLM context auto-fit invalidates plans before warmup. Captured bindings own
+query, metadata and scratch views. DCP reserves its packing and NCCL receive
+buffers with the scorer and reuses the existing CuTe global selector.
+
+The [indexer serving receipt](sm103-indexer-serving-validation.json) records
+599 host tests, 199 SM120 component tests, standalone serving and GLM packed-tail
+checks, and two-rank scorer/NCCL graph checks. Tests cover large recycled page
+IDs, input mutation, poisoned scratch, exact index/score association, frozen
+kernel resolution and cumulative allocation counters. All 58 SM103 indexer
+cubins match the inspected baseline, including 21 retained stack flags.
+The companion tool cross-compiles three TP2 selectors and six supporting
+packing callables. Neither compilation nor SM120 execution qualifies B300.
+
+Complete checkpoint/speculative contracts, model evaluation, matching native
+and ARM64 packages, the final full-source corpus, SM121 regression and Station
+HBM transport remain implementation or validation work.

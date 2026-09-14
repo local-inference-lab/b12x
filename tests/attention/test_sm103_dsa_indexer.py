@@ -109,7 +109,7 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
             rtol=0,
         )
 
-    dsa_indexer.run(bind(capacity))
+    dsa_indexer.prewarm_fp8(plan, scratch=scratch)
     identities = {id(v) for v in compiler._MEMORY_CACHE.values()}
     b12x.freeze_kernel_resolution(
         "DSA live rows and pool views retain their compiled kernels"
@@ -119,6 +119,16 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
             dsa_indexer.run(bind(rows, compact=True))
             check(rows)
             assert {id(v) for v in compiler._MEMORY_CACHE.values()} == identities
+        from dataclasses import replace
+        indices_only = replace(bind(3), output_scores=None)
+        dsa_indexer.run(indices_only)
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)
+        dsa_indexer.run(indices_only)
+        torch.cuda.synchronize(device)
+        after = torch.cuda.memory_stats(device)
+        for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
+            assert before[key] == after[key]
         binding = bind(3)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

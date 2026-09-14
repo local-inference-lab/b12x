@@ -2090,6 +2090,9 @@ def _split_index_k_cache_runtime_views(
         .view(torch.float32)
         .squeeze(-1)
     )
+    k_scales = index_k_cache.view(torch.float32)[
+        :, data_bytes // _SCALE_BYTES : data_bytes // _SCALE_BYTES + _PAGE_SIZE
+    ]
     return k_quant_bytes, k_scales
 
 

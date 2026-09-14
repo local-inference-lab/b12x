@@ -564,8 +564,8 @@ def _resolve_binding_metadata(
     if metadata is not None:
         raise ValueError("pass either metadata or binding, not both")
     metadata = IndexerPagedMetadata(
-        real_page_table=getattr(binding, "real_page_table"),
-        cache_seqlens_int32=getattr(binding, "cache_seqlens_int32"),
+        real_page_table=binding.real_page_table,
+        cache_seqlens_int32=binding.cache_seqlens_int32,
         schedule_metadata=getattr(binding, "schedule_metadata", None),
         expected_num_q_heads=getattr(binding, "expected_num_q_heads", None),
         shared_page_table=bool(getattr(binding, "shared_page_table", False)),
@@ -865,7 +865,10 @@ def index_topk_fp8(
             num_heads=indexer_heads,
             topk=topk,
             out_indices=out_indices,
-            out_values=out_scores,
+            out_values=(
+                out_scores if out_scores is not None
+                else scratch.get_indexer_contiguous_topk_buffers(row_count=q_rows)[0]
+            ),
             pack_values=cache[0],
             pack_indices=cache[1],
             merge_state=cache[2],
