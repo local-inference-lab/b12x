@@ -1172,7 +1172,11 @@ separate E4M3 projection weights with FP32 block scales, and a BF16 broadcast su
 It accepts H divisible by 128 through 16384 and up to 16 streams. Hidden-path
 scratch covers `max_tokens * streams` rows. Learned norm weights have H elements;
 weight scales have shape `[H/128,H/128]`. Both projections preserve their BF16
-rounding before addition. The companion DeepSeek model integration remains open.
+rounding before addition. The companion DeepSeek adapter installs a retained
+feedback owner after both FP8 linear providers finalize their weights. It
+shards raw inputs and positions together and preserves the flat pre-head
+recycled residual. The [serving receipt](sm103-mtp-fp8-serving-validation.json)
+records local call-site validation; complete model execution remains unqualified.
 Policy query schema 2 includes the contract. Embedded Qwen measurements do not
 cover ordinary RMS feedback; AUTO uses the heuristic until those plans are
 measured. Generator candidate contract version 3 races all three contracts.
@@ -1228,7 +1232,7 @@ acceptance rates, full-model token equality or complete DFlash2 serving.
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including SQG FP16, unequal plane rates, 384-expert records, nonzero draw extents, distinct input-scale halves and BTX paired records; implement frozen QSRT coupled high-rate conversion where required |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
-| MTP feedback | `sequence/mtp_feedback/_concat.py`, `_cute_prefill.py` and `_fp8.py`: qualify all three implemented contracts on SM103; companion `vllm/models/glm5next/nvidia/mtp.py`: evaluate full GLM speculative decoding; integrate per-stream FP8 feedback into `vllm/models/deepseek_v4/nvidia/mtp.py`, preserving sequence-parallel sharding and the pre-head recycled residual |
+| MTP feedback | `sequence/mtp_feedback/_concat.py`, `_cute_prefill.py` and `_fp8.py`: qualify all three implemented contracts on SM103; companion `vllm/models/glm5next/nvidia/mtp.py` and `vllm/models/deepseek_v4/nvidia/mtp.py`: evaluate complete speculative decoding with retained feedback plans, actual collectives, head collapse and recycled-state semantics |
 | Full serving | LIL vLLM per-operation capability routing, plan retention, and warmup: complete target/draft execution and CUDA graph replay before enabling full GLM or V4.1 serving |
 | Station HBM transport | `comm/roce/_transport.py`: implement HBM registration, peer exchange, and ordering before admitting `hbm_gdr`; qualify registration and visibility on Station hardware |
 

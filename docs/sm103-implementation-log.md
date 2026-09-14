@@ -1503,3 +1503,29 @@ DeepSeek companion MTP integration, complete model/speculative evaluation,
 frozen QSRT coupled high-rate conversion, matching native vLLM/ARM64 builds,
 SM121 regression, Station direct-HBM transport and final consolidated evidence
 remain open. Physical SM103 runtime execution remains unqualified.
+
+## DeepSeek MTP feedback integration
+
+Companion revision `33e4f799dd916d3b302ed52de35ab54db7d3df06` installs the
+per-stream FP8 feedback owner after both linear providers finalize their
+weights. GLM and DeepSeek share plan/storage ownership and the output-mutating
+Torch operator. The hidden projection reserves scheduler capacity times stream
+count; the model retains the flat pre-head residual and existing padding
+metadata. Sequence parallelism shards raw inputs and positions together.
+
+The [serving receipt](sm103-mtp-fp8-serving-validation.json) records 63 host
+passes, 15 SM120 call-site/post-load passes and 13 related provider passes.
+The DeepSeek matrix covers H256/H5120, FP32/UE8M0 checkpoint scales, both local
+shard ranks, eager/Inductor execution, live counts 1/4/17 and graph mutation.
+Memcheck and synccheck each pass six cases with zero kernel errors under the
+existing API-reporting exception. The b12x package source remains identical to
+the FP8 MTP operator receipt, preserving its SM103 compilation evidence.
+
+The test decoder and gather fixtures isolate feedback and local sharding;
+actual collectives, head collapse and full-model decoding remain unqualified.
+The native vLLM library is still precompiled from a different source revision.
+No GLM or DeepSeek V4 checkpoint was found in the inspected GPU-host model
+locations. Qwen3.8 and DFlash2 checkpoints are available for a subsequent
+full-model regression. Other open work includes frozen QSRT coupled high-rate
+conversion, native/ARM64 builds, SM121 regression, Station direct-HBM transport
+and final consolidated evidence. Physical SM103 execution remains unqualified.
