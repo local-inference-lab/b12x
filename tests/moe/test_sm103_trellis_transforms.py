@@ -18,18 +18,19 @@ def _require_gpu():
 
 
 @pytest.mark.parametrize(
-    "coupled,kind,prepared_mixed",
+    "coupled,kind,prepared_mixed,swiglu_limit",
     [
-        (False, "silu", False),
-        (False, "situ", False),
-        (True, "situ", False),
-        pytest.param(True, "situ", True, id="prepared_mixed"),
+        (False, "silu", False, None),
+        (False, "situ", False, None),
+        (True, "situ", False, None),
+        pytest.param(True, "situ", True, None, id="prepared_mixed"),
+        pytest.param(False, "silu", False, 10.0, id="v41_input_clamp"),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("broadcast", [False, True])
 def test_transform_oracles_live_counts_and_graph(
-    coupled, kind, prepared_mixed, dtype, broadcast
+    coupled, kind, prepared_mixed, swiglu_limit, dtype, broadcast
 ):
     _require_gpu()
     import cuda.bindings.driver as cuda
@@ -92,7 +93,8 @@ def test_transform_oracles_live_counts_and_graph(
             state.intermediate_rotations,
         )
     gate, up = (
-        torch.randn(routes, width, device=device, dtype=torch.float16) * 0.1
+        torch.randn(routes, width, device=device, dtype=torch.float16)
+        * (32.0 if swiglu_limit is not None else 0.1)
         for _ in range(2)
     )
     down = torch.randn(routes, hidden, device=device, dtype=torch.float16) * 0.1
@@ -136,7 +138,10 @@ def test_transform_oracles_live_counts_and_graph(
         options=f"--gpu-arch={target}",
     )
     fm = cute.compile(
-        IntermediateRotation(width, experts, routes, coupled=coupled, activation=kind),
+        IntermediateRotation(
+            width, experts, routes, coupled=coupled, activation=kind,
+            swiglu_limit=swiglu_limit,
+        ),
         *middle_args,
         c.Int32(routes),
         stream,
@@ -153,11 +158,18 @@ def test_transform_oracles_live_counts_and_graph(
     def expected():
         return (
             reference.input_rotation(source, ids, suh, top_k, coupled),
-            reference.intermediate_rotation(gate, up, ids, rotations, coupled, kind),
+            reference.intermediate_rotation(
+                gate, up, ids, rotations, coupled, kind, swiglu_limit
+            ),
             reference.output_rotation(down, ids, svh, weights, coupled),
         )
 
     expected_a, expected_h, expected_out = expected()
+    if swiglu_limit is not None:
+        unclamped = reference.intermediate_rotation(
+            gate, up, ids, rotations, coupled, kind
+        )
+        assert torch.linalg.vector_norm(expected_h - unclamped) > expected_h.norm()
     with patch.object(
         cute, "compile", side_effect=AssertionError("kernel resolution is frozen")
     ):

@@ -11,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float16, Float32, Int32, Int64
 
 from ..w4a8_trellis_decode import _w4a8_had128_quad as had128_quad
+from ..activations import normalize_swiglu_limit_for_activation
 
 
 @cute.jit
@@ -48,7 +49,13 @@ def had512(values: cute.Tensor, lane: Int32):
 
 
 @cute.jit
-def activate(gate: Float32, up: Float32, kind: cutlass.Constexpr):
+def activate(
+    gate: Float32, up: Float32, kind: cutlass.Constexpr,
+    limit: cutlass.Constexpr = None,
+):
+    if cutlass.const_expr(limit is not None):
+        gate = cute.arch.fmin(gate, Float32(limit))
+        up = cute.arch.fmax(cute.arch.fmin(up, Float32(limit)), Float32(-limit))
     if cutlass.const_expr(kind == "situ"):
         gate_clip = 4.0 * cute.math.tanh(gate * 0.25)
         up_clip = 25.0 * cute.math.tanh(up * 0.04)
@@ -209,7 +216,10 @@ class InputRotation:
 
 
 class IntermediateRotation:
-    def __init__(self, intermediate, experts, capacity, *, coupled, activation):
+    def __init__(
+        self, intermediate, experts, capacity, *, coupled, activation,
+        swiglu_limit=None,
+    ):
         if min(intermediate, experts, capacity) <= 0 or intermediate % 128:
             raise ValueError(
                 "Trellis intermediate rotation requires positive geometry and complete H128 blocks"
@@ -224,6 +234,9 @@ class IntermediateRotation:
             )
         self.width, self.experts, self.capacity = intermediate, experts, capacity
         self.coupled, self.activation = coupled, activation
+        self.swiglu_limit = normalize_swiglu_limit_for_activation(
+            activation, swiglu_limit
+        )
 
     @cute.jit
     def __call__(
@@ -291,7 +304,8 @@ class IntermediateRotation:
                             .to(Float32)
                         )
                         activated = (
-                            activate(gv, uv, self.activation).to(Float16).to(Float32)
+                            activate(gv, uv, self.activation, self.swiglu_limit)
+                            .to(Float16).to(Float32)
                         )
                         values[j] = (
                             (

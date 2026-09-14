@@ -1361,9 +1361,17 @@ transform graphs with nonzero prepared signs. Frozen encoder sign bytes agree
 under Torch 2.13 and 2.14. See the [coupled transform contract](moe-execution-model.md#coupled-trellis-transforms)
 for global coordinates and shared-scale selection.
 
+Uncoupled Trellis SiLU input clamps are implemented, including V4.1's limit
+of 10. The [clamp receipt](sm103-trellis-silu-clamp-validation.json) records
+portable SM120 transform checks and 28 SM103 callables for TP1 and TP2.
+Complete SM103 expert execution and V4.1 Trellis checkpoint loading remain
+unqualified. Coupled SiTU does not accept a SiLU input clamp.
+
 ```bash
 python -m pytest tests/moe/test_sm103_trellis.py -q
 python scripts/compile_sm103.py --component trellis --output-dir /tmp/sm103-trellis
+# V4.1 SiLU-clamped K3 geometry only, including TP1 and TP2:
+python scripts/compile_sm103.py --component trellis_clamped --output-dir /tmp/sm103-trellis-clamped
 # Execute native expert and projection qualification on the selected B300.
 python scripts/qualify_sm103.py --component trellis_moe --execute \
   --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-trellis-moe \
