@@ -374,36 +374,25 @@ class MoEWeightPreparationPlan:
                         f"{granularity} trellis rates declare no pair kinds"
                     )
             elif granularity == "per_expert_pair":
-                if self.coupled_hadamard:
-                    raise ValueError(
-                        "coupled-Hadamard Trellis execution is qualified "
-                        "only for uniform rate granularity"
-                    )
+                from .btx_schema import PAIR_KIND_RATE_CODES, rate_code_bits
+
                 if bits != 3:
                     raise ValueError(
                         "per-expert-pair Trellis rates require the "
                         "trellis_bits=3 base specialization"
                     )
-                if pair_kinds is None:
+                if not pair_kinds:
                     raise ValueError(
                         "per-expert-pair Trellis rates declare "
                         "trellis_pair_kinds"
                     )
-                if "P44" in pair_kinds:
+                if not pair_kinds <= PAIR_KIND_RATE_CODES.keys():
                     raise ValueError(
-                        "Trellis pair-kind sets containing P44 (whole-expert"
-                        " K4 tiers) have no fused execution arm; use"
-                        " mixed-tier or multi-launch execution"
+                        f"unknown Trellis pair kinds: {sorted(pair_kinds - PAIR_KIND_RATE_CODES.keys())}"
                     )
-                if pair_kinds not in (
-                    frozenset({"P33"}),
-                    frozenset({"P33", "P24"}),
-                    frozenset({"P33", "P43"}),
-                ):
-                    raise ValueError(
-                        "Trellis pair-kind sets must be {P33}, {P33,P24}, "
-                        f"or {{P33,P43}}; got {sorted(pair_kinds)}"
-                    )
+                for kind in pair_kinds:
+                    for rate in rate_code_bits(PAIR_KIND_RATE_CODES[kind]):
+                        _validate_trellis_codebook_bits(codebook, rate)
             elif granularity == "per_expert_projection":
                 if self.coupled_hadamard and self.source_format != "b12x_trellis":
                     raise ValueError(
@@ -438,9 +427,13 @@ class MoEWeightPreparationPlan:
                 if self.trellis_codebook != _TRELLIS_SQG_E4M3 and not (
                     self.source_format == "b12x_trellis"
                     and self.trellis_codebook in {_TRELLIS_MCG, "sqg_fp16"}
+                ) and not (
+                    self.source_format == "btx"
+                    and granularity == "per_expert_pair"
+                    and self.trellis_codebook == _TRELLIS_MCG
                 ):
                     raise ValueError(
-                        "coupled Trellis requires SQG E4M3 or canonical MCG/SQG FP16 weights"
+                        "coupled Trellis requires SQG E4M3, canonical MCG/SQG FP16 or BTX paired MCG weights"
                     )
                 if blocks is None:
                     blocks = (512, 128)
