@@ -67,8 +67,8 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         raise ValueError("two-shot payload must contain complete native rows")
     rows = payload.numel() // int(runtime.row_elems)
     operation = _operation(surface)
-    if operation == "reduce_scatter" and rows % int(runtime.world_size):
-        raise ValueError("two-shot reduce-scatter rows must divide world size")
+    if operation in ("reduce_scatter", "all_reduce") and rows % int(runtime.world_size):
+        raise ValueError("two-shot reduction rows must be divisible by world size")
     if surface in _FP8_SURFACES:
         scale = _tensor(values, "scale")
         if scale.device != runtime.device or scale.numel() != rows:
@@ -148,6 +148,8 @@ def query_from_metadata(
     if alignment < 16 or alignment & (alignment - 1):
         raise ValueError("two-shot metadata alignment must be a power of two >= 16")
     rows = count // int(runtime.row_elems)
+    if rows % int(runtime.world_size):
+        raise ValueError("two-shot reduction rows must be divisible by world size")
     call_metadata = FrozenMapping({
         "operation": "all_reduce", "dtype": "bfloat16", "scale_dtype": None,
         "rows": rows, "row_elems": int(runtime.row_elems), "shape": tuple(shape),
@@ -234,6 +236,9 @@ class _TwoShotExecutionState:
             tuple(out.shape), tuple(out.stride()), _alignment(out)
         ) != (tuple(call["output_shape"]), tuple(call["output_stride"]), call["output_alignment"]):
             raise ValueError("two-shot output metadata differs from preparation")
+        if call["operation"] == "all_reduce":
+            payload = payload.view(-1, int(call["row_elems"]))
+            out = out.view_as(payload)
         return self.runtime._launch_prepared(
             payload, scale, out, state=self, threads=threads, block_limit=block_limit,
         )

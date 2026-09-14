@@ -28,14 +28,18 @@ def _check(operation, rank, device):
     pool = PCIeTwoShotBF16.from_exchange_group(
         exchange_group=dist.group.WORLD,
         device=device,
-        max_rows=rows,
+        max_rows=32,
         row_elems=width,
     )
     input_rows = rows // world if operation == "all_gather" else rows
     output_rows = rows // world if operation == "reduce_scatter" else rows
     source = torch.empty((input_rows, width), dtype=torch.bfloat16, device=device)
+    if operation == "all_reduce":
+        source = torch.empty((16, 5120), dtype=torch.bfloat16, device=device)
     source.fill_(rank + 1)
     output = torch.empty((output_rows, width), dtype=source.dtype, device=device)
+    if operation == "all_reduce":
+        output = torch.empty_like(source)
     call = {"inp" if operation == "all_reduce" else "payload": source, "out": output}
     query = query_from_runtime(pool, surface=f"PCIeTwoShotBF16.{operation}", call=call)
     plan = make_plan(query, runtime=pool)
@@ -49,6 +53,9 @@ def _check(operation, rank, device):
             device=device, autotune=False, compile_workers=2
         ) as session:
             session.prepare((request,))
+            if operation in ("all_reduce", "reduce_scatter"):
+                torch.cuda.synchronize(device)
+                assert output.eq(10).all(), "priming must reduce every input element"
             launch = getattr(pool, operation)
             for _ in range(3):
                 assert launch(source, out=output, plan=plan) is output

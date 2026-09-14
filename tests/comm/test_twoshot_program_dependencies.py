@@ -9,8 +9,35 @@ from __future__ import annotations
 
 import multiprocessing
 import traceback
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.parametrize("metadata_only", (False, True))
+def test_twoshot_rejects_partial_rank_rows(metadata_only):
+    import torch
+    from b12x.comm.pcie._twoshot_preparation import (
+        query_from_metadata,
+        query_from_runtime,
+    )
+
+    runtime = SimpleNamespace(device=torch.device("cpu"), row_elems=4096, world_size=4)
+    # Twelve 5120-element token rows are fifteen native rows, not four equal shards.
+    with pytest.raises(ValueError, match="rows must be divisible by world size"):
+        if metadata_only:
+            query_from_metadata(
+                runtime,
+                surface="PCIeTwoShotBF16.all_reduce",
+                shape=(12, 5120),
+                dtype=torch.bfloat16,
+            )
+        else:
+            query_from_runtime(
+                runtime,
+                surface="PCIeTwoShotBF16.all_reduce",
+                call={"inp": torch.empty((12, 5120), dtype=torch.bfloat16)},
+            )
 
 
 def _discover_programs(connection):
