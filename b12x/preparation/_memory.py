@@ -1,4 +1,4 @@
-"""Read allocator usage without materializing Python statistics for every graph pool."""
+"""Allocator counters and cleanup of retired preparation graph pools."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -22,3 +22,8 @@ def _counter():
 
 def allocated_bytes(device_ordinal: int) -> int:
     return int(_counter().allocated_bytes(device_ordinal))
+
+
+def release_graph_pool_cache(pool_id):
+    """Return retired graph blocks to CUDA while retaining the default pool cache."""
+    _counter().release_graph_pool_cache(*pool_id)

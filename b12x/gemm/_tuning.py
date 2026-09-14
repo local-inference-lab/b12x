@@ -1,9 +1,11 @@
 """Native three-dimensional dense GEMM host launch contract."""
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
+
+from b12x.preparation._efficiency import capture_exhaustive_search
 
 from b12x.preparation import FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, TuningContract
+from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
 
 
 RECIPES = (
@@ -38,6 +40,7 @@ class DenseGemmQuery:
     sm_count: int | None = None
     workspace_form: str = "owned"
     sfb_k_replicated: bool = False
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     def __post_init__(self):
         object.__setattr__(self, "overrides", FrozenMapping(self.overrides))
@@ -507,7 +510,39 @@ def _parameters(query, device):
             values["tile_m"], values["tile_n"] = (value[0],), (value[1],)
         else:
             values[mapping[name]] = (value,)
-    return values
+
+    def short_unswapped_async(p):
+        return (query.recipe != "nvfp4" or p["load_path"] != "cpasync"
+                or (not p["swap_ab"] and query.in_features <= 256))
+
+    def bounded_row_padding(p):
+        row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
+        if query.recipe == "nvfp4":
+            return row_tile < 128 or query.max_rows >= 64 or query.in_features <= 512
+        if query.recipe in ("mxfp8", "block_fp8", "tensor_fp8"):
+            return row_tile < 128 or query.max_rows >= 64 or p["tile_k"] == 64
+        return True
+
+    def narrow_output_swap(p):
+        return (query.recipe != "mxfp8" or not p["swap_ab"]
+                or query.max_rows > 16 or 2 * query.out_features <= query.in_features)
+
+    def bounded_prefill_k_tile(p):
+        return (query.recipe != "nvfp4" or p["tile_k"] != 512
+                or query.max_rows <= 256 or query.in_features <= 1024
+                or (query.out_features <= 1024 and p["tile_m"] == 64))
+
+    def reuse_rows(p):
+        row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
+        return query.recipe != "mxfp8" or query.max_rows <= 128 or row_tile >= 32
+
+    return ParameterSpace.create(
+        TUNING.knobs, values=values, exhaustive=query.exhaustive,
+        efficiency_predicates=() if query.overrides or query.batch != 1 else (
+            short_unswapped_async, bounded_row_padding, narrow_output_swap,
+            bounded_prefill_k_tile, reuse_rows,
+        ),
+    )
 
 
 def _validate_query(query, device):
@@ -518,7 +553,7 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=6,
+    query_schema_version=7,
     config_schema_version=2,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
@@ -528,7 +563,7 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),

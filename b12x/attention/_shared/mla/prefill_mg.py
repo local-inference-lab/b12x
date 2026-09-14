@@ -183,6 +183,33 @@ def _to_cute(x, dtype, align=16, dynamic_layout=False):
         from cutlass.cute.runtime import make_fake_tensor
 
         return make_fake_tensor(dtype, tuple(x.shape), tuple(x.stride()), assumed_align=align)
+    if compile_only_launches_enabled() and hasattr(x, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if dynamic_layout and x.ndim >= 1 and leading_dim is not None:
+            shape = tuple(cute.sym_int(32) for _ in x.shape)
+            strides = tuple(
+                1 if idx == leading_dim else cute.sym_int(64)
+                for idx in range(x.ndim)
+            )
+        else:
+            if x.numel() == 0:
+                # Preserve empty optional arguments; CuTe fake layouts require
+                # positive extents, while an empty CPU tensor owns no storage.
+                from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+                with unset_fake_temporarily():
+                    empty = torch.empty_strided(
+                        tuple(x.shape), tuple(x.stride()), dtype=x.dtype, device="cpu",
+                    )
+                converted = from_dlpack(empty, assumed_align=align)
+                converted.element_type = dtype
+                return converted
+            shape, strides = tuple(x.shape), tuple(x.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=align)
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
     if dynamic_layout and x.ndim >= 1:

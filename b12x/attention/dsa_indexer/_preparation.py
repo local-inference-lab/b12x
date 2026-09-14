@@ -6,7 +6,7 @@ created only after a session chose and admitted the immutable configuration.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 import torch
@@ -255,7 +255,7 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
     def compile_jobs(config, device):
-        return (CompileJob.create("b12x.attention.dsa_indexer._preparation:compile_indexer", TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal),)
+        return (CompileJob.create("b12x.attention.dsa_indexer._preparation:compile_indexer", TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(config), device.ordinal),)
     def memory(config, device):
         if query.cache_format == "mxfp4":
             from types import SimpleNamespace
@@ -291,7 +291,7 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
             fused_merge=selection.config.fused_merge,
         )
         launchers = compile_indexer(
-            TUNING.encode_query(query), TUNING.encode_config(selection.config),
+            TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(selection.config),
             device.ordinal,
         )
         if not isinstance(launchers, Mapping):

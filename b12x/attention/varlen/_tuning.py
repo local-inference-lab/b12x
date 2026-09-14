@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from b12x.preparation._efficiency import capture_exhaustive_search
 
 from b12x.preparation import (
     DeviceIdentity,
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
 )
 
@@ -27,6 +30,7 @@ class VarlenAttentionQuery:
     kv_rows: int
     max_seqlen_q: int
     max_seqlen_k: int
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,7 +100,7 @@ def _validate_config(
 def _tuning_parameters(
     query: VarlenAttentionQuery,
     _device: DeviceIdentity | None,
-) -> dict[str, range]:
+):
     import cutlass.utils as utils
 
     # Production fixes four compute warps, one stage and 160 threads. These
@@ -107,10 +111,15 @@ def _tuning_parameters(
     capacity = utils.get_smem_capacity_in_bytes("sm_120")
     q_width = (query.q_head_dim + 15) // 16 * 16
     v_width = (query.v_head_dim + 15) // 16 * 16
-    return {
-        "tile_m": range(64, capacity // (2 * q_width) + 1, 64),
-        "tile_n": range(16, capacity // (2 * (q_width + v_width)) + 1, 16),
-    }
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "tile_m": range(64, capacity // (2 * q_width) + 1, 64),
+            "tile_n": range(16, capacity // (2 * (q_width + v_width)) + 1, 16),
+        },
+        exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: p["tile_m"] <= 128,),
+    )
 
 
 def _materialize_tuning(
@@ -145,7 +154,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.varlen",
-    query_schema_version=1,
+    query_schema_version=2,
     config_schema_version=1,
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),
@@ -159,7 +168,7 @@ TUNING = TuningContract(
         Knob(name="tile_m", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     parameters=_tuning_parameters,
     materialize=_materialize_tuning,
 )

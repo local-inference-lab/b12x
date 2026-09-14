@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 import torch
 
@@ -451,7 +451,7 @@ def plan(
         contract=TUNING, query=query, invocation=invocation, override=override,
         _compile_jobs=lambda config, device: (CompileJob.create(
             "b12x.attention.dense_mla._preparation:compile_dense_mla",
-            TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal,
+            TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(config), device.ordinal,
         ),),
         _memory_requirements=memory, _materialize=materialize, _device=caps.device,
     )

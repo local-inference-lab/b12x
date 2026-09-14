@@ -5,19 +5,18 @@ import gc
 import math
 import statistics
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from b12x._lib.compile_plan import (
     ProgramKey, forbid_lowering, observe_programs, record_program, retain_compiled_programs,
 )
 from .types import PreparedCall, _prime, _close_all
 
-# Rounds each surviving candidate completes after calibration, and the factor by
-# which a candidate may trail the leader and still be re-timed. Across recorded
-# races the round-to-round spread of one candidate stays under 4% and the
-# eventual winner never trailed the first round's leader by more than 0.2%.
+# Surviving candidates complete three scored rounds within the leader margin.
 SURVIVOR_ROUNDS = 3
 ELIMINATION_MARGIN = 1.10
+DEFAULT_SAMPLES = 2
+ROUND_BUDGET_US = 256.0
 
 
 class _ParentCompilations:
@@ -77,8 +76,33 @@ def no_compilation():
         observed.check()
 
 
+class _GraphPool:
+    """Keep CUDA and pinned-host allocator pools owned between candidate graphs."""
+
+    def __init__(self, stream):
+        import torch
+
+        # A bare pool token owns neither allocator's reference count. This graph
+        # holds both counts without allocating sample storage or being replayed.
+        self.graph = torch.cuda.CUDAGraph(keep_graph=True)
+        self.event = torch.cuda.Event(external=True)
+        with torch.cuda.stream(stream):
+            self.graph.capture_begin()
+            try:
+                self.event.record()
+            finally:
+                self.graph.capture_end()
+        self.id = self.graph.pool()
+
+    def close(self):
+        from ._memory import release_graph_pool_cache
+
+        self.graph.reset()
+        release_graph_pool_cache(self.id)
+
+
 class _TimedCall:
-    def __init__(self, call, eviction, samples):
+    def __init__(self, call, eviction, samples, capture_stream, *, pool=None):
         import torch
         self.call, self.eviction = call, eviction
         self.events = tuple((torch.cuda.Event(enable_timing=True, external=True),
@@ -92,8 +116,12 @@ class _TimedCall:
                 collecting = gc.isenabled()
                 gc.disable()
                 try:
-                    with torch.cuda.graph(self.graph):
-                        self._invoke()
+                    with torch.cuda.stream(capture_stream):
+                        self.graph.capture_begin(pool=pool)
+                        try:
+                            self._invoke()
+                        finally:
+                            self.graph.capture_end()
                 finally:
                     if collecting:
                         gc.enable()
@@ -138,9 +166,21 @@ class PreparedRace:
     planned_rounds: int = 0
     active_count: int = 0
     latest_round_us: tuple[float, ...] = ()
+    release_pools: bool = True
+    _closed: bool = field(default=False, init=False)
+    pool_ids: tuple = field(default=(), init=False)
 
     def close(self):
-        _close_all(timer.close for timer in self.timers)
+        if self._closed:
+            return
+        self._closed = True
+        from ._memory import release_graph_pool_cache
+
+        self.pool_ids = tuple(timer.graph.pool() for timer in self.timers if timer.graph is not None)
+        closers = [timer.close for timer in self.timers]
+        if self.release_pools:
+            closers.extend(lambda pool=pool: release_graph_pool_cache(pool) for pool in self.pool_ids)
+        _close_all(closers)
 
 
 @dataclass(frozen=True)
@@ -170,8 +210,15 @@ def _l2_flush_fn(device: object, *, enabled: bool):
     return flush
 
 
-def prepare_race_steps(calls, *, device_ordinal, samples=8):
-    """Yield only outside GPU/compilation scopes, once per candidate bracket."""
+def prepare_race_steps(
+    calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, graph_pools=None,
+    capture_stream=None, eviction=None,
+):
+    """Capture a batch, optionally reusing pools after their graphs are destroyed.
+
+    Each position owns a separate pool: simultaneously live candidate graphs
+    must not share storage because the race changes their replay order.
+    """
     import torch
     if not calls or type(samples) is not int or samples <= 0:
         raise ValueError("a race requires candidates and positive samples")
@@ -181,25 +228,47 @@ def prepare_race_steps(calls, *, device_ordinal, samples=8):
     completed = False
     try:
         with torch.cuda.device(device_ordinal), no_compilation():
-            eviction = _l2_flush_fn(torch.device("cuda", device_ordinal), enabled=True)
-            eviction()
-            torch.cuda.synchronize(device_ordinal)
+            if eviction is None:
+                eviction = _l2_flush_fn(torch.device("cuda", device_ordinal), enabled=True)
+            if capture_stream is None:
+                capture_stream = torch.cuda.Stream(device=device_ordinal)
+            try:
+                eviction()
+                if not primed:
+                    for call in calls:
+                        _prime(call)
+            finally:
+                torch.cuda.current_stream(device_ordinal).synchronize()
         yield
-        for call in calls:
+        for index, call in enumerate(calls):
             with torch.cuda.device(device_ordinal), no_compilation():
-                _prime(call)
-                torch.cuda.synchronize(device_ordinal)
-            yield
-        for call in calls:
-            with torch.cuda.device(device_ordinal), no_compilation():
-                timers.append(_TimedCall(call, eviction, samples))
-                torch.cuda.synchronize(device_ordinal)
+                pool = None
+                if graph_pools is not None and call.capture_safe:
+                    while len(graph_pools) <= index:
+                        graph_pools.append(_GraphPool(capture_stream))
+                    pool = graph_pools[index].id
+                timers.append(_TimedCall(call, eviction, samples, capture_stream, pool=pool))
             yield
         completed = True
-        return PreparedRace(tuple(timers), eviction, samples)
+        return PreparedRace(tuple(timers), eviction, samples, release_pools=graph_pools is None)
     finally:
         if not completed:
-            _close_all(timer.close for timer in timers)
+            PreparedRace(tuple(timers), None, samples, release_pools=graph_pools is None).close()
+
+
+def _replay_timers(timers, *, device_ordinal, sample_count=0, compilation_active=None):
+    import torch
+
+    overlaps = 0
+    with torch.cuda.device(device_ordinal), no_compilation():
+        try:
+            for timer in timers:
+                if compilation_active is not None and compilation_active():
+                    overlaps += sample_count
+                timer.replay()
+        finally:
+            torch.cuda.current_stream(device_ordinal).synchronize()
+    return overlaps
 
 
 def measure_race_steps(
@@ -214,7 +283,6 @@ def measure_race_steps(
     rounds, and ``champion`` exempts timer 0, which carries the previous batch's
     winner. Left unset, every timer completes every round.
     """
-    import torch
     if type(rounds) is not int or rounds <= 0:
         raise ValueError("race rounds must be positive")
     if eliminate:
@@ -224,20 +292,7 @@ def measure_race_steps(
     values = [[] for _ in prepared.timers]
     active = list(range(len(prepared.timers)))
     overlaps = 0
-    for _ in range(2):
-        for timer in prepared.timers:
-            with torch.cuda.device(device_ordinal), no_compilation():
-                timer.replay()
-                torch.cuda.synchronize(device_ordinal)
-            yield
-    pilots = tuple(statistics.fmean(timer.samples()) for timer in prepared.timers)
-    if any(not math.isfinite(value) or value <= 0 for value in pilots):
-        raise RuntimeError("candidate calibration produced an invalid latency")
-    repeats = tuple(
-        2 * max(1, math.ceil(1024.0 / (2 * prepared.sample_count * pilot)))
-        if timer.call.capture_safe else 1
-        for timer, pilot in zip(prepared.timers, pilots)
-    )
+    repeats = [1] * len(prepared.timers)
     for turn in range(rounds):
         order = list(active)
         if turn % 2:
@@ -245,18 +300,27 @@ def measure_race_steps(
         offset = (turn // 2) % len(order)
         order = order[offset:] + order[:offset]
         totals = [0.0] * len(prepared.timers)
-        for repetition in range(max(repeats[index] for index in order)):
-            for index in (order if repetition % 2 == 0 else reversed(order)):
-                if repetition >= repeats[index]:
-                    continue
-                with torch.cuda.device(device_ordinal), no_compilation():
-                    if compilation_active is not None and compilation_active():
-                        overlaps += prepared.sample_count
-                    timer = prepared.timers[index]
-                    timer.replay()
-                    torch.cuda.synchronize(device_ordinal)
-                    totals[index] += statistics.fmean(timer.samples())
-                yield
+        repetition = 0
+        while repetition < max(repeats[index] for index in order):
+            indices = tuple(
+                index for index in (order if repetition % 2 == 0 else reversed(order))
+                if repetition < repeats[index]
+            )
+            overlaps += _replay_timers(
+                tuple(prepared.timers[index] for index in indices),
+                device_ordinal=device_ordinal, sample_count=prepared.sample_count,
+                compilation_active=compilation_active,
+            )
+            for index in indices:
+                latency = statistics.fmean(prepared.timers[index].samples())
+                if not math.isfinite(latency) or latency <= 0:
+                    raise RuntimeError("candidate race produced an invalid latency")
+                totals[index] += latency
+                if turn == 0 and repetition == 0 and prepared.timers[index].call.capture_safe:
+                    # The first scored replay also sizes the remaining work.
+                    repeats[index] = max(1, math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)))
+            repetition += 1
+            yield
         for index in order:
             values[index].append(totals[index] / repeats[index])
         # Timers that sat out this round report no latency, so a reader of the
@@ -292,8 +356,11 @@ def _consume(steps):
             return finished.value
 
 
-def _prepare_race(calls, *, device_ordinal, samples=8):
-    return _consume(prepare_race_steps(calls, device_ordinal=device_ordinal, samples=samples))
+def _prepare_race(calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, graph_pools=None, capture_stream=None):
+    return _consume(prepare_race_steps(
+        calls, device_ordinal=device_ordinal, samples=samples, primed=primed, graph_pools=graph_pools,
+        capture_stream=capture_stream,
+    ))
 
 
 def _measure_race(prepared, *, device_ordinal, rounds=7, compilation_active=None):

@@ -330,7 +330,7 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
     )
 
     def materialize(selection, device):
-        _, values, contiguous = _batched_payload(TUNING.encode_query(query), invocation)
+        _, values, contiguous = _batched_payload(TUNING.encode_query(replace(query, exhaustive=False)), invocation)
         q_shape, k_shape, v_shape, dtype, selected_causal, left, right, has_sink = values
         concrete = contiguous._get_attention_plan(
             q_shape, k_shape, v_shape, device.ordinal, dtype, selected_causal, left, right,
@@ -345,7 +345,7 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
         contract=TUNING, query=query, invocation=invocation, override=override,
         _compile_jobs=lambda config, device: (CompileJob.create(
             "b12x.attention.varlen._preparation:compile_batched_attention",
-            TUNING.encode_query(query), invocation.to_dict(), config.to_dict(), device.ordinal,
+            TUNING.encode_query(replace(query, exhaustive=False)), invocation.to_dict(), config.to_dict(), device.ordinal,
         ),),
         _memory_requirements=lambda config, device: _batched_memory(invocation, device),
         _materialize=materialize, _device=q.device,
@@ -359,7 +359,7 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
     )
 
     def materialize(selection, device):
-        _, values, contiguous = _varlen_payload(TUNING.encode_query(query), invocation)
+        _, values, contiguous = _varlen_payload(TUNING.encode_query(replace(query, exhaustive=False)), invocation)
         (*shapes, dtype, selected_causal, left, right, has_sink, max_q, max_k) = values
         q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
         concrete = contiguous._get_varlen_attention_plan(
@@ -375,7 +375,7 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
         contract=TUNING, query=query, invocation=invocation, override=override,
         _compile_jobs=lambda config, device: (CompileJob.create(
             "b12x.attention.varlen._preparation:compile_varlen_attention",
-            TUNING.encode_query(query), invocation.to_dict(), config.to_dict(), device.ordinal,
+            TUNING.encode_query(replace(query, exhaustive=False)), invocation.to_dict(), config.to_dict(), device.ordinal,
         ),),
         _memory_requirements=lambda config, device: _varlen_memory(invocation, device),
         _materialize=materialize, _device=q.device,

@@ -1753,6 +1753,7 @@ class _CuTeOneshotBackend:
         if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
             raise RuntimeError("input buffer is not registered")
         plan = self._plain_graph_plan(state, inp)
+        eager_transport, eager_threads, _ = self._plain_launch_config(state, inp)
         from ._oneshot_cute import get_oneshot_launcher
 
         variants = (
@@ -1768,8 +1769,8 @@ class _CuTeOneshotBackend:
                 stage_input,
                 device_slot_selection,
                 slot_bias,
-                plan.transport,
-                plan.threads,
+                plan.transport if device_slot_selection else eager_transport,
+                plan.threads if device_slot_selection else eager_threads,
                 plan.device_index,
             )
         state.plain_graph_plans[self._plain_graph_plan_key(inp)] = plan
@@ -3042,7 +3043,8 @@ class PCIeOneshotAllReduce:
                 table_address, state.signal_table_address, inp.data_ptr(), out.data_ptr(),
                 call["size_packs"], call["remote_push_region_packs"],
                 int(state.eager_buffer_bytes or 0) // 16,
-                *plan.remote_push_slot_ptrs, call["blocks"],
+                *plan.remote_push_slot_ptrs,
+                call["blocks"] if state.device_slot_selection else call["eager_blocks"],
             )
 
     def _run_prepared_fused(

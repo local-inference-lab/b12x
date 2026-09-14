@@ -301,6 +301,9 @@ class PreparationProgress:
     batch_index: int = 0
     batch_candidates: int = 0
     tuning_rank: int = 0
+    total_candidates: int | None = None
+    global_candidate_count: int = 0
+    selection_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(kw_only=True)
@@ -380,6 +383,7 @@ class _Prepared:
     closers: tuple
     device: DetectedDevice
     variants: Mapping[int, Plan] | None = None
+    scratch: tuple[ScratchBufferSpec, ...] | None = None
     users: list = field(default_factory=list)
     closed: bool = False
 
@@ -422,12 +426,22 @@ class _PreparedSlot:
         return None if prepared is None else prepared.selection
 
     def _install(self, prepared):
+        previous = self._prepared
         object.__setattr__(self, "_prepared", prepared)
+        try:
+            if prepared.scratch is None:
+                prepared.scratch = self.memory_requirements().scratch
+        except BaseException:
+            object.__setattr__(self, "_prepared", previous)
+            raise
 
     def _clear(self):
         object.__setattr__(self, "_prepared", None)
 
     def scratch_specs(self):
+        prepared = self.prepared
+        if prepared is not None:
+            return prepared.scratch
         return self.memory_requirements().scratch
 
     def __getstate__(self):

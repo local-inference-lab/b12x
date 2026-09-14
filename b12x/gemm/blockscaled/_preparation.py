@@ -42,7 +42,7 @@ def _dense_lowering(query, config, device):
 def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_count, capability):
     import cutlass
     from b12x._lib import dense_gemm as dense
-    from . import _quantize
+    from . import _quantize, _reduce
 
     query = _decode_query(query_payload)
     config = BlockscaledConfig.from_config(FrozenMapping(config_payload))
@@ -63,7 +63,7 @@ def compile_packed(query_payload, config_payload, dense_payload, ordinal, sm_cou
             )
             programs = {"gemm": gemm}
             if slices > 1:
-                programs["reduce"] = dense._get_compiled_dense_split_k_reduce(query.out_features, slices, ordinal)
+                programs["reduce"] = _reduce.compile_reduce(query.out_features, slices, ordinal)
             return programs
         programs = dense._compile_dense_lowering(dense_payload, ordinal)
         if functional_mxfp8_quantization(query, config):

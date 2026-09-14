@@ -8,6 +8,14 @@ int64_t allocated_bytes(int device) {
     return stats.allocated_bytes[aggregate].current;
 }
 
+void release_graph_pool_cache(uint64_t first, uint64_t second) {
+    if (first == 0 && second == 0) {
+        throw std::invalid_argument("graph pool cleanup requires a private pool");
+    }
+    c10::cuda::CUDACachingAllocator::emptyCache({first, second});
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("allocated_bytes", &allocated_bytes);
+    module.def("release_graph_pool_cache", &release_graph_pool_cache);
 }

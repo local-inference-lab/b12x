@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, TuningContract
+from b12x.preparation._efficiency import capture_exhaustive_search
+from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
 
 FUSED_MERGE_AUTO = "auto"
 FUSED_MERGE_COOPERATIVE = "cooperative"
@@ -39,6 +40,7 @@ class DsaIndexerQuery:
     cache_format: str = "fp8"
     max_candidates: int = 0
     candidate_topk_blocks: int = 0
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -148,15 +150,24 @@ def _equivalence(query, device, config):
 
 
 def _parameters(query, _device):
-    return {
-        "backend": (_BACKEND,),
-        "fused_merge": (FUSED_MERGE_AUTO,) if query.cache_format == "mxfp4" else FUSED_MERGE_CHOICES,
-        "mxfp4_score_kind": ("score", "score_tensorcore") if query.cache_format == "mxfp4" else (None,),
-    }
+    tensorcore_prefill = (
+        query.cache_format == "mxfp4" and query.mode == "prefill"
+        and query.num_q_heads == 32 and query.max_q_rows >= 64
+    )
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "backend": (_BACKEND,),
+            "fused_merge": (FUSED_MERGE_AUTO,) if query.cache_format == "mxfp4" else FUSED_MERGE_CHOICES,
+            "mxfp4_score_kind": ("score", "score_tensorcore") if query.cache_format == "mxfp4" else (None,),
+        },
+        exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: not tensorcore_prefill or p["mxfp4_score_kind"] != "score",),
+    )
 
 
 TUNING = TuningContract(
-    component_id="attention.dsa_indexer", query_schema_version=2, config_schema_version=3,
+    component_id="attention.dsa_indexer", query_schema_version=3, config_schema_version=3,
     query_fields=frozenset(DsaIndexerQuery.__dataclass_fields__),
     config_fields=frozenset(DsaIndexerConfig.__dataclass_fields__),
     encode_query=_encode_query, encode_config=_encode_config, decode_config=DsaIndexerConfig.from_config,
@@ -166,7 +177,7 @@ TUNING = TuningContract(
         Knob(name="fused_merge", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="mxfp4_score_kind", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3, equivalence_key=_equivalence, parameters=_parameters,
+    candidate_contract_version=4, equivalence_key=_equivalence, parameters=_parameters,
     materialize=lambda query, device, choice: DsaIndexerConfig.from_config(choice),
 )
 

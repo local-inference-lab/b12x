@@ -1,7 +1,9 @@
 """Configuration contract for chunked GDN prefill."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from b12x.preparation._efficiency import capture_exhaustive_search
 
 from b12x.preparation import FrozenMapping, Knob, ParameterBinding, ParameterSpace, TuningContract
 from .._shared.delta_prefill.config import PrefillConfig, validate_metadata_query
@@ -30,6 +32,7 @@ class GdnPrefillQuery:
     a_log_dtype: str = "float32"
     dt_bias_dtype: str = "float32"
     state_indices_dtype: str = "int32"
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     @property
     def heads(self) -> int:
@@ -51,6 +54,7 @@ class GdnPrefillQuery:
             "a_log_dtype": self.a_log_dtype,
             "dt_bias_dtype": self.dt_bias_dtype,
             "state_indices_dtype": self.state_indices_dtype,
+            "exhaustive": self.exhaustive,
         }
 
 
@@ -154,8 +158,11 @@ def _tuning_parameters(query: GdnPrefillQuery, device):
     segments = tuple(value for value in SEGMENT_CHOICES if value < query.max_tokens) + covering[:1]
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"window_tiles": windows, "segment_tokens": segments},
-        predicates=(
+        values={"window_tiles": range(1, capacity + 1), "segment_tokens": SEGMENT_CHOICES},
+        exhaustive=query.exhaustive,
+        efficiency_predicates=(
+            lambda p: p["algorithm"] != "sequential" or p["window_tiles"] in windows,
+            lambda p: p["algorithm"] != "chunk_parallel" or p["segment_tokens"] in segments,
             # One segment per sequence leaves chunk-parallel no chunk-level
             # parallelism: it runs the sequential schedule plus summary and combine.
             lambda parameters: (
@@ -186,7 +193,7 @@ def _encode_query(query: GdnPrefillQuery) -> dict[str, object]:
 
 
 TUNING = TuningContract(
-    component_id="sequence.gdn_prefill", query_schema_version=4, config_schema_version=2,
+    component_id="sequence.gdn_prefill", query_schema_version=5, config_schema_version=2,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles", "algorithm", "segment_tokens"}),
     encode_query=_encode_query, encode_config=GdnPrefillConfig.to_dict,
@@ -203,7 +210,7 @@ TUNING = TuningContract(
         Knob(name="window_tiles", values=None, binding=ParameterBinding.COMPILE,
              when=FrozenMapping({"algorithm": "sequential"})),
     ),
-    candidate_contract_version=3, parameters=_tuning_parameters, materialize=_materialize_tuning,
+    candidate_contract_version=4, parameters=_tuning_parameters, materialize=_materialize_tuning,
 )
 
 __all__ = [

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+
+from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
 from typing import Mapping
 
 from b12x.preparation import (
@@ -10,6 +12,7 @@ from b12x.preparation import (
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
 )
 
@@ -34,6 +37,7 @@ class DenseMlaQuery:
     max_page_table_width: int
     num_cache_pages: int
     abi: FrozenMapping
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -53,6 +57,7 @@ class DenseMlaQuery:
             "max_page_table_width": self.max_page_table_width,
             "num_cache_pages": self.num_cache_pages,
             "abi": self.abi.to_dict(),
+            "exhaustive": self.exhaustive,
         }
 
     @classmethod
@@ -126,18 +131,27 @@ def _validate_config(
         raise ValueError("dense MLA max_splits cannot exceed the cache chunk count")
 
 
-def _tuning_parameters(
-    query: DenseMlaQuery,
-    _device: DeviceIdentity | None,
-) -> dict[str, range]:
-    # The contract accepts every positive cache-chunk budget. The production
-    # planner may use fewer splits, but its default does not bound eligibility.
-    return {"max_splits": range(1, max(1, (query.cache_tokens + 63) // 64) + 1)}
+def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
+    capacity = max(1, (query.cache_tokens + 63) // 64)
+    splits = set(powers_of_two(capacity))
+    divisor = 1
+    while divisor <= capacity:
+        quotient = (capacity + divisor - 1) // divisor
+        splits.add(quotient)
+        if quotient == 1:
+            break
+        divisor = (capacity - 1) // (quotient - 1) + 1
+    splits.add(_default_config(query, device).max_splits)
+    return ParameterSpace.create(
+        TUNING.knobs, values={"max_splits": range(1, capacity + 1)},
+        exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: p["max_splits"] in splits,),
+    )
 
 
 TUNING = TuningContract(
     component_id="attention.mla",
-    query_schema_version=4,
+    query_schema_version=5,
     config_schema_version=1,
     query_fields=frozenset(
         {
@@ -157,6 +171,7 @@ TUNING = TuningContract(
             "max_page_table_width",
             "num_cache_pages",
             "abi",
+            "exhaustive",
         }
     ),
     config_fields=frozenset({"max_splits"}),
@@ -169,7 +184,7 @@ TUNING = TuningContract(
     knobs=(
         Knob(name="max_splits", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     parameters=_tuning_parameters,
 )
 

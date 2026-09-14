@@ -415,6 +415,7 @@ class CompilePool:
         self._condition = Condition()
         self._plans: dict[bytes, CompilationPlan] = {}
         self._submitted: set[ProgramKey] = set()
+        self._cute_programs = self._triton_programs = 0
         self._completed: set[ProgramKey] = set()
         self._required: list[CompilationPlan] = []
         self._optional: list[CompilationPlan] = []
@@ -476,9 +477,12 @@ class CompilePool:
             if not queue:
                 break
             plan = queue.pop(0)
-            if not set(plan.programs) - self._submitted:
+            added = set(plan.programs) - self._submitted
+            if not added:
                 continue
-            self._submitted.update(plan.programs)
+            self._submitted.update(added)
+            self._cute_programs += sum(p.dialect == "cute" for p in added)
+            self._triton_programs += sum(p.dialect == "triton" for p in added)
             self._jobs += 1
             self._inflight += 1
             self._pool.apply_async(
@@ -583,8 +587,8 @@ class CompilePool:
         with self._condition:
             return CompilationSummary(
                 jobs=self._jobs, requested_jobs=self._requested_jobs,
-                cute_programs=sum(p.dialect == "cute" for p in self._submitted),
-                triton_programs=sum(p.dialect == "triton" for p in self._submitted),
+                cute_programs=self._cute_programs,
+                triton_programs=self._triton_programs,
                 workers_used=len(self._pids), cute_compilations=self._cute_count,
                 triton_compilations=self._triton_count,
                 peak_parallel_cute_compilations=int(self._activity[1]),

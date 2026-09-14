@@ -11,6 +11,7 @@ from b12x.preparation import FrozenMapping, Knob, ParameterBinding, ParameterSpa
 class WoProjectionQuery:
     dtype: str
     max_tokens: int
+    dynamic_tokens: bool = False
     groups: int
     group_width: int
     rank: int
@@ -23,7 +24,6 @@ class WoProjectionQuery:
     return_3d: bool = False
     positions_dtype: str = "int64"
     cos_sin_dtype: str = "bfloat16"
-    variable_tokens: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "codegen", FrozenMapping(self.codegen))
@@ -36,7 +36,7 @@ class WoProjectionConfig:
 
 def _decode_domain(query):
     return (
-        query.dtype == "bfloat16" and 1 <= query.max_tokens <= 8
+        not query.dynamic_tokens and query.dtype == "bfloat16" and 1 <= query.max_tokens <= 8
         and (query.groups, query.group_width, query.rank, query.hidden)
         == (2, 4096, 1024, 5120)
     )
@@ -51,12 +51,10 @@ def _validate_query(query, device):
         query.max_tokens, query.groups, query.group_width, query.rank, query.hidden,
     )):
         raise ValueError("WO geometry must contain positive integer dimensions")
+    if type(query.dynamic_tokens) is not bool:
+        raise TypeError("WO dynamic_tokens must be a boolean")
     if query.operation not in ("plain", "inv_rope"):
         raise ValueError("WO operation must be plain or inv_rope")
-    if type(query.variable_tokens) is not bool or (
-        query.variable_tokens and query.max_tokens <= 16
-    ):
-        raise ValueError("variable WO tokens require a capacity above 16")
     if query.operation == "inv_rope" and (
         any(type(value) is not int or value <= 0 for value in (query.heads_per_group, query.nope_dim, query.rope_dim))
         or query.heads_per_group * (query.nope_dim + query.rope_dim) != query.group_width
@@ -97,7 +95,7 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=4,
+    query_schema_version=5,
     config_schema_version=2,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
@@ -111,7 +109,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=("mxfp8",), binding=ParameterBinding.COMPILE),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     parameters=_parameters,
     materialize=lambda query, device, choice: WoProjectionConfig(**dict(choice)),
 )

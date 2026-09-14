@@ -1,7 +1,6 @@
 """Prepared native block-FP8 linear launchers."""
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -10,7 +9,8 @@ from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import require_prepared
-from ._tuning import BlockFp8LinearConfig, BlockFp8LinearQuery, TUNING, split_k_slices
+from .._tuning import DenseGemmConfig
+from ._tuning import BlockFp8LinearQuery, TUNING, dense_query
 from .._shared.block_fp8 import (
     BlockFP8LinearBinding,
     BlockFP8LinearScratchCaps,
@@ -31,75 +31,16 @@ def _dtype(name: str) -> torch.dtype:
     return getattr(torch, name)
 
 
-def _dense_lowering(query: BlockFp8LinearQuery, config: BlockFp8LinearConfig, device):
-    """Lower the actual dense branch using metadata-only native operands."""
-    from b12x._lib.dense_gemm import _lower_dense_gemm
+def _dense_lowering(query, config, device):
+    from .._preparation import _configured_lowering
 
-    m, k, n = query.max_tokens, _physical_mxfp8_k(query.in_features), query.out_features
-    values = lambda rows: torch.empty_strided(
-        (rows, k, 1), (k, 1, rows * k), dtype=torch.float8_e4m3fn, device="meta"
-    )
-    scales = lambda rows: torch.empty_strided(
-        (32, 4, math.ceil(rows / 128), 4, math.ceil((k // 32) / 4), 1),
-        (16, 4, math.ceil((k // 32) / 4) * 512, 1, 512,
-         math.ceil(rows / 128) * math.ceil((k // 32) / 4) * 512),
-        dtype=torch.float8_e8m0fnu, device="meta",
-    )
-    out = torch.empty_strided(
-        (m, n, 1), (n, 1, m * n), dtype=_dtype(query.output_dtype), device="meta"
-    )
-    return _lower_dense_gemm(
-        (values(m), scales(m)), (values(n), scales(n)), out,
-        ab_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu",
-        c_dtype=query.output_dtype, sf_vec_size=32, sm_count=device.sm_count,
-        mma_tiler_mn=(config.tile_m, config.tile_n), expected_m=m,
-        sfb_k_replicated=query.weight_block_size == 128,
-        _split_k_slices_override=split_k_slices(config) if split_k_slices(config) > 1 else None,
-        _split_k_atomic_bf16_override=False if split_k_slices(config) > 1 else None,
-        _split_k_workspace=(
-            torch.empty((split_k_slices(config), m, n), dtype=torch.float32, device="meta")
-            if split_k_slices(config) > 1 else None
-        ),
-    )
+    return _configured_lowering(dense_query(query), config, device)
 
 
-def _fused_route(query):
-    return (
-        query.max_tokens <= 8 and query.source_dtype == query.output_dtype == "bfloat16"
-        and query.weight_block_size == 128 and query.in_features % 128 == 0
-    )
-
-
-def _fused_workspace_nbytes(query, config, sm_count):
-    if not _fused_route(query):
-        from types import SimpleNamespace
-        lowering = _dense_lowering(query, config, SimpleNamespace(sm_count=sm_count))
-        policy = lowering.policy
-        return (policy.split_k_slices * query.max_tokens * query.out_features * 4
-                if policy.split_k_slices > 1 and not policy.split_k_atomic_bf16 else 0)
-    from b12x._lib import dense_gemm as dense
-    source = torch.empty((query.max_tokens, query.in_features), dtype=torch.bfloat16, device="meta")
-    weight = torch.empty_strided(
-        (query.out_features, query.in_features, 1),
-        (query.in_features, 1, query.out_features * query.in_features),
-        dtype=torch.float8_e4m3fn, device="meta",
-    )
-    scales = torch.empty_strided(
-        (32, 4, math.ceil(query.out_features / 128), 4, math.ceil((query.in_features // 32) / 4), 1),
-        (16, 4, math.ceil((query.in_features // 32) / 4) * 512, 1, 512,
-         math.ceil(query.out_features / 128) * math.ceil((query.in_features // 32) / 4) * 512),
-        dtype=torch.float8_e8m0fnu, device="meta",
-    )
-    out = torch.empty_strided(
-        (query.max_tokens, query.out_features, 1),
-        (query.out_features, 1, query.max_tokens * query.out_features),
-        dtype=torch.bfloat16, device="meta",
-    )
-    return dense._lower_dense_gemm_fused_quant_a(
-        source, weight, scales, sm_count=sm_count, out=out,
-        expected_m=query.max_tokens, sfb_k_replicated=True,
-        mma_tiler_mn=(config.tile_m, config.tile_n),
-    ).workspace_nbytes
+def _workspace_nbytes(lowering):
+    policy = lowering.policy
+    return (policy.split_k_slices * lowering.m * lowering.n * 4
+            if policy.split_k_slices > 1 and not policy.split_k_atomic_bf16 else 0)
 
 
 @dataclass(frozen=True)
@@ -109,7 +50,6 @@ class _BlockFP8Compiled:
     lowering: object
     quantize: object
     dense: object | None = None
-    fused: object | None = None
 
 
 def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
@@ -118,7 +58,7 @@ def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
     from b12x._lib.quant.mxfp8_rows import _get_compiled_mxfp8_rows_quant
 
     query = BlockFp8LinearQuery(**dict(query_payload))
-    config = BlockFp8LinearConfig.from_config(FrozenMapping(config_payload))
+    config = DenseGemmConfig(**dict(config_payload))
 
     class _Device:
         identity = None
@@ -126,50 +66,6 @@ def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
         def __init__(self):
             self.sm_count = sm_count
 
-    if _fused_route(query):
-        source = torch.empty(
-            (query.max_tokens, query.in_features),
-            dtype=torch.bfloat16,
-            device="meta",
-        )
-        weight = torch.empty_strided(
-            (query.out_features, query.in_features, 1),
-            (query.in_features, 1, query.out_features * query.in_features),
-            dtype=torch.float8_e4m3fn,
-            device="meta",
-        )
-        scales = torch.empty_strided(
-            (32, 4, math.ceil(query.out_features / 128), 4,
-             math.ceil((query.in_features // 32) / 4), 1),
-            (16, 4, math.ceil((query.in_features // 32) / 4) * 512, 1, 512,
-             math.ceil(query.out_features / 128) * math.ceil((query.in_features // 32) / 4) * 512),
-            dtype=torch.float8_e8m0fnu,
-            device="meta",
-        )
-        out = torch.empty_strided(
-            (query.max_tokens, query.out_features, 1),
-            (query.out_features, 1, query.max_tokens * query.out_features),
-            dtype=torch.bfloat16,
-            device="meta",
-        )
-        lowering = dense._lower_dense_gemm_fused_quant_a(
-            source, weight, scales, sm_count=sm_count, out=out,
-            expected_m=query.max_tokens, sfb_k_replicated=True,
-            mma_tiler_mn=(config.tile_m, config.tile_n),
-        )
-        with torch.cuda.device(ordinal):
-            quantize = _get_compiled_mxfp8_rows_quant(
-                query.in_features, torch.bfloat16, 8, 128, "linear",
-                device_ordinal=ordinal, sm_count=sm_count,
-            )
-            fused = dense._compile_dense_fused_quant_lowering(
-                lowering.to_dict(), ordinal
-            )
-        return attach_programs(
-            _BlockFP8Compiled(lowering=lowering, quantize=quantize, fused=fused),
-            quantize,
-            fused,
-        )
     lowering = _dense_lowering(query, config, _Device())
     subgroup_width, threads = ((8, 128) if query.max_tokens <= 8 else (4, 256))
     with torch.cuda.device(ordinal):
@@ -192,12 +88,11 @@ def compile_block_fp8(query_payload, config_payload, ordinal, sm_count):
 @dataclass(frozen=True)
 class _BlockFP8ExecutionState:
     query: BlockFp8LinearQuery
-    config: BlockFp8LinearConfig
+    config: DenseGemmConfig
     device: torch.device
     scratch: object
     quantize: object | None
     dense: object | None
-    fused: object | None
 
     def _check_source(self, source):
         source_2d = _source_2d(source)
@@ -209,8 +104,6 @@ class _BlockFP8ExecutionState:
         return source_2d
 
     def quantize_input(self, source, *, out: MXFP8Rows | None = None, _initialize_scales=True):
-        if self.quantize is None:
-            raise ValueError("the prepared fused block-FP8 route has no standalone quantizer")
         source_2d = self._check_source(source)
         physical_k = _physical_mxfp8_k(self.query.in_features)
         if out is None:
@@ -243,18 +136,12 @@ class _BlockFP8ExecutionState:
                 or output.dtype != _dtype(self.query.output_dtype)
                 or output.device != self.device):
             raise ValueError("block-FP8 output differs from prepared capacity")
-        if self.fused is not None:
-            self.fused.run(
-                source_2d, weight.values.view(self.query.out_features, physical_k, 1),
-                weight.scale_mma, output, split_k_workspace=workspace, stream=stream,
-            )
-        else:
-            x_q = self.quantize_input(source_2d, out=x_q, _initialize_scales=False)
-            self.dense.run(
-                (x_q.values.view(source_2d.shape[0], physical_k, 1), x_q.scale_mma),
-                (weight.values.view(self.query.out_features, physical_k, 1), weight.scale_mma),
-                out=output, stream=stream, split_k_workspace=workspace,
-            )
+        x_q = self.quantize_input(source_2d, out=x_q, _initialize_scales=False)
+        self.dense.run(
+            (x_q.values.view(source_2d.shape[0], physical_k, 1), x_q.scale_mma),
+            (weight.values.view(self.query.out_features, physical_k, 1), weight.scale_mma),
+            out=output, stream=stream, split_k_workspace=workspace,
+        )
         result = output[:, :, 0]
         if bias is not None:
             if (bias.device != self.device or bias.dtype != output.dtype
@@ -310,7 +197,7 @@ def plan(caps: BlockFP8LinearScratchCaps, *, invocation=FrozenMapping(), overrid
         from b12x._lib import dense_gemm as dense
         alpha = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
         resident = 0 if alpha is None else alpha.numel() * alpha.element_size()
-        workspace_nbytes = _fused_workspace_nbytes(query, config, device.identity.sm_count)
+        workspace_nbytes = _workspace_nbytes(_dense_lowering(query, config, device.identity))
         return MemoryRequirements(
             scratch=_scratch_plan(
                 caps, (config.tile_m, config.tile_n), workspace_nbytes=workspace_nbytes,
@@ -326,31 +213,19 @@ def plan(caps: BlockFP8LinearScratchCaps, *, invocation=FrozenMapping(), overrid
             device.identity.sm_count,
         )
         resolved_device = torch.device("cuda", device.ordinal)
-        if programs.fused is not None:
-            fused = dense._materialize_dense_fused_quant(
-                programs.lowering, resolved_device
-            )
-            quantize, core = programs.quantize, None
-            workspace_nbytes = programs.lowering.workspace_nbytes
-        else:
-            lowering = programs.lowering
-            core = dense._DenseExecutionState(
-                lowering, resolved_device, programs.dense["gemm"],
-                programs.dense.get("reduce"),
-                dense._cached_alpha_one(resolved_device) if lowering.alpha_is_one else None,
-            )
-            quantize, fused = programs.quantize, None
-            policy = lowering.policy
-            workspace_nbytes = (
-                policy.split_k_slices * query.max_tokens * query.out_features * 4
-                if policy.split_k_slices > 1 and not policy.split_k_atomic_bf16 else 0
-            )
+        lowering = programs.lowering
+        core = dense._DenseExecutionState(
+            lowering, resolved_device, programs.dense["gemm"],
+            programs.dense.get("reduce"),
+            dense._cached_alpha_one(resolved_device) if lowering.alpha_is_one else None,
+        )
+        workspace_nbytes = _workspace_nbytes(lowering)
         return _BlockFP8ExecutionState(
             query, config, resolved_device,
             _scratch_plan(
                 caps, (config.tile_m, config.tile_n), workspace_nbytes=workspace_nbytes,
             ),
-            quantize, core, fused,
+            programs.quantize, core,
         )
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override,

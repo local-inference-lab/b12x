@@ -98,3 +98,89 @@ def test_inverse_rope_prepared_execution_rejects_mismatched_runtime_pointer_dtyp
             )
 
 
+
+
+@torch.no_grad()
+def test_prefill_chunk_remainders_reuse_launchers_and_replay():
+    require_b12x()
+    from dataclasses import replace
+    from b12x.preparation._measurement import no_compilation
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, groups, width, rank, hidden = 4096, 2, 4096, 1024, 5120
+    counts = (1, 129, 3575, 3582, capacity)
+    source = torch.randn(capacity, 16, 512, dtype=torch.bfloat16, device=device) / 8
+    positions = torch.arange(capacity, device=device).remainder_(64)
+    angles = torch.randn(64, 32, device=device)
+    table = torch.cat((angles.cos(), angles.sin()), dim=-1).bfloat16()
+    weights = quantize_wo_projection_weights_mxfp8_torch(
+        torch.randn(groups, rank, width, device=device, dtype=torch.bfloat16) / width**0.5,
+        torch.randn(hidden, groups * rank, device=device, dtype=torch.bfloat16) / (groups * rank)**0.5,
+    )
+    caps = wo.Caps(device=device, max_tokens=capacity, groups=groups, group_width=width, rank=rank, hidden=hidden)
+    invocation = dict(operation="inv_rope", heads_per_group=8, nope_dim=448, rope_dim=64)
+    prefill = wo.plan(caps, invocation={**invocation, "dynamic_tokens": True})
+    exact = {rows: wo.plan(replace(caps, max_tokens=rows), invocation=invocation) for rows in counts}
+
+    def bind(state, scratch, rows):
+        return state.bind_inv_rope(
+            scratch=scratch, o=source[:rows], positions=positions[:rows], cos_sin_cache=table,
+            weights=weights, heads_per_group=8, nope_dim=448, rope_dim=64,
+        )
+
+    def prepare(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in state._scratch_state.scratch_specs())
+        binding = bind(state, scratch, state.query.max_tokens)
+        return PreparedCall(run=lambda: state.run_inv_rope(binding))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(plan.request(name=f"wo.{index}", prepare_call=prepare)
+                              for index, plan in enumerate((prefill, *exact.values()))))
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in prefill.scratch_specs())
+        reference_scratch = tuple(torch.empty_like(tensor) for tensor in scratch)
+        state = prefill.prepared.state
+        launchers = (state.ordinary_a.gemm, state.ordinary_b.gemm,
+                     state.quantizers.inv_rope, state.quantizers.group_major)
+        session.freeze()
+        for rows in counts:
+            reference_state = exact[rows].prepared.state
+            reference = bind(reference_state, reference_scratch, rows)
+            binding = bind(state, scratch, rows)
+            with no_compilation():
+                expected = reference_state.run_inv_rope(reference).clone()
+                actual = state.run_inv_rope(binding)
+            torch.cuda.synchronize(device)
+            assert actual.shape == (rows, hidden)
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+            torch.testing.assert_close(binding.x_q.values.view(torch.uint8), reference.x_q.values.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(binding.x_q.scale_rows.view(torch.uint8), reference.x_q.scale_rows.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.002)
+            assert torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0) > 0.99999
+            assert launchers == (state.ordinary_a.gemm, state.ordinary_b.gemm,
+                                 state.quantizers.inv_rope, state.quantizers.group_major)
+            if rows != 3575:
+                continue
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with session.capture(), torch.cuda.graph(graph):
+                    replayed = state.run_inv_rope(binding)
+                source[:rows].neg_()
+                positions[:rows].add_(1).remainder_(table.shape[0])
+                replayed.fill_(float("nan"))
+                pointers = tuple(tensor.data_ptr() for tensor in (*scratch, replayed))
+                allocated = torch.cuda.memory_allocated(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert torch.cuda.memory_allocated(device) == allocated
+                assert tuple(tensor.data_ptr() for tensor in (*scratch, replayed)) == pointers
+                with no_compilation():
+                    expected = reference_state.run_inv_rope(reference)
+                torch.testing.assert_close(replayed, expected, rtol=0.01, atol=0.002)
+                assert torch.isfinite(replayed).all() and torch.count_nonzero(replayed) > 0
+            finally:
+                graph.reset()
+        with pytest.raises(ValueError, match="exact prepared token count"):
+            bind(exact[capacity].prepared.state, reference_scratch, 3575)
+        with pytest.raises(ValueError, match="planned token capacity"):
+            state._check_tokens(capacity + 1)

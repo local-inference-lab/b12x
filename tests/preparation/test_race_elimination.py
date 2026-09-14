@@ -28,8 +28,7 @@ class _Timer:
         self.replays += 1
 
     def samples(self):
-        # Two calibration laps precede round one and report the first latency.
-        index = min(max(self.replays - 3, 0), len(self.latencies_us) - 1)
+        index = min(self.replays - 1, len(self.latencies_us) - 1)
         return (self.latencies_us[index],)
 
 
@@ -41,7 +40,7 @@ def host_timing(monkeypatch):
         yield None
 
     monkeypatch.setattr(torch.cuda, "device", scope)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(_measurement, "no_compilation", scope)
 
 
@@ -59,8 +58,7 @@ def _measure(prepared, *, eliminate=True, **kwargs):
 
 
 def _rounds(timer):
-    """Replays beyond the two calibration laps."""
-    return timer.replays - 2
+    return timer.replays
 
 
 def test_trailing_candidates_stop_after_one_round_and_keep_their_median(host_timing):
@@ -146,3 +144,98 @@ def test_overlapping_compilation_counts_every_replayed_sample(host_timing):
     measurement = _measure(prepared, rounds=7, compilation_active=lambda: True)
 
     assert measurement.overlapped_samples == 8 * (_rounds(leader) + _rounds(behind))
+
+
+class _QueuedTimer:
+    def __init__(self, name, latency_us, queue, order, *, fail=False):
+        self.name = name
+        self.latency_us = latency_us
+        self.queue = queue
+        self.order = order
+        self.fail = fail
+        self.replays = 0
+        self.completed = 0
+        self.call = SimpleNamespace(capture_safe=True)
+
+    def replay(self):
+        assert self not in self.queue, "timing events overwritten before completion"
+        if self.fail:
+            raise RuntimeError("replay failed")
+        self.replays += 1
+        self.queue.append(self)
+        self.order.append(self.name)
+
+    def samples(self):
+        assert not self.queue, "elapsed time read before GPU work completed"
+        assert self.completed == self.replays
+        return (self.latency_us,) * 8
+
+
+@pytest.fixture
+def queued_timing(host_timing, monkeypatch):
+    queue, order, synchronizations = [], [], []
+
+    def synchronize(*_args):
+        synchronizations.append(tuple(timer.name for timer in queue))
+        for timer in queue:
+            timer.completed += 1
+        queue.clear()
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: SimpleNamespace(synchronize=synchronize))
+    return queue, order, synchronizations
+
+
+def test_batched_replays_preserve_individual_timing_and_balanced_order(queued_timing):
+    queue, order, synchronizations = queued_timing
+    timers = tuple(
+        _QueuedTimer(name, latency, queue, order)
+        for name, latency in (("fast", 8.0), ("middle", 15.0), ("slow", 50.0))
+    )
+
+    measurement = _measure(PreparedRace(timers, None, 8), rounds=2, eliminate=False)
+
+    assert measurement.latencies_us == (8.0, 15.0, 50.0)
+    assert [timer.replays for timer in timers] == [8, 6, 2]
+    assert order == [
+        "fast", "middle", "slow", "middle", "fast", "fast", "middle", "fast",
+        "slow", "middle", "fast", "fast", "middle", "middle", "fast", "fast",
+    ]
+    assert len(synchronizations) == 8
+    assert not queue
+
+
+def test_failed_replay_drains_preceding_gpu_work(queued_timing):
+    queue, order, synchronizations = queued_timing
+    first = _QueuedTimer("first", 8.0, queue, order)
+    failing = _QueuedTimer("failing", 8.0, queue, order, fail=True)
+    steps = measure_race_steps(PreparedRace((first, failing), None, 8), device_ordinal=0)
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        next(steps)
+
+    assert first.completed == first.replays == 1
+    assert synchronizations == [("first",)]
+    assert not queue
+
+
+def test_cancellation_yields_with_completed_gpu_work(queued_timing):
+    queue, order, _ = queued_timing
+    timers = tuple(_QueuedTimer(str(index), 8.0, queue, order) for index in range(3))
+    prepared = PreparedRace(timers, None, 8)
+    steps = measure_race_steps(prepared, device_ordinal=0)
+
+    next(steps)
+    steps.close()
+
+    assert not queue
+    assert all(timer.completed == timer.replays == 1 for timer in timers)
+    assert prepared.completed_rounds == 0
+
+
+@pytest.mark.parametrize("latency", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_first_measurement_is_rejected_before_sizing_replays(host_timing, latency):
+    timer = _Timer(latency)
+    timer.call.capture_safe = True
+    with pytest.raises(RuntimeError, match="invalid latency"):
+        _measure(_race((timer,)))
+    assert timer.replays == 1

@@ -74,7 +74,7 @@ def _v41_dequantized_operands(x, weight, scale):
     return x_deq, w_deq
 
 
-def _assert_v41_accumulation_matches_reference(source, weight, scale, actual):
+def _assert_v41_accumulation_matches_reference(source, weight, scale, actual, *, atomic_slices=1):
     x_deq, w_deq = _v41_dequantized_operands(source, weight, scale)
     a, b = x_deq.double(), w_deq.double()
     exact = a @ b.T
@@ -86,6 +86,18 @@ def _assert_v41_accumulation_matches_reference(source, weight, scale, actual):
     # scaling is an exact power-of-two operation for these finite operands.
     k_u = source.shape[-1] * 2.0**-24
     accumulation_error = (k_u / (1.0 - k_u)) * absolute_products
+    if atomic_slices > 1:
+        # Atomic split-K rounds each partial and every accumulated BF16 sum.
+        # Bound those extra roundings using the sum of absolute exact partials.
+        partial_k = source.shape[-1] // atomic_slices
+        absolute_partials = sum(
+            (a[:, start:start + partial_k] @ b[:, start:start + partial_k].T).abs()
+            for start in range(0, source.shape[-1], partial_k)
+        )
+        rounding_u = 2.0**-8
+        operations = atomic_slices + 1
+        gamma = operations * rounding_u / (1.0 - operations * rounding_u)
+        accumulation_error = (1.0 + gamma) * accumulation_error + gamma * absolute_partials
     # Final BF16/FP16 round-to-nearest contributes at most half the local ULP.
     actual64 = actual.double()
     below = torch.nextafter(actual, torch.full_like(actual, -float("inf"))).double()

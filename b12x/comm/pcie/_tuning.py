@@ -106,6 +106,6 @@ def _validate_query(query: PcieQuery, device) -> None:
             raise ValueError("posted-write DCP head gather requires TP4 BF16 64x512 heads")
 
 
-TUNING = replace(TUNING, query_schema_version=5, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=6, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

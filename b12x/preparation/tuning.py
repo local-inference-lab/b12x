@@ -65,14 +65,23 @@ class Knob:
 
 @dataclass(frozen=True, kw_only=True)
 class ParameterSpace:
-    """Finite axes and pure predicates over complete parameter assignments."""
+    """Finite axes with correctness and optional efficiency predicates.
+
+    ``predicates`` always apply. ``efficiency_predicates`` only prune the search
+    when ``exhaustive`` is false; components capture that policy in their query.
+    """
 
     knobs: tuple[Knob, ...]
     predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
+    efficiency_predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
+    exhaustive: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "knobs", tuple(self.knobs))
         object.__setattr__(self, "predicates", tuple(self.predicates))
+        object.__setattr__(self, "efficiency_predicates", tuple(self.efficiency_predicates))
+        if type(self.exhaustive) is not bool:
+            raise TypeError("exhaustive must be a boolean")
         names = set()
         for knob in self.knobs:
             if knob.name in names or set(knob.when) - names:
@@ -96,6 +105,8 @@ class ParameterSpace:
         *,
         values: Mapping[str, Iterable[object]] = FrozenMapping(),
         predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
+        efficiency_predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
+        exhaustive: bool = False,
     ) -> ParameterSpace:
         """Resolve planner ranges while preserving the declared binding times."""
         knobs = tuple(knobs)
@@ -109,12 +120,17 @@ class ParameterSpace:
                 for knob in knobs
             ),
             predicates=tuple(predicates),
+            efficiency_predicates=tuple(efficiency_predicates),
+            exhaustive=exhaustive,
         )
 
     def _passes_predicates(self, assignment: Mapping[str, object]) -> bool:
         # Predicates must not mutate or retain the enumeration's working mapping.
         # An exception is a planner defect, not a reason to silently drop a choice.
-        return all(predicate(assignment) for predicate in self.predicates)
+        return all(predicate(assignment) for predicate in self.predicates) and (
+            self.exhaustive
+            or all(predicate(assignment) for predicate in self.efficiency_predicates)
+        )
 
     def validate(self, assignment: Mapping[str, object]) -> None:
         if set(assignment) != {knob.name for knob in self.knobs}:
@@ -127,8 +143,12 @@ class ParameterSpace:
                 raise ValueError(
                     f"parameter {knob.name!r} is outside its eligible values"
                 )
-        if not self._passes_predicates(assignment):
-            raise ValueError("assignment fails the plan's parameter predicates")
+        if not all(predicate(assignment) for predicate in self.predicates):
+            raise ValueError("assignment fails the plan's correctness predicates")
+        if not self.exhaustive and not all(
+            predicate(assignment) for predicate in self.efficiency_predicates
+        ):
+            raise ValueError("assignment fails the plan's efficiency predicates")
 
     def _product(
         self, index: int, assignment: dict[str, object]
@@ -184,7 +204,7 @@ class TuningConfiguration(Generic[QueryT, ConfigT]):
     query: QueryT
     encoded_query: FrozenMapping
     device: DeviceIdentity | None
-    space: ParameterSpace
+    space: ParameterSpace | None
     default: ConfigT
     pinned: ConfigT | None
     contract: TuningContract[QueryT, ConfigT]
@@ -239,7 +259,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
             return values
         return ParameterSpace.create(self.knobs, values=values)
 
-    def configure(self, query, *, device, override=None) -> TuningConfiguration:
+    def configure(self, query, *, device, override=None, search=True) -> TuningConfiguration:
         self.validate_query(query, device)
         encoded = FrozenMapping(self.encode_query(query))
         if set(encoded) != self.query_fields:
@@ -250,7 +270,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
         self.config_payload(default)
         return TuningConfiguration(
             query=query, encoded_query=encoded, device=device,
-            space=self.parameter_space(query, device), default=default,
+            space=self.parameter_space(query, device) if search else None, default=default,
             pinned=override, contract=self,
         )
 
@@ -278,6 +298,8 @@ class TuningContract(Generic[QueryT, ConfigT]):
     def iterate(self, configuration: TuningConfiguration) -> CandidateIterator:
         if configuration.contract is not self:
             raise ValueError("configuration belongs to another contract")
+        if configuration.space is None:
+            raise ValueError("candidate enumeration requires a search configuration")
         return CandidateIterator(configuration)
 
     def eligible_plan(self, query, device, *, eligible=None) -> EligiblePlan:

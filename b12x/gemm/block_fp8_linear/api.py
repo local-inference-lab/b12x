@@ -12,7 +12,8 @@ from .._shared.block_fp8 import block_fp8_linear_mxfp8 as run
 from .._shared.block_fp8 import pack_block_fp8_linear_weight_mxfp8 as pack_weight
 from .._shared.block_fp8 import quantize_block_fp8_linear_input_mxfp8 as quantize_input
 from ._preparation import plan
-from ._tuning import BlockFp8LinearConfig, BlockFp8LinearQuery
+from .._tuning import DenseGemmConfig
+from ._tuning import BlockFp8LinearQuery
 from . import META
 
 
@@ -28,7 +29,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
-    "Caps", "Plan", "Binding", "Weight", "BlockFp8LinearConfig",
+    "Caps", "Plan", "Binding", "Weight", "DenseGemmConfig",
     "BlockFp8LinearQuery", "plan", "bind", "run", "pack_weight",
     "quantize_input", "is_supported",
 ]

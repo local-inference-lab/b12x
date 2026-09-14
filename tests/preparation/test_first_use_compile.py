@@ -69,3 +69,57 @@ def test_first_use_evicts_deferred_launchers_from_decorated_kernel_memos(monkeyp
     assert factory("resolved") is resident_launcher
     assert factory("planned") is not deferred_launcher
     assert calls == ["planned", "resolved", "planned"]
+
+
+def test_mhc_program_bundle_reuse_obeys_deferred_and_resident_reclamation(monkeypatch):
+    from b12x.norm.mhc import _preparation as mhc
+    from b12x.preparation import FrozenMapping
+
+    key = ProgramKey("cute", "2" * 64, "mhc")
+    built = []
+
+    def build(*_args):
+        program = DeferredCuTeKernel(key, memory_key=("mhc",))
+        built.append(program)
+        return {"partial": program}
+
+    mhc._compile_mhc.cache_clear()
+    monkeypatch.setattr(mhc._compile_mhc, "_function", build)
+    monkeypatch.setattr(mhc, "_codegen_snapshot", lambda: FrozenMapping({"constant": 1}))
+    monkeypatch.setattr(program_cache, "_CACHES", {mhc._compile_mhc})
+    monkeypatch.setattr(program_cache, "_MAPPING_CACHES", [])
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    payload = {"codegen": {"constant": 1}}
+    try:
+        planned = mhc.compile_mhc(payload, {}, {}, 0)
+        assert mhc.compile_mhc(dict(payload), {}, {}, 0) is planned
+        assert compile_plan.program_keys(planned) == (key,)
+        assert compile_plan.evict_planning_artifacts((key,)) == 1
+        resident = mhc.compile_mhc(payload, {}, {}, 0)
+        assert resident is not planned
+        resident["partial"]._resolved = object()
+        assert compile_plan.evict_planning_artifacts((key,)) == 0
+        assert mhc.compile_mhc(payload, {}, {}, 0) is resident
+        assert mhc._compile_mhc.evict_unretained(frozenset({key})) == 0
+        assert mhc._compile_mhc.evict_unretained(frozenset()) == 1
+        assert len(built) == 2
+    finally:
+        mhc._compile_mhc.cache_clear()
+
+
+def test_mhc_program_bundle_hit_still_validates_codegen_snapshot(monkeypatch):
+    import pytest
+    from b12x.norm.mhc import _preparation as mhc
+    from b12x.preparation import FrozenMapping
+
+    mhc._compile_mhc.cache_clear()
+    monkeypatch.setattr(mhc._compile_mhc, "_function", lambda *_args: {})
+    monkeypatch.setattr(mhc, "_codegen_snapshot", lambda: FrozenMapping({"constant": 1}))
+    try:
+        payload = {"codegen": {"constant": 1}}
+        mhc.compile_mhc(payload, {}, {}, 0)
+        monkeypatch.setattr(mhc, "_codegen_snapshot", lambda: FrozenMapping({"constant": 2}))
+        with pytest.raises(ValueError, match="code-generation snapshot"):
+            mhc.compile_mhc(payload, {}, {}, 0)
+    finally:
+        mhc._compile_mhc.cache_clear()

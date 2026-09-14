@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from b12x.preparation import Knob, ParameterBinding, TuningContract
+from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
+
+from b12x.preparation import Knob, ParameterBinding, ParameterSpace, TuningContract
 from .._shared.delta_prefill.config import PrefillConfig, validate_metadata_query
 from .._shared.delta_prefill.workspace import (
     BACKEND,
@@ -36,6 +38,7 @@ class KdaPrefillQuery:
     a_log_dtype: str = "float32"
     dt_bias_dtype: str = "float32"
     state_indices_dtype: str = "int32"
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -52,6 +55,7 @@ class KdaPrefillQuery:
             "a_log_dtype": self.a_log_dtype,
             "dt_bias_dtype": self.dt_bias_dtype,
             "state_indices_dtype": self.state_indices_dtype,
+            "exhaustive": self.exhaustive,
         }
 
 
@@ -105,7 +109,15 @@ def _validate_config(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -
 
 def _tuning_parameters(query: KdaPrefillQuery, device):
     del device
-    return {"window_tiles": range(1, tiles_capacity(query.max_tokens, query.max_seqs) + 1)}
+    capacity = tiles_capacity(query.max_tokens, query.max_seqs)
+    windows = powers_of_two(capacity) | {
+        capacity, default_window_tiles(query.heads, query.max_tokens, query.max_seqs),
+    }
+    return ParameterSpace.create(
+        TUNING.knobs, values={"window_tiles": range(1, capacity + 1)},
+        exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: p["window_tiles"] in windows,),
+    )
 
 
 # The state slot count sizes the caller's pool; it does not change which
@@ -118,14 +130,14 @@ def _encode_query(query: KdaPrefillQuery) -> dict[str, object]:
 
 
 TUNING = TuningContract(
-    component_id="sequence.kda_prefill", query_schema_version=4, config_schema_version=1,
+    component_id="sequence.kda_prefill", query_schema_version=5, config_schema_version=1,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
     encode_query=_encode_query, encode_config=KdaPrefillConfig.to_dict,
     decode_config=KdaPrefillConfig.from_config, validate_query=_validate_query,
     validate_config=_validate_config, default_config=_default_config,
     knobs=(Knob(name="backend", values=(BACKEND,), binding=ParameterBinding.COMPILE), Knob(name="v_split", values=V_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="k_split", values=K_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="stages", values=STAGE_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="window_tiles", values=None, binding=ParameterBinding.COMPILE)),
-    candidate_contract_version=2, parameters=_tuning_parameters,
+    candidate_contract_version=3, parameters=_tuning_parameters,
 )
 
 __all__ = ["BACKEND", "CHUNK_TOKENS", "K_SPLIT_CHOICES", "KdaPrefillConfig", "KdaPrefillQuery", "STAGE_CHOICES", "V_SPLIT_CHOICES", "WINDOW_BYTES_BUDGET", "WORKSPACE_RECORD_BYTES", "WorkspaceRecord", "default_window_tiles", "tiles_capacity", "TUNING"]

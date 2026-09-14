@@ -1614,6 +1614,9 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "NVCC_PREPEND_FLAGS",
     }
     operational_env_vars = {
+        "B12X_AUTOTUNE",
+        "B12X_AUTOTUNE_EXHAUSTIVE",
+        "B12X_TUNING_CACHE_VERSION",
         "B12X_COMPILE_CACHE_DIR",
         "B12X_COMPILE_DISK_CACHE",
         "B12X_COMPILE_MEMORY_CACHE",

@@ -305,9 +305,18 @@ def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_ses
         graph.reset()
 
 
-@pytest.mark.parametrize("tile_k,stages", [(32, 3), (64, 2)])
-@pytest.mark.parametrize("tokens", [1, 17])
-def test_lagged_post_pre_tf32_small_projection_tile(tile_k, stages, tokens, mhc_session):
+@pytest.mark.parametrize("tile_k,stages,tokens,geometry", [
+    (32, 3, 1, {}), (32, 3, 17, {}), (64, 2, 1, {}), (64, 2, 17, {}),
+    (64, 2, 1, {"projection_tile_n": 64, "projection_num_m_warps": 2,
+                "projection_tile_m": 32}),
+    (64, 2, 1, {"projection_tile_n": 32, "projection_num_n_warps": 4}),
+    (256, 4, 1, {"projection_k_splits": 40}),
+])
+def test_lagged_post_pre_tf32_small_projection_tile(
+    tile_k, stages, tokens, geometry, mhc_session, monkeypatch,
+):
+    if geometry:
+        monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
     device = require_sm120()
     hidden = 5120
     residual, x, fn, scale, bias = _make_inputs(
@@ -328,6 +337,8 @@ def test_lagged_post_pre_tf32_small_projection_tile(tile_k, stages, tokens, mhc_
         projection_num_m_warps=1, projection_num_n_warps=1,
         projection_k_splits=2, lagged_prepare=False,
     )
+    from dataclasses import replace
+    config = replace(config, **geometry)
     from b12x.preparation import FrozenMapping
     plan = mhc.plan(
         mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden),
@@ -335,6 +346,11 @@ def test_lagged_post_pre_tf32_small_projection_tile(tile_k, stages, tokens, mhc_
             has_norm_weight=True, norm_eps=1e-20, rms_eps=1e-20,
             hc_eps=1e-6, sinkhorn_iters=20)), override=config,
     )
+    if geometry:
+        from b12x.norm.mhc._tuning import TUNING
+        choice = config.to_dict()
+        del choice["projection_tile_m"]
+        TUNING.parameter_space(plan.query, None).validate(choice)
     args = (x, residual, prev_post, prev_comb, fn, scale, bias)
     prepare(mhc_session, "post_pre", args, options, plan=plan)
     predicted = torch.empty_like(incoming)

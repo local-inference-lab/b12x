@@ -21,7 +21,7 @@ META = OpMeta(
         "Plan",
         "Binding",
         "Weight",
-        "BlockFp8LinearConfig",
+        "DenseGemmConfig",
         "BlockFp8LinearQuery",
         "plan",
         "bind",
@@ -45,7 +45,7 @@ META = OpMeta(
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
-        BlockFp8LinearConfig,
+        DenseGemmConfig,
         BlockFp8LinearQuery,
         Caps,
         Plan,

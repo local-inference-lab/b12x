@@ -740,6 +740,24 @@ def _quantize_group_major_trg_to_tk_kernel(
         scale_u8,
     )
 
+# Prefill retains the same quantization math with live row counts and strides.
+_prefill_grouped_quantizer = triton.jit(
+    _quantize_grouped_tgd_to_tdg_kernel.fn,
+    do_not_specialize=("tokens", "values_stride_g", "scale_mma_s5"),
+    do_not_specialize_on_alignment=("tokens", "values_stride_g", "scale_mma_s5"),
+)
+_prefill_inv_rope_quantizer = triton.jit(
+    _quantize_attention_inv_rope_to_tdg_kernel.fn,
+    do_not_specialize=("tokens", "values_stride_g", "scale_mma_s5"),
+    do_not_specialize_on_alignment=("tokens", "values_stride_g", "scale_mma_s5"),
+)
+_prefill_group_major_quantizer = triton.jit(
+    _quantize_group_major_trg_to_tk_kernel.fn,
+    do_not_specialize=("tokens", "source_stride_g", "scale_mma_s5"),
+    do_not_specialize_on_alignment=("tokens", "source_stride_g", "scale_mma_s5"),
+)
+
+
 def _dtype_from_name(name: str) -> torch.dtype:
     try:
         dtype = getattr(torch, name.removeprefix("torch."))
@@ -752,7 +770,7 @@ def _dtype_from_name(name: str) -> torch.dtype:
 
 @dataclass
 class _WOQuantizers:
-    """Retained Triton launchers for one exact prepared WO invocation."""
+    """Retained Triton launchers for one prepared WO invocation."""
 
     query_key: tuple[object, ...]
     grouped: object | None
@@ -810,11 +828,13 @@ class _WOQuantizers:
 
 
 def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
-    """Compile the exact standalone Triton quantizers from declaration metadata."""
+    """Compile standalone Triton quantizers from declaration metadata."""
 
     query = dict(query_payload)
     operation = str(query["operation"])
+    dynamic_tokens = query["dynamic_tokens"]
     key = (
+        dynamic_tokens,
         operation, str(query["dtype"]), int(query["max_tokens"]), int(query["groups"]),
         int(query["group_width"]), int(query["rank"]), int(query["hidden"]),
         int(query["heads_per_group"] or 0), int(query["nope_dim"] or 0),
@@ -831,7 +851,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
     maximum = int(dict(query["codegen"])["quant_chunks_per_program"])
     chunks = _wo_quant_chunks_per_program(group_width, maximum=maximum)
     fast_b16_scale = (
-        tokens == 16 and groups == 4 and query["heads_per_group"] == 8
+        not dynamic_tokens and tokens == 16 and groups == 4 and query["heads_per_group"] == 8
         and group_width == 4096 and query["nope_dim"] == 448
         and query["rope_dim"] == 64 and chunks == 16
     )
@@ -839,8 +859,11 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
     scale_strides = torch.empty(
         scale_shape, device="meta", dtype=torch.uint8
     ).view(torch.float8_e8m0fnu).permute(3, 4, 1, 5, 2, 0).stride()
+    grouped_kernel = _prefill_grouped_quantizer if dynamic_tokens else _quantize_grouped_tgd_to_tdg_kernel
+    group_major_kernel = _prefill_group_major_quantizer if dynamic_tokens else _quantize_group_major_trg_to_tk_kernel
+    inv_rope_kernel = _prefill_inv_rope_quantizer if dynamic_tokens else _quantize_attention_inv_rope_to_tdg_kernel
     with torch.cuda.device(ordinal):
-        grouped = _quantize_grouped_tgd_to_tdg_kernel.warmup(
+        grouped = grouped_kernel.warmup(
             source_dtype, torch.float8_e4m3fn, torch.uint8, torch.uint8, tokens, groups, group_width,
             groups * group_width, group_width, 1, group_width, 1,
             0 if groups == 1 else tokens * group_width,
@@ -853,7 +876,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
         group_major_strides = torch.empty(group_major_scale, device="meta", dtype=torch.uint8).view(
             torch.float8_e8m0fnu
         ).permute(3, 4, 1, 5, 2, 0).stride()
-        group_major = _quantize_group_major_trg_to_tk_kernel.warmup(
+        group_major = group_major_kernel.warmup(
             torch.bfloat16, torch.float8_e4m3fn, torch.uint8, torch.uint8, tokens,
             int(query["rank"]), groups, int(query["rank"]), 1,
             1 if groups == 1 else tokens * int(query["rank"]),
@@ -862,7 +885,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
         )
         inv_rope = None
         if operation == "inv_rope":
-            inv_rope = _quantize_attention_inv_rope_to_tdg_kernel.warmup(
+            inv_rope = inv_rope_kernel.warmup(
                 source_dtype, _dtype_from_name(str(query["positions_dtype"])),
                 _dtype_from_name(str(query["cos_sin_dtype"])), torch.float8_e4m3fn, torch.uint8,
                 torch.uint8, torch.float8_e4m3fn, tokens, groups, int(query["heads_per_group"]), group_width,
@@ -873,7 +896,8 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
                 HEAD_DIM=int(query["nope_dim"]) + int(query["rope_dim"]), NOPE_DIM=int(query["nope_dim"]),
                 HALF_ROPE_DIM=int(query["rope_dim"]) // 2, CHUNKS_PER_PROGRAM=chunks,
                 FAST_B16_SCALE=fast_b16_scale, CLEAR_OUTPUT=False, CLEAR_HIDDEN=0, CLEAR_BLOCK_SIZE=1,
-                num_warps=2 if tokens == 16 else 4, grid=(tokens, groups, group_width // 32 // chunks),
+                num_warps=2 if tokens == 16 and not dynamic_tokens else 4,
+                grid=(tokens, groups, group_width // 32 // chunks),
             )
     launchers = _WOQuantizers(key, grouped, inv_rope, group_major, chunks, b_chunks, fast_b16_scale)
     attach_programs(launchers, grouped, group_major, inv_rope)

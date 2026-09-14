@@ -10,11 +10,13 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs, compile_only_launches
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._tuning import MhcConfig, MhcQuery, TUNING
 
 _CONTROL_NAMES = (
+    "B12X_AUTOTUNE_EXHAUSTIVE",
     "B12X_MHC_PREFILL_TF32_MMA", "B12X_MHC_PREFILL_BF16_MMA",
     "B12X_MHC_PREFILL_BF16_MIN_TOKENS", "B12X_MHC_PREFILL_TF32_MIN_TOKENS",
     "B12X_MHC_PREFILL_MIN_TOKENS", "B12X_MHC_PREFILL_BLOCK_M",
@@ -128,6 +130,17 @@ def _decode_query(payload):
 
 
 def compile_mhc(query_payload, config_payload, native_payload, ordinal):
+    """Reuse the planned programs without reconstructing their fake operands."""
+    query_payload = FrozenMapping(query_payload)
+    if query_payload["codegen"] != _codegen_snapshot():
+        raise ValueError("MHC compiler code-generation snapshot differs from declaration")
+    return _compile_mhc(
+        query_payload, FrozenMapping(config_payload), FrozenMapping(native_payload), ordinal,
+    )
+
+
+@program_cache
+def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
     """Compile exactly the chosen branch using shape-faithful CUDA FakeTensors."""
     from torch._subclasses.fake_tensor import FakeTensorMode
     from . import _kernels as kernels
@@ -135,8 +148,6 @@ def compile_mhc(query_payload, config_payload, native_payload, ordinal):
     query = _decode_query(query_payload)
     config = MhcConfig.from_config(FrozenMapping(config_payload))
     native = _NativeLaunch(**native_payload)
-    if query.codegen != _codegen_snapshot():
-        raise ValueError("MHC compiler code-generation snapshot differs from declaration")
     device = torch.device("cuda", ordinal)
     m, h, s = query.max_tokens, query.hidden_size, query.split_k
     programs = {}

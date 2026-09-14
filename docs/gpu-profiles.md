@@ -64,7 +64,7 @@ to the native launch. A live count within capacity does not declare another
 plan. Kernels with a static-M ABI still require their exact specialization.
 
 WO projection defaults to exact-M preparation. Its optional invocation
-`variable_tokens=True` permits live rows within a prepared capacity above 16.
+`dynamic_tokens=True` permits live rows within a prepared capacity.
 The ordinary native GEMMs and packing use the live count and group strides;
 small fused decode declarations remain exact. Preparing one large capacity
 therefore covers arbitrary prefix-replay suffixes without padding, changing
@@ -72,24 +72,55 @@ precision, or declaring/JIT-compiling a serving-time plan.
 
 ## Selection and cache semantics
 
-Selection precedence is:
+With autotuning enabled, selection precedence is:
 
 1. A valid explicit per-query config pin.
 2. A validated completed choice from the selection cache.
 3. A race over the complete eligible configuration set on a cache miss.
-4. The component's validated default when tuning is disabled or cancelled.
+
+With autotuning disabled or cancelled, unprepared plans use a valid explicit
+pin or the component's validated heuristic default. Already prepared plans
+remain ready.
 
 A fixed or effective-singleton declaration primes without a race. Defaults,
 pins, fixed choices and partial races are never saved as measured winners.
 Malformed matching cache data fails closed. Compiler artifact availability is
 checked independently of selection-cache presence.
 
-`autotune=False` still compiles, loads and primes; it reuses a valid cached
-choice. `cache_only=True` refuses search and compilation. A complete cached
-restart loads and primes process-local state without starting compiler
-workers.
+`autotune=False` uses a serial warmup through the same session's materialize,
+prime and resource-ownership hooks. It skips selection-cache lookup, candidate
+enumeration, compilation planning, compiler worker processes and measurement
+graphs. Missing kernels compile in the calling process. Set `B12X_AUTOTUNE=0`
+before launch on every rank to force this behavior for every batch.
 
-The cache uses schema 4 and the compiler, toolchain and device identity.
+During vLLM startup, press ESC in the foreground terminal to stop autotuning
+across ranks and use that warmup path for remaining plans. The panel advertises
+the key when terminal input is available. Cancellation persists across both
+preparation stages; an active compile or GPU step must return before its rank
+can switch. Each rank warms its own defaults, without candidate sharding or
+winner consolidation. The coordinator retains collective ordering, error
+propagation and complete-world completion. Incomplete races are not cached.
+
+`cache_only=True` refuses search and compilation. A complete cached restart
+loads and primes process-local state without starting compiler workers.
+
+The decision cache uses schema 5 and an explicit positive integer version,
+`B12X_TUNING_CACHE_VERSION`, which defaults to `1`. Set the same version on
+every rank. Increment it before launch to discard prior tuning decisions:
+
+```bash
+export B12X_TUNING_CACHE_VERSION=2
+```
+
+Decision identity includes that version, the model namespace and physical
+device identity. Source edits and compiler/toolchain changes do not invalidate
+decisions automatically. CuTe and Triton artifacts retain their source-based
+keys; the tuning-cache version is excluded from the compiler environment key.
+A cached decision still validates its assignment and configuration, then
+compiles any missing artifacts for that selected configuration. Increment the
+decision version when implementation or toolchain changes warrant retuning.
+Schema-4 files are left intact and are not read by schema 5.
+
 A selection key digests the component, the contract versions, the encoded
 query, the invocation, the pin and the dependencies. GDN decode, GDN and KDA
 prefill, QSA and PLE encode their query without the pool's size (state slot
@@ -114,6 +145,17 @@ requires a host C++ compiler and CUDA headers located through `CUDA_HOME`.
 The extension uses PyTorch's extension cache (`TORCH_EXTENSIONS_DIR` when
 set). Preparation that performs no race does not build it.
 
+Each candidate is primed once. A batch captures two representative samples
+per candidate by default, with L2 eviction and activation production before
+each timed invocation. The first scored replay also sizes a 256-microsecond
+kernel-time budget per round; there are no unscored calibration replays.
+Replay groups wait on their launch stream before reading or reusing events.
+Each candidate position has a separate graph pool and all positions reuse
+one capture stream and L2 buffer across batches. A retained, non-replayed
+owner graph keeps CUDA and pinned-host allocator pools live between batches.
+Candidate graphs are destroyed before their pools are reused; pool caches
+are released after the query's race and trial cleanup.
+
 Within a batch every candidate is timed by CUDA-graph replay for at least one
 round. After each round a candidate whose best round trails the batch leader
 by more than 10% stops being re-timed and keeps the median of the rounds it
@@ -133,6 +175,41 @@ budget and the MoE task-queue clamp. These ranges do not establish a
 performance bound on omitted configurations; selection quality requires
 measured comparisons. Changing a space bumps the family's
 `candidate_contract_version`, which invalidates its cached selections.
+
+Dense GEMM, mHC, KDA/GDN prefill, dense MLA, the DSA indexer, contiguous attention and paged GQA
+separate correctness constraints from efficiency predicates. `B12X_AUTOTUNE_EXHAUSTIVE=1`, set
+before declaration, bypasses the efficiency group while retaining TMA alignment,
+MMA divisibility, thread-block and shared-memory limits, and scratch bounds.
+The default search removes padded M tiles with an equivalent smaller-tile grid,
+excess N coverage, inactive N warps, surplus pipeline stages, and projection grids
+smaller than one eighth of the device's SM count. These are efficiency heuristics,
+not correctness requirements. The query captures the setting, so exhaustive and
+pruned searches have distinct selection-cache identities. Explicit valid pins
+remain valid in either mode. Dense GEMM restricts NVFP4 cp.async to unswapped K<=256, bounds oversized
+row tiles, restricts MXFP8 decode swapping to N<=K/2, and omits wide NVFP4
+K512 prefill tiles outside short-K or narrow-output cases. MXFP8 retains
+16-row tiles through M128 and the legal BK64 row-tile exception. Explicit
+launch constraints bypass these search heuristics.
+
+mHC prefill at M>=384 couples M warp groups, single N warps and 128–256
+buffered K elements. At M>=2048 it keeps N tiles covering all 24 projections
+and at least 2048 K elements per split. Beyond eight K splits, the grid is
+limited to four times the device's SM count. These predicates preserve the
+declared cartesian axes; explicit valid pins and exhaustive search bypass
+them. The DSA indexer omits scalar scoring for MXFP4 prefill with 32 query
+heads and at least 64 query rows.
+
+KDA samples power-of-two windows plus capacity and its L2-derived default.
+GDN retains its capacity/half/quarter/default window ladder and covering
+segment restrictions in ordinary mode. Dense MLA samples quotient and
+power-of-two split caps plus its default; these are capacity heuristics,
+not equivalence classes for dynamic lengths. Contiguous attention limits
+M tiles to 128 while preserving every legal N tile. Paged GQA samples
+power-of-two residencies plus 3, 6, saturation and its default, preserving
+explicit residency and split-KV controls. Exhaustive mode restores each
+complete declared axis. These restrictions do not change kernel math,
+launch specialization, trial timing or elimination. Other components retain
+their declared predicates.
 
 Equal declarations reuse a completed candidate list and coverage counts when
 they share the same contract object. During the configuration pass, memory
@@ -271,8 +348,12 @@ retaining mandatory preparation with:
 
 The compact loading display is rank-zero only and is driven by real
 preparation phases, candidate counts, completed timing rounds and cache and
-compiler activity. Race status identifies the displayed rank and batch;
-latency histories reset between batches and do not combine different ranks.
+compiler activity. The progress bar counts measured candidates against the
+planned candidate races across the participating ranks; request readiness is a separate
+count. Candidate counts describe search work, not an elapsed-time estimate.
+Race status distinguishes batch size, rank-local candidates and global
+candidate count. Latency histories reset between batches and do not combine
+different ranks.
 Redirected output uses plain milestone lines.
 
 Set `B12X_PREPARATION_TRACE_DIR` before startup to collect timing JSONL:

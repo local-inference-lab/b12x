@@ -157,7 +157,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
     def compile_jobs(config, device):
         return (CompileJob.create(
             "b12x.sequence._shared.delta_prefill.preparation:compile_prefill",
-            component, query.to_dict(), tuning.TUNING.encode_config(config), device.ordinal,
+            component, replace(query, exhaustive=False).to_dict(), tuning.TUNING.encode_config(config), device.ordinal,
         ),)
 
     def memory(config, device):
@@ -170,7 +170,7 @@ def make_plan(caps, impl, tuning, *, invocation, override):
 
     def materialize(selection, device):
         native_layout = layout(selection.config)
-        programs = compile_prefill(component, query.to_dict(), tuning.TUNING.encode_config(selection.config), device.ordinal)
+        programs = compile_prefill(component, replace(query, exhaustive=False).to_dict(), tuning.TUNING.encode_config(selection.config), device.ordinal)
         parallel = getattr(native_layout, "parallel", None) is not None
         resources = None
         if not parallel:

@@ -10,6 +10,7 @@ so it never touches a session, CUDA, a compiler, or a measurement object.
 from __future__ import annotations
 
 import math
+import os
 import statistics
 import sys
 import time
@@ -21,13 +22,14 @@ _STAGES = ("PLAN", "BUILD", "TUNE", "PRIME", "READY")
 _PHASE_STAGE = {
     "planning": "PLAN", "selecting": "PLAN", "compiling": "BUILD",
     "preparing candidates": "TUNE", "calibrating": "TUNE", "autotuning": "TUNE",
-    "priming": "PRIME", "finishing": "PRIME", "ready": "READY", "waiting for ranks": "WAIT",
+    "priming": "PRIME", "warming heuristics": "PRIME", "finishing": "PRIME", "ready": "READY", "waiting for ranks": "WAIT",
 }
 _PHASE_LABEL = {
     "planning": "Planning requests", "selecting": "Selecting configuration",
     "compiling": "Compiling kernels", "preparing candidates": "Preparing candidates",
-    "calibrating": "Calibrating measurements", "autotuning": "Measuring candidates",
-    "priming": "Priming kernels", "finishing": "Finalizing preparation",
+    "calibrating": "Building measurement graphs", "autotuning": "Measuring candidates",
+    "priming": "Priming kernels", "warming heuristics": "Compiling and warming heuristic kernels",
+    "finishing": "Finalizing preparation",
     "ready": "All kernels ready", "waiting for ranks": "Waiting for ranks",
 }
 _INK = "#d8dfe5"
@@ -38,7 +40,7 @@ _WARNING = "#d6b77b"
 _ERROR = "#df9292"
 _STAGE_STYLE = {stage: _SIGNAL for stage in _STAGES}
 _STAGE_STYLE.update(WAIT=_WARNING, FAILED=_ERROR)
-_OUTCOME_PRIORITY = ("tuned", "cached", "fixed", "default")
+_OUTCOME_PRIORITY = ("tuned", "cached", "fixed", "default", "override")
 _EIGHTHS = "▏▎▍▌▋▊▉█"
 _RACE_PHASES = frozenset({"preparing candidates", "calibrating", "autotuning"})
 
@@ -88,7 +90,6 @@ class _Frame:
     lanes: tuple[_Lane, ...] = ()
     previous_medians: tuple[tuple[int, float], ...] = ()
     lanes_changed_at: float = 0.0
-    journey: tuple[str, ...] = ()
     compile_rate: tuple[int, ...] = ()
     peak_active: int = 0
     widest: tuple[float, str] | None = None
@@ -104,10 +105,13 @@ class PreparationDisplay:
     or a measurement object. Pipe output is plain milestone text.
     """
 
-    def __init__(self, *, global_rank: int, stream=None):
+    def __init__(self, *, global_rank: int, stream=None, title="b12x / one-time kernel autotuning", cancel_available=False):
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("progress display requires a nonnegative global rank")
         self._enabled = global_rank == 0
+        self._title = _plain(title)
+        self._cancel_available = cancel_available
+        self._tuning_stopped = False
         self._stream = sys.stderr if stream is None else stream
         self._frame = _Frame(PreparationProgress(False, False, (), False), "PLAN")
         self._live = None
@@ -120,14 +124,8 @@ class PreparationDisplay:
         self._last_stop = False
         self._signature = None
         self._frame_at = 0.0
-        self._completed_seen = 0
-        self._measured_seen = 0
         self._request_key = None
         self._request_started = 0.0
-        self._request_candidates = 0
-        self._request_raced = False
-        self._request_cache_hits = 0
-        self._journey = []
         self._race_history = []
         self._race_rounds = 0
         self._lanes = ()
@@ -160,6 +158,20 @@ class PreparationDisplay:
         )
         self._live.start(refresh=True)
 
+    def write_output(self, line):
+        """Write a complete startup log line above the live panel."""
+        if self._live is not None:
+            from rich.text import Text
+
+            self._console.print(Text.from_ansi(line), highlight=False)
+        else:
+            self._stream.write(line + "\n")
+            self._stream.flush()
+
+    def tuning_stopped(self):
+        self._tuning_stopped = True
+        self._cancel_available = False
+
     def update(self, progress: PreparationProgress):
         if self._started is None or self._closed:
             raise RuntimeError("progress updates require an active display context")
@@ -174,6 +186,7 @@ class PreparationDisplay:
             progress.measured_candidates, progress.cache_hits, progress.compilations,
             progress.active_compilations, progress.tuning_stopped, progress.done,
             progress.batch_index, progress.batch_candidates, progress.tuning_rank,
+            progress.total_candidates, progress.global_candidate_count, progress.selection_counts,
         )
         if signature == self._signature and now - self._frame_at < 0.25 and not progress.done:
             return
@@ -183,7 +196,7 @@ class PreparationDisplay:
         self._frame = _Frame(
             progress, _PHASE_STAGE.get(progress.phase, "PLAN"),
             lanes=self._lanes, previous_medians=self._previous_medians,
-            lanes_changed_at=self._lanes_changed_at, journey=tuple(self._journey),
+            lanes_changed_at=self._lanes_changed_at,
             compile_rate=self._rate(now), peak_active=self._peak_active, widest=self._widest,
             request_started=self._request_started,
         )
@@ -203,35 +216,17 @@ class PreparationDisplay:
 
     def _account(self, progress, now):
         previous = self._frame.progress
-        completed = progress.completed_requests - self._completed_seen
-        if completed > 0:
-            measured = progress.measured_candidates - self._measured_seen
-            if self._request_raced:
-                outcome = "tuned" if measured > 0 else "default"
-            elif self._request_candidates == 1:
-                outcome = "fixed"
-            elif self._request_candidates == 0 or previous.cache_hits > self._request_cache_hits:
-                outcome = "cached"
-            else:
-                outcome = "default"
-            self._journey.extend(["fixed"] * (completed - 1))
-            self._journey.append(outcome)
-            if outcome == "tuned" and len(self._lanes) > 1:
-                spread = self._lanes[-1].median_us / self._lanes[0].median_us
-                if self._widest is None or spread > self._widest[0]:
-                    self._widest = (spread, previous.component_id)
-            self._completed_seen = progress.completed_requests
-            self._measured_seen = progress.measured_candidates
+        tuned = dict(progress.selection_counts).get("tuned", 0)
+        previous_tuned = dict(previous.selection_counts).get("tuned", 0)
+        if tuned > previous_tuned and len(self._lanes) > 1:
+            spread = self._lanes[-1].median_us / self._lanes[0].median_us
+            if self._widest is None or spread > self._widest[0]:
+                self._widest = (spread, previous.component_id)
         key = (progress.component_id, progress.request_name)
         if key != self._request_key:
             self._request_key = key
             self._request_started = now
-            self._request_candidates = 0
-            self._request_raced = False
-            self._request_cache_hits = previous.cache_hits
             self._reset_race()
-        self._request_candidates = max(self._request_candidates, progress.candidate_count)
-        self._request_raced = self._request_raced or progress.phase in _RACE_PHASES
         if (progress.batch_index != previous.batch_index
                 or progress.tuning_rank != previous.tuning_rank
                 or progress.completed_rounds < self._race_rounds):
@@ -301,6 +296,14 @@ class PreparationDisplay:
 
         frame = self._frame
         p = frame.progress
+        if self._stream.isatty():
+            try:
+                size = os.get_terminal_size(self._stream.fileno())
+            except (AttributeError, OSError, ValueError):
+                pass
+            else:
+                if size.columns > 0 and size.lines > 0:
+                    self._console.size = size
         width, height = self._console.width, self._console.height
         if width < 76 or height < 10:
             return self._render_line(frame, width)
@@ -321,8 +324,11 @@ class PreparationDisplay:
             grid.add_row(row)
         return Panel(
             grid, box=box.SQUARE, border_style=_TRACK, padding=(0, 2), expand=True,
-            title=Text(" b12x / kernel autotuning ", style=f"bold {_INK}"),
+            title=Text(f" {self._title} ", style=f"bold {_INK}"),
             title_align="left",
+            subtitle=Text("Press ESC to use default tuning", style=_DIM)
+            if self._cancel_available and not p.tuning_stopped and not p.done else None,
+            subtitle_align="right",
         )
 
     def _two(self, left, right):
@@ -360,10 +366,18 @@ class PreparationDisplay:
         from rich.text import Text
 
         p = frame.progress
-        fraction = p.completed_requests / p.total_requests if p.total_requests else 0.0
-        label = Text(f"{p.completed_requests} / {p.total_requests} requests", style=_INK, no_wrap=True)
-        label.append(f"   {fraction:4.0%}" if p.total_requests else "     —", style=_SIGNAL)
-        return self._two(_bar(fraction, max(8, inner - label.cell_len - 2)), label)
+        if p.total_candidates:
+            fraction = p.measured_candidates / p.total_candidates
+            label = Text(
+                f"{p.measured_candidates} / {p.total_candidates} candidates measured",
+                style=_INK, no_wrap=True,
+            )
+            label.append(f"   {fraction:4.0%}", style=_SIGNAL)
+            return self._two(_bar(fraction, max(8, inner - label.cell_len - 2)), label)
+        detail = "Counting candidates" if p.total_candidates is None and not p.done else "No candidate races"
+        return self._two(Text(detail, style=_DIM), Text(
+            f"{p.completed_requests} / {p.total_requests} requests ready", style=_INK, no_wrap=True,
+        ))
 
     def _activity_row(self, frame):
         p = frame.progress
@@ -371,14 +385,15 @@ class PreparationDisplay:
             text = self._field("STATUS", "Preparation failed", f"during {p.phase}")
             text.stylize(_ERROR, 10)
             return text
-        if p.tuning_stopped and not p.done:
-            text = self._field("STATUS", "Tuning stopped", "completing required preparation")
+        if (p.tuning_stopped or self._tuning_stopped) and not p.done:
+            detail = "compiling and warming heuristics" if p.tuning_stopped else "stopping autotuning across ranks"
+            text = self._field("STATUS", "Tuning stopped", detail)
             text.stylize(_WARNING, 10)
             return text
         detail = ""
         if p.phase == "autotuning":
             count = p.batch_candidates or p.candidate_count
-            detail = f"round {p.completed_rounds} / {p.total_rounds}  ·  {count} candidates"
+            detail = f"round {p.completed_rounds} / {p.total_rounds}  ·  {count} in batch"
             if p.active_count and p.active_count < count:
                 detail += f"  ·  {p.active_count} timed"
         elif p.phase == "preparing candidates":
@@ -389,6 +404,8 @@ class PreparationDisplay:
             detail = f"{p.active_compilations} active  ·  {p.compilations} built"
         if p.batch_index and p.phase in _RACE_PHASES:
             detail = f"rank {p.tuning_rank} batch {p.batch_index}  ·  {detail}"
+            if p.candidate_sharded:
+                detail += f"  ·  {p.candidate_count} on rank / {p.global_candidate_count} total"
         return self._field("STATUS", _PHASE_LABEL.get(p.phase, p.phase), detail)
 
     def _detail_row(self, frame):
@@ -408,9 +425,10 @@ class PreparationDisplay:
         if p.phase in _RACE_PHASES:
             return self._field("BEST", "Awaiting measurements")
         if p.done or frame.failed:
-            counts = [f"{frame.journey.count(outcome)} {outcome}" for outcome in _OUTCOME_PRIORITY
-                      if outcome in frame.journey]
-            return self._field("RESULT", "  ·  ".join(counts) or "No completed requests")
+            selected = dict(p.selection_counts)
+            counts = [f"{selected[outcome]} {outcome}" for outcome in _OUTCOME_PRIORITY
+                      if selected.get(outcome, 0)]
+            return self._field("RESULT", "  ·  ".join(counts) or "No selection results")
         return self._field("MEASURED", f"{p.measured_candidates} candidates")
 
     def _summary_row(self, frame):
@@ -426,9 +444,16 @@ class PreparationDisplay:
         color = _STAGE_STYLE[stage]
         line = Text("b12x  ", style=f"bold {_INK}", no_wrap=True, overflow="ellipsis")
         line.append(stage, style=f"bold {color}")
-        line.append(f"  {p.completed_requests}/{p.total_requests}", style=_INK)
-        if p.tuning_stopped and not p.done:
-            line.append("  tuning stopped", style=_WARNING)
+        show_hint = self._cancel_available and not p.done and not p.tuning_stopped
+        if not show_hint:
+            if p.total_candidates:
+                line.append(f"  {p.measured_candidates}/{p.total_candidates} candidates", style=_INK)
+            else:
+                line.append(f"  {p.completed_requests}/{p.total_requests} ready", style=_INK)
+        if (p.tuning_stopped or self._tuning_stopped) and not p.done:
+            line.append("  warming heuristics" if p.tuning_stopped else "  stopping tuning", style=_WARNING)
+        elif self._cancel_available and not p.done:
+            line.append("  Press ESC to use default tuning", style=_DIM)
         elif p.phase == "autotuning":
             line.append(f"  round {p.completed_rounds}/{p.total_rounds}", style=_DIM)
         if width >= 60 and p.component_id and not p.done:

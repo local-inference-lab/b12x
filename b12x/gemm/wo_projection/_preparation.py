@@ -30,8 +30,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
         raise ValueError("inverse-RoPE WO declaration requires heads_per_group, nope_dim, and rope_dim")
     allowed = {
         "operation", "heads_per_group", "nope_dim", "rope_dim", "return_3d",
-        "positions_dtype", "cos_sin_dtype",
-        "variable_tokens",
+        "positions_dtype", "cos_sin_dtype", "dynamic_tokens",
     }
     if set(invocation) - allowed:
         raise ValueError("unknown WO invocation field")
@@ -46,6 +45,7 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
     from .._shared.wo_mxfp8 import _WO_QUANT_CHUNKS_PER_PROGRAM
     return WoProjectionQuery(
         dtype=str(caps.dtype).removeprefix("torch."), max_tokens=caps.max_tokens,
+        dynamic_tokens=invocation.get("dynamic_tokens", False),
         groups=caps.groups, group_width=caps.group_width, rank=caps.rank, hidden=caps.hidden,
         operation=operation,
         heads_per_group=int(invocation["heads_per_group"]) if inv_rope else None,
@@ -54,7 +54,6 @@ def _query(caps: WOProjectionScratchCaps, invocation: FrozenMapping) -> WoProjec
         return_3d=bool(invocation.get("return_3d", False)),
         positions_dtype=str(invocation.get("positions_dtype", "int64")),
         cos_sin_dtype=str(invocation.get("cos_sin_dtype", "bfloat16")),
-        variable_tokens=invocation.get("variable_tokens", False),
         codegen=FrozenMapping({
             "quant_chunks_per_program": _WO_QUANT_CHUNKS_PER_PROGRAM,
             "wo_b_fused_tile": _fused_tile_override(),
@@ -70,15 +69,21 @@ def _fused_b_tile(query: WoProjectionQuery, config):
 
 
 def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=None):
-    """Declare native WO, optionally allowing live rows within a large capacity."""
+    """Declare WO projection at a planned token count.
+
+    ``invocation["dynamic_tokens"]=True`` allows any positive live count up to
+    ``caps.max_tokens`` using the capacity's launch configuration. The default
+    requires the exact planned count and preserves decode specialization.
+    """
     if not isinstance(caps, WOProjectionScratchCaps):
         raise TypeError("caps must be WOProjectionScratchCaps")
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
+    use_fused_b = caps.max_tokens <= 8 and not query.dynamic_tokens
     fused = {}
 
     def fused_b(config, device):
-        if caps.max_tokens > 8:
+        if not use_fused_b:
             return None
         key = (device.identity, config)
         if key not in fused:
@@ -156,7 +161,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             _materialize_dense(a_lowering, torch.device("cuda", device.ordinal)),
             _materialize_dense(b_lowering, torch.device("cuda", device.ordinal)),
             (_materialize_dense_fused_quant(fused_b(selection.config, device), torch.device("cuda", device.ordinal))
-             if caps.max_tokens <= 8 else None),
+             if use_fused_b else None),
             compile_wo_quantizers(TUNING.encode_query(query), device.ordinal),
         )
 
@@ -169,7 +174,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                               ordinary_states(config, device)[1].to_dict(), device.ordinal),
             *((CompileJob.create("b12x._lib.dense_gemm:_compile_dense_fused_quant_lowering",
                                  fused_b(config, device).to_dict(), device.ordinal),)
-              if caps.max_tokens <= 8 else ()),
+              if use_fused_b else ()),
             CompileJob.create(
                 "b12x.gemm._shared.wo_mxfp8:compile_wo_quantizers",
                 TUNING.encode_query(query), device.ordinal,
@@ -197,7 +202,7 @@ class _PreparedWO:
         source = kwargs["source_tgd"]
         if str(source.dtype).removeprefix("torch.") != self.query.dtype:
             raise ValueError("WO source dtype differs from declaration")
-        self._require_exact_tokens(source.shape[0])
+        self._check_tokens(source.shape[0])
         return self._scratch_state.bind(**kwargs)
 
     def bind_inv_rope(self, **kwargs):
@@ -214,20 +219,18 @@ class _PreparedWO:
             or str(cos_sin_cache.dtype).removeprefix("torch.") != self.query.cos_sin_dtype
         ):
             raise ValueError("inverse-RoPE WO tensor dtypes differ from declaration")
-        self._require_exact_tokens(o.shape[0])
+        self._check_tokens(o.shape[0])
         return self._scratch_state.bind_inv_rope(**kwargs)
 
-    def _require_exact_tokens(self, tokens):
-        if self.query.variable_tokens:
-            if not 0 < int(tokens) <= self.query.max_tokens:
-                raise ValueError("WO tokens exceed the prepared capacity")
-            return
-        if int(tokens) != self.query.max_tokens:
+    def _check_tokens(self, tokens):
+        if not 1 <= int(tokens) <= self.query.max_tokens:
+            raise ValueError("WO execution exceeds its planned token capacity")
+        if not self.query.dynamic_tokens and int(tokens) != self.query.max_tokens:
             raise ValueError("WO plan requires its exact prepared token count")
 
     def quantize_a(self, source_tgd, *, out=None):
         from .._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
-        self._require_exact_tokens(source_tgd.shape[0])
+        self._check_tokens(source_tgd.shape[0])
         if out is None:
             out = empty_mxfp8_rows_for_dense_gemm(
                 source_tgd.shape[0], self.query.group_width, num_groups=self.query.groups,
@@ -240,7 +243,7 @@ class _PreparedWO:
         self, o, positions, cos_sin_cache, *, groups, heads_per_group, nope_dim, rope_dim, out=None,
     ):
         from .._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
-        self._require_exact_tokens(o.shape[0])
+        self._check_tokens(o.shape[0])
         if (groups, heads_per_group, nope_dim, rope_dim) != (
             self.query.groups, self.query.heads_per_group, self.query.nope_dim, self.query.rope_dim,
         ):
@@ -258,7 +261,7 @@ class _PreparedWO:
 
     def quantize_b(self, tmp_trg, *, out=None):
         from .._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
-        self._require_exact_tokens(tmp_trg.shape[0])
+        self._check_tokens(tmp_trg.shape[0])
         if out is None:
             out = empty_mxfp8_rows_for_dense_gemm(
                 tmp_trg.shape[0], self.query.rank * self.query.groups, num_groups=1,
@@ -279,11 +282,11 @@ class _PreparedWO:
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,
         )
-        if self.query.max_tokens <= 8:
+        if self.fused_b is not None:
             source = binding.tmp
             if binding.weights.groups == 1:
                 source = source.as_strided(
-                    (self.query.max_tokens, binding.weights.rank),
+                    (tokens, binding.weights.rank),
                     (binding.weights.rank, 1),
                 )
             self.fused_b.run(
@@ -314,9 +317,9 @@ class _PreparedWO:
             (a_values, binding.weights.wo_a.scale_mma),
             out=binding.tmp, alpha=None, stream=stream,
         )
-        if self.query.max_tokens <= 8:
+        if self.fused_b is not None:
             source = binding.tmp if binding.weights.groups != 1 else binding.tmp.as_strided(
-                (self.query.max_tokens, binding.weights.rank), (binding.weights.rank, 1)
+                (tokens, binding.weights.rank), (binding.weights.rank, 1)
             )
             self.fused_b.run(
                 source, binding.weights.wo_b.values.reshape(binding.weights.hidden, -1, 1),

@@ -1,4 +1,4 @@
-"""Completed exhaustive choices; executable artifacts retain their own caches."""
+"""Versioned tuning decisions, independent of executable artifact caches."""
 from __future__ import annotations
 
 import fcntl
@@ -24,18 +24,22 @@ def digest(value):
 
 def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
     import torch
-    from b12x._lib.compiler import (
-        _compile_environment_key, _device_uuid_key, _runtime_toolchain_key,
-        b12x_package_fingerprint,
-    )
+    from b12x._lib.compiler import _device_uuid_key
+
+    raw_version = os.environ.get("B12X_TUNING_CACHE_VERSION", "1")
+    try:
+        version = int(raw_version)
+    except ValueError:
+        raise ValueError("B12X_TUNING_CACHE_VERSION must be a positive integer") from None
+    if version <= 0:
+        raise ValueError("B12X_TUNING_CACHE_VERSION must be a positive integer")
     with torch.cuda.device(device_ordinal):
         uuid = _device_uuid_key(device_ordinal)
         if uuid is None:
             raise RuntimeError("preparation requires a resolved physical CUDA device")
         return {
-            "schema_version": 4, "namespace": dict(namespace),
-            "source": b12x_package_fingerprint(), "toolchain": _runtime_toolchain_key(),
-            "environment": _compile_environment_key(), "device": uuid,
+            "schema_version": 5, "tuning_cache_version": version,
+            "namespace": dict(namespace), "device": uuid,
             "visible_ordinal": device_ordinal,
         }
 
@@ -45,8 +49,11 @@ class SelectionCache:
 
     def __init__(self, root: str | Path, identity: Mapping[str, object]):
         self.identity = json.loads(_json(identity))
-        if self.identity.get("schema_version") != 4:
-            raise ValueError("preparation selection cache requires schema 4")
+        if self.identity.get("schema_version") != 5:
+            raise ValueError("preparation selection cache requires schema 5")
+        version = self.identity.get("tuning_cache_version")
+        if type(version) is not int or version <= 0:
+            raise ValueError("selection cache requires a positive tuning_cache_version")
         self.path = Path(root) / f"{digest(self.identity)}.json"
         self.records = self._read()
 

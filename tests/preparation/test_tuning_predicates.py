@@ -481,8 +481,12 @@ def test_gdn_prefill_races_one_segment_plan_and_a_window_ladder():
     # cap = ceil(128/16) + 1 = 9 tiles, raced as one, two and four windows.
     assert windows == {9, 5, 3}
     space.validate(sequential)
-    with pytest.raises(ValueError, match="eligible values"):
+    with pytest.raises(ValueError, match="efficiency predicates"):
         space.validate({**sequential, "window_tiles": 8})
+    exhaustive = component.TUNING.parameter_space(replace(query, exhaustive=True), IDENTITY)
+    exhaustive.validate({**sequential, "window_tiles": 8})
+    exhaustive.validate({**sequential, "algorithm": "chunk_parallel",
+                         "segment_tokens": 1024, "window_tiles": None})
     # A 128-token sequence is one 128-token segment: chunk-parallel has no
     # chunk-level parallelism to exploit and is not raced at all.
     assert not any(

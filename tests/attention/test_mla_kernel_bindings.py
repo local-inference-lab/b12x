@@ -410,3 +410,41 @@ def test_sm120_prefill_dual_non_eligible_raises() -> None:
             extra_indices=extra_indices,
             extra_page_block_size=2,
         )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("shape,stride", [
+    ((3, 8), (8, 1)), ((1, 8), (1, 1)), ((3, 8), (24, 3)), ((0,), (1,)),
+])
+def test_prefill_compile_descriptors_never_export_fake_storage(
+    monkeypatch, device, dynamic, shape, stride,
+):
+    """Compilation preserves native layouts without exporting FakeTensor storage."""
+    import cutlass
+    from b12x._lib.compile_plan import compile_only_launches
+    from b12x.attention._shared.mla import prefill_mg
+
+    real = torch.empty_strided(shape, stride, dtype=torch.float32)
+    expected = prefill_mg._to_cute(real, cutlass.Float32, align=4, dynamic_layout=dynamic)
+
+    from_dlpack = prefill_mg.from_dlpack
+
+    def reject_fake_dlpack(tensor, *args, **kwargs):
+        assert not hasattr(tensor, "fake_mode"), "FakeTensor must not export storage"
+        assert tensor.numel() == 0
+        return from_dlpack(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(prefill_mg, "from_dlpack", reject_fake_dlpack)
+    with FakeTensorMode(), compile_only_launches():
+        fake = torch.empty_strided(shape, stride, dtype=torch.float32, device=device)
+        actual = prefill_mg._to_cute(fake, cutlass.Float32, align=4, dynamic_layout=dynamic)
+    from cutlass._mlir import ir
+
+    assert actual.element_type == expected.element_type
+    assert actual.dynamic_shapes_mask == expected.dynamic_shapes_mask
+    assert actual.dynamic_strides_mask == expected.dynamic_strides_mask
+    with ir.Context(), ir.Location.unknown():
+        # CPU DLPack uses generic memory; compile descriptors describe GPU memory.
+        expected_type = str(expected.mlir_type).replace(", generic,", ", gmem,")
+        assert str(actual.mlir_type).replace(", generic,", ", gmem,") == expected_type

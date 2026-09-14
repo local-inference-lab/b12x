@@ -1,5 +1,6 @@
 """Rendering and accounting checks for the rank-zero preparation dashboard."""
 import io
+from collections import Counter
 import time
 
 import pytest
@@ -20,11 +21,15 @@ def _progress(**overrides):
         compilations=0, active_compilations=0, elapsed_seconds=0.0, tuning_stopped=False,
     )
     base.update(overrides)
+    sources = ("cached", "fixed", "tuned", "cached", "default", "fixed")
+    base.setdefault("selection_counts", tuple(sorted(
+        Counter(sources[:base["completed_requests"]]).items()
+    )))
     return PreparationProgress(**base)
 
 
 def _timeline():
-    """Two cached, one fixed, one raced, one default (stopped), one raced request."""
+    """Two cached, two fixed, one tuned, and one stopped request."""
     yield _progress(phase="planning", total_requests=0)
     yield _progress(phase="planning", cache_hits=2)
     common = dict(cache_hits=2)
@@ -103,7 +108,7 @@ def test_every_phase_renders_within_console_width(width, height):
     assert max(len(line) for line in text.splitlines()) <= width
 
 
-def test_outcomes_and_lanes_are_inferred_from_snapshots():
+def test_reported_outcomes_and_measured_lanes_render_from_snapshots():
     display, console = _attach(140, 40)
     seen_lanes = None
     for progress in _timeline():
@@ -115,7 +120,9 @@ def test_outcomes_and_lanes_are_inferred_from_snapshots():
     assert seen_lanes[0].median_us == pytest.approx(41.0)
     assert seen_lanes[0].history == (41.0, 40.0, 42.0)
     frame = display._frame
-    assert frame.journey == ("cached", "fixed", "tuned", "cached", "default", "fixed")
+    assert dict(frame.progress.selection_counts) == {
+        "cached": 2, "fixed": 2, "tuned": 1, "default": 1,
+    }
     assert frame.widest is not None and frame.widest[1] == "attention.dense_mla"
     assert frame.widest[0] == pytest.approx(65.0 / 41.0)
     text = _render_text(display, console)
@@ -190,3 +197,59 @@ def test_batch_change_resets_measurements_when_intermediate_rounds_are_not_repor
     assert display._frame.lanes[0].history == (30.0,)
     assert display._frame.lanes[1].history == (40.0,)
     assert "rank 2 batch 3" in _render_text(display, console)
+
+
+def test_progress_bar_measures_candidate_work_independently_of_request_count():
+    display, console = _attach(180, 40)
+    display.update(_progress(
+        phase="autotuning", component_id="norm.mhc", request_name="mhc.post_pre.m4096",
+        completed_requests=1, total_requests=100, measured_candidates=900, total_candidates=1000,
+        candidate_count=43, global_candidate_count=172, candidate_sharded=True,
+        batch_candidates=20, batch_index=2, completed_rounds=1, total_rounds=3,
+    ))
+    text = _render_text(display, console)
+    assert "900 / 1000 candidates measured" in text
+    assert "90%" in text
+    assert "20 in batch" in text
+    assert "43 on rank / 172 total" in text
+    assert "1 / 100 requests" not in text
+
+
+def test_planning_does_not_present_request_fraction_as_remaining_work():
+    display, console = _attach(140, 40)
+    display.update(_progress(completed_requests=1, total_requests=100))
+    text = _render_text(display, console)
+    assert "Counting candidates" in text
+    assert "1 / 100 requests ready" in text
+    assert "%" not in text
+
+
+@pytest.mark.parametrize("width", [60, 84])
+def test_escape_hint_and_cancellation_status(width):
+    stream = io.StringIO()
+    display = PreparationDisplay(global_rank=0, stream=stream, cancel_available=True)
+    with display:
+        display._console = Console(file=stream, width=width, height=24, color_system=None)
+        display.update(_progress(phase="autotuning"))
+        display._console.print(display._render())
+        assert "Press ESC to use default tuning" in stream.getvalue()
+        stream.seek(0)
+        stream.truncate()
+        display.tuning_stopped()
+        display._console.print(display._render())
+        assert "Press ESC to use default tuning" not in stream.getvalue()
+        assert "stopping" in stream.getvalue()
+
+
+def test_results_use_selections_when_completion_snapshots_are_skipped():
+    display, console = _attach(160, 40)
+    display.update(_progress(phase="autotuning", candidate_count=64))
+    display.update(_progress(
+        phase="ready", done=True, completed_requests=298, total_requests=298,
+        measured_candidates=64000,
+        selection_counts=(("tuned", 279), ("fixed", 1), ("default", 17), ("override", 1)),
+    ))
+    text = _render_text(display, console)
+    assert "279 tuned" in text and "1 fixed" in text
+    assert "17 default" in text and "1 override" in text
+    assert "279 fixed" not in text

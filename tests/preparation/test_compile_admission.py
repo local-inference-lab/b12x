@@ -77,6 +77,49 @@ def test_stop_preserves_promoted_shared_required_programs(monkeypatch):
     completed((1, 1, 0, programs))
     assert pool.ready(required)
     assert not pool.pending
+    summary = pool.summary()
+    assert (summary.cute_programs, summary.triton_programs) == (3, 0)
+    assert summary.cute_compilations == 3
+    pool.close()
+
+
+def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(monkeypatch):
+    workers = Workers()
+    context = SimpleNamespace(Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers)
+    monkeypatch.setattr(compile_pool.multiprocessing, "get_context", lambda kind: context)
+    pool = CompilePool(
+        device_ordinal=0,
+        compute_capability=(12, 0),
+        device_uuid="synthetic-device",
+        product_name="synthetic-gpu",
+        sm_count=1,
+        max_shared_memory_per_block=1024,
+        max_shared_memory_per_multiprocessor=2048,
+        workers=1,
+    )
+    cute = ProgramKey("cute", "shared")
+    triton = ProgramKey("triton", "shared")
+    another = ProgramKey("cute", "another")
+    first = CompilationPlan(CompileJob.create("integration.producer:compile", 1), (cute, triton))
+    second = CompilationPlan(CompileJob.create("integration.producer:compile", 2), (cute, another))
+    pool.submit_plans((first, second, first))
+    summary = pool.summary()
+    assert (summary.jobs, summary.requested_jobs) == (1, 3)
+    assert (summary.cute_programs, summary.triton_programs) == (1, 1)
+    assert (summary.cute_compilations, summary.triton_compilations) == (0, 0)
+    programs, complete, _ = workers.calls[0]
+    complete((1, 1, 1, programs))
+    summary = pool.summary()
+    assert (summary.cute_programs, summary.triton_programs) == (2, 1)
+    assert (summary.cute_compilations, summary.triton_compilations) == (1, 1)
+    programs, complete, _ = workers.calls[1]
+    complete((1, 1, 0, programs))
+    pool.submit_plans((second, first))
+    summary = pool.summary()
+    assert (summary.jobs, summary.requested_jobs) == (2, 5)
+    assert (summary.cute_programs, summary.triton_programs) == (2, 1)
+    assert (summary.cute_compilations, summary.triton_compilations) == (2, 1)
+    assert not pool.pending
     pool.close()
 
 

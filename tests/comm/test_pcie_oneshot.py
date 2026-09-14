@@ -485,8 +485,9 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
     launchers = []
 
     def fake_get_oneshot_launcher(*args):
-        launchers.append(args)
-        return object()
+        launcher = _OneshotLaunch(*args[:-1])
+        launchers.append(launcher)
+        return launcher
 
     monkeypatch.setattr(
         "b12x.comm.pcie._oneshot_cute.get_oneshot_launcher",
@@ -503,10 +504,12 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
     plan = state.plain_graph_plans[key]
     assert plan.transport == "tp2_remote_push"
     assert (plan.threads, plan.blocks) == (64, 16)
-    assert [args[4:8] for args in launchers] == [
-        (True, 0, "tp2_remote_push", 64),
-        (True, 1, "tp2_remote_push", 64),
-    ]
+    assert launchers[0]._transport == "pull"
+    assert not launchers[0]._device_slot_selection
+    assert [
+        (launcher._device_slot_selection, launcher._slot_bias, launcher._transport)
+        for launcher in launchers[1:]
+    ] == [(True, 0, "tp2_remote_push"), (True, 1, "tp2_remote_push")]
 
 
 def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None:

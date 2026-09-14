@@ -269,6 +269,8 @@ def _tf32_pin(query):
 def _validate_query(query, device):
     if not isinstance(query, MhcQuery):
         raise TypeError("query must be MhcQuery")
+    if query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") not in ("0", "1"):
+        raise ValueError("B12X_AUTOTUNE_EXHAUSTIVE must be 0 or 1")
     if query.operation not in ("pre", "post", "post_pre", "collapse"):
         raise ValueError("unknown mHC operation")
     if query.dtype != "bfloat16":
@@ -336,7 +338,6 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     if type(smem_limit) is not int or smem_limit <= 0:
         raise ValueError("TF32 preparation requires the declared device's shared-memory limit")
     alignment = MHCPrefillTf32ProjectTmaKernel.buffer_align_bytes
-    m_warps = (query.max_tokens + 15) // 16
     n_cover = 1 << (_MIXES - 1).bit_length()
 
     def shared_bytes(p):
@@ -356,27 +357,75 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             )
         )
 
+    m_warp_values = next(knob.values for knob in TUNING.knobs
+                         if knob.name == "projection_num_m_warps")
+    min_grid = 1 if device is None else max(1, (device.sm_count + 7) // 8)
+
+    def compact_m_grid(p):
+        if p["backend"] != "tf32_tma":
+            return True
+        warps = p["projection_num_m_warps"]
+        grid = (query.max_tokens + 16 * warps - 1) // (16 * warps)
+        return not any(
+            smaller < warps
+            and (query.max_tokens + 16 * smaller - 1) // (16 * smaller) == grid
+            for smaller in m_warp_values
+        )
+
+    def sufficient_grid(p):
+        if p["backend"] != "tf32_tma":
+            return True
+        tile_m = 16 * p["projection_num_m_warps"]
+        tile_n = p["projection_tile_n"]
+        return (
+            ((query.max_tokens + tile_m - 1) // tile_m)
+            * ((_MIXES + tile_n - 1) // tile_n)
+            * p["projection_k_splits"]
+            >= min_grid
+        )
+
+    def bounded_split_grid(p):
+        if p["backend"] != "tf32_tma" or device is None or p["projection_k_splits"] <= 8:
+            return True
+        tile_m = 16 * p["projection_num_m_warps"]
+        grid = ((query.max_tokens + tile_m - 1) // tile_m) * (
+            (_MIXES + p["projection_tile_n"] - 1) // p["projection_tile_n"]
+        ) * p["projection_k_splits"]
+        return grid <= 4 * device.sm_count
+
+    def prefill_warp_layout(p):
+        if p["backend"] != "tf32_tma" or query.max_tokens < 384:
+            return True
+        m_warps = p["projection_num_m_warps"]
+        return p["projection_num_n_warps"] == 1 and (
+            m_warps % 4 == 0
+            or (p["projection_tile_n"] == 8 and m_warps >= 2)
+        )
+
+    def prefill_column_tiles(p):
+        return (p["backend"] != "tf32_tma" or query.max_tokens < 2048
+                or p["projection_tile_n"] >= _MIXES)
+
+    def prefill_pipeline(p):
+        if p["backend"] != "tf32_tma" or query.max_tokens < 384:
+            return True
+        stages = p["projection_num_stages"]
+        buffered_k = stages * p["projection_tile_k"]
+        return 128 <= buffered_k <= 256 and (
+            stages > 1 or p["projection_tile_n"] == 8
+        )
+
+    def prefill_split_work(p):
+        return (p["backend"] != "tf32_tma" or query.max_tokens < 2048
+                or total_k // p["projection_k_splits"] >= 2048)
+
     return ParameterSpace.create(
         TUNING.knobs,
         values=values,
+        exhaustive=query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") == "1",
         predicates=(
-            # Smaller FP32 weight rows produce invalid split TMA copies.
+            # TMA alignment, complete MMA tiles, CTA limits and scratch bounds.
             lambda p: p["backend"] != "tf32_tma" or p["projection_tile_k"] >= 32,
-            # Each M warp owns 16 rows. Do not launch warps that are inactive even
-            # in the first tile; partial final tiles remain useful and eligible.
-            lambda p: (
-                p["backend"] != "tf32_tma" or p["projection_num_m_warps"] <= m_warps
-            ),
-            # Keep the exact and power-of-two covering N tiles, but not larger
-            # overtiles that add masked MMA work without reducing the N grid.
-            lambda p: p["backend"] != "tf32_tma" or p["projection_tile_n"] <= n_cover,
-            # An N warp owns every num_n_warps-th eight-column MMA tile.
-            lambda p: (
-                p["backend"] != "tf32_tma"
-                or p["projection_num_n_warps"]
-                <= min(p["projection_tile_n"], _MIXES) // 8
-            ),
-            # Production CTA and complete-MMA-tile constraints.
             lambda p: (
                 p["backend"] != "tf32_tma"
                 or (p["projection_num_m_warps"] * p["projection_num_n_warps"] + 1) * 32
@@ -390,13 +439,33 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
                 p["backend"] != "tf32_tma"
                 or (total_k // p["projection_tile_k"]) % p["projection_k_splits"] == 0
             ),
-            # More stages than iterations cannot buffer any additional work.
+            lambda p: p["backend"] != "tf32_tma" or shared_bytes(p) <= smem_limit,
+        ),
+        efficiency_predicates=(
+            # Larger M tiles with the same grid only add padding and storage.
+            compact_m_grid,
+            # Keep exact and power-of-two N coverage and avoid wholly masked warps.
+            lambda p: p["backend"] != "tf32_tma" or p["projection_tile_n"] <= n_cover,
+            lambda p: (
+                p["backend"] != "tf32_tma"
+                or p["projection_num_n_warps"]
+                <= min(p["projection_tile_n"], _MIXES) // 8
+            ),
+            # More stages than iterations cannot buffer additional work.
             lambda p: (
                 p["backend"] != "tf32_tma"
                 or p["projection_num_stages"]
                 <= total_k // (p["projection_tile_k"] * p["projection_k_splits"])
             ),
-            lambda p: p["backend"] != "tf32_tma" or shared_bytes(p) <= smem_limit,
+            # Keep at least one eighth of an SM wave; splits and both tiles couple.
+            sufficient_grid,
+            # Beyond eight K splits, cap scheduling and reduction at four SM waves.
+            bounded_split_grid,
+            # Prefill couples the warp layout, column coverage and buffered K work.
+            prefill_warp_layout,
+            prefill_column_tiles,
+            prefill_pipeline,
+            prefill_split_work,
         ),
     )
 
@@ -411,7 +480,7 @@ def _materialize_tuning(query, device, choice):
 
 TUNING = TuningContract(
     component_id="norm.mhc",
-    query_schema_version=6,
+    query_schema_version=7,
     config_schema_version=3,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
@@ -421,7 +490,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=9,
+    candidate_contract_version=12,
     knobs=(
         Knob(
             name="backend",

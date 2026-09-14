@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+
+from b12x.preparation._efficiency import capture_exhaustive_search, powers_of_two
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation.tuning import Knob, ParameterBinding, TuningContract
+from b12x.preparation.tuning import Knob, ParameterBinding, ParameterSpace, TuningContract
 
 
 def _compress_lut(values: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -74,6 +76,7 @@ class GqaQuery:
     force_split_kv: bool | None
     abi: FrozenMapping
     controls: FrozenMapping
+    exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +99,7 @@ class GqaQuery:
             "force_split_kv": self.force_split_kv,
             "abi": self.abi,
             "controls": self.controls,
+            "exhaustive": self.exhaustive,
         }
 
 
@@ -326,7 +330,7 @@ def _validate_query(query: GqaQuery, _device: DeviceIdentity | None) -> None:
 def _tuning_parameters(
     query: GqaQuery,
     device: DeviceIdentity | None,
-) -> dict[str, tuple[object, ...] | range]:
+):
     if query.requested_graph_ctas_per_sm is not None:
         graph_options = (query.requested_graph_ctas_per_sm,)
     else:
@@ -355,14 +359,31 @@ def _tuning_parameters(
         )
         maximum = max(1, (work_ctas + device.sm_count - 1) // device.sm_count)
         graph_options = range(1, maximum + 1)
-    return {
+    if query.requested_graph_ctas_per_sm is not None:
+        residencies = frozenset(graph_options)
+    else:
+        import torch
+        from ._controls import paged_controls
+        from .planner import resolve_decode_graph_ctas_per_sm
+
+        with paged_controls(query.controls):
+            default_residency = resolve_decode_graph_ctas_per_sm(
+                kv_dtype=getattr(torch, query.kv_dtype), batch=query.batch_size,
+                page_size=query.page_size, head_dim_qk=query.head_dim_qk,
+                head_dim_vo=query.head_dim_vo,
+                gqa_group_size=query.q_heads // query.kv_heads,
+            )
+        residencies = powers_of_two(maximum) | {3, 6, maximum, default_residency}
+    return ParameterSpace.create(TUNING.knobs, values={
         "graph_ctas_per_sm": graph_options,
         "force_split_kv": (
             (query.force_split_kv,)
             if query.force_split_kv is not None
             else (False, True)
         ),
-    }
+    }, exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: p["graph_ctas_per_sm"] in residencies,),
+    )
 
 
 def _materialize_tuning(
@@ -397,10 +418,10 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.gqa",
-    query_schema_version=6,
+    query_schema_version=7,
     config_schema_version=3,
     semantic_version=1,
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     query_fields=frozenset(GqaQuery.__dataclass_fields__) - {"device"},
     config_fields=frozenset(GqaConfig.__dataclass_fields__),
     encode_query=GqaQuery.to_dict,

@@ -9,7 +9,7 @@ import torch
 from b12x.preparation import (
     CollectiveRequirement, DetectedDevice, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
-    plan_from_handle, require_prepared,
+    current_prepared_state, plan_from_handle, require_prepared,
 )
 from b12x.preparation._cache import SelectionCache
 from b12x.preparation.types import _CompositePlan
@@ -20,7 +20,7 @@ from .test_defaults import Config, Query, contract
 
 def session(tmp_path, **kwargs):
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
-    value._cache = SelectionCache(tmp_path, {"schema_version": 4})
+    value._cache = SelectionCache(tmp_path, {"schema_version": 5, "tuning_cache_version": 1})
     return value
 
 
@@ -251,12 +251,16 @@ def test_complete_race_cached_restart_and_disabled_precedence(tmp_path, monkeypa
         assert result.selections["first"].config.width == 2
         assert result.benchmarked_candidates == 3
         assert sorted(trial_closed) == [3, 6, 12]
-    with session(tmp_path, autotune=False) as engine:
+    with session(tmp_path) as engine:
         result = engine.prepare((request(name="different-owner", tuning=contract(), calls=calls),))
         assert result.selections["different-owner"].source == "cached"
+    with session(tmp_path, autotune=False) as engine:
+        result = engine.prepare((request(name="heuristic", tuning=contract(), calls=calls),))
+        assert result.selections["heuristic"].source == "default"
+        assert result.selections["heuristic"].config == Config(7)
         result = engine.prepare((request(name="pin", tuning=contract(), pin=Config(9), calls=calls),))
         assert result.selections["pin"].source == "override"
-    assert calls == [6, 6, 27]
+    assert calls == [6, 6, 21, 27]
 
 
 def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypatch):
@@ -399,6 +403,141 @@ def test_candidate_memory_envelope_covers_every_legal_config(tmp_path):
 
     assert envelope.scratch[0].shape == (1024,)
     assert plan.scratch_specs()[0].shape == (1,)
+
+
+def test_prepared_scratch_reuses_selection_and_preserves_live_residency(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    sized = []
+
+    def memory(config, device):
+        state = current_prepared_state()
+        sized.append((current_plan(), state))
+        return MemoryRequirements(
+            scratch=(ScratchBufferSpec(
+                name="workspace", shape=(config.width,),
+                dtype=torch.uint8, device=torch.device("cpu"),
+            ),),
+            persistent=(PersistentMemory(
+                current_plan(), 16, 0 if state is None else state.resident,
+            ),),
+        )
+
+    plan = Plan(
+        contract=contract(), query=Query(3),
+        _compile_jobs=lambda config, device: (), _memory_requirements=memory,
+        _materialize=lambda selection, device: SimpleNamespace(
+            value=selection.config.width * 3, resident=8,
+        ),
+    )
+    req = plan.request(
+        name="workspace",
+        prepare_call=lambda state: PreparedCall(run=lambda: state.value),
+        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+    )
+    assert plan.scratch_specs()[0].shape == (7,)
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        default_specs = plan.scratch_specs()
+        assert default_specs[0].shape == (7,)
+        engine.prepare((req,))
+        selected_specs = plan.scratch_specs()
+        assert selected_specs[0].shape == (2,)
+        assert selected_specs is not default_specs
+        assert sized[-1] == (plan, plan.prepared.state)
+        assert plan.memory_requirements().pending_persistent_nbytes == 8
+        plan.prepared.state.resident = 16
+        assert plan.memory_requirements().pending_persistent_nbytes == 0
+        count = len(sized)
+        engine.freeze()
+        with engine.capture():
+            for _ in range(10):
+                assert plan.scratch_specs() is selected_specs
+        assert len(sized) == count
+    assert plan.scratch_specs()[0].shape == (7,)
+    assert plan.memory_requirements().pending_persistent_nbytes == 16
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        assert plan.scratch_specs()[0].shape == (7,)
+        assert plan.scratch_specs() is not selected_specs
+
+
+def test_composite_scratch_retains_all_exact_variants_without_replanning(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    sized = []
+    counts = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 4096)
+
+    def child(rows):
+        def memory(config, device):
+            sized.append(rows)
+            return MemoryRequirements(scratch=(ScratchBufferSpec(
+                name="workspace", shape=(rows * config.width,),
+                dtype=torch.uint8, device=torch.device("cpu"),
+            ),))
+
+        return Plan(
+            contract=contract(), query=Query(rows),
+            _compile_jobs=lambda config, device: (), _memory_requirements=memory,
+            _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
+        )
+
+    children = {rows: child(rows) for rows in counts}
+    plan = _CompositePlan(
+        component_id="test.arithmetic", capacity_metadata={}, variants=children,
+        _assemble=lambda states, device: dict(states),
+    )
+    req = plan.request(
+        name="workspace",
+        prepare_calls={rows: lambda state: PreparedCall(run=lambda: state.value) for rows in counts},
+        benchmark_calls={rows: lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None) for rows in counts},
+    )
+    assert plan.scratch_specs()[0].shape == (4096 * 7,)
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        assert plan.scratch_specs()[0].shape == (4096 * 7,)
+        engine.prepare((req,))
+        specs = plan.scratch_specs()
+        assert specs[0].shape == (4096 * 2,)
+        assert tuple(plan.prepared.state) == counts
+        assert all(state.value == 6 for state in plan.prepared.state.values())
+        count = len(sized)
+        engine.freeze()
+        with engine.capture():
+            for _ in range(80):
+                assert plan.scratch_specs() is specs
+        assert len(sized) == count
+    assert plan.scratch_specs()[0].shape == (4096 * 7,)
+
+
+def test_failed_prepared_scratch_snapshot_preserves_previous_payload(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    closed = []
+
+    def memory(config, device):
+        state = current_prepared_state()
+        if state is not None and state.value == 6:
+            raise ValueError("selected workspace is invalid")
+        return MemoryRequirements()
+
+    plan = replace(declaration(tuning=contract()), _memory_requirements=memory)
+    req = plan.request(
+        name="workspace",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.value, close=lambda: closed.append(state.value),
+        ),
+        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+    )
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        previous = plan.prepared
+        with pytest.raises(ValueError, match="selected workspace is invalid"):
+            engine.prepare((req,))
+        assert plan.prepared is previous
+        assert require_prepared(plan, "test.arithmetic").value == 21
+        assert plan.scratch_specs() == ()
+        assert closed == [6]
+    assert closed == [6, 21]
 
 
 def test_stop_mid_race_discards_partial_winner_and_restores_trials(tmp_path, monkeypatch):
@@ -552,12 +691,15 @@ def test_plan_handles_are_stable_and_resolve_only_live_plans():
 def test_unprepared_plan_materializes_its_default_with_a_warning_before_freeze_only(
     tmp_path, caplog,
 ):
+    from b12x.preparation.session import _warn_unprepared_declaration
+
+    _warn_unprepared_declaration.cache_clear()
     calls = []
     req = request(name="lazy", calls=calls)
     with caplog.at_level("WARNING", logger="b12x"):
         state = require_prepared(req.plan, "test.arithmetic")
-    assert state.value == 6
-    assert req.plan.selection.source == "fixed"
+    assert state.value == 21
+    assert req.plan.selection.source == "default"
     assert calls == []
     messages = [r.getMessage() for r in caplog.records if "not prepared before its first use" in r.getMessage()]
     assert len(messages) == 1 and "test.arithmetic" in messages[0]
@@ -922,3 +1064,237 @@ def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
         assert authorizations == ["first-channel", "second-channel"]
         assert progress[-1].completed_requests == progress[-1].total_requests == 1
         assert requests[0].plan.prepared is not requests[1].plan.prepared
+
+
+@pytest.mark.parametrize("dependent", (False, True))
+def test_sharded_races_exchange_after_independent_work_and_release_trials(
+    tmp_path, monkeypatch, dependent,
+):
+    _deterministic_timer(monkeypatch)
+    closed = []
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        requests = []
+        for i in range(2):
+            req = request(
+                name=f"query-{i}", tuning=contract(values=(1, 2, 4, 8)),
+                dependencies=("query-0",) if dependent and i else (),
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None,
+                    close=lambda: closed.append(state.value),
+                ),
+            )
+            req = replace(req, plan=replace(req.plan, query=Query(i + 3)))
+            requests.append(req)
+        job = engine.begin(requests)
+        exchanges = []
+        tuning = None
+        for _ in range(100):
+            progress = job.advance(tuning=tuning)
+            tuning = None
+            if progress.ready_tuning:
+                exchanges.append(len(progress.ready_tuning))
+                assert len(closed) == sum(exchanges) * 2
+                assert requests[1].plan.prepared is None
+                tuning = progress.ready_tuning
+            if progress.done:
+                break
+        else:
+            pytest.fail("sharded job did not finish")
+        assert exchanges == ([1, 1] if dependent else [2])
+        assert progress.total_candidates == progress.measured_candidates == 4
+        assert progress.global_candidate_count == 4
+        assert progress.candidate_count == 2
+        assert all(req.plan.selection.source == "tuned" for req in requests)
+        job.result()
+
+
+def test_cancelled_pending_races_prepare_defaults_without_caching(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        requests = tuple(
+            replace(
+                req := request(name=f"query-{i}", tuning=contract(), benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None,
+                )), plan=replace(req.plan, query=Query(i + 3)),
+            )
+            for i in range(2)
+        )
+        job = engine.begin(requests)
+        for _ in range(100):
+            progress = job.advance()
+            if progress.ready_tuning:
+                break
+        assert len(progress.ready_tuning) == 2
+        keys = [item.key for item in progress.ready_tuning]
+        with pytest.raises(ValueError, match="consolidation"):
+            job.advance(tuning=(progress.ready_tuning[0],))
+        assert all(req.plan.prepared is None for req in requests)
+        engine.cancel_tuning()
+        progress = job.advance(tuning=())
+        while not progress.done:
+            progress = job.advance()
+        assert all(req.plan.selection.source == "default" for req in requests)
+        assert all(engine._cache.get(key) is None for key in keys)
+        job.result()
+
+
+def test_fixed_collective_without_dependents_does_not_split_race_results(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        races = []
+        for i in range(2):
+            req = request(name=f"race-{i}", tuning=contract(), benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None,
+            ))
+            races.append(replace(req, plan=replace(req.plan, query=Query(i + 3))))
+        collective = request(name="comm", collective=CollectiveRequirement("comm", (0, 1)))
+        collective = replace(collective, plan=replace(collective.plan, query=Query(99)))
+        job = engine.begin((races[0], collective, races[1]))
+        tuning = key = None
+        boundaries = []
+        for _ in range(100):
+            progress = job.advance(tuning=tuning, collective_key=key)
+            tuning = key = None
+            if progress.ready_tuning:
+                boundaries.append(("tuning", len(progress.ready_tuning)))
+                tuning = progress.ready_tuning
+            if progress.ready_collectives:
+                boundaries.append(("collective", 1))
+                key = progress.ready_collectives[0].key
+            if progress.done:
+                break
+        assert progress.done
+        assert boundaries == [("tuning", 2), ("collective", 1)]
+        job.result()
+
+
+def test_candidate_progress_counts_races_and_excludes_fixed_or_cached_choices(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+
+    def requests():
+        return (
+            request(name="race", tuning=contract(values=(1, 2, 4, 8, 16)),
+                    benchmark=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None)),
+            request(name="fixed", tuning=contract(values=(1,))),
+        )
+
+    for expected in (5, 0):
+        snapshots = []
+        with session(tmp_path, race_batch=2) as engine:
+            result = engine.prepare(requests(), progress=snapshots.append)
+        assert snapshots[-1].total_candidates == expected
+        assert snapshots[-1].measured_candidates == expected
+        assert result.benchmarked_candidates == expected
+        assert all(p.measured_candidates <= p.total_candidates for p in snapshots if p.total_candidates is not None)
+
+
+def test_first_use_warnings_group_equal_declarations_without_hiding_other_shapes(caplog):
+    from b12x.preparation.session import _LAZY_SESSIONS, _warn_unprepared_declaration
+
+    _warn_unprepared_declaration.cache_clear()
+    plans = [declaration(shared=True) for _ in range(20)]
+    plans.append(replace(declaration(shared=True), query=Query(5)))
+    try:
+        with caplog.at_level("DEBUG", logger="b12x.preparation"):
+            states = [require_prepared(plan, "test.arithmetic") for plan in plans]
+        assert all(state is states[0] for state in states[:20])
+        assert states[-1] is not states[0]
+        assert all(plan.prepared is not None for plan in plans)
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(messages) == 2
+        assert "rows=3" in messages[0] and "rows=5" in messages[1]
+        details = [r.getMessage() for r in caplog.records if "unprepared plan Query#" in r.getMessage()]
+        assert len(details) == 21
+    finally:
+        for plan in plans:
+            _LAZY_SESSIONS[None].release(plan)
+        _warn_unprepared_declaration.cache_clear()
+
+
+def test_progress_counts_prepared_selection_sources_once_per_shared_group(tmp_path):
+    fixed = request(name="fixed", shared=True)
+    alias = request(name="alias", shared=True)
+    pinned = replace(request(name="pinned"), plan=declaration(pin=Config(9)))
+
+    def finish(engine, requests):
+        job = engine.begin(requests)
+        try:
+            while True:
+                progress = job.advance()
+                if progress.done:
+                    break
+            assert sum(dict(progress.selection_counts).values()) == progress.completed_requests
+            job.result().close()
+            return dict(progress.selection_counts)
+        finally:
+            job.close()
+
+    with session(tmp_path) as engine:
+        assert finish(engine, (fixed, alias, pinned)) == {"fixed": 1, "override": 1}
+        engine.cancel_tuning()
+        default = replace(request(name="default"), plan=replace(declaration(), query=Query(5)))
+        assert finish(engine, (fixed, default)) == {"fixed": 1, "default": 1}
+        engine.freeze()
+        assert finish(engine, (fixed, alias, pinned, default)) == {
+            "fixed": 1, "override": 1, "default": 1,
+        }
+
+
+def test_missing_wo_warning_reports_shape_and_geometry_without_codegen_dump(caplog):
+    from b12x.gemm import wo_projection
+    from b12x.preparation import FrozenMapping
+    from b12x.preparation.session import _prepare_default, _warn_unprepared_declaration
+    from unittest.mock import patch
+
+    plan = wo_projection.plan(
+        wo_projection.Caps(
+            device="cuda:0", max_tokens=1797, groups=2,
+            group_width=4096, rank=1024, hidden=5120,
+        ),
+        invocation=FrozenMapping({
+            "operation": "inv_rope", "heads_per_group": 8, "nope_dim": 448, "rope_dim": 64,
+            "positions_dtype": "int64", "cos_sin_dtype": "bfloat16",
+        }),
+    )
+    _warn_unprepared_declaration.cache_clear()
+    try:
+        with patch("b12x.preparation.session.prepare_default"), caplog.at_level("WARNING"):
+            _prepare_default(plan)
+        (message,) = [record.getMessage() for record in caplog.records]
+        for detail in (
+            "gemm.wo_projection", "max_tokens=1797", "operation=inv_rope",
+            "dtype=bfloat16", "groups=2", "group_width=4096", "rank=1024", "hidden=5120",
+        ):
+            assert detail in message
+        assert "codegen" not in message and "positions_dtype" not in message
+    finally:
+        _warn_unprepared_declaration.cache_clear()
+
+
+def test_missing_plan_warning_uses_component_query_fields(caplog):
+    from dataclasses import dataclass
+    from unittest.mock import patch
+    from b12x.preparation.session import _prepare_default, _warn_unprepared_declaration
+
+    @dataclass(frozen=True)
+    class ShapeQuery:
+        image_shape: tuple[int, ...]
+        window_width: int
+        max_rows: int
+
+    tuning = replace(
+        contract(), component_id="test.image", query_fields=frozenset(ShapeQuery.__dataclass_fields__),
+        encode_query=lambda query: vars(query),
+    )
+    plan = replace(declaration(), contract=tuning, query=ShapeQuery((3, 16, 16), 7, 19))
+    _warn_unprepared_declaration.cache_clear()
+    try:
+        with patch("b12x.preparation.session.prepare_default"), caplog.at_level("WARNING"):
+            _prepare_default(plan)
+        (message,) = [record.getMessage() for record in caplog.records]
+        assert "max_rows=19, image_shape=(3, 16, 16), window_width=7" in message
+    finally:
+        _warn_unprepared_declaration.cache_clear()

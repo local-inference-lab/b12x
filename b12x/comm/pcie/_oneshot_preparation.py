@@ -106,6 +106,22 @@ def _owned_resident_layout(runtime, native) -> tuple[int, int, int]:
     return rank_data_nbytes, slab_nbytes, len(runtime._owned_buffers)
 
 
+def _plain_launcher_metadata(backend, native, inp):
+    graph = backend._plain_graph_plan(native, inp)
+    eager_transport, eager_threads, eager_blocks = backend._plain_launch_config(
+        native, inp, graph_channel=False,
+    )
+    return {
+        "dtype": _dtype_name(inp.dtype), "transport": graph.transport,
+        "threads": graph.threads, "blocks": graph.blocks,
+        "eager_transport": eager_transport, "eager_threads": eager_threads,
+        "eager_blocks": eager_blocks,
+        "size_packs": graph.size_packs, "stage_input": graph.stage_input,
+        "device_index": graph.device_index,
+        "remote_push_region_packs": graph.remote_push_region_packs,
+    }
+
+
 def query_from_metadata(
     runtime, *, surface: str, shape: tuple[int, ...], dtype: torch.dtype,
     strides: tuple[int, ...] | None = None, alignment: int = 16,
@@ -129,15 +145,8 @@ def query_from_metadata(
     stage_input = native.eager_tables is not None
     variants = ((False, 0), (True, 0), (True, 1)) if stage_input else ((False, 0),)
     if surface in _PLAIN_SURFACES:
-        graph = backend._plain_graph_plan(native, tensor)
-        launcher = {
-            "dtype": _dtype_name(dtype), "transport": graph.transport,
-            "threads": graph.threads, "blocks": graph.blocks,
-            "size_packs": graph.size_packs, "stage_input": graph.stage_input,
-            "device_index": graph.device_index,
-            "remote_push_region_packs": graph.remote_push_region_packs,
-        }
-        registered = not graph.stage_input
+        launcher = _plain_launcher_metadata(backend, native, tensor)
+        registered = not launcher["stage_input"]
     else:
         if tensor.ndim == 0 or tensor.shape[-1] * tensor.element_size() % 16:
             raise ValueError("fused oneshot input last dimension must occupy 16-byte packs")
@@ -206,17 +215,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     stage_input = native.eager_tables is not None
     variants = ((False, 0), (True, 0), (True, 1)) if stage_input else ((False, 0),)
     if surface in _PLAIN_SURFACES:
-        graph = backend._plain_graph_plan(native, inp)
-        launcher = {
-            "dtype": dtype,
-            "transport": graph.transport,
-            "threads": graph.threads,
-            "blocks": graph.blocks,
-            "size_packs": graph.size_packs,
-            "stage_input": graph.stage_input,
-            "device_index": graph.device_index,
-            "remote_push_region_packs": graph.remote_push_region_packs,
-        }
+        launcher = _plain_launcher_metadata(backend, native, inp)
     else:
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(native, inp)
         pack_elems = 16 // inp.element_size()
@@ -283,7 +282,10 @@ def compile_oneshot_surface(query_payload, ordinal):
             return {
                 variant: get_oneshot_launcher(
                     call["dtype"], query.world_size, query.rank, call["stage_input"],
-                    variant[0], variant[1], call["transport"], call["threads"], call["device_index"],
+                    variant[0], variant[1],
+                    call["transport"] if variant[0] else call["eager_transport"],
+                    call["threads"] if variant[0] else call["eager_threads"],
+                    call["device_index"],
                 ) for variant in variants
             }
         if query.surface in _FUSED_SURFACES:
@@ -401,7 +403,9 @@ def plan(
         return _OneshotExecutionState(query, runtime, MappingProxyType(launchers))
 
     native = _state(runtime)
-    if query.call.get("transport") == "tp4_remote_push" and (
+    if "tp4_remote_push" in (
+        query.call.get("transport"), query.call.get("eager_transport")
+    ) and (
         runtime.world_size != 4
         or not native.sharded_eager_storage
         or native.eager_tables is None
