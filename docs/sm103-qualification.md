@@ -98,7 +98,7 @@ and cache-writer launchers, 58 indexer launchers, ten unquantized projection lau
 36 quantized-linear launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
 activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
 147 DeepSeek compressed attention/cache-writer launchers, and 131 mHC launchers:
-748 callables in total. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+748 CuTe callables plus ten supporting activation-packing callables. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
@@ -156,6 +156,29 @@ before consuming their register results and releasing TMEM. The compile
 auditor rejects emitted TMEM loads without a completion wait. This follows
 NVIDIA's [tcgen05 completion contract](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model);
 it remains subject to physical SM103 synchronization qualification.
+
+Packed MXFP8 calls with FP16 input accept caller-owned output and workspace.
+BF16 input retains b12x's precision policy; FP16 input uses quantized execution.
+For serving, prewarm configured capacity buckets and pass the covering capacity
+as `expected_m`. Warmup covers precision routes inside each bucket, including
+profile entries whose row count differs from a bucket endpoint. Its public
+return value remains the number of requested capacities.
+
+Supporting activation packing has a separate offline compiler component:
+
+```bash
+python scripts/compile_sm103.py --component activation_packing \
+  --output-dir /tmp/sm103-activation-packing
+```
+
+This component is also included in `--component all`. It compiles ten
+BF16/FP16 MXFP8 and BF16 NVFP4 packing variants, including K padding and
+reciprocal NVFP4 global scales, with runtime row counts. Core compute remains
+CuTe DSL. The [MXFP8 serving receipt](sm103-linear-workspace-validation.json)
+records targeted dense and packing artifacts and available-hardware evidence.
+The companion vLLM MXFP8 graph test admits SM103 and validates configured
+capacity reuse, input mutation, poisoned scratch, stable addresses and replay
+allocation counts. Physical B300 execution remains required.
 
 The precision generator races actual public A16 and native quantized calls.
 Its NVFP4 oracle independently rounds activations to E2M1/E4M3 and evaluates

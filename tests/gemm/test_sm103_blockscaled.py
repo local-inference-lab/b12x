@@ -121,14 +121,16 @@ def test_native_dense_counts_groups_tails_and_graphs(recipe, groups, dtype, monk
         unfreeze_kernel_resolution()
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-def test_packed_quantized_graph_and_independent_oracle(recipe, monkeypatch):
+@pytest.mark.parametrize("recipe,dtype", [
+    ("nvfp4", torch.bfloat16), ("mxfp8", torch.bfloat16), ("mxfp8", torch.float16),
+])
+def test_packed_quantized_graph_and_independent_oracle(recipe, dtype, monkeypatch):
     a16.require_b12x()
     from benchmarks.benchmark_blockscaled_precision import _reference_weight, quantized_nvfp4_reference
     from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
     weight, local, multiplier = _reference_weight(recipe, 136, 384)
-    source = torch.randn(33, 384, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(33, 136, device="cuda", dtype=torch.bfloat16)
+    source = torch.randn(33, 384, device="cuda", dtype=dtype)
+    out = torch.empty(33, 136, device="cuda", dtype=dtype)
     scratch = torch.empty(blockscaled.workspace_size(weight, 33), device="cuda", dtype=torch.uint8)
     activation_scale = torch.tensor([4.0], device="cuda")
     args = dict(activation_global_scale=activation_scale) if recipe == "nvfp4" else {}
@@ -136,7 +138,7 @@ def test_packed_quantized_graph_and_independent_oracle(recipe, monkeypatch):
     # SM12x retains its existing precision-regime specializations. SM103 must
     # reuse the callable warmed at the two endpoints for every interior count.
     warmup_counts = (1, 33) if torch.cuda.get_device_capability() == (10, 3) else counts
-    blockscaled.prewarm(weight, warmup_counts, mode="quantized", workspace=scratch, **args)
+    blockscaled.prewarm(weight, warmup_counts, mode="quantized", out_dtype=dtype, workspace=scratch, **args)
     def call(m):
         return blockscaled.mm(source[:m], weight, out=out[:m], workspace=scratch, mode="quantized", **args)
     def reference(m):

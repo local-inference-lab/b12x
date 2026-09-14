@@ -1,0 +1,189 @@
+{
+  "schema": "b12x.sm103.linear_workspace.validation.v1",
+  "recorded_at_utc": "2026-09-14T01:14:12.402534+00:00",
+  "status": "implemented; host and SM120 operator regressions pass; physical SM103 and full-model execution unqualified",
+  "source_sha256": "be2c79eae4a8a8d9791dd87c9c9028c95e82612e87e256a5761b0df19c308ecb",
+  "compiled": [
+    {
+      "component": "blockscaled",
+      "callables": 36,
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-blockscaled-sm103-final/manifest.json",
+        "sha256": "67281e8d52df2b5eaba01fd19e427fee4c3bc54cc75daa69402a18e9de6ad8e2",
+        "bytes": 48003
+      }
+    },
+    {
+      "component": "packing",
+      "callables": 10,
+      "manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-packing-sm103-final/manifest.json",
+        "sha256": "37afd032ee72967d20b41ff42bf8db978d121502963812791b279dfbcf40656d",
+        "bytes": 15161
+      }
+    }
+  ],
+  "local_and_remote_package_sources_match": true,
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-ripper-source-check.json",
+    "sha256": "cd5290a31bbfe121997517004a4dee032fa57e0f65e152f79cedb76ea6d10a4c",
+    "bytes": 560
+  },
+  "sanitizer_scope": "Kernel memcheck and synccheck; API reporting disabled only on the recorded SM120 driver/CUDA-Python probe mismatch. Enable API checks on SM103.",
+  "runtime_qualified_on_sm103": false,
+  "performance_claims": false,
+  "base_revision": "725afdaef68cab5f32dfb77673278088db4611fa",
+  "validation": [
+    {
+      "name": "linear-workspace-b12x-host-release",
+      "passed": 51,
+      "skipped": 255,
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/architecture/test_sm103_blockscaled.py",
+        "tests/policy/test_blockscaled_precision.py",
+        "tests/gemm/test_blockscaled.py",
+        "tests/gemm/test_blockscaled_a16.py",
+        "tests/gemm/test_sm103_blockscaled.py",
+        "tests/gemm/test_mxfp8_linear.py",
+        "-q"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-b12x-host-release.log",
+        "sha256": "a40cb3b659afc54853acc616b68ea03931fd3b2cfb1f2753d0d0f523d837a8e2",
+        "bytes": 844
+      },
+      "kernel_errors": null
+    },
+    {
+      "name": "linear-workspace-b12x-sm120-final",
+      "passed": 215,
+      "skipped": 36,
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_blockscaled_a16.py",
+        "tests/gemm/test_mxfp8_linear.py",
+        "tests/gemm/test_sm103_blockscaled.py",
+        "-q"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "1"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-b12x-sm120-final.log",
+        "sha256": "e0a16f125ac577ef6eed33e5025675ead8e7544c3f9d9b5ae341cae5a96bcad7",
+        "bytes": 2179
+      },
+      "kernel_errors": null
+    },
+    {
+      "name": "linear-workspace-b12x-memcheck",
+      "passed": 6,
+      "skipped": 0,
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_blockscaled_a16.py",
+        "tests/gemm/test_sm103_blockscaled.py",
+        "-k",
+        "fp16_mxfp8_compiled_workspace_replay or prewarm_prepares_interior or packed_quantized_graph",
+        "-q"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-b12x-memcheck.log",
+        "sha256": "ec6aaead7ed5135c99ca0e987983ee32e55f0628bbfc4359a7627a1c83732915",
+        "bytes": 1856
+      },
+      "kernel_errors": 0
+    },
+    {
+      "name": "linear-workspace-b12x-synccheck",
+      "passed": 6,
+      "skipped": 0,
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/gemm/test_blockscaled_a16.py",
+        "tests/gemm/test_sm103_blockscaled.py",
+        "-k",
+        "fp16_mxfp8_compiled_workspace_replay or prewarm_prepares_interior or packed_quantized_graph",
+        "-q"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "1"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-b12x-synccheck.log",
+        "sha256": "af8dc36af397e3886e23ceb7994e1c44fb99f896053af1db2b99f654cbac6288",
+        "bytes": 176
+      },
+      "kernel_errors": 0
+    }
+  ],
+  "dense_resources": {
+    "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-blockscaled-resources.json",
+    "sha256": "43f23e985698874fa2481362b1efecc25269e5a57203038cfb849d4d5c176e3d",
+    "bytes": 87450
+  },
+  "packing_resources": {
+    "path": "/home/jasonc/b12x-sm103-evidence/linear-workspace-packing-resources.json",
+    "sha256": "e4e9d9cb9c9a814b18977fdeb3b05c466767da4d63f9e2ea1c814af01ebd7f02",
+    "bytes": 2441
+  },
+  "package": {
+    "files": 460,
+    "python_files": 457,
+    "profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "a0b64496e377cc419bb266e2632335eb1447ff27a9db86a82f9ca7eb3745f281",
+        "bytes": 2581643
+      },
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "7d67d306ec1f220bac0c9e1656544b64d9c06b7d127577ff9b4f069ef19bec16",
+        "bytes": 2355512
+      }
+    }
+  },
+  "changes": [
+    "FP16 MXFP8 caller-owned output and scratch through the one-shot API",
+    "Prewarm every configured capacity and interior precision route; preserve unhinted endpoint warmup",
+    "Offline BF16/FP16 activation-packing compiler component with runtime row counts"
+  ],
+  "limitations": [
+    "Targeted 36 dense and 10 packing callables compiled for this source; not a new full-corpus execution or performance census",
+    "No physical SM103 execution",
+    "NVFP4, MXFP4 and tensor/block FP8 serving adapters still need capacity/workspace integration",
+    "Complete model evaluation and other documented DeepSeek, Trellis and Station transport work remain outstanding"
+  ]
+}
