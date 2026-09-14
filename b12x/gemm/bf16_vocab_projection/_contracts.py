@@ -1,7 +1,7 @@
 """Declarative and prepared BF16 vocabulary projection boundary."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -43,6 +43,7 @@ class Binding:
     plan: Plan
     source: torch.Tensor
     weight: torch.Tensor
+    output: torch.Tensor | None = None
 
 
 def plan(

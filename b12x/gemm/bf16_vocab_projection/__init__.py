@@ -26,6 +26,7 @@ META = OpMeta(
     ),
     dtypes=("bf16",),
     requires=("triton",),
+    archs=("sm103a", "sm120a", "sm121a"),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="11814a27",
