@@ -1875,3 +1875,29 @@ replays with frozen resolution and shared-expert overlap enabled.
 SM12x paired-rate execution remains limited to one 256-channel pair per rank.
 V4.1's wider paired extents use the separate SM103 atom implementation; the
 uniform SM120 result does not qualify that implementation or BTX model accuracy.
+
+## Consolidated Trellis TP2 source and package artifacts
+
+Status: cross-compiled and packaged; physical SM103 execution unqualified.
+
+The [consolidated receipt](sm103-consolidated-validation.json) binds revision
+`2e6c166e` to 1,225 callables, 1,235 CUDA entry points, and their PTX, cubin,
+SASS and resource hashes. The corpus includes clamped TP1/TP2 Trellis,
+MLA compression, HyperConnection, embedding and Engram. Qualification
+preparation verifies the artifacts against the clean source and emits all
+27 operator-suite commands. All 27 suites collect successfully without
+executing on a GPU.
+
+Compared with source `7b697152`, 117 callables are added and none removed.
+All 17 positive register-set deltas remain recorded. Two supporting MXFP4
+packers add two allocated GPRs each; no existing callable changes stack,
+local memory, static shared memory or local load/store counts. The 44
+stack/local flags are unchanged and no added callable has a flag. Source
+and Torch/Triton differences prevent attributing these deltas to a compiler
+migration; occupancy and latency remain unqualified.
+
+The matching wheel includes all Python sources and three embedded profiles.
+All 476 packaged files match the checkout, and 56 host checks pass with imports
+resolved from the extracted wheel. The frozen Git archive, complete compile
+corpus, wheel and qualification commands remain outside the repository with
+their identities recorded in the compact receipt.
