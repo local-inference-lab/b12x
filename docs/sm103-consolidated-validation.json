@@ -1,0 +1,160 @@
+{
+  "schema": "b12x.sm103.consolidated_compilation.v1",
+  "status": "cross-compiled; physical SM103 execution unqualified",
+  "implementation_revision": "7b6971528d64befebddedee559545ae23cb02ea7",
+  "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
+  "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+  "command": [
+    "scripts/compile_sm103.py",
+    "--component",
+    "all",
+    "--output-dir",
+    "/models/b12x-sm103-validation/consolidated-vocab-sm103",
+    "--nvdisasm",
+    "/models/b12x-sm103-validation/cuda-inspect-13.4/nvidia/cu13/bin/nvdisasm",
+    "--cuobjdump",
+    "/models/b12x-sm103-validation/cuda-inspect-13.4/nvidia/cu13/bin/cuobjdump"
+  ],
+  "target": "sm_103a",
+  "packages": {
+    "torch": "2.13.0+cu130",
+    "cuda-python": "13.4.1",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-cutlass-dsl-libs-base": "4.6.2",
+    "nvidia-cutlass-dsl-libs-core": "4.6.2",
+    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "triton": "3.7.1"
+  },
+  "callables": 1108,
+  "cute_callables": 1092,
+  "supporting_triton_packing_callables": 16,
+  "cuda_entries": 1116,
+  "components": {
+    "moe": 9,
+    "roce": 8,
+    "trellis": 375,
+    "sequence": 87,
+    "dense_mla": 17,
+    "sparse_mla": 45,
+    "compressed_mla": 147,
+    "mhc": 131,
+    "dsa_indexer": 58,
+    "projection": 16,
+    "blockscaled": 38,
+    "fp8": 19,
+    "fp6": 58,
+    "block_fp8_linear": 28,
+    "wo_projection": 56,
+    "activation_packing": 16
+  },
+  "resource_comparison": {
+    "baseline_revision": "770f397d9ee2de1f7ac56c4e8b48849d011afa9c",
+    "baseline_source_sha256": "61001cf402dd6a917a21410f095090700547766bb59cba31c0dba5efba00d0dc",
+    "baseline_packages": {
+      "torch": "2.14.0",
+      "cuda-python": "13.4.1",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "nvidia-cutlass-dsl-libs-base": "4.6.2",
+      "nvidia-cutlass-dsl-libs-core": "4.6.2",
+      "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+      "triton": "3.8.0"
+    },
+    "scope": "Source and Torch/Triton environments differ; this is artifact/resource accounting, not an isolated compiler migration or performance comparison.",
+    "existing_callables": 993,
+    "added_callables": 115,
+    "removed": [],
+    "identical_existing_ptx": 976,
+    "identical_existing_cubins": 936,
+    "changed_existing_cubins": 57,
+    "positive_existing_deltas": {
+      "gdn_prefill_int64_checkpoint1_recurrence": {
+        "0.REG": 3,
+        "R": 3
+      },
+      "activation_pack_mxfp8_bf16_k128_reciprocal0": {
+        "0.REG": 2,
+        "R": 2
+      },
+      "activation_pack_mxfp8_bf16_k160_reciprocal0": {
+        "0.REG": 1,
+        "R": 1
+      },
+      "activation_pack_mxfp8_fp16_k128_reciprocal0": {
+        "0.REG": 2,
+        "R": 2
+      },
+      "activation_pack_mxfp8_fp16_k160_reciprocal0": {
+        "0.REG": 1,
+        "R": 1
+      },
+      "activation_pack_mxfp4_bf16_k160_reciprocal0": {
+        "0.REG": 1,
+        "R": 2
+      },
+      "activation_pack_mxfp4_bf16_k1024_reciprocal0": {
+        "0.REG": 2,
+        "R": 2
+      },
+      "activation_pack_mxfp4_fp16_k160_reciprocal0": {
+        "0.REG": 1,
+        "R": 2
+      },
+      "activation_pack_mxfp4_fp16_k1024_reciprocal0": {
+        "0.REG": 2,
+        "R": 2
+      }
+    },
+    "stack_or_local_flagged_callables": 44,
+    "disposition": "Retain all nine positive register deltas for physical SM103 qualification. GDN recurrence rises from 161 to 164 allocated GPRs; eight supporting activation packers rise by one or two. None adds stack, local memory, LDL/STL or static shared memory. Occupancy and latency are unqualified. Forty compute callables and four supporting packers retain their existing stack/local flags."
+  },
+  "preparation": {
+    "status": "prepared",
+    "suites": 23,
+    "gpu_execution": false,
+    "source": "Frozen archive of 7b697152; the later reference correction does not alter this manifest or its source identity."
+  },
+  "artifacts": {
+    "manifest.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-reviewed-sm103/manifest.json",
+      "bytes": 1408124,
+      "sha256": "251390c29052ed9c673dc62576afadd317b0ea7eafca5f4f6e125d9fe8effae7"
+    },
+    "consolidated-vocab-resources.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-resources.json",
+      "bytes": 1970907,
+      "sha256": "0c8f89d37385d83ec701adf857c69f9421775584ea23538d6b1a4098061dfc29"
+    },
+    "consolidated-vocab-ripper-command.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-ripper-command.json",
+      "bytes": 613,
+      "sha256": "564939602a72735a52d7a8d69df99066068f7a60bd86d32fe0c57a880fbe8fda"
+    },
+    "consolidated-vocab-ripper-compile.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-ripper-compile.log",
+      "bytes": 2490,
+      "sha256": "224eb4b41f22dfcf5ce8b93b359431be4fae519645f3d04744e90aa810ee2138"
+    },
+    "consolidated-vocab-ripper-exit.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-ripper-exit.json",
+      "bytes": 17,
+      "sha256": "e89df0eae5ec7db81135aed16463968955c578bcc4f2ec43172eff351f080c17"
+    },
+    "consolidated-vocab-local-oom.log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-local-oom.log",
+      "bytes": 1124,
+      "sha256": "82a81fe01dede770cef4c67f5739a5a2fa5d7d814ddcf77c132f778e89e68b38"
+    },
+    "qualification.json": {
+      "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-prepared/qualification.json",
+      "bytes": 11660,
+      "sha256": "4ee447379348c5534da2d0b24b6b84308fe1f9475640fc8870c1345ac02620c6"
+    }
+  },
+  "runtime_qualified": false,
+  "performance_claim": false,
+  "limitations": [
+    "Representative specialization corpus; actual model contracts may require additional geometries.",
+    "MLA compression, HyperConnection and embedding are not yet admitted or included as separate SM103 compile groups.",
+    "Complete GLM/V4.1 serving, speculative parity, Station HBM transport and frozen QSRT coupled high-rate conversion remain open."
+  ]
+}

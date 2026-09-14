@@ -145,7 +145,9 @@ def rms_concat(
         ),
         dim=-1,
     )
-    return F.linear(joined, combined_fc_weight)
+    # BF16 GEMM may reduce partial sums in BF16 on some devices. The oracle
+    # uses FP64 accumulation so those reductions cannot change a BF16 tie.
+    return F.linear(joined.double(), combined_fc_weight.double()).to(joined.dtype)
 
 
 __all__.append("rms_concat")
