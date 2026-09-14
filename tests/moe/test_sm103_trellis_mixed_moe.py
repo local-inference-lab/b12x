@@ -6,7 +6,7 @@ import torch
 from b12x.moe import fused_moe
 from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
 from b12x.policy.generation.providers.trellis_reference import moe_reference
-from tests.moe.test_trellis_config import _glm_config
+from tests.moe.test_trellis_config import _glm_config, _k3_config
 
 
 def prepare_mixed(
@@ -18,8 +18,16 @@ def prepare_mixed(
     device="cuda",
     dtype=torch.bfloat16,
     activation="silu",
+    coupled=False,
+    per_expert_scales=False,
+    transform_draw=0,
 ):
     config = _glm_config()
+    if coupled:
+        config["transform"]["expert"] = _k3_config()["transform"]["expert"]
+    if per_expert_scales:
+        for name in ("input_scales", "output_scales"):
+            config["scale"][name]["vectors"] = "per_expert"
     rates = [
         [3 if uniform else 3 + (e + p) % 3 for p in range(3)] for e in range(experts)
     ]
@@ -54,34 +62,77 @@ def prepare_mixed(
         atoms=atoms,
         rate=torch.tensor(rates, device=device, dtype=torch.uint8) * 17,
         input_scales=fused_moe.ScaleFactors(
-            (0.875 + 0.25 * torch.rand(hidden, device=device)).half()
+            (
+                0.875
+                + 0.25
+                * torch.rand(
+                    (experts, hidden) if per_expert_scales else (hidden,), device=device
+                )
+            ).half()
         ),
         intermediate_scales=fused_moe.ScaleFactors(
             (0.875 + 0.25 * torch.rand(experts, 3, width, device=device)).half()
         ),
         output_scales=fused_moe.ScaleFactors(
-            (0.875 + 0.25 * torch.rand(hidden, device=device)).half()
+            (
+                0.875
+                + 0.25
+                * torch.rand(
+                    (experts, hidden) if per_expert_scales else (hidden,), device=device
+                )
+            ).half()
+        ),
+        expert_transform_draws=(
+            torch.full((experts,), transform_draw, device=device, dtype=torch.uint8)
+            if coupled
+            else None
         ),
     )
     return fused_moe.prepare_weights(plan=plan, weights=weights), native, rates
 
 
+def test_mixed_coupled_nonzero_draws_fail_closed():
+    if not torch.cuda.is_available():
+        pytest.skip("canonical preparation requires a GPU")
+    with pytest.raises(NotImplementedError, match="all-zero expert_transform_draws"):
+        prepare_mixed(coupled=True, hidden=512, activation="situ", transform_draw=1)
+
+
 @pytest.mark.parametrize(
     "experts,uniform", [(5, False), (5, True), (384, False), (384, True)]
 )
-def test_mixed_preparation_preserves_records_and_large_namespace(experts, uniform):
+@pytest.mark.parametrize("coupled", [False, True])
+def test_mixed_preparation_preserves_records_and_large_namespace(
+    experts, uniform, coupled
+):
     if not torch.cuda.is_available():
         pytest.skip("canonical preparation requires a GPU")
     from types import SimpleNamespace
 
     torch.manual_seed(73)
-    weights, native, rates = prepare_mixed(experts=experts, uniform=uniform)
+    hidden, activation = (512, "situ") if coupled else (256, "silu")
+    weights, native, rates = prepare_mixed(
+        experts=experts,
+        uniform=uniform,
+        coupled=coupled,
+        hidden=hidden,
+        activation=activation,
+        per_expert_scales=not uniform,
+    )
     prepared = weights._impl.representation_for("w4a16")
     assert prepared.descriptor_local_bits == (24 if experts > 256 else 8)
     state, offsets, counts = _mixed_contract(
-        SimpleNamespace(weight_E=experts, k=256, n=128, device=weights.device), prepared
+        SimpleNamespace(weight_E=experts, k=hidden, n=128, device=weights.device),
+        prepared,
     )
-    assert state.intermediate_rotations.shape == (experts, 384)
+    assert state.coupled_hadamard is coupled
+    assert state.intermediate_rotations.shape == (experts, 768 if coupled else 384)
+    if coupled:
+        assert (
+            prepared.rotations.gate_suh.data_ptr()
+            == prepared.rotations.up_suh.data_ptr()
+        )
+        assert torch.all(state.intermediate_rotations[:, 384:] == 1)
     rows = prepared.descriptor_map.cpu().view(3, -1)
     for projection in range(3):
         for expert in sorted({0, 1, experts // 2, experts - 1}):
@@ -92,7 +143,7 @@ def test_mixed_preparation_preserves_records_and_large_namespace(experts, unifor
             )
             bits = rates[expert][projection]
             assert tier == bits - 3 and local < counts[projection][tier]
-            word_count = 256 * 128 * bits // 32
+            word_count = hidden * 128 * bits // 32
             start = offsets[projection][tier] + local * word_count
             payload = prepared.w13 if projection < 2 else prepared.w2
             restored = (
@@ -104,13 +155,27 @@ def test_mixed_preparation_preserves_records_and_large_namespace(experts, unifor
             torch.testing.assert_close(
                 restored, native[projection, expert], atol=0, rtol=0
             )
-    source = torch.randn(4, 256, device=weights.device, dtype=torch.bfloat16) * 0.01
+    source = torch.randn(4, hidden, device=weights.device, dtype=torch.bfloat16) * 0.01
     ids = torch.tensor(
         [[0, experts - 1], [1, -1], [experts - 1, 0], [0, 1]], device=weights.device
     )
     router = torch.rand(4, 2, device=weights.device)
-    expected = moe_reference(source, prepared, ids, router, activation_kind="silu")
+    expected = moe_reference(source, prepared, ids, router, activation_kind=activation)
     assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+    if uniform:
+        # An all-K3 descriptor table must preserve the uniform record contract,
+        # including the coupled transform flag and FP16 rounding boundaries.
+        uniform_expected = moe_reference(
+            source, prepared.tiers[0], ids, router, activation_kind=activation
+        )
+        torch.testing.assert_close(expected, uniform_expected, atol=0, rtol=0)
+    if coupled and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
+        with pytest.raises(NotImplementedError, match="silu|coupled"):
+            fused_moe.plan_execution(
+                experts=weights,
+                capacity=fused_moe.ExecutionCapacity(max_tokens=8, top_k=2),
+            )
+        return
     if experts <= 256 and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
         execution = fused_moe.plan_execution(
             experts=weights,
@@ -143,7 +208,15 @@ def test_mixed_preparation_preserves_records_and_large_namespace(experts, unifor
 
 
 def _run_native_mixed(
-    *, experts, uniform, dtype, activation, hidden=256, width=128, top_k=2
+    *,
+    experts,
+    uniform,
+    dtype,
+    activation,
+    hidden=256,
+    width=128,
+    top_k=2,
+    coupled=False,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native mixed Trellis MoE")
@@ -157,6 +230,8 @@ def _run_native_mixed(
         activation=activation,
         hidden=hidden,
         width=width,
+        coupled=coupled,
+        per_expert_scales=not uniform,
     )
     payload = weights._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -233,7 +308,7 @@ def _run_native_mixed(
             for target in (None, external):
                 external.fill_(float("nan"))
                 bound = bind(live, target)
-                assert len(bound._backend_binding.calls) == 9
+                assert len(bound._backend_binding.calls) == (8 if coupled else 9)
                 check(fused_moe.run(binding=bound), references[live])
                 if target is not None:
                     assert torch.isnan(external[live:]).all()
@@ -265,9 +340,11 @@ def _run_native_mixed(
         )
         addresses = tuple(t.data_ptr() for t in owners)
         allocated = torch.cuda.memory_allocated()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
         assert tuple(t.data_ptr() for t in owners) == addresses
         assert (
             tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
@@ -303,4 +380,30 @@ def test_native_mixed_moe_v41_geometry():
         hidden=5120,
         width=2304,
         top_k=6,
+    )
+
+
+@pytest.mark.parametrize("experts,uniform", [(5, False), (384, False), (384, True)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_native_coupled_mixed_moe_graph_and_capacity(experts, uniform, dtype):
+    _run_native_mixed(
+        experts=experts,
+        uniform=uniform,
+        dtype=dtype,
+        activation="situ",
+        hidden=512,
+        coupled=True,
+    )
+
+
+def test_native_coupled_mixed_moe_v41_geometry():
+    _run_native_mixed(
+        experts=384,
+        uniform=False,
+        dtype=torch.bfloat16,
+        activation="situ",
+        hidden=5120,
+        width=2304,
+        top_k=6,
+        coupled=True,
     )

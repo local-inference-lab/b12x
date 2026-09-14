@@ -59,6 +59,7 @@ class PreparedProjectionTrellisWeights:
     params_dtype: torch.dtype
     descriptor_local_bits: int = 8
     down_counts: tuple[int, int, int] | None = None
+    coupled_hadamard: bool = False
     source_format: str = "b12x_trellis"
     w13_layout: str = "trellis_t256_proj"
     weight_layout: str = "trellis_mixed3"
@@ -422,6 +423,41 @@ def _coupled_rows(
     return torch.cat((values, signs.to(device=device)), dim=1).contiguous()
 
 
+def _expert_transform_rows(
+    config: TrellisConfig,
+    weights: TrellisWeights,
+    intermediate: torch.Tensor,
+    *,
+    num_experts: int,
+    intermediate_size: int,
+) -> tuple[bool, torch.Tensor]:
+    values = intermediate.reshape(num_experts, -1)
+    if config.transform.expert.kind == "none":
+        if weights.expert_transform_draws is not None:
+            raise ValueError(
+                "expert_transform_draws is invalid when expert transform is 'none'"
+            )
+        return False, values
+    draws = weights.expert_transform_draws
+    if draws is None:
+        raise ValueError("coupled_hadamard preparation requires expert_transform_draws")
+    _require_cuda_tensor(
+        draws,
+        name="expert_transform_draws",
+        dtype=torch.uint8,
+        device=weights.atoms.device,
+    )
+    if tuple(draws.shape) != (num_experts,):
+        raise ValueError(f"expert_transform_draws must be uint8[{num_experts}]")
+    if torch.count_nonzero(draws).item():
+        raise NotImplementedError(
+            "rank-local coupled_hadamard preparation requires all-zero expert_transform_draws"
+        )
+    return True, _coupled_rows(
+        values, draws, intermediate_size=intermediate_size, device=weights.atoms.device
+    )
+
+
 def _uniform_prepared(
     config: TrellisConfig,
     weights: TrellisWeights,
@@ -491,40 +527,22 @@ def _uniform_prepared(
         down_svh=down_svh,
         tile_config=(64, 256, 64, 256),
     )
-    if config.transform.expert.kind == "none":
-        if weights.expert_transform_draws is not None:
-            raise ValueError(
-                "expert_transform_draws is invalid when expert transform is 'none'"
-            )
-        return prepared
-    draws = weights.expert_transform_draws
-    if draws is None:
-        raise ValueError("coupled_hadamard preparation requires expert_transform_draws")
-    _require_cuda_tensor(
-        draws,
-        name="expert_transform_draws",
-        dtype=torch.uint8,
-        device=weights.atoms.device,
+    coupled, rotations = _expert_transform_rows(
+        config,
+        weights,
+        intermediate,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
     )
-    if tuple(draws.shape) != (num_experts,):
-        raise ValueError(f"expert_transform_draws must be uint8[{num_experts}]")
-    if torch.count_nonzero(draws).item():
-        raise NotImplementedError(
-            "rank-local coupled_hadamard preparation currently requires "
-            "all-zero expert_transform_draws"
-        )
+    if not coupled:
+        return prepared
     assert prepared.trellis is not None
     return replace(
         prepared,
         trellis=replace(
             prepared.trellis,
             coupled_hadamard=True,
-            intermediate_rotations=_coupled_rows(
-                intermediate.reshape(num_experts, -1),
-                draws,
-                intermediate_size=intermediate_size,
-                device=weights.atoms.device,
-            ),
+            intermediate_rotations=rotations,
         ),
     )
 
@@ -545,10 +563,15 @@ def _projection_prepared(
 ) -> PreparedProjectionTrellisWeights:
     if config.codebook is not TrellisCodebook.MCG:
         raise ValueError("projection-tiered trellis execution requires codebook 'mcg'")
-    if config.transform.expert.kind != "none":
-        raise ValueError("projection-tiered trellis execution has no expert transform")
-    if weights.expert_transform_draws is not None:
-        raise ValueError("expert_transform_draws is invalid without an expert transform")
+    coupled, transform_rows = _expert_transform_rows(
+        config,
+        weights,
+        intermediate,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+    )
+    if coupled and gate_suh.data_ptr() != up_suh.data_ptr():
+        raise ValueError("coupled Trellis requires a shared input scale vector")
 
     offsets = _bundle_offsets(bits, hidden_size)
     memberships = tuple(
@@ -615,9 +638,9 @@ def _projection_prepared(
             w2=down,
             gate_suh=gate_suh,
             up_suh=up_suh,
-            intermediate_rotations=intermediate.reshape(num_experts, -1),
+            intermediate_rotations=transform_rows,
             down_svh=down_svh,
-            rotation_columns=3 * intermediate_size,
+            rotation_columns=(6 if coupled else 3) * intermediate_size,
             tile_config=(128, 128, 128, 128),
             required_fc1_tile_n=128,
             dummy_scale=dummy_scale,
@@ -628,6 +651,7 @@ def _projection_prepared(
             fc2_pair_kind=None,
             fc1_pair_modes=None,
             fc2_pair_modes=None,
+            coupled_hadamard=coupled,
         )
         if shared_workspace is None:
             shared_workspace = prepared.workspace
@@ -666,20 +690,18 @@ def _projection_prepared(
     )
     broadcast_input = int(gate_suh.shape[0]) == 1
     broadcast_output = int(down_svh.shape[0]) == 1
+    gate_table = (
+        gate_suh if broadcast_input else torch.cat((gate_suh,) * 3, dim=0).contiguous()
+    )
+    up_table = (
+        gate_table
+        if coupled
+        else (up_suh if broadcast_input else torch.cat((up_suh,) * 3, dim=0).contiguous())
+    )
     rotations = MixedTrellisRotations(
-        intermediate=torch.cat((intermediate,) * 3, dim=0)
-        .reshape(3 * num_experts, -1)
-        .contiguous(),
-        gate_suh=(
-            gate_suh
-            if broadcast_input
-            else torch.cat((gate_suh,) * 3, dim=0).contiguous()
-        ),
-        up_suh=(
-            up_suh
-            if broadcast_input
-            else torch.cat((up_suh,) * 3, dim=0).contiguous()
-        ),
+        intermediate=torch.cat((transform_rows,) * 3, dim=0).contiguous(),
+        gate_suh=gate_table,
+        up_suh=up_table,
         down_svh=(
             down_svh
             if broadcast_output
@@ -710,6 +732,7 @@ def _projection_prepared(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         params_dtype=params_dtype,
+        coupled_hadamard=coupled,
     )
 
 

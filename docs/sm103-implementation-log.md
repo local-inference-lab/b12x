@@ -1152,3 +1152,40 @@ packing callables. Neither compilation nor SM120 execution qualifies B300.
 Complete checkpoint/speculative contracts, model evaluation, matching native
 and ARM64 packages, the final full-source corpus, SM121 regression and Station
 HBM transport remain implementation or validation work.
+
+
+## Coupled mixed-rate Trellis preparation and binding
+
+Status: implemented; complete SM103 expert execution remains unqualified.
+Canonical MCG K3/K4/K5 preparation accepts coupled H512/H128 transforms with
+all-zero expert draws. Prepared tiers retain the transform flag, six-I
+intermediate rows and shared gate/up input scale storage. The public SM103
+backend uses eight materialized launches and retains 15 compiled callables
+per static transform configuration across live counts and rate distributions.
+SM120/SM121 preserve their rejection of coupled projection-tiered execution.
+
+The [coupled mixed-rate receipt](sm103-trellis-coupled-mixed-validation.json)
+records 539 host tests, 46 SM120 GPU tests, and 13 targeted cases passing both
+memcheck and synccheck with zero errors. Coverage includes canonical record
+preservation, five/384-expert descriptors, broadcast/per-expert scale aliasing,
+exact all-K3 agreement with the uniform oracle, frozen host binding, prepared
+transform graph mutation, stable addresses and cumulative allocation counts.
+Ordinary MCG and uniform SQG execution regressions pass on SM120. Twenty-seven
+complete-expert tests require physical SM103, including seven added coupled
+mixed-rate cases.
+
+The source-bound Trellis compile contains 176 callables, including 30 coupled
+mixed-rate variants. Added variants use 12–140 allocated GPRs. The component
+has no stack/local-memory flags or positive existing resource deltas, and all
+56 TMEM readers retain completion waits. All 146 existing PTX artifacts match
+the recorded mixed-rate baseline. Of their cubins, 125 match byte-for-byte;
+21 differ in SASS register operands with identical resource counts, register
+sets and instruction counts. Raw artifact identities remain distinct. The
+wheel and sdist match 460 package Python files and three embedded profiles;
+the extracted wheel constructs the public coupled MCG weight plan outside
+the checkout.
+
+Paired/grouped records, nonzero transform draws, complete checkpoint and
+speculative execution, model evaluation, matching native/ARM64 builds,
+SM121 regression, the final full-source corpus and Station HBM transport
+remain open. No B300 runtime or performance result is claimed.

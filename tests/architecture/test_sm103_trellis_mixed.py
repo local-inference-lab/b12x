@@ -43,7 +43,7 @@ def test_projection_descriptor_format_is_explicit(bits):
         )
 
 
-def host_prepared(experts, uniform):
+def host_prepared(experts, uniform, coupled=False):
     from b12x.moe.fused_moe.trellis import (
         PreparedProjectionTrellisWeights,
         _coalesce_payloads,
@@ -55,7 +55,7 @@ def host_prepared(experts, uniform):
     )
     from dataclasses import replace
 
-    hidden, width = 256, 128
+    hidden, width = 512 if coupled else 256, 128
     bits = 24 if experts > 256 else 8
     membership = [
         [0 if uniform else (e + p) % 3 for e in range(experts)] for p in range(3)
@@ -89,7 +89,9 @@ def host_prepared(experts, uniform):
                 params_dtype=torch.float16,
                 fc1_tile_n=128,
                 fc2_tile_n=128,
-                trellis=TrellisWeightState(codebook="mcg", bits=rate),
+                trellis=TrellisWeightState(
+                    codebook="mcg", bits=rate, coupled_hadamard=coupled
+                ),
             )
         )
     w13, views13 = _coalesce_payloads(tuple(t.w13 for t in tiers))
@@ -97,14 +99,17 @@ def host_prepared(experts, uniform):
     tiers = tuple(
         replace(t, w13=a, w2=b) for t, a, b in zip(tiers, views13, views2, strict=True)
     )
+    gate = torch.ones(1, hidden, dtype=torch.float16)
     return PreparedProjectionTrellisWeights(
         tiers=tiers,
         global_to_combined=mapping,
         descriptor_map=descriptors,
         rotations=MixedTrellisRotations(
-            intermediate=torch.ones(3 * experts, 3 * width, dtype=torch.float16),
-            gate_suh=torch.ones(1, hidden, dtype=torch.float16),
-            up_suh=torch.ones(1, hidden, dtype=torch.float16),
+            intermediate=torch.ones(
+                3 * experts, (6 if coupled else 3) * width, dtype=torch.float16
+            ),
+            gate_suh=gate,
+            up_suh=gate if coupled else gate.clone(),
             down_svh=torch.ones(1, hidden, dtype=torch.float16),
         ),
         gate_counts=counts[0],
@@ -122,11 +127,15 @@ def host_prepared(experts, uniform):
         num_experts=experts,
         params_dtype=torch.bfloat16,
         descriptor_local_bits=bits,
+        coupled_hadamard=coupled,
     )
 
 
 @pytest.mark.parametrize("experts", [5, 384])
-def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, experts):
+@pytest.mark.parametrize("coupled", [False, True])
+def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
+    monkeypatch, experts, coupled
+):
     from dataclasses import replace
     from unittest.mock import patch
     import cutlass.cute as cute
@@ -135,7 +144,8 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
     from b12x.moe._shared.execution import PreparedWeightLayout
     from tests.architecture.test_sm103_trellis_moe import caps, canonical_execution
 
-    capacity = caps(monkeypatch, coupled=False, mixed=True)
+    hidden = 512 if coupled else 256
+    capacity = caps(monkeypatch, coupled=coupled, mixed=True)
     capacity = replace(
         capacity,
         num_topk=2,
@@ -143,7 +153,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
         weight_plan=replace(
             capacity.weight_plan,
             num_experts=experts,
-            hidden_size=256,
+            hidden_size=hidden,
             intermediate_size=128,
         ),
     )
@@ -163,11 +173,12 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype) for s in plan.scratch_specs()
     }
-    source, router = torch.empty(8, 256, dtype=torch.bfloat16), torch.empty(8, 2)
+    source, router = torch.empty(8, hidden, dtype=torch.bfloat16), torch.empty(8, 2)
     observed_counts = []
     for uniform in (False, True):
-        payload = host_prepared(experts, uniform)
+        payload = host_prepared(experts, uniform, coupled)
         state, offsets, counts = backend._mixed_contract(capacity, payload)
+        assert state.coupled_hadamard is coupled
         assert (
             state.intermediate_rotations.data_ptr()
             == payload.rotations.intermediate.data_ptr()
@@ -202,7 +213,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
                         topk_weights=router[:live],
                     )
                     calls = bound._backend_binding.calls
-                    assert len(calls) == 9 and all(
+                    assert len(calls) == (8 if coupled else 9) and all(
                         fn in launches.values() for fn, _ in calls
                     )
                     projection_calls = [
@@ -216,12 +227,12 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
                         assert tuple(int(v) for v in args[10]) == counts[phase]
                         assert int(args[11]) == 2 * live
                     assert (
-                        bound.output.shape == (live, 256)
+                        bound.output.shape == (live, hidden)
                         and bound.output.dtype == torch.float32
                     )
         observed_counts.append(counts)
         execution, public_experts = canonical_execution(
-            capacity, plan, weights, coupled=False, mixed=True
+            capacity, plan, weights, coupled=coupled, mixed=True
         )
         public_bound = fused_moe.bind(
             execution,
@@ -231,7 +242,37 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(monkeypatch, e
             topk_ids=torch.zeros(1, 2, dtype=torch.int64),
             topk_weights=router[:1],
         )
-        assert len(public_bound._backend_binding.calls) == 9
+        assert len(public_bound._backend_binding.calls) == (8 if coupled else 9)
+        if coupled:
+            for corrupted, error in (
+                (replace(payload, coupled_hadamard=False), "tier transforms"),
+                (
+                    replace(
+                        payload,
+                        rotations=replace(
+                            payload.rotations, up_suh=payload.rotations.up_suh.clone()
+                        ),
+                    ),
+                    "shared input",
+                ),
+            ):
+                with pytest.raises(ValueError, match=error):
+                    fused_moe.bind(
+                        execution,
+                        scratch=scratch,
+                        a=source[:1],
+                        experts=replace(
+                            public_experts,
+                            _impl=replace(
+                                weights,
+                                representation=replace(
+                                    weights.representation, value=corrupted
+                                ),
+                            ),
+                        ),
+                        topk_ids=torch.zeros(1, 2, dtype=torch.int64),
+                        topk_weights=router[:1],
+                    )
     assert observed_counts[0] != observed_counts[1]
 
 
