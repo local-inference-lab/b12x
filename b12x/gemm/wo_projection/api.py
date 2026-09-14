@@ -64,6 +64,53 @@ def quantize_input_b(tmp_trg, *, plan: Plan, out=None):
     return state.quantize_b(tmp_trg, out=out)
 
 
+@torch.no_grad()
+def prewarm_inv_rope(
+    plan: Plan,
+    *,
+    weights: Weights,
+    cos_sin_cache: torch.Tensor,
+    heads_per_group: int,
+    nope_dim: int = 448,
+    rope_dim: int = 64,
+    positions_dtype: torch.dtype = torch.int64,
+    scratch=None,
+) -> None:
+    """Resolve the plan's inverse-RoPE kernels before capture or resolution freeze.
+
+    Scratch may be borrowed from a serving workspace. Temporary inputs and output
+    are allocated only during this eager preparation step.
+    """
+    raise_if_kernel_resolution_frozen("WO inverse-RoPE prewarm")
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("WO inverse-RoPE prewarm requires eager execution")
+    if positions_dtype not in (torch.int32, torch.int64):
+        raise ValueError("WO positions must use Int32 or Int64")
+    capacity = plan.caps.max_tokens
+    counts = (1,) if plan.backend == "mxfp8_tcgen05" else tuple(sorted({
+        *range(1, min(capacity, 16) + 1), capacity,
+    }))
+    device = plan.caps.device
+    with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+        rows = max(counts)
+        source = torch.ones(
+            (rows, plan.caps.groups * heads_per_group, nope_dim + rope_dim),
+            dtype=plan.caps.dtype, device=device,
+        )
+        positions = torch.zeros(rows, dtype=positions_dtype, device=device)
+        output = torch.empty(rows, plan.caps.hidden, dtype=plan.caps.dtype, device=device)
+        if scratch is None:
+            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                            for spec in plan.scratch_specs())
+        for count in counts:
+            binding = bind_inv_rope(
+                plan, scratch=scratch, o=source[:count], positions=positions[:count],
+                cos_sin_cache=cos_sin_cache, weights=weights, heads_per_group=heads_per_group,
+                nope_dim=nope_dim, rope_dim=rope_dim, out=output[:count],
+            )
+            run_inv_rope(binding=binding)
+
+
 def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 

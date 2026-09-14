@@ -8,16 +8,23 @@ from b12x._lib.utils import cuda_stream_to_int
 
 
 def _span(tensor):
-    return tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()
+    if tensor.numel() == 0:
+        return tensor.data_ptr(), tensor.data_ptr()
+    elements = 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride(), strict=True))
+    return tensor.data_ptr(), tensor.data_ptr() + elements * tensor.element_size()
 
 
-def validate_binding(source, weights, x_q, tmp, tmp_q, output, *, extra_reads=()):
-    if source.dtype != torch.bfloat16 or not source.is_contiguous():
-        raise ValueError("SM103 WO requires contiguous BF16 input")
+def validate_binding(source, weights, x_q, tmp, tmp_q, output, *, extra_reads=(), native=True):
+    if native:
+        from ._quant_cute import _grouped_source_stride
+        if source.dtype != torch.bfloat16:
+            raise ValueError("SM103 WO requires BF16 input")
+        _grouped_source_stride(source, source.shape[0], weights.groups * weights.group_width)
     writes = (x_q.values, x_q.scale_rows, x_q.scale_mma, tmp,
               tmp_q.values, tmp_q.scale_rows, tmp_q.scale_mma, output)
     reads = (source, weights.wo_a.values, weights.wo_a.scale_rows, weights.wo_a.scale_mma,
              weights.wo_b.values, weights.wo_b.scale_rows, weights.wo_b.scale_mma, *extra_reads)
+    reads += tuple(t for t in (weights.wo_a.values_tiled, weights.wo_b.values_tiled) if t is not None)
     if any(t.device != source.device for t in (*reads, *writes)):
         raise ValueError("WO inputs, weights, and scratch must share one device")
     for i, tensor in enumerate(writes):

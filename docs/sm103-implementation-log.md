@@ -1023,3 +1023,37 @@ its allocating inverse-RoPE behavior requires separate lifecycle work. Remaining
 Trellis formats, GLM/DeepSeek feedback, complete model execution and Station HBM
 transport remain open, along with SM121 regression and physical SM103
 qualification.
+
+## WO output ownership and strided attention input
+
+Status: implemented; physical SM103 execution remains unqualified.
+WO bindings accept an aligned caller-owned BF16 output that survives reuse of
+the intermediate workspace. SM12x bound inverse-RoPE execution consumes the
+binding's scratch and output through an opaque mutating operation. It shares
+the functional entry's launch implementation and preserves compatible decode
+epilogues. A prefill capacity cannot select an incompatible quantized decode
+epilogue. Binding constructs views without device writes; scratch regions have
+fixed capacity offsets on every supported architecture.
+
+The SM103 quantizer accepts input rows sliced from padded attention buffers.
+Its Int64 row stride is a runtime argument and does not enter the compile key.
+Compile contract 4 records the added argument. The public `prewarm_inv_rope`
+helper resolves the retained plan before capture and chooses its warmup counts
+inside b12x. It rejects capture and frozen resolution.
+
+Validation covers caller-owned output, poisoned workspace and output, padded
+heads, input mutation, explicit streams, fixed capacities and allocation-free
+replay. Large-offset cases address source rows and cosine-cache rows beyond
+2^31 elements. The [WO serving receipt](sm103-wo-serving-validation.json)
+records host and SM120 results, sanitizer checks, package identities and 56
+SM103 compiled callables. The native GEMM cubins match the WO backend baseline.
+Forty quantizers have positive R, UR or UP count deltas; six add two or four
+allocated GPRs. No stack or local-memory flags appear. Those deltas remain
+visible for physical B300 profiling, without a performance claim.
+
+Companion vLLM still needs a WO owner that retains plans and workspace, invokes
+prewarm before capture, and allocates output with the proper lifetime. Its
+checkpoint scale metadata and TP reduction must remain correct. The attention
+planning audit, target/draft model execution, remaining Trellis contracts and
+Station HBM transport remain open. SM121 runtime regression is outstanding;
+the inspected GB10 host was running a vLLM worker and was left undisturbed.

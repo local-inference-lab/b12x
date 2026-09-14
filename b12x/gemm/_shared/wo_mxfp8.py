@@ -207,6 +207,7 @@ class _WOProjectionState:
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
         source_tgd: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
+        out: torch.Tensor | None = None,
         return_3d: bool = False,
         expected_m: int | None = None,
     ) -> WOProjectionBinding:
@@ -217,7 +218,7 @@ class _WOProjectionState:
             x_q=views.x_q,
             tmp=views.tmp,
             tmp_q=views.tmp_q,
-            output=views.output,
+            output=_wo_projection_output(out, views.output),
             source_tgd=source_tgd,
             weights=weights,
             return_3d=return_3d,
@@ -234,6 +235,7 @@ class _WOProjectionState:
         cos_sin_cache: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
         heads_per_group: int,
+        out: torch.Tensor | None = None,
         nope_dim: int = 448,
         rope_dim: int = 64,
         return_3d: bool = False,
@@ -252,7 +254,7 @@ class _WOProjectionState:
             x_q=views.x_q,
             tmp=views.tmp,
             tmp_q=views.tmp_q,
-            output=views.output,
+            output=_wo_projection_output(out, views.output),
             o=o,
             positions=positions,
             cos_sin_cache=cos_sin_cache,
@@ -286,14 +288,7 @@ class _WOProjectionState:
         group_width = int(self.caps.group_width)
         rank = int(self.caps.rank)
         hidden = int(self.caps.hidden)
-        layout = self.layout if self.backend == "mxfp8_tcgen05" else _layout_wo_projection(
-            offset_bytes=0,
-            tokens=tokens,
-            groups=groups,
-            group_width=group_width,
-            rank=rank,
-            hidden=hidden,
-        )
+        layout = self.layout
         if int(layout.nbytes) > int(self.layout.nbytes):
             raise RuntimeError(
                 "WO projection scratch layout exceeds reserved scratch "
@@ -340,8 +335,6 @@ class _WOProjectionState:
                 ),
                 dtype=torch.uint8,
             )
-            if self.backend != "mxfp8_tcgen05" and m % MXFP8_SCALE_ROW_TILE:
-                scale_physical_u8.fill_(127)
             scale_mma = scale_physical_u8.view(torch.float8_e8m0fnu).permute(
                 3,
                 4,
@@ -2248,6 +2241,18 @@ def _check_wo_projection_weights(weights: WOProjectionMXFP8Weights) -> None:
     )
 
 
+def _wo_projection_output(out: torch.Tensor | None, arena_output: torch.Tensor) -> torch.Tensor:
+    if out is None:
+        return arena_output
+    if out.device != arena_output.device or out.dtype != arena_output.dtype:
+        raise ValueError("WO output must match the plan device and BF16 dtype")
+    if out.ndim == 2:
+        out = out.unsqueeze(-1)
+    if out.shape != arena_output.shape or not out.is_contiguous() or out.data_ptr() % 16:
+        raise ValueError("WO output must be 16-byte aligned contiguous [tokens, hidden] or [tokens, hidden, 1]")
+    return out
+
+
 def _check_wo_projection_views(
     *,
     x_q: MXFP8Rows,
@@ -2388,9 +2393,9 @@ def _build_wo_projection_binding_from_views(
         tokens=tokens,
         weights=weights,
     )
-    if backend == "mxfp8_tcgen05":
-        from b12x.gemm.wo_projection._execution import validate_binding
-        validate_binding(source_tgd, weights, x_q, tmp, tmp_q, output)
+    from b12x.gemm.wo_projection._execution import validate_binding
+    validate_binding(source_tgd, weights, x_q, tmp, tmp_q, output,
+                     native=backend == "mxfp8_tcgen05")
     return WOProjectionBinding(
         source_tgd=source_tgd,
         weights=weights,
@@ -2488,11 +2493,11 @@ def _build_wo_projection_inv_rope_binding_from_views(
         tokens=tokens,
         weights=weights,
     )
+    from b12x.gemm.wo_projection._execution import validate_binding
+    validate_binding(o, weights, x_q, tmp, tmp_q, output,
+                     extra_reads=(positions, cos_sin_cache), native=backend == "mxfp8_tcgen05")
     if backend == "mxfp8_tcgen05":
-        from b12x.gemm.wo_projection._execution import validate_binding
         from b12x.gemm.wo_projection._quant_cute import _validate_rope
-        validate_binding(o, weights, x_q, tmp, tmp_q, output,
-                         extra_reads=(positions, cos_sin_cache))
         _validate_rope(o, positions, cos_sin_cache, tokens,
                        nope_dim + rope_dim, nope_dim, rope_dim)
     return WOProjectionInvRopeBinding(
@@ -3012,6 +3017,35 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         hidden=hidden,
         sfb_k_replicated=sfb_k_replicated,
     )
+    return _run_inv_rope_mxfp8(
+        o, positions, cos_sin_cache, weights, heads_per_group, nope_dim, rope_dim,
+        expected_m, stream_int,
+    )
+
+
+def _run_inv_rope_mxfp8(
+    o, positions, cos_sin_cache, weights, heads_per_group, nope_dim, rope_dim,
+    expected_m, stream_int, views=None,
+):
+    if stream_int is not None:
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_int, device=o.device)):
+            return _launch_inv_rope_mxfp8(
+                o, positions, cos_sin_cache, weights, heads_per_group, nope_dim,
+                rope_dim, expected_m, stream_int, views,
+            )
+    return _launch_inv_rope_mxfp8(
+        o, positions, cos_sin_cache, weights, heads_per_group, nope_dim,
+        rope_dim, expected_m, stream_int, views,
+    )
+
+
+def _launch_inv_rope_mxfp8(
+    o, positions, cos_sin_cache, weights, heads_per_group, nope_dim, rope_dim,
+    expected_m, stream_int, views,
+):
+    groups, group_width, rank, hidden = (
+        weights.groups, weights.group_width, weights.rank, weights.hidden
+    )
     alpha_one = _cached_alpha_one(o.device)
     tokens = int(o.shape[0])
     # Tiny-M WO-B uses atomic split-K. Clear its output inside the initial
@@ -3026,8 +3060,15 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     # affect a logical output row. Standalone quantizers retain initialized
     # padding.
     atomic_output_precleared = tokens <= 8
-    output = None
-    if atomic_output_precleared:
+    output = None if views is None else views.output
+    if views is not None:
+        x_q = views.x_q
+        _run_wo_a_quant_kernel(
+            o, positions, cos_sin_cache, x_q.values, x_q.scale_rows, x_q.scale_mma,
+            tokens, groups, heads_per_group, group_width, nope_dim + rope_dim,
+            nope_dim, rope_dim, clear_output=output if atomic_output_precleared else None,
+        )
+    elif atomic_output_precleared:
         output = torch.empty((tokens, hidden, 1), dtype=torch.bfloat16, device=o.device)
         values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
             tokens,
@@ -3088,23 +3129,32 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         and nope_dim == 448
         and rope_dim == 64
     )
-    if use_quantized_intermediate:
-        tmp_q_bases = empty_mxfp8_rows_bases(
-            tokens,
-            rank * groups,
-            num_groups=1,
-            device=o.device,
-            initialize_scales=False,
-        )
-        tmp_q = mxfp8_rows_from_bases(
-            *tmp_q_bases,
-            tokens,
-            rank * groups,
-            num_groups=1,
-        )
+    # Quantized C requires the 64-column tile selected by a decode capacity.
+    quantized_output_tile = expected_m == 16 or (
+        expected_m is not None and 9 <= expected_m <= 15
+        and rank == 1024 and group_width == 512 and groups == 4
+    )
+    if use_quantized_intermediate and quantized_output_tile:
+        if views is None:
+            tmp_q_bases = empty_mxfp8_rows_bases(
+                tokens,
+                rank * groups,
+                num_groups=1,
+                device=o.device,
+                initialize_scales=False,
+            )
+            tmp_q = mxfp8_rows_from_bases(
+                *tmp_q_bases,
+                tokens,
+                rank * groups,
+                num_groups=1,
+            )
+        else:
+            tmp_q = views.tmp_q
         wo_a_dense_gemm_mxfp8(
             x_q,
             weights.wo_a,
+            out=None if views is None else views.tmp,
             quantized_out=tmp_q,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
@@ -3113,6 +3163,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
         return wo_b_dense_gemm_mxfp8(
             tmp_q,
             weights.wo_b,
+            out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
             stream=stream_int,
@@ -3120,6 +3171,7 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     tmp = wo_a_dense_gemm_mxfp8(
         x_q,
         weights.wo_a,
+        out=None if views is None else views.tmp,
         alpha=alpha_one,
         expected_m=expected_m,
         sfb_k_replicated=weights.sfb_k_replicated,
@@ -3137,10 +3189,13 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             _atomic_output_precleared=atomic_output_precleared,
             stream=stream_int,
         )
-    tmp_q = quantize_wo_b_input_mxfp8(tmp, _initialize_scales=False)
+    tmp_q = quantize_wo_b_input_mxfp8(
+        tmp, out=None if views is None else views.tmp_q, _initialize_scales=False
+    )
     return wo_b_dense_gemm_mxfp8(
         tmp_q,
         weights.wo_b,
+        out=output,
         alpha=alpha_one,
         expected_m=expected_m,
         sfb_k_replicated=weights.sfb_k_replicated,
@@ -3174,6 +3229,76 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
 ) -> torch.Tensor:
     del stream_int
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
+
+
+@torch.library.custom_op(
+    "b12x::wo_projection_inv_rope_mxfp8_bound",
+    mutates_args=("x_values", "x_rows", "x_mma", "tmp", "tmp_values",
+                  "tmp_rows", "tmp_mma", "output"),
+)
+def _wo_projection_inv_rope_mxfp8_bound_op(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a_values: torch.Tensor,
+    wo_a_values_tiled: torch.Tensor | None,
+    wo_a_scale_rows: torch.Tensor,
+    wo_a_scale_mma: torch.Tensor,
+    wo_b_values: torch.Tensor,
+    wo_b_values_tiled: torch.Tensor | None,
+    wo_b_scale_rows: torch.Tensor,
+    wo_b_scale_mma: torch.Tensor,
+    groups: int,
+    group_width: int,
+    rank: int,
+    hidden: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    expected_m: int,
+    sfb_k_replicated: bool,
+    stream_int: int | None,
+    x_values: torch.Tensor,
+    x_rows: torch.Tensor,
+    x_mma: torch.Tensor,
+    tmp: torch.Tensor,
+    tmp_values: torch.Tensor,
+    tmp_rows: torch.Tensor,
+    tmp_mma: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    weights = WOProjectionMXFP8Weights(
+        wo_a=MXFP8Rows(
+            values=wo_a_values,
+            scale_rows=wo_a_scale_rows,
+            scale_mma=wo_a_scale_mma,
+            values_tiled=wo_a_values_tiled,
+        ),
+        wo_b=MXFP8Rows(
+            values=wo_b_values,
+            scale_rows=wo_b_scale_rows,
+            scale_mma=wo_b_scale_mma,
+            values_tiled=wo_b_values_tiled,
+        ),
+        groups=groups,
+        group_width=group_width,
+        rank=rank,
+        hidden=hidden,
+        sfb_k_replicated=sfb_k_replicated,
+    )
+    views = _WOProjectionScratchViews(
+        x_q=MXFP8Rows(x_values, x_rows, x_mma), tmp=tmp,
+        tmp_q=MXFP8Rows(tmp_values, tmp_rows, tmp_mma), output=output,
+    )
+    _run_inv_rope_mxfp8(
+        o, positions, cos_sin_cache, weights, heads_per_group, nope_dim, rope_dim,
+        expected_m, stream_int, views,
+    )
+
+
+@_wo_projection_inv_rope_mxfp8_bound_op.register_fake
+def _wo_projection_inv_rope_mxfp8_bound_fake(*args):
+    return None
 
 
 def wo_projection_inv_rope_mxfp8(
@@ -3259,11 +3384,16 @@ def wo_projection_inv_rope_mxfp8(
     # wo_projection_mxfp8); decode -> 32x128, prefill -> 64x128, no caller change.
     if expected_m is None:
         expected_m = int(tokens)
-    # One fully opaque fused op runs the whole quantize -> gemm -> quantize ->
-    # gemm chain internally, so the token-shaped activation MXFP8 views never
-    # become graph values (see _wo_projection_inv_rope_mxfp8_fused_op). Any
-    # bound scratch is intentionally unused here.
-    output = torch.ops.b12x.wo_projection_inv_rope_mxfp8_fused(
+    op = torch.ops.b12x.wo_projection_inv_rope_mxfp8_fused
+    scratch_args = ()
+    if binding is not None:
+        op = torch.ops.b12x.wo_projection_inv_rope_mxfp8_bound
+        scratch_args = (
+            binding.x_q.values, binding.x_q.scale_rows, binding.x_q.scale_mma,
+            binding.tmp, binding.tmp_q.values, binding.tmp_q.scale_rows,
+            binding.tmp_q.scale_mma, binding.output,
+        )
+    output = op(
         o,
         positions,
         cos_sin_cache,
@@ -3285,7 +3415,10 @@ def wo_projection_inv_rope_mxfp8(
         expected_m,
         weights.sfb_k_replicated,
         cuda_stream_to_int(stream),
+        *scratch_args,
     )
+    if binding is not None:
+        output = binding.output
     if return_3d:
         return output
     return output[:, :, 0]
