@@ -111,20 +111,24 @@ emits stack or local-memory traffic. All 21 deferred operator suites collect
 successfully; collection verifies imports and selectors without executing tests.
 
 The [consolidated compilation receipt](sm103-consolidated-validation.json)
-binds source revision `7b697152` to 1,108 callables and 1,116 CUDA entry points,
-including BTX paired records, all three MTP feedback contracts and vocabulary
-projection. All artifact hashes verify, and 23 physical-SM103 suites are
-prepared from the identical frozen source without executing them. Of 993
-existing callables, 976 retain identical PTX and 936 retain identical cubins;
-no callable is removed. Source and Torch/Triton versions differ between these
-corpora, so this comparison does not isolate compiler effects.
+binds source revision `2e6c166e` to 1,225 callables and 1,235 CUDA entry points,
+including clamped Trellis TP1/TP2, MLA compression, HyperConnection, embedding
+and Engram. All artifact hashes verify, and 27 physical-SM103 suites are
+prepared from the identical frozen source and collect successfully without
+executing them. Of 1,108
+existing callables, 1,086 retain identical PTX and 1,050 retain identical
+cubins; no callable is removed. Source and Torch/Triton versions differ between
+these corpora, so this comparison does not isolate compiler effects.
 
-Nine existing callables have positive register deltas: GDN checkpoint
-recurrence rises from 161 to 164 allocated GPRs, and eight supporting activation
-packers rise by one or two. None adds stack, local memory, local loads/stores
-or static shared memory. Forty compute callables and four supporting packers
-retain their stack/local flags. All positive deltas remain recorded;
-occupancy and latency require physical SM103 qualification.
+Seventeen existing callables have positive register-set deltas. Two MXFP4 K128
+activation packers add two allocated GPRs each; the other increases affect exact
+R, UR, P or UP sets. No existing callable changes stack, local memory, local
+load/store counts or static shared memory. All 44 stack/local flags are
+unchanged, and no added callable has a flag. All positive deltas remain recorded;
+occupancy and latency require physical SM103 qualification. The wheel built
+from the same revision contains all Python sources and three embedded profiles;
+all 476 packaged files match the checkout and 56 host checks pass against the
+extracted wheel.
 
 Binary dependency resolution succeeds for b12x with Python 3.12, ARM64,
 CUDA 13.0 and glibc 2.28. Resolving b12x together with the companion vLLM CUDA
