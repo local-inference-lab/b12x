@@ -613,6 +613,24 @@ Twenty-one sampled indexer specializations report stack frames of 8–312 bytes
 and zero reported local storage. The resource flags remain in the receipt;
 target occupancy and latency require physical SM103 measurements.
 
+`prewarm_fp8` resolves an FP8/FP32 capacity plan with one live query before
+capture or kernel-resolution freeze. It accepts reserved scratch and the
+physical cache-page pitch. Single-page warmup preserves that pitch so larger
+pools reuse the same callable. `prefill_k_rows` exposes the planned streamed K
+window for integration metadata budgets. Bound prefill aliases unused output
+arguments into reserved storage; indices-only fused execution also uses planned
+score scratch. Neither path allocates transient launch storage.
+
+The [indexer serving receipt](sm103-indexer-serving-validation.json) records
+public prewarm, fixed-capacity reuse, high-page addressing, graph replay,
+package integrity and SM103 compilation. Its 58 cubins are byte-identical to
+the inspected indexer baseline, including the 21 retained stack flags.
+The companion vLLM owner supplies configured capacity and metadata through the
+public API. DCP packing and gather buffers share the reserved workspace with
+the scorer; its existing CuTe selector consumes gathered candidates. SM120
+two-rank tests cover the combined scorer/NCCL path. These checks do not qualify
+complete models or physical B300 execution.
+
 DSA config schema 2 admits the warp backend. Embedded SM12x profiles retain
 their measured native configs. Offline profile generation selects candidates
 through the component policy and uses candidate contract version 2 for the
@@ -1038,7 +1056,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
 | DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; exercise the implemented companion plan owner with real checkpoint weights and complete attention output |
-| Serving indexer ownership | Companion `vllm/models/deepseek_v4/nvidia/b12x_indexer.py` and `vllm/v1/attention/backends/mla/b12x_indexer.py`: use the public plan/bind/run API and replace live-row and page-table plan keys with configured capacities, retained scratch and eager warmup; prove reuse under frozen resolution |
+| Serving indexer ownership | Companion `vllm/model_executor/layers/attention/b12x_dsa_indexer.py`: exercise implemented public plans, retained scratch, eager warmup and DCP merge through real checkpoint/model execution |
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and MCG projection-tiered execution, including 384-expert records; add paired/grouped or coupled mixed rates required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |

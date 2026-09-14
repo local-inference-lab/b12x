@@ -1110,3 +1110,85 @@ def test_compressed_prewarm_reuses_declared_capacity_and_rejects_capture(monkeyp
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="eager"):
         api.prewarm(plan, scratch=scratch)
+
+
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize("page_stride", [8448, 16896])
+def test_dsa_fp8_prewarm_uses_capacity_plan_and_rejects_capture(
+    monkeypatch, mode, page_stride
+):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention.dsa_indexer import api
+
+    plan = api.plan(
+        api.Caps(
+            device="cpu",
+            num_q_heads=32,
+            max_q_rows=19,
+            max_page_table_width=32,
+            topk=512,
+            mode=mode,
+        )
+    )
+    scratch = _one_scratch(plan)
+    calls = []
+
+    def run(binding):
+        assert binding.plan is plan
+        assert binding.q_fp8.shape == (1, 32, 128)
+        assert binding.index_k_cache.stride(0) == page_stride
+        assert binding.runtime.scratch.max_total_q == 19
+        assert binding.runtime.scratch.shared_scratch.data_ptr() == scratch.data_ptr()
+        calls.append(
+            (
+                binding.output_scores is not None,
+                binding.runtime.real_page_table.stride(0),
+            )
+        )
+
+    monkeypatch.setattr(api, "run", run)
+    api.prewarm_fp8(plan, scratch=scratch, cache_page_stride_bytes=page_stride)
+    strides = (0, 32) if mode == "prefill" else (32,)
+    assert set(calls) == {
+        (scores, stride) for scores in (False, True) for stride in strides
+    }
+    if mode == "prefill":
+        assert api.prefill_k_rows(plan) == plan.layout.supertile_tokens
+    else:
+        with pytest.raises(ValueError, match="prefill"):
+            api.prefill_k_rows(plan)
+    for invalid_stride in (8444, 8449):
+        with pytest.raises(ValueError, match="cache page stride"):
+            api.prewarm_fp8(
+                plan, scratch=scratch, cache_page_stride_bytes=invalid_stride
+            )
+    freeze_kernel_resolution("prewarm precedes frozen serving")
+    try:
+        with pytest.raises(RuntimeError, match="frozen"):
+            api.prewarm_fp8(plan, scratch=scratch)
+    finally:
+        unfreeze_kernel_resolution()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="eager"):
+        api.prewarm_fp8(plan, scratch=scratch)
+
+
+@pytest.mark.parametrize("pages", [0, 1, 3])
+@pytest.mark.parametrize("stride", [8448, 16896])
+def test_index_cache_views_preserve_physical_stride_for_single_page(pages, stride):
+    from b12x.attention.dsa_indexer.kernel import _split_index_k_cache_runtime_views
+
+    storage = torch.zeros((pages + 1, stride), dtype=torch.uint8)
+    cache = storage[1:, :8448]
+    values, scales = _split_index_k_cache_runtime_views(cache)
+    assert values.shape == (pages, 64, 128)
+    assert scales.shape == (pages, 64)
+    assert values.stride() == (stride, 128, 1)
+    assert scales.stride() == (stride // 4, 1)
+    if pages:
+        values.fill_(3)
+        scales.fill_(0.5)
+        assert torch.equal(cache[:, :8192], torch.full_like(cache[:, :8192], 3))
+        assert torch.equal(cache[:, 8192:].view(torch.float32), scales)
+        assert torch.count_nonzero(storage[0]) == 0

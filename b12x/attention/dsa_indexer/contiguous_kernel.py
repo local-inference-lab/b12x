@@ -2965,8 +2965,8 @@ def run_contiguous_logits_kernel(
         out_view = staged_binding.out_view
     else:
         if _tiled_output and _use_prefill:
-            # In tiled mode, no need for the full scatter matrix
-            out_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+            # Tiled output makes the scatter argument constexpr-dead.
+            out_kernel = tile_logits.as_strided((1, 1), (1, 1))
         elif preinitialize_invalid_logits:
             out_kernel = torch.full(
                 (q_rows_total, k_rows),
@@ -3047,7 +3047,7 @@ def run_contiguous_logits_kernel(
         tile_logits_kernel = torch.empty(
             (1, 1), dtype=torch.float32, device=q_fp8.device
         )
-    if staged_binding is not None:
+    if staged_binding is not None or (_tiled_output and _use_prefill):
         # run_contiguous_logits_kernel always compiles BLOCK_SCORE_OUTPUT=False;
         # this argument is therefore constexpr-dead.  Keep its rank/strides
         # stable while aliasing caller-owned output storage for graph replay.
