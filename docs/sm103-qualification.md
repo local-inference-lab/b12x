@@ -1,17 +1,18 @@
 # SM103 / B300 qualification
 
 Status: **implemented prototype, unqualified on B300**. The normal b12x API
-selects native NVFP4 and uniform or projection-tiered Trellis MoE backends for SM103. Physical SM103 execution, complete
-GLM serving, V4.1 serving and Station RDMA remain unqualified. No B300 performance
+selects native NVFP4 and uniform, projection-tiered or grouped atom Trellis MoE
+backends for SM103. Physical SM103 execution, complete GLM serving, V4.1 serving
+and Station RDMA remain unqualified. No B300 performance
 numbers or measured B300 policy profile are included.
 
 ## Support and architecture boundaries
 
-| Area | Implementation and evidence | Required Station work |
+| Area | Implementation and evidence | Remaining work |
 | --- | --- | --- |
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
-| Trellis | Native uniform and MCG K3/K4/K5 projection-tiered MoE with ordinary or coupled transforms, global draw coordinates, inline FP16 tcgen05 projection, routing and weighted reduction; 384-expert descriptors; host and SM120 preparation/operand tests and SM103 compilation | Native complete-expert numerics and graphs; paired/grouped records and coupled extents crossing distinct input-scale halves remain unsupported |
+| Trellis | Native uniform, projection-tiered and grouped atom MoE with MCG, SQG E4M3 or SQG FP16 codebooks; ordinary/coupled transforms, global draw coordinates and distinct input-scale halves; inline FP16 tcgen05 projections, routing and weighted reduction; host and SM120 tests and SM103 compilation | Native complete-expert numerics and graphs; legacy BTX paired records remain unsupported |
 | Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
@@ -90,23 +91,40 @@ python scripts/compile_sm103.py --component all --output-dir /tmp/sm103-compile
 
 The output directory must be empty. Optional `--nvdisasm /path/to/nvdisasm`
 and `--cuobjdump /path/to/cuobjdump` retain SASS and resource reports. The manifest
-records source/toolchain identity and per-file hashes. The representative corpus
-contains nine MoE launchers, eight TP2 communication launchers, 20 reconstruction
-and 28 uniform Trellis projection launchers, 64 uniform Trellis MoE launchers,
-four mixed-rate projection launchers and 60 projection-tiered MoE launchers,
-36 recurrent launchers, 17 dense MLA launchers, 45 GLM sparse MLA
-and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
-38 quantized-linear and reduction launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
-activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
-147 DeepSeek compressed attention/cache-writer launchers, 131 mHC launchers,
-and 56 WO projection/quantization launchers. The representative corpus contains
-836 CuTe callables plus sixteen supporting activation-packing callables. The
-176-callable Trellis component has a separate source-bound compile receipt;
-a complete representative rebuild from the final project source remains pending.
-This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+records source/toolchain identity and per-file hashes. The
+[source-readiness receipt](sm103-source-readiness.json) binds 977 CuTe callables
+and sixteen supporting activation-packing callables to one package source
+revision. It records the counts for all sixteen component groups, including
+317 Trellis callables, and the consolidated SASS/resource audit. Specialization
+coverage is representative; additional model geometries need their own checks.
+The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
+The receipt also retains separate nine-callable MoE builds for capacity 128
+with gate-first weights and capacity 8193 with 65,544 routes. Neither build
+emits stack or local-memory traffic. All 21 deferred operator suites collect
+successfully; collection verifies imports and selectors without executing tests.
+
+The resource audit covers 1,001 CUDA entry points in those 993 callables;
+two BF16 projection callables each contain five entries. All 748 callables
+from the prior complete corpus retain identical PTX and have no resource
+increases. Forty compute callables retain stack/local-memory flags. Four
+supporting NVFP4 packers retain eight-byte stack frames without explicit local
+loads or stores. Their resource metrics match the preceding component evidence.
+These flags remain part of B300 resource and latency qualification.
+
+Binary dependency resolution succeeds for b12x with Python 3.12, ARM64,
+CUDA 13.0 and glibc 2.28. Resolving b12x together with the companion vLLM CUDA
+and build requirements requires glibc 2.34 for the pinned
+[TileLang ARM64 wheel](https://pypi.org/project/tilelang/0.1.12/#files).
+That combined resolution selects Torch 2.13.0+cu130, Triton 3.7.1, CUTLASS DSL
+4.6.2 and FlashInfer 0.6.17. The standalone b12x resolution selects Torch
+2.14.0+cu130 and Triton 3.8.0. The
+[source-readiness receipt](sm103-source-readiness.json) records requirements
+with package hashes and the exact resolver commands. ARM64 installation, C helper
+builds, matching vLLM native libraries and native loading remain unqualified.
+Resolution alone does not establish an executable ARM64 environment.
 
 Native MoE routes occupy the CUDA X grid dimension. Planning rejects route
 counts above the signed Int32 limit and projection-column grids above 65,535
@@ -172,21 +190,20 @@ Forty quantizer variants have positive R, UR, or UP count deltas against the
 WO backend baseline; six increase allocated GPRs by two or four. The receipt
 retains every delta for B300 profiling. Native GEMM cubins are byte-identical
 to that baseline. These are static resource results; occupancy and performance
-remain unqualified. The complete SM103 corpus has not been rebuilt.
+remain unqualified.
 
 The companion vLLM adapter retains configured WO capacity plans, prewarms both
 position dtypes through the public b12x API, and binds an independent BF16 output
 that survives shared-scratch reuse. Its four eager/Inductor serving cases pass
 SM120 memcheck and synccheck with zero kernel errors. They exercise arbitrary
 positive FP32 128x128 checkpoint scales and 32x32 UE8M0 scales, padded attention
-rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution. Uniform BTX extents retain their manifest
-barrier checks; valid crossing extents carry the same split as canonical weights.
-See the [input-scale-half validation receipt](sm103-trellis-input-halves-validation.json).
+rows, live counts 1/3/8/9/16/65/129, graph mutation and frozen kernel resolution.
 The companion `docs/design/b12x_wo_serving_validation.json` records source and
-native-library identities. Complete DeepSeek SM103 selection remains rejected
-because the indexer still needs the public plan/bind/run API, retained capacity
-planning, warmup and capture ownership. The model selector honors the adapter's
-architecture gate even when individual b12x operators support SM103.
+native-library identities. The companion indexer also retains public b12x
+plans, capacities, warmup and capture ownership. Complete DeepSeek SM103
+selection remains rejected until checkpoint and model execution contracts are
+qualified. The model selector honors the adapter's architecture gate even when
+individual b12x operators support SM103.
 
 ```bash
 python scripts/compile_sm103.py --component wo_projection \
@@ -201,9 +218,9 @@ resolution across M1/M3/M8/M9/M16/M127/M128/M129, and checks input mutation,
 poisoned scratch, explicit streams, stable addresses and allocation-free replay.
 Stage relative L2 must remain below 0.005 and cosine above 0.9999. It also tests
 both cosine and source row offsets beyond 2^31 elements and isolates invalid
-positions in separate processes. Companion vLLM still needs a retained WO plan
-owner and warmup before its SM103 attention route can be enabled. SM12x bound
-inverse-RoPE execution uses its supplied intermediates and output. Its functional
+positions in separate processes. Companion vLLM retains the WO plan owner and
+warmup; real-checkpoint attention output and full-model execution remain
+unqualified. SM12x bound inverse-RoPE execution uses its supplied intermediates and output. Its functional
 convenience call continues to allocate; both entries share the same launch
 implementation. No complete model evaluation is established by these checks.
 
@@ -219,8 +236,7 @@ SM12x FP16 split-K writes FP32 partials and uses a typed CuTe reduction;
 BF16 retains its atomic accumulation policy and its rounding behavior. The
 workspace tests freeze kernel resolution, poison scratch/output, mutate inputs,
 and check graph replay, empty requests, explicit streams, and alias rejection.
-The current targeted compilation covers 19 FP8 and 38 dense/reduction callables;
-the complete corpus has not been rebuilt for this workspace change.
+The consolidated compilation includes 19 FP8 and 38 dense/reduction callables.
 
 `gemm.blockscaled.mm` selects the dense SM103 tcgen05/TMEM implementation for
 NVFP4, MXFP4, and MXFP8. W4A16 and W8A16 preserve BF16 activations and inline

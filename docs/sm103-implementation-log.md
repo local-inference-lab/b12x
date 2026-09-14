@@ -1363,3 +1363,47 @@ pass outside the checkout. Companion vLLM remains unchanged at
 Legacy BTX paired records, complete speculative model integration and
 evaluation, a matching native vLLM build, ARM64 dependencies, SM121 regression,
 Station direct-HBM transport and the final full-project compile remain open.
+
+## Consolidated source compilation and ARM64 dependency resolution
+
+The [source-readiness receipt](sm103-source-readiness.json) binds the complete
+representative compile command to package source revision `770f397d` and source
+hash `61001cf402dd6a917a21410f095090700547766bb59cba31c0dba5efba00d0dc`.
+All sixteen component groups compile: 977 CuTe callables and sixteen supporting
+activation-packing callables contain 1,001 CUDA entry points. Separate native
+MoE builds cover capacity 128 with gate-first weights and capacity 8193 with
+65,544 routes; each contains nine callables and emits no stack or local traffic.
+
+All 748 callables from the preceding full corpus retain identical PTX; 723
+retain identical cubins. The other 25 cubins retain identical allocated
+resources, exact register sets and instruction counts. No existing resource
+metric increases. All 317 Trellis callables from the canonical FP16 milestone
+also retain identical PTX and resource metrics. All 149 TMEM readers retain completion waits.
+The census preserves forty compute stack/local-traffic flags and four supporting
+NVFP4 packing frames. The latter have no explicit local loads or stores and
+match the preceding packing component evidence. Hardware resource and latency
+qualification remains required.
+
+The resource auditor recognizes the FP8/FP6 `UTCQMMA` opcode alongside
+`UTCHMMA` and `UTCOMMA`, only at instruction positions. Its host suite passes
+15 tests, including predicated instructions and rejection of ordinary warp
+MMA or misleading branch labels. The initial checker failure remains in the
+evidence directory. Kernel sources and compile artifacts remain unchanged.
+All 21 deferred operator suites collect successfully, and the qualification
+launcher prepares their commands against the verified consolidated manifest.
+
+Binary package resolution succeeds for standalone b12x on Python 3.12, ARM64,
+CUDA 13.0 and glibc 2.28, selecting 66 packages. The combined b12x and companion
+vLLM CUDA/build requirements resolve to 204 packages at glibc 2.34, including
+Torch 2.13.0+cu130, Triton 3.7.1, CUTLASS DSL 4.6.2 and FlashInfer 0.6.17.
+The glibc 2.28 companion attempt fails because the pinned TileLang ARM64 wheel
+requires glibc 2.34. Commands, input hashes, package hashes and both resolver
+results are retained. This checks dependency availability, not ARM64 installation
+or native execution.
+
+The qualification and companion integration documents describe canonical
+grouped/SQG FP16 Trellis, WO ownership and indexer warmup as implemented.
+Legacy BTX paired records, complete GLM/DeepSeek speculative integration and
+model evaluation, matching native vLLM builds, ARM64 installation/native helpers,
+available-host SM121 regression and Station direct-HBM transport remain open.
+Physical SM103 execution remains unqualified.
