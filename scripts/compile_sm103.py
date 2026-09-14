@@ -867,19 +867,23 @@ def compile_trellis(out):
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix="trellis_moe_" + label + "_")
         launches.update({"trellis_moe_" + label + "_" + key: fn for key, fn in compiled.items()})
-    for local_bits, experts, dtype, activation in (
-        (8, 5, torch.float16, "situ"),
-        (24, 384, torch.bfloat16, "silu"),
+    for local_bits, experts, dtype, activation, coupled in (
+        (8, 5, torch.float16, "situ", False),
+        (24, 384, torch.bfloat16, "silu", False),
+        (8, 5, torch.float16, "situ", True),
+        (24, 384, torch.bfloat16, "situ", True),
     ):
-        label = f"trellis_mixed_d{local_bits}_"
+        label = f"trellis_mixed_d{local_bits}_" + ("coupled_" if coupled else "")
         caps = SimpleNamespace(
             k=5120, n=2304, weight_E=experts, max_tokens=128, num_topk=min(experts, 6),
             route_num_experts=2 * experts, dtype=dtype, activation=activation,
-            weight_plan=SimpleNamespace(coupled_hadamard=False, source_format="b12x_trellis",
+            weight_plan=SimpleNamespace(coupled_hadamard=coupled, source_format="b12x_trellis",
                                         trellis_bits=3, trellis_codebook="mcg"),
         )
         compiled = compile_moe(caps, offline=True, artifact_dir=out, artifact_prefix=label)
         launches.update({label + key: fn for key, fn in compiled.items()})
+        if coupled:
+            continue
         for id_dtype in (cutlass.Int32, cutlass.Int64):
             args = [pointer(t) for t in (cutlass.Float16, cutlass.Uint32, cutlass.Uint8, id_dtype, cutlass.Int32, cutlass.Float16)]
             args += [cutlass.Int32(0), cutlass.Int64(3 * experts), cutlass.Int64(1),

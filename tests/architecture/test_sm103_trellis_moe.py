@@ -17,8 +17,9 @@ from tests.moe.test_trellis_config import _k3_config, _glm_config
 
 def weight_plan(coupled=True, mixed=False, canonical=False):
     config = _glm_config() if mixed else _k3_config()
-    if not coupled:
-        config["transform"]["expert"] = {"kind": "none"}
+    config["transform"]["expert"] = (
+        _k3_config()["transform"]["expert"] if coupled else {"kind": "none"}
+    )
     result = fused_moe.plan_weights(
         source=fused_moe.TrellisConfig.from_dict(config),
         activation=fused_moe.ActivationSpec(
@@ -129,8 +130,15 @@ def test_public_scratch_plan_and_policy(coupled, monkeypatch):
 
 def test_mixed_plan_is_supported_and_invalid_coupled_geometry_fails():
     backend.validate_weight_plan(weight_plan(coupled=False, mixed=True))
+    mixed = weight_plan(coupled=True, mixed=True)
+    assert mixed.coupled_hadamard
+    backend.validate_weight_plan(mixed)
     with pytest.raises(NotImplementedError, match="divisible by 512"):
         backend.validate_weight_plan(replace(weight_plan(), hidden_size=4992))
+    with pytest.raises(NotImplementedError, match="SiTU"):
+        backend.validate_weight_plan(
+            replace(mixed, specs=(replace(mixed.specs[0], activation="silu"),))
+        )
 
 
 def test_canonical_rates_are_all_precompiled(monkeypatch):

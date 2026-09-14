@@ -133,6 +133,28 @@ def test_schema_keeps_codebook_rate_and_transform_orthogonal() -> None:
     assert TrellisConfig.from_dict(value).to_dict() == value
 
 
+@pytest.mark.parametrize(
+    "granularity", ["uniform", "per_layer", "per_expert", "per_expert_projection"]
+)
+def test_coupled_mcg_weight_plan_preserves_rate_granularity(granularity):
+    from b12x.moe import fused_moe
+
+    config = _glm_config()
+    config["rate"] = {"granularity": granularity}
+    config["transform"]["expert"] = _k3_config()["transform"]["expert"]
+    plan = fused_moe.plan_weights(
+        source=TrellisConfig.from_dict(config),
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity="situ", io_dtype=torch.bfloat16
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=384, hidden_size=5120, intermediate_size=2304
+        ),
+    )
+    assert plan._impl.coupled_hadamard
+    assert plan._impl.trellis_rate_granularity == granularity
+
+
 def test_projection_tier_payloads_share_one_flat_allocation() -> None:
     payloads = (
         torch.arange(12, dtype=torch.int32).reshape(2, 2, 3),

@@ -18,11 +18,19 @@ def _require_gpu():
 
 
 @pytest.mark.parametrize(
-    "coupled,kind", [(False, "silu"), (False, "situ"), (True, "situ")]
+    "coupled,kind,prepared_mixed",
+    [
+        (False, "silu", False),
+        (False, "situ", False),
+        (True, "situ", False),
+        pytest.param(True, "situ", True, id="prepared_mixed"),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("broadcast", [False, True])
-def test_transform_oracles_live_counts_and_graph(coupled, kind, dtype, broadcast):
+def test_transform_oracles_live_counts_and_graph(
+    coupled, kind, prepared_mixed, dtype, broadcast
+):
     _require_gpu()
     import cuda.bindings.driver as cuda
     import cutlass as c
@@ -54,6 +62,31 @@ def test_transform_oracles_live_counts_and_graph(coupled, kind, dtype, broadcast
     if coupled:
         rotations[:, 3 * width :] = (
             torch.randint(0, 2, (experts, 3 * width), device=device).mul_(2).sub_(1)
+        )
+    if prepared_mixed:
+        from types import SimpleNamespace
+        from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
+        from tests.moe.test_sm103_trellis_mixed_moe import prepare_mixed
+
+        prepared, _, _ = prepare_mixed(
+            experts=experts,
+            hidden=hidden,
+            width=width,
+            coupled=True,
+            activation=kind,
+            dtype=dtype,
+            per_expert_scales=not broadcast,
+        )
+        state, _, _ = _mixed_contract(
+            SimpleNamespace(weight_E=experts, k=hidden, n=width, device=device),
+            prepared._impl.representation_for("w4a16"),
+        )
+        assert state.coupled_hadamard
+        assert state.gate_suh.data_ptr() == state.up_suh.data_ptr()
+        suh, svh, rotations = (
+            state.gate_suh,
+            state.down_svh,
+            state.intermediate_rotations,
         )
     gate, up = (
         torch.randn(routes, width, device=device, dtype=torch.float16) * 0.1
@@ -155,14 +188,21 @@ def test_transform_oracles_live_counts_and_graph(coupled, kind, dtype, broadcast
         up.mul_(0.75)
         down.neg_()
         ids.copy_(torch.arange(routes, device=device) % experts)
+        if prepared_mixed:
+            suh.mul_(0.75)
+            svh.mul_(0.875)
+            rotations[:, : 3 * width].mul_(0.8)
+            rotations[:, 3 * width :].neg_()
         changed_a, changed_h, changed_out = expected()
         assert not torch.equal(changed_out, expected_out)
         addresses = tuple(t.data_ptr() for t in (source, ids, rotations, a, h, out))
         allocated = torch.cuda.memory_allocated()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
         assert addresses == tuple(
             t.data_ptr() for t in (source, ids, rotations, a, h, out)
         )

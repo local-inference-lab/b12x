@@ -166,7 +166,7 @@ def _moe_reference(
 
         rotations = prepared.rotations
         state = SimpleNamespace(
-            coupled_hadamard=False,
+            coupled_hadamard=prepared.coupled_hadamard,
             gate_suh=rotations.gate_suh[:experts],
             up_suh=rotations.up_suh[:experts],
             down_svh=rotations.down_svh[:experts],
