@@ -44,6 +44,7 @@ def canonical_execution(capacity, plan, experts, *, coupled, mixed=False):
     public = replace(
         public,
         _impl=capacity.weight_plan,
+        activation=replace(public.activation, swiglu_limit=capacity.swiglu_limit),
         geometry=fused_moe.MoEGeometry(
             num_experts=capacity.weight_E,
             hidden_size=capacity.k,
@@ -89,14 +90,15 @@ def caps(monkeypatch, *, coupled=True, mixed=False, codebook="sqg_e4m3", **kwarg
     )
 
 
-@pytest.mark.parametrize("coupled", [False, True])
-def test_public_scratch_plan_and_policy(coupled, monkeypatch):
-    capacity = caps(monkeypatch, coupled=coupled)
+@pytest.mark.parametrize("coupled,limit", [(False, None), (False, 10.0), (True, None)])
+def test_public_scratch_plan_and_policy(coupled, limit, monkeypatch):
+    capacity = caps(monkeypatch, coupled=coupled, swiglu_limit=limit)
     plan = _impl.plan_tp_moe_scratch(capacity, prewarm_launches=False)
     assert plan.full_rotation
     assert plan.launch_plan.implementation == backend.BACKEND
     assert plan.launch_plan.execution.gemm_engine.value == "trellis_tcgen05"
     assert plan.launch_plan.policy_resolution.source is PolicySource.HEURISTIC
+    assert plan.launch_plan.swiglu_limit == limit
     buffers = plan._backend_plan.buffers
     assert all(b.offset % 1024 == 0 for b in buffers)
     assert all(
@@ -166,12 +168,28 @@ def test_canonical_rates_are_all_precompiled(monkeypatch):
     assert all(entry[2]["options"] == "--gpu-arch=sm_103a" for entry in recorded)
 
 
+def test_v41_clamp_is_retained_by_compiled_intermediate_transform(monkeypatch):
+    import cutlass.cute as cute
+    from b12x.moe._shared.kernels.sm103.trellis_transforms import IntermediateRotation
+
+    capacity = caps(monkeypatch, coupled=False, swiglu_limit=10.0)
+    kernels = []
+    with patch.object(cute, "compile", side_effect=lambda kernel, *a, **kw: kernels.append(kernel)):
+        backend.compile_launches(capacity, offline=True)
+    intermediate = [kernel for kernel in kernels if isinstance(kernel, IntermediateRotation)]
+    assert len(intermediate) == 1 and intermediate[0].swiglu_limit == 10.0
+    with pytest.raises(ValueError, match="situ activation contract"):
+        IntermediateRotation(256, 3, 8, coupled=True, activation="situ", swiglu_limit=10.0)
+
+
 @pytest.mark.parametrize(
-    "coupled,split", [(False, None), (True, None), (True, 64), (True, 192)]
+    "coupled,split,limit",
+    [(False, None, None), (False, None, 10.0), (True, None, None),
+     (True, 64, None), (True, 192, None)],
 )
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 def test_native_binding_retains_capacity_launches_and_checks_aliases(
-    monkeypatch, coupled, split, bits
+    monkeypatch, coupled, split, limit, bits
 ):
     import cutlass.cute as cute
     from b12x.moe._shared.execution import PreparedWeightLayout
@@ -181,7 +199,9 @@ def test_native_binding_retains_capacity_launches_and_checks_aliases(
     )
 
     codebook = "sqg_fp16" if bits >= 5 else "sqg_e4m3"
-    capacity = caps(monkeypatch, coupled=coupled, codebook=codebook)
+    capacity = caps(
+        monkeypatch, coupled=coupled, codebook=codebook, swiglu_limit=limit
+    )
     wp = replace(
         capacity.weight_plan,
         num_experts=3,

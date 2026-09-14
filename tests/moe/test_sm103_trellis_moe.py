@@ -20,6 +20,7 @@ def prepare_experts(
     intermediate_offset=0,
     distinct_input_scales=False,
     codebook="sqg_e4m3",
+    swiglu_limit=None,
 ):
     experts, hidden, width = geometry
     config = _k3_config()
@@ -31,7 +32,8 @@ def prepare_experts(
     plan = fused_moe.plan_weights(
         source=fused_moe.TrellisConfig.from_dict(config),
         activation=fused_moe.ActivationSpec(
-            mode="a16", nonlinearity="situ" if coupled else "silu", io_dtype=dtype
+            mode="a16", nonlinearity="situ" if coupled else "silu", io_dtype=dtype,
+            swiglu_limit=swiglu_limit,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=experts, hidden_size=hidden, intermediate_size=width
@@ -186,7 +188,7 @@ def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
 
 def _run_native_moe(
     coupled, bits, id_dtype, *, geometry=(3, 512, 256), top_k=2, cross_half=False,
-    codebook="sqg_e4m3",
+    codebook="sqg_e4m3", swiglu_limit=None,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for native Trellis MoE")
@@ -209,6 +211,7 @@ def _run_native_moe(
         intermediate_offset=geometry[2] if coupled and not cross_half else 0,
         distinct_input_scales=cross_half,
         codebook=codebook,
+        swiglu_limit=swiglu_limit,
     )
     payload = experts._impl.representation_for("w4a16")
     plan = fused_moe.plan_execution(
@@ -227,7 +230,9 @@ def _run_native_moe(
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
     }
-    source = torch.randn(8, hidden, device="cuda", dtype=dtype) * 0.02
+    source = torch.randn(8, hidden, device="cuda", dtype=dtype) * (
+        2.0 if swiglu_limit is not None else 0.02
+    )
     ids = (torch.arange(8 * top_k, device="cuda", dtype=id_dtype) % 6).view(8, top_k)
     ids[0, 1] = -1
     if id_dtype == torch.int64:
@@ -250,6 +255,7 @@ def _run_native_moe(
             activation_kind=experts.plan.activation.nonlinearity,
             route_expert_map=route_map,
             output_expert_map=output_map,
+            swiglu_limit=swiglu_limit,
         )
 
     def check(actual, reference):
@@ -349,6 +355,13 @@ def test_native_moe_oracle_capacity_binding_and_graph(coupled, bits, id_dtype):
 
 def test_v41_geometry_native_moe():
     _run_native_moe(True, 3, torch.int64, geometry=(384, 5120, 2304), top_k=6)
+
+
+def test_v41_clamped_silu_geometry_native_moe():
+    _run_native_moe(
+        False, 3, torch.int64, geometry=(384, 5120, 2304), top_k=6,
+        swiglu_limit=10.0,
+    )
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4])
