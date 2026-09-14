@@ -112,3 +112,40 @@ def feedback(
 
 
 __all__ = ["gemma_rmsnorm", "feedback"]
+
+
+def rms_concat(
+    token_embedding: torch.Tensor,
+    hidden_state: torch.Tensor,
+    positions: torch.Tensor,
+    token_norm_weight: torch.Tensor,
+    state_norm_weight: torch.Tensor,
+    combined_fc_weight: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """GLM feedback with ordinary RMSNorm and one concatenated BF16 projection.
+
+    Normalization and learned-weight multiplication accumulate in FP32 before
+    the BF16 result cast, matching the vLLM CUDA RMSNorm implementation.
+    """
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+    embedding = token_embedding.masked_fill(positions.eq(0).unsqueeze(-1), 0)
+
+    def normalize(x, weight):
+        values = x.float()
+        inverse = torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + eps)
+        return (values * inverse * weight.float()).to(x.dtype)
+
+    joined = torch.cat(
+        (
+            normalize(embedding, token_norm_weight),
+            normalize(hidden_state, state_norm_weight),
+        ),
+        dim=-1,
+    )
+    return F.linear(joined, combined_fc_weight)
+
+
+__all__.append("rms_concat")

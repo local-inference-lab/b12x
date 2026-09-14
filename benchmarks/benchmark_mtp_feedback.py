@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Benchmark Qwen3.8 Flash Next MTP feedback through its public API.
+"""Benchmark Qwen and GLM MTP feedback through their public planned API.
 
-The benchmark matrix fixes the production geometry at four residual streams and hidden
-size 2560, then covers single-token decode, a four-token speculative step, and
+The matrix covers single-token decode, a four-token speculative step, and
 four prefill sizes including a padded-row boundary. Every case validates the
 seeded PyTorch oracle before recording eager-launch and CUDA-graph-replay
 samples.
@@ -32,7 +31,6 @@ try:
         capture_cuda_graph,
         make_l2_flush_fn,
         nvidia_smi_gpu_mode_snapshot,
-        require_sm120,
     )
 except ModuleNotFoundError:
     from common import (  # type: ignore[no-redef]
@@ -41,7 +39,6 @@ except ModuleNotFoundError:
         capture_cuda_graph,
         make_l2_flush_fn,
         nvidia_smi_gpu_mode_snapshot,
-        require_sm120,
     )
 
 
@@ -56,7 +53,7 @@ _RESULT_KIND = "qwen38_flash_next_mtp_feedback_benchmark_v1"
 
 @dataclass(frozen=True)
 class Profile:
-    """One live-token count in the Qwen3.8 Flash Next MTP workload."""
+    """One live-token count in a fixed-capacity MTP workload."""
 
     name: str
     phase: str
@@ -119,6 +116,12 @@ def _select_profiles(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--contract",
+        choices=("qwen_multistream", "rms_concat"),
+        default="qwen_multistream",
+    )
+    parser.add_argument("--hidden-size", type=int)
     parser.add_argument(
         "--profiles",
         type=_parse_filter,
@@ -211,15 +214,19 @@ def _make_binding(
     device: torch.device,
     capacity_tokens: int,
     policy=None,
+    contract="qwen_multistream",
+    hidden_size=None,
 ) -> mtp.Binding:
     """Allocate and bind one case exclusively through the public lifecycle."""
 
+    hidden_size = hidden_size or (4096 if contract == "rms_concat" else _HIDDEN_SIZE)
     caps = mtp.Caps(
         device=device,
         max_tokens=capacity_tokens,
-        hidden_size=_HIDDEN_SIZE,
-        streams=_STREAMS,
+        hidden_size=hidden_size,
+        streams=1 if contract == "rms_concat" else _STREAMS,
         dtype=_DTYPE,
+        contract=contract,
     )
     planned = mtp.plan(caps, policy=policy)
     (scratch_spec,) = planned.scratch_specs()
@@ -235,6 +242,25 @@ def _make_binding(
         dtype=_DTYPE,
         device=device,
     )
+    if contract == "rms_concat":
+
+        def randn(shape, scale):
+            return _randn_bf16(shape, scale=scale, generator=generator, device=device)
+
+        return mtp.bind(
+            planned,
+            scratch=scratch,
+            token_embedding=randn((capacity_tokens, hidden_size), 0.4),
+            multi_state=randn((capacity_tokens, hidden_size), 0.4),
+            token_norm_weight=(1 + randn((hidden_size,), 0.05)),
+            state_norm_weight=(1 + randn((hidden_size,), 0.05)),
+            combined_fc_weight=randn(
+                (hidden_size, 2 * hidden_size), (2 * hidden_size) ** -0.5
+            ),
+            positions=torch.arange(capacity_tokens, dtype=torch.int64, device=device),
+            output=output,
+            tokens=profile.tokens,
+        )
     return mtp.bind(
         planned,
         scratch=scratch,
@@ -379,6 +405,8 @@ def _benchmark_profile(
     l2_flush,
     capacity_tokens: int,
     policy=None,
+    contract="qwen_multistream",
+    hidden_size=None,
 ) -> dict[str, Any]:
     binding = _make_binding(
         profile,
@@ -386,16 +414,29 @@ def _benchmark_profile(
         device=device,
         capacity_tokens=capacity_tokens,
         policy=policy,
+        contract=contract,
+        hidden_size=hidden_size,
     )
-    reference = mtp.reference.feedback(
-        binding.token_embedding,
-        binding.multi_state,
-        binding.token_norm_weight,
-        binding.state_norm_weight,
-        binding.embedding_fc_weight,
-        binding.hidden_fc_weight,
-        eps=eps,
-    )
+    if contract == "rms_concat":
+        reference = mtp.reference.rms_concat(
+            binding.token_embedding,
+            binding.multi_state,
+            binding.positions,
+            binding.token_norm_weight,
+            binding.state_norm_weight,
+            binding.combined_fc_weight,
+            eps=eps,
+        )
+    else:
+        reference = mtp.reference.feedback(
+            binding.token_embedding,
+            binding.multi_state,
+            binding.token_norm_weight,
+            binding.state_norm_weight,
+            binding.embedding_fc_weight,
+            binding.hidden_fc_weight,
+            eps=eps,
+        )
     reference_finite = bool(torch.isfinite(reference).all().item())
     reference_nonzero = bool(torch.count_nonzero(reference).item())
     if not reference_finite or not reference_nonzero:
@@ -459,8 +500,9 @@ def _benchmark_profile(
         "shape": {
             "tokens": profile.tokens,
             "capacity_tokens": capacity_tokens,
-            "streams": _STREAMS,
-            "hidden_size": _HIDDEN_SIZE,
+            "streams": binding.plan.caps.streams,
+            "hidden_size": binding.plan.caps.hidden_size,
+            "contract": contract,
             "dtype": "bfloat16",
         },
         "storage": {
@@ -534,7 +576,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.output is not None and args.output.expanduser().exists():
         raise SystemExit(f"refusing to overwrite benchmark result: {args.output}")
 
-    require_sm120()
+    if not mtp.is_supported(args.device, contract=args.contract):
+        raise SystemExit("selected MTP contract is unavailable on this device")
     device = torch.device(args.device)
     if device.type != "cuda":
         raise SystemExit(f"--device must select CUDA, got {device}")
@@ -544,6 +587,7 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
 
     properties = torch.cuda.get_device_properties(device)
+    major, minor = torch.cuda.get_device_capability(device)
     mode_before = nvidia_smi_gpu_mode_snapshot()
     l2_flush = make_l2_flush_fn(
         args.flush_l2,
@@ -562,12 +606,18 @@ def main(argv: list[str] | None = None) -> None:
                 samples=args.samples,
                 l2_flush=l2_flush,
                 capacity_tokens=capacity_tokens,
+                contract=args.contract,
+                hidden_size=args.hidden_size,
             )
         )
 
     root = Path(__file__).resolve().parents[1]
     result = {
-        "kind": _RESULT_KIND,
+        "kind": (
+            _RESULT_KIND
+            if args.contract == "qwen_multistream"
+            else "rms_concat_mtp_feedback_benchmark_v1"
+        ),
         "provenance": {
             "command": [sys.executable, *sys.argv],
             "cwd": os.getcwd(),
@@ -578,16 +628,23 @@ def main(argv: list[str] | None = None) -> None:
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
         "contract": {
-            "model": "Qwen3.8 Flash Next",
+            "model": "GLM RMS-concat"
+            if args.contract == "rms_concat"
+            else "Qwen3.8 Flash Next",
             "operator": "b12x.sequence.mtp_feedback",
             "api_lifecycle": ["Caps", "plan", "bind", "run"],
-            "streams": _STREAMS,
-            "hidden_size": _HIDDEN_SIZE,
+            "streams": 1 if args.contract == "rms_concat" else _STREAMS,
+            "hidden_size": args.hidden_size
+            or (4096 if args.contract == "rms_concat" else _HIDDEN_SIZE),
             "dtype": "bfloat16",
-            "reference": "b12x.sequence.mtp_feedback.reference.feedback",
+            "recipe": args.contract,
+            "reference": "b12x.sequence.mtp_feedback.reference."
+            + ("rms_concat" if args.contract == "rms_concat" else "feedback"),
             "projection_backend": "cutedsl",
             "projection_specialization": "fixed_capacity_runtime_live_rows",
-            "triton_role": "normalization_and_reduction_auxiliaries",
+            "triton_role": None
+            if args.contract == "rms_concat"
+            else "normalization_and_reduction_auxiliaries",
             "eager_timed": True,
             "cuda_graph_replay_timed": True,
             "raw_samples_preserved": True,

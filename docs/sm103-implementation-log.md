@@ -1443,3 +1443,29 @@ source and fresh caches. Frozen QSRT coupled high-rate conversion, complete
 GLM/DeepSeek speculative integration and model evaluation, matching native
 vLLM/ARM64 builds, available-host SM121 regression and Station direct-HBM
 transport remain open. Physical SM103 execution remains unqualified.
+
+
+## GLM RMS-concat MTP feedback
+
+The existing MTP API represents GLM feedback with an explicit `rms_concat`
+contract. A CuTe kernel masks zero-position embeddings and applies independent
+ordinary RMS normalization; the retained CuTe BF16 projection consumes fixed
+concatenation scratch. The Qwen flattened Gemma contract and its optimized
+projections remain separate. Policy query schema 2 separates the contracts;
+Qwen profile entries preserve measured coverage and GLM uses AUTO heuristics.
+The generator races both normalization configurations through production plans.
+
+The companion GLM MTP layer uses retained scheduler-capacity storage and an
+opaque output-mutating Torch operator. Its final residual norm and normalized
+recycled state are preserved. Validation passes 622 host tests, 44 SM120 MTP
+and benchmark tests, 40 companion host tests and two companion eager/Inductor
+call-site tests with graph mutation. Memcheck and synccheck each pass five
+RMS-concat tests with zero kernel errors under the documented SM120 CUDA API
+reporting exception. The compile corpus produces 30 SM103 callables/entries,
+with no stack/local-memory flags. The [receipt](sm103-mtp-validation.json)
+records artifact identities and validation limits.
+
+Complete GLM checkpoint/model evaluation, DeepSeek per-stream FP8 feedback,
+DFlash2 execution, frozen QSRT coupled high-rate conversion, matching native
+vLLM/ARM64 builds, SM121 regression and Station HBM transport remain open.
+Physical SM103 execution remains unqualified.
