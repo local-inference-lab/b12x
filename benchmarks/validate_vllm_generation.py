@@ -121,6 +121,7 @@ def inspect_worker(worker):
         "speculator": type(speculator).__name__,
         "models": {},
         "graphs": {},
+        "nvfp4_comparisons": getattr(worker, "_nvfp4_comparisons", []),
     }
     for label, model in (
         ("target", runner.get_model()),
@@ -163,6 +164,76 @@ class GenerationValidationWorkerExtension:
 
     def inspect_generation_validation(self):
         return inspect_worker(self)
+
+    def compare_generation_nvfp4_layers(self, names):
+        """Compare selected eager calls using the same loaded weights and inputs."""
+        import torch
+
+        from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+            FlashInferCutlassNvFp4LinearKernel,
+        )
+
+        modules = dict(self.model_runner.get_model().named_modules())
+        comparisons = self._nvfp4_comparisons = []
+        for name in names:
+            layer = modules[name]
+            kernel = layer.quant_method.kernel
+            if type(kernel).__name__ != "B12xNvFp4LinearKernel":
+                raise ValueError(f"{name} does not use B12xNvFp4LinearKernel")
+            # Both providers consume the same swizzled, K-aligned weight layout.
+            # Padded checkpoint geometry needs a separate layout comparison.
+            if layer.weight.shape[1] * 2 % 128 or layer.weight.shape[0] % 128:
+                raise ValueError(f"{name} requires aligned NVFP4 diagnostic geometry")
+            reference = FlashInferCutlassNvFp4LinearKernel(kernel.config)
+
+            def install(name, kernel, reference):
+                original = kernel.apply_weights
+                seen = set()
+
+                def compared(layer, x, bias=None):
+                    actual = original(layer, x, bias)
+                    rows = x.numel() // x.shape[-1]
+                    if rows not in seen and len(seen) < 5:
+                        seen.add(rows)
+                        retained = actual.float().clone()
+                        expected = reference.apply_weights(layer, x, bias).float()
+                        if not bool(
+                            torch.isfinite(retained).all()
+                            and torch.isfinite(expected).all()
+                        ):
+                            raise AssertionError(f"{name} produced nonfinite values")
+                        delta = retained - expected
+                        denominator = expected.square().mean().sqrt()
+                        if float(denominator) == 0:
+                            raise AssertionError(f"{name} reference output is zero")
+                        comparisons.append(
+                            {
+                                "layer": name,
+                                "rows": rows,
+                                "input_shape": list(x.shape),
+                                "weight_shape": list(layer.weight.shape),
+                                "finite": True,
+                                "reference_rms": float(denominator),
+                                "max_absolute_error": float(delta.abs().max()),
+                                "relative_rms_error": float(
+                                    delta.square().mean().sqrt()
+                                    / denominator.clamp_min(1e-30)
+                                ),
+                                "cosine": float(
+                                    torch.nn.functional.cosine_similarity(
+                                        retained.flatten(), expected.flatten(), dim=0
+                                    )
+                                ),
+                                "unequal_elements": int((retained != expected).sum()),
+                                "elements": retained.numel(),
+                            }
+                        )
+                    return actual
+
+                kernel.apply_weights = compared
+
+            install(name, kernel, reference)
+        return list(names)
 
 
 def compare_runs(reference: dict, actual: dict) -> list[dict]:
@@ -227,8 +298,16 @@ def main():
     parser.add_argument("--require-full-graphs", action="store_true")
     parser.add_argument("--require-prefix-cache", action="store_true")
     parser.add_argument("--require-repeat-equality", action="store_true")
+    parser.add_argument(
+        "--compare-nvfp4-layer",
+        action="append",
+        default=[],
+        help="Eager diagnostic: compare this target layer with FlashInfer CUTLASS",
+    )
     args = parser.parse_args()
     config = json.loads(args.engine_config.read_text())
+    if args.compare_nvfp4_layer and not config.get("enforce_eager", False):
+        parser.error("NVFP4 layer comparisons require enforce_eager=true")
     extension = (
         "benchmarks.validate_vllm_generation.GenerationValidationWorkerExtension"
     )
@@ -306,6 +385,10 @@ def main():
         from vllm import LLM, SamplingParams
 
         llm = LLM(**config)
+        if args.compare_nvfp4_layer:
+            llm.collective_rpc(
+                "compare_generation_nvfp4_layers", args=(args.compare_nvfp4_layer,)
+            )
         report["workers_before"] = llm.collective_rpc("inspect_generation_validation")
         for worker in report["workers_before"]:
             kernels = {
@@ -358,6 +441,11 @@ def main():
             report["runs"].append(outputs)
             save()
         report["workers_after"] = llm.collective_rpc("inspect_generation_validation")
+        if args.compare_nvfp4_layer:
+            for worker in report["workers_after"]:
+                observed = {v["layer"] for v in worker["nvfp4_comparisons"]}
+                if observed != set(args.compare_nvfp4_layer):
+                    raise AssertionError("Not every requested NVFP4 layer executed")
         report["metrics"] = [
             dataclasses.asdict(m) for m in llm.get_metrics() if "spec_decode" in m.name
         ]

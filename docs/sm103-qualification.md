@@ -876,7 +876,9 @@ NVFP4 MLP weights. It does not qualify GLM, DeepSeek or Qwen Flash Next.
 | --- | --- |
 | b12x target graphs versus b12x eager, 2,482-token prompt corpus | All six request outputs match exactly; 67 target graph replays per rank; prefix reuse observed |
 | b12x eager versus FlashInfer eager, short prompts | Exact output IDs differ on two of four distinct prompts; cause unresolved |
+| b12x eager versus FlashInfer eager, 3,882-token prompt corpus | All six request outputs match exactly |
 | DFlash2 versus b12x target eager, 3,882-token prompt corpus | Target and draft execute; 1,648 cached tokens reused; 182 proposed tokens and 85 accepted; exact output IDs differ on two prompts |
+| FlashInfer DFlash2 versus FlashInfer target eager, same corpus | Prefix reuse and target/draft graphs execute; exact output IDs differ on one prompt |
 
 The DFlash2 run records 19 target and 63 draft query graph replays per rank.
 Its raw receipt remains failed because reference parity fails. An earlier
@@ -885,6 +887,26 @@ target-only reference. Neither case establishes full speculative correctness.
 The logs also retain inference-time JIT warnings. The native vLLM libraries
 used by these model runs come from a different source revision; matching
 native builds require separate acceptance.
+
+The FlashInfer speculative control proposes 147 tokens, accepts 77 and records
+16 target and 60 draft query graph replays per rank. Its exact-reference check
+also fails. Speculative token inequality is therefore present with both linear
+backends; their speculative outputs also differ from each other. The cause
+remains unresolved, and exact-reference validation remains failed.
+
+For an eager projection diagnostic, repeat `--compare-nvfp4-layer` with
+target module names from the receipt. The harness compares the first five
+distinct row counts observed for each selected NVFP4 layer against
+FlashInfer CUTLASS, using the same loaded weights and live activations. It
+records error metrics and returns the original b12x output to the model.
+Graph configurations are rejected for this diagnostic. It does not provide
+timing or allocation-free execution evidence.
+
+The sampled gate/up and down projections in layers 0, 31 and 63 match exactly
+across both ranks: 60 comparisons and 77,721,600 BF16 output elements, with
+live row counts 1, 32, 52, 234 and 256. All generated tokens also match the
+uninstrumented b12x eager reference. This narrows the full-model investigation
+but does not establish equality for every layer, row count or decoding mode.
 
 Companion revision `5e040862e127518c1cf5248c8f5113ab6d2e0985` supplies the
 b12x loader's file-range descriptors, source filtering, scoped allocation and
