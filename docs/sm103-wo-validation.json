@@ -1,0 +1,229 @@
+{
+  "schema": "b12x.sm103.wo.validation.v1",
+  "recorded_at_utc": "2026-09-14T12:32:13.072460+00:00",
+  "status": "implemented; host and SM120 regressions pass; native WO execution unqualified on SM103",
+  "runtime_qualified_on_sm103": false,
+  "performance_claims": false,
+  "base_revision": "1b675b5cb174175bdd82d755ebbad279a8d01757",
+  "source_sha256": "8101a89cfe5d7256878e3b5e6ad439b3339341ff103b89b4f235a3c6e66f7705",
+  "implementation": {
+    "backend": "mxfp8_tcgen05",
+    "config_schema_version": 2,
+    "capacity_retained": true,
+    "fixed_scratch_offsets": true,
+    "inverse_rope_accumulation": "FP32 before MXFP8 rounding",
+    "addressing": "Int64 row/group/cosine offsets",
+    "quantizer_compile_contract": 3,
+    "invalid_positions": "device error before out-of-range cosine access"
+  },
+  "compiled": {
+    "command": [
+      "scripts/compile_sm103.py",
+      "--component",
+      "wo_projection",
+      "--output-dir",
+      "/home/jasonc/b12x-sm103-evidence/wo-sm103-release",
+      "--nvdisasm",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvdisasm",
+      "--cuobjdump",
+      "/home/jasonc/b12x-sm103/.venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/cuobjdump"
+    ],
+    "manifest": {
+      "path": "/home/jasonc/b12x-sm103-evidence/wo-sm103-release/manifest.json",
+      "sha256": "a6240040b2eb561c40394311d652fe207d131ff787b4917cc9da1a8e6d78ab41",
+      "bytes": 75787
+    },
+    "callables": 56,
+    "quantizers": 48,
+    "native_gemms": 8,
+    "resources": {
+      "path": "/home/jasonc/b12x-sm103-evidence/wo-resources-release.json",
+      "sha256": "27e95aea7fd7f1ceed00548ebd09eec7348aa74fb0a3dca0144f3195e810c73e",
+      "bytes": 97677
+    },
+    "resource_summary": {
+      "manifest_sha256": "a6240040b2eb561c40394311d652fe207d131ff787b4917cc9da1a8e6d78ab41",
+      "source_sha256": "8101a89cfe5d7256878e3b5e6ad439b3339341ff103b89b4f235a3c6e66f7705",
+      "callables": 56,
+      "native_gemms": 8,
+      "quantizers": 48,
+      "position_guards": 32,
+      "stack_or_local_flags": [],
+      "max_allocated_registers": 134,
+      "max_static_smem": 1024,
+      "max_dynamic_smem": 67712
+    }
+  },
+  "validation": [
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/architecture",
+        "tests/policy",
+        "tests/gemm/test_wo_projection_scratch_bindings.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_103a"
+      },
+      "worktree": "/home/jasonc/b12x-sm103",
+      "passed": 523,
+      "skipped": 23,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-host-release.log",
+        "sha256": "ee4d7c89a9d27db610d848ab99679abafb7ea3e8166fe6eb1b92fd1a6fff15e7",
+        "bytes": 673
+      }
+    },
+    {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_gemm_wo_projection.py",
+        "tests/gemm/test_wo_projection.py",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-47363510-b87a-13a5-4824-2542e97df76c"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 44,
+      "skipped": 6,
+      "kernel_errors": null,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-sm120-source-final.log",
+        "sha256": "9bf44aca0a96e913a52536902d5b634c4a9e71424a7282542815c7c9eaa74d0b",
+        "bytes": 111
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "-k",
+        "not native and not invalid_cosine",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 13,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-quant-memcheck-source-final.log",
+        "sha256": "4783995366b6c862e4c113d971feb306e2db22e6fcc89b42fcdadafafd04e9ba",
+        "bytes": 176
+      }
+    },
+    {
+      "command": [
+        "/home/jasonc/b12x-sm103-regression-20260912/.deps/cuda_sanitizer_api-linux-x86_64-13.4.57-archive/compute-sanitizer/compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--report-api-errors",
+        "no",
+        "--error-exitcode",
+        "99",
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/gemm/test_sm103_wo_projection.py",
+        "-k",
+        "not native and not invalid_cosine",
+        "--disable-warnings",
+        "--tb=short"
+      ],
+      "environment": {
+        "CUTE_DSL_ARCH": "sm_120a",
+        "CUDA_VISIBLE_DEVICES": "GPU-cc109c01-9756-d0db-21ea-f1825d3f963f"
+      },
+      "worktree": "/home/jasonc/b12x-sm103-regression-20260912",
+      "passed": 13,
+      "skipped": 0,
+      "kernel_errors": 0,
+      "log": {
+        "path": "/home/jasonc/b12x-sm103-evidence/wo-quant-synccheck-release.log",
+        "sha256": "9b918e800348c34132b1c107e4bcf289b437f792dc919b73af1daa98b0190a52",
+        "bytes": 175
+      }
+    }
+  ],
+  "source_manifest": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-source-manifest.json",
+    "sha256": "b7e9b78f0353b55d51e35029743cd7766604c0722cbf492595de1aa603119859",
+    "bytes": 52611
+  },
+  "remote_source_check": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-ripper-source-check.json",
+    "sha256": "e6c67a25f4ff1a3144782e856d57a5153042bb5444dfd3d823b9e34c3efd29e3",
+    "bytes": 168
+  },
+  "qualification_prepared": {
+    "path": "/home/jasonc/b12x-sm103-evidence/wo-qualification-prepared/qualification.json",
+    "sha256": "f79d31f61ee31b921744fa8281c63571828de792fcdba2918eea1814d8923525",
+    "bytes": 2630
+  },
+  "package": {
+    "files": 463,
+    "python_files": 460,
+    "profiles": 3,
+    "artifacts": {
+      "b12x-1.3.0-py3-none-any.whl": {
+        "sha256": "9d0a02ee015f1f1658d0c164695adc1fcd2ac39550a5782db89e9b1a35b0de04",
+        "bytes": 2591035
+      },
+      "b12x-1.3.0.tar.gz": {
+        "sha256": "7a5b9e26f4bffff94ab243601268779a05cd7e24c60d395688b995f76a6336ef",
+        "bytes": 2362103
+      }
+    }
+  },
+  "provider_smoke": {
+    "cases": 4,
+    "scope": "SM120 production graph checks; samples are diagnostic only",
+    "log": {
+      "path": "/home/jasonc/b12x-sm103-evidence/wo-provider-sm120-release.log",
+      "sha256": "ace17ccc4385c5da648a878e99041b1f2c2d90dcd30ff16362fe2373e8867922",
+      "bytes": 2233
+    },
+    "runner": {
+      "path": "/home/jasonc/b12x-sm103-evidence/run_wo_probe.py",
+      "sha256": "104eb26518acab41d84322f51e4905298792671d2fcfe21e7643ca6897dcb226",
+      "bytes": 1146
+    }
+  },
+  "sanitizer_scope": "Kernel memcheck/synccheck; API reporting disabled only for the recorded CUDA-Python/SM120 driver probe mismatch. Invalid-position subprocess tests run outside sanitizer. Enable API reporting on SM103.",
+  "limitations": [
+    "Six native WO runtime cases require physical SM103; no native execution or performance claim",
+    "Companion vLLM still needs a retained WO plan owner, scratch, warmup and architecture admission",
+    "SM12x retains legacy projection paths, including allocating inverse-RoPE execution",
+    "Targeted WO compilation only; the complete representative SM103 corpus has not been rebuilt",
+    "SM121 regression and complete GLM/V4.1/DFlash2 model evaluation remain outstanding"
+  ]
+}

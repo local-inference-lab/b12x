@@ -21,6 +21,7 @@ numbers or measured B300 policy profile are included.
 | DeepSeek compressed MLA | Implemented planned ordinary-MMA decode/extend over separate V4/V4.1 SWA and indexed caches, with V4.1 cache writers; SM120 oracles and graph tests; SM103 compilation | Physical SM103 numerics, graphs, cache writes, and prefill resource qualification |
 | DSA indexer | Implemented FP8 scoring and exact radix selection; inline BF16 MXFP4 decode/prefill with the V4.1 rounding contract; SM120 regressions and SM103 compilation | SM103 score/top-k, high-pid, graph, and cooperative-merge qualification |
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
+| DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables | Native two-stage numerics and graphs; companion vLLM plan retention and warmup remain source work |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Implement capability routing, target/draft contracts and transport before physical qualification |
 
@@ -97,8 +98,9 @@ four mixed-rate projection launchers and 30 projection-tiered MoE launchers,
 and cache-writer launchers, 58 indexer launchers, ten unquantized projection launchers,
 38 quantized-linear and reduction launchers, 19 tensor/compact FP8 launchers, and 28 MXFP8
 activation-quantizer launchers, 58 FP6 projection/quantization launchers, and
-147 DeepSeek compressed attention/cache-writer launchers, and 131 mHC launchers:
-750 CuTe callables plus sixteen supporting activation-packing callables. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
+147 DeepSeek compressed attention/cache-writer launchers, 131 mHC launchers,
+and 56 WO projection/quantization launchers. The representative corpus contains
+806 CuTe callables plus sixteen supporting activation-packing callables. This is not an exhaustive specialization census. The GLM MoE compile defaults are K=4096, N=2048, E=288, top-k=8,
 capacity=8. `--capacity 128` exercises a separate prefill capacity. No CUDA
 context is needed for this offline command. Successful compilation does not
 establish valid runtime descriptors, numerics, ordering or performance.
@@ -135,6 +137,48 @@ Grace/Station behavior, and plugin installation are explicitly outside this
 operator suite. Passing it does not enable a model-wide serving route.
 
 ## Quantized projections
+
+`gemm.wo_projection` selects the `mxfp8_tcgen05` backend on SM103. Its bound
+`run` and `run_inv_rope` paths quantize grouped activations, execute WO-A,
+quantize the group-major intermediate, and execute WO-B through the shared
+native MXFP8 GEMM. Inverse RoPE stays in FP32 until activation quantization.
+Packed 128x128 and 32x32 UE8M0 weight layouts remain shared with SM12x; SM103
+does not allocate the additional SM12x tiled weight copies.
+
+Reserve `plan.scratch_specs()` before capture and warm the binding with `run`
+or `run_inv_rope`. SM103 bindings retain the planned capacity and fixed scratch
+offsets. Live rows remain launch arguments, and quantization overwrites padded
+scale bytes on every call. Values, weights, positions, cosine cache and scratch
+must share one device. Input and writable buffers must not overlap. Positions
+must index the cosine cache; invalid indices raise a device error. Pool-scaled
+offsets use Int64, including cosine-cache addresses beyond 2^31 elements.
+SM103 inverse-RoPE execution requires a binding; the legacy allocating
+convenience call is not admitted on that architecture.
+
+The [WO validation receipt](sm103-wo-validation.json) records host contracts,
+SM120 quantizer and legacy projection regressions, and SM103 compilation.
+The CuTe quantizers use 28–40 allocated registers; the eight native GEMM
+specializations use 134 registers, 1,024 bytes of static shared memory and
+67,712 bytes of dynamic shared memory. No stack or local-memory flags appear.
+These are static resource results, not occupancy or performance measurements.
+The complete corpus has not been rebuilt for this component addition.
+
+```bash
+python scripts/compile_sm103.py --component wo_projection \
+  --output-dir /tmp/sm103-wo-compile
+python scripts/qualify_sm103.py --component wo_projection --execute \
+  --device-uuid GPU-actual-B300-UUID --output-dir /tmp/sm103-wo-runtime
+```
+
+The hardware suite checks exact quantizer bytes and padded scales, validates
+both GEMM stages against independently decoded FP32 references, freezes kernel
+resolution across M1/M3/M8/M9/M16/M127/M128/M129, and checks input mutation,
+poisoned scratch, explicit streams, stable addresses and allocation-free replay.
+Stage relative L2 must remain below 0.005 and cosine above 0.9999. It also tests
+the 4 GiB cosine-cache boundary and isolates invalid-position tests in separate
+processes. Companion vLLM still needs a retained WO plan owner and warmup before
+its SM103 attention route can be enabled. SM12x retains its existing projection
+and quantization paths, including the legacy inverse-RoPE allocation behavior.
 
 Tensor-scaled and compact K128 block-FP8 linears accept caller-owned output
 and scratch through `gemm.blockscaled.mm` and `mm_block_fp8`. Reserve
@@ -954,6 +998,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | DSA | `attention/dsa_indexer`: physical SM103 qualification of FP8 and MXFP4 score/select paths, cooperative merge, high page IDs, and graph replay |
 | KDA/GDN | `sequence/{gdn_decode,kda_prefill,gdn_prefill}`: physical SM103 qualification of implemented CuTe paths; admit chunk-parallel GDN only after its own corpus |
 | Dense/draft linears | `gemm/blockscaled/_sm103.py`, `_a16_cute.py`, `_fp8_cute.py`, `_fp6.py`, `gemm/block_fp8_linear`: qualify native block-scaled, A16, tensor/compact FP8, planned BF16/FP16 block-FP8, and FP6 workspace execution |
+| DeepSeek WO projection | `gemm/wo_projection/_execution.py`, `_quant_cute.py`: qualify native bound execution; add the companion vLLM WO plan owner, retained scratch and warmup before enabling its SM103 attention route |
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`: qualify uniform and MCG projection-tiered execution, including 384-expert records; add paired/grouped or coupled mixed rates required by the selected checkpoint |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |

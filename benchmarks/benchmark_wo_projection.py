@@ -106,6 +106,8 @@ def check_outputs(
             f"non-finite output detected vs {label}: "
             f"candidate_finite={cand_finite}, reference_finite={ref_finite}"
         )
+    if not torch.count_nonzero(candidate).item() or not torch.count_nonzero(reference).item():
+        raise CorrectnessError(f"zero output detected vs {label}")
     diff = (candidate.float() - reference.float()).abs()
     max_abs = diff.max().item()
     rmse = diff.square().mean().sqrt().item()
@@ -394,7 +396,11 @@ def bench_one(
     nope_dim: int,
     rope_dim: int,
     compare_deepgemm: bool = False,
+    capacity: int | None = None,
 ) -> dict[str, object]:
+    capacity = tokens if capacity is None else capacity
+    if capacity < tokens or tokens <= 0:
+        raise ValueError("WO benchmark requires positive tokens within planned capacity")
     case = make_case(
         tokens=tokens,
         groups=groups,
@@ -415,7 +421,7 @@ def bench_one(
         plan = plan_wo_projection_scratch(
             WOProjectionScratchCaps(
                 device="cuda",
-                max_tokens=tokens,
+                max_tokens=capacity,
                 groups=groups,
                 group_width=group_width,
                 rank=rank,
@@ -437,7 +443,7 @@ def bench_one(
                 nope_dim=nope_dim,
                 rope_dim=rope_dim,
                 return_3d=True,
-                expected_m=tokens,
+                expected_m=capacity,
             )
 
             def b12x_launch() -> torch.Tensor:
@@ -449,7 +455,7 @@ def bench_one(
                 source_tgd=case["x_tgd"],
                 weights=case["weights"],
                 return_3d=True,
-                expected_m=tokens,
+                expected_m=capacity,
             )
 
             def b12x_launch() -> torch.Tensor:
@@ -458,12 +464,6 @@ def bench_one(
         b12x_replay, b12x_graph_out = capture_graph_replay(b12x_launch)
         results["b12x_replay"] = b12x_replay
         results["b12x_out"] = b12x_graph_out if inv_rope else binding.output
-        results["b12x"] = bench_events(
-            b12x_replay,
-            warmup=warmup,
-            iters=iters,
-            l2_flush=l2_flush,
-        )
     except Exception as exc:
         results["b12x"] = None
         print(f"      b12x two-GEMM FAILED: {exc}")
@@ -486,12 +486,6 @@ def bench_one(
             torch_graph_out = torch_outputs[0]
         results["torch_replay"] = torch_replay
         results["torch_out"] = torch_graph_out
-        results[REFERENCE_LABEL] = bench_events(
-            torch_replay,
-            warmup=warmup,
-            iters=iters,
-            l2_flush=l2_flush,
-        )
     except Exception as exc:
         results[REFERENCE_LABEL] = None
         print(f"      {REFERENCE_LABEL} FAILED: {exc}")
@@ -510,12 +504,6 @@ def bench_one(
             dg_replay, dg_graph_out = capture_graph_replay(dg_launch)
             results["deepgemm_replay"] = dg_replay
             results["deepgemm_out"] = dg_graph_out
-            results[DEEPGEMM_LABEL] = bench_events(
-                dg_replay,
-                warmup=warmup,
-                iters=iters,
-                l2_flush=l2_flush,
-            )
         except Exception as exc:
             results[DEEPGEMM_LABEL] = None
             print(f"      deepgemm WO chain FAILED: {exc}")
@@ -542,6 +530,11 @@ def bench_one(
                 label=f"{REFERENCE_LABEL} (deepgemm route)",
             )
 
+    for label, replay_key in (("b12x", "b12x_replay"), (REFERENCE_LABEL, "torch_replay"),
+                              (DEEPGEMM_LABEL, "deepgemm_replay")):
+        replay = results.get(replay_key)
+        if replay is not None:
+            results[label] = bench_events(replay, warmup=warmup, iters=iters, l2_flush=l2_flush)
     return results
 
 
