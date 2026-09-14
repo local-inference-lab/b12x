@@ -81,6 +81,9 @@ class TrellisWeights:
     ``atoms`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
+    ``global_intermediate_size`` and ``intermediate_offset`` locate this rank
+    on the checkpoint's intermediate axis, in channels. Nonzero coupled draws
+    require that metadata so preparation slices the global sign sequence.
     """
 
     atoms: torch.Tensor
@@ -89,6 +92,8 @@ class TrellisWeights:
     intermediate_scales: ScaleFactors
     output_scales: ScaleFactors
     expert_transform_draws: torch.Tensor | None = None
+    global_intermediate_size: int | None = None
+    intermediate_offset: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.atoms, torch.Tensor):
@@ -108,6 +113,21 @@ class TrellisWeights:
             raise TypeError(
                 "TrellisWeights.expert_transform_draws must be a tensor or None"
             )
+        for name, value in (
+            ("global_intermediate_size", self.global_intermediate_size),
+            ("intermediate_offset", self.intermediate_offset),
+        ):
+            if value is None and name == "global_intermediate_size":
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"TrellisWeights.{name} must be an integer")
+            minimum = 32 if name == "global_intermediate_size" else 0
+            if value < minimum or value % 32:
+                raise ValueError(
+                    f"TrellisWeights.{name} must be a multiple of 32 at least {minimum}"
+                )
+        if self.intermediate_offset and self.global_intermediate_size is None:
+            raise ValueError("intermediate_offset requires global_intermediate_size")
 
 
 @dataclass(frozen=True)

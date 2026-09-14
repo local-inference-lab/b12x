@@ -76,6 +76,9 @@ def test_transform_oracles_live_counts_and_graph(
             activation=kind,
             dtype=dtype,
             per_expert_scales=not broadcast,
+            transform_draw=5,
+            global_intermediate_size=4 * width,
+            intermediate_offset=width,
         )
         state, _, _ = _mixed_contract(
             SimpleNamespace(weight_E=experts, k=hidden, n=width, device=device),
