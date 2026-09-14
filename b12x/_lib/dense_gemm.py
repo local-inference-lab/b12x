@@ -1459,7 +1459,10 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        fragment = sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        # The mainloop addresses each scale fragment as (values, rows, K).
+        # MXFP4 may expose several trailing K modes; preserve their order.
+        return cute.group_modes(fragment, 2) if cute.rank(fragment) > 3 else fragment
 
     def _partition_fragment_SFB(
         self,
@@ -1467,7 +1470,8 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        fragment = sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        return cute.group_modes(fragment, 2) if cute.rank(fragment) > 3 else fragment
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
         return sm120_utils.thrfrg_SFA(sfa_tensor, tiled_mma)

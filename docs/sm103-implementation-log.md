@@ -889,3 +889,47 @@ NVFP4, MXFP4 and tensor/block FP8 serving adapters still need configured
 capacity and workspace integration. DeepSeek output projection, remaining
 Trellis formats, GLM/DeepSeek feedback, complete model evaluation and Station
 HBM transport remain implementation or integration work.
+
+## FP4 serving capacities and activation buffers
+
+Status: implemented and cross-compiled; physical SM103 execution remains
+unqualified. The companion NVFP4 and MXFP4 adapters retain configured capacities
+and reserve packed activation values and scales before capture. A shared
+execution owner also preserves MXFP8 workspace handling and retains borrowed
+buffers in captured graphs. NVFP4 uses the native out-quantizer, clears its
+unwritten scale padding, and preserves the original alpha tensor. Strided
+activations are made contiguous before quantization.
+
+The public `gemm.blockscaled.quantize_mxfp4` helper writes caller-owned E2M1
+values and UE8M0 F8_128x4 scale storage, including padding. Its supporting
+Triton kernel preserves signed zero and uses runtime row counts; core GEMM
+remains CuTe DSL. On SM120, MXFP4 scale fragments with several trailing K modes
+are grouped into the mainloop's three-mode contract. This preserves math,
+fragment order and launch policy. The long-K regression uses an exact FP32
+oracle because Torch BF16 GEMM can reduce partial sums to BF16.
+
+Validation: 52 b12x host tests and eight qualification-tool tests pass; 231
+SM120 operator tests pass with 40 hardware/dependency skips. Ten MXFP4 cases
+pass both memcheck and synccheck. The companion passes 53 host tests and 38
+GPU cases under both sanitizers: twenty FP4 serving cases, twelve MXFP8
+regressions and six MXFP4 byte comparisons against FlashInfer. Sanitizers
+report zero kernel errors. Tests cover BF16/FP16, eager/Inductor, exact packed
+bytes and scale padding, finite extremes/subnormals, input mutation, frozen
+kernel resolution, poisoned buffers, stable addresses and no replay allocation.
+These are operator tests; complete model evaluation remains outstanding.
+
+SM103 compilation covers 36 dense and sixteen supporting packing callables.
+Existing resources, exact register counts and instruction counts match the
+previous targeted artifacts. All 22 dense TMEM readers retain completion
+waits. The six added MXFP4 packers have no stack/local-memory flags. Four
+NVFP4 packing variants retain eight-byte stack frames with FP32 division
+slow-path calls and no SASS local loads/stores. Wheel and sdist match 458
+package Python files and three profiles. The
+[FP4 serving receipt](sm103-fp4-serving-validation.json) records exact sources,
+commands, artifacts and limits. This is a targeted compile, not a rebuild of
+the complete SM103 corpus.
+
+Tensor/block FP8 serving capacity and workspace, DeepSeek output projection,
+remaining Trellis formats, GLM/DeepSeek speculative feedback, complete model
+execution and Station direct-HBM transport remain implementation or integration
+work. SM121 regression and physical SM103 qualification remain outstanding.

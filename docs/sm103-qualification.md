@@ -171,14 +171,38 @@ python scripts/compile_sm103.py --component activation_packing \
   --output-dir /tmp/sm103-activation-packing
 ```
 
-This component is also included in `--component all`. It compiles ten
-BF16/FP16 MXFP8 and BF16 NVFP4 packing variants, including K padding and
+This component is also included in `--component all`. It compiles sixteen
+BF16/FP16 MXFP8/MXFP4 and BF16 NVFP4 packing variants, including K padding and
 reciprocal NVFP4 global scales, with runtime row counts. Core compute remains
 CuTe DSL. The [MXFP8 serving receipt](sm103-linear-workspace-validation.json)
 records targeted dense and packing artifacts and available-hardware evidence.
 The companion vLLM MXFP8 graph test admits SM103 and validates configured
 capacity reuse, input mutation, poisoned scratch, stable addresses and replay
 allocation counts. Physical B300 execution remains required.
+
+`gemm.blockscaled.quantize_mxfp4` packs contiguous BF16/FP16 activations into
+caller-owned E2M1 values and UE8M0 F8_128x4 scale storage. It overwrites all
+padded scales, preserves signed zero, and uses a runtime row count. The
+companion NVFP4 and MXFP4 adapters reserve their packed activation buffers
+before capture and pass configured capacities into GEMM. NVFP4 retains the
+native vLLM out-quantizer and its original alpha tensor; strided activations
+are made contiguous, and native scale padding is cleared before reuse.
+
+The MXFP4 packing suite is included in `qualify_sm103.py --component blockscaled`.
+Run companion FP4/MXFP8 graph tests and MXFP4 byte comparisons on physical B300:
+
+```bash
+CUTE_DSL_ARCH=sm_103a .venv/bin/python -m pytest \
+  tests/model_executor/kernels/test_b12x_linear.py \
+  -k 'serving_graph or packing_matches_flashinfer' -q
+```
+
+Run that command from the companion vLLM checkout. Its tests cover BF16/FP16,
+eager/Inductor, strided inputs, capacity boundaries, exact quantizer bytes,
+independent GEMM references, poisoned buffers, frozen kernel resolution,
+retained workspace, stable addresses, and no replay allocation. The
+[FP4 serving receipt](sm103-fp4-serving-validation.json) records available-hardware
+checks separately from deferred SM103 and complete model execution.
 
 The precision generator races actual public A16 and native quantized calls.
 Its NVFP4 oracle independently rounds activations to E2M1/E4M3 and evaluates
