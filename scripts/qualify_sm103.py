@@ -38,6 +38,7 @@ SUITES = {
     "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k", "not standalone_cute_norm"],
     "mla_compress": ["tests/attention/test_mla_compress.py"],
     "embedding": ["tests/sequence/test_embedding.py"],
+    "engram": ["tests/sequence/test_engram.py"],
     "hyperconnection": ["tests/norm/test_hyperconnection.py"],
     "dense_mla": [
         "tests/attention/test_dense_mla.py",
