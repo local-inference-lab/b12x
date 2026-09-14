@@ -66,7 +66,7 @@ def run(weight, ids, *, out, plan: Plan, num_rows=None):
 
 
 def is_supported(device=None):
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 def clear_caches():

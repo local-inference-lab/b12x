@@ -1340,11 +1340,128 @@ def compile_bf16_projection(out):
         ),
     ):
         for n, k in (
-            (97, 259), (248320, 2560), (124160, 5120),
+            (97, 259), (248320, 2560), (124160, 5120), (129280, 5120),
             (154880, 4096), (77440, 6144), (524297, 4096),
         ):
             name = f"vocabulary_n{n}_k{k}"
             vocab.compile_kernel(n, k, 0, "sm_103a")
+    return launches
+
+
+def compile_v41_support(out, component):
+    """Compile production CSA, embedding and HyperConnection launch factories."""
+    from contextlib import nullcontext
+
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    with patch.object(torch.cuda, "device", lambda *args: nullcontext()):
+        if component in ("mla_compress", "all"):
+            from b12x.attention.mla_compress import _cute as compressor
+
+            compressor.compile_compress.cache_clear()
+            with (
+                patch.object(compressor, "compile_cute", capture),
+                patch.object(compressor, "current_cuda_stream", lambda: cuda.CUstream(0)),
+            ):
+                for ratio in (1, 2):
+                    for tokens, requests, states in ((12, 4, 8), (8192, 128, 2**22 + 2)):
+                        case = f"mla_compress_ratio{ratio}_t{tokens}_r{requests}_s{states}"
+                        compressor.compile_compress(ratio, tokens, requests, states, 0)
+        if component in ("embedding", "all"):
+            from b12x.sequence.embedding import _kernel as embedding
+
+            embedding._compile.cache_clear()
+            with (
+                patch.object(embedding, "compile_cute", capture),
+                patch.object(embedding, "current_cuda_stream", lambda: cuda.CUstream(0)),
+            ):
+                for width in (129, 4096, 5120):
+                    for dtype in (torch.bfloat16, torch.float32):
+                        for ids in (torch.int32, torch.int64):
+                            case = f"embedding_h{width}_{dtype}_{ids}"
+                            embedding._compile(width, dtype, ids, 0)
+        if component in ("hyperconnection", "all"):
+            from b12x.norm.hyperconnection import _cute as hc
+
+            def tensor(*shape, dtype=torch.bfloat16):
+                return torch.empty(shape, device="meta", dtype=dtype)
+
+            def compile_run(key, entry, tensors, *, eps=None, runtime_ints=(), runtime_int64s=()):
+                hc._compile(
+                    key, entry, len(tensors), torch.device("cuda:0"),
+                    has_eps=eps is not None, runtime_ints=len(runtime_ints),
+                    runtime_int64s=len(runtime_int64s),
+                    pointer_dtypes=tuple(t.dtype for t in tensors),
+                )
+
+            hc.clear_caches()
+            with (
+                patch.object(hc, "compile_cute", capture),
+                patch.object(hc, "current_cuda_stream", lambda: cuda.CUstream(0)),
+                patch.object(hc, "_device_index", lambda tensor: 0),
+                patch.object(hc, "_run", compile_run),
+            ):
+                for streams, hidden in ((1, 5120), (4, 5120), (4, 2560), (3, 257)):
+                    prefix = f"hyperconnection_s{streams}_h{hidden}"
+                    state = tensor(1, streams * hidden)
+                    for zero_centered, dtype in ((True, torch.bfloat16), (False, torch.bfloat16), (False, torch.float32)):
+                        case = f"{prefix}_norm_centered{int(zero_centered)}_{dtype}"
+                        hc.grouped_rmsnorm(state, tensor(streams * hidden, dtype=dtype),
+                            tensor(1, streams * hidden), eps=1e-6, streams=streams,
+                            hidden_size=hidden, zero_centered=zero_centered)
+                    for mask in (False, True):
+                        case = f"{prefix}_engram_mask{int(mask)}"
+                        hc.engram_mix(state, tensor(1, 2 * hidden), tensor(2, streams, hidden),
+                            tensor(1, dtype=torch.bool) if mask else None,
+                            tensor(1, streams * hidden), eps=1e-6,
+                            streams=streams, hidden_size=hidden)
+                    case = f"{prefix}_gate"
+                    hc.gate_mean(state, tensor(1, streams * hidden), tensor(1, hidden),
+                        streams=streams, hidden_size=hidden)
+                    case = f"{prefix}_combine"
+                    hc.combine(state, tensor(1, hidden), tensor(1, streams),
+                        tensor(1, streams * hidden), streams=streams, hidden_size=hidden)
+                    if (streams, hidden) == (4, 2560):
+                        case = f"{prefix}_combine_norm"
+                        hc.combine_norm(state, tensor(1, hidden), tensor(1, streams),
+                            tensor(streams * hidden), tensor(1, streams * hidden),
+                            tensor(1, streams * hidden), eps=1e-6,
+                            streams=streams, hidden_size=hidden)
+                    case = f"{prefix}_scaled_silu"
+                    hc.scaled_silu(tensor(1, 320), tensor(1, 320), streams=streams)
+                for left in (torch.bfloat16, torch.float32):
+                    for right in (torch.bfloat16, torch.float32):
+                        for output in (torch.bfloat16, torch.float32):
+                            case = f"hyperconnection_add_{left}_{right}_{output}"
+                            hc.pointwise("add", tensor(1, 257, dtype=left),
+                                tensor(1, 257, dtype=right), tensor(1, 257, dtype=output))
+                    for output in (torch.bfloat16, torch.float32):
+                        case = f"hyperconnection_sigmoid_{left}_{output}"
+                        value = tensor(1, 257, dtype=left)
+                        hc.pointwise("sigmoid", value, value, tensor(1, 257, dtype=output))
+                for width in (257, 2048, 2304):
+                    for limit in (2.0, float("inf")):
+                        for rounded in (False, True):
+                            case = f"hyperconnection_swiglu_h{width}_limit{limit}_round{int(rounded)}"
+                            value = tensor(1, 2 * width)
+                            hc.pointwise("swiglu", value, value, tensor(1, width),
+                                width=width, limit=limit, round_silu=rounded)
     return launches
 
 
@@ -1671,6 +1788,9 @@ def main():
             "trellis",
             "sequence",
             "mtp_feedback",
+            "mla_compress",
+            "hyperconnection",
+            "embedding",
             "dense_mla",
             "sparse_mla",
             "compressed_mla",
@@ -1804,6 +1924,8 @@ def main():
             launches.update(compile_fp6(out))
         if args.component in ("block_fp8_linear", "all"):
             launches.update(compile_block_fp8_linear(out))
+        if args.component in ("mla_compress", "hyperconnection", "embedding", "all"):
+            launches.update(compile_v41_support(out, args.component))
         if args.component in ("wo_projection", "all"):
             launches.update(compile_wo_projection(out))
         if args.component in ("activation_packing", "all"):
