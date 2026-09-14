@@ -1,9 +1,10 @@
-"""MTP token/multi-stream feedback fusion.
+"""MTP token and hidden-state feedback through fixed-capacity plans.
 
-The op normalizes and projects a token embedding alongside the target model's
-pre-final multi-stream residual state.  State normalization intentionally uses
-one flattened ``S*H`` variance group; the hidden projection is shared across
-streams.  The result is a caller-owned BF16 ``[T, S, H]`` draft-layer input.
+``qwen_multistream`` normalizes the target's pre-final state over flattened
+``S*H`` with Gemma weights, then adds separate projections into BF16 ``[T,S,H]``.
+``rms_concat`` masks zero-position embeddings, independently RMS-normalizes
+embedding and hidden state with ordinary learned weights, and projects their
+concatenation into BF16 ``[T,H]`` for GLM feedback.
 
 ``plan(Caps(...), invocation=invocation_from_tensors(...))`` declares capacity
 and input alignment. ``PreparationSession`` compiles and primes the complete
@@ -23,6 +24,7 @@ META = OpMeta(
     name="mtp_feedback",
     group="sequence",
     api_style="planned",
+    archs=("sm103a", "sm120a", "sm121a"),
     entry_points=(
         "Caps",
         "Plan",
@@ -37,7 +39,7 @@ META = OpMeta(
         "is_supported",
     ),
     dtypes=("bf16",),
-    requires=("triton",),
+    requires=(),
     provenance=Provenance(
         repo="https://github.com/lukealonso/b12x",
         commit="fa097786643f49d9e9591fd8b2eb0cb3398d8f79",
@@ -46,10 +48,10 @@ META = OpMeta(
     test_path="tests/sequence/test_mtp_feedback.py",
     since="1.3.0",
     notes=(
-        "Qualified Qwen S=4,H=2560 uses mandatory capacity-specialized "
-        "CuTeDSL projection GEMMs with runtime live-row grids. Triton is used "
-        "only by the normalization and reduction auxiliaries feeding those "
-        "projections. Other geometries or tensor contracts are unsupported."
+        "Both contracts use CuTeDSL projections with runtime live-row grids. "
+        "Qwen S=4,H=2560 requires Triton normalization auxiliaries; RMS-concat "
+        "uses CuTe normalization, S=1 and H divisible by 64 through 16384. "
+        "SM103 runtime qualification requires physical B300 hardware."
     ),
 )
 

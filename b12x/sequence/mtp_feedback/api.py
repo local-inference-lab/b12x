@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..._lib.gating import has_cutlass_dsl, has_triton
+from ..._lib.gating import default_is_supported
 
 from . import reference
 from ._impl import Binding, Caps, Plan, bind, plan, run
@@ -10,10 +10,15 @@ from ._preparation import invocation_from_tensors
 from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery
 
 
-def is_supported(device=None) -> bool:
-    """True when mandatory CuTe projections and Triton auxiliaries are usable."""
-    del device
-    return has_cutlass_dsl() and has_triton()
+def is_supported(device=None, *, contract="qwen_multistream") -> bool:
+    """Check the architecture and toolchain for the selected feedback contract."""
+    if contract == "rms_concat":
+        return default_is_supported(device, archs=("sm103a", "sm120a", "sm121a"))
+    if contract == "qwen_multistream":
+        return default_is_supported(
+            device, requires=("triton",), archs=("sm103a", "sm120a", "sm121a")
+        )
+    return False
 
 
 __all__ = [
