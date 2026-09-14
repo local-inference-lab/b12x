@@ -290,6 +290,7 @@ class MoEWeightPreparationPlan:
     trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
     coupled_hadamard_blocks: tuple[int, int] | None = None
+    trellis_group_size: int | None = None
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)
@@ -318,6 +319,16 @@ class MoEWeightPreparationPlan:
             self, "storage_policy", WeightStoragePolicy(self.storage_policy)
         )
         object.__setattr__(self, "coupled_hadamard", bool(self.coupled_hadamard))
+        if self.trellis_group_size is not None and (
+            self.source_format != "b12x_trellis"
+            or type(self.trellis_group_size) is not int
+            or self.trellis_group_size <= 0
+            or self.trellis_group_size % 32
+            or self.intermediate_size % self.trellis_group_size
+        ):
+            raise ValueError(
+                "canonical Trellis group size must be a positive multiple of 32 dividing the local intermediate width"
+            )
         if self.source_format in _TRELLIS_SOURCE_FORMATS:
             bits = 3 if self.trellis_bits is None else int(self.trellis_bits)
             codebook = (
@@ -398,7 +409,10 @@ class MoEWeightPreparationPlan:
                     raise ValueError(
                         "projection-tiered coupled Trellis requires canonical b12x_trellis weights"
                     )
-                if self.trellis_codebook != _TRELLIS_MCG:
+                if (
+                    self.trellis_codebook != _TRELLIS_MCG
+                    and self.source_format != "b12x_trellis"
+                ):
                     raise ValueError(
                         "per-expert-projection trellis rates require the mcg codebook"
                     )
@@ -753,6 +767,7 @@ def plan_moe_weight_preparation(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Iterable[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    trellis_group_size: int | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -1010,6 +1025,7 @@ def plan_moe_weight_preparation(
             else frozenset(str(kind) for kind in trellis_pair_kinds)
         ),
         coupled_hadamard_blocks=coupled_hadamard_blocks,
+        trellis_group_size=trellis_group_size,
     )
 
 

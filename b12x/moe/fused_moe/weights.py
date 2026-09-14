@@ -81,6 +81,12 @@ class TrellisWeights:
     ``atoms`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
+    A configured group size appends a local ``I_local/group_size`` rate axis;
+    the rank extent must start on a group boundary. Each rate byte stores
+    independent low/high plane bit widths in its low/high nibbles. Atom rows
+    concatenate expert-major gate/up/down sections, each with its low plane
+    followed by its high plane. Grouped rows may end in zero padding; their
+    storage and physical row stride must be aligned to 16 bytes.
     ``global_intermediate_size`` and ``intermediate_offset`` locate this rank
     on the checkpoint's intermediate axis, in channels. Nonzero coupled draws
     require that metadata so preparation slices the global sign sequence.
