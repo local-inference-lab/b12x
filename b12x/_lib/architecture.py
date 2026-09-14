@@ -97,6 +97,7 @@ def require_kernel_architecture(
         "b12x.gemm.blockscaled._sm103",
         "b12x.gemm.blockscaled._fp6",
         "b12x.gemm._shared.sm103_blockscaled",
+        "b12x.gemm.wo_projection._quant_cute",
         "b12x._lib.quant.mxfp8_rows",
         "b12x.quantization.mxfp6._rows",
         "b12x.norm.mhc._kernels",

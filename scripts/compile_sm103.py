@@ -1227,6 +1227,59 @@ def compile_block_fp8_linear(out):
     return launches
 
 
+def compile_wo_projection(out):
+    """Compile WO quantization, inverse RoPE, and both native projection stages."""
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+    from b12x.gemm.wo_projection import _quant_cute as quant
+    from b12x.gemm.blockscaled import _sm103 as gemm
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec, **kwargs):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    quant._get_compiled_wo_quant.cache_clear()
+    gemm.compile_kernel.cache_clear()
+    with (patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+          patch.object(quant, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(quant, "b12x_compile", capture),
+          patch.object(gemm, "b12x_compile", capture)):
+        for groups, width, rank, hidden in ((1, 128, 128, 256), (2, 512, 256, 2560),
+                                          (3, 512, 512, 2560), (4, 4096, 1024, 4096)):
+            shape = f"g{groups}_w{width}_r{rank}"
+            for dtype in (torch.bfloat16, torch.float16):
+                for mode in ("grouped", "group_major"):
+                    span = width if mode == "grouped" else rank
+                    case = f"wo_{shape}_{dtype}_{mode}"
+                    quant._get_compiled_wo_quant(mode, groups * span, span, dtype,
+                                                False, 0, 0, 0, torch.int64,
+                                                torch.bfloat16, 0, "sm_103a")
+                head = 128 if width == 128 else 512
+                rope = 32 if head == 128 else 64
+                for positions_dtype in (torch.int32, torch.int64):
+                    for cache_dtype in (torch.bfloat16, torch.float32):
+                        case = f"wo_{shape}_{dtype}_rope_{positions_dtype}_{cache_dtype}"
+                        quant._get_compiled_wo_quant(
+                            "grouped", groups * width, width, dtype, True,
+                            head, head - rope, rope, positions_dtype, cache_dtype, 0, "sm_103a",
+                        )
+            for stage, n, k, batch in (("a", rank, width, groups), ("b", hidden, groups * rank, 1)):
+                case = f"wo_{shape}_{stage}"
+                gemm.compile_kernel(n, k, batch, "mxfp8", "bfloat16", 0, True)
+    return launches
+
+
 def compile_activation_packing(out):
     """Compile the supporting BF16/FP16 quantizer with runtime row counts."""
     import triton
@@ -1464,6 +1517,7 @@ def main():
             "fp8",
             "fp6",
             "block_fp8_linear",
+            "wo_projection",
             "activation_packing",
             "all",
         ),
@@ -1584,6 +1638,8 @@ def main():
             launches.update(compile_fp6(out))
         if args.component in ("block_fp8_linear", "all"):
             launches.update(compile_block_fp8_linear(out))
+        if args.component in ("wo_projection", "all"):
+            launches.update(compile_wo_projection(out))
         if args.component in ("activation_packing", "all"):
             launches.update(compile_activation_packing(out))
         artifacts = []
