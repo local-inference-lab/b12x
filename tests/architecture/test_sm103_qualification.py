@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from scripts import qualify_sm103 as qualification
+from scripts.audit_sm103_resources import metrics
 from scripts._sm103_source import package_source_sha256, source_identity
 
 
@@ -139,6 +140,38 @@ def test_compile_artifact_integrity_rejects_tampering(tmp_path):
     (directory / "kernel.cubin").write_bytes(b"modified")
     with pytest.raises(ValueError, match="identity mismatch"):
         qualification.verify_compile_artifacts(tmp_path / "manifest.json", manifest)
+
+
+@pytest.mark.parametrize(
+    "instruction,native_mma,accepted",
+    [
+        ("UTCHMMA idesc[UR4], UPT ;", True, True),
+        ("UTCOMMA.BLOCK16 idesc[UR4], UPT ;", True, True),
+        ("UTCQMMA idesc[UR4], UPT ;", True, True),
+        ("@!UP0 UTCQMMA idesc[UR4], UPT ;", True, True),
+        ("HMMA.16816.F32 R0, R4, R8, R0 ;", True, False),
+        ("BRA UTCQMMA.target ;", True, False),
+        ("HMMA.16816.F32 R0, R4, R8, R0 ;", False, True),
+    ],
+)
+def test_resource_audit_requires_native_mma_opcode(
+    tmp_path, instruction, native_mma, accepted
+):
+    directory = tmp_path / "kernel"
+    directory.mkdir()
+    payloads = {
+        "kernel.resources.txt": "REG:32 STACK:0 SHARED:1024 LOCAL:0\n",
+        "kernel.sass": f"// UTCQMMA\n/*0000*/ {instruction}\n",
+        "kernel.ptx": ".target sm_103a\n",
+    }
+    for name, payload in payloads.items():
+        (directory / name).write_text(payload)
+    artifact = dict(name="kernel", files=payloads, native_mma=native_mma)
+    if accepted:
+        assert metrics(tmp_path, artifact)["native_mma"] is native_mma
+    else:
+        with pytest.raises(ValueError, match="native MMA absent from SASS"):
+            metrics(tmp_path, artifact)
 
 
 def test_skipped_tests_remain_visible_in_qualification_counts(tmp_path):

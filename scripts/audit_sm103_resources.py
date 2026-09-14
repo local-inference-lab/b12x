@@ -51,11 +51,12 @@ def metrics(root, artifact):
     readers = b"tcgen05.ld." in ptx
     if readers and b"tcgen05.wait::ld.sync.aligned;" not in ptx:
         raise ValueError(f"{name}: missing TMEM load-completion wait")
-    if (
-        artifact["native_mma"]
-        and "UTCHMMA" not in instructions
-        and "UTCOMMA" not in instructions
-    ):
+    native_mma_instruction = re.search(
+        r"^\s*/\*[0-9a-fA-F]+\*/\s+(?:@\S+\s+)?UTC[HOQ]MMA(?:\.|\s)",
+        instructions,
+        re.MULTILINE,
+    )
+    if artifact["native_mma"] and native_mma_instruction is None:
         raise ValueError(f"{name}: native MMA absent from SASS")
     return {
         "entries": entries,
