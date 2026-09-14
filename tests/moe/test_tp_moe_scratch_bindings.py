@@ -90,6 +90,57 @@ def test_dynamic_deterministic_output_is_opt_in(
     )
 
 
+@pytest.mark.parametrize(
+    ("before", "after", "override", "expected"),
+    [
+        ("0", "1", None, False),
+        ("1", "0", None, True),
+        ("1", "0", False, False),
+        ("0", "1", True, True),
+    ],
+)
+def test_canonical_moe_numerical_control_is_frozen_before_lowering(
+    monkeypatch, before, after, override, expected
+):
+    """Sizing and compilation must use declaration-time, not ambient controls."""
+    from b12x.moe.fused_moe._preparation import _control_snapshot, _lower_caps, _query
+    from b12x.moe.fused_moe._tuning import TUNING
+    from b12x.moe.fused_moe.execution import ExecutionCapacity, RoutingSpec
+    from b12x.moe.fused_moe.planning import ActivationSpec
+    from b12x.preparation import DeviceIdentity
+
+    weight_plan = _weight_plan("w4a8_mx", source_format="fp4_e8m0_k32", k=256)
+    experts = SimpleNamespace(
+        plan=SimpleNamespace(
+            _impl=weight_plan,
+            activation=ActivationSpec(
+                mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+            ),
+        ),
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=64,
+        _impl=SimpleNamespace(can_share_input=lambda **kwargs: False),
+    )
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", before)
+    controls = _control_snapshot()
+    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", after)
+    query = _query(
+        experts,
+        ExecutionCapacity(max_tokens=64, top_k=2),
+        64,
+        RoutingSpec(deterministic_output=override),
+        controls,
+        {},
+    )
+    assert query.deterministic_output is expected
+    config = TUNING.configure(
+        query, device=DeviceIdentity("nvidia", (12, 0), 188, "SM120")
+    ).default
+    caps = _lower_caps(query, config, weight_plan, torch.device("cuda"))
+    assert caps.deterministic_output is expected
+
+
 def test_moe_force_envs_do_not_override_explicit_quant_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

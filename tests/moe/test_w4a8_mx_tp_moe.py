@@ -974,16 +974,18 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
 
 
 @pytest.mark.parametrize(
-    ("max_tokens", "unseen_counts", "expected_implementation"),
+    ("max_tokens", "unseen_counts", "expected_implementation", "deterministic"),
     (
-        pytest.param(8, (1, 2, 7), "micro", id="micro-capacity"),
-        pytest.param(64, (1, 2, 8, 16), "dynamic", id="dynamic-capacity"),
+        pytest.param(8, (1, 2, 7), "micro", False, id="micro-capacity"),
+        pytest.param(64, (1, 2, 8, 16), "dynamic", False, id="dynamic-capacity"),
+        pytest.param(64, (6, 33), "dynamic", True, id="deterministic-capacity"),
     ),
 )
 def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
     max_tokens: int,
     unseen_counts: tuple[int, ...],
     expected_implementation: str,
+    deterministic: bool,
 ) -> None:
     _skip_if_unavailable()
     from b12x.preparation import PreparationSession, PreparedCall
@@ -991,7 +993,7 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
     from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
 
     device = torch.device("cuda", torch.cuda.current_device())
-    n = 192
+    n = 576 if deterministic else 192
     replay_counts = (*unseen_counts, max_tokens)
     weights = _weights(n=n, seed=117 + max_tokens)
     x, topk_ids, topk_weights = _routed_inputs(max_tokens, 118 + max_tokens)
@@ -1030,6 +1032,7 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
     plan = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=max_tokens, top_k=_TOPK),
+        routing=fused_moe.RoutingSpec(deterministic_output=deterministic),
         invocation={"fast_math": False},
     )
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
@@ -1063,6 +1066,7 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 fused_moe.run(binding=binding)
+            expected = None
             for _ in range(3):
                 output.fill_(float("nan"))
                 allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -1076,6 +1080,10 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
                     replayed.float().flatten(), references[rows].float().flatten(), dim=0).item()
                 assert cosine > 0.998, (rows, cosine)
                 assert torch.isnan(output[rows:]).all()
+                if deterministic:
+                    if expected is not None:
+                        assert torch.equal(replayed, expected)
+                    expected = replayed.clone()
             graph.reset()
 
 
