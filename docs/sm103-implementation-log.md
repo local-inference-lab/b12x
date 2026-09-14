@@ -1316,3 +1316,50 @@ Legacy BTX paired records, canonical SQG FP16 preparation, full-model
 speculative feedback and evaluation, a matching native vLLM build, ARM64
 dependencies, SM121 regression, Station direct-HBM transport and the final
 full-project compile remain outstanding.
+
+## Canonical SQG FP16 and bounded epilogue predicates
+
+Canonical SQG FP16 preparation accepts uniform K5/K6, grouped rates and
+independent low/high plane rates. It uses the existing 416-byte D3L descriptor
+and FP16 reconstruction law. Ordinary and coupled transforms retain global
+draw extents and distinct input-scale halves. Uniform native plans prewarm
+16 ordinary or 18 coupled callables; grouped plans prewarm 14 or 15. Rates,
+offsets and live counts retain their runtime roles. Canonical uniform SQG
+FP16 also passes complete SM120 expert execution through the existing backend.
+
+The shared native epilogue computes one tile-relative cutoff in Int64, clamps
+it to 0–128, then uses boolean predicates to select the contributing MMA row.
+This preserves column selection while shortening live ranges after TMEM loads.
+The compiler initially emitted an eight-byte stack frame and one local load
+and store for each uniform SQG FP16 dual-input projection. The final code
+uses 138 allocated registers and no stack or local traffic for all eleven
+dual-input variants. The eight previously implemented dual-input variants
+decrease from 167 to 138 registers. The rewrite preserves quantization,
+synchronization, launch geometry and planner policy; it is not a measured
+performance result.
+
+The [validation receipt](sm103-trellis-fp16-validation.json) records 710 host
+tests, 147 SM120 regressions and 105 host tests under companion Torch 2.13.
+Twelve targeted cases pass memcheck and synccheck with zero errors. Portable
+checks cover exact K5/K6 plane reconstruction, invalid rate boundaries,
+mutated graph metadata and epilogue origins above 2^31 and at 2^40. The complete
+native suite has nine additional SM103 tests, including grouped, uniform and
+coupled cross-half execution. Physical SM103 execution remains unqualified.
+
+The final Trellis corpus contains 317 callables and CUDA entry points,
+including 63 canonical SQG FP16 callables. Of the 254 existing entries,
+246 retain identical PTX and 220 retain identical cubins. Eight changed
+entries contain the epilogue rewrite; 26 other changed cubins retain identical
+PTX, allocated resources, register sets and instruction counts. No existing
+resource count increases, no stack or local traffic remains, and all 89 TMEM
+readers retain completion waits. The before/after manifests and resource
+comparison preserve the initial spill evidence.
+
+The wheel and source distribution match all 462 Python files, three embedded
+profiles and six C sources. Extracted-wheel planning and constructor checks
+pass outside the checkout. Companion vLLM remains unchanged at
+`a72cfdcf7b484ab395fdd4d2ee0843877a919f39`.
+
+Legacy BTX paired records, complete speculative model integration and
+evaluation, a matching native vLLM build, ARM64 dependencies, SM121 regression,
+Station direct-HBM transport and the final full-project compile remain open.

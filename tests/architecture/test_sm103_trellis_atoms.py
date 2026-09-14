@@ -46,8 +46,10 @@ def test_input_scale_axes_follow_declarations(experts, per_expert):
     "granularity", ["uniform", "per_layer", "per_expert", "per_expert_projection"]
 )
 @pytest.mark.parametrize("group_size", [None, 32, 256])
-def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size):
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_fp16"])
+def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size, codebook):
     config = _glm_config()
+    config["codebook"] = codebook
     config["rate"] = {"granularity": granularity}
     if group_size is not None:
         config["rate"]["group_size"] = group_size
@@ -61,15 +63,19 @@ def test_rate_axes_preserve_both_plane_nibbles(granularity, group_size):
     }[granularity]
     if group_size is not None:
         shape += (groups,)
-    raw = torch.full(shape, 0x42, dtype=torch.uint8)
+    first, last = (0x65, 0x56) if codebook == "sqg_fp16" else (0x42, 0x64)
+    raw = torch.full(shape, first, dtype=torch.uint8)
     if group_size is not None:
-        raw[..., -1] = 0x64
+        raw[..., -1] = last
     value, atomic = normalize_rates(
         config, raw, experts=3, intermediate_size=256, device=torch.device("cpu")
     )
     assert atomic and value.shape == (groups, 3, 3) and value.is_contiguous()
-    assert torch.all(value[-1] == (0x64 if group_size is not None else 0x42))
-    for invalid in (0x13, 0x37, 0xFF):
+    assert torch.all(value[-1] == (last if group_size is not None else first))
+    invalid_rates = (0x13, 0x37, 0xFF)
+    if codebook == "sqg_fp16":
+        invalid_rates += (0x45, 0x54, 0x75, 0x57)
+    for invalid in invalid_rates:
         raw.fill_(invalid)
         with pytest.raises(ValueError, match="atom planes"):
             normalize_rates(
@@ -137,7 +143,7 @@ def cpu_prepare(plan, bundle):
     )
 
 
-@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
 @pytest.mark.parametrize("coupled,group_size", [(False, 32), (True, 64), (True, None)])
 def test_atom_binding_reuses_capacity_kernels(
     monkeypatch, codebook, coupled, group_size

@@ -1,6 +1,6 @@
 """Canonical high-rate SQG FP16-D3L reconstruction data and references.
 
-``sqg_fp16_d3l`` is defined only at uniform K5/K6.  Its graph is the same
+``sqg_fp16_d3l`` is defined for K5/K6 tiles. Its graph is the same
 carry-mixed L16 permutation used by SQG-XOR-Cheb-T12 at K2/K3/K4; its scalar
 law is a frozen 104-entry dyadic-linear descriptor evaluated with one FP16
 FMA.  The interleaved ``(base, slope)`` table is 416 bytes.

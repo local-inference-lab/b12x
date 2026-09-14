@@ -200,12 +200,13 @@ class RoutedTrellisGemm:
         coordinates = thr_copy.partition_D(
             thr_mma.partition_C(cute.make_identity_tensor((128, 128)))
         )
+        split = self.output_split(source, n_base)
         values = cute.make_rmem_tensor(coordinates.shape, Float32)
         cute.copy(copy, acc_source, values)
         cute.arch.fence_view_async_tmem_load()
         for item in cutlass.range_constexpr(cute.size(values)):
             row, col = coordinates[item]
-            if self.output_row(source, row, n_base + Int64(col)) & (
+            if self.output_row(split, row, Int32(col)) & (
                 n_base + col < self.n
             ):
                 output[route * out_stride + n_base + Int64(col)] = values[item].to(
@@ -287,11 +288,24 @@ class RoutedTrellisGemm:
             sA[row, col] = value
 
     @cute.jit
-    def output_row(self, source, row, column: Int64):
-        # Both physical FC1 slots share this split. A boundary inside a CTA
-        # selects between two MMA rows separately for every output column.
+    def output_split(self, source, n_base: Int64):
         if cutlass.const_expr(self.dual_input):
-            selected = row == Int32(column >= source[2])
+            # Subtract in Int64 before narrowing the bounded tile coordinate.
+            # One CTA-local cutoff avoids a 64-bit comparison for every value
+            # while the TMEM accumulator fragment is live in registers.
+            relative = source[2] - n_base
+            split = Int32(cute.min(cute.max(relative, Int64(0)), Int64(128)))
+        else:
+            split = Int32(0)
+        return split
+
+    @cute.jit
+    def output_row(self, split: Int32, row, column: Int32):
+        # Both physical FC1 slots select the same input half per output column.
+        if cutlass.const_expr(self.dual_input):
+            selected = ((row == 0) & (column < split)) | (
+                (row == 1) & (column >= split)
+            )
         else:
             selected = row == 0
         return selected
