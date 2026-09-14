@@ -25,7 +25,7 @@ numbers or measured B300 policy profile are included.
 | DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
 | MTP feedback | GLM ordinary RMS-concat, Qwen flattened Gemma multi-stream and DeepSeek per-stream FP8 contracts use existing planned APIs and CuTe projections; GLM and DeepSeek companion call-site, graph and Inductor checks pass on SM120; 51 SM103 callables compiled | Physical SM103 execution, actual sequence-parallel collectives, head collapse and full speculative model evaluation |
-| Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; all 20 direct-loader tests collect | Execute direct-loader tests on an available GPU with host page-table access; qualify Grace placement on the Station |
+| Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; 34 direct-loader tests pass on SM121 | Execute companion loader integration on SM121; qualify Grace placement on the Station |
 | DFlash2 | Qwen target/draft execution, accepted proposals, target/draft graphs and prefix reuse exercised on SM120 | Exact token equality with target-only execution remains unresolved; full GLM DFlash2 and physical SM103 execution remain unqualified |
 | Full GLM/V4.1, HBM GDR | Model components and experimental Grace transport are implemented; complete serving and direct HBM transport remain unsupported | Complete model/checkpoint evaluation and direct HBM transport implementation |
 
@@ -109,13 +109,21 @@ with gate-first weights and capacity 8193 with 65,544 routes. Neither build
 emits stack or local-memory traffic. All 21 deferred operator suites collect
 successfully; collection verifies imports and selectors without executing tests.
 
-The resource audit covers 1,001 CUDA entry points in those 993 callables;
-two BF16 projection callables each contain five entries. All 748 callables
-from the prior complete corpus retain identical PTX and have no resource
-increases. Forty compute callables retain stack/local-memory flags. Four
-supporting NVFP4 packers retain eight-byte stack frames without explicit local
-loads or stores. Their resource metrics match the preceding component evidence.
-These flags remain part of B300 resource and latency qualification.
+The [consolidated compilation receipt](sm103-consolidated-validation.json)
+binds source revision `7b697152` to 1,108 callables and 1,116 CUDA entry points,
+including BTX paired records, all three MTP feedback contracts and vocabulary
+projection. All artifact hashes verify, and 23 physical-SM103 suites are
+prepared from the identical frozen source without executing them. Of 993
+existing callables, 976 retain identical PTX and 936 retain identical cubins;
+no callable is removed. Source and Torch/Triton versions differ between these
+corpora, so this comparison does not isolate compiler effects.
+
+Nine existing callables have positive register deltas: GDN checkpoint
+recurrence rises from 161 to 164 allocated GPRs, and eight supporting activation
+packers rise by one or two. None adds stack, local memory, local loads/stores
+or static shared memory. Forty compute callables and four supporting packers
+retain their stack/local flags. All positive deltas remain recorded;
+occupancy and latency require physical SM103 qualification.
 
 Binary dependency resolution succeeds for b12x with Python 3.12, ARM64,
 CUDA 13.0 and glibc 2.28. Resolving b12x together with the companion vLLM CUDA
@@ -918,7 +926,36 @@ safetensors loading preserves Torch allocation/copy behavior. All 81
 model/post-load tests and 13 MoE numerical/graph tests pass on SM120. Run
 `tests/loader/test_vllm.py` in the combined environment on a GPU with host
 page-table access; all 20 tests collect, but the inspected RTX GPUs lack that
-capability. The occupied SM121 hosts have not been used for GPU execution.
+capability. The separate [SM121 receipt](sm103-sm121-validation.json) records
+34 passing direct-loader tests on GB10, including file offsets above 4 GiB,
+TP slices and registered/pinned write-combining storage. These exercise b12x's
+loader directly; companion loader integration still needs execution there.
+
+## SM121 regression and primary checkpoint contracts
+
+Status: **selected component regression qualified on GB10; complete model
+serving unqualified**. The SM121 suite passes 126 tests initially, with four
+explicit skips and two RMS-concat oracle failures. The diagnostic compares
+the disputed output values with FP64 dot products: both round to BF16 `1.0`,
+matching the kernel, while the BF16 GEMM reference changes the tie through
+reduced-precision partial reductions. The reference now accumulates the
+projection in FP64 before rounding to BF16. All five affected cases pass on
+SM121 and SM120 with unchanged tolerances and exact top-1 checks; the runtime
+kernel is unchanged. Thirteen vocabulary tests and seven vocabulary memcheck
+cases pass on SM121 with zero memory errors. The receipt records the API-error
+reporting exception and all skips. The four original inference containers
+are restored with unchanged identities and configuration; health returns 200.
+
+The [primary checkpoint inventory](sm103-primary-models.json) locates
+DeepSeek-V4.1-Flash, both GLM-5.3-Flash NVFP4 variants and the GLM DFlash2 BF16
+draft on maxwell. Their configurations have recorded hashes. DeepSeek uses
+`DeepseekV41ForCausalLM`, 40 layers, H5120, 384 experts and vocabulary 129280;
+its routed experts use native MXFP4. This is a distinct contract from the
+registered DeepSeek V4 model. Companion revision `5c0857f9cd` lacks the V4.1
+model, CED and Engram integration. Its port must preserve the existing SM103
+work and qualify MLA compression, HyperConnection, embedding and a supported
+expert representation. Checkpoint availability does not establish model
+support. GLM and V4.1 full-model and speculative correctness remain open.
 
 ## Companion native build
 
@@ -1002,7 +1039,7 @@ external native modules and GPU execution need separate qualification.
 
 ## BF16 vocabulary projection
 
-Status: **implemented and cross-compiled; SM120 regression qualified; SM103
+Status: **implemented and cross-compiled; SM120/SM121 regression qualified; SM103
 execution unqualified**. The existing planned vocabulary API selects a CuTe
 backend on SM103. It reuses the BF16 reduction kernel, with FP32 accumulation,
 BF16 output and Int64 matrix offsets. Existing SM120/SM121 default policies

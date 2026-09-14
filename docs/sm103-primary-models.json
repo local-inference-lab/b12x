@@ -1,0 +1,88 @@
+{
+  "schema": "b12x.sm103.primary_checkpoint_inventory.v1",
+  "status": "checkpoint configurations located; full-model qualification pending",
+  "checkpoints": [
+    {
+      "host": "maxwell",
+      "path": "/home/jasonc/models/DeepSeek-V4.1-Flash",
+      "config": {
+        "path": "/home/jasonc/b12x-sm103-evidence/sm121-20260914/DeepSeek-V4.1-Flash-config.json",
+        "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+      },
+      "architectures": [
+        "DeepseekV41ForCausalLM"
+      ],
+      "model_type": "deepseek_v41_text",
+      "hidden_size": 5120,
+      "layers": 40,
+      "experts": 384,
+      "vocab_size": 129280,
+      "quant_method": "fp8"
+    },
+    {
+      "host": "maxwell",
+      "path": "/home/jasonc/models/GLM-5.3-Flash-NVFP4",
+      "config": {
+        "path": "/home/jasonc/b12x-sm103-evidence/sm121-20260914/GLM-5.3-Flash-NVFP4-config.json",
+        "sha256": "676382abd1e90a6c85f0c8f33d45441ecd45fd514fd7b63ce5610e732d8e4996"
+      },
+      "architectures": [
+        "Glm5NextForConditionalGeneration"
+      ],
+      "model_type": "glm5_next_text",
+      "hidden_size": 4096,
+      "layers": 45,
+      "experts": 288,
+      "vocab_size": 154880,
+      "quant_method": "modelopt"
+    },
+    {
+      "host": "maxwell",
+      "path": "/home/jasonc/models/GLM-5.3-Flash-NVFP4-Spark",
+      "config": {
+        "path": "/home/jasonc/b12x-sm103-evidence/sm121-20260914/GLM-5.3-Flash-NVFP4-Spark-config.json",
+        "sha256": "e1c0246a44ebefb5fd6383fb57aebbf7ac69ff6e7b23e989c0571b279a0eca23"
+      },
+      "architectures": [
+        "Glm5NextForConditionalGeneration"
+      ],
+      "model_type": "glm5_next_text",
+      "hidden_size": 4096,
+      "layers": 45,
+      "experts": 288,
+      "vocab_size": 154880,
+      "quant_method": "modelopt"
+    },
+    {
+      "host": "maxwell",
+      "path": "/home/jasonc/models/GLM-5.3-Flash-DFlash2-BF16-dc77ff1c",
+      "config": {
+        "path": "/home/jasonc/b12x-sm103-evidence/sm121-20260914/GLM-5.3-Flash-DFlash2-BF16-dc77ff1c-config.json",
+        "sha256": "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573"
+      },
+      "architectures": [
+        "DFlash2DraftModel"
+      ],
+      "model_type": "qwen3",
+      "hidden_size": 4096,
+      "layers": 5,
+      "experts": null,
+      "vocab_size": 154880,
+      "quant_method": null
+    }
+  ],
+  "companion_v41_gap": {
+    "required_architecture": "DeepseekV41ForCausalLM",
+    "registered_in_companion_revision_5c0857f9cd": false,
+    "existing_implementation_revision": "2ac48a52c16b362ac3418810e8d7d317003ae6d1",
+    "implementation_path": "vllm/models/deepseek_v4_1",
+    "serving_b12x_revision": "135c9715d20d8534638b57be8dcd634ab333e87a",
+    "required_work": [
+      "Port the distinct V4.1 model, config/tokenizer, CED, cache ownership and Engram integration with their existing tests.",
+      "Admit and qualify the required MLA compression, HyperConnection and embedding contracts on SM103; their public metadata currently admits SM12x only.",
+      "Select and qualify a supported expert representation. The native checkpoint declares FP4 experts; the SM103 fused-MoE policy currently accepts ModelOpt NVFP4 and Trellis/BTX, not native MXFP4.",
+      "Preserve the SM103 kernels and policy changes while incorporating required upstream API updates."
+    ]
+  },
+  "physical_sm103_qualified": false
+}

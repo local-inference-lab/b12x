@@ -344,9 +344,9 @@
     "No physical SM103 execution, numerical qualification or performance measurement.",
     "CuTe multirow projection is tested directly; companion logits select this vocabulary plan only for one live row.",
     "Full model accuracy, exact target/graph and speculative parity, complete serving warmup and allocation-free serving remain open.",
-    "Primary GLM-5.3 Flash and DeepSeek V4.1 Flash checkpoints are unavailable for complete model validation.",
+    "Primary GLM-5.3 Flash and DeepSeek V4.1 Flash checkpoints are located on maxwell; full-model qualification and the distinct V4.1 companion port remain open (docs/sm103-primary-models.json).",
     "The source delta after the GPU run is formatting in the generator and compile launcher only; raw hashes and equal Python AST hashes are retained.",
-    "The consolidated full-source corpus is a separate validation gate."
+    "The 7b697152 consolidated source corpus passes compilation and artifact verification (docs/sm103-consolidated-validation.json)."
   ],
   "artifacts": {
     "source-final-manifest.json": {
@@ -777,7 +777,7 @@
     "existing_service_health_http": 200
   },
   "consolidated_compile_retry": {
-    "status": "local attempt failed; retry on larger host pending",
+    "status": "completed on ripper; artifacts verified; physical SM103 execution unqualified",
     "source_sha256": "49a4f199cc9d08fce4e6b21071e94474b4b68455a723a2443a4aa311e43656ce",
     "local_failure": "Kernel global OOM killed compiler PID 1104908 at 4,659,580 KiB anonymous RSS; no complete manifest produced",
     "local_oom": {
@@ -790,6 +790,8 @@
       "path": "/home/jasonc/b12x-sm103-evidence/consolidated-vocab-ripper-command.json",
       "bytes": 613,
       "sha256": "564939602a72735a52d7a8d69df99066068f7a60bd86d32fe0c57a880fbe8fda"
-    }
-  }
+    },
+    "receipt": "docs/sm103-consolidated-validation.json"
+  },
+  "sm121_regression_receipt": "docs/sm103-sm121-validation.json"
 }
