@@ -24,6 +24,7 @@ numbers or measured B300 policy profile are included.
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
+| MTP feedback | GLM ordinary RMS-concat and Qwen flattened Gemma multi-stream contracts use existing planned APIs and CuTe projections; GLM vLLM call-site, graph and Inductor checks pass on SM120; 30 SM103 callables compiled | Physical SM103 execution, full model evaluation, DeepSeek per-stream FP8 feedback and DFlash2 integration |
 | DFlash2, full GLM/V4.1, HBM GDR | Unsupported as complete execution paths | Implement capability routing, target/draft contracts and transport before physical qualification |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
@@ -1153,6 +1154,54 @@ before allocating a proxy. Grace TP2 requires `experimental=True` and is never
 automatically selected instead of NCCL. Repeat at actual GLM hidden/logit shard
 sizes and compare complete C1/C4 serving before changing integration policy.
 
+## GLM and Qwen MTP feedback
+
+Status: **implemented and cross-compiled; unqualified on physical SM103**.
+`sequence.mtp_feedback.Caps(contract="rms_concat", streams=1, hidden_size=4096, ...)`
+plans GLM's ordinary RMS normalization and combined BF16 projection. Binding
+accepts `positions`, two learned RMS weights and `combined_fc_weight[H,2H]`.
+Zero-position embeddings are discarded before normalization, including NaNs.
+The output is caller-owned BF16 `[tokens,H]`. The CuTe normalization kernel
+writes fixed scratch and the CuTe TMA/warp-MMA projection consumes it. Warm-run
+before capture; live token counts remain runtime launch arguments.
+
+The default `qwen_multistream` contract retains flattened `S*H` Gemma RMS
+normalization and separate projections. DeepSeek V4 feedback uses ordinary RMS
+per stream and separate FP8 projections; it is not represented by either contract.
+Policy query schema 2 includes the contract. Embedded Qwen measurements do not
+cover GLM; AUTO uses the heuristic until the generator measures GLM plans.
+
+The [MTP validation receipt](sm103-mtp-validation.json) records the compile,
+SM120, sanitizer, policy, packaging and companion call-site evidence. The
+companion GLM adapter retains one scheduler-capacity plan, scratch and output,
+prepares both position dtypes before capture, and uses an opaque output-mutating
+Torch operator during compilation. Final residual RMS normalization and the
+normalized recycled state remain in the GLM model layer.
+
+```sh
+CUTE_DSL_ARCH=sm_103a .venv/bin/python scripts/compile_sm103.py \
+  --component mtp_feedback --output-dir /tmp/sm103-mtp-compile
+.venv/bin/python scripts/qualify_sm103.py --component mtp_feedback \
+  --compile-manifest /tmp/sm103-mtp-compile/manifest.json \
+  --output-dir /tmp/sm103-mtp-commands
+```
+
+On B300, execute the prepared suite with `--execute --device-uuid "$GPU_UUID"`
+and an empty output directory. Repeat with compute-sanitizer. The suite selects
+21 production-contract tests; standalone research normalization tests are excluded.
+After correctness, collect eager and graph timings:
+
+```sh
+CUDA_VISIBLE_DEVICES="$GPU_UUID" CUTE_DSL_ARCH=sm_103a \
+  .venv/bin/python -m benchmarks.benchmark_mtp_feedback \
+  --contract rms_concat --hidden-size 4096 --capacity-tokens 4096 \
+  --warmup 20 --samples 100 --output /tmp/glm-mtp-feedback.json
+```
+
+Repeat with `--contract qwen_multistream --hidden-size 2560`. Record GPU mode,
+source identity and raw samples. These operator tests do not establish draft
+acceptance rates, full-model token equality or complete DFlash2 serving.
+
 ## Source-level completion order
 
 | Work | Source seam and acceptance condition |
@@ -1169,7 +1218,7 @@ sizes and compare complete C1/C4 serving before changing integration policy.
 | Trellis experts | `fused_moe/_sm103_trellis.py`, `fused_moe/trellis.py`, `fused_moe/trellis_atoms.py`: qualify uniform, ordinary/coupled MCG projection-tiered and grouped atom execution, including SQG FP16, unequal plane rates, 384-expert records, nonzero draw extents, distinct input-scale halves and BTX paired records; implement frozen QSRT coupled high-rate conversion where required |
 | Grace/NIC ordering | `comm/roce/_transport.py`, `_roce_proxy.c`, `_cute_intrinsics.py`: hardware stress, registration and visibility; retain fatal timeout semantics |
 | mHC | `norm/mhc`: physical SM103 qualification of current and lagged mixing, high/low TF32 projection, planned schedules, and replay |
-| MTP feedback | `sequence/mtp_feedback`: admit and compile the existing Qwen contract separately; verify GLM and DeepSeek target/draft tensor contracts before sharing feedback kernels |
+| MTP feedback | `sequence/mtp_feedback/_concat.py` and `_cute_prefill.py`: qualify implemented GLM/Qwen contracts on SM103; companion `vllm/models/glm5next/nvidia/mtp.py`: evaluate full GLM speculative decoding; implement DeepSeek per-stream RMS plus separate FP8 projections without borrowing Qwen's flattened Gemma semantics |
 | Full serving | LIL vLLM per-operation capability routing, plan retention, and warmup: complete target/draft execution and CUDA graph replay before enabling full GLM or V4.1 serving |
 | Station HBM transport | `comm/roce/_transport.py`: implement HBM registration, peer exchange, and ordering before admitting `hbm_gdr`; qualify registration and visibility on Station hardware |
 

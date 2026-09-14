@@ -13,7 +13,138 @@ from b12x.sequence import mtp_feedback as mtp
 from b12x.sequence.mtp_feedback import _cute_norm
 from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 
-from ..conftest import require_b12x as require_sm120
+from ..conftest import require_sm103_or_sm12x as require_sm120
+from ..conftest import require_sm103_or_sm12x
+
+
+def _make_concat_case(device, hidden=256, capacity=33, position_dtype=torch.int64):
+    planned = mtp.plan(
+        mtp.Caps(
+            device=device,
+            max_tokens=capacity,
+            hidden_size=hidden,
+            streams=1,
+            contract="rms_concat",
+        )
+    )
+    (spec,) = planned.scratch_specs()
+    tensors = {
+        "scratch": torch.empty(spec.shape, dtype=spec.dtype, device=device),
+        "token_embedding": _randn((capacity, hidden), device=device),
+        "multi_state": _randn((capacity, hidden), device=device),
+        "token_norm_weight": 1 + _randn((hidden,), device=device),
+        "state_norm_weight": 1 + _randn((hidden,), device=device),
+        "combined_fc_weight": _randn(
+            (hidden, 2 * hidden), device=device, scale=(2 * hidden) ** -0.5
+        ),
+        "positions": torch.arange(capacity, dtype=position_dtype, device=device),
+        "output": torch.full(
+            (capacity, hidden), 7.0, dtype=torch.bfloat16, device=device
+        ),
+    }
+    return planned, tensors
+
+
+def _concat_reference(binding, eps=1e-6):
+    return mtp.reference.rms_concat(
+        binding.token_embedding,
+        binding.multi_state,
+        binding.positions,
+        binding.token_norm_weight,
+        binding.state_norm_weight,
+        binding.combined_fc_weight,
+        eps=eps,
+    )
+
+
+@pytest.mark.parametrize("hidden", [256, 4096])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_rms_concat_graph_reuses_capacity_and_reads_mutated_inputs(
+    hidden, position_dtype
+):
+    device = require_sm103_or_sm12x()
+    planned, tensors = _make_concat_case(device, hidden, position_dtype=position_dtype)
+    tensors["token_embedding"][0].fill_(float("nan"))
+    # Zero-position embeddings must be discarded even when poisoned.
+    binding = mtp.bind(planned, **tensors, tokens=4)
+    mtp.run(binding)
+    torch.cuda.synchronize()
+    from b12x.sequence.mtp_feedback import _concat
+
+    cache_before = _concat.compile_norm.cache_info()
+    projection = planned._backend_plan.projection
+    freeze_kernel_resolution("RMS-concat live counts reuse planned callables")
+    try:
+        for live in (1, 4, 17, 33, 0):
+            tensors["output"].fill_(7)
+            binding = mtp.bind(planned, **tensors, tokens=live)
+            mtp.run(binding)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                mtp.run(binding)
+            tensors["multi_state"].add_(0.1)
+            tensors["state_norm_weight"].neg_()
+            tensors["combined_fc_weight"].mul_(-0.75)
+            if live > 1:
+                tensors["positions"][1] = 0
+                tensors["token_embedding"][1].fill_(float("nan"))
+            expected = _concat_reference(binding)
+            tensors["output"][:live].fill_(float("nan"))
+            tensors["scratch"].fill_(0xFF)
+            before = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated(device) == before
+            assert binding.output.data_ptr() == tensors["output"][:live].data_ptr()
+            assert torch.equal(
+                tensors["output"][live:], torch.full_like(tensors["output"][live:], 7)
+            )
+            torch.testing.assert_close(binding.output, expected, rtol=0.02, atol=0.04)
+            if live:
+                assert torch.isfinite(binding.output).all()
+                assert binding.output.count_nonzero() > 0
+                assert (
+                    F.cosine_similarity(
+                        binding.output.float().flatten(),
+                        expected.float().flatten(),
+                        dim=0,
+                    )
+                    > 0.9999
+                )
+                assert torch.equal(binding.output.argmax(-1), expected.argmax(-1))
+                assert not binding.token_normalized[0].count_nonzero()
+                # Learned weights are ordinary RMS weights, not Gemma (1+w).
+                assert binding.state_normalized.count_nonzero() > 0
+            del graph
+    finally:
+        unfreeze_kernel_resolution()
+    assert _concat.compile_norm.cache_info() == cache_before
+    assert planned._backend_plan.projection is projection
+
+
+def test_rms_concat_rejects_aliases_missing_weights_and_capacity_overflow():
+    device = require_sm103_or_sm12x()
+    planned, tensors = _make_concat_case(device)
+    with pytest.raises(ValueError, match="overlap"):
+        mtp.bind(planned, **(tensors | {"output": tensors["multi_state"]}), tokens=1)
+    with pytest.raises(TypeError, match="combined_fc_weight"):
+        mtp.bind(planned, **(tensors | {"combined_fc_weight": None}), tokens=1)
+    with pytest.raises(ValueError, match="capacity"):
+        mtp.bind(planned, **tensors, tokens=34)
+    with pytest.raises(ValueError, match="positions"):
+        mtp.bind(planned, **(tensors | {"positions": tensors["positions"].float()}))
+    live = {
+        name: value[:3]
+        if name in {"token_embedding", "multi_state", "positions", "output"}
+        else value
+        for name, value in tensors.items()
+    }
+    binding = mtp.bind(planned, **live)
+    assert binding.tokens == 3
+    mtp.run(binding)
+    torch.testing.assert_close(
+        binding.output, _concat_reference(binding), rtol=0.02, atol=0.04
+    )
 
 
 _case_resources = ContextVar("mtp_case_resources")
@@ -405,13 +536,9 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
 
     def launch(tokens: int) -> None:
         token_source = _randn((tokens, hidden_size), device=device, scale=0.4)
-        state_source = _randn(
-            (tokens, streams, hidden_size), device=device, scale=0.4
-        )
+        state_source = _randn((tokens, streams, hidden_size), device=device, scale=0.4)
         token_weight = _randn((hidden_size,), device=device, scale=0.05)
-        state_weight = _randn(
-            (streams * hidden_size,), device=device, scale=0.05
-        )
+        state_weight = _randn((streams * hidden_size,), device=device, scale=0.05)
         token_output = torch.empty_like(token_source)
         state_output = torch.empty_like(state_source)
 
@@ -436,12 +563,8 @@ def test_standalone_cute_norm_reuses_binaries_across_live_token_counts_when_froz
         expected_state = mtp.reference.gemma_rmsnorm(
             state_source.flatten(-2), state_weight
         ).view_as(state_source)
-        torch.testing.assert_close(
-            token_output, expected_token, rtol=2e-2, atol=4e-2
-        )
-        torch.testing.assert_close(
-            state_output, expected_state, rtol=2e-2, atol=4e-2
-        )
+        torch.testing.assert_close(token_output, expected_token, rtol=2e-2, atol=4e-2)
+        torch.testing.assert_close(state_output, expected_state, rtol=2e-2, atol=4e-2)
 
     _cute_norm.clear_caches()
     monkeypatch.setattr(_cute_norm, "compile_cute", traced_compile)
@@ -468,9 +591,7 @@ def test_standalone_cute_norm_uses_source_device_when_non_current() -> None:
     target = torch.device("cuda", target_index)
     tokens, streams, hidden_size = 2, 4, 2560
     token_source = _randn((tokens, hidden_size), device=target, scale=0.4)
-    state_source = _randn(
-        (tokens, streams, hidden_size), device=target, scale=0.4
-    )
+    state_source = _randn((tokens, streams, hidden_size), device=target, scale=0.4)
     token_weight = _randn((hidden_size,), device=target, scale=0.05)
     state_weight = _randn((streams * hidden_size,), device=target, scale=0.05)
     token_output = torch.empty_like(token_source)
@@ -507,9 +628,7 @@ def test_standalone_cute_norm_correctness_and_graph_stability() -> None:
     device = require_sm120()
     tokens, streams, hidden_size = 4, 4, 2560
     token_source = _randn((tokens, hidden_size), device=device, scale=0.4)
-    state_source = _randn(
-        (tokens, streams, hidden_size), device=device, scale=0.4
-    )
+    state_source = _randn((tokens, streams, hidden_size), device=device, scale=0.4)
     token_weight = _randn((hidden_size,), device=device, scale=0.05)
     state_weight = _randn((streams * hidden_size,), device=device, scale=0.05)
     token_output = torch.empty_like(token_source)

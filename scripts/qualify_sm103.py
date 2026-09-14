@@ -35,6 +35,7 @@ SUITES = {
     "gdn_decode": ["tests/sequence/test_gdn_decode.py"],
     "kda_prefill": ["tests/sequence/test_kda_prefill.py"],
     "gdn_prefill": ["tests/sequence/test_gdn_prefill.py"],
+    "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k", "not standalone_cute_norm"],
     "dense_mla": [
         "tests/attention/test_dense_mla.py",
         "tests/attention/test_dense_mla_window.py",

@@ -159,6 +159,90 @@ def compile_sequence(out):
     return launches
 
 
+def compile_mtp_feedback(out):
+    """Compile the production GLM and Qwen feedback launch factories."""
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import torch
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from b12x.sequence.mtp_feedback import _concat as concat, _cute_prefill as gemm
+    from b12x.sequence.mtp_feedback import _kernels as aux
+
+    launches = {}
+    case = ""
+
+    def capture(kernel, *args, compile_spec):
+        directory = out / case
+        directory.mkdir()
+        compiled = cute.compile(
+            kernel, *args, no_jit_engine=True,
+            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
+        )
+        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
+        launches[case] = compiled
+        return compiled
+
+    concat.compile_norm.cache_clear()
+    gemm._KERNEL_CACHE.clear()
+    gemm._WARMED.clear()
+    with (patch.object(torch.cuda, "device"),
+          patch.object(concat, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(gemm, "current_cuda_stream", lambda: cuda.CUstream(0)),
+          patch.object(concat, "compile_cute", capture),
+          patch.object(gemm, "b12x_compile", capture)):
+        for hidden in (256, 320, 4096):
+            for warps in (4, 8):
+                for dtype in (torch.int32, torch.int64):
+                    case = f"mtp_concat_norm_h{hidden}_w{warps}_{dtype}"
+                    concat.compile_norm(hidden, 1 << (hidden - 1).bit_length(),
+                                        warps, dtype, 0, (10, 3))
+        for rows in (16, 32, 64, 128):
+            for contract, hidden, streams, add in (
+                ("concat", 4096, 1, False),
+                ("qwen_embedding", 2560, 4, False),
+                ("qwen_state", 2560, 4, True),
+            ):
+                case = f"mtp_{contract}_projection_rows{rows}"
+                gemm.compile_mtp_prefill_bf16_gemm(
+                    rows, hidden, 2 * hidden if contract == "concat" else hidden,
+                    device=torch.device("cuda:0"), streams=streams, add_token_path=add,
+                )
+
+    cases = (
+        ("token_norm", aux._token_norm_kernel,
+         dict(token_embedding="*bf16", token_norm_weight="*bf16", token_normalized="*bf16", eps="fp32"),
+         dict(HIDDEN_SIZE=2560, BLOCK_H=4096)),
+        ("state_partial", aux._state_partial_sum_kernel,
+         dict(multi_state="*bf16", state_partial_sums="*fp32"),
+         dict(HIDDEN_SIZE=2560, BLOCK_H=4096)),
+        ("state_norm", aux._state_norm_kernel,
+         dict(multi_state="*bf16", state_partial_sums="*fp32", state_norm_weight="*bf16", state_normalized="*bf16", eps="fp32"),
+         dict(HIDDEN_SIZE=2560, BLOCK_H=4096, STREAMS=4, BLOCK_S=4)),
+    )
+    for name, kernel, signature, constants in cases:
+        for warps in (4, 8):
+            case = f"mtp_qwen_{name}_w{warps}"
+            options = dict(num_warps=warps, num_stages=1)
+            compiled = triton.compile(ASTSource(kernel, signature, constexprs=constants),
+                                      target=GPUTarget("cuda", 103, 32), options=options)
+            if compiled.metadata.global_scratch_size or compiled.metadata.profile_scratch_size:
+                raise RuntimeError(f"{case}: implicit launch scratch is unsupported")
+            directory = out / case
+            directory.mkdir()
+            (directory / (case + ".ptx")).write_text(compiled.asm["ptx"])
+            (directory / (case + ".cubin")).write_bytes(compiled.asm["cubin"])
+            (directory / (case + ".mlir")).write_text(compiled.asm["ttgir"])
+            (directory / (case + ".metadata.json")).write_text(json.dumps({
+                "role": "existing Qwen normalization auxiliary; projections use CuTe DSL",
+                "signature": signature, "constants": constants, "options": options,
+                "metadata": compiled.metadata._asdict(),
+            }, indent=2, default=str) + "\n")
+            launches[case] = compiled
+    return launches
+
+
 def compile_roce(out):
     """Trace the existing TP2 peer protocol without allocating host/NIC regions."""
     import cuda.bindings.driver as cuda
@@ -1547,6 +1631,7 @@ def main():
             "roce",
             "trellis",
             "sequence",
+            "mtp_feedback",
             "dense_mla",
             "sparse_mla",
             "compressed_mla",
@@ -1658,6 +1743,8 @@ def main():
             launches.update(compile_trellis(out))
         if args.component in ("sequence", "all"):
             launches.update(compile_sequence(out))
+        if args.component in ("mtp_feedback", "all"):
+            launches.update(compile_mtp_feedback(out))
         if args.component in ("dense_mla", "all"):
             launches.update(compile_dense_mla(out))
         if args.component in ("sparse_mla", "all"):

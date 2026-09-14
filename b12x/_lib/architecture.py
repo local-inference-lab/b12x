@@ -74,6 +74,8 @@ def require_kernel_architecture(
     if module in {
         "b12x.comm.roce._oneshot_cute", "b12x.comm.roce._allgather_cute",
         "b12x.sequence.gdn_decode._cute_kernels",
+        "b12x.sequence.mtp_feedback._concat",
+        "b12x.sequence.mtp_feedback._cute_prefill",
         "b12x.sequence.gdn_decode._cute_kda",
         "b12x.sequence._shared.delta_prefill._cute_kernels",
         "b12x.attention.dense_mla._forward",

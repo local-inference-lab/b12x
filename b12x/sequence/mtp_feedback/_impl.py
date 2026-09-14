@@ -53,6 +53,7 @@ class Caps:
     hidden_size: int = 2560
     streams: int = 4
     dtype: torch.dtype = torch.bfloat16
+    contract: str = "qwen_multistream"
 
     def __post_init__(self) -> None:
         device = _canonical_device(self.device)
@@ -61,7 +62,17 @@ class Caps:
         max_tokens = _positive("max_tokens", self.max_tokens)
         hidden_size = _positive("hidden_size", self.hidden_size)
         streams = _positive("streams", self.streams)
-        if hidden_size != QWEN_HIDDEN_SIZE or streams != QWEN_STREAMS:
+        if self.contract not in {"qwen_multistream", "rms_concat"}:
+            raise ValueError(f"unsupported MTP feedback contract {self.contract!r}")
+        if self.contract == "rms_concat" and (
+            streams != 1 or hidden_size % 64 or hidden_size > 16384
+        ):
+            raise ValueError(
+                "RMS-concat feedback requires S=1 and H divisible by 64 through 16384"
+            )
+        if self.contract == "qwen_multistream" and (
+            hidden_size != QWEN_HIDDEN_SIZE or streams != QWEN_STREAMS
+        ):
             raise ValueError(
                 "MTP feedback only implements the Qwen3.8 CuTe contract "
                 f"S={QWEN_STREAMS},H={QWEN_HIDDEN_SIZE}; got "
@@ -80,10 +91,10 @@ class _Layout:
     """Fixed MTP feedback launch geometry and scratch-buffer contract."""
 
     caps: Caps
-    token_normalized_offset_bytes: int
-    state_partial_sums_offset_bytes: int
-    state_normalized_offset_bytes: int
-    token_path_offset_bytes: int
+    token_normalized_offset_bytes: int | None
+    state_partial_sums_offset_bytes: int | None
+    state_normalized_offset_bytes: int | None
+    token_path_offset_bytes: int | None
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     token_projection_rows: int
     state_projection_rows: int
@@ -97,11 +108,13 @@ class _Layout:
     def shapes_and_dtypes(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         return tuple((spec.shape, spec.dtype) for spec in self._scratch_specs)
 
-    def output_shape(self, tokens: int | None = None) -> tuple[int, int, int]:
+    def output_shape(self, tokens: int | None = None) -> tuple[int, ...]:
         live_tokens = self._live_tokens(tokens)
+        if self.caps.contract == "rms_concat":
+            return (live_tokens, self.caps.hidden_size)
         return (live_tokens, self.caps.streams, self.caps.hidden_size)
 
-    def output_storage_shape(self) -> tuple[int, int, int]:
+    def output_storage_shape(self) -> tuple[int, ...]:
         """Return the fixed caller-owned logical-capacity output shape."""
         return self.output_shape()
 
@@ -127,15 +140,15 @@ class Binding:
     tokens: int
     scratch: torch.Tensor
     token_normalized: torch.Tensor
-    state_partial_sums: torch.Tensor
+    state_partial_sums: torch.Tensor | None
     state_normalized: torch.Tensor
-    token_path: torch.Tensor
+    token_path: torch.Tensor | None
     token_embedding: torch.Tensor
     multi_state: torch.Tensor
     token_norm_weight: torch.Tensor
     state_norm_weight: torch.Tensor
-    embedding_fc_weight: torch.Tensor
-    hidden_fc_weight: torch.Tensor
+    embedding_fc_weight: torch.Tensor | None
+    hidden_fc_weight: torch.Tensor | None
     output: torch.Tensor
     plan: Plan | None = None
 
@@ -201,6 +214,8 @@ def _require_tensor(
     shape: tuple[int, ...],
     caps: Caps,
 ) -> None:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
     if tensor.dtype != caps.dtype:
@@ -233,10 +248,12 @@ def _bind(
     multi_state: torch.Tensor,
     token_norm_weight: torch.Tensor,
     state_norm_weight: torch.Tensor,
-    embedding_fc_weight: torch.Tensor,
-    hidden_fc_weight: torch.Tensor,
+    embedding_fc_weight: torch.Tensor | None = None,
+    hidden_fc_weight: torch.Tensor | None = None,
     output: torch.Tensor,
     tokens: int | None = None,
+    combined_fc_weight: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> Binding:
     """Bind fixed-capacity tensors without allocating runtime storage."""
     if not isinstance(plan, _Layout):
@@ -334,7 +351,7 @@ def _bind(
 
 
 def run(binding: Binding, *, eps: float = 1e-6) -> torch.Tensor:
-    """Write and return the caller-owned BF16 ``[T,S,H]`` draft input."""
+    """Return caller-owned BF16 draft input: ``[T,H]`` or Qwen ``[T,S,H]``."""
     if not isinstance(binding, Binding):
         raise TypeError(f"binding must be Binding, got {type(binding)!r}")
     eps_value = float(eps)
