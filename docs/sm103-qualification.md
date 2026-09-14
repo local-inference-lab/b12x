@@ -13,7 +13,7 @@ numbers or measured B300 policy profile are included.
 | Architecture, dispatch, policy, scratch | Implemented; host tests pass | Check actual device identity and launch limits |
 | NVFP4 MoE | Native CuTe TMA/tcgen05/TMEM projections, route quantization, SiLU requantization, weighted reduction; cross-compiled | Numeric oracle, TMA bounds, graph replay, profiling |
 | Trellis | Native uniform, projection-tiered, grouped atom and BTX paired MoE with MCG, SQG E4M3 or SQG FP16 codebooks; ordinary/coupled transforms, global draw coordinates and distinct input-scale halves; inline FP16 tcgen05 projections, routing and weighted reduction; host and SM120 tests and SM103 compilation | Native complete-expert numerics and graphs; frozen QSRT coupled high-rate conversion remains unsupported |
-| Engram | Existing hashing/lookup plus owning device/mapped/Grace placement; SM120 lookup and graph checks | Grace allocation, visibility, large-table and serving measurements |
+| Engram | Existing hashing/lookup and owning device/mapped/Grace placement; optional resident E8M0 scales and bounded disk prefetch; SM120 regressions and memcheck pass; 16 SM103 callables compile | SM121 coverage of disk additions; physical SM103/Grace visibility and serving measurements |
 | RoCEnante | Explicit experimental Grace TP2 selection; shared peer protocol; cross-compiled GPU kernels | Registration, ordering, epochs, failure behavior, NCCL comparison |
 | KDA/GDN | Implemented CuTe decode and sequential prefill; SM120 correctness, state-pool, and graph tests; SM103 compilation | Physical SM103 execution; GDN chunk-parallel algorithm remains unsupported |
 | Dense MLA | Implemented BF16/E4M3 compressed-cache attention for (QK,V) widths (576,512) and (1088,1024); SM120 tests and SM103 compilation | SM103 correctness, high-pid, split, query-quantization, and graph qualification |
@@ -1436,6 +1436,23 @@ fit. Preserve HBM for KV, scratch and graph pools. Frozen QSRT coupled high-rate
 conversion and complete MTP execution remain model blockers.
 
 ## Engram placement
+
+Status: **implemented**, with SM120 component qualification and SM103
+cross-compilation recorded in the [Engram receipt](sm103-engram-validation.json).
+Disk tables accept `resident_scales=True` to keep the original E8M0 scale bytes
+in owned mapped host memory, and `prefetch=True` to overlap one bounded read
+per table with independent work. Consumption and abort drain the read before
+staging can be reused. Disk I/O stays outside graph capture; downstream graphs
+read stable prepared outputs. Existing device, mapped-host and Grace storage
+owners retain their lifetime and coherency checks.
+
+Twenty-four SM120 tests pass, including raw scale bytes, row-varying scale
+patterns, TP tails, offsets beyond Int32, frozen resolution, graph mutations
+and failed-read recovery. The same suite passes memcheck with zero kernel
+memory errors; CUDA API-error reporting is explicitly disabled. Twenty-five
+host checks pass. Sixteen SM103 callables compile with no stack/local traffic
+and at most 40 allocated GPRs. These results do not qualify full-model serving,
+SM121 disk additions or physical SM103 execution.
 
 NVIDIA documents GB300 HBM, Grace LPDDR memory and coherent CPU/GPU access for
 [DGX Station](https://docs.nvidia.com/dgx/dgx-station-development-guide/overview.html).

@@ -1767,3 +1767,21 @@ companion port is prepared in an isolated worktree; its cache/encoder/Engram
 integration and supported expert checkpoint representation remain separate work.
 The SM121 test window restores all four original inference containers and
 images, preserves their configuration hashes, and ends with HTTP 200 health.
+
+## Engram resident scales and bounded disk prefetch
+
+Engram disk tables accept owned E8M0 scale storage and one outstanding prefetch
+per table. The read retains its transaction and preparing thread/stream until
+consumption or cancellation. Existing Grace and mapped storage owners remain
+part of the lookup binding. Tests vary scales by source row, so global scale
+addressing cannot accidentally match compact staging addressing.
+
+The [Engram receipt](sm103-engram-validation.json) records 24 passing SM120
+tests and 24 passing memcheck cases with zero kernel memory errors; API-error
+reporting is explicitly disabled. Twenty-five host checks pass. The compiler
+adds 16 hash/gather callables covering primary table geometry and TP2 shards;
+none uses stack/local memory. The qualification launcher includes Engram.
+The test host uses task-local liburing development headers and its existing
+liburing runtime. Earlier missing-library and incomplete-port failures remain
+in external evidence. Physical SM103 execution and SM121 coverage of these
+disk additions remain unqualified.
