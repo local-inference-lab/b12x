@@ -938,10 +938,10 @@ class TPMoEScratchPlan:
     _core_workspace_plan: _TPCoreWorkspacePlan
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     _backend_plan: object | None = field(default=None, repr=False)
-    _prewarmed_fused_launches: tuple[tuple[int, object], ...] = field(
+    _prewarmed_fused_launches: tuple[tuple[bool, object], ...] = field(
         default=(), repr=False
     )
-    _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, object], ...] = field(
+    _prewarmed_topk_sum_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
         default=(), repr=False
     )
     _mixed_trellis_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
@@ -7949,8 +7949,8 @@ def _plan_full_rotation_w4a16_launches(
     core_plan: _TPCoreWorkspacePlan,
     capacity_tokens: int,
 ) -> tuple[
-    tuple[tuple[int, object], ...],
-    tuple[tuple[torch.dtype, bool, object], ...],
+    tuple[tuple[bool, object], ...],
+    tuple[tuple[torch.dtype, bool, bool, object], ...],
 ]:
     """Compile the fixed Trellis launches before serving memory profiling.
 
@@ -8035,7 +8035,7 @@ def _plan_full_rotation_w4a16_launches(
 
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
             return compile_w4a16_fused_moe(
-                size_m=token_count,
+                size_m=capacity_tokens,
                 hidden_size=core_plan.k,
                 intermediate_size=core_plan.n,
                 num_experts=core_plan.weight_E,
@@ -8044,8 +8044,6 @@ def _plan_full_rotation_w4a16_launches(
                 apply_router_weight_on_input=caps.apply_router_weight_on_input,
                 zero_fc2_output=False,
                 moe_block_size=block_size_m,
-                # Match the lazy unified path: specialize the live M while
-                # retaining the caller-owned route arena's full grid capacity.
                 max_m_blocks=capacity_m_blocks,
                 element_dtype="fp16",
                 fast_math=caps.w4a16_fast_math,
@@ -8076,6 +8074,7 @@ def _plan_full_rotation_w4a16_launches(
             (
                 ids_dtype,
                 mapped,
+                broadcast,
                 compile_w4a16_topk_sum(
                     m=capacity_tokens,
                     topk=core_plan.num_topk,
@@ -8680,10 +8679,8 @@ def plan_tp_moe_scratch(
                 device=torch.device(caps.device),
             ),
         ),
-        # Keep strong references to the launches primed in the module caches,
-        # but leave the runtime binding unresolved.  ``run_w4a16_moe`` uses a
-        # None launch as a dispatch signal and then gets these exact objects
-        # from its compile cache without doing first-use JIT work.
+        # Binding selects only the immutable transform-table layout and route
+        # dtype. Live row counts remain scalar arguments to these launches.
         _prewarmed_fused_launches=fused_launches,
         _prewarmed_topk_sum_launches=topk_sum_launches,
         _mixed_trellis_launches=mixed_trellis_launches,
