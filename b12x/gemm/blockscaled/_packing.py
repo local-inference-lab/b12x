@@ -45,7 +45,7 @@ def _quantize_mxfp4(
 
 
 @_quantize_mxfp4.register_fake
-def _quantize_mxfp4_fake(source, out_values, out_scales, stream):
+def _quantize_mxfp4_fake(source: torch.Tensor, out_values: torch.Tensor, out_scales: torch.Tensor, stream: int | None):
     return None
 
 

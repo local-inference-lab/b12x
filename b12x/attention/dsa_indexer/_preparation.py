@@ -27,9 +27,10 @@ from .scratch import B12XIndexerScratchCaps, INDEXER_SOURCE_LAYOUT_PAGED, plan_i
 class _DsaIndexerState:
     """FP8 prepared state retaining its scratch layout and native launchers."""
 
-    def __init__(self, layout, config, launchers):
+    def __init__(self, layout, config, launchers, *, output_scores):
         self.layout = layout
         self.config = config
+        self.output_scores = output_scores
         self.launchers = MappingProxyType(dict(launchers))
 
     def bind(self, **kwargs):
@@ -37,6 +38,8 @@ class _DsaIndexerState:
 
     def run(self, runtime, *, q_fp8, query_weights, index_k_cache,
             output_indices, output_scores=None, **_ignored):
+        if (output_scores is not None) != self.output_scores:
+            raise ValueError("DSA output_scores presence differs from the prepared declaration")
         return index_topk_fp8(
             q_fp8=q_fp8, weights=query_weights, index_k_cache=index_k_cache,
             binding=runtime, page_size=self.layout.caps.page_size,
@@ -347,7 +350,10 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
         if not isinstance(launchers, Mapping):
             raise TypeError("FP8 DSA compiler factory did not return launchers")
         load_programs(launchers)
-        return attach_programs(_DsaIndexerState(layout, selection.config, launchers), launchers)
+        return attach_programs(_DsaIndexerState(
+            layout, selection.config, launchers,
+            output_scores=query.operands["output_scores"] is not None,
+        ), launchers)
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize, _device=caps.device)
 
 

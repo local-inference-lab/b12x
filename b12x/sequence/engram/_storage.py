@@ -52,9 +52,15 @@ def allocate_storage(plan, *, memory="device"):
 
     if not isinstance(plan, Plan):
         raise TypeError("plan must be an Engram Plan")
+    from b12x.preparation.types import require_prepared
+    state = require_prepared(plan, "sequence.engram")
+    if state.operation != "lookup":
+        raise ValueError("table storage requires a prepared Engram lookup plan")
+    if state.compact_rows:
+        raise ValueError("table storage requires an uncompressed lookup declaration")
     if memory not in {"device", "mapped_host", "grace"}:
         raise ValueError("Engram memory must be device, mapped_host, or grace")
-    if memory == "grace" and not probe_platform(plan.caps.device).grace_coherent:
+    if memory == "grace" and not probe_platform(state.caps.device).grace_coherent:
         raise NotImplementedError(
             "Grace Engram placement requires coherent SM103 CPU/GPU memory"
         )
@@ -63,14 +69,14 @@ def allocate_storage(plan, *, memory="device"):
 
         def allocate(shape, dtype):
             if memory == "device":
-                tensor = torch.empty(shape, dtype=dtype, device=plan.caps.device)
+                tensor = torch.empty(shape, dtype=dtype, device=state.caps.device)
                 return tensor, tensor
-            allocation = MappedHostAllocation(shape, dtype, plan.caps.device)
+            allocation = MappedHostAllocation(shape, dtype, state.caps.device)
             allocations.append(allocation)
             return allocation.device_view, allocation.host_view
 
-        weight, weight_load = allocate(plan.weight_shape, torch.float8_e4m3fn)
-        scales, scales_load = allocate(plan.scale_shape, torch.uint8)
+        weight, weight_load = allocate(state.weight_shape, torch.float8_e4m3fn)
+        scales, scales_load = allocate(state.scale_shape, torch.uint8)
     except Exception:
         for allocation in reversed(allocations):
             allocation.close()

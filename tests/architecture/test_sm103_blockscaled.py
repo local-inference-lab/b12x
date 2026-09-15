@@ -7,8 +7,8 @@ import pytest
 import torch
 
 from b12x._lib.architecture import require_kernel_architecture, UnsupportedArchitectureError
-from b12x.gemm.blockscaled._policy import BLOCKSCALED_POLICY, BlockscaledQuery
-from b12x.policy import DeviceIdentity, PolicyContext, PolicySource
+from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledQuery
+from b12x.preparation import DeviceIdentity
 
 
 B300 = DeviceIdentity(vendor="nvidia", product_name="NVIDIA B300",
@@ -16,18 +16,15 @@ B300 = DeviceIdentity(vendor="nvidia", product_name="NVIDIA B300",
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-def test_sm103_precision_uses_unmeasured_heuristic_without_embedded_profile(recipe):
-    context = PolicyContext.for_identity(B300)
-    assert context.profile_id is None
-    query = BlockscaledQuery(recipe=recipe, in_features=384, out_features=136)
-    resolution = context.resolve(BLOCKSCALED_POLICY, query)
-    assert resolution.source is PolicySource.HEURISTIC
-    assert resolution.config.select(1) == (128, 64, 4)
-    assert resolution.config.select(8) == (128, 64, 4)
-    assert resolution.config.select(129) is None
-    assert set(BLOCKSCALED_POLICY.encode_query(query)) == {"recipe", "in_features", "out_features"}
+def test_sm103_precision_capacity_default_is_unmeasured(recipe):
+    for rows in (1, 8, 129):
+        query = BlockscaledQuery(recipe=recipe, num_tokens=rows, in_features=384,
+                                 padded_in_features=384, out_features=136,
+                                 activation_scale_available=recipe == "nvfp4")
+        result = TUNING.configure(query, device=B300)
+        assert result.default.mode == ("a16" if rows <= 8 else "quantized")
     unknown = replace(B300, compute_capability=(10, 9))
-    assert not PolicyContext.for_identity(unknown).resolve(BLOCKSCALED_POLICY, query).config.a16_rows
+    assert TUNING.configure(query, device=unknown).default.mode == "quantized"
 
 
 def test_compiler_admits_only_portable_a16_and_native_dense_entry_types():
@@ -54,15 +51,12 @@ def test_scale_storage_preserves_grouped_f8_128x4_layout(vector, rows, k, groups
 
 
 def test_native_compile_miss_fails_under_frozen_resolution():
-    from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.gemm.blockscaled._sm103 import compile_kernel
     compile_kernel.cache_clear()
-    freeze_kernel_resolution("host cache-miss contract")
-    try:
+    with kernel_resolution_guard("host cache-miss contract"):
         with pytest.raises(RuntimeError, match="frozen"):
             compile_kernel(136, 384, 1, "nvfp4", "bfloat16", 0)
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("option", [dict(swap_ab=True), dict(_tile_k_override=256), dict(plain_fp8=True, swap_ab=True), dict(block_fp8=True, _tile_k_override=256)])

@@ -1,6 +1,6 @@
 """CuTe FP6/FP8 activation quantization with runtime row counts."""
 
-from functools import lru_cache
+from b12x._lib.program_cache import program_cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -130,7 +130,7 @@ class QuantizeRows:
             padding += cutlass.Int64(grid) * 128
 
 
-@lru_cache(maxsize=1024)
+@program_cache
 def compile_scales(k, fmt, per_row, device_ordinal, architecture):
     if fmt not in ("e2m3", "e3m2", "e4m3") or k <= 0 or k % 128 or k >= 2**31:
         raise ValueError("FP6 activation scales require a valid format and positive K divisible by 128")
@@ -145,7 +145,7 @@ def compile_scales(k, fmt, per_row, device_ordinal, architecture):
             (k, fmt, per_row, device_ordinal, architecture)), options=f"--gpu-arch={architecture}")
 
 
-@lru_cache(maxsize=1024)
+@program_cache
 def compile_quantizer(k, fmt, per_row, packed, device_ordinal, architecture):
     if fmt not in ("e2m3", "e3m2", "e4m3") or packed and fmt == "e4m3":
         raise ValueError("FP6 row quantization requires a valid format and storage recipe")

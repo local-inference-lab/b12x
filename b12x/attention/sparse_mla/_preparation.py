@@ -19,7 +19,7 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 
-def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True):
+def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True, config_payload=None):
     """Extract real decode or prefill native programs from FakeTensor metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode
     from ._scratch import (
@@ -66,6 +66,7 @@ def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True):
                 caps, FrozenMapping({"prefill_mg_enabled": prefill_mg_enabled})
             ),
             torch.cuda.get_device_properties(device).multi_processor_count,
+            SparseMlaConfig.from_config(FrozenMapping(config_payload)) if config_payload is not None else SparseMlaConfig(backend="native"),
         )
         state.prime(
             binding,
@@ -142,6 +143,7 @@ class _SparseMlaState:
     layout: object
     query: SparseMlaQuery
     sm_count: int
+    config: SparseMlaConfig
     prepared: object | None = None
     def scratch_specs(self):
         return self.layout.scratch_specs()
@@ -153,6 +155,12 @@ class _SparseMlaState:
         return self.bind_for_preparation(**kwargs)
     def prime(self, binding: B12XSparseMLABinding, *, kv_cache, attention_sink=None):
         """Resolve every declared launcher from this state's exact live ABI."""
+        if self.config.backend == "warp":
+            from . import _sm103
+            runtime = _sm103.bind(self, binding, attention_sink)
+            _sm103.prepare(runtime)
+            object.__setattr__(self, "prepared", tuple(item[0] for item in runtime.prepared))
+            return
         if self.caps.mode == "decode":
             from b12x.attention._shared.mla.kernel import (
                 compile_unified_decode_launch,
@@ -173,6 +181,7 @@ class _SparseMlaState:
                 latent_scale_per_token=self.caps.latent_scale_per_token,
                 return_lse=self.caps.return_lse,
                 controls=FrozenMapping(),
+                forced_num_splits=self.config.num_splits,
             )
             prepared = compile_unified_decode_launch(
                 prepared=prepared,
@@ -213,6 +222,11 @@ class _SparseMlaState:
             # A plan materialized on first use resolves its launchers from its
             # first binding; under a kernel resolution guard this raises.
             self.prime(binding, kv_cache=kv_cache, attention_sink=attention_sink)
+        if self.config.backend == "warp":
+            from . import _sm103
+            return _sm103.run_prepared(
+                _sm103.bind(self, binding, attention_sink), self.prepared
+            )
         if self.caps.mode == "decode":
             from b12x.attention._shared.mla.kernel import run_prepared_unified_decode
 
@@ -274,11 +288,11 @@ def plan(
         contract=TUNING, query=query, invocation=invocation, override=override,
         _compile_jobs=lambda config, device: (CompileJob.create(
             "b12x.attention.sparse_mla._preparation:compile_sparse_mla",
-            caps, device.ordinal, query.prefill_mg_enabled,
+            caps, device.ordinal, query.prefill_mg_enabled, config.to_dict(),
         ),),
         _memory_requirements=lambda config, device: MemoryRequirements(scratch=layout.scratch_specs()),
         _materialize=lambda selection, device: _SparseMlaState(
-            caps, layout, query, device.identity.sm_count
+            caps, layout, query, device.identity.sm_count, selection.config
         ),
         _device=caps.device,
     )

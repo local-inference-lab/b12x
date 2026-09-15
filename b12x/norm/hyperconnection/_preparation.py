@@ -29,11 +29,11 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
     config = HyperConnectionConfig.from_config(FrozenMapping(config_payload))
     role, streams, hidden = query.operation, query.streams, query.hidden_size
     device = torch.device("cuda", ordinal)
-    if role == "grouped_rmsnorm" and not query.zero_centered:
+    if role == "grouped_rmsnorm" and (not query.zero_centered or config.backend == "cutedsl_full"):
         weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
-            ("rmsnorm", ordinal, streams, hidden, str(weight_dtype)),
-            native._GroupedRmsNorm(streams, hidden, False), 3, device,
+            ("rmsnorm", ordinal, streams, hidden, str(weight_dtype), query.zero_centered),
+            native._GroupedRmsNorm(streams, hidden, query.zero_centered), 3, device,
             has_eps=True, runtime_ints=1,
             pointer_dtypes=(torch.bfloat16, weight_dtype, torch.bfloat16),
         )
@@ -43,6 +43,9 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
             HIDDEN_SIZE=hidden, STREAMS=streams, BLOCK_H=config.reduction_block_h,
             num_warps=config.reduction_num_warps, grid=(query.max_tokens * streams,),
         )
+    if role == "gate_mean" and config.backend == "cutedsl_full":
+        return native._compile(("gate", ordinal, streams, hidden),
+                               native._GateMean(streams, hidden), 3, device, runtime_ints=1)
     if role == "gate_mean":
         import triton
         return kernels._gate_mean_kernel.warmup(
@@ -92,11 +95,11 @@ def _launcher(query, config, compiled):
     from . import _kernels as kernels
 
     role = query.operation
-    if role == "grouped_rmsnorm" and query.zero_centered:
+    if role == "grouped_rmsnorm" and query.zero_centered and config.backend != "cutedsl_full":
         def invoke(*tensors, eps=None):
             kernels._norm_launch(*tensors, query.eps, query.streams, query.hidden_size,
                                  config.reduction_block_h, config.reduction_num_warps)
-    elif role == "gate_mean":
+    elif role == "gate_mean" and config.backend != "cutedsl_full":
         def invoke(*tensors, eps=None):
             kernels._gate_mean_launch(*tensors, query.streams, query.hidden_size, config.pointwise_block)
     else:
@@ -106,7 +109,7 @@ def _launcher(query, config, compiled):
             runtime = lambda tensors: (tensors[0].shape[0], tensors[2].stride(0))
         elif role == "grouped_rmsnorm":
             runtime = lambda tensors: (tensors[0].shape[0] * query.streams,)
-        elif role == "engram_mix":
+        elif role in ("engram_mix", "gate_mean"):
             runtime = lambda tensors: (tensors[0].shape[0],)
         else:
             runtime = lambda tensors: (tensors[-1].numel(),)

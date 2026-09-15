@@ -9,7 +9,7 @@ or the streaming top-k's unrelated candidate folds.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
+from b12x._lib.program_cache import program_cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -20,6 +20,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from ..._lib.compiler import KernelCompileSpec, compile as b12x_compile
+from ..._lib.compile_plan import attach_programs
 from ..._lib.intrinsics import (
     cvt_fp32x2_to_e2m1x2,
     f16x2_to_f32x2,
@@ -948,7 +949,19 @@ class _SortPositions:
                     out_lengths[row] = count
 
 
-@cache
+@dataclass(frozen=True)
+class _IndexerProgram:
+    raw: object
+    dtypes: tuple
+
+    def __iter__(self):
+        return iter((self.raw, self.dtypes))
+
+    def __getitem__(self, index):
+        return (self.raw, self.dtypes)[index]
+
+
+@program_cache
 def _compile(kind: str, recipe: tuple, device_index: int):
     # Pointer-only launch ABIs: all live row/page/width/stride quantities are
     # runtime scalars and do not contribute to compile identity.
@@ -993,7 +1006,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 9, key),
     )
-    return raw, dtypes
+    return attach_programs(_IndexerProgram(raw, dtypes), raw)
 
 
 def _launch(kind, recipe, tensors, scalars, *, launcher=None):

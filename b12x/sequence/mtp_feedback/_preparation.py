@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.compile_plan import attach_programs
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import Caps, _bind, _materialize_layout
 from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery, TUNING
@@ -40,7 +41,17 @@ def compile_feedback(query_payload, config_payload, ordinal):
     query = MtpFeedbackQuery(**dict(query_payload))
     config = MtpFeedbackConfig.from_config(FrozenMapping(config_payload))
     device = torch.device("cuda", ordinal)
-    caps = Caps(device=device, max_tokens=query.max_tokens, hidden_size=query.hidden_size, streams=query.streams)
+    caps = Caps(device=device, max_tokens=query.max_tokens, hidden_size=query.hidden_size, streams=query.streams, contract=query.contract)
+    if query.contract != "qwen_multistream":
+        from b12x.preparation.device import detect_device
+        from . import _concat, _fp8
+        backend = _concat if query.contract == "rms_concat" else _fp8
+        layout = backend.plan(caps, config, detect_device(device).identity)
+        programs = layout._backend_plan
+        dependencies = [programs.norms, programs.projection]
+        if query.contract == "rms_streams_fp8":
+            dependencies.extend((programs.quant, programs.add))
+        return {"layout": attach_programs(layout, *dependencies)}
     layout = _materialize_layout(caps, config)
     embedding, multi_state, token_weight, state_weight = (
         _CompilePointer(torch.bfloat16, value) for value in query.input_alignments
@@ -82,6 +93,10 @@ class _MtpState:
                 raise ValueError("MTP input alignment differs from preparation")
 
     def bind(self, **kwargs):
+        if self.layout._backend_plan is not None:
+            plan = kwargs.pop("_plan", None)
+            binding = self.layout._backend_plan.bind(self.layout, **kwargs)
+            return replace(binding, plan=plan)
         binding = _bind(self.layout, **kwargs)
         self._check((binding.token_embedding, binding.multi_state,
                      binding.token_norm_weight, binding.state_norm_weight))
@@ -90,6 +105,10 @@ class _MtpState:
     def run(self, binding, *, eps=1e-6):
         if binding._state is not self.layout:
             raise ValueError("binding belongs to another prepared MTP layout")
+        if self.layout._backend_plan is not None:
+            if not math.isfinite(float(eps)) or float(eps) <= 0:
+                raise ValueError("MTP epsilon must be finite and positive")
+            return self.layout._backend_plan.run(binding, eps=eps)
         self.run_tensors(
             binding.token_embedding, binding.multi_state, binding.token_norm_weight,
             binding.state_norm_weight, binding.embedding_fc_weight, binding.hidden_fc_weight,
@@ -117,13 +136,18 @@ def make_plan(caps, *, invocation, override):
         raise ValueError("unknown MTP invocation metadata")
     query = MtpFeedbackQuery(
         dtype=str(caps.dtype).removeprefix("torch."), max_tokens=caps.max_tokens,
-        hidden_size=caps.hidden_size, streams=caps.streams, **dict(invocation),
+        hidden_size=caps.hidden_size, streams=caps.streams, contract=caps.contract, **dict(invocation),
     )
     layouts = {}
 
-    def layout(config):
+    def layout(config, device):
         if config not in layouts:
-            layouts[config] = _materialize_layout(caps, config)
+            if caps.contract == "qwen_multistream":
+                layouts[config] = _materialize_layout(caps, config)
+            else:
+                from . import _concat, _fp8
+                backend = _concat if caps.contract == "rms_concat" else _fp8
+                layouts[config] = backend.plan(caps, config, device.identity, compile_launches=False)
         return layouts[config]
 
     def compile_jobs(config, device):
@@ -133,11 +157,11 @@ def make_plan(caps, *, invocation, override):
         ),)
 
     def memory(config, device):
-        return MemoryRequirements(scratch=layout(config).scratch_specs())
+        return MemoryRequirements(scratch=layout(config, device).scratch_specs())
 
     def materialize(selection, device):
         programs = compile_feedback(TUNING.encode_query(query), selection.config.to_dict(), device.ordinal)
-        return _MtpState(query, layout(selection.config), MappingProxyType(programs))
+        return attach_programs(_MtpState(query, programs.get("layout") or layout(selection.config, device), MappingProxyType(programs)), programs)
 
     return Plan(
         contract=TUNING, query=query, invocation=invocation, override=override,

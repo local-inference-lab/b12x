@@ -83,7 +83,7 @@ def run(
 
 def is_supported(device=None) -> bool:
     """True when the SM120/SM121 Trellis kernel stack is available."""
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 def clear_caches() -> None:

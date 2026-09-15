@@ -106,11 +106,17 @@ class GdnConfig:
         )
 
 
+def _backend(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        return "cutedsl"
+    return "triton" if query.key_heads == query.value_heads else "cutedsl"
+
+
 def _default_config(
     query: GdnQuery,
     _device: DeviceIdentity | None,
 ) -> GdnConfig:
-    backend = "triton" if query.key_heads == query.value_heads else "cutedsl"
+    backend = _backend(query, _device)
     return GdnConfig(
         backend=backend,
         recurrent_block_v=32,
@@ -165,8 +171,10 @@ def _validate_config(
 ) -> None:
     if not isinstance(config, GdnConfig):
         raise TypeError("config must be GdnConfig")
-    expected_backend = "triton" if query.key_heads == query.value_heads else "cutedsl"
-    if config.backend != expected_backend:
+    expected_backend = _backend(query, _device)
+    portable_kda = (query.key_heads == query.value_heads and config.backend == "cutedsl"
+                    and _device is not None and _device.compute_capability in {(12, 0), (12, 1)})
+    if config.backend != expected_backend and not portable_kda:
         raise ValueError(f"GDN recipe requires the {expected_backend} backend")
     if not isinstance(config.recurrent_block_v, int) or isinstance(
         config.recurrent_block_v, bool
@@ -181,9 +189,7 @@ def _validate_config(
 
 
 def _tuning_parameters(query: GdnQuery, device):
-    del device
-    # Production dispatch is fixed by the equal-head KDA / grouped-head GDN recipe.
-    return {"backend": ("triton" if query.key_heads == query.value_heads else "cutedsl",)}
+    return {"backend": (_backend(query, device),)}
 
 
 # The state slot count sizes the caller's pool; it does not change which
@@ -198,7 +204,7 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 TUNING = TuningContract(
     component_id="attention.gdn",
     query_schema_version=4,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "recurrent_block_v"}),
     encode_query=_encode_query,
@@ -211,7 +217,7 @@ TUNING = TuningContract(
         Knob(name="backend", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="recurrent_block_v", values=(16, 32), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     parameters=_tuning_parameters,
 )
 

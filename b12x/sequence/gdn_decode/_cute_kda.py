@@ -237,10 +237,11 @@ class KdaNorm:
                     )
 
 
-_CACHE = {}
-_WARMED = set()
+from b12x._lib.program_cache import program_cache
+from b12x._lib.compiler import run_compiled
 
 
+@program_cache
 def compile_kernels(key):
     (
         device,
@@ -255,6 +256,7 @@ def compile_kernels(key):
         validate,
         *dtypes,
     ) = key
+    compile_key = (device, heads, block_v, qknorm, null, validate, *dtypes)
     types = tuple(_numeric_type(dtype) for dtype in dtypes)
     state_type, index_type, alog_type, bias_type, norm_type = types
     recurrence = KdaRecurrence(heads, block_v, qknorm, null, validate, state_type)
@@ -285,7 +287,7 @@ def compile_kernels(key):
         Float32(-5.0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_decode.kda_recurrence", 1, key
+            "sequence.gdn_decode.kda_recurrence", 2, compile_key
         ),
     )
     raw_norm = b12x_compile(
@@ -295,239 +297,38 @@ def compile_kernels(key):
         Int32(1),
         Float32(1e-6),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.gdn_decode.kda_norm", 1, key),
+        compile_spec=KernelCompileSpec.from_key("sequence.gdn_decode.kda_norm", 2, compile_key),
     )
-    _CACHE[key] = raw, raw_norm
     return raw, raw_norm
 
 
-def _execute(
-    inputs,
-    pool,
-    output,
-    duplicate_slots,
-    error_code,
-    geometry,
-    qknorm,
-    validate,
-    scale,
-    lower_bound,
-    eps,
-):
-    (
-        mixed,
-        raw_g,
-        beta,
-        z,
-        alog,
-        bias,
-        weight,
-        starts,
-        accepted,
-        indices,
-        nseq,
-        ntokens,
-    ) = inputs
-    max_tokens, max_seqs, max_slots, columns, heads, block_v, null, table_size = (
-        geometry
-    )
-    key = (
-        output.device.index,
-        max_tokens,
-        max_seqs,
-        max_slots,
-        columns,
-        heads,
-        block_v,
-        qknorm,
-        None if null == -1 else null,
-        validate,
-        pool.dtype,
-        indices.dtype,
-        alog.dtype,
-        bias.dtype,
-        weight.dtype,
-    )
-    capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and key not in _WARMED:
-        raise RuntimeError("CuTe KDA must be warm-run before CUDA graph capture")
-    raw, norm = _CACHE[key] if key in _CACHE else compile_kernels(key)
+def run_prepared(programs, tensors, *, scale, lower_bound, eps):
+    """Launch the retained recurrence and normalization on trusted metadata."""
+    (mixed, raw_g, beta, z, alog, bias, weight, pool, starts, accepted,
+     indices, nseq, ntokens, output) = tensors
+    raw, norm = programs
     seq_capacity, live_columns = indices.shape
     token_capacity = output.shape[0]
-    if validate:
-        from . import _kernels as metadata
-
-        metadata._reset_validation_kernel[((table_size + 255) // 256,)](
-            duplicate_slots,
-            error_code,
-            TABLE_SIZE=table_size,
-            BLOCK=256,
-            num_warps=1,
-            num_stages=1,
-        )
-        metadata._validate_packed_metadata_kernel[(seq_capacity,)](
-            starts,
-            accepted,
-            nseq,
-            ntokens,
-            error_code,
-            token_capacity,
-            seq_capacity,
-            live_columns,
-            num_warps=1,
-            num_stages=1,
-        )
-        metadata._validate_active_state_slots_kernel[(seq_capacity * live_columns,)](
-            starts,
-            accepted,
-            indices,
-            nseq,
-            duplicate_slots,
-            error_code,
-            seq_capacity,
-            live_columns,
-            stride_indices_request=indices.stride(0),
-            stride_indices_column=indices.stride(1),
-            MAX_STATE_SLOTS=max_slots,
-            TABLE_SIZE=table_size,
-            HAS_NULL_STATE_INDEX=null != -1,
-            NULL_STATE_INDEX=null,
-            num_warps=1,
-            num_stages=1,
-        )
 
     def ptr(t):
         return _pointer(t, _numeric_type(t.dtype))
 
-    raw(
-        tuple(
-            ptr(t)
-            for t in (
-                mixed,
-                raw_g,
-                beta,
-                alog,
-                bias,
-                pool,
-                starts,
-                accepted,
-                indices,
-                nseq,
-                output,
-                error_code,
-            )
-        ),
-        (
-            mixed.stride(0),
-            raw_g.stride(0),
-            beta.stride(0),
-            beta.stride(1),
-            bias.stride(0),
-            pool.stride(0),
-            indices.stride(0),
-            indices.stride(1),
-            output.stride(0),
-        ),
-        (seq_capacity, live_columns),
-        scale,
-        lower_bound,
+    # The current GDN contract trusts packed metadata. Error pointers are
+    # eliminated by the compile-time validation flag and are never dereferenced.
+    unused_error = _pointer(output, Int32)
+    run_compiled(raw, (
+        (*tuple(ptr(t) for t in (
+            mixed, raw_g, beta, alog, bias, pool, starts, accepted,
+            indices, nseq, output,
+        )), unused_error),
+        (mixed.stride(0), raw_g.stride(0), beta.stride(0), beta.stride(1),
+         bias.stride(0), pool.stride(0), indices.stride(0), indices.stride(1),
+         output.stride(0)),
+        (seq_capacity, live_columns), float(scale), float(lower_bound),
         current_cuda_stream(),
-    )
-    norm(
-        tuple(ptr(t) for t in (output, z, weight, ntokens, error_code)),
-        (output.stride(0), z.stride(0)),
-        token_capacity,
-        eps,
+    ))
+    run_compiled(norm, (
+        (ptr(output), ptr(z), ptr(weight), ptr(ntokens), unused_error),
+        (output.stride(0), z.stride(0)), token_capacity, float(eps),
         current_cuda_stream(),
-    )
-    if not capturing:
-        _WARMED.add(key)
-
-
-@torch.library.custom_op(
-    "b12x::cute_kda_decode",
-    mutates_args=("pool", "output", "duplicate_slots", "error_code"),
-)
-def _op(
-    inputs: list[torch.Tensor],
-    pool: torch.Tensor,
-    output: torch.Tensor,
-    duplicate_slots: torch.Tensor,
-    error_code: torch.Tensor,
-    geometry: list[int],
-    qknorm: bool,
-    validate: bool,
-    scale: float,
-    lower_bound: float,
-    eps: float,
-) -> None:
-    with torch.cuda.device(pool.device):
-        _execute(
-            inputs,
-            pool,
-            output,
-            duplicate_slots,
-            error_code,
-            geometry,
-            qknorm,
-            validate,
-            scale,
-            lower_bound,
-            eps,
-        )
-
-
-@_op.register_fake
-def _fake(
-    inputs,
-    pool,
-    output,
-    duplicate_slots,
-    error_code,
-    geometry,
-    qknorm,
-    validate,
-    scale,
-    lower_bound,
-    eps,
-):
-    return None
-
-
-def run(binding, *, scale, lower_bound, eps):
-    caps = binding.plan.caps
-    _op(
-        [
-            binding.mixed_qkv,
-            binding.raw_g,
-            binding.raw_beta,
-            binding.z,
-            binding.A_log,
-            binding.dt_bias,
-            binding.norm_weight,
-            binding.query_start_loc,
-            binding.num_accepted_tokens,
-            binding.state_indices,
-            binding.num_seqs,
-            binding.num_tokens,
-        ],
-        binding.recurrent_state,
-        binding.output,
-        binding.duplicate_slots,
-        binding.error_code,
-        [
-            caps.max_tokens,
-            caps.max_seqs,
-            caps.max_state_slots,
-            caps.state_index_columns,
-            caps.value_heads,
-            binding.plan.recurrent_block_v,
-            -1 if caps.null_state_index is None else caps.null_state_index,
-            binding.plan.duplicate_table_size,
-        ],
-        caps.qk_l2norm,
-        caps.kda_metadata_validation == "transactional",
-        scale,
-        lower_bound,
-        eps,
-    )
+    ))

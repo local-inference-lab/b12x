@@ -103,6 +103,8 @@ from b12x._lib.scratch import (
 
 from ._route_pack_cache import route_pack_prewarm_key
 from ._tuning import MoeDecodeConfig, MoeDecodeQuery
+from ._backends import config_backend
+from b12x._lib.architecture import UnsupportedArchitectureError
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
@@ -1093,10 +1095,10 @@ class TPMoEScratchPlan:
             topk_sum_launch = next(
                 (
                     launch
-                    for ids_dtype, mapped, launch in self._prewarmed_topk_sum_launches
+                    for ids_dtype, mapped, broadcast, launch in self._prewarmed_topk_sum_launches
                     if ids_dtype == topk_ids.dtype
                     and mapped == (output_expert_map is not None or route_expert_map is not None)
-                    and launch.broadcast_svh == broadcast_svh
+                    and broadcast == broadcast_svh
                 ),
                 None,
             )
@@ -7000,14 +7002,14 @@ def plan_tp_moe_execution(
     if not isinstance(decode_config, MoeDecodeConfig):
         raise TypeError("decode_config must be a concrete MoeDecodeConfig")
     weight_E = weight_plan.num_experts
-    backend = architecture_backend(policy_context.device)
+    backend = config_backend(decode_config)
     if backend is not None:
         return backend.plan_execution(
             num_tokens=num_tokens, num_topk=num_topk, device=device,
             weight_plan=weight_plan, quant_mode=quant_mode,
             swiglu_limit=swiglu_limit, swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta, apply_router_weight_on_input=apply_router_weight_on_input,
-            policy_context=policy_context,
+            decode_config=decode_config,
         )
     if weight_plan.trellis_group_size is not None:
         raise UnsupportedArchitectureError(
@@ -8077,7 +8079,7 @@ def _plan_full_rotation_w4a16_launches(
             (
                 ids_dtype,
                 mapped,
-                broadcast,
+                broadcast_svh,
                 compile_w4a16_topk_sum(
                     m=capacity_tokens,
                     topk=core_plan.num_topk,
@@ -8582,7 +8584,7 @@ def _plan_tp_moe_arena_layout_from_caps(
 
 def tp_moe_required_nbytes(caps: TPMoEScratchCaps) -> int:
     """Return the planned arena bytes without compiling launches or retaining storage."""
-    backend = architecture_backend(getattr(getattr(caps, "policy_context", None), "device", None))
+    backend = config_backend(caps.decode_config)
     if backend is not None:
         return backend.plan_scratch(caps, prewarm_launches=False).layout.total_nbytes
     return _plan_tp_moe_arena_layout_from_caps(caps).total_nbytes
@@ -8593,7 +8595,7 @@ def plan_tp_moe_scratch(
     *,
     prewarm_launches: bool = True,
 ) -> TPMoEScratchPlan:
-    backend = architecture_backend(getattr(getattr(caps, "policy_context", None), "device", None))
+    backend = config_backend(caps.decode_config)
     if backend is not None:
         return backend.plan_scratch(caps, prewarm_launches=prewarm_launches)
     deterministic_output = caps.deterministic_output

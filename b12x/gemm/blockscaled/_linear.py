@@ -651,7 +651,7 @@ def mxfp8_linear(
             )
     _output_dtype_name(resolved_out_dtype)
 
-    if not prequantized and source_2d.dtype == torch.bfloat16:
+    if not prequantized and plan.component_id == "gemm.blockscaled_precision":
         return blockscaled_mm(
             source_values,
             packed_weight,
@@ -774,6 +774,17 @@ def tensor_fp8_linear(
         raise ValueError("source and packed weight must be on the same device")
     _output_dtype_name(out_dtype)
 
+    if plan.query.fp8_workspace:
+        from ._fp8_workspace import linear
+        return linear(
+            source_2d, packed_weight.values, None, packed_weight.scale_mma,
+            packed_weight.block_scale, packed_weight.output_scale, plan=plan,
+            out=out, workspace=workspace, bias=bias, tensor_scaled=True,
+            out_dtype=out_dtype, stream=stream,
+        ).view(*source.shape[:-1], packed_weight.out_features)
+    if out is not None or workspace is not None:
+        raise ValueError("caller-owned FP8 storage requires a workspace declaration")
+
     out_features = int(packed_weight.out_features)
     _validate_bias(
         bias,
@@ -818,6 +829,7 @@ def blockscaled_mm(
     if isinstance(rhs, NVFP4LinearWeight) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
         and lhs.dtype in (torch.bfloat16, torch.float16)
+        and plan.component_id == "gemm.blockscaled_precision"
     ):
         if not isinstance(lhs, torch.Tensor):
             raise TypeError("packed NVFP4 linear requires a BF16 source tensor")
@@ -859,7 +871,7 @@ def blockscaled_mm(
                 "values tensor directly; its static scale is already folded "
                 "into the packed weight"
             )
-        return tensor_fp8_linear(lhs, rhs, plan=plan, **kwargs)
+        return tensor_fp8_linear(lhs, rhs, plan=plan, out=out, **kwargs)
     if not isinstance(lhs, tuple) or not isinstance(rhs, tuple):
         raise TypeError(
             "raw blockscaled.mm operands must be (values, scale) pairs, or rhs "
@@ -873,7 +885,7 @@ def blockscaled_mm(
                 "serialized blockscaled values must either both be 2D or both "
                 "use the native 3D dense-GEMM layout"
             )
-        if kwargs.get("block_fp8", False) and (out is not None or "workspace" in kwargs):
+        if kwargs.get("block_fp8", False) and plan.query.fp8_workspace:
             options = dict(kwargs)
             if (options.pop("ab_dtype", None), options.pop("sf_dtype", None),
                     options.pop("sf_vec_size", None)) != ("float8_e4m3fn", "float32", 128):
@@ -882,11 +894,13 @@ def blockscaled_mm(
             out_dtype = _output_dtype(options.pop("c_dtype"))
             from ._fp8_workspace import linear
             return linear(lhs_values, rhs_values, lhs_scale, rhs_scale, None,
-                          options.pop("alpha", None), out=out, out_dtype=out_dtype,
+                          options.pop("alpha", None), plan=plan, out=out, out_dtype=out_dtype,
                           **options)
         if out is not None:
             raise ValueError("serialized FP4 blockscaled.mm does not accept out")
         recipe = dict(kwargs)
+        if recipe.get("workspace") is None:
+            recipe.pop("workspace", None)
         try:
             ab_dtype = recipe.pop("ab_dtype")
             sf_dtype = recipe.pop("sf_dtype")

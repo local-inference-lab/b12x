@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from b12x.moe._shared.kernels.w4a16.btx import BtxLayer
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -176,6 +177,24 @@ class PackedWeights:
 
 
 @dataclass(frozen=True, kw_only=True)
+class BtxWeights:
+    """A whole-record BTX layer extent and its destination CUDA device."""
+
+    layer: BtxLayer
+    device: torch.device | str
+
+    def __post_init__(self) -> None:
+        from b12x.moe._shared.kernels.w4a16.btx import BtxLayer
+
+        if not isinstance(self.layer, BtxLayer):
+            raise TypeError("BTX weights require a BtxLayer extent")
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            raise ValueError("canonical BTX preparation requires a CUDA destination")
+        object.__setattr__(self, "device", device)
+
+
+@dataclass(frozen=True, kw_only=True)
 class PreparedExperts:
     """Prepared expert tensors owned by a canonical weight plan."""
 
@@ -211,6 +230,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "BtxWeights",
     "PackedWeights",
     "PreparedExperts",
     "PreparedWeightFormat",

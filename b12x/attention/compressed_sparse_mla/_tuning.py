@@ -69,6 +69,7 @@ class SparseMlaConfig:
     single_pass: bool
     v41_compute_mode: str = "fp8"
     v41_heads_per_block: int = 16
+    backend: str = "native"
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "SparseMlaConfig":
@@ -78,6 +79,7 @@ class SparseMlaConfig:
             "single_pass",
             "v41_compute_mode",
             "v41_heads_per_block",
+            "backend",
         }
         if set(payload) != expected:
             raise ValueError("compressed MLA configs require exact split and V4.1 fields")
@@ -100,6 +102,7 @@ class SparseMlaConfig:
             single_pass=single_pass,
             v41_compute_mode=compute_mode,
             v41_heads_per_block=heads_per_block,
+            backend=payload["backend"],
         )
 
 
@@ -131,6 +134,11 @@ def _split_config(query: SparseMlaQuery, max_chunks: int):
 
 
 def _default_config(query: SparseMlaQuery, device: DeviceIdentity | None) -> SparseMlaConfig:
+    if device is not None and device.compute_capability == (10, 3):
+        tiles = max(1, (query.swa_width + 63) // 64) + (query.indexed_width + 63) // 64
+        chunks = min(4, tiles) if query.mode == "decode" else 1
+        return SparseMlaConfig(max_chunks_per_row=chunks, split_chunk_size=1,
+                               single_pass=query.mode != "decode", backend="warp")
     single_pass = _single_pass(query, device)
     split = (
         None
@@ -189,6 +197,20 @@ def _validate_config(
 
     if not isinstance(config, SparseMlaConfig):
         raise TypeError("config must be SparseMlaConfig")
+    if config.backend not in {"native", "warp"}:
+        raise ValueError("compressed MLA backend must be native or warp")
+    if device is not None and device.compute_capability == (10, 3) and config.backend != "warp":
+        raise ValueError("SM103 compressed MLA requires its warp backend")
+    if config.backend == "warp":
+        if (query.query_rows >= 2**31 or query.num_q_heads > 65535
+                or query.mode not in {"decode", "extend"}
+                or (query.qk_head_dim, query.v_head_dim) != (512, 512)
+                or config.v41_heads_per_block != 16 or config.v41_compute_mode not in {"fp8", "bf16"}
+                or not 1 <= config.max_chunks_per_row <= 256
+                or config.split_chunk_size != 1 or config.single_pass != (query.mode != "decode")
+                or (query.mode != "decode" and config.max_chunks_per_row != 1)):
+            raise ValueError("warp compressed MLA requires its fixed GLM-independent 512-head split contract")
+        return
     if not 1 <= config.max_chunks_per_row <= _COMPRESSED_SPARSE_MLA_SPLIT_MAX_CHUNKS:
         raise ValueError("compressed MLA split capacity exceeds the production limit")
     if config.split_chunk_size <= 0:
@@ -219,13 +241,14 @@ def _parameters(
     query: SparseMlaQuery, device: DeviceIdentity | None
 ) -> dict[str, tuple[object, ...]]:
     default = _default_config(query, device)
-    if query.cache_format == "deepseek_v4":
+    if default.backend == "warp" or query.cache_format == "deepseek_v4":
         modes = (default.v41_compute_mode,)
         head_blocks = (default.v41_heads_per_block,)
     else:
         modes = ("fp8", "bf16")
         head_blocks = (8, 16)
     return {
+        "backend": (default.backend,),
         "max_chunks_per_row": (default.max_chunks_per_row,),
         "split_chunk_size": (default.split_chunk_size,),
         "single_pass": (default.single_pass,),
@@ -245,7 +268,7 @@ def _materialize(
 TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
     query_schema_version=5,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__),
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
     encode_query=SparseMlaQuery.to_dict,
@@ -255,7 +278,7 @@ TUNING = TuningContract(
     validate_config=_validate_config,
     default_config=_default_config,
     knobs=(
-        Knob(name="max_chunks_per_row", values=None, binding=ParameterBinding.COMPILE),
+        Knob(name="backend", values=None),        Knob(name="max_chunks_per_row", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="split_chunk_size", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="single_pass", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="v41_compute_mode", values=None, binding=ParameterBinding.COMPILE),

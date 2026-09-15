@@ -28,7 +28,7 @@ def run(*, binding: Binding):
 
 
 def is_supported(device=None) -> bool:
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [

@@ -11,6 +11,21 @@ GRACE = PlatformCapabilities((10, 3), False, True, True, True, "aarch64")
 SPARK = PlatformCapabilities((12, 1), True, True, True, True, "aarch64")
 
 
+
+def _plan(device, tokens):
+    from types import SimpleNamespace
+    from tests.sequence.test_engram import _declaration
+    from b12x.sequence.engram._impl import _State
+    from tests.architecture._prepared import install_host_state
+    plan = _declaration("cuda:0", tokens=tokens,
+                         invocation={"operation": "lookup", "compact_rows": False})
+    q = plan.query
+    shard_rows = (q.table_rows + q.tp_size - 1) // q.tp_size
+    caps = SimpleNamespace(device=device, max_tokens=tokens)
+    state = _State(caps, None, None, None, None, None, q.pad_id, q.table_rows,
+                   0, shard_rows, shard_rows, "lookup", False, (), ())
+    return install_host_state(plan, state, None)
+
 def test_station_transport_is_explicit_and_tp2_only():
     assert GRACE.grace_coherent
     assert select_transport(SPARK, world_size=4).backend == "spark_mapped"
@@ -51,7 +66,6 @@ def test_coherency_does_not_follow_from_sm103_name(field, value):
 
 def test_engram_storage_uses_existing_lookup_api_and_retains_owner():
     from b12x.sequence import engram
-    from tests.sequence.test_engram import _plan
 
     plan = _plan(torch.device("cpu"), tokens=1)
     storage = engram.allocate_storage(plan)
@@ -83,7 +97,6 @@ def test_engram_storage_uses_existing_lookup_api_and_retains_owner():
 
 def test_grace_engram_allocation_fails_before_allocating_without_coherency(monkeypatch):
     from b12x.sequence.engram import _storage
-    from tests.sequence.test_engram import _plan
 
     plan = _plan(torch.device("cpu"), tokens=1)
     monkeypatch.setattr(

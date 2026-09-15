@@ -1,11 +1,13 @@
 """Canonical mixed-rate preparation and native SM103 expert qualification."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
 
 from b12x.moe import fused_moe
+from b12x.preparation import require_prepared
 from b12x.moe.fused_moe._sm103_trellis import _mixed_contract
-from b12x.policy.generation.providers.trellis_reference import moe_reference
+from tests._reference.trellis_reference import moe_reference
 from tests.moe.test_trellis_config import _glm_config, _k3_config
 
 
@@ -195,7 +197,7 @@ def test_mixed_preparation_preserves_records_and_large_namespace(
             fused_moe.plan_execution(
                 experts=weights,
                 capacity=fused_moe.ExecutionCapacity(max_tokens=8, top_k=2),
-            )
+            ).scratch_specs()
         return
     if experts <= 256 and torch.cuda.get_device_capability() in ((12, 0), (12, 1)):
         execution = fused_moe.plan_execution(
@@ -204,7 +206,7 @@ def test_mixed_preparation_preserves_records_and_large_namespace(
                 max_tokens=8, top_k=2, warmup_token_counts=(1, 4)
             ),
         )
-        fused_moe.prewarm(execution)
+        execution.scratch_specs()
         scratch = {
             s.name: torch.empty(s.shape, device=s.device, dtype=s.dtype)
             for s in execution.scratch_specs()
@@ -271,10 +273,11 @@ def _run_native_mixed(
             route_num_experts=2 * experts,
         ),
     )
-    fused_moe.prewarm(plan)
-    assert all(v.implementation == "tcgen05_trellis" for v in plan.variants)
-    assert len({id(v._impl) for v in plan.variants}) == 1
-    launches = tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
+    plan.scratch_specs()
+    plan.scratch_specs()
+    states = require_prepared(plan, "moe.decode").variants
+    assert all(v.config.backend == "tcgen05_trellis" for v in states.values())
+    launches = tuple(id(fn) for fn in require_prepared(plan, "moe.decode").variants[8].scratch._backend_plan.launches.values())
     assert len(launches) == (16 if coupled else 15)
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
@@ -330,8 +333,7 @@ def _run_native_mixed(
         )
 
     references = {live: expected(live) for live in (1, 3, 4, 8)}
-    b12x.freeze_kernel_resolution("mixed Trellis serving contract")
-    try:
+    with kernel_resolution_guard("mixed Trellis serving contract"):
         for live in (8, 1, 4, 3):
             for target in (None, external):
                 external.fill_(float("nan"))
@@ -379,7 +381,7 @@ def _run_native_mixed(
         assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
         assert tuple(t.data_ptr() for t in owners) == addresses
         assert (
-            tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
+            tuple(id(fn) for fn in require_prepared(plan, "moe.decode").variants[8].scratch._backend_plan.launches.values())
             == launches
         )
         check(bound.output, reference)
@@ -389,8 +391,6 @@ def _run_native_mixed(
         graph.replay()
         torch.cuda.synchronize()
         assert torch.count_nonzero(bound.output) == 0
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("experts,uniform", [(5, False), (384, False), (384, True)])

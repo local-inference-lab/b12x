@@ -28,6 +28,7 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.compile_plan import attach_programs
 
 from .host import (
     max_packed_route_slots,
@@ -1841,7 +1842,7 @@ def compile_mixed_trellis(
         # Compilation is independent of an artifact's tier partition. Replace
         # plan metadata and the top-k launch on every cache lookup so one
         # artifact cannot leak its partition into another artifact.
-        return replace(
+        return attach_programs(replace(
             cached,
             topk_sum=topk_sum,
             tier0_num_experts=int(tier0_num_experts),
@@ -1849,7 +1850,7 @@ def compile_mixed_trellis(
             sms=int(sms),
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
-        )
+        ), cached.compiled, topk_sum)
 
     compile_m = _fake_m_for_specialization(size_m)
     compile_rows = compile_m * top_k
@@ -1958,6 +1959,7 @@ def compile_mixed_trellis(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
     )
+    result = attach_programs(result, compiled, topk_sum)
     _CACHE[cache_key] = result
     return result
 
@@ -2096,7 +2098,7 @@ def compile_mixed_trellis3(
     )
     cached = _CACHE3.get(cache_key)
     if cached is not None:
-        return replace(
+        return attach_programs(replace(
             cached,
             topk_sum=topk_sum,
             tier0_num_experts=counts[0],
@@ -2105,7 +2107,7 @@ def compile_mixed_trellis3(
             sms=int(sms),
             broadcast_suh=bool(broadcast_suh),
             broadcast_svh=bool(broadcast_svh),
-        )
+        ), cached.compiled, topk_sum)
 
     compile_m = _fake_m_for_specialization(size_m)
     compile_rows = compile_m * top_k
@@ -2219,6 +2221,7 @@ def compile_mixed_trellis3(
         broadcast_suh=bool(broadcast_suh),
         broadcast_svh=bool(broadcast_svh),
     )
+    result = attach_programs(result, compiled, topk_sum)
     _CACHE3[cache_key] = result
     return result
 

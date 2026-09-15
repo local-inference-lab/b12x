@@ -1,4 +1,5 @@
 """Deferred B300 qualification through the canonical b12x MoE API."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
@@ -50,8 +51,8 @@ def case(
         experts=prepared,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=top_k),
     )
-    fused_moe.prewarm(plan)
-    scratch = torch.empty(plan.scratch.nbytes, dtype=torch.uint8, device=device)
+    plan.scratch_specs()
+    scratch = torch.empty(sum(spec.nbytes for spec in plan.scratch_specs()), dtype=torch.uint8, device=device)
     return prepared, plan, scratch
 
 
@@ -65,8 +66,7 @@ def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_lay
         prepared._impl.w1_fp4.data_ptr(),
         prepared._impl.w2_fp4.data_ptr(),
     )
-    b12x.freeze_kernel_resolution("SM103 qualification")
-    try:
+    with kernel_resolution_guard("SM103 qualification"):
         for m in (1, 4, 8, 2):
             a = torch.randn((m, 256), device=device, dtype=torch.bfloat16) * 0.1
             ids = torch.arange(m * 2, device=device, dtype=id_dtype).reshape(m, 2) % 4
@@ -110,8 +110,6 @@ def test_native_moe_correctness_and_graph_capacity_reuse(id_dtype, mode, w13_lay
                 prepared._impl.w1_fp4.data_ptr(),
                 prepared._impl.w2_fp4.data_ptr(),
             )
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
@@ -128,8 +126,7 @@ def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
     source_weights = torch.rand((period, top_k), device=device)
     a, ids, weights = source[rows], source_ids[rows], source_weights[rows]
     scratch_ptr = scratch.data_ptr()
-    b12x.freeze_kernel_resolution("SM103 prefill route boundary")
-    try:
+    with kernel_resolution_guard("SM103 prefill route boundary"):
         for live in (1, 8192, capacity):
             binding = fused_moe.bind(
                 plan,
@@ -161,5 +158,3 @@ def test_native_moe_prefill_crosses_route_grid_boundary_with_frozen_plan():
             assert F.cosine_similarity(
                 actual.float().flatten(), expected.float().flatten(), dim=0
             ) > 0.999
-    finally:
-        b12x.unfreeze_kernel_resolution()

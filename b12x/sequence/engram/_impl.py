@@ -45,7 +45,7 @@ class Binding:
  _state:_State; token_ids:torch.Tensor; token_mask:torch.Tensor; query_start_loc:torch.Tensor; request_slots:torch.Tensor; committed_history:torch.Tensor; num_seqs:torch.Tensor; num_tokens:torch.Tensor; hash_ids:torch.Tensor; compressed:torch.Tensor; request_ids:torch.Tensor; scratch:torch.Tensor; plan:Plan
 @dataclass(frozen=True)
 class LookupBinding:
- _state:_State; weight:torch.Tensor; scale_bytes:torch.Tensor; hash_ids:torch.Tensor; num_tokens:torch.Tensor; out:torch.Tensor; plan:Plan; disk_table:object|None=None
+ _state:_State; weight:torch.Tensor; scale_bytes:torch.Tensor; hash_ids:torch.Tensor; num_tokens:torch.Tensor; out:torch.Tensor; plan:Plan; disk_table:object|None=None; storage:object|None=None
 
 def _need(n,x,shape,dtype,device):
  _require_tensor(n,x,shape=shape,dtype=dtype,device=device)
@@ -64,8 +64,15 @@ def bind(plan: Plan, **kwargs):
  return _bind_state(p, plan=plan, **kwargs)
 
 def _bind_lookup_state(p: _State, *, weight=None, scales=None, hash_ids, num_tokens, out,
-                       disk_table=None, plan: Plan | None = None):
+                       disk_table=None, storage=None, plan: Plan | None = None):
  c=p.caps
+ if storage is not None:
+  from ._storage import TableStorage
+  if not isinstance(storage, TableStorage) or storage.plan is not plan or storage.closed:
+   raise ValueError("table storage must own this plan and remain open")
+  if disk_table is not None or weight is not None or scales is not None:
+   raise ValueError("table storage owns its weight and scale planes")
+  weight, scales = storage.weight, storage.scales
  if disk_table is not None:
   from ._disk import DiskTable
   if not isinstance(disk_table,DiskTable) or disk_table.state is not p: raise ValueError("disk table must own this prepared Engram state")
@@ -82,7 +89,7 @@ def _bind_lookup_state(p: _State, *, weight=None, scales=None, hash_ids, num_tok
  _need("weight",weight,weight_shape,torch.float8_e4m3fn,c.device); _need("scales",scale,scale_shape,torch.uint8,c.device); _need("hash_ids",hash_ids,(c.max_tokens,24),torch.int64,c.device); _need("num_tokens",num_tokens,(1,),torch.int32,c.device); _need("out",out,(c.max_tokens,6144),torch.bfloat16,c.device)
  _require_mutation_alias_contract(mutable=(("out",out),),read_only=(("weight",weight),("scales",scales),("hash_ids",hash_ids),("num_tokens",num_tokens)))
  if disk_table is not None: disk_table.freeze()
- return LookupBinding(p,weight,scale,hash_ids,num_tokens,out,plan,disk_table)
+ return LookupBinding(p,weight,scale,hash_ids,num_tokens,out,plan,disk_table,storage)
 def bind_lookup(plan: Plan, **kwargs):
  p=require_prepared(plan,"sequence.engram")
  if not isinstance(p,_State) or p.operation!="lookup": raise TypeError("plan does not own lookup Engram")
@@ -96,6 +103,7 @@ def run(binding,token_count=None):
  return binding.hash_ids
 def run_lookup(binding,token_count=None,*,clear_tail=True):
  if not isinstance(binding,LookupBinding): raise TypeError("lookup run requires an Engram lookup binding")
+ if binding.storage is not None and binding.storage.closed: raise RuntimeError("Engram table storage is closed")
  prepared=binding.hash_ids.shape[0] if token_count is None else operator.index(token_count)
  if not 0<=prepared<=binding.hash_ids.shape[0]: raise ValueError("token count exceeds capacity")
  from ._kernels import lookup_op

@@ -3,7 +3,7 @@
 import torch
 
 
-from b12x.policy.generation.providers.trellis_reference import (
+from tests._reference.trellis_reference import (
     native_weight as native_weight,
 )
 

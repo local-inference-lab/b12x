@@ -172,7 +172,7 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                 programs["gram"] = kernels._run_mhc_post_pre_prefill_gram_launch(**args)
                 if native.route == "tf32":
                     programs["project"] = kernels._run_mhc_prefill_tf32_project_launch(
-                        out=out, fn=fn, partials=partials, split_fp32_fn=query.lagged_mix,
+                        out=out, fn=fn, partials=partials, split_fp32_fn=query.lagged_mix or config.projection_split_fp32,
                         **_projection_options(config),
                     )
                 else:
@@ -275,7 +275,7 @@ def _post_pre_primary(query, config, native, programs):
         if native.route == "tf32":
             project = partial(
                 kernels._run_mhc_prefill_tf32_project_launch, _prepared=programs["project"],
-                split_fp32_fn=query.lagged_mix, **_projection_options(config),
+                split_fp32_fn=query.lagged_mix or config.projection_split_fp32, **_projection_options(config),
             )
             def primary(*, fn, fn_bf16=None, **args):
                 gram(**args)

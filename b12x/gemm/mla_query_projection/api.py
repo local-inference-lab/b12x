@@ -49,7 +49,7 @@ def can_implement(*, num_heads: int, max_m: int, nope_dim: int, latent_dim: int,
 
 
 def is_supported(device=None) -> bool:
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 def clear_caches() -> None:

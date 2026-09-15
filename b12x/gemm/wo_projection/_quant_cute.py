@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import functools
+from b12x._lib.compiler import run_compiled
+from b12x._lib.compile_plan import attach_programs
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -403,7 +405,10 @@ def _get_compiled_wo_quant(
                              cos_sin_dtype, device_ordinal, architecture)
 
 
-@functools.cache
+from b12x._lib.program_cache import program_cache
+
+
+@program_cache
 def _compile_wo_quant(
     mode: str,
     total_k: int,
@@ -477,6 +482,8 @@ def _compile_wo_quant(
         ),
     )
 
+    sm_count = torch.cuda.get_device_properties(device_ordinal).multi_processor_count
+
     def launch_tensors(
         source: torch.Tensor,
         positions: torch.Tensor,
@@ -491,9 +498,8 @@ def _compile_wo_quant(
         total_tasks = m * (total_k // 32 // groups_per_warp_tile)
         warps_per_cta = _THREADS // 32
         natural_grid = max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta)
-        sm_count = torch.cuda.get_device_properties(source.device).multi_processor_count
         grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
-        raw(
+        run_compiled(raw, (
             make_ptr(
                 source_type,
                 source.data_ptr(),
@@ -535,9 +541,9 @@ def _compile_wo_quant(
             Int64(cos_sin.numel()),
             Int32(grid_x),
             current_cuda_stream() if stream is None else cuda.CUstream(cuda_stream_to_int(stream)),
-        )
+        ))
 
-    return launch_tensors
+    return attach_programs(launch_tensors, raw)
 
 
 _get_compiled_wo_quant.cache_clear = _compile_wo_quant.cache_clear
@@ -559,6 +565,7 @@ def quantize_wo_grouped_rows_cute(
     nope_dim: int = 0,
     rope_dim: int = 0,
     stream: object = None,
+    compiled=None,
 ) -> None:
     """Quantize flat `[m, groups*group_width]` rows into the grouped WO-A
     MXFP8 operand, optionally applying inverse RoPE first."""
@@ -582,14 +589,17 @@ def quantize_wo_grouped_rows_cute(
         cs_t = source_flat
     if m:
         with torch.cuda.device(source_flat.device):
-            _get_compiled_wo_quant(
+            fn = compiled
+            if fn is None:
+                fn = _get_compiled_wo_quant(
                 "grouped", groups * group_width, group_width, source_flat.dtype,
                 inv_rope, head_dim if inv_rope else 0, nope_dim if inv_rope else 0,
                 rope_dim if inv_rope else 0,
                 pos_t.dtype if inv_rope else torch.int64,
                 cs_t.dtype if inv_rope else torch.bfloat16,
                 source_flat.device.index,
-            )(source_flat, pos_t, cs_t, values, scale_rows, scale_mma, m, stream)
+            )
+            fn(source_flat, pos_t, cs_t, values, scale_rows, scale_mma, m, stream)
 
 
 def quantize_wo_group_major_rows_cute(
@@ -602,6 +612,7 @@ def quantize_wo_group_major_rows_cute(
     groups: int,
     rank: int,
     stream: object = None,
+    compiled=None,
 ) -> None:
     """Quantize the WO-A output (physical `[groups, m, rank]`) as group-major
     flat `[m, groups*rank]` MXFP8 rows for WO-B."""
@@ -610,10 +621,13 @@ def quantize_wo_group_major_rows_cute(
                       m=m, total_k=groups * rank, span=rank, mode="group_major")
     if m:
         with torch.cuda.device(source_gmr.device):
-            _get_compiled_wo_quant(
+            fn = compiled
+            if fn is None:
+                fn = _get_compiled_wo_quant(
                 "group_major", groups * rank, rank, source_gmr.dtype, False,
                 0, 0, 0, torch.int64, torch.bfloat16, source_gmr.device.index,
-            )(source_gmr, source_gmr, source_gmr, values, scale_rows, scale_mma, m, stream)
+            )
+            fn(source_gmr, source_gmr, source_gmr, values, scale_rows, scale_mma, m, stream)
 
 
 def _grouped_source_stride(source, m, total_k):

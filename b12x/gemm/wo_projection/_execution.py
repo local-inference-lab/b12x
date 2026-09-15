@@ -93,7 +93,7 @@ def _execute(
 
 
 @_execute.register_fake
-def _execute_fake(source, positions, cos_sin, wa, wa_mma, wb, wb_mma,
-                  x_values, x_rows, x_mma, tmp, tmp_values, tmp_rows, tmp_mma,
-                  output, groups, group_width, rank, nope_dim, rope_dim, stream_int):
+def _execute_fake(source: torch.Tensor, positions: torch.Tensor | None, cos_sin: torch.Tensor | None, wa: torch.Tensor, wa_mma: torch.Tensor, wb: torch.Tensor, wb_mma: torch.Tensor,
+                  x_values: torch.Tensor, x_rows: torch.Tensor, x_mma: torch.Tensor, tmp: torch.Tensor, tmp_values: torch.Tensor, tmp_rows: torch.Tensor, tmp_mma: torch.Tensor,
+                  output: torch.Tensor, groups: int, group_width: int, rank: int, nope_dim: int, rope_dim: int, stream_int: int | None):
     return None

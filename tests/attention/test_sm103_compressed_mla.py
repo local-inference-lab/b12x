@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from b12x.attention import compressed_sparse_mla as mla
-from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
+from b12x.attention.compressed_sparse_mla._tuning import SparseMlaConfig
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
     pack_compressed_sparse_mla_kv_cache_reference,
@@ -71,7 +71,8 @@ def test_compressed_warp_numerics(
         indexed = None
     sink = torch.linspace(-1, 5, heads, device=device) if with_sink else None
     config = SparseMlaConfig(
-        max_chunks_per_row=4, v41_compute_mode=precision, backend="warp"
+        max_chunks_per_row=4 if mode == "decode" else 1, split_chunk_size=1,
+        single_pass=mode != "decode", v41_compute_mode=precision, backend="warp"
     )
     plan = mla.plan(
         mla.Caps(
@@ -86,7 +87,11 @@ def test_compressed_warp_numerics(
             swa_page_size=page_size,
             indexed_page_size=page_size,
         ),
-        config=config,
+        override=config, invocation=mla.invocation_from_tensors(
+            q=q, swa_k_cache=swa[:0] if source == "indexed" else swa,
+            indexed_k_cache=indexed, attn_sink=sink, out=q,
+            return_lse=True, lse_scale="natural",
+        ),
     )
     (spec,) = plan.scratch_specs()
     storage = torch.full(spec.shape, 0x7F, device=device, dtype=spec.dtype)
@@ -186,12 +191,10 @@ def test_compressed_warp_numerics(
 )
 @pytest.mark.parametrize("mode", ["decode", "extend"])
 def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention.compressed_sparse_mla import _warp
-    from b12x.policy import PolicyContext
+    from b12x.preparation import require_prepared
+    from dataclasses import replace
 
     device = require_blackwell()
     torch.manual_seed(719)
@@ -222,10 +225,14 @@ def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
         torch.arange(128, device=device, dtype=torch.int64) + swa_pid * swa_page
     )
 
+    writer_plan = (mla.plan_cache_writer(
+        mla.CacheWriterQuery(max_rows=128, page_size=swa_page, cache_kind="swa"),
+        device=device) if recipe == "deepseek_v41" else None)
+
     def write_swa():
         if recipe == "deepseek_v41":
             mla.write_cache(
-                swa_values, swa, writer_slots, page_size=swa_page, cache_kind="swa"
+                swa_values, swa, writer_slots, plan=writer_plan
             )
 
     write_swa()
@@ -248,35 +255,43 @@ def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
     lengths[0], lengths[1], lengths[2], lengths[3] = -1, 1, 13, 999
     index_lengths = lengths.clone()
     sink = torch.linspace(-1, 4, heads, device=device)
-    plan = mla.plan(
-        mla.Caps(
-            device=device,
-            num_q_heads=heads,
-            max_q_rows=rows,
-            max_width=2 * capacity,
-            swa_width=capacity,
-            indexed_width=capacity,
-            swa_page_size=swa_page,
-            indexed_page_size=index_page,
-            cache_format=recipe,
-            mode=mode,
-            use_cuda_graph=True,
-        ),
-        config=SparseMlaConfig(
-            max_chunks_per_row=4, v41_compute_mode=precision, backend="warp"
-        ),
+    caps = mla.Caps(
+        device=device, num_q_heads=heads, max_q_rows=rows,
+        max_width=2 * capacity, swa_width=capacity, indexed_width=capacity,
+        swa_page_size=swa_page, indexed_page_size=index_page,
+        cache_format=recipe, mode=mode, use_cuda_graph=True,
+        max_page_table_width=4,
     )
-    (spec,) = plan.scratch_specs()
-    storage = torch.full(spec.shape, 0x7F, device=device, dtype=spec.dtype)
+    config = SparseMlaConfig(
+        max_chunks_per_row=4 if mode == "decode" else 1, split_chunk_size=1,
+        single_pass=mode != "decode", v41_compute_mode=precision, backend="warp",
+    )
     output = torch.empty_like(q)
+    plans = {}
+    for extra, with_sink, natural, internal in (
+        (False, False, True, False), (True, True, True, False),
+        (True, True, False, False), (True, True, True, True),
+    ):
+        declaration = mla.plan(
+            caps if extra else replace(caps, indexed_width=0, max_width=capacity),
+            override=config,
+            invocation=mla.invocation_from_tensors(
+                q=q, swa_k_cache=swa, indexed_k_cache=indexed if extra else None,
+                attn_sink=sink if with_sink else None, out=None if internal else output,
+                return_lse=True, lse_scale="natural" if natural else "base2",
+            ),
+        )
+        declaration.scratch_specs()
+        plans[extra, with_sink, natural, internal] = declaration
+    storage = torch.full((max(p.scratch_specs()[0].shape[0] for p in plans.values()),),
+                         0x7F, device=device, dtype=torch.uint8)
 
-    def bind(live, width, *, extra=True, mapping=table, start=0):
+    def bind(live, width, *, extra=True, mapping=table, start=0,
+             with_sink=True, natural=True, default_output=False):
         active = slice(start, start + live)
         return mla.bind(
-            plan,
-            scratch=storage,
-            q=q[active],
-            swa_indices=swa_indices[active, :width].contiguous(),
+            plans[extra, with_sink, natural, default_output], scratch=storage,
+            q=q[active], swa_indices=swa_indices[active, :width].contiguous(),
             swa_lengths=lengths[active],
             indexed_indices=logical[active, :width].contiguous() if extra else None,
             indexed_lengths=index_lengths[active] if extra else None,
@@ -285,16 +300,12 @@ def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
 
     def run(binding, *, extra=True, with_sink=True, natural=True, default_output=False):
         return mla.run(
-            binding=binding,
-            swa_k_cache=swa,
-            swa_page_size=swa_page,
+            binding=binding, swa_k_cache=swa, swa_page_size=swa_page,
             indexed_k_cache=indexed if extra else None,
             indexed_page_size=index_page if extra else None,
-            attn_sink=sink if with_sink else None,
-            sm_scale=512**-0.5,
-            return_lse=True,
-            lse_scale="natural" if natural else "base2",
-            out=None if default_output else output[: binding.q.shape[0]],
+            attn_sink=sink if with_sink else None, sm_scale=512**-0.5,
+            return_lse=True, lse_scale="natural" if natural else "base2",
+            out=None if default_output else output[:binding.q.shape[0]],
         )
 
     def check(result, binding, *, extra=True, with_sink=True, natural=True):
@@ -382,23 +393,22 @@ def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
         if width and live > 1:
             assert torch.count_nonzero(actual[1:])
 
-    # Warm without an indexed source or sink; both remain legal under frozen resolution.
-    initial = bind(rows, capacity, extra=False)
+    # Every optional-operand and output contract is prepared before serving.
+    initial = bind(rows, capacity, extra=False, with_sink=False)
     initial_result = run(initial, extra=False, with_sink=False)
     check(initial_result, initial, extra=False, with_sink=False)
-    callables = dict(_warp._CACHE[plan.backend_key])
+    callables = tuple(require_prepared(p, "attention.compressed_sparse_mla").launch for p in plans.values())
 
     def no_resolution(*args, **kwargs):
         raise AssertionError("serving must reuse the precompiled plan")
 
-    monkeypatch.setattr(PolicyContext, "resolve", no_resolution)
     monkeypatch.setattr(_warp, "b12x_compile", no_resolution)
-    freeze_kernel_resolution("compressed MLA runtime counts, sink, and page tables")
-    try:
+    with kernel_resolution_guard("compressed MLA runtime counts, sink, and page tables"):
         for live, width in ((rows, capacity), (3, 13), (1, 1), (0, 0), (5, 0)):
-            binding = bind(live, width)
             for natural in (False, True):
+                binding = bind(live, width, natural=natural)
                 check(run(binding, natural=natural), binding, natural=natural)
+            binding = bind(live, width, default_output=True)
             check(run(binding, default_output=True), binding)
         binding = bind(3, capacity, start=1)
         assert binding.swa_lengths.data_ptr() % 16 == 4
@@ -431,9 +441,7 @@ def test_compressed_warp_serving(recipe, precision, mode, monkeypatch):
         assert pointers == tuple(
             t.data_ptr() for t in (q, swa, indexed, storage, output)
         )
-        assert callables == _warp._CACHE[plan.backend_key]
-    finally:
-        unfreeze_kernel_resolution()
+        assert callables == tuple(require_prepared(p, "attention.compressed_sparse_mla").launch for p in plans.values())
 
 
 @pytest.mark.parametrize(

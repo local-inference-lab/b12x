@@ -1464,7 +1464,7 @@ def test_stateless_add_retains_fp32_before_cancellation(output_dtype):
 
 
 def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
 
     device = require_sm120()
     capacity, width = 9, 257
@@ -1488,8 +1488,9 @@ def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
 
     launch(capacity)
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("stateless activation/add live row reuse")
+    guard = kernel_resolution_guard("stateless activation/add live row reuse")
+    guard.__enter__()
+    request.addfinalizer(lambda: guard.__exit__(None, None, None))
     outputs = (shared, vision, added, vision_added, confidence)
     pointers = tuple(t.data_ptr() for t in outputs)
     for rows in (0, 1, 7, capacity):
@@ -1524,7 +1525,7 @@ def test_stateless_tails_frozen_live_counts_and_graph_mutation(request):
 
 
 def test_ordinary_rmsnorm_preserves_fp32_weights_and_pointer_abi(request):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
 
     device = require_sm120()
     capacity, streams, hidden = 7, 4, 256
@@ -1552,8 +1553,9 @@ def test_ordinary_rmsnorm_preserves_fp32_weights_and_pointer_abi(request):
     launch(capacity, rounded)
     launch(capacity, weights)
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("ordinary RMSNorm BF16/FP32 weight ABI")
+    guard = kernel_resolution_guard("ordinary RMSNorm BF16/FP32 weight ABI")
+    guard.__enter__()
+    request.addfinalizer(lambda: guard.__exit__(None, None, None))
     for rows in (1, 3, capacity):
         for weight in (rounded, weights):
             graph = torch.cuda.CUDAGraph()

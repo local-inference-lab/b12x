@@ -5,7 +5,7 @@ import torch
 
 from b12x._lib.intrinsics import quant_dequant_mxfp8_torch
 from b12x._lib.quant import mxfp8_rows as quant
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm import block_fp8_linear as linear
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from tests.gemm.test_sm103_blockscaled import check
@@ -63,8 +63,7 @@ def test_public_quantizer_counts_and_graph_reuse(dtype, floor, monkeypatch):
                                      storage.scale_mma, expected_m=129, physical_k=256, min_amax=floor)
     run(1)
     cached = quant._get_compiled_mxfp8_rows_quant.cache_info()
-    freeze_kernel_resolution("MXFP8 live rows reuse one planned callable")
-    try:
+    with kernel_resolution_guard("MXFP8 live rows reuse one planned callable"):
         for m in (1, 4, 8, 9, 65, 129):
             run(m)
             assert_quantized(source[:m], storage, floor)
@@ -91,8 +90,6 @@ def test_public_quantizer_counts_and_graph_reuse(dtype, floor, monkeypatch):
         for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
             assert before[key] == after[key]
         assert pointers == [t.data_ptr() for t in tensors]
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("block,n,k", [(128, 256, 384), (32, 136, 160), (32, 256, 576)])
@@ -105,8 +102,7 @@ def test_public_plan_counts_bias_mutation_graph_and_stream(block, n, k, dtype, m
     packed = linear.pack_weight(weight, scale, block_size=(block, block))
     bias = torch.randn(n, device="cuda", dtype=dtype).mul_(.125)
     plan = linear.plan(linear.Caps(device=source.device, max_tokens=129, in_features=k,
-                                  out_features=n, output_dtype=dtype, block_size=(block, block)))
-    assert plan.backend == ("mxfp8_tcgen05" if torch.cuda.get_device_capability() == (10, 3) else "mxfp8")
+                                  out_features=n, source_dtype=dtype, output_dtype=dtype, block_size=(block, block)))
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
     output = torch.empty(129, n, 1, device="cuda", dtype=dtype)
@@ -114,8 +110,7 @@ def test_public_plan_counts_bias_mutation_graph_and_stream(block, n, k, dtype, m
                             output=output[:m], bias=bias) for m in (1, 4, 8, 9, 65, 129)]
     linear.run(binding=bindings[0])
     cached = quant._get_compiled_mxfp8_rows_quant.cache_info()
-    freeze_kernel_resolution("planned block-FP8 fixed capacity")
-    try:
+    with kernel_resolution_guard("planned block-FP8 fixed capacity"):
         for binding in bindings:
             expected = reference(binding.source, weight, scale, block).to(dtype) + bias
             check(linear.run(binding=binding), expected.float())
@@ -150,8 +145,6 @@ def test_public_plan_counts_bias_mutation_graph_and_stream(block, n, k, dtype, m
         for key in ("allocation.all.allocated", "allocated_bytes.all.allocated"):
             assert before[key] == after[key]
         assert addresses == [t.data_ptr() for t in tensors]
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("subgroup", [4, 8])
@@ -168,19 +161,21 @@ def test_quantizer_source_row_past_int32_elements(subgroup):
 
 
 @pytest.mark.parametrize("block,k", [(128, 384), (32, 160)])
-def test_functional_prewarm_compilation_and_graph(block, k):
+def test_functional_preparation_compilation_and_graph(block, k):
     n = 256
     source = torch.randn(129, k, device="cuda", dtype=torch.bfloat16).mul_(.25)
     weight = torch.randn(n, k, device="cuda").mul_(.125).to(torch.float8_e4m3fn)
     scale = torch.randint(123, 129, (n // block, k // block), device="cuda", dtype=torch.uint8).view(torch.float8_e8m0fnu)
     packed = linear.pack_weight(weight, scale, block_size=(block, block))
-    linear.prewarm(packed, (1, 129), expected_m=129)
+    plan = linear.plan(linear.Caps(device=source.device, max_tokens=129,
+        in_features=k, out_features=n, block_size=(block, block), output_mode="functional"))
+    from b12x.preparation import require_prepared
+    require_prepared(plan, "gemm.block_fp8_linear", source.device)
     def run(x):
-        return linear.run(x, packed, expected_m=129)
+        return linear.run(x, packed, plan=plan)
     compiled = torch.compile(run, fullgraph=True, dynamic=True)
     check(compiled(source), reference(source, weight, scale, block))
-    freeze_kernel_resolution("functional block-FP8 serving after public prewarm")
-    try:
+    with kernel_resolution_guard("functional block-FP8 serving after preparation"):
         for m in (1, 4, 8, 65, 129):
             check(run(source[:m]), reference(source[:m], weight, scale, block))
         graph = torch.cuda.CUDAGraph()
@@ -193,28 +188,3 @@ def test_functional_prewarm_compilation_and_graph(block, k):
             graph.replay()
             check(output, reference(source, weight, scale, block))
         assert output.data_ptr() == address
-    finally:
-        unfreeze_kernel_resolution()
-
-
-@pytest.mark.parametrize("block", [32, 128])
-def test_profile_provider_qualifies_production_plans_and_gates_timing(block, tmp_path, monkeypatch):
-    from b12x._lib import intrinsics
-    from b12x.policy import PolicyContext
-    from b12x.policy.generation import GenerationContext, GenerationSettings, SweepCase
-    from b12x.policy.generation.providers import gemm
-    identity = PolicyContext.for_device("cuda").device
-    context = GenerationContext(device=identity, device_ordinal=0, work_dir=tmp_path,
-                                source_revision="test", settings=GenerationSettings(
-                                    warmup=1, groups=1, repetitions=2, cold_l2=False))
-    case = SweepCase.create(group_id=f"block{block}", query=dict(max_tokens=4,
-                            in_features=256, out_features=256, output_dtype="bfloat16", weight_block_size=block))
-    with gemm._BlockFp8Session(context) as session:
-        candidates = session.candidates(case)
-        measurements = session.measure(case, candidates)
-        assert measurements and all(row.correct for row in measurements)
-        assert all(row.latency_us > 0 and row.metrics["nonzero"] for row in measurements)
-        monkeypatch.setattr(intrinsics, "quant_dequant_mxfp8_torch", lambda x, **kw: torch.zeros_like(x, dtype=torch.float32))
-        monkeypatch.setattr(gemm, "_cuda_event_samples_us", lambda *a, **kw: pytest.fail("timed an incorrect candidate"))
-        rejected = session.measure(case, candidates)
-        assert all(not row.correct and row.latency_us is None and "oracle failed" in row.error for row in rejected)

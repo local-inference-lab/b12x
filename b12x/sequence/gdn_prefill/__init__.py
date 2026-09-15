@@ -42,7 +42,7 @@ META = OpMeta(
     test_path="tests/preparation/test_delta_prefill.py", since="1.4.0",
     notes=("BF16 activations, FP32 state, "
            "head dim 128, three value heads per Q/K head, 16-token chunks."),
-)
+ archs=("sm103a", "sm120a", "sm121a"))
 
 if TYPE_CHECKING:
     from .api import (Binding, Caps, GdnPrefillConfig, GdnPrefillQuery, Plan, bind,

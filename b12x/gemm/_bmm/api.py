@@ -43,7 +43,7 @@ def can_implement_bmm(*, batch: int, max_m: int, n: int, k: int, a_dtype: str,
 
 
 def is_bmm_supported(device=None) -> bool:
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 def clear_bmm_caches() -> None:

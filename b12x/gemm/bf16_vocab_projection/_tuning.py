@@ -121,14 +121,18 @@ def _validate_config(
 ) -> None:
     if not isinstance(config, Bf16VocabProjectionConfig):
         raise TypeError("config must be Bf16VocabProjectionConfig")
+    if config.backend == "cute":
+        if config.to_dict() != CUTE_CONFIG:
+            raise ValueError("CuTe vocabulary projection requires its fixed GEMV config")
+        return
+    if _device is not None and _device.compute_capability == (10, 3):
+        raise ValueError("SM103 vocabulary projection requires CuTe")
     if config.backend == "torch":
         if (config.algorithm, config.block_k, config.num_warps) != ("torch", 0, 0):
             raise ValueError("torch projection configs cannot carry Triton knobs")
         return
     if config.backend != "triton":
         raise ValueError(f"unsupported projection backend {config.backend!r}")
-    if device is not None and device.compute_capability == (10, 3):
-        raise ValueError("SM103 vocabulary projection uses the CuTe backend")
     if query.max_tokens != 1:
         raise ValueError("the Triton vocabulary GEMV requires max_tokens=1")
     if query.in_features > MAX_IN_FEATURES:
@@ -150,6 +154,11 @@ def _validate_config(
 
 
 def _tuning_parameters(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        from b12x.preparation import ParameterSpace
+        return ParameterSpace(knobs=tuple(
+            Knob(name=name, values=(value,)) for name, value in CUTE_CONFIG.items()
+        ))
     row_blocks = tuple(
         1 << exponent
         for exponent in range(MAX_IN_FEATURES.bit_length())
@@ -166,7 +175,7 @@ def _tuning_parameters(query, device):
 TUNING = TuningContract(
     component_id="gemm.bf16_vocab_projection",
     query_schema_version=1,
-    config_schema_version=2,
+    config_schema_version=3,
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -175,7 +184,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     knobs=(
         Knob(name="backend", values=("torch", "triton"), binding=ParameterBinding.COMPILE),
         Knob(name="algorithm", values=("row", "loop"), binding=ParameterBinding.COMPILE,

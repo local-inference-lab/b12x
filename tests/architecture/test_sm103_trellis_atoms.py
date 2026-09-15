@@ -202,13 +202,14 @@ def test_atom_binding_reuses_capacity_kernels(
     prepared = fused_moe.PreparedExperts(plan=replace(public, _impl=raw), _impl=owner)
     execution = fused_moe.plan_execution(
         experts=prepared,
-        policy=capacity.policy_context,
         capacity=fused_moe.ExecutionCapacity(
-            max_tokens=8, top_k=2, warmup_token_counts=(1, 4), route_num_experts=6
+            max_tokens=8, top_k=2, route_num_experts=6
         ),
     )
-    execution._impl = plan
-    execution._prewarmed = True
+    from b12x.moe.fused_moe._preparation import _FusedMoeState
+    from tests.architecture._prepared import install_host_state
+    state = _FusedMoeState(prepared, plan, capacity.decode_config, None, None, None)
+    install_host_state(execution, state, capacity.decode_config, scratch=plan.scratch_specs())
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype) for s in plan.scratch_specs()
     }
@@ -262,7 +263,7 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
         first_slot=first, width=width, global_width=global_width,
     )
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
-        owner = fused_moe.prepare_weights(
+        owner = _impl.prepare_b12x_fp4_moe_weights(
             plan=weight_plan, params_dtype=torch.bfloat16,
             btx_layer=layer, btx_device="cpu",
         )
@@ -303,7 +304,7 @@ def test_btx_pair_records_retain_public_binding_and_scale_order(
     ids, router = torch.zeros(8, 2, dtype=torch.int64), torch.ones(8, 2)
     with patch.object(cute, "compile", side_effect=AssertionError("resolution frozen")):
         for live in (8, 1, 4, 3):
-            bound = fused_moe.bind(plan, scratch=scratch, experts=owner, a=source[:live], topk_ids=ids[:live], topk_weights=router[:live])
+            bound = plan.bind( scratch=scratch, experts=owner, a=source[:live], topk_ids=ids[:live], topk_weights=router[:live])
             calls = bound._backend_binding.calls
             assert len(calls) == (7 if coupled and payload.trellis.input_scale_split is None else 8)
             fc1 = launches["fc1_atoms_dual" if payload.trellis.input_scale_split else "fc1_atoms"]
@@ -348,9 +349,11 @@ def test_btx_pair_preparation_fails_closed(tmp_path, coupled):
 ])
 def test_btx_pair_expansion_does_not_enable_sm12x(monkeypatch, coupled, width, kinds):
     from b12x._lib.architecture import UnsupportedArchitectureError
-    from b12x.policy import DeviceIdentity, PolicyContext
+    from b12x.preparation import DeviceIdentity
+    from b12x.moe.fused_moe._tuning import TUNING
+    from b12x.moe.fused_moe._sm103 import query_for_weight_plan
 
-    plan = fused_moe.plan_weights(
+    plan = _impl.plan_b12x_fp4_moe_weights(
         quant_modes="w4a16", source_format="btx", activation="situ",
         params_dtype=torch.bfloat16, num_experts=3, hidden_size=512,
         intermediate_size=width, trellis_codebook="sqg_e4m3", trellis_bits=3,
@@ -358,11 +361,10 @@ def test_btx_pair_expansion_does_not_enable_sm12x(monkeypatch, coupled, width, k
         coupled_hadamard=coupled, coupled_hadamard_blocks=(512, 128) if coupled else None,
     )
     identity = DeviceIdentity(vendor="nvidia", product_name="Synthetic SM120", compute_capability=(12, 0), sm_count=70)
-    from types import SimpleNamespace
-    import b12x.policy.context as context
-    monkeypatch.setattr(context, "detect_device", lambda device: SimpleNamespace(identity=identity, ordinal=None))
+    query = query_for_weight_plan(plan, quant_mode="w4a16", num_tokens=1, num_topk=2)
+    config = TUNING.configure(query, device=identity, search=False).default
     with pytest.raises(UnsupportedArchitectureError, match="SM12x BTX paired"):
         _impl.plan_tp_moe_execution(
             num_tokens=1, num_topk=2, device="cpu", weight_plan=plan,
-            quant_mode="w4a16", policy_context=PolicyContext.for_identity(identity),
+            quant_mode="w4a16", decode_config=config,
         )

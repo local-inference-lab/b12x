@@ -4,42 +4,36 @@ from __future__ import annotations
 
 import torch
 
-from b12x._lib.dense_gemm import dense_gemm
-from b12x._lib.gating import get_compute_capability
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.utils import cuda_stream_to_int
 from ._a16 import _check_tensor, _overlap, _stream_context
 
 
-def _layout(rows, n, input_k, padded_k, tensor_scaled):
-    padded_bytes = rows * padded_k if input_k != padded_k else 0
+def prepared_layout(query, lowering, use_block):
+    """Reserve padding, unit scales, and split partials for the declared capacity."""
+    rows, k = query.max_rows, query.padded_in_features
+    padded_bytes = rows * k if query.in_features != k else 0
     scale_start = (padded_bytes + 255) // 256 * 256
-    scale_bytes = min(rows, 8) * (padded_k // 128) * 4 if tensor_scaled else 0
+    scale_bytes = rows * (k // 128) * 4 if query.recipe == "tensor_fp8" and use_block else 0
     partial_start = (scale_start + scale_bytes + 255) // 256 * 256
-    # The dense FP8 policy splits at most four ways, only for capacities <= 8.
-    partial_bytes = 4 * min(rows, 8) * n * 4
+    policy = lowering.policy
+    partial_bytes = (policy.split_k_slices * rows * query.out_features * 4
+                     if policy.split_k_slices > 1 and not policy.split_k_atomic_bf16 else 0)
     return scale_start, partial_start, partial_start + partial_bytes
 
 
-def workspace_size(weight, max_tokens: int) -> int:
-    from ._linear import TensorFP8LinearWeight
-    if not isinstance(max_tokens, int) or max_tokens < 0:
-        raise ValueError("max_tokens must be a non-negative integer")
-    if isinstance(weight, TensorFP8LinearWeight):
-        return _layout(max_tokens, weight.out_features, weight.in_features,
-                       weight.padded_in_features, True)[-1]
-    values, scales = weight
-    if (values.ndim != 2 or values.dtype != torch.float8_e4m3fn
-            or values.shape[0] <= 0 or values.shape[0] % 128
-            or values.shape[1] <= 0 or values.shape[1] % 128
-            or scales.dtype != torch.float32
-            or scales.shape != (values.shape[0] // 128, values.shape[1] // 128)):
-        raise ValueError("FP8 workspace requires compact K128 block-scaled weights")
-    return _layout(max_tokens, values.shape[0], values.shape[1], values.shape[1], False)[-1]
-
-
 def _execute(source, values, source_scale, weight_scale, weight_block_scale,
-             alpha, bias, out, workspace, tensor_scaled, expected_m, out_dtype, stream):
-    from ._linear import _use_block_fp8_recipe
+             alpha, bias, out, workspace, tensor_scaled, plan_handle, out_dtype, stream):
+    from b12x.preparation import plan_from_handle, require_prepared
+    state = require_prepared(plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source.device)
+    query = state.query
+    if not query.fp8_workspace:
+        raise ValueError("FP8 workspace execution requires a bounded workspace declaration")
+    if tensor_scaled != (query.recipe == "tensor_fp8"):
+        raise ValueError("FP8 scale recipe differs from the prepared declaration")
+    if (out is not None) != (query.output_mode == "provided"):
+        raise ValueError("FP8 output ownership differs from the prepared declaration")
+    if (workspace is not None) != (query.workspace_form == "provided"):
+        raise ValueError("FP8 workspace ownership differs from the prepared declaration")
     if source.device.type != "cuda" or source.dtype != torch.float8_e4m3fn:
         raise ValueError("FP8 GEMM requires CUDA E4M3 activation values")
     _check_tensor("source", source, source.device, torch.float8_e4m3fn)
@@ -52,10 +46,11 @@ def _execute(source, values, source_scale, weight_scale, weight_block_scale,
         raise ValueError("FP8 GEMM requires valid K32 input and K128 weight geometry")
     if not tensor_scaled and input_k != k:
         raise ValueError("compact block-FP8 input K must equal weight K")
-    if expected_m is not None and expected_m <= 0:
-        raise ValueError("expected_m must be positive when provided")
-    if workspace is not None and expected_m is not None and m > expected_m:
-        raise ValueError("FP8 workspace execution requires a covering expected_m capacity")
+    if (m > query.max_rows or input_k != query.in_features or k != query.padded_in_features
+            or n != query.out_features or source.device != state.device):
+        raise ValueError("FP8 execution differs from its prepared capacity/geometry/device")
+    if out_dtype != getattr(torch, query.output_dtype):
+        raise ValueError("FP8 output dtype differs from the prepared declaration")
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("FP8 output must be BF16 or FP16")
     if alpha is not None:
@@ -75,11 +70,11 @@ def _execute(source, values, source_scale, weight_scale, weight_block_scale,
         raise ValueError("FP8 output must have shape [M,N]")
     if any(t is not None and _overlap(t, out) for t in borrowed):
         raise ValueError("FP8 output must not overlap inputs")
-    scale_start, partial_start, needed = _layout(m, n, input_k, k, tensor_scaled)
+    if not m:
+        return out
+    scale_start, partial_start, needed = prepared_layout(query, state.dense.lowering, state.use_block)
     if workspace is None:
-        # The allocator must retain scratch until work on the launch stream retires.
-        with torch.cuda.device(source.device), _stream_context(stream, source.device):
-            workspace = torch.empty(needed, device=source.device, dtype=torch.uint8)
+        workspace = state.workspace
     _check_tensor("workspace", workspace, source.device, torch.uint8)
     if workspace.numel() < needed:
         raise ValueError(f"FP8 workspace requires at least {needed} bytes")
@@ -94,18 +89,14 @@ def _execute(source, values, source_scale, weight_scale, weight_block_scale,
             padded[:, :input_k].copy_(source)
         else:
             padded = source
-        block = not tensor_scaled
+        block = state.use_block if tensor_scaled else True
         if tensor_scaled:
-            block = get_compute_capability(source.device) != (10, 3) and _use_block_fp8_recipe(
-                live_m=m, expected_m=expected_m if expected_m is not None else m,
-                out_features=n, padded_in_features=k, sm_count=get_num_sm(source.device),
-            )
             if block:
                 source_scale = workspace[scale_start:scale_start + m * (k // 128) * 4].view(torch.float32).view(m, k // 128)
                 source_scale.fill_(1.0)
                 weight_scale = weight_block_scale
             else:
-                # Plain FP8 consumes alpha alone; the launch ignores scale pointers.
+                weight_scale = weight_scale.view(torch.float8_e8m0fnu)
                 source_scale = weight_scale
         if block:
             if n % 128:
@@ -118,14 +109,10 @@ def _execute(source, values, source_scale, weight_scale, weight_block_scale,
                 if scale.shape != shape:
                     raise ValueError(f"FP8 {name} must have shape {shape}")
         partial = workspace[partial_start:needed].view(torch.float32)
-        dense_gemm(
+        state.dense.run(
             (padded.reshape(m, k, 1), source_scale),
             (values.reshape(n, k, 1), weight_scale), out=out.view(m, n, 1),
-            alpha=alpha, ab_dtype="float8_e4m3fn",
-            sf_dtype="float32" if block else "float8_e8m0fnu",
-            c_dtype="bfloat16" if out_dtype == torch.bfloat16 else "float16",
-            sf_vec_size=128 if block else 32, block_fp8=block, plain_fp8=not block,
-            expected_m=expected_m, stream=stream, _split_k_workspace=partial,
+            alpha=alpha, stream=stream, split_k_workspace=partial,
         )
         if bias is not None:
             out.add_(bias)
@@ -137,15 +124,15 @@ def _functional(
     source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
     weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
     alpha: torch.Tensor | None, bias: torch.Tensor | None, workspace: torch.Tensor | None,
-    tensor_scaled: bool, expected_m: int | None, out_dtype: torch.dtype, stream: int | None,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
 ) -> torch.Tensor:
     return _execute(source, values, source_scale, weight_scale, weight_block_scale,
-                    alpha, bias, None, workspace, tensor_scaled, expected_m, out_dtype, stream)
+                    alpha, bias, None, workspace, tensor_scaled, plan_handle, out_dtype, stream)
 
 
 @_functional.register_fake
-def _functional_fake(source, values, source_scale, weight_scale, weight_block_scale,
-                     alpha, bias, workspace, tensor_scaled, expected_m, out_dtype, stream):
+def _functional_fake(source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None, weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+                     alpha: torch.Tensor | None, bias: torch.Tensor | None, workspace: torch.Tensor | None, tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None):
     return source.new_empty((source.shape[0], values.shape[0]), dtype=out_dtype)
 
 
@@ -154,25 +141,72 @@ def _out(
     source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
     weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
     alpha: torch.Tensor | None, bias: torch.Tensor | None, workspace: torch.Tensor | None, out: torch.Tensor,
-    tensor_scaled: bool, expected_m: int | None, out_dtype: torch.dtype, stream: int | None,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
 ) -> None:
     _execute(source, values, source_scale, weight_scale, weight_block_scale,
-             alpha, bias, out, workspace, tensor_scaled, expected_m, out_dtype, stream)
+             alpha, bias, out, workspace, tensor_scaled, plan_handle, out_dtype, stream)
 
 
 @_out.register_fake
-def _out_fake(source, values, source_scale, weight_scale, weight_block_scale,
-              alpha, bias, workspace, out, tensor_scaled, expected_m, out_dtype, stream):
+def _out_fake(source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None, weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+              alpha: torch.Tensor | None, bias: torch.Tensor | None, workspace: torch.Tensor | None, out: torch.Tensor, tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None):
+    return None
+
+
+@torch.library.custom_op("b12x::blockscaled_fp8_owned", mutates_args=())
+def _owned(
+    source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
+    weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+    alpha: torch.Tensor | None, bias: torch.Tensor | None,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
+) -> torch.Tensor:
+    return _execute(source, values, source_scale, weight_scale, weight_block_scale,
+                    alpha, bias, None, None, tensor_scaled, plan_handle, out_dtype, stream)
+
+
+@_owned.register_fake
+def _owned_fake(
+    source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
+    weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+    alpha: torch.Tensor | None, bias: torch.Tensor | None,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
+) -> torch.Tensor:
+    return source.new_empty((source.shape[0], values.shape[0]), dtype=out_dtype)
+
+
+@torch.library.custom_op("b12x::blockscaled_fp8_owned_out", mutates_args=("out",))
+def _owned_out(
+    source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
+    weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+    alpha: torch.Tensor | None, bias: torch.Tensor | None, out: torch.Tensor,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
+) -> None:
+    _execute(source, values, source_scale, weight_scale, weight_block_scale,
+             alpha, bias, out, None, tensor_scaled, plan_handle, out_dtype, stream)
+
+
+@_owned_out.register_fake
+def _owned_out_fake(
+    source: torch.Tensor, values: torch.Tensor, source_scale: torch.Tensor | None,
+    weight_scale: torch.Tensor, weight_block_scale: torch.Tensor | None,
+    alpha: torch.Tensor | None, bias: torch.Tensor | None, out: torch.Tensor,
+    tensor_scaled: bool, plan_handle: int, out_dtype: torch.dtype, stream: int | None,
+) -> None:
     return None
 
 
 def linear(source, values, source_scale, weight_scale, weight_block_scale, alpha,
-           *, out=None, workspace=None, bias=None, tensor_scaled=False, expected_m=None,
+           *, plan, out=None, workspace=None, bias=None, tensor_scaled=False,
            out_dtype=torch.bfloat16, stream=None):
     if weight_scale.dtype == torch.float8_e8m0fnu:
         weight_scale = weight_scale.view(torch.uint8)
     args = (source, values, source_scale, weight_scale, weight_block_scale, alpha, bias, workspace)
-    options = (tensor_scaled, expected_m, out_dtype, cuda_stream_to_int(stream))
+    options = (tensor_scaled, plan.handle, out_dtype, cuda_stream_to_int(stream))
+    if workspace is None:
+        if out is None:
+            return _owned(*args[:-1], *options)
+        _owned_out(*args[:-1], out, *options)
+        return out
     if out is None:
         return _functional(*args, *options)
     _out(*args, out, *options)

@@ -1,4 +1,5 @@
 """Canonical atom preparation and deferred complete SM103 expert execution."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 from dataclasses import replace
 
@@ -7,8 +8,22 @@ import torch
 
 from b12x._lib.architecture import UnsupportedArchitectureError
 from b12x.moe import fused_moe
-from b12x.policy.generation.providers.trellis_reference import moe_reference
+from b12x.preparation import require_prepared
+from tests._reference.trellis_reference import moe_reference
 from tests._reference.trellis_atoms import atom_fixture, btx_atom_fixture
+
+
+def _btx_plan(raw, layer):
+    return fused_moe.plan_weights(
+        source=fused_moe.BtxSource(manifest=layer.manifest),
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity=raw.activation, io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=raw.num_experts, hidden_size=raw.hidden_size,
+            intermediate_size=raw.intermediate_size,
+        ),
+    )
 
 
 @pytest.mark.parametrize("codebook", ["mcg", "sqg_e4m3", "sqg_fp16"])
@@ -32,7 +47,7 @@ def test_atom_preparation_rejects_invalid_storage_and_sm12x(codebook, coupled):
             fused_moe.plan_execution(
                 experts=prepared,
                 capacity=fused_moe.ExecutionCapacity(max_tokens=8, top_k=2),
-            )
+            ).scratch_specs()
     source = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16) * 0.01
     ids = torch.tensor([[0, 1], [2, -1]], device="cuda")
     router = torch.ones(2, 2, device="cuda")
@@ -75,19 +90,21 @@ def test_btx_pair_preparation_and_independent_oracle(tmp_path, codebook, coupled
     from unittest.mock import patch
 
     public, layer, _ = btx_atom_fixture(tmp_path, codebook=codebook, coupled=coupled)
+    public = _btx_plan(public, layer)
+    # This qualifies CUDA byte preparation only; no SM103 kernel executes here.
     with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
         experts = fused_moe.prepare_weights(
-            plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+            plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
         )
-    payload = experts.representation_for("w4a16")
+    payload = experts._impl.representation_for("w4a16")
     source = torch.randn(3, 512, dtype=torch.bfloat16, device="cuda") * 0.01
     ids = torch.tensor([[0, 1], [1, 2], [2, -1]], device="cuda")
     router = torch.ones(3, 2, device="cuda")
-    reference = moe_reference(source, payload, ids, router, activation_kind=public.activation)
+    reference = moe_reference(source, payload, ids, router, activation_kind=public.activation.nonlinearity)
     assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
     duplicate = ids[:, :1].expand(-1, 2).contiguous()
     cancelling = torch.tensor([[1., -1.]], device="cuda").expand(3, 2).contiguous()
-    cancelled = moe_reference(source, payload, duplicate, cancelling, activation_kind=public.activation)
+    cancelled = moe_reference(source, payload, duplicate, cancelling, activation_kind=public.activation.nonlinearity)
     torch.testing.assert_close(cancelled, torch.zeros_like(cancelled), atol=0, rtol=0)
 
 
@@ -113,7 +130,6 @@ def test_native_btx_pair_moe_graph_and_capacity(tmp_path, codebook, coupled, fir
 def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None, first_slot=0):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("physical SM103 required for complete grouped Trellis MoE")
-    import b12x
 
     if btx_path is None:
         public, bundle, _, _ = atom_fixture(
@@ -121,34 +137,27 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
             width=width, device="cuda",
         )
         experts = fused_moe.prepare_weights(plan=public, weights=bundle)
-        payload = experts._impl.representation_for("w4a16")
-        plan = fused_moe.plan_execution(
-            experts=experts,
-            capacity=fused_moe.ExecutionCapacity(
-                max_tokens=8, top_k=2, warmup_token_counts=(1, 4), route_num_experts=6,
-            ),
-        )
-        fused_moe.prewarm(plan)
-        native_plan = plan._impl
-        activation_kind = public.activation.nonlinearity
-        assert all(v.implementation == "tcgen05_trellis" for v in plan.variants)
-        assert len({id(v._impl) for v in plan.variants}) == 1
     else:
         public, layer, _ = btx_atom_fixture(
             btx_path, codebook=codebook, coupled=coupled, width=width,
             first_slot=first_slot, global_width=1024 if first_slot else 768,
         )
+        public = _btx_plan(public, layer)
         experts = fused_moe.prepare_weights(
-            plan=public, btx_layer=layer, btx_device="cuda", params_dtype=torch.bfloat16,
+            plan=public, weights=fused_moe.BtxWeights(layer=layer, device="cuda"),
         )
-        payload = experts.representation_for("w4a16")
-        plan = fused_moe.plan(fused_moe.Caps(
-            max_tokens=8, num_topk=2, device="cuda", weight_plan=public,
-            quant_mode="w4a16", core_token_counts=(1, 4, 8), route_num_experts=6,
-        ))
-        native_plan = plan
-        activation_kind = public.activation
-        assert plan.launch_plan.implementation == "tcgen05_trellis"
+    payload = experts._impl.representation_for("w4a16")
+    plan = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(
+            max_tokens=8, top_k=2, warmup_token_counts=(1, 4), route_num_experts=6,
+        ),
+    )
+    plan.scratch_specs()
+    states = require_prepared(plan, "moe.decode").variants
+    native_plan = states[8].scratch
+    activation_kind = public.activation.nonlinearity
+    assert all(v.config.backend == "tcgen05_trellis" for v in states.values())
     launches = tuple(id(fn) for fn in native_plan._backend_plan.launches.values())
     assert len(launches) == (15 if coupled else 14)
     scratch = {
@@ -186,8 +195,7 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
         assert relative < 0.02 and cosine >= 0.999
 
     def bind(live, target=None):
-        return fused_moe.bind(
-            plan,
+        return fused_moe.bind(plan,
             scratch=scratch,
             experts=experts,
             a=source[:live],
@@ -198,22 +206,24 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
             output_expert_map=output_map,
         )
 
+    def run(*, binding):
+        return fused_moe.run(binding=binding)
+
     references = {live: expected(live) for live in (1, 3, 4, 8)}
-    b12x.freeze_kernel_resolution("grouped atom serving contract")
-    try:
+    with kernel_resolution_guard("grouped atom serving contract"):
         for live in (8, 1, 4, 3):
             for target in (None, external):
                 external.fill_(float("nan"))
                 bound = bind(live, target)
                 assert len(bound._backend_binding.calls) == (7 if coupled and payload.trellis.input_scale_split is None else 8)
-                check(fused_moe.run(binding=bound), references[live])
+                check(run(binding=bound), references[live])
                 if target is not None:
                     assert torch.isnan(external[live:]).all()
         bound = bind(8)
-        fused_moe.run(binding=bound)
+        run(binding=bound)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            fused_moe.run(binding=bound)
+            run(binding=bound)
         before = bound.output.clone()
         source.mul_(0.8)
         payload.w13.bitwise_xor_(0x124)
@@ -255,5 +265,3 @@ def _run_native_atom_moe(codebook, coupled, group_size, width, *, btx_path=None,
         graph.replay()
         torch.cuda.synchronize()
         assert torch.count_nonzero(bound.output) == 0
-    finally:
-        b12x.unfreeze_kernel_resolution()
