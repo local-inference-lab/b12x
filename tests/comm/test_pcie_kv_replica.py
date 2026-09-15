@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -50,6 +51,7 @@ def test_paged_kv_replica_live_launch_uses_retained_binding(monkeypatch):
     binding = runtime._bind_prepared(state, **tensors)
     launch = []
     monkeypatch.setattr(runtime, "_bind_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     monkeypatch.setattr(
         "b12x.comm.pcie._kv_replica_cute.run_kv_replica",
         lambda *args, **kwargs: launch.append((args, kwargs)),

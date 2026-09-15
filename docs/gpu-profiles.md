@@ -393,8 +393,8 @@ and one through eight rows within the declared eager-slot capacity. Other plain
 shapes use the pull transport, and the default remains off. The transport uses
 four source shards, alternating graph slots, and a system-scope barrier.
 Destinations are rank-staggered, incoming loads bypass L1, and accumulation uses
-rotating-rank FP32 addition followed by one BF16 rounding operation. The factory
-The four-rank tensor-parallel preparation path snapshots the flag and checks rank
+rotating-rank FP32 addition followed by one BF16 rounding operation. The
+four-rank tensor-parallel preparation path snapshots the flag and checks rank
 agreement before allocating IPC; binding and replay do not reread it. Fused
 four-rank tensor-parallel eligibility is unchanged.
 

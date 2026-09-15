@@ -71,6 +71,8 @@ def test_posted_write_head_gather_binds_fixed_tensor_abi_once(monkeypatch):
     assert calls[0][1]["peer_write_bound"] is True
     with pytest.raises(ValueError, match="requires BF16 tensors"):
         runtime._bind_all_gather_heads(state, local_input.float(), out)
+    with pytest.raises(ValueError, match="output shape"):
+        runtime._bind_all_gather_heads(state, local_input, out[:, :16])
 
 
 class _FakeExt:

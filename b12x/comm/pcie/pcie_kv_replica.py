@@ -215,15 +215,16 @@ class PCIePagedKvReplica(_IPCChannel):
             raise ValueError(
                 "live replica request/token counts exceed prepared capacity"
             )
-        run_kv_replica(
-            state.launcher(),
-            self,
-            binding.cache,
-            binding.table,
-            binding.positions,
-            binding.starts,
-            binding.out,
-            requests=requests,
-            max_tokens=max_tokens,
-            output_pages_per_request=binding.output_pages_per_request,
-        )
+        with torch.cuda.device(self.device):
+            run_kv_replica(
+                state.launcher(),
+                self,
+                binding.cache,
+                binding.table,
+                binding.positions,
+                binding.starts,
+                binding.out,
+                requests=requests,
+                max_tokens=max_tokens,
+                output_pages_per_request=binding.output_pages_per_request,
+            )
