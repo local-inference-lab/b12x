@@ -1,6 +1,6 @@
 {
   "schema": "b12x.sm103.primary_checkpoint_inventory.v1",
-  "status": "checkpoint configurations located; native V4.1 SM121 TP4 qualification recorded; primary SM103 model qualification pending",
+  "status": "Implemented prototype. Native V4.1 has bounded SM121 checkpoint evidence; GLM component regressions pass, but checkpoint accuracy qualification remains unresolved. Physical SM103 execution is unqualified.",
   "checkpoints": [
     {
       "host": "maxwell",
@@ -99,12 +99,12 @@
     "required_work": [
       "Convert or obtain a provenance-bound V4.1 BTX checkpoint and qualify full-model accuracy. Native MXFP4 full-model results do not qualify Trellis weights.",
       "Qualify target/draft execution with the selected expert representation.",
-      "Qualify source-matched ARM64 runtime libraries. The five core libraries already compile for the SM103 family and pass CPU loading checks; complete external-library and GPU qualification remain separate.",
+      "Qualify source-matched ARM64 runtime libraries on the GPU. Five core and five external libraries compile and load with CUDA uninitialized; these checks do not establish runtime qualification.",
       "Run physical SM103 model correctness and serving qualification."
     ]
   },
   "companion_glm": {
-    "status": "Implemented; SM120 component and synthetic eager/graph/DFlash2 checks pass. The SM121 TP4 checkpoint fails arithmetic with b12x KDA and passes bounded gates with reference KDA. The KDA discrepancy and physical SM103 execution remain unqualified.",
+    "status": "Implemented; stable partial-pool selection, planned native splits, speculative history and unmapped-slot guards pass component regressions on SM120. Fixed requests pass on SM121, but checkpoint accuracy gates remain unresolved. Physical SM103 execution is unqualified.",
     "implementation_revision": "5d58e328c1412ebdc2bd0106f51db535797b8e36",
     "runtime_source_sha256": "faa368f0a6a772374b8ac4f820252ef5ec68a8d336b4097a8d3e50021868ba85",
     "b12x_revision": "2e6c166ed21929206b7860be5ce253401705e4cf",
@@ -129,7 +129,7 @@
     "synthetic_scope": "Four-layer GLM model with dummy weights, hidden size 4096, eight experts, and real attention/KDA/MoE launch paths. This does not establish checkpoint accuracy.",
     "native_scope": "SM120 core libraries match the recorded source build by hash; all 324 native and build files are identical to companion revision 5d58e328c1. External libraries retain their precompiled identities. Complete native-build and SM103 runtime qualification remain separate.",
     "checkpoint_sm121": {
-      "status": "failed arithmetic gate",
+      "status": "Historical pre-fix trial: failed arithmetic gate; superseded by fixed_sparse_selection.",
       "requests": 3,
       "expected_arithmetic": "42",
       "actual_arithmetic": "38",
@@ -147,7 +147,7 @@
       "conclusion": "The separately loaded runs associate the arithmetic result with the KDA configuration; they do not isolate its cause. Subsequent captures show a first-token difference before decode and close agreement with the FP32 oracle."
     },
     "kda_capture_diagnostic": {
-      "status": "Reference prefill with b12x decode returns 38; captured tensors closely match the FP32 oracle. The cause of the model discrepancy remains unresolved.",
+      "status": "Historical pre-fix diagnostic: reference prefill with b12x decode returns 38; captured tensors closely match the FP32 oracle. Later sparse-selection regression identifies omitted partial-pool tails.",
       "capture_files": 272,
       "capture_pairs": 136,
       "exact_prefill_to_decode_state_handoffs": 136,
@@ -162,7 +162,7 @@
       },
       "inference_jit_events": 0,
       "frozen_workers": 4,
-      "interpretation": "The runs differ before the first decode step. These separately loaded and differently instrumented runs do not isolate a decoder defect. All captured state handoffs are exact and both b12x and reference decoders closely match the independent FP32 oracle on the same inputs. Model discrepancy remains unresolved.",
+      "interpretation": "The runs differ before the first decode step. These separately loaded and differently instrumented runs do not isolate a decoder defect. All captured state handoffs are exact and both b12x and reference decoders closely match the independent FP32 oracle on the same inputs. See fixed_sparse_selection for the subsequent attention fix and checkpoint checks.",
       "limitations": "First 26-token prompt and first one-token decode per KDA layer/rank. CPU tensor copies and temporary allocations are diagnostic instrumentation; this does not qualify graph replay, allocation behavior, model accuracy or SM103 execution.",
       "original_service_restored": true,
       "health_http": 200,
@@ -178,6 +178,22 @@
         "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/kda-decode-only/diagnostic-manifest.json",
         "sha256": "14d57e2c13043f9bb4349bd1610638444259e5d9dba619af09883e950de71d02"
       }
-    }
+    },
+    "fixed_sparse_selection": {
+      "status": "Stable selection compaction and fixed planned decode splits pass SM120 oracles and earlier SM121 eager/graph checks. DFlash scored 25/32 against a 29/32 floor. The history-only graph control scored 27/32 against the same floor; both failures remain unresolved.",
+      "receipt": "docs/sm103-glm-sparse-validation.json",
+      "companion_runtime_revision": "ac96719947658fa213a3f45dee6c68beea02ee10",
+      "b12x_runtime_revision": "ebace59f5bc86c3e4ed3161c13962d69a7981af1",
+      "pooling_component_receipt": {
+        "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/speculative-history/component-receipt.json",
+        "sha256": "c84945381b45ffc804e8e6ff7d392fcdf33429ac7c9660cc9dedc222609474cb"
+      },
+      "repeatability_status": "Completed on identical ac96719947 source. Graph scores 26/28/27 and DFlash scores 26/28/28 out of 32; serial exact-text matches 4/32 and 3/32 with prefix caching enabled. Earlier accuracy gates remain failed.",
+      "repeatability_manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/repeatability/diagnostic-manifest.json",
+        "sha256": "6ca02e4474f20375ff1197397e742d3937a5badc5d2d3a7fb03f734a34409587"
+      }
+    },
+    "implementation_revision_scope": "The top-level GLM revision, hashes and checks describe the pre-fix implementation. fixed_sparse_selection identifies the current runtime and its separate checkpoint evidence."
   }
 }

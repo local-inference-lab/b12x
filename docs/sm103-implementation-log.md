@@ -1997,3 +1997,84 @@ memory. Host compilation uses no native CPU architecture flags. Commands,
 binaries, resource reports and hashes are preserved outside the repository.
 These results do not qualify GPU execution, DeepGEMM runtime JIT,
 FlashAttention, the Rust parser or a complete companion native build.
+
+## GLM sparse selection and fixed decode splits
+
+Status: component correctness qualified on SM120; SM103 runtime unqualified.
+
+A resident-checkpoint diagnostic records 1,632 KDA input/output captures across
+six requests. Repeated requests diverge with both reference-only and b12x-only
+KDA. The first three KDA layers remain identical on every rank; the following
+KDA layer receives different inputs after sparse attention layer 3. The bounded
+GSM8K check returns 27/32 correct with no invalid answers. These observations do
+not isolate a KDA arithmetic defect.
+
+GLM C4 selections store partial-pool tails after interior padding. The sparse
+adapter now compacts valid selections into a stable prefix before supplying its
+length to attention. The regression fails numerically before the fix and passes
+through both native and portable decode/extend paths afterward, including live
+cache pages beyond the Int32 byte-offset boundary. DCP preserves the selected
+order on both ranks.
+
+Native sparse MLA also consumes a fixed split count from its typed plan. Config
+schema 3 serializes that count for both backends; native AUTO uses one split.
+The previous runtime-planner profile entries have empty coverage until the fixed
+schedule is requalified. No performance improvement is claimed.
+
+The component evidence includes 37 GLM GPU tests, 17 remapping GPU tests, four
+Compute Sanitizer cases with zero errors, frozen kernel resolution across live
+row counts 1/3/26, stable addresses and allocation-free graph replay. All 19
+supporting metadata variants cross-compile for SM103 with no stack or local
+memory. The rebuilt wheel also passes the four attention regressions. Its raw
+package fingerprint remains distinct from the checkout because four repository
+Markdown files are excluded from packaging.
+
+Commands, identities, limitations and checkpoint qualification state are recorded
+in [the sparse selection receipt](sm103-glm-sparse-validation.json).
+
+## GLM speculative pooling and unmapped slots
+
+Status: component regressions qualified on SM120; checkpoint accuracy and SM103
+execution unqualified.
+
+Companion commits `e1587ea558` and `ac96719947` preserve the preceding partial
+pool across rejected verifier rows and reject unmapped slots before packed page
+conversion. Independent GPU regressions reproduce both defects on the preceding
+sources. The fixed history ring uses planned capacities 4/11/18 and absolute
+token positions; all scaled offsets remain Int64. The final source passes
+53 cases under Compute Sanitizer in complementary eight- and 45-case processes,
+with zero errors. A combined process retains 22.23 GiB and fails three allocations
+after 50 passes; its failure remains in the evidence.
+
+The final 27 metadata variants compile for SM103, producing 108 verified
+artifacts without stack or local-memory use. The unmapped-slot guard adds eight
+registers to one packed decode variant, from 48 to 56, with unchanged 1,024-byte
+shared memory. Physical profiling must assess the retained resource flag.
+
+The selection-fix checkpoint trial passes 11 fixed requests and produces the
+same 39 tokens across eager, graphs and DFlash on four SM121 workers. GSM8K scores
+are 29/32, 30/32 and 25/32 with zero invalid answers. DFlash fails the comparative
+accuracy gate despite accepted draft proposals and clean frozen graph execution.
+The history-only graph control scores 27/32, also failing the declared 29/32
+floor, so that controller stops before DFlash. Each trial restores the original
+four containers and HTTP 200 health. These failures remain separate from the
+independently reproduced component defects and their passing regressions.
+
+The [GLM receipt](sm103-glm-sparse-validation.json) binds source revisions,
+commands, raw logs, offline artifacts and per-trial service restoration.
+
+The final-source repeatability diagnostic uses identical companion
+`ac96719947` source in graph and DFlash modes. Serial first/repeat and C4 scores
+are 26/32, 28/32 and 27/32 for graphs, versus 26/32, 28/32 and 28/32 for DFlash,
+with no invalid answers. Exact serial text matches are 4/32 and 3/32 with prefix
+caching enabled. These observations do not isolate a DFlash-specific regression
+or waive the earlier failed gates. Both modes pass the same 11 fixed requests
+and 39 output tokens; all four workers freeze resolution and replay graphs
+without inference JIT. Completed DFlash log intervals record 7,427 accepted
+proposals from 13,811 drafted tokens, without a performance claim.
+
+The original four-container service is restored with the same IDs, images and
+configuration hashes. HTTP health returns 200, and an operational generation
+check returns 42. Source archives and every mounted package file on all four
+hosts verify after execution. The immutable diagnostic manifest is bound by the
+GLM receipt; runtime sources remain unchanged by the documentation commits.
