@@ -102,5 +102,27 @@
       "Build and qualify matching companion native libraries for ARM64.",
       "Run physical SM103 model correctness and serving qualification."
     ]
+  },
+  "companion_glm": {
+    "status": "Implemented; SM120 component and synthetic eager/graph checks pass. Full-checkpoint accuracy and physical SM103 execution remain unqualified.",
+    "implementation_revision": "5d58e328c1412ebdc2bd0106f51db535797b8e36",
+    "runtime_source_sha256": "faa368f0a6a772374b8ac4f820252ef5ec68a8d336b4097a8d3e50021868ba85",
+    "b12x_revision": "2e6c166ed21929206b7860be5ce253401705e4cf",
+    "b12x_package_fingerprint": "f9a49923aa91173bc986a1655551d1b9a18be9a3c248b46d84492ce7a7f8180b",
+    "receipt": "companion vLLM docs/design/b12x_glm_serving_validation.json",
+    "checks": {
+      "host_passed": 153,
+      "host_skipped": 29,
+      "sm120_pooling_passed": 31,
+      "sm120_kda_passed": 3,
+      "synthetic_requests_per_arm": 6,
+      "synthetic_output_tokens_per_arm": 48,
+      "exact_eager_graph_tokens": true,
+      "graph_replays": 21,
+      "inference_jit_compilations": 0,
+      "sm103_supporting_pooling_callables": 11
+    },
+    "synthetic_scope": "Four-layer GLM model with dummy weights, hidden size 4096, eight experts, and real attention/KDA/MoE launch paths. This does not establish checkpoint accuracy.",
+    "native_scope": "Prebuilt regression libraries on SM120; a matching native build of the complete companion source remains unqualified."
   }
 }
