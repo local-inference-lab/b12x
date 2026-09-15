@@ -110,6 +110,28 @@ class _Trial:
 # pending compilation always return control before more work is admitted.
 _ADVANCE_SECONDS = 0.1
 
+# Cross-rank priming assumes co-scheduled ranks: a collective authorization is
+# consumed in the round after the exchange, and the local work before the launch
+# (autotune rounds) is unbounded, so the barrier converts the shared
+# authorization into a launch lockstep. Generous by default: it only ever waits
+# during preparation, and must cover the slowest rank's pre-launch round.
+_BARRIER_TIMEOUT_SECONDS = float(os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120"))
+
+
+class CollectiveBarrierTimeout(RuntimeError):
+    """A rank timed out waiting for peers to enter a collective it was authorized for."""
+
+    def __init__(self, key: str, ranks: tuple[int, ...], arrived: tuple[int, ...]):
+        waiting = tuple(sorted(set(ranks) - set(arrived)))
+        super().__init__(
+            f"collective barrier timed out for {key!r} after "
+            f"{_BARRIER_TIMEOUT_SECONDS:g}s: ranks {waiting} never entered "
+            f"(arrived: {tuple(sorted(arrived))})"
+        )
+        self.key = key
+        self.ranks = ranks
+        self.arrived = tuple(sorted(arrived))
+
 
 def _declaration_key(plan):
     if isinstance(plan, _CompositePlan):
@@ -223,7 +245,7 @@ class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
         compile_workers=None, rounds=SURVIVOR_ROUNDS, samples=DEFAULT_SAMPLES, cache_only=False,
-        race_batch=32, race_budget=None,
+        race_batch=32, race_budget=None, collective_barrier=None,
     ):
         if compile_workers is None:
             compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
@@ -243,6 +265,9 @@ class PreparationSession:
         self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
         self.race_batch, self.race_budget = race_batch, race_budget
         self.namespace = FrozenMapping(namespace or {})
+        if collective_barrier is not None and not callable(collective_barrier):
+            raise TypeError("collective_barrier must be callable")
+        self.collective_barrier = collective_barrier
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
         self._stop = threading.Event()
@@ -578,6 +603,7 @@ class PreparationJob:
         self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
+        self._barrier_marker = None
         self._total_requests = len(requests)
         self._completed_requests = 0
         self._selection_counts = {}
@@ -638,6 +664,25 @@ class PreparationJob:
             ready_cache=ready_cache,
         )
 
+    def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
+        """Convert a shared collective authorization into a launch lockstep.
+
+        Both ranks were authorized for the same requirement in the same
+        exchange round, but the local work before either rank launches is
+        unbounded (autotune races). The embedder-supplied barrier waits for
+        every participant rank to enter before this rank proceeds to the
+        launch, so the kernel-side spin window only covers launch jitter.
+        """
+        barrier = self.session.collective_barrier
+        try:
+            barrier(requirement.key, requirement.ranks)
+        except CollectiveBarrierTimeout:
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"collective barrier for {requirement.key!r} failed: {error}"
+            ) from error
+
     def advance(self, *, collective_key=None, tuning=None, cache=None):
         started = time.perf_counter()
         if self._last_advance_end is not None:
@@ -686,6 +731,8 @@ class PreparationJob:
         elif isinstance(self._blocked, CollectiveRequirement):
             if collective_key != self._blocked.key:
                 return self._progress(False, False, (self._blocked,), False)
+            if self.session.collective_barrier is not None:
+                self._collective_barrier(self._blocked)
             self._blocked = None
         elif isinstance(self._blocked, _TuningBatch):
             required = self._blocked.contributions
