@@ -11,7 +11,6 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
