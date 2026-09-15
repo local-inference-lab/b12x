@@ -1901,3 +1901,21 @@ All 476 packaged files match the checkout, and 56 host checks pass with imports
 resolved from the extracted wheel. The frozen Git archive, complete compile
 corpus, wheel and qualification commands remain outside the repository with
 their identities recorded in the compact receipt.
+
+## GLM planned KDA and pooling integration
+
+Status: implemented in companion revision `5d58e328c1`; SM120 component and
+synthetic model checks pass; checkpoint accuracy and SM103 execution unqualified.
+
+The companion uses public KDA prefill plans for mixed batches, retains separate
+speculative output ranges, and binds the public sparse MLA API. Cache negotiation
+preserves complete C4 pages and excludes padding beyond planned context. Pooling
+helpers keep live counts out of Triton specialization and use Int64 scaled
+offsets.
+
+The [primary model inventory](sm103-primary-models.json) records 153 passing host
+checks, 31 SM120 pooling checks and three KDA checks. Six synthetic sequences
+produce identical 48-token outputs in eager and graph execution, with 21 graph
+replays and frozen resolution. Eleven supporting pooling variants have inspected
+SM103 PTX, cubins, SASS and resources, with zero stack or local memory. Full GLM
+checkpoint qualification remains separate from these results.

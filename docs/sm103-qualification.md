@@ -804,6 +804,14 @@ NSA, indexer, KDA, dense linears or draft model.
 Physical SM103 serving qualification follows per-operation correctness tests.
 Use the existing LIL vLLM model interfaces and capability-driven companion
 adapters. Complete GLM checkpoint execution remains unqualified.
+The companion implementation at `5d58e328c1` uses the public CuTe KDA prefill
+plan for mixed batches, binds sparse MLA through the public API, and negotiates
+compatible pooled-cache pages. Its SM120 synthetic model produces the same
+48 tokens in eager and graph execution, with 21 graph replays and frozen
+kernel resolution. Component tests cover high state IDs and allocation-free
+replay. Eleven supporting pooling and metadata variants cross-compile for
+SM103. The [primary model inventory](sm103-primary-models.json) identifies the
+source and receipt; dummy weights do not establish checkpoint accuracy.
 The established `plan_weights` / `prepare_weights` / `plan_execution` /
 `prewarm` / `bind` / `run` interface is unchanged. Once per-operation integration
 is qualified, record exact vLLM/b12x revisions and launch the real checkpoint:
