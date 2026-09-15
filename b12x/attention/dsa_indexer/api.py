@@ -8,7 +8,7 @@ from typing import Literal
 import torch
 
 from ..._lib.gating import default_is_supported
-from ...preparation import FrozenMapping, Plan, require_prepared
+from ...preparation import Plan, require_prepared
 from . import META
 from ._impl import clear_indexer_caches as clear_caches
 from ._preparation import invocation_from_descriptors, invocation_from_tensors, plan
@@ -104,6 +104,9 @@ def bind(plan: Plan, *, scratch: torch.Tensor | Mapping[str, torch.Tensor] | Seq
          candidate_lengths: torch.Tensor | None = None,
          candidate_output: torch.Tensor | None = None,
          candidate_output_lengths: torch.Tensor | None = None,
+         candidate_force_blocks: torch.Tensor | None = None,
+         candidate_visible_lengths: torch.Tensor | None = None,
+         candidate_active_width: torch.Tensor | None = None,
          score_width: int | None = None) -> Binding:
     """Bind real tensors to a prepared FP8 or MXFP4 plan."""
     if not isinstance(plan, Plan):
@@ -122,7 +125,10 @@ def bind(plan: Plan, *, scratch: torch.Tensor | Mapping[str, torch.Tensor] | Seq
             active_width=active_width, output_indices=output_indices,
             output_scores=output_scores, candidate_indices=candidate_indices,
             candidate_lengths=candidate_lengths, candidate_output=candidate_output,
-            candidate_output_lengths=candidate_output_lengths, score_width=score_width)
+            candidate_output_lengths=candidate_output_lengths,
+            candidate_force_blocks=candidate_force_blocks,
+            candidate_visible_lengths=candidate_visible_lengths,
+            candidate_active_width=candidate_active_width, score_width=score_width)
         return Binding(plan=plan, runtime=runtime_binding, q_fp8=None,
                        q_mxfp4=q_mxfp4, q_scales=q_scales,
                        query_weights=query_weights, index_k_cache=index_k_cache,
@@ -228,8 +234,54 @@ def select(binding: Binding) -> torch.Tensor:
     return select_mxfp4(binding.runtime, launchers=state._launchers)
 
 
+def select_tokens(binding: Binding) -> torch.Tensor:
+    """Select final logical top-k tokens without source-candidate expansion."""
+    from .mxfp4 import select_topk_mxfp4
+
+    state = _mxfp4_binding_state(binding, operation="select_tokens")
+    return select_topk_mxfp4(binding.runtime, launchers=state._launchers)
+
+
+def select_candidate_blocks(
+    binding: Binding,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select coarse source blocks and return mutable index and score views."""
+    from .mxfp4 import select_candidate_blocks_mxfp4
+
+    state = _mxfp4_binding_state(binding, operation="select_candidate_blocks")
+    return select_candidate_blocks_mxfp4(
+        binding.runtime, launchers=state._launchers
+    )
+
+
+def expand_candidate_blocks(binding: Binding) -> torch.Tensor:
+    """Expand the currently selected coarse blocks into logical token IDs."""
+    from .mxfp4 import expand_candidate_blocks_mxfp4
+
+    state = _mxfp4_binding_state(binding, operation="expand_candidate_blocks")
+    return expand_candidate_blocks_mxfp4(
+        binding.runtime, launchers=state._launchers
+    )
+
+
+def _mxfp4_binding_state(
+    binding: Binding, *, operation: str
+) -> MXFP4PreparedState:
+    if not isinstance(binding, Binding):
+        raise TypeError("binding must be dsa_indexer.Binding")
+    device_tensor = (
+        binding.q_mxfp4 if binding.q_mxfp4 is not None else binding.q_fp8
+    )
+    state = require_prepared(
+        binding.plan, "attention.dsa_indexer", device_tensor.device
+    )
+    if not isinstance(state, MXFP4PreparedState):
+        raise TypeError(f"{operation} is only available for staged MXFP4 DSA")
+    return state
+
+
 def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
 
-__all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run", "score", "select", "scratch_specs", "invocation_from_descriptors", "invocation_from_tensors", "quantize_q_mxfp4", "quantize_write_index_k_mxfp4", "index_mxfp4_page_bytes", "MXFP4_INDEX_PAGE_BYTES", "INDEX_HEAD_DIM", "PAGED_INDEX_PAGE_SIZE", "is_supported", "clear_caches"]
+__all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run", "score", "select", "select_tokens", "select_candidate_blocks", "expand_candidate_blocks", "scratch_specs", "invocation_from_descriptors", "invocation_from_tensors", "quantize_q_mxfp4", "quantize_write_index_k_mxfp4", "index_mxfp4_page_bytes", "MXFP4_INDEX_PAGE_BYTES", "INDEX_HEAD_DIM", "PAGED_INDEX_PAGE_SIZE", "is_supported", "clear_caches"]

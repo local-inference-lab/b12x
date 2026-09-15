@@ -721,3 +721,63 @@ def test_source_selection_replay_reaches_newest_block_beyond_first_stripe(indexe
             assert bool((args["candidate_output"][0, count:] == -1).all())
     finally:
         graph.reset()
+
+
+def test_staged_source_selection_accepts_merged_block_ids(indexer_session):
+    """External exact-DCP merge can replace block IDs before expansion."""
+    device = torch.device("cuda")
+    q = torch.randn((1, 1, 128), dtype=torch.bfloat16, device=device)
+    keys = torch.randn((128, 128), dtype=torch.bfloat16, device=device)
+    lengths = torch.tensor([128], dtype=torch.int32, device=device)
+    weights = torch.ones((1, 1), dtype=torch.bfloat16, device=device)
+    plan, args = _allocate(
+        indexer_session,
+        q,
+        keys,
+        lengths,
+        query_weights=weights,
+        source=True,
+        page_size=128,
+    )
+    args["candidate_force_blocks"] = torch.tensor(
+        [1], dtype=torch.int32, device=device
+    )
+    args["candidate_visible_lengths"] = torch.tensor(
+        [32], dtype=torch.int32, device=device
+    )
+    args["candidate_active_width"] = torch.tensor(
+        [32], dtype=torch.int32, device=device
+    )
+    binding = api.bind(plan, query_weights=weights, **args)
+    api.score(binding)
+
+    args["candidate_output"].fill_(-77)
+    api.select_tokens(binding)
+    assert bool((args["candidate_output"] == -77).all())
+
+    block_indices, block_scores = api.select_candidate_blocks(binding)
+    assert tuple(block_indices.shape) == (1, 2048)
+    assert tuple(block_scores.shape) == (1, 2048)
+    forced = torch.isposinf(block_scores[0])
+    assert int(forced.sum()) == 1
+    assert block_indices[0, forced].item() == 1
+    block_indices.fill_(-1)
+    block_indices[0, :2] = torch.tensor([3, 1], dtype=torch.int32, device=device)
+    # Global DCP top-k overwrites block IDs but need not rewrite local scores.
+    block_scores.fill_(-torch.inf)
+    # Expansion uses global visibility even though scoring used a local shard.
+    lengths.fill_(8)
+    args["active_width"].fill_(8)
+    api.expand_candidate_blocks(binding)
+
+    expected = torch.cat(
+        (
+            torch.arange(8, 16, dtype=torch.int32, device=device),
+            torch.arange(24, 32, dtype=torch.int32, device=device),
+        )
+    )
+    assert args["candidate_output_lengths"].item() == expected.numel()
+    torch.testing.assert_close(
+        args["candidate_output"][0, : expected.numel()], expected, rtol=0, atol=0
+    )
+    assert bool((args["candidate_output"][0, expected.numel() :] == -1).all())

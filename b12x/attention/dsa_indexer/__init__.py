@@ -15,7 +15,8 @@ A three-stage pipeline whose outputs feed ``attention.sparse_mla`` /
 The production paged DSA lifecycle is ``plan(Caps(...), invocation=...)`` →
 ``PreparationSession.prepare`` → ``bind(Plan, ...)`` → ``run``.
 Declarations carry no executable layout, CUDA allocation, or policy result.
-Lower-level scorer and selector stages are private implementation facets.
+MXFP4 additionally exposes prepared score, token-select, source-block-select,
+and source-block-expand stages for exact distributed candidate merging.
 
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
@@ -39,6 +40,9 @@ META = OpMeta(
         "run",
         "score",
         "select",
+        "select_tokens",
+        "select_candidate_blocks",
+        "expand_candidate_blocks",
         "quantize_q_mxfp4",
         "quantize_write_index_k_mxfp4",
         "scratch_specs",

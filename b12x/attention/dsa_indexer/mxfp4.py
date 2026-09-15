@@ -691,9 +691,11 @@ class _SelectPrepare:
         active: cute.Pointer,
         candidate_lengths: cute.Pointer,
         select_lengths: cute.Pointer,
+        force_blocks: cute.Pointer,
         rows: Int32,
         width: Int32,
         output_width: Int32,
+        use_explicit_force: Int32,
         stream: cuda.CUstream,
     ):
         self.kernel(
@@ -703,9 +705,11 @@ class _SelectPrepare:
             _flat(active),
             _flat(candidate_lengths),
             _flat(select_lengths),
+            _flat(force_blocks),
             rows,
             width,
             output_width,
+            use_explicit_force,
         ).launch(
             grid=(
                 cutlass.min(
@@ -727,9 +731,11 @@ class _SelectPrepare:
         active: cute.Tensor,
         candidate_lengths: cute.Tensor,
         select_lengths: cute.Tensor,
+        force_blocks: cute.Tensor,
         rows: Int32,
         width: Int32,
         output_width: Int32,
+        use_explicit_force: Int32,
     ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
@@ -744,6 +750,9 @@ class _SelectPrepare:
             extent = cutlass.min(cutlass.max(candidate_lengths[row], Int32(0)), width)
         if cutlass.const_expr(self.blocks):
             extent = (extent + Int32(7)) // Int32(8)
+            forced_block = (visible - Int32(1)) // Int32(8)
+            if use_explicit_force != Int32(0):
+                forced_block = force_blocks[row]
         if col == Int32(0):
             select_lengths[row] = extent
         # The selector consumes only extent entries. The private logit tail
@@ -758,7 +767,7 @@ class _SelectPrepare:
                             value,
                             Float32(scores[Int64(row) * Int64(width) + Int64(pos)]),
                         )
-                if visible > Int32(0) and col == (visible - Int32(1)) // Int32(8):
+                if visible > Int32(0) and col == forced_block:
                     value = Float32(float("inf"))
             else:
                 value = Float32(scores[Int64(row) * Int64(width) + Int64(col)])
@@ -827,7 +836,9 @@ class _SortPositions:
             base = Int64(row) * Int64(self.topk) + Int64(slot)
             idx = indices[base]
             value = values[base]
-            valid = idx >= Int32(0) and value > Float32(-float("inf"))
+            valid = idx >= Int32(0)
+            if cutlass.const_expr(not self.expand_blocks):
+                valid = valid and value > Float32(-float("inf"))
             if cutlass.const_expr(self.expand_blocks):
                 valid = valid and idx * Int32(8) < visible
             else:
@@ -975,8 +986,8 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         scalars = (Int32(1), Int32(64), Int32(1), Int64(1), Int64(4352), Int64(1))
     elif kind == "prepare":
         obj = _SelectPrepare(*recipe)
-        dtypes = (BFloat16, Float32, Int32, Int32, Int32, Int32)
-        scalars = (Int32(1), Int32(64), Int32(64))
+        dtypes = (BFloat16, Float32, Int32, Int32, Int32, Int32, Int32)
+        scalars = (Int32(1), Int32(64), Int32(64), Int32(0))
     else:
         obj = _SortPositions(*recipe)
         dtypes = (Int32, Float32, Int32, Float32, Int32, Int32, Int32)
@@ -991,7 +1002,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         *pointers,
         *scalars,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 9, key),
+        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 10, key),
     )
     return raw, dtypes
 
@@ -1165,6 +1176,9 @@ class MXFP4Runtime:
     candidate_lengths: torch.Tensor | None
     candidate_output: torch.Tensor | None
     candidate_output_lengths: torch.Tensor | None
+    candidate_force_blocks: torch.Tensor | None
+    candidate_visible_lengths: torch.Tensor | None
+    candidate_active_width: torch.Tensor | None
 
 
 def bind_mxfp4(
@@ -1184,10 +1198,11 @@ def bind_mxfp4(
     candidate_lengths,
     candidate_output,
     candidate_output_lengths,
+    candidate_force_blocks,
+    candidate_visible_lengths,
+    candidate_active_width,
     score_width=None,
 ):
-    from .api import Binding
-
     caps = plan.caps
     width_capacity = caps.max_candidates or caps.max_page_table_width * caps.page_size
     if score_width is not None and (
@@ -1271,6 +1286,41 @@ def bind_mxfp4(
         )
     elif candidate_output is not None or candidate_output_lengths is not None:
         raise ValueError("candidate output requires candidate_topk_blocks in Caps")
+    if candidate_force_blocks is not None:
+        if not caps.candidate_topk_blocks:
+            raise ValueError(
+                "candidate force blocks require candidate_topk_blocks in Caps"
+            )
+        _check(
+            candidate_force_blocks,
+            "candidate_force_blocks",
+            (rows,),
+            torch.int32,
+            caps.device,
+        )
+    if (candidate_visible_lengths is None) != (candidate_active_width is None):
+        raise ValueError(
+            "candidate visible lengths and active width must be provided together"
+        )
+    if candidate_visible_lengths is not None:
+        if not caps.candidate_topk_blocks:
+            raise ValueError(
+                "candidate visibility overrides require candidate_topk_blocks in Caps"
+            )
+        _check(
+            candidate_visible_lengths,
+            "candidate_visible_lengths",
+            (rows,),
+            torch.int32,
+            caps.device,
+        )
+        _check(
+            candidate_active_width,
+            "candidate_active_width",
+            (1,),
+            torch.int32,
+            caps.device,
+        )
     runtime = plan.inner.bind(
         scratch=scratch,
         score_width=score_width,
@@ -1281,6 +1331,9 @@ def bind_mxfp4(
         candidate_lengths=candidate_lengths,
         candidate_output=candidate_output,
         candidate_output_lengths=candidate_output_lengths,
+        candidate_force_blocks=candidate_force_blocks,
+        candidate_visible_lengths=candidate_visible_lengths,
+        candidate_active_width=candidate_active_width,
     )
     return runtime
 
@@ -1306,7 +1359,7 @@ def score_mxfp4(binding, *, launchers=None):
     return scores
 
 
-def select_mxfp4(binding, *, launchers=None):
+def select_topk_mxfp4(binding, *, launchers=None):
     caps, rt = binding.plan.caps, binding.runtime
     rows = binding.q_mxfp4.shape[0]
     s = {name: view[:rows] for name, view in rt.scratch.items()}
@@ -1316,8 +1369,8 @@ def select_mxfp4(binding, *, launchers=None):
                 launcher=None if launchers is None else launchers[(kind, recipe)])
     launch("prepare", (bool(caps.max_candidates), False),
            (s["scores"], s["logits"], rt.cache_lengths, rt.active_width,
-            candidate_lengths, s["lengths"]),
-           (rows, s["scores"].shape[1], s["logits"].shape[1]))
+            candidate_lengths, s["lengths"], rt.cache_lengths),
+           (rows, s["scores"].shape[1], s["logits"].shape[1], 0))
     run_row_topk(row_logits=s["logits"], lengths=s["lengths"], topk=caps.topk,
                  output_values=s["values"], output_indices=s["indices"],
                  output_gather_table=rt.candidate_indices,
@@ -1326,19 +1379,108 @@ def select_mxfp4(binding, *, launchers=None):
     launch("sort", (caps.topk, False),
            (s["indices"], s["values"], binding.output_indices, out_values,
             rt.cache_lengths, rt.active_width, s["lengths"]), (rows,))
-    if caps.candidate_topk_blocks:
-        launch("prepare", (False, True),
-               (s["scores"], s["block_logits"], rt.cache_lengths, rt.active_width,
-                rt.cache_lengths, s["block_lengths"]),
-               (rows, s["scores"].shape[1], s["block_logits"].shape[1]))
-        run_row_topk(row_logits=s["block_logits"], lengths=s["block_lengths"],
-                     topk=caps.candidate_topk_blocks,
-                     output_values=s["block_values"], output_indices=s["block_indices"],
-                     launcher=None if launchers is None else launchers[("topk", caps.candidate_topk_blocks)][0])
-        launch("sort", (caps.candidate_topk_blocks, True),
-               (s["block_indices"], s["block_values"], rt.candidate_output,
-                s["block_values"], rt.cache_lengths, rt.active_width,
-                rt.candidate_output_lengths), (rows,))
+    return binding.output_indices
+
+
+def select_candidate_blocks_mxfp4(binding, *, launchers=None):
+    """Select source-layer coarse blocks without expanding them to tokens."""
+    caps, rt = binding.plan.caps, binding.runtime
+    if not caps.candidate_topk_blocks:
+        raise ValueError("candidate block selection requires candidate_topk_blocks")
+    rows = binding.q_mxfp4.shape[0]
+    s = {name: view[:rows] for name, view in rt.scratch.items()}
+
+    def launch(kind, recipe, tensors, scalars):
+        _launch(
+            kind,
+            recipe,
+            tensors,
+            scalars,
+            launcher=None if launchers is None else launchers[(kind, recipe)],
+        )
+
+    launch(
+        "prepare",
+        (False, True),
+        (
+            s["scores"],
+            s["block_logits"],
+            rt.cache_lengths,
+            rt.active_width,
+            rt.cache_lengths,
+            s["block_lengths"],
+            (
+                rt.candidate_force_blocks
+                if rt.candidate_force_blocks is not None
+                else rt.cache_lengths
+            ),
+        ),
+        (
+            rows,
+            s["scores"].shape[1],
+            s["block_logits"].shape[1],
+            int(rt.candidate_force_blocks is not None),
+        ),
+    )
+    run_row_topk(
+        row_logits=s["block_logits"],
+        lengths=s["block_lengths"],
+        topk=caps.candidate_topk_blocks,
+        output_values=s["block_values"],
+        output_indices=s["block_indices"],
+        launcher=(
+            None
+            if launchers is None
+            else launchers[("topk", caps.candidate_topk_blocks)][0]
+        ),
+    )
+    return s["block_indices"], s["block_values"]
+
+
+def expand_candidate_blocks_mxfp4(binding, *, launchers=None):
+    """Sort and expand selected source blocks into the bound token buffer."""
+    caps, rt = binding.plan.caps, binding.runtime
+    if not caps.candidate_topk_blocks:
+        raise ValueError("candidate block expansion requires candidate_topk_blocks")
+    rows = binding.q_mxfp4.shape[0]
+    s = {name: view[:rows] for name, view in rt.scratch.items()}
+    visible_lengths = (
+        rt.candidate_visible_lengths
+        if rt.candidate_visible_lengths is not None
+        else rt.cache_lengths
+    )
+    active_width = (
+        rt.candidate_active_width
+        if rt.candidate_active_width is not None
+        else rt.active_width
+    )
+    _launch(
+        "sort",
+        (caps.candidate_topk_blocks, True),
+        (
+            s["block_indices"],
+            s["block_values"],
+            rt.candidate_output,
+            s["block_values"],
+            visible_lengths,
+            active_width,
+            rt.candidate_output_lengths,
+        ),
+        (rows,),
+        launcher=(
+            None
+            if launchers is None
+            else launchers[("sort", (caps.candidate_topk_blocks, True))]
+        ),
+    )
+    return rt.candidate_output
+
+
+def select_mxfp4(binding, *, launchers=None):
+    select_topk_mxfp4(binding, launchers=launchers)
+    if binding.plan.caps.candidate_topk_blocks:
+        select_candidate_blocks_mxfp4(binding, launchers=launchers)
+        expand_candidate_blocks_mxfp4(binding, launchers=launchers)
     return binding.output_indices
 
 
@@ -1377,6 +1519,8 @@ class MXFP4PreparedState:
              page_table, cache_lengths, active_width, output_indices,
              output_scores=None, candidate_indices=None, candidate_lengths=None,
              candidate_output=None, candidate_output_lengths=None, score_width=None,
+             candidate_force_blocks=None,
+             candidate_visible_lengths=None, candidate_active_width=None,
              **_ignored):
         runtime = bind_mxfp4(
             self, scratch=scratch, q_mxfp4=q_mxfp4, q_scales=q_scales,
@@ -1385,7 +1529,10 @@ class MXFP4PreparedState:
             active_width=active_width, output_indices=output_indices,
             output_scores=output_scores, candidate_indices=candidate_indices,
             candidate_lengths=candidate_lengths, candidate_output=candidate_output,
-            candidate_output_lengths=candidate_output_lengths, score_width=score_width,
+            candidate_output_lengths=candidate_output_lengths,
+            candidate_force_blocks=candidate_force_blocks,
+            candidate_visible_lengths=candidate_visible_lengths,
+            candidate_active_width=candidate_active_width, score_width=score_width,
         )
         return MXFP4Binding(plan=self, runtime=runtime, q_mxfp4=q_mxfp4,
                             q_scales=q_scales, query_weights=query_weights,
