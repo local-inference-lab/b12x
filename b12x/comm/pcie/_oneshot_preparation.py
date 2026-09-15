@@ -403,6 +403,15 @@ def plan(
         return _OneshotExecutionState(query, runtime, MappingProxyType(launchers))
 
     native = _state(runtime)
+    if "tp4_remote_push" in (
+        query.call.get("transport"), query.call.get("eager_transport")
+    ) and (
+        runtime.world_size != 4
+        or not native.sharded_eager_storage
+        or native.eager_tables is None
+        or native.eager_buffer_bytes is None
+    ):
+        raise ValueError("TP4 plain push requires established four-shard IPC storage")
     rank_data_nbytes, slab_nbytes, owned_slab_count = _owned_resident_layout(
         runtime, native
     )

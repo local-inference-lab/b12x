@@ -103,6 +103,36 @@ class SparseMlaConfig:
         )
 
 
+_POOL_SHAPE_FIELDS = frozenset({"swa_cache_shape", "indexed_cache_shape"})
+_QUERY_FIELDS = frozenset(SparseMlaQuery.__dataclass_fields__) - _POOL_SHAPE_FIELDS
+
+
+def _encode_query(query: SparseMlaQuery) -> dict[str, object]:
+    """Keep live cache-page counts outside configuration-selection identity."""
+    return {
+        name: value
+        for name, value in query.to_dict().items()
+        if name not in _POOL_SHAPE_FIELDS
+    }
+
+
+def _encode_invocation(invocation: FrozenMapping) -> dict[str, object]:
+    """Retain cache layout while omitting only each pool's leading page count."""
+    encoded = dict(invocation)
+    for name in ("swa_k_cache", "indexed_k_cache"):
+        descriptor = invocation[name]
+        if descriptor is None:
+            continue
+        if not isinstance(descriptor, FrozenMapping):
+            raise TypeError(f"compressed MLA {name} invocation must be tensor metadata")
+        shape = descriptor["shape"]
+        encoded[name] = {
+            **{key: value for key, value in descriptor.items() if key != "shape"},
+            "shape_tail": tuple(shape[1:]),
+        }
+    return encoded
+
+
 def _single_pass(query: SparseMlaQuery, device: DeviceIdentity | None) -> bool:
     from b12x.attention._shared.mla.compressed_api import _should_use_sm121_single_pass_decode
 
@@ -244,11 +274,11 @@ def _materialize(
 
 TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
-    query_schema_version=5,
+    query_schema_version=6,
     config_schema_version=4,
-    query_fields=frozenset(SparseMlaQuery.__dataclass_fields__),
+    query_fields=_QUERY_FIELDS,
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
-    encode_query=SparseMlaQuery.to_dict,
+    encode_query=_encode_query,
     encode_config=asdict,
     decode_config=SparseMlaConfig.from_config,
     validate_query=_validate_query,
@@ -272,6 +302,7 @@ TUNING = TuningContract(
         if query.cache_format == "deepseek_v41"
         else None,
     ),
+    encode_invocation=_encode_invocation,
 )
 
 

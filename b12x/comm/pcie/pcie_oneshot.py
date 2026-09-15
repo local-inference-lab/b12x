@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -1370,6 +1369,7 @@ class _CuTeOneshotState:
         False,
     )
     sharded_eager_storage: bool = False
+    tp4_remote_push_capable: bool = False
     plain_remote_push_region_packs: int = 0
     eager_slot: int = 0
     device_slot_selection: bool = False
@@ -1507,6 +1507,13 @@ class _CuTeOneshotBackend:
             state.world_size,
             state.transport_policy,
         )
+        state.tp4_remote_push_capable = (
+            state.world_size == 4
+            and state.transport_policy[3]
+            and state.sharded_eager_storage
+            and state.eager_tables is not None
+            and state.eager_buffer_bytes is not None
+        )
         if state.world_size == 2 and state.transport_policy[2]:
             base_shards = state.world_size if state.sharded_eager_storage else 1
             state.plain_remote_push_region_packs = (
@@ -1587,6 +1594,18 @@ class _CuTeOneshotBackend:
     ) -> tuple[str, int, int]:
         """Select a plain all-reduce transport and its launch geometry."""
 
+        if (
+            state.tp4_remote_push_capable
+            and inp.dtype is torch.bfloat16
+            and inp.ndim > 0
+            and int(inp.shape[-1]) in (1280, 5120)
+            and 1 <= inp.numel() // int(inp.shape[-1]) <= 8
+            and inp.numel() * inp.element_size() <= state.eager_buffer_bytes
+        ):
+            threads, blocks = cls._launch_geometry(
+                inp.numel() * inp.element_size() // 16
+            )
+            return "tp4_remote_push", threads, blocks
         remote_push = cls._tp2_plain_remote_push_geometry(
             state,
             inp,

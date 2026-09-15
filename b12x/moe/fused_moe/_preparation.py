@@ -95,6 +95,9 @@ def _control_snapshot() -> FrozenMapping:
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "dynamic_deterministic_output": _impl._env_flag(
+            "B12X_DYNAMIC_DETERMINISTIC_OUTPUT", default=False
+        ),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -146,7 +149,12 @@ def _query(
         route_logits_dtype=None if routing.logits_dtype is None else str(routing.logits_dtype).removeprefix("torch."),
         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
         collect_activation_amax=bool(routing.collect_activation_amax),
-        deterministic_output=routing.deterministic_output,
+        deterministic_output=(
+            routing.deterministic_output
+            if routing.deterministic_output is not None
+            else controls["dynamic_deterministic_output"]
+            and plan.quant_modes != frozenset({"w4a16"})
+        ),
         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
         swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),
@@ -610,6 +618,13 @@ def _program_carriers(
     elif plan.implementation == "dynamic":
         exact_m = plan.routed_rows // plan.num_topk
         dynamic = _dynamic_program_arguments(plan, caps)
+        if plan.deterministic_output:
+            from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+
+            launches.append(compile_w4a16_topk_sum(
+                m=exact_m, topk=plan.num_topk, hidden_size=plan.k,
+                element_dtype=_impl._w4a16_element_dtype(plan.dtype),
+            ))
         for dtype in (torch.int32, torch.int64):
             launch, _ = _impl._get_dynamic_kernel(
                 plan.weight_E, exact_m, plan.k, dynamic["n"], plan.num_topk,

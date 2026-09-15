@@ -20,6 +20,7 @@ from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
+    ld_global_cg_v4_u32,
     ld_global_v4_u32,
     st_global_v4_f32,
     st_global_v4_u32,
@@ -187,10 +188,15 @@ class _OneshotLaunch(_PackedMath):
         super().__init__(dtype_name)
         if transport not in (
             "pull",
+            "tp4_remote_push",
             "tp2_remote_push",
             "tp2_remote_push_stream",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
+        if transport == "tp4_remote_push" and (
+            world_size != 4 or not stage_input or dtype_name != "bfloat16"
+        ):
+            raise ValueError("TP4 plain push requires staged BF16 on four ranks")
         if transport.startswith("tp2_remote_push") and (
             world_size != 2
             or not stage_input
@@ -306,7 +312,7 @@ class _OneshotLaunch(_PackedMath):
         generation = Uint32(0)
         slot = Uint32(0)
         if cutlass.const_expr(self._device_slot_selection):
-            if cutlass.const_expr(self._transport == "pull"):
+            if cutlass.const_expr(self._transport in ("pull", "tp4_remote_push")):
                 generation = ld_relaxed_gpu_u32(
                     Int64(signal_ptrs[self._rank]) + Int64(_GRAPH_EPOCH_OFFSET)
                 )
@@ -315,7 +321,7 @@ class _OneshotLaunch(_PackedMath):
                     Int64(signal_ptrs[self._rank]) + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
                 )
             slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
-            if cutlass.const_expr(self._transport == "pull"):
+            if cutlass.const_expr(self._transport in ("pull", "tp4_remote_push")):
                 peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
             else:
                 # All threads retain the epoch before the final CTA advances it.
@@ -360,6 +366,49 @@ class _OneshotLaunch(_PackedMath):
                 )
                 index += stride
 
+            if cutlass.const_expr(self._device_slot_selection):
+                if Int32(tidx) == Int32(0):
+                    self_signal = Int64(signal_ptrs[self._rank])
+                    graph_epoch_arrive(
+                        self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                        self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
+                        Uint32(gdim),
+                    )
+        elif cutlass.const_expr(self._transport == "tp4_remote_push"):
+            publish_index = index
+            while publish_index < size_packs:
+                words = ld_global_v4_u32(
+                    input_base + Int64(publish_index) * Int64(16)
+                )
+                for peer_index in cutlass.range_constexpr(1, self._world_size):
+                    peer = (self._rank + peer_index) % self._world_size
+                    destination = Int64(peer_ptrs[peer]) + (
+                        Int64(self._rank) * plain_capacity_packs
+                        + Int64(publish_index)
+                    ) * Int64(16)
+                    st_global_v4_u32(destination, *words)
+                publish_index += stride
+            self._multi_gpu_barrier(signal_ptrs)
+            while index < size_packs:
+                accumulator = cute.make_rmem_tensor(
+                    (self._pack_elems,), cutlass.Float32
+                )
+                for peer_index in cutlass.range_constexpr(self._world_size):
+                    peer = (self._rank + peer_index) % self._world_size
+                    if cutlass.const_expr(peer == self._rank):
+                        source = input_base + Int64(index) * Int64(16)
+                    else:
+                        source = Int64(peer_ptrs[self._rank]) + (
+                            Int64(peer) * plain_capacity_packs + Int64(index)
+                        ) * Int64(16)
+                    words = ld_global_cg_v4_u32(source)
+                    self._accumulate_words(
+                        accumulator, *words, peer_index == 0
+                    )
+                self._store_accumulator(
+                    output_base + Int64(index) * Int64(16), accumulator
+                )
+                index += stride
             if cutlass.const_expr(self._device_slot_selection):
                 if Int32(tidx) == Int32(0):
                     self_signal = Int64(signal_ptrs[self._rank])
@@ -1265,7 +1314,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 4, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 5, cache_key),
     )
 
     def run(

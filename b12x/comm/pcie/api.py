@@ -23,6 +23,7 @@ from .pcie_dcp_topk import (
 from .pcie_dma import (
     PCIeDmaAllReduce as DmaAllReduce,
 )
+from .pcie_kv_replica import PCIePagedKvReplica as PagedKvReplica
 from .pcie_oneshot import (
     PCIeOneshotAllReduce as OneshotAllReduce,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "DcpAllToAll",
     "DcpAllToAllPool",
     "DcpTopKOwnerExchange",
+    "PagedKvReplica",
     "VocabParallelArgmax",
     "kimi_topk16",
     "parse_oneshot_max_size",

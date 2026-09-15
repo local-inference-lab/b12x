@@ -121,7 +121,8 @@ def _declaration_key(plan):
     return (
         contract.component_id, contract.query_schema_version, contract.config_schema_version,
         contract.semantic_version, contract.candidate_contract_version,
-        FrozenMapping(contract.encode_query(plan.query)), plan.invocation,
+        FrozenMapping(contract.encode_query(plan.query)),
+        contract.invocation_payload(plan.invocation),
         None if plan.override is None else contract.config_payload(plan.override),
         plan._device,
     )
@@ -769,7 +770,7 @@ class PreparationJob:
             "semantic_version": contract.semantic_version,
             "candidate_contract_version": contract.candidate_contract_version,
             "query": configuration.encoded_query.to_dict(),
-            "invocation": request.plan.invocation.to_dict(),
+            "invocation": contract.invocation_payload(request.plan.invocation).to_dict(),
             "pin": None if configuration.pinned is None else contract.config_payload(configuration.pinned).to_dict(),
             "dependencies": dependencies,
         })

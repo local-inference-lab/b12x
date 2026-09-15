@@ -475,7 +475,7 @@ def _cached_alpha_one(device: torch.device | str) -> torch.Tensor:
     return alpha
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tokens", "values_stride_g", "scale_mma_s5"])
 def _quantize_grouped_tgd_to_tdg_kernel(
     source,
     values,
@@ -547,7 +547,7 @@ def _quantize_grouped_tgd_to_tdg_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tokens", "values_stride_g", "scale_mma_s5"])
 def _quantize_attention_inv_rope_to_tdg_kernel(
     o,
     positions,
@@ -682,7 +682,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["tokens", "source_stride_g", "scale_mma_s5"])
 def _quantize_group_major_trg_to_tk_kernel(
     source,
     values,

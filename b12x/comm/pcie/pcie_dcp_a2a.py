@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from b12x.preparation.types import Plan, require_prepared
+from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
     _SINGLE_CHANNEL_ID,
@@ -162,6 +163,16 @@ class _StagingLayout:
     lse_capacity: int
     slot_bytes: int
     slab_bytes: int
+
+
+@dataclass(frozen=True)
+class _HeadGatherBinding:
+    """Validated posted-write tensors for one prepared gather plan."""
+
+    runtime: object
+    state: object
+    local_input: torch.Tensor
+    out: torch.Tensor
 
 
 def _staging_layout(
@@ -894,7 +905,7 @@ class PCIeDCPA2A:
 
     def all_gather_heads(
         self,
-        local_input: torch.Tensor,
+        local_input: torch.Tensor | _HeadGatherBinding,
         out: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
@@ -903,10 +914,81 @@ class PCIeDCPA2A:
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         with _device_guard(self.device):
+            state = self._prepared_state(plan)
+            binding = (
+                local_input if isinstance(local_input, _HeadGatherBinding) else None
+            )
+            if binding is not None:
+                if binding.runtime is not self or binding.state is not state:
+                    raise ValueError(
+                        "head-gather binding belongs to a different prepared runtime"
+                    )
+                if out is not None:
+                    raise ValueError("a bound head gather owns its output tensor")
+                local_input, out = binding.local_input, binding.out
             return self._all_gather_heads_on_device(
-                local_input, out, state=self._prepared_state(plan),
+                local_input, out, state=state,
+                peer_write_bound=binding is not None,
                 threads=threads, block_limit=block_limit,
             )
+
+    def bind_all_gather_heads(self, local_input, out, *, plan):
+        """Validate and retain posted-write tensor addresses before serving."""
+        with _device_guard(self.device):
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError("DCP head-gather tensors must be bound before capture")
+            state = self._prepared_state(plan)
+            return self._bind_all_gather_heads(state, local_input, out)
+
+    def _bind_all_gather_heads(self, state, local_input, out):
+        if self._closed:
+            raise RuntimeError("PCIeDCPA2A is closed")
+        if state.query.call.get("peer_write", False):
+            if out is None:
+                raise ValueError("posted-write DCP head gather requires a bound output")
+            if local_input.device != self.device or out.device != self.device:
+                raise ValueError(
+                    "posted-write DCP head gather tensors must be on the runtime device"
+                )
+            if (
+                local_input.dtype is not torch.bfloat16
+                or out.dtype is not torch.bfloat16
+            ):
+                raise ValueError("posted-write DCP head gather requires BF16 tensors")
+            if local_input.ndim != 3:
+                raise ValueError(
+                    "posted-write DCP input must have batch, local-head, and head dimensions"
+                )
+            batch, local_heads, head_dim = local_input.shape
+            if not 0 < batch <= self.max_batch_size:
+                raise ValueError(
+                    f"batch size {batch} exceeds configured capacity "
+                    f"{self.max_batch_size}"
+                )
+            if local_heads != self.heads_per_rank or head_dim != self.query_head_dim:
+                raise ValueError(
+                    "input shape does not match configured local heads/head_dim: "
+                    f"{tuple(local_input.shape)}"
+                )
+            expected_out = (batch, self.total_heads, self.query_head_dim)
+            if out.shape != expected_out:
+                raise ValueError(
+                    f"output shape must be {expected_out}, got {tuple(out.shape)}"
+                )
+            if not local_input.is_contiguous() or not out.is_contiguous():
+                raise ValueError(
+                    "posted-write DCP head gather tensors must be contiguous"
+                )
+            if local_input.data_ptr() % 16 or out.data_ptr() % 16:
+                raise ValueError(
+                    "posted-write DCP head gather requires 16-byte alignment"
+                )
+            if (
+                batch * self.total_heads * self.query_head_dim
+                > self._output_capacity_elems
+            ):
+                raise ValueError("PCIe DCP all-gather staging capacity exceeded")
+        return _HeadGatherBinding(self, state, local_input, out)
 
     def _all_gather_heads_on_device(
         self,
@@ -914,47 +996,58 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor],
         *,
         state,
+        peer_write_bound: bool = False,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor:
-        self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
-        if local_input.device != self.device:
-            raise ValueError("input must be on the runtime device")
-        if local_input.dtype not in SUPPORTED_GATHER_DTYPES:
-            raise ValueError(f"unsupported input dtype {local_input.dtype}")
-        if local_input.ndim != 3:
-            raise ValueError("input must have shape [batch, local_heads, head_dim]")
-        batch, local_heads, head_dim = local_input.shape
+        peer_write = bool(state.query.call.get("peer_write", False))
+        if peer_write and not peer_write_bound:
+            raise ValueError("posted-write DCP head gather requires a tensor binding")
+        self._check_stream()
+        if peer_write:
+            batch = local_input.shape[0]
+        else:
+            if local_input.device != self.device:
+                raise ValueError("input must be on the runtime device")
+            if local_input.dtype not in SUPPORTED_GATHER_DTYPES:
+                raise ValueError(f"unsupported input dtype {local_input.dtype}")
+            if local_input.ndim != 3:
+                raise ValueError("input must have shape [batch, local_heads, head_dim]")
+            batch, local_heads, head_dim = local_input.shape
         if batch <= 0 or batch > self.max_batch_size:
             raise ValueError(
                 f"batch size {batch} exceeds configured capacity {self.max_batch_size}"
             )
-        if local_heads != self.heads_per_rank or head_dim != self.query_head_dim:
-            raise ValueError(
-                "input shape does not match configured local heads/head_dim: "
-                f"{tuple(local_input.shape)}"
-            )
-        if not local_input.is_contiguous():
-            raise ValueError("input must be contiguous")
-        expected_out = (batch, self.total_heads, self.query_head_dim)
-        if out is None:
-            out = torch.empty(
-                expected_out,
-                device=local_input.device,
-                dtype=local_input.dtype,
-            )
-        if out.device != self.device or out.dtype != local_input.dtype:
-            raise ValueError("output device and dtype must match input")
-        if out.shape != expected_out:
-            raise ValueError(
-                f"output shape must be {expected_out}, got {tuple(out.shape)}"
-            )
-        if not out.is_contiguous():
-            raise ValueError("output must be contiguous")
-        if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
-            raise ValueError("PCIe DCP all-gather staging capacity exceeded")
+        if not peer_write:
+            if local_heads != self.heads_per_rank or head_dim != self.query_head_dim:
+                raise ValueError(
+                    "input shape does not match configured local heads/head_dim: "
+                    f"{tuple(local_input.shape)}"
+                )
+            if not local_input.is_contiguous():
+                raise ValueError("input must be contiguous")
+            expected_out = (batch, self.total_heads, self.query_head_dim)
+            if out is None:
+                out = torch.empty(
+                    expected_out,
+                    device=local_input.device,
+                    dtype=local_input.dtype,
+                )
+            if out.device != self.device or out.dtype != local_input.dtype:
+                raise ValueError("output device and dtype must match input")
+            if out.shape != expected_out:
+                raise ValueError(
+                    f"output shape must be {expected_out}, got {tuple(out.shape)}"
+                )
+            if not out.is_contiguous():
+                raise ValueError("output must be contiguous")
+            if (
+                batch * self.total_heads * self.query_head_dim
+                > self._output_capacity_elems
+            ):
+                raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(
             threads=threads,
             block_limit=block_limit,
@@ -974,6 +1067,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                peer_write,
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "

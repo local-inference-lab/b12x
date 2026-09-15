@@ -123,6 +123,37 @@ def test_summary_counts_unique_dispatched_programs_across_overlapping_plans(monk
     pool.close()
 
 
+def test_selection_identity_reuses_plan_while_retaining_full_factory_payload(
+    monkeypatch,
+):
+    pool = object.__new__(CompilePool)
+    pool._plans = {}
+    described = []
+
+    def describe(job):
+        described.append(job)
+        return CompilationPlan(job, (ProgramKey("cute", "shared-selection"),))
+
+    monkeypatch.setattr(compile_pool, "describe_compilation", describe)
+    identity = {"layout": "paged", "shape_tail": (128, 656)}
+    first = CompileJob.create_for_selection(
+        "integration.producer:compile",
+        identity,
+        {"cache_shape": (1024, 128, 656)},
+    )
+    second = CompileJob.create_for_selection(
+        "integration.producer:compile",
+        identity,
+        {"cache_shape": (4096, 128, 656)},
+    )
+
+    plans = pool.plan((first, second))
+
+    assert plans[0] is plans[1]
+    assert described == [first]
+    assert described[0].args == ({"cache_shape": (1024, 128, 656)},)
+
+
 def test_failed_job_cannot_become_ready(monkeypatch):
     workers = Workers()
     context = SimpleNamespace(Array=lambda kind, values: Activity(values), Pool=lambda **kwargs: workers)
