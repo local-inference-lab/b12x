@@ -1055,3 +1055,101 @@ def test_op_zero_tokens_copies_states_only() -> None:
             tensors["recurrent_state"][int(inputs["final"][request])],
             inputs["pool"][int(inputs["initial"][request])], rtol=0, atol=0,
         )
+
+
+@pytest.mark.parametrize("decode_backend", ["auto", "cutedsl"])
+def test_prefill_state_continues_through_decode_with_high_ids_and_graphs(decode_backend):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.policy import GDN_ATTENTION, PolicyContext
+    from b12x.sequence import gdn_decode as decode, kda_prefill as prefill
+    from ..conftest import require_sm103_or_sm12x
+
+    device = require_sm103_or_sm12x()
+    heads, prefix_tokens, decode_capacity = 16, 26, 4
+    tail = (1 << 31) // (heads * HEAD_DIM * HEAD_DIM) + 1
+    inputs = make_inputs(
+        lengths=[prefix_tokens + decode_capacity], heads=heads, seed=41,
+        device=device, state_slots=2, initial=[0], final=[1], null_state_index=0,
+    )
+    pool = torch.empty(tail + decode_capacity, heads, HEAD_DIM, HEAD_DIM, device=device)
+    pool[0].fill_(float("nan"))
+    prefix_inputs = dict(inputs, num_tokens=prefix_tokens)
+    prefix_inputs["cu_seqlens"] = torch.tensor([0, prefix_tokens], dtype=torch.int32, device=device)
+    prefix_inputs["final"] = torch.tensor([tail], dtype=torch.int32, device=device)
+    prefix, _ = make_binding(
+        prefix_inputs, max_tokens=33, max_seqs=1,
+        recurrent_state=pool, metadata_validation="trusted",
+    )
+    policy = PolicyContext.for_device(device)
+    if decode_backend != "auto":
+        policy = policy.with_override(
+            GDN_ATTENTION, decode.GdnConfig(backend=decode_backend, recurrent_block_v=32)
+        )
+    plan = decode.plan(
+        decode.Caps(
+            device=device, max_tokens=decode_capacity, max_seqs=1,
+            max_state_slots=pool.shape[0], key_heads=heads, value_heads=heads,
+            state_index_columns=decode_capacity, state_dtype=torch.float32,
+            gate_activation="sigmoid", null_state_index=0,
+            kda_metadata_validation="trusted",
+        ),
+        policy=policy,
+    )
+    scratch_spec, = plan.scratch_specs()
+    z = inputs["raw_g"][prefix_tokens:].clone()
+    weight = torch.linspace(0.8, 1.2, HEAD_DIM, device=device)
+    binding = decode.bind_kda(
+        plan, scratch=torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+        mixed_qkv=torch.cat([
+            inputs[name][prefix_tokens:].flatten(1) for name in ("q", "k", "v")
+        ], dim=1),
+        raw_g=inputs["raw_g"][prefix_tokens:], raw_beta=inputs["raw_beta"][prefix_tokens:],
+        z=z, A_log=inputs["A_log"], dt_bias=inputs["dt_bias"], norm_weight=weight,
+        recurrent_state=pool,
+        query_start_loc=torch.tensor([0, decode_capacity], dtype=torch.int32, device=device),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=device),
+        state_indices=torch.arange(tail, tail + decode_capacity, device=device).view(1, -1),
+        num_seqs=torch.ones(1, dtype=torch.int32, device=device),
+        num_tokens=torch.tensor([decode_capacity], dtype=torch.int32, device=device),
+        output=torch.empty(decode_capacity, heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
+    )
+
+    def run():
+        prefill.run(prefix, lower_bound=-5.0)
+        return decode.run_kda(binding, lower_bound=-5.0, eps=1e-5)
+
+    run()
+    addresses = (pool.data_ptr(), prefix.output.data_ptr(), binding.output.data_ptr())
+    freeze_kernel_resolution("KDA prefill-to-decode continuity")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for live in (1, 4, 1):
+            binding.query_start_loc[-1].fill_(live)
+            binding.num_tokens.fill_(live)
+            expected, final, _ = recurrent_kda(
+                *(inputs[name][:prefix_tokens + live].cpu() for name in ("q", "k", "v", "raw_g", "raw_beta")),
+                inputs["A_log"].cpu(), inputs["dt_bias"].cpu(), lower_bound=-5.0,
+                initial_state=torch.zeros(heads, HEAD_DIM, HEAD_DIM),
+            )
+            values = expected[prefix_tokens:].float()
+            expected_decode = (
+                values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-5)
+                * weight.cpu() * torch.sigmoid(z[:live].float().cpu())
+            ).bfloat16()
+            for replay in (False, True):
+                if replay:
+                    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                else:
+                    run()
+                assert torch.count_nonzero(binding.output[:live]) > 0
+                assert_kda_close("continued output", expected_decode, binding.output[:live].cpu(), ratio=1e-2)
+                assert_kda_close("continued state", final, pool[tail + live - 1].cpu(), ratio=5e-3)
+                assert torch.isnan(pool[0]).all()
+                assert addresses == (pool.data_ptr(), prefix.output.data_ptr(), binding.output.data_ptr())
+    finally:
+        unfreeze_kernel_resolution()
