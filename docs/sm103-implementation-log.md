@@ -1968,5 +1968,15 @@ Prefix C1/C4/repeat outputs also match each other. The bounded GSM8K check
 passes 29/32 questions with zero invalid answers. All four workers freeze
 b12x resolution; each records two inference-time compilations in the
 reference KDA path. Original-service restoration passes again. This
-localizes the arithmetic discrepancy to the KDA implementation choice;
-prefill versus decode and the numerical cause remain unresolved.
+associates the arithmetic discrepancy with the KDA configuration. It does
+not isolate its cause across separately loaded model instances.
+
+A subsequent run uses reference prefill and b12x decode and still returns
+`38`, tied with `42` in the reported decode logits. Its first-token logits
+already differ from the reference run, before decode begins. Captures from
+all 136 layer/rank pairs preserve the prefill state exactly into decode.
+SM120 AUTO replay reproduces the SM121 b12x outputs and states exactly;
+CuTe and reference decode closely match the independent FP32 oracle on
+those same inputs. B12x prefill output/state relative RMS errors stay below
+0.007/0.004. These captures do not establish a decoder defect or resolve
+the model discrepancy. The original service is restored with HTTP 200.
