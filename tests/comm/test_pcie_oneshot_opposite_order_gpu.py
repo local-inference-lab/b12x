@@ -24,9 +24,7 @@ pytestmark = pytest.mark.skipif(
 WORLD_SIZE = 4
 EAGER_ITERS = int(os.getenv("B12X_PCIE_OPPOSITE_EAGER_ITERS", "64"))
 GRAPH_REPLAYS = int(os.getenv("B12X_PCIE_OPPOSITE_GRAPH_REPLAYS", "64"))
-TEST_TIMEOUT_SECONDS = float(
-    os.getenv("B12X_PCIE_OPPOSITE_TIMEOUT_SECONDS", "180")
-)
+TEST_TIMEOUT_SECONDS = float(os.getenv("B12X_PCIE_OPPOSITE_TIMEOUT_SECONDS", "180"))
 NUMEL = int(os.getenv("B12X_PCIE_OPPOSITE_NUMEL", "32768"))
 
 
@@ -110,6 +108,42 @@ def _run_eager_opposite_order(
         torch.cuda.synchronize(device)
         for name in ("a", "b"):
             _assert_reduced(outputs[name], bases[name], world_size, device)
+
+
+def _run_tp4_remote_push_payload_visibility(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Publish changing peer payloads, then consume them after the GPU barrier."""
+    stream = torch.cuda.Stream(device=device)
+    pool.prepare_channels(("eager:tp4-payload-visibility",))
+    channel = pool.for_stream(
+        stream,
+        channel_id="eager:tp4-payload-visibility",
+    )
+    inp = torch.empty((8, 1280), device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(inp)
+    state = channel._ext._state(channel._ptr)
+    assert channel._ext._plain_launch_config(state, inp)[0] == "tp4_remote_push"
+
+    # The remote-push kernel stores each rank's payload into peer memory before
+    # publishing its counter. Changing every payload makes a stale peer read
+    # observable after pcie_arrive_and_wait returns.
+    rank_sum = world_size * (world_size - 1) // 2
+    for iteration in range(EAGER_ITERS):
+        base = float(16 * (iteration % 16))
+        with torch.cuda.stream(stream):
+            inp.fill_(base + rank)
+            channel.all_reduce(inp, out=out)
+        stream.synchronize()
+        torch.testing.assert_close(
+            out,
+            torch.full_like(out, world_size * base + rank_sum),
+            rtol=0,
+            atol=0,
+        )
 
 
 def _capture_channel(
@@ -224,6 +258,7 @@ def _run_graph_opposite_order(
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
+    os.environ["B12X_PCIE_TP4_REMOTE_PUSH"] = "1"
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
@@ -243,6 +278,13 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         max_concurrent_channels=2,
     )
     try:
+        _run_tp4_remote_push_payload_visibility(
+            pool,
+            device,
+            rank,
+            world_size,
+        )
+        dist.barrier()
         _run_capture_warmup_scope(pool, device, rank, world_size)
         dist.barrier()
         _run_eager_opposite_order(pool, device, rank, world_size)

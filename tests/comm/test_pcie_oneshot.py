@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -34,7 +33,6 @@ from b12x.comm.pcie.pcie_oneshot import (
     parse_pcie_oneshot_max_size,
 )
 from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch, _OneshotLaunch
-from b12x.comm.pcie._cute_intrinsics import pcie_arrive_and_wait
 
 
 @pytest.fixture(autouse=True)
@@ -328,10 +326,7 @@ def _make_cute_state(
         transport_policy=transport_policy,
         sharded_eager_storage=sharded_eager_storage,
         tp4_remote_push_capable=(
-            eager
-            and world_size == 4
-            and transport_policy[3]
-            and sharded_eager_storage
+            eager and world_size == 4 and transport_policy[3] and sharded_eager_storage
         ),
         plain_remote_push_region_packs=plain_remote_push_region_packs,
     )
@@ -343,12 +338,16 @@ def test_plain_tp4_push_plan_rejects_unsharded_storage(monkeypatch):
     from b12x.preparation import FrozenMapping
 
     query = PcieQuery(
-        surface="OneshotAllReduce.all_reduce", world_size=4, rank=0,
-        topology="pcie_ipc", call=FrozenMapping({"transport": "tp4_remote_push"}),
+        surface="OneshotAllReduce.all_reduce",
+        world_size=4,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping({"transport": "tp4_remote_push"}),
         setup=FrozenMapping(),
     )
     native = SimpleNamespace(
-        sharded_eager_storage=False, eager_tables=(300, 400),
+        sharded_eager_storage=False,
+        eager_tables=(300, 400),
         eager_buffer_bytes=84 * 1024,
     )
     monkeypatch.setattr(preparation, "_state", lambda runtime: native)
@@ -365,26 +364,28 @@ def test_plain_tp4_push_uses_frozen_policy_for_supported_bf16_shapes(monkeypatch
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
     for rows, hidden in ((1, 5120), (6, 5120), (8, 1280)):
         inp = torch.empty(rows, hidden, dtype=torch.bfloat16)
-        assert _CuTeOneshotBackend._plain_launch_config(
-            state, inp
-        )[0] == "tp4_remote_push"
+        assert (
+            _CuTeOneshotBackend._plain_launch_config(state, inp)[0] == "tp4_remote_push"
+        )
     for rows, hidden, dtype in (
-        (9, 5120, torch.bfloat16), (6, 4096, torch.bfloat16),
-        (6, 5120, torch.float16), (6, 5120, torch.float32),
+        (9, 5120, torch.bfloat16),
+        (6, 4096, torch.bfloat16),
+        (6, 5120, torch.float16),
+        (6, 5120, torch.float32),
     ):
-        assert _CuTeOneshotBackend._plain_launch_config(
-            state, torch.empty(rows, hidden, dtype=dtype)
-        )[0] == "pull"
+        assert (
+            _CuTeOneshotBackend._plain_launch_config(
+                state, torch.empty(rows, hidden, dtype=dtype)
+            )[0]
+            == "pull"
+        )
     disabled = _make_cute_state(4, eager_buffer_bytes=84 * 1024)
-    assert _CuTeOneshotBackend._plain_launch_config(
-        disabled, torch.empty(6, 5120, dtype=torch.bfloat16)
-    )[0] == "pull"
-
-
-def test_pcie_barrier_acquires_peer_payload_before_consumption():
-    source = inspect.getsource(pcie_arrive_and_wait)
-    assert "ld.acquire.sys.global.u32 seen" in source
-    assert "ld.relaxed.sys.global.u32 seen" not in source
+    assert (
+        _CuTeOneshotBackend._plain_launch_config(
+            disabled, torch.empty(6, 5120, dtype=torch.bfloat16)
+        )[0]
+        == "pull"
+    )
 
 
 @pytest.mark.parametrize(
