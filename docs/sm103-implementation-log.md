@@ -1960,3 +1960,13 @@ correctness gate. Prefix reuse, GSM8K, graphs and DFlash remain unexecuted in
 that trial. The original four containers, images and configurations are
 restored with a healthy endpoint. Component and dummy-model results do not
 qualify this checkpoint.
+
+The controlled KDA reference diagnostic retains the same source, weights,
+configuration and other b12x components. Reference KDA prefill and decode
+return `42`; the capital and expression token IDs match the b12x trial.
+Prefix C1/C4/repeat outputs also match each other. The bounded GSM8K check
+passes 29/32 questions with zero invalid answers. All four workers freeze
+b12x resolution; each records two inference-time compilations in the
+reference KDA path. Original-service restoration passes again. This
+localizes the arithmetic discrepancy to the KDA implementation choice;
+prefill versus decode and the numerical cause remain unresolved.
