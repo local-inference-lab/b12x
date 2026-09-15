@@ -570,7 +570,7 @@ def plan(caps: B12XCompressedSparseMLAScratchCaps, *, invocation=FrozenMapping()
     def compile_jobs(config, device):
         return (CompileJob.create(
             "b12x.attention.compressed_sparse_mla._preparation:compile_compressed_sparse_mla",
-            TUNING.encode_query(query), TUNING.encode_config(config), device.ordinal,
+            query.to_dict(), TUNING.encode_config(config), device.ordinal,
         ),)
 
     def memory(config, device):
@@ -581,7 +581,7 @@ def plan(caps: B12XCompressedSparseMLAScratchCaps, *, invocation=FrozenMapping()
         # their artifacts available.  The returned launch is the sole runtime
         # dispatcher; program keys are never used as an execution surrogate.
         programs = compile_compressed_sparse_mla(
-            TUNING.encode_query(query), TUNING.encode_config(selection.config), device.ordinal,
+            query.to_dict(), TUNING.encode_config(selection.config), device.ordinal,
         )
         load_programs(programs)
         return attach_programs(_PreparedCompressedSparseMla(

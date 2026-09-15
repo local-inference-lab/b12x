@@ -232,6 +232,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
     ] | None = None
     materialize: Callable[[QueryT, DeviceIdentity | None, FrozenMapping], ConfigT] | None = None
     equivalence_key: Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None = None
+    encode_invocation: Callable[[FrozenMapping], Mapping[str, object]] | None = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.component_id):
@@ -279,6 +280,21 @@ class TuningContract(Generic[QueryT, ConfigT]):
         if set(payload) != self.config_fields:
             raise ValueError("config codec fields differ from the contract")
         return payload
+
+    def invocation_payload(self, invocation: Mapping[str, object]) -> FrozenMapping:
+        """Encode invocation metadata that affects configuration selection.
+
+        Plans retain their complete invocation metadata for ABI validation and
+        materialization. A component may omit live pool geometry here when that
+        geometry cannot affect its eligible configurations or compiled programs.
+        """
+        invocation = FrozenMapping(invocation)
+        if self.encode_invocation is None:
+            return invocation
+        payload = self.encode_invocation(invocation)
+        if not isinstance(payload, Mapping):
+            raise TypeError("invocation codec must return a mapping")
+        return FrozenMapping(payload)
 
     def _lower(self, query, device, assignment):
         payload = FrozenMapping(assignment)
