@@ -11,6 +11,8 @@ The [qualification runbook](sm103-qualification.md) contains exact bring-up
 commands and acceptance conditions. The [GLM validation receipt](sm103-glm-sparse-validation.json)
 binds component, checkpoint and compilation results to their respective sources;
 the [implementation log](sm103-implementation-log.md) preserves development history.
+The [feature and fix map](sm103-change-summary.md) identifies implementation
+entry points and the b12x and companion vLLM corrections required for serving.
 
 | State | Evidence and limits |
 | --- | --- |
