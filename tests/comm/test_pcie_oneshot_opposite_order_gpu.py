@@ -10,7 +10,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from b12x.comm.pcie._oneshot_preparation import (
+    _prepare_plain_call,
+    plan as oneshot_plan,
+    query_from_runtime,
+)
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.preparation import CollectiveRequirement, PreparationSession
 
 
 pytestmark = pytest.mark.skipif(
@@ -64,6 +70,42 @@ def _rank_order(rank: int) -> tuple[str, str]:
     return ("a", "b") if rank % 2 == 0 else ("b", "a")
 
 
+def _prepare_plain_execution(channel, inp, out, *, name):
+    """Materialize and prime one current-API oneshot execution plan."""
+    query = query_from_runtime(
+        channel,
+        surface="OneshotAllReducePool.all_reduce",
+        call={"inp": inp},
+    )
+    declaration = oneshot_plan(query, runtime=channel)
+    collective = CollectiveRequirement(
+        key=name,
+        ranks=tuple(range(dist.get_world_size())),
+    )
+    session = PreparationSession(device=channel.device, autotune=False)
+    try:
+        result = session.prepare(
+            (
+                declaration.request(
+                    name=name,
+                    collective=collective,
+                    prepare_call=lambda state: _prepare_plain_call(
+                        state,
+                        inp=inp,
+                        out=out,
+                    ),
+                ),
+            ),
+            coordinator=lambda progress: (
+                collective.key if progress.ready_collectives else None
+            ),
+        )
+    except Exception:
+        session.close()
+        raise
+    return session, result, declaration
+
+
 def _run_eager_opposite_order(
     pool: PCIeOneshotAllReducePool,
     device: torch.device,
@@ -92,22 +134,45 @@ def _run_eager_opposite_order(
     outputs = {name: torch.empty_like(inp) for name, inp in inputs.items()}
     streams = {"a": stream_a, "b": stream_b}
     channels = {"a": channel_a, "b": channel_b}
-
-    for iteration in range(EAGER_ITERS):
-        bases = {
-            "a": float(4 * (iteration % 32)),
-            "b": float(1024 + 8 * (iteration % 32)),
-        }
-        for name in _rank_order(rank):
-            with torch.cuda.stream(streams[name]):
-                inputs[name].fill_(bases[name] + rank)
-                channels[name].all_reduce(inputs[name], out=outputs[name])
-
-        # Both valid channel collectives are now enqueued on every rank. A
-        # device-wide wait makes a deadlock visible to the parent timeout.
-        torch.cuda.synchronize(device)
+    resources = []
+    plans = {}
+    try:
         for name in ("a", "b"):
-            _assert_reduced(outputs[name], bases[name], world_size, device)
+            inputs[name].fill_(rank)
+            with torch.cuda.stream(streams[name]):
+                session, result, plans[name] = _prepare_plain_execution(
+                    channels[name],
+                    inputs[name],
+                    outputs[name],
+                    name=f"eager:opposite:{name}",
+                )
+            resources.append((session, result))
+
+        for iteration in range(EAGER_ITERS):
+            bases = {
+                "a": float(4 * (iteration % 32)),
+                "b": float(1024 + 8 * (iteration % 32)),
+            }
+            for name in _rank_order(rank):
+                with torch.cuda.stream(streams[name]):
+                    inputs[name].fill_(bases[name] + rank)
+                    channels[name].all_reduce(
+                        inputs[name],
+                        plan=plans[name],
+                        out=outputs[name],
+                    )
+
+            # Both valid channel collectives are now enqueued on every rank. A
+            # device-wide wait makes a deadlock visible to the parent timeout.
+            torch.cuda.synchronize(device)
+            for name in ("a", "b"):
+                _assert_reduced(outputs[name], bases[name], world_size, device)
+    finally:
+        for session, result in reversed(resources):
+            try:
+                result.close()
+            finally:
+                session.close()
 
 
 def _run_tp4_remote_push_payload_visibility(
@@ -125,25 +190,39 @@ def _run_tp4_remote_push_payload_visibility(
     )
     inp = torch.empty((8, 1280), device=device, dtype=torch.bfloat16)
     out = torch.empty_like(inp)
+    inp.fill_(rank)
     state = channel._ext._state(channel._ptr)
     assert channel._ext._plain_launch_config(state, inp)[0] == "tp4_remote_push"
 
     # The remote-push kernel stores each rank's payload into peer memory before
     # publishing its counter. Changing every payload makes a stale peer read
     # observable after pcie_arrive_and_wait returns.
-    rank_sum = world_size * (world_size - 1) // 2
-    for iteration in range(EAGER_ITERS):
-        base = float(16 * (iteration % 16))
-        with torch.cuda.stream(stream):
-            inp.fill_(base + rank)
-            channel.all_reduce(inp, out=out)
-        stream.synchronize()
-        torch.testing.assert_close(
+    with torch.cuda.stream(stream):
+        session, result, plan = _prepare_plain_execution(
+            channel,
+            inp,
             out,
-            torch.full_like(out, world_size * base + rank_sum),
-            rtol=0,
-            atol=0,
+            name="eager:tp4-payload-visibility",
         )
+    try:
+        rank_sum = world_size * (world_size - 1) // 2
+        for iteration in range(EAGER_ITERS):
+            base = float(16 * (iteration % 16))
+            with torch.cuda.stream(stream):
+                inp.fill_(base + rank)
+                channel.all_reduce(inp, plan=plan, out=out)
+            stream.synchronize()
+            torch.testing.assert_close(
+                out,
+                torch.full_like(out, world_size * base + rank_sum),
+                rtol=0,
+                atol=0,
+            )
+    finally:
+        try:
+            result.close()
+        finally:
+            session.close()
 
 
 def _capture_channel(
@@ -152,13 +231,14 @@ def _capture_channel(
     inp: torch.Tensor,
     out: torch.Tensor,
     channel_id: str,
+    plan,
 ) -> tuple[object, torch.cuda.CUDAGraph]:
     graph = torch.cuda.CUDAGraph()
     with (
         pool.capture(stream, channel_id=channel_id) as channel,
         torch.cuda.graph(graph, stream=stream),
     ):
-        channel.all_reduce(inp, out=out)
+        channel.all_reduce(inp, plan=plan, out=out)
     return channel, graph
 
 
@@ -180,30 +260,44 @@ def _run_capture_warmup_scope(
     pool.prepare_channels(("eager:warmup", "graph:warmup"))
 
     graph = torch.cuda.CUDAGraph()
-    with (
-        torch.cuda.stream(stream),
-        pool.capture(stream, channel_id="graph:warmup") as graph_channel,
-    ):
-        # CUDA capture has not begun. The active semantic scope must still
-        # override the call site's static eager id on this same owner stream.
-        warmup_channel = pool.for_stream(stream, channel_id="eager:warmup")
-        assert warmup_channel is graph_channel
-        warmup_channel.all_reduce(inp, out=out)
+    session = result = None
+    try:
+        with (
+            torch.cuda.stream(stream),
+            pool.capture(stream, channel_id="graph:warmup") as graph_channel,
+        ):
+            session, result, plan = _prepare_plain_execution(
+                graph_channel,
+                inp,
+                out,
+                name="graph:warmup",
+            )
+            # CUDA capture has not begun. The active semantic scope must still
+            # override the call site's static eager id on this same owner stream.
+            warmup_channel = pool.for_stream(stream, channel_id="eager:warmup")
+            assert warmup_channel is graph_channel
+            warmup_channel.all_reduce(inp, plan=plan, out=out)
+            stream.synchronize()
+            _assert_reduced(out, 4096.0, world_size, device)
+
+            with torch.cuda.graph(graph, stream=stream):
+                graph_channel.all_reduce(inp, plan=plan, out=out)
+
+        # Leaving the semantic scope restores normal eager routing even though
+        # the graph-owned channel remains alive for replay on the same stream.
+        eager_channel = pool.for_stream(stream, channel_id="eager:warmup")
+        assert eager_channel is not graph_channel
+        with torch.cuda.stream(stream):
+            inp.fill_(8192.0 + rank)
+            graph.replay()
         stream.synchronize()
-        _assert_reduced(out, 4096.0, world_size, device)
-
-        with torch.cuda.graph(graph, stream=stream):
-            graph_channel.all_reduce(inp, out=out)
-
-    # Leaving the semantic scope restores normal eager routing even though
-    # the graph-owned channel remains alive for replay on the same stream.
-    eager_channel = pool.for_stream(stream, channel_id="eager:warmup")
-    assert eager_channel is not graph_channel
-    with torch.cuda.stream(stream):
-        inp.fill_(8192.0 + rank)
-        graph.replay()
-    stream.synchronize()
-    _assert_reduced(out, 8192.0, world_size, device)
+        _assert_reduced(out, 8192.0, world_size, device)
+    finally:
+        graph.reset()
+        if result is not None:
+            result.close()
+        if session is not None:
+            session.close()
 
 
 def _run_graph_opposite_order(
@@ -224,37 +318,64 @@ def _run_graph_opposite_order(
     if rank % 2:
         logical_ids = tuple(reversed(logical_ids))
     pool.prepare_channels(logical_ids)
-    captured = {}
-    for name in _rank_order(rank):
-        captured[name] = _capture_channel(
-            pool,
-            {"a": stream_a, "b": stream_b}[name],
-            inputs[name],
-            outputs[name],
-            f"graph:{name}",
-        )
-        {"a": stream_a, "b": stream_b}[name].synchronize()
-    dist.barrier()
-    channel_a, graph_a = captured["a"]
-    channel_b, graph_b = captured["b"]
-    assert channel_a is not channel_b
-    assert channel_a._signal_ptrs != channel_b._signal_ptrs
-
     streams = {"a": stream_a, "b": stream_b}
-    graphs = {"a": graph_a, "b": graph_b}
-    for iteration in range(GRAPH_REPLAYS):
-        bases = {
-            "a": float(256 + 4 * (iteration % 32)),
-            "b": float(2048 + 8 * (iteration % 32)),
-        }
-        for name in _rank_order(rank):
-            with torch.cuda.stream(streams[name]):
-                inputs[name].fill_(bases[name] + rank)
-                graphs[name].replay()
-
-        torch.cuda.synchronize(device)
+    channels = {
+        name: pool.for_stream(streams[name], channel_id=f"graph:{name}")
+        for name in ("a", "b")
+    }
+    resources = []
+    plans = {}
+    captured = {}
+    try:
         for name in ("a", "b"):
-            _assert_reduced(outputs[name], bases[name], world_size, device)
+            inputs[name].fill_(rank)
+            with torch.cuda.stream(streams[name]):
+                session, result, plans[name] = _prepare_plain_execution(
+                    channels[name],
+                    inputs[name],
+                    outputs[name],
+                    name=f"graph:opposite:{name}",
+                )
+            resources.append((session, result))
+
+        for name in _rank_order(rank):
+            captured[name] = _capture_channel(
+                pool,
+                streams[name],
+                inputs[name],
+                outputs[name],
+                f"graph:{name}",
+                plans[name],
+            )
+            streams[name].synchronize()
+        dist.barrier()
+        channel_a, graph_a = captured["a"]
+        channel_b, graph_b = captured["b"]
+        assert channel_a is not channel_b
+        assert channel_a._signal_ptrs != channel_b._signal_ptrs
+
+        graphs = {"a": graph_a, "b": graph_b}
+        for iteration in range(GRAPH_REPLAYS):
+            bases = {
+                "a": float(256 + 4 * (iteration % 32)),
+                "b": float(2048 + 8 * (iteration % 32)),
+            }
+            for name in _rank_order(rank):
+                with torch.cuda.stream(streams[name]):
+                    inputs[name].fill_(bases[name] + rank)
+                    graphs[name].replay()
+
+            torch.cuda.synchronize(device)
+            for name in ("a", "b"):
+                _assert_reduced(outputs[name], bases[name], world_size, device)
+    finally:
+        for _channel, graph in captured.values():
+            graph.reset()
+        for session, result in reversed(resources):
+            try:
+                result.close()
+            finally:
+                session.close()
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
