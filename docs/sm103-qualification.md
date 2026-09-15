@@ -2,8 +2,9 @@
 
 Status: **implemented prototype, unqualified on B300**. The normal b12x API
 selects native NVFP4 and uniform, projection-tiered, grouped atom or BTX paired Trellis MoE
-backends for SM103. Physical SM103 execution, complete GLM serving, V4.1 serving
-and Station RDMA remain unqualified. No B300 performance
+backends for SM103. Native V4.1 checkpoint serving passes the recorded SM121
+checks. GLM checkpoint correctness, V4.1 Trellis model accuracy, physical SM103
+execution and Station RDMA remain unqualified. No B300 performance
 numbers or measured B300 policy profile are included.
 
 ## Support and architecture boundaries
@@ -24,11 +25,12 @@ numbers or measured B300 policy profile are included.
 | Quantized linears | Implemented NVFP4/MXFP4/MXFP6/MXFP8 tcgen05/TMEM GEMM, inline W4A16/W8A16, tensor-scaled FP8, compact K128 block-FP8 warp MMA, and planned BF16/FP16 block-FP8 linear | Physical SM103 numerics, grouped strides, boundaries, frozen resolution, and graphs |
 | DeepSeek WO projection | Implemented planned MXFP8 WO-A/WO-B tcgen05 chain and CuTe inverse-RoPE quantization; SM120 quantizer checks and 56 SM103 compiled callables; companion vLLM retained plans, output and warmup pass SM120 serving checks | Native two-stage numerics and graphs; complete DeepSeek attention/indexer integration and model evaluation |
 | DeepSeek mHC | Implemented CuTe pre/post/post-pre and lagged mixing, high/low TF32 projection, plan-owned scheduling, and collapse; SM120 oracles and graphs; SM103 compilation | Physical SM103 numerics, graph replay, and real-checkpoint qualification |
-| V4.1 supporting operators | Existing CSA compression, HyperConnection and embedding APIs admit SM103; HyperConnection selects CuTe for every stage; SM120/SM121 correctness and memcheck pass; 72 callables cross-compiled | Physical SM103 state, graph and numeric qualification; complete V4.1 integration |
+| V4.1 supporting operators | Existing CSA compression, HyperConnection and embedding APIs admit SM103; HyperConnection selects CuTe for every stage; SM120/SM121 correctness and memcheck pass; 72 callables cross-compiled; native V4.1 checkpoint serving passes bounded SM121 TP4 checks | Physical SM103 state, graph and numeric qualification; Trellis checkpoint accuracy |
 | MTP feedback | GLM ordinary RMS-concat, Qwen flattened Gemma multi-stream and DeepSeek per-stream FP8 contracts use existing planned APIs and CuTe projections; GLM and DeepSeek companion call-site, graph and Inductor checks pass on SM120; 51 SM103 callables compiled | Physical SM103 execution, actual sequence-parallel collectives, head collapse and full speculative model evaluation |
 | Checkpoint-loader integration | Companion scoped allocation/copy hooks, file-range descriptors, filtering and post-load completion are implemented; host tests and SM120 model/MoE regressions pass; 34 direct-loader tests pass on SM121 | Execute companion loader integration on SM121; qualify Grace placement on the Station |
-| DFlash2 | Qwen target/draft execution, accepted proposals, target/draft graphs and prefix reuse exercised on SM120 | Exact token equality with target-only execution remains unresolved; full GLM DFlash2 and physical SM103 execution remain unqualified |
-| Full GLM/V4.1, HBM GDR | Model components and experimental Grace transport are implemented; complete serving and direct HBM transport remain unsupported | Complete model/checkpoint evaluation and direct HBM transport implementation |
+| DFlash2 | GLM dummy target/draft execution on SM120 matches all 48 target-only tokens, with 54 graph replays and frozen resolution; Qwen target/draft execution and accepted proposals are exercised | Qwen exact token equality remains unresolved; GLM checkpoint acceptance/accuracy and physical SM103 execution remain unqualified |
+| Full GLM/V4.1 | Companion model integrations are implemented; native V4.1 SM121 TP4 checkpoint checks pass; GLM SM121 TP4 loads and generates but fails the arithmetic gate | Resolve GLM checkpoint correctness; qualify V4.1 Trellis weights and both models on SM103 |
+| HBM GDR | Experimental Grace transport is implemented; direct HBM transport is unsupported | Implement and qualify direct HBM transport on capable hardware |
 
 Native block-scaled MoE on SM103 uses tcgen05 and TMEM; SM120/SM121 use warp MMA. The architecture
 descriptor records 512 TMEM columns and a 227 KiB block SMEM limit for SM103,
@@ -586,6 +588,10 @@ strides, scale, lower bound, and live device counts remain runtime arguments.
 Tests cover smaller bound views and mutable counts under frozen resolution,
 accepted-draft restarts, null slots, malformed metadata, parameter dtypes,
 noncontiguous beta, graph allocation, and state offsets beyond 2^31 elements.
+The public prefill-to-decode continuity test also compares 16-head execution
+with the FP32 recurrent oracle after a 26-token prefix. AUTO and CuTe decode
+pass on SM120 with live counts 1/4/1, high state-pool IDs, frozen resolution
+and allocation-free graph replay.
 
 Sequential KDA and GDN prefill retain the shared chunked CuTe implementation,
 including checkpoints and long sequences spanning workspace windows. SM103

@@ -1939,3 +1939,24 @@ Torch 2.13.0 and verified dependency revisions. The split toolkit requires the
 installed CUDA-library header path and an isolated NVRTC linker name. The
 recorded core library hashes are unchanged. These external outputs have no GPU
 qualification and do not replace the libraries used by the GLM trials.
+
+## KDA state continuity and GLM checkpoint correctness
+
+Status: public KDA prefill-to-decode continuity qualified on SM120; real GLM
+checkpoint correctness failed on SM121; physical SM103 execution unqualified.
+
+The public sequence test uses 16 local heads, a 26-token prefix, and live
+decode counts 1/4/1. Both AUTO and CuTe decode agree with the independent FP32
+recurrent oracle. Live state slots begin beyond the Int32 element-offset
+boundary. Frozen resolution, poisoned null state, stable addresses and
+allocation-free graph replay pass.
+
+The GLM NVFP4 checkpoint loads all 45 layers on four SM121 workers using the
+companion source recorded in the [primary model inventory](sm103-primary-models.json).
+All workers freeze b12x resolution after warmup and record no inference-time
+compilation. The arithmetic prompt returns `38` for `19 + 23`; the capital
+and expression prompts return `Canberra` and `x + 1`. This fails the checkpoint
+correctness gate. Prefix reuse, GSM8K, graphs and DFlash remain unexecuted in
+that trial. The original four containers, images and configurations are
+restored with a healthy endpoint. Component and dummy-model results do not
+qualify this checkpoint.
