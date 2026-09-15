@@ -144,7 +144,40 @@
       "prefix_c1_c4_repeat_exact_tokens": true,
       "gsm8k": "29/32 correct, zero invalid; first 32 examples, five-shot, 512-token limit, seed 41",
       "qualification": false,
-      "conclusion": "The KDA implementation choice changes the arithmetic result. Prefill versus decode and the numerical cause remain unresolved."
+      "conclusion": "The separately loaded runs associate the arithmetic result with the KDA configuration; they do not isolate its cause. Subsequent captures show a first-token difference before decode and close agreement with the FP32 oracle."
+    },
+    "kda_capture_diagnostic": {
+      "status": "Reference prefill with b12x decode returns 38; captured tensors closely match the FP32 oracle. The cause of the model discrepancy remains unresolved.",
+      "capture_files": 272,
+      "capture_pairs": 136,
+      "exact_prefill_to_decode_state_handoffs": 136,
+      "sm120_replay": {
+        "b12x_auto_matches_sm121_capture_exactly": true,
+        "b12x_decode_output_max_relative_rms": 8.035406472226902e-05,
+        "b12x_decode_state_max_relative_rms": 9.501836874947407e-08,
+        "b12x_prefill_output_max_relative_rms": 0.006902278398443265,
+        "b12x_prefill_state_max_relative_rms": 0.0035457714971257226,
+        "reference_decode_output_max_relative_rms": 0.00018952610389900152,
+        "reference_decode_bit_exact_outputs_vs_capture": 117
+      },
+      "inference_jit_events": 0,
+      "frozen_workers": 4,
+      "interpretation": "The runs differ before the first decode step. These separately loaded and differently instrumented runs do not isolate a decoder defect. All captured state handoffs are exact and both b12x and reference decoders closely match the independent FP32 oracle on the same inputs. Model discrepancy remains unresolved.",
+      "limitations": "First 26-token prompt and first one-token decode per KDA layer/rank. CPU tensor copies and temporary allocations are diagnostic instrumentation; this does not qualify graph replay, allocation behavior, model accuracy or SM103 execution.",
+      "original_service_restored": true,
+      "health_http": 200,
+      "summary": {
+        "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/kda-decode-only/analysis-summary.json",
+        "sha256": "c7ea90408ed209c765b9a41e3f9e5df8f2c2623fb185e36475ec51eb7b27b130"
+      },
+      "capture_manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/kda-decode-only/capture-manifest.json",
+        "sha256": "50d1388ff0808774a84fffc6777695823aa52ff519c301d14a512b333bad29d9"
+      },
+      "diagnostic_manifest": {
+        "path": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/kda-decode-only/diagnostic-manifest.json",
+        "sha256": "14d57e2c13043f9bb4349bd1610638444259e5d9dba619af09883e950de71d02"
+      }
     }
   }
 }
