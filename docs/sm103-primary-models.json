@@ -120,9 +120,12 @@
       "exact_eager_graph_tokens": true,
       "graph_replays": 21,
       "inference_jit_compilations": 0,
-      "sm103_supporting_pooling_callables": 11
+      "sm103_supporting_pooling_callables": 11,
+      "synthetic_dflash_requests": 6,
+      "synthetic_dflash_exact_target_only_tokens": true,
+      "synthetic_dflash_graph_replays": 54
     },
     "synthetic_scope": "Four-layer GLM model with dummy weights, hidden size 4096, eight experts, and real attention/KDA/MoE launch paths. This does not establish checkpoint accuracy.",
-    "native_scope": "Prebuilt regression libraries on SM120; a matching native build of the complete companion source remains unqualified."
+    "native_scope": "SM120 core libraries match the recorded source build by hash; all 324 native and build files are identical to companion revision 5d58e328c1. External libraries retain their precompiled identities. Complete native-build and SM103 runtime qualification remain separate."
   }
 }

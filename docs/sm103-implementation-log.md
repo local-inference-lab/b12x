@@ -1919,3 +1919,23 @@ produce identical 48-token outputs in eager and graph execution, with 21 graph
 replays and frozen resolution. Eleven supporting pooling variants have inspected
 SM103 PTX, cubins, SASS and resources, with zero stack or local memory. Full GLM
 checkpoint qualification remains separate from these results.
+
+## GLM speculative configuration and external native artifacts
+
+Status: synthetic SM120 DFlash2 execution qualified; external native
+compilation and CPU loading qualified; checkpoint and SM103 execution
+remain unqualified.
+
+The GLM DFlash2 configuration selects the draft cache dtype independently of
+the target's compressed MLA layout and reserves fixed capacity for both models.
+Six requests on the four-layer dummy target and two-layer dummy draft produce
+the same 48 tokens as target-only execution. The worker records 54 total graph
+replays with frozen b12x resolution and no inference-time compilation.
+
+The companion native build produces FlashMLA, its extension, FlashKDA,
+QuTLASS and DeepGEMM libraries. All five load with CUDA hidden and uninitialized;
+311 CUDA entry records have saved resource reports. The build uses CUDA 13.0.88,
+Torch 2.13.0 and verified dependency revisions. The split toolkit requires the
+installed CUDA-library header path and an isolated NVRTC linker name. The
+recorded core library hashes are unchanged. These external outputs have no GPU
+qualification and do not replace the libraries used by the GLM trials.

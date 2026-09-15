@@ -924,5 +924,28 @@
         "sha256": "46fd8f664818f623428688a87f2b0092f856b71db80a41676cc05c59d04a5e04"
       }
     }
+  },
+  "external_build": {
+    "status": "Cross-compiled and CPU loading qualified; GPU execution unqualified.",
+    "source_revision": "5e040862e127518c1cf5248c8f5113ab6d2e0985",
+    "native_source_identical_to": "5d58e328c1412ebdc2bd0106f51db535797b8e36",
+    "targets": [
+      "_flashmla_C",
+      "_flashmla_extension_C",
+      "_flashkda_C",
+      "_qutlass_C",
+      "deep_gemm._C"
+    ],
+    "cuda_entries": 311,
+    "architectures": [
+      "sm_100f",
+      "sm_120f"
+    ],
+    "cpu_loading": "passed with CUDA hidden and uninitialized",
+    "core_libraries_unchanged": true,
+    "receipt": "companion vLLM docs/design/b12x_native_external_validation.json",
+    "artifact_root": "/home/jasonc/b12x-sm103-evidence/glm-serving-20260914/native-externals",
+    "gpu_execution": false,
+    "performance_claim": false
   }
 }
