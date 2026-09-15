@@ -1064,9 +1064,18 @@ CUDA_VISIBLE_DEVICES='' cmake --build "$native_build_dir" --target \
 Stage the resulting libraries in a separate runtime copy and verify their
 hashes before loading. The receipt records CPU loading with CUDA hidden and
 uninitialized, then 185 passing SM120 tests covering NVFP4 quantization,
-b12x MoE and GLM/DeepSeek/DSpark model integration. External native modules
-retain their precompiled identities; this receipt covers the five listed
-core targets.
+b12x MoE and GLM/DeepSeek/DSpark model integration. Those GPU checks use
+precompiled external modules alongside the five built core targets.
+
+The separate external build covers FlashMLA, its extension, FlashKDA,
+QuTLASS and DeepGEMM. All five libraries load with CUDA hidden and
+uninitialized. The four CUDA libraries contain 311 entry records targeting
+`sm_100f` or `sm_120f`; raw resource reports retain positive stack usage.
+The existing core artifacts remain unchanged. The external libraries have
+not replaced the libraries in the recorded GLM trials and have no GPU
+qualification. The companion receipt
+`docs/design/b12x_native_external_validation.json` binds source, dependency,
+library, compiler-command and resource identities.
 
 On the 3,882-token Qwen corpus, eager output matches the prior eager reference
 for all six requests. Target graphs execute 69 replays per rank, but one
