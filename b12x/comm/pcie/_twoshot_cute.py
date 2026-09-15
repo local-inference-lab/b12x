@@ -21,6 +21,7 @@ from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
+from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     cvt_e4m3x4_to_f32x4,
     ld_global_nc_f32,
@@ -895,6 +896,6 @@ def get_twoshot_launcher(
         )
         raw(*raw_args)
 
-    return run
+    return attach_programs(run, raw)
 
 __all__ = ["get_twoshot_launcher"]
