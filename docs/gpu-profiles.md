@@ -377,23 +377,25 @@ These nested totals must not be added together.
 ## Native benchmark consumers
 
 `B12X_PCIE_DCP_HEAD_GATHER_PUSH=1` opts into the experimental native posted-write
-head gather for world4, BF16, 64 global heads and 512 head dimension. The default
-is `0` (existing pull transport). `query_from_runtime(..., call={..., "peer_write":
-True})` can pin this explicitly. The control is captured in declaration metadata
-and the compiled launcher identity; changing it after preparation does not change
-binding or graph replay. Other push geometry fails closed. The same IPC slab,
-system-scope barrier and graph slots are retained, with L1-bypassing incoming
-loads. Serialized launch/replay remains required; this is not a qualified default.
+decode-context-parallel head gather for four ranks, BF16, 64 global heads, and a
+512-element head dimension. The default `0` selects the pull transport.
+`query_from_runtime(..., call={..., "peer_write": True})` can pin the posted-write
+transport explicitly. The control is captured in declaration metadata and the
+compiled launcher identity; changing it after preparation does not change binding
+or graph replay. Other push geometry fails closed. The transport uses the channel's
+IPC slab, system-scope barrier, graph slots, and L1-bypassing incoming loads.
+Serialized launch and replay remain required; this transport is not a qualified
+default.
 
-`B12X_PCIE_TP4_REMOTE_PUSH=1` also enables the experimental native plain BF16
-all-reduce for DeepSeek V4.1 widths 5120/1280 and 1-8 rows within the declared
-eager slot
-capacity. Other plain shapes retain pull, and the default remains off. This
-reuses the already-declared four source shards, alternating graph slots and
-system barrier. Destinations are rank-staggered, incoming loads bypass L1, and
-the original rotating-rank FP32 sum and single BF16 rounding are retained.
-The factory snapshots the flag and checks agreement before allocating IPC;
-bind/replay does not reread it. Existing fused TP4 eligibility is unchanged.
+`B12X_PCIE_TP4_REMOTE_PUSH=1` enables the experimental native plain BF16
+all-reduce for four-rank tensor parallelism, DeepSeek V4.1 widths 5120 and 1280,
+and one through eight rows within the declared eager-slot capacity. Other plain
+shapes use the pull transport, and the default remains off. The transport uses
+four source shards, alternating graph slots, and a system-scope barrier.
+Destinations are rank-staggered, incoming loads bypass L1, and accumulation uses
+rotating-rank FP32 addition followed by one BF16 rounding operation. The factory
+snapshots the flag and checks rank agreement before allocating IPC; binding and
+replay do not reread it. Fused four-rank tensor-parallel eligibility is unchanged.
 
 `benchmarks/benchmark_startup_autotuner.py` uses the same declarations and
 session with explicit retained benchmark calls. Its optional group subsets are

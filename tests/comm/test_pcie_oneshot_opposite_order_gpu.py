@@ -71,7 +71,7 @@ def _rank_order(rank: int) -> tuple[str, str]:
 
 
 def _prepare_plain_execution(channel, inp, out, *, name):
-    """Materialize and prime one current-API oneshot execution plan."""
+    """Materialize and prime one prepared oneshot execution plan."""
     query = query_from_runtime(
         channel,
         surface="OneshotAllReducePool.all_reduce",

@@ -236,8 +236,21 @@ def prepared_call(state, **actual):
     """Build a priming call that invokes the materialized native owner state."""
     runtime, query = state.runtime, state.query
     if query.surface == "PagedKvReplica.replicate":
+        binding = runtime._bind_prepared(
+            state,
+            actual["cache"],
+            actual["table"],
+            actual["positions"],
+            actual["starts"],
+            actual["out"],
+        )
         return PreparedCall(
-            run=lambda: runtime._run_prepared(state, **actual),
+            run=lambda: runtime._run_prepared(
+                state,
+                binding,
+                requests=actual["requests"],
+                max_tokens=actual["max_tokens"],
+            ),
             output=actual["out"], capture_safe=True,
         )
     if query.surface == "DcpTopKOwnerExchange.stage_candidates":
