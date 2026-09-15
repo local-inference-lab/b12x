@@ -77,7 +77,7 @@ class CompileJob:
         selection_identity: object,
         *args: object,
         **kwargs: object,
-    ):
+    ) -> CompileJob:
         """Retain full factory inputs while deduplicating one selection."""
         return cls(
             factory=factory,
