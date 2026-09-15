@@ -57,6 +57,7 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
+    run_compiled,
 )
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.utils import (
@@ -8651,6 +8652,7 @@ class _DenseLowering:
     target_occupancy_override: int | None
     direct_sfa_live16: bool
     direct_m1_wo_a_inputs: bool
+    architecture: str = "sm12x"
 
     def to_dict(self):
         from dataclasses import asdict
@@ -9151,6 +9153,10 @@ def _lower_dense_gemm(
 def _compile_dense_lowering(payload, device_ordinal):
     """Compile exact production launchers from metadata, without tensor storage."""
     p = _DenseLowering.from_dict(payload)
+    if p.architecture == "sm103":
+        from b12x.gemm._sm103_preparation import compile_dense
+        with torch.cuda.device(device_ordinal):
+            return compile_dense(p, device_ordinal)
     split = p.policy.split_k_slices > 1
     atomic = split and p.policy.split_k_atomic_bf16
     output_type = "float32" if split and not atomic else p.c_dtype
@@ -9184,12 +9190,15 @@ def _compile_dense_lowering(payload, device_ordinal):
             )
         programs = {"gemm": gemm}
         if split and not atomic:
-            if p.policy.split_k_slices != 2:
-                raise ValueError("non-atomic dense reduction requires two slices")
-            programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
-                torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
-                grid=(triton.cdiv(p.m * p.n, 1024),),
-            )
+            if p.c_dtype == "float16" or p.policy.split_k_slices != 2:
+                programs["reduce"] = _get_compiled_dense_split_k_reduce(
+                    p.n, p.policy.split_k_slices, device_ordinal, p.c_dtype,
+                )
+            else:
+                programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
+                    torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
+                    grid=(triton.cdiv(p.m * p.n, 1024),),
+                )
         return programs
 
 
@@ -9217,6 +9226,11 @@ class _DenseExecutionState:
             rhs_values_tiled=None, quantized_c=None, x_bf16=None, w_gscale=None,
             row_scale=None, split_k_workspace=None):
         p = self.lowering
+        if p.architecture == "sm103":
+            if any(value is not None for value in (rhs_values_tiled, quantized_c, x_bf16, w_gscale, row_scale)):
+                raise ValueError("SM103 prepared dense execution has no auxiliary operand route")
+            from b12x.gemm._sm103_preparation import run_dense
+            return run_dense(self, lhs, rhs, out, alpha=alpha, stream=stream)
         a, sfa = lhs
         b, sfb = rhs
         m = int(a.shape[0])
@@ -9291,7 +9305,14 @@ class _DenseExecutionState:
             alpha_tensor_gpu=alpha_value, stream_int=stream_int,
         )
         if temporary is not None:
-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
+            if p.c_dtype == "float16" or p.policy.split_k_slices != 2:
+                run_compiled(self.reduction, (
+                    make_ptr(cutlass.Float32, temporary.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                    make_ptr(get_cutlass_dtype(p.c_dtype), out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                    m, cuda_stream_from_int_or_current(stream_int),
+                ))
+            else:
+                self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
         return out
 
 
@@ -9544,3 +9565,61 @@ def _materialize_dense_fused_quant(lowering, device):
     return _DenseFusedQuantState(
         lowering, device, programs["gemm"], programs.get("reduce"), _cached_alpha_one(device),
     )
+
+
+class _DenseSplitKReduce:
+    def __init__(self, n: int, slices: int, c_dtype=cutlass.BFloat16):
+        self.n = n
+        self.slices = slices
+        self.c_dtype = c_dtype
+
+    @cute.jit
+    def __call__(self, partials: cute.Pointer, output: cute.Pointer,
+                 m: Int32, stream: cuda.CUstream):
+        self.kernel(partials, output, m).launch(
+            grid=((Int64(m) * self.n + 255) // 256, 1, 1),
+            block=(256, 1, 1), stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, partials: cute.Pointer, output: cute.Pointer, m: Int32):
+        offset = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
+        size = Int64(m) * self.n
+        if offset < size:
+            value = cutlass.Float32(0)
+            for part in cutlass.range_constexpr(self.slices):
+                value += partials[Int64(part) * size + offset]
+            output[offset] = self.c_dtype(value)
+
+
+@program_cache
+def _get_compiled_dense_split_k_reduce(n: int, slices: int, device: int,
+                                     c_dtype: str = "bfloat16"):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("split-K reduction must be prewarmed before CUDA graph capture")
+    if c_dtype not in ("bfloat16", "float16", "float32"):
+        raise ValueError("split-K reduction output must be BF16, FP16 or FP32")
+    from b12x._lib.gating import get_compute_capability
+    launch_type = _DenseSplitKReduce
+    if get_compute_capability(torch.device("cuda", device)) == (10, 3):
+        from b12x.gemm.blockscaled._a16_cute import DenseA16Reduce
+        launch_type = DenseA16Reduce
+    dtype = get_cutlass_dtype(c_dtype)
+    launch = launch_type(n, slices, dtype)
+    key = (n, slices, device, c_dtype)
+    raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
+    return b12x_compile(
+        launch,
+        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+        1, current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("gemm.dense.split_k_reduce", 2, key),
+    )
+
+
+def dense_gemm_a16_reduce(partials, out, *, n, m, slices, stream=None):
+    c_dtype = str(out.dtype).removeprefix("torch.")
+    fn = _get_compiled_dense_split_k_reduce(n, slices, out.device.index, c_dtype)
+    fn(make_ptr(cutlass.Float32, partials.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+       make_ptr(get_cutlass_dtype(c_dtype), out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+       m, cuda_stream_from_int_or_current(cuda_stream_to_int(stream) if stream is not None else None))

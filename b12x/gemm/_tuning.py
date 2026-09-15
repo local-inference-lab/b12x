@@ -377,6 +377,11 @@ def knob_values(query):
 
 
 def validate_config(query, config, device):
+    if device is not None and device.compute_capability == (10, 3):
+        from ._sm103_preparation import config_for
+        if config != config_for(query):
+            raise ValueError("SM103 dense config differs from the implemented native launch")
+        return
     from b12x._lib import dense_gemm as dense
 
     if not isinstance(config, DenseGemmConfig):
@@ -473,6 +478,9 @@ def validate_config(query, config, device):
 
 
 def default_config(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        from ._sm103_preparation import config_for
+        return config_for(query)
     from b12x._lib import dense_gemm as dense
     from ._preparation import _default_lowering
     p = _default_lowering(query, device)
@@ -499,6 +507,11 @@ def default_config(query, device):
 
 
 def _parameters(query, device):
+    if device is not None and device.compute_capability == (10, 3):
+        return ParameterSpace(knobs=tuple(
+            Knob(name=name, values=(value,))
+            for name, value in asdict(default_config(query, device)).items()
+        ))
     values = knob_values(query)
     mapping = {
         "load_path": "load_path", "swap_ab": "swap_ab",
@@ -554,7 +567,7 @@ def _validate_query(query, device):
 TUNING = TuningContract(
     component_id="gemm.mm",
     query_schema_version=7,
-    config_schema_version=2,
+    config_schema_version=3,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
     encode_query=lambda query: {field.name: getattr(query, field.name) for field in fields(query)},
@@ -563,7 +576,7 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),

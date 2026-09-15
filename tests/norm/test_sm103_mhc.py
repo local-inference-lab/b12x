@@ -5,12 +5,12 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.norm import mhc
-from b12x.policy import MHC, PolicyContext
-from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery
+from b12x.preparation import FrozenMapping
+from b12x.norm.mhc._tuning import TUNING
 from ..conftest import require_sm103_or_sm12x
-from .test_mhc import _make_inputs, _mhc_pre_reference, _mhc_post_reference
+from tests._reference.mhc import _make_inputs, _mhc_pre_reference, _mhc_post_reference
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120, 7168])
@@ -39,17 +39,17 @@ def test_current_mix_reuses_capacity_and_mutable_graph_inputs(
         if fuse_norm
         else None
     )
-    context = PolicyContext.for_device(device)
-    query = MhcQuery(
-        dtype="bfloat16", max_tokens=capacity, hidden_size=hidden, split_k=hidden // 64
-    )
-    config = replace(
-        MHC_POLICY.heuristic(query, context.device), projection_split_fp32=True
-    )
-    plan = mhc.plan(
-        mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden),
-        policy=context.with_override(MHC, config),
-    )
+    invocation = FrozenMapping({"operation": phase, "has_norm_weight": fuse_norm,
+                                "expanded_residual": phase == "pre",
+                                "norm_eps": 1e-6, "rms_eps": 1e-6, "hc_eps": 1e-6,
+                                "sinkhorn_iters": 20})
+    caps = mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden)
+    declaration = mhc.plan(caps, invocation=invocation)
+    from b12x.preparation.device import detect_device
+    config = TUNING.configure(declaration.query, device=detect_device(device).identity,
+                              search=False).default
+    plan = mhc.plan(caps, invocation=invocation,
+                    override=replace(config, projection_split_fp32=True))
     scratch = tuple(
         torch.empty(spec.shape, dtype=spec.dtype, device=device)
         for spec in plan.scratch_specs()
@@ -85,26 +85,16 @@ def test_current_mix_reuses_capacity_and_mutable_graph_inputs(
     # plans whose first invocation contains only one live row.
     run(1)
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("mHC current-mix capacity qualification")
+    guard = kernel_resolution_guard("mHC current-mix capacity qualification")
+    guard.__enter__()
+    request.addfinalizer(lambda: guard.__exit__(None, None, None))
 
     def refuse(*args, **kwargs):
         pytest.fail("mHC replay attempted policy resolution")
 
-    monkeypatch.setattr(PolicyContext, "resolve", refuse)
-    from b12x.norm.mhc import _kernels, _policy
-
-    for module in (_kernels, _policy):
-        for name in (
-            "_selected_post_pre_decode_split_n",
-            "_selected_mhc_decode_finalize_threads",
-            "_selected_post_pre_partials_per_cta",
-        ):
-            monkeypatch.setattr(module, name, refuse)
-    # A serving plan retains the setup-time overrides after the environment changes.
-    monkeypatch.setenv(
-        "B12X_MHC_PREFILL_TF32_MMA", "0" if plan.schedule.tf32_enabled else "1"
-    )
+    from b12x.preparation.tuning import TuningContract
+    monkeypatch.setattr(TuningContract, "configure", refuse)
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0" if config.backend == "tf32_tma" else "1")
     monkeypatch.setenv("B12X_MHC_PARTIALS_PER_CTA", "19")
     for live in (0, 1, 3, 8, 16, capacity - 1, capacity):
         graph = torch.cuda.CUDAGraph()

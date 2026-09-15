@@ -168,7 +168,8 @@ def btx_atom_fixture(
         layer, atoms=layer.atoms.clone(), gate_suh=layer.gate_suh.clone(),
         up_suh=layer.up_suh.clone(), down_svh=layer.down_svh.clone(),
     )
-    plan = fused_moe.plan_weights(
+    from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
+    plan = plan_b12x_fp4_moe_weights(
         quant_modes="w4a16", source_format="btx",
         activation="situ" if coupled else "silu", params_dtype=torch.bfloat16,
         num_experts=experts, hidden_size=hidden, intermediate_size=width,

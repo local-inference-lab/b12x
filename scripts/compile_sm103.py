@@ -18,6 +18,35 @@ sys.path.insert(0, str(ROOT))
 from scripts._sm103_source import package_source_sha256, source_identity
 
 
+_EXPORT_DIRECTORIES = {}
+
+
+def _export_compile(kernel, args, compile_spec, directory):
+    """Keep production program identities while exporting native compiler artifacts."""
+    import shutil
+    from b12x._lib import compiler
+    from b12x._lib.compile_plan import program_keys
+    original = compiler._call_cute_compile
+
+    def export(compile_callable, func, operands, kwargs, *, compile_spec, cache_key):
+        compiled = original(compile_callable, func, operands,
+            {**kwargs, "options": kwargs.get("options", "") +
+             f" --keep-ptx --keep-cubin --dump-dir={directory}"},
+            compile_spec=compile_spec, cache_key=cache_key)
+        _EXPORT_DIRECTORIES[cache_key] = directory
+        return compiled
+
+    with patch.object(compiler, "_call_cute_compile", export):
+        compiled = compiler.compile(kernel, *args, compile_spec=compile_spec)
+    key, = program_keys(compiled)
+    source = _EXPORT_DIRECTORIES[key.key]
+    if source != directory:
+        for artifact in source.iterdir():
+            if artifact.suffix in {".ptx", ".cubin"}:
+                shutil.copyfile(artifact, directory / artifact.name)
+    return compiled
+
+
 def compile_sequence(out):
     """Compile production recurrent launch factories using pointer prototypes.
 
@@ -40,12 +69,7 @@ def compile_sequence(out):
         name = case + "_" + compile_spec.kernel_id.rsplit(".", 1)[-1]
         directory = out / name
         directory.mkdir()
-        compiled = cute.compile(
-            kernel,
-            *args,
-            no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
         launches[name] = compiled
         return compiled
@@ -76,16 +100,14 @@ def compile_sequence(out):
                     null_state_index=0,
                     **geometry,
                 )
-                plan = impl._materialize_plan(
-                    caps,
-                    v_split=64,
-                    k_split=1,
-                    stages=3,
-                    window_tiles=128,
-                    policy_resolution=None,
-                )
+                from b12x.sequence.kda_prefill._tuning import KdaPrefillConfig
+                from b12x.sequence.gdn_prefill._tuning import GdnPrefillConfig
+                config_type = KdaPrefillConfig if recipe == "kda" else GdnPrefillConfig
+                plan = impl._materialize_layout(caps, config_type(
+                    backend="cutedsl", v_split=64, k_split=1, stages=3, window_tiles=128,
+                ))
                 binding = SimpleNamespace(
-                    plan=plan,
+                    _state=plan,
                     output=descriptor(torch.bfloat16),
                     initial_state_indices=descriptor(index_type),
                     A_log=descriptor(torch.float32),
@@ -138,7 +160,7 @@ def compile_sequence(out):
             )
             binding = qwen.Binding.__new__(qwen.Binding)
             fields = dict(
-                plan=SimpleNamespace(caps=caps),
+                _state=SimpleNamespace(caps=caps),
                 output=descriptor(torch.bfloat16),
                 recurrent_state=descriptor(state_type),
                 state_indices=descriptor(index_type),
@@ -155,7 +177,7 @@ def compile_sequence(out):
                 qwen._compile(binding)
     prefill.clear_caches()
     qwen._KERNEL_CACHE.clear()
-    kda._CACHE.clear()
+    kda.compile_kernels.cache_clear()
     return launches
 
 
@@ -181,17 +203,13 @@ def compile_mtp_feedback(out):
             name += "_" + compile_spec.kernel_id.rsplit(".", 1)[-1]
         directory = out / name
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
         launches[name] = compiled
         return compiled
 
     concat.compile_norm.cache_clear()
     gemm._KERNEL_CACHE.clear()
-    gemm._WARMED.clear()
     stream_fp8.compile_aux.cache_clear()
     fp8_gemm.compile_kernel.cache_clear()
     with (patch.object(torch.cuda, "device"),
@@ -589,8 +607,13 @@ def compile_dsa_indexer(out):
                 )
 
     def capture(kernel, *args, compile_spec):
-        emit(compile_spec.kernel_id.rsplit(".", 1)[-1] + "_" + case, kernel, args[:-1])
-        return launches[next(reversed(launches))]
+        name = "indexer_" + compile_spec.kernel_id.rsplit(".", 1)[-1] + "_" + case
+        directory = out / name
+        directory.mkdir()
+        compiled = _export_compile(kernel, args, compile_spec, directory)
+        (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
+        launches[name] = compiled
+        return compiled
 
     for heads in (8, 16, 32):
         for candidates in (False, True):
@@ -624,7 +647,7 @@ def compile_compressed_mla(out):
     import cutlass.cute as cute
     import torch
     from b12x.attention.compressed_sparse_mla import _warp
-    from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
+    from b12x.attention.compressed_sparse_mla._tuning import SparseMlaConfig
     from b12x.attention.compressed_sparse_mla._scratch import (
         B12XCompressedSparseMLAScratchCaps as Caps,
         plan_compressed_sparse_mla_scratch,
@@ -640,10 +663,11 @@ def compile_compressed_mla(out):
                     device="cpu", num_q_heads=heads, max_q_rows=19,
                     max_width=swa_width + index_width, swa_width=swa_width,
                     indexed_width=index_width, cache_format=recipe, mode=mode,
-                    max_chunks_per_row=4, swa_page_size=64, indexed_page_size=32,
+                    max_chunks_per_row=4 if mode == "decode" else 1, swa_page_size=64, indexed_page_size=32,
                 )
                 plan = plan_compressed_sparse_mla_scratch(caps, execution_config=SparseMlaConfig(
-                    max_chunks_per_row=4, v41_compute_mode=precision, backend="warp",
+                    max_chunks_per_row=4 if mode == "decode" else 1, split_chunk_size=1,
+                    single_pass=mode != "decode", v41_compute_mode=precision, backend="warp",
                 ))
                 storage = torch.empty(plan.scratch_specs()[0].shape, dtype=torch.uint8)
                 q = torch.empty(3, heads, 512, dtype=torch.bfloat16)
@@ -1062,311 +1086,70 @@ def compile_trellis_clamped(out):
 
 
 def compile_mhc(out):
-    """Compile production mHC launch factories with nonexecuting tensor metadata.
+    """Export native mHC artifacts from the production preparation factories."""
+    import shutil
+    from scripts._sm103_preparation_corpus import CASES
 
-    CPU DLPack tensors preserve each factory's exact dynamic layout annotation.
-    Fake CUDA tensors exercise shape/dtype validation without a CUDA context.
-    """
-    import cuda.bindings.driver as cuda
-    import cutlass.cute as cute
-    from cutlass.base_dsl.runtime import cuda as cuda_helpers
-    import torch
-    from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
-    from b12x.norm.mhc import _kernels as kernels
-    from b12x.norm.mhc import _pre_prefill as prepare
-    from b12x.norm.mhc._policy import MHC_POLICY, MhcQuery, native_config_for
-    from b12x.policy import DeviceIdentity
-
+    evidence = out / "mhc_preparation"
+    command = [sys.executable, str(ROOT / "scripts/compile_sm103_prepared.py"),
+               "--output-dir", str(evidence), "--workers", "2"]
+    for case in CASES:
+        if case.startswith("mhc:"):
+            command.extend(("--case", case))
+    subprocess.run(command, check=True)
     launches = {}
-    case = ""
-    convert = kernels._to_kernel_tensor
-
-    def target_attribute(attribute, device_id=0):
-        # CuTe derives the preferred SMEM carveout from min_blocks_per_mp.
-        # CUDA Programming Guide table 32 specifies 228 KiB for CC 10.3.
-        if (
-            attribute
-            != cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
-        ):
-            raise RuntimeError(f"unreviewed offline CUDA attribute {attribute}")
-        return 228 * 1024
-
-    def prototype(value, dtype, **kwargs):
-        with unset_fake_temporarily():
-            cpu = torch.empty_strided(value.shape, value.stride(), dtype=value.dtype)
-            return convert(cpu, dtype, **kwargs)
-
-    def capture(kernel, *, compile_spec, compile_args, runtime_args):
-        directory = out / case
+    for source in sorted((evidence / "native").iterdir()):
+        name = "mhc_" + source.name
+        directory = out / name
         directory.mkdir()
-        with unset_fake_temporarily():
-            compiled = cute.compile(
-                kernel,
-                *compile_args,
-                no_jit_engine=True,
-                options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-            )
-        (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
-        launches[case] = compiled
-
-    device = DeviceIdentity(
-        vendor="nvidia", product_name="B300", compute_capability=(10, 3), sm_count=148
-    )
-    with (
-        FakeTensorMode(),
-        patch.object(cuda_helpers, "get_device_attribute", target_attribute),
-        patch.object(kernels, "_to_kernel_tensor", prototype),
-        patch.object(prepare, "_to_kernel_tensor", prototype),
-        patch.object(kernels, "b12x_launch", capture),
-        patch.object(prepare, "launch", capture),
-        patch.object(kernels, "current_cuda_stream", lambda: cuda.CUstream(0)),
-        patch.object(prepare, "current_cuda_stream", lambda: cuda.CUstream(0)),
-        patch.object(torch.cuda, "is_available", lambda: False),
-    ):
-        for hidden in (4096, 5120, 7168):
-
-            def tensor(*shape, dtype=torch.float32):
-                return torch.empty(shape, dtype=dtype, device="cuda:0")
-
-            native = native_config_for(8, hidden, (10, 3))
-            residual = tensor(3, 4, hidden, dtype=torch.bfloat16)
-            output = tensor(3, 4, hidden, dtype=torch.bfloat16)
-            x = tensor(3, hidden, dtype=torch.bfloat16)
-            y = tensor(3, hidden, dtype=torch.bfloat16)
-            fn = tensor(24, 4 * hidden)
-            partials = tensor(3, hidden // 64, 25)
-            post, comb = tensor(3, 4), tensor(3, 4, 4)
-            scale, bias = tensor(3), tensor(24)
-            incoming, predicted = tensor(3, 4), tensor(3, 4)
-            for phase in ("broadcast", "pre", "post_pre"):
-                for gram, lagged in ((False, False), (True, False), (False, True)):
-                    case = f"mhc_h{hidden}_{phase}_gram{int(gram)}_lagged{int(lagged)}"
-                    kwargs = dict(
-                        fn=fn,
-                        partials=partials,
-                        out=output,
-                        compute_gram=gram,
-                        pre_mix=incoming if lagged else None,
-                        y=y if lagged else None,
-                        planned_tokens=8,
-                        native_config=native,
-                    )
-                    if phase == "post_pre":
-                        kernels._run_mhc_post_pre_partial_launch(
-                            x=x,
-                            residual=residual,
-                            prev_post=post,
-                            prev_comb=comb,
-                            **kwargs,
-                        )
-                    else:
-                        if phase == "broadcast":
-                            kwargs["fn"] = tensor(24, hidden)
-                        kernels._run_mhc_pre_partial_launch(
-                            residual=x if phase == "broadcast" else residual, **kwargs
-                        )
-            case = f"mhc_h{hidden}_post"
-            kernels._run_mhc_post_launch(
-                x=x, residual=residual, prev_post=post, prev_comb=comb, out=output
-            )
-            for gram in (False, True):
-                for block_m in (0, 2):
-                    case = f"mhc_h{hidden}_compact_b{block_m}_gram{int(gram)}"
-                    entry = (
-                        kernels._run_mhc_post_pre_prefill_block_m_partial_launch
-                        if block_m
-                        else kernels._run_mhc_post_pre_prefill_partial_launch
-                    )
-                    kwargs = (
-                        dict(block_m=block_m, tile_n=12 if hidden == 7168 else 24)
-                        if block_m
-                        else {}
-                    )
-                    entry(
-                        x=x,
-                        residual=residual,
-                        prev_post=post,
-                        prev_comb=comb,
-                        fn=fn,
-                        partials=partials,
-                        out=output,
-                        compute_gram=gram,
-                        **kwargs,
-                    )
-            case = f"mhc_h{hidden}_prefill_gram"
-            kernels._run_mhc_post_pre_prefill_gram_launch(
-                x=x,
-                residual=residual,
-                prev_post=post,
-                prev_comb=comb,
-                partials=partials,
-                out=output,
-            )
-            for tma in (False, True):
-                case = f"mhc_h{hidden}_bf16_tma{int(tma)}"
-                kernels._run_mhc_prefill_bf16_project_launch(
-                    out=output,
-                    fn_bf16=tensor(24, 4 * hidden, dtype=torch.bfloat16),
-                    partials=partials,
-                    use_tma=tma,
-                )
-            for splits, tile_n in ((4, 6), (8, 6)):
-                if hidden // splits % 256:
-                    continue
-                for gram in (False, True):
-                    case = f"mhc_h{hidden}_split{splits}_gram{int(gram)}"
-                    kernels._run_mhc_post_pre_partial_launch(
-                        x=x,
-                        residual=residual,
-                        prev_post=post,
-                        prev_comb=comb,
-                        fn=fn,
-                        out=output,
-                        partials=partials,
-                        planned_tokens=8,
-                        compute_gram=gram,
-                        decode_source_splits=splits,
-                        decode_tile_n=tile_n,
-                    )
-            for capacity in (
-                (384, 2304, 3072, 3584, 8192) if hidden == 4096 else (384, 4096)
-            ):
-                config = MHC_POLICY.heuristic(
-                    MhcQuery(
-                        dtype="bfloat16",
-                        max_tokens=capacity,
-                        hidden_size=hidden,
-                        split_k=hidden // 64,
-                    ),
-                    device,
-                )
-                for split in (False, True):
-                    case = f"mhc_h{hidden}_tf32_capacity{capacity}_split{int(split)}"
-                    kernels._run_mhc_prefill_tf32_project_launch(
-                        out=output,
-                        fn=fn,
-                        partials=partials,
-                        tile_m=config.projection_tile_m,
-                        tile_n=config.projection_tile_n,
-                        tile_k=config.projection_tile_k,
-                        num_stages=config.projection_num_stages,
-                        num_m_warps=config.projection_num_m_warps,
-                        num_n_warps=config.projection_num_n_warps,
-                        k_splits=config.projection_k_splits,
-                        split_fp32_fn=split,
-                    )
-            for compact, lagged, ready in (
-                (False, False, False),
-                (False, True, False),
-                (False, True, True),
-                (True, False, False),
-                (True, True, False),
-            ):
-                for norm in (False, True):
-                    for weight_type in (
-                        (torch.bfloat16, torch.float32) if norm else (torch.bfloat16,)
-                    ):
-                        case = f"mhc_h{hidden}_finalize_c{int(compact)}_l{int(lagged)}_r{int(ready)}_norm{int(norm)}_{weight_type}"
-                        kernels._run_mhc_finalize_gram_launch(
-                            residual=output,
-                            partials=partials,
-                            scale=scale,
-                            bias=bias,
-                            y=y,
-                            post=post,
-                            comb=comb,
-                            rms_eps=1e-20 if lagged else 1e-6,
-                            hc_eps=1e-6,
-                            sinkhorn_iters=20,
-                            norm_weight=tensor(hidden, dtype=weight_type),
-                            norm_eps=1e-20 if lagged else 1e-6,
-                            fuse_norm=norm,
-                            compact_partials=compact,
-                            compact_projection_splits=1,
-                            pre_mix=incoming if lagged else None,
-                            pre_out=predicted if lagged else None,
-                            lagged_prepared=ready,
-                            planned_tokens=384 if compact else 8,
-                            native_config=native,
-                        )
-            # Custom-op bodies are invoked directly so fake dispatch cannot skip compilation.
-            case = f"mhc_h{hidden}_lagged_prepare"
-            prepare.prepare_lagged_prefill._init_fn(residual, output, partials)
-            for weighted in (False, True):
-                case = f"mhc_h{hidden}_collapse_weighted{int(weighted)}"
-                kernels._mhc_collapse_op._init_fn(
-                    residual, incoming if weighted else None, y
-                )
+        for artifact in source.iterdir():
+            destination = name + ".metadata.json" if artifact.name == "metadata.json" else artifact.name
+            shutil.copyfile(artifact, directory / destination)
+        launches[name] = None
+    if not launches:
+        raise RuntimeError("mHC preparation exported no native artifacts")
     return launches
 
 
 def compile_bf16_projection(out):
-    """Compile SIMT and warp-MMA unquantized projection entry points."""
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    import torch
-    from cutlass.cute.runtime import make_fake_compact_tensor as tensor
-    from b12x.gemm.bf16_gemv._kernel import ProjectionKernel
+    """Export selected SIMT, warp-MMA, prefill and vocabulary programs."""
+    from b12x.gemm.bf16_gemv import _kernel as projection, _prefill as prefill
     from b12x.gemm.bf16_vocab_projection import _cute as vocab
-    from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel
-    from b12x.moe._shared.kernels.sm103.launch import pointer
 
     launches = {}
+    name = ""
 
-    def compile_case(name, kernel, args):
+    def capture(kernel, *args, compile_spec=None, **kwargs):
         directory = out / name
         directory.mkdir()
-        compiled = cute.compile(
-            kernel,
-            *args,
-            no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (name + ".mlir")).write_text(str(compiled.ir_module))
         launches[name] = compiled
         return compiled
 
-    for x_type in (cutlass.BFloat16, cutlass.Float32):
-        for w_type in (cutlass.BFloat16, cutlass.Float32):
-            for out_type in (cutlass.BFloat16, cutlass.Float32):
-                name = f"projection_{x_type.__name__}_{w_type.__name__}_{out_type.__name__}"
-                kernel = ProjectionKernel(
-                    512, 4096, x_type == w_type == cutlass.BFloat16, True
-                )
-                args = [pointer(t) for t in (x_type, w_type, cutlass.Float32, out_type)]
-                args += [
-                    cutlass.Int32(1),
-                    *([cutlass.Int64(1)] * 5),
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    cuda.CUstream(0),
-                ]
-                compile_case(name, kernel, args)
-    for out_type in (cutlass.BFloat16, cutlass.Float32):
-        compile_case(
-            f"projection_prefill_{out_type.__name__}",
-            Bf16PrefillKernel(512, 5120),
-            [
-                tensor(cutlass.BFloat16, (cute.sym_int(), 5120), assumed_align=16),
-                tensor(cutlass.BFloat16, (512, 5120), assumed_align=16),
-                tensor(out_type, (cute.sym_int(), 512), assumed_align=16),
-                cutlass.Int32(1),
-                cuda.CUstream(0),
-            ],
-        )
+    projection.compile_projection.cache_clear()
+    with patch.object(projection, "b12x_compile", capture):
+        for source in ("bfloat16", "float32"):
+            for weight in ("bfloat16", "float32"):
+                for output in ("bfloat16", "float32"):
+                    for rows in (1, 2, 4, 8):
+                        name = f"projection_simt_{source}_{weight}_{output}_r{rows}"
+                        projection.compile_projection(0, "simt", rows, 512, 4096,
+                                                      source, weight, output, "float32")
+        for output in ("bfloat16", "float32"):
+            for bias in (None, "float32"):
+                name = f"projection_mma_{output}_bias{bias}"
+                projection.compile_projection(0, "mma", 8, 512, 4096,
+                                              "bfloat16", "bfloat16", output, bias)
+    prefill.compile_prefill.cache_clear()
+    with patch.object(prefill, "b12x_compile", capture):
+        for output in ("bfloat16", "float32"):
+            name = f"projection_prefill_{output}"
+            prefill.compile_prefill(0, 257, 512, 5120, output)
     vocab.compile_kernel.cache_clear()
-    with (
-        patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
-        patch.object(
-            vocab, "b12x_compile",
-            lambda kernel, *args, **kwargs: compile_case(name, kernel, args),
-        ),
-    ):
-        for n, k in (
-            (97, 259), (248320, 2560), (124160, 5120), (129280, 5120),
-            (154880, 4096), (77440, 6144), (524297, 4096),
-        ):
+    with patch.object(vocab, "b12x_compile", capture):
+        for n, k in ((97, 259), (248320, 2560), (124160, 5120), (129280, 5120),
+                     (154880, 4096), (77440, 6144), (524297, 4096)):
             name = f"vocabulary_n{n}_k{k}"
             vocab.compile_kernel(n, k, 0, "sm_103a")
     return launches
@@ -1383,13 +1166,10 @@ def compile_v41_support(out, component):
     launches = {}
     case = ""
 
-    def capture(kernel, *args, **kwargs):
+    def capture(kernel, *args, compile_spec=None, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1410,7 +1190,7 @@ def compile_v41_support(out, component):
         if component in ("embedding", "all"):
             from b12x.sequence.embedding import _kernel as embedding
 
-            embedding._compile.cache_clear()
+            embedding.compile_embedding.cache_clear()
             with (
                 patch.object(embedding, "compile_cute", capture),
                 patch.object(embedding, "current_cuda_stream", lambda: cuda.CUstream(0)),
@@ -1419,7 +1199,7 @@ def compile_v41_support(out, component):
                     for dtype in (torch.bfloat16, torch.float32):
                         for ids in (torch.int32, torch.int64):
                             case = f"embedding_h{width}_{dtype}_{ids}"
-                            embedding._compile(width, dtype, ids, 0)
+                            embedding.compile_embedding(width, dtype, ids, 0)
         if component in ("hyperconnection", "all"):
             from b12x.norm.hyperconnection import _cute as hc
 
@@ -1502,10 +1282,7 @@ def compile_block_fp8_linear(out):
     def capture(kernel, *args, compile_spec, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1519,14 +1296,14 @@ def compile_block_fp8_linear(out):
                 for floor in (0.0, 1e-4):
                     case = f"mxfp8_rows_{dtype}_k{k}_floor{floor}"
                     quant._get_compiled_mxfp8_rows_quant(
-                        k, dtype, 8, 128, "linear", floor, 0, "sm_103a",
+                        k, dtype, 8, 128, "linear", floor, device_ordinal=0, sm_count=148,
                     )
             for subgroup, threads, order in ((0, 256, "linear"), (4, 256, "linear"),
                                               (8, 256, "trellis_native_mma")):
                 for floor in (0.0, 1e-4):
                     case = f"mxfp8_rows_{dtype}_lanes{subgroup}_{order}_floor{floor}"
                     quant._get_compiled_mxfp8_rows_quant(
-                        8192, dtype, subgroup, threads, order, floor, 0, "sm_103a",
+                        8192, dtype, subgroup, threads, order, floor, device_ordinal=0, sm_count=148,
                     )
     return launches
 
@@ -1545,10 +1322,7 @@ def compile_wo_projection(out):
     def capture(kernel, *args, compile_spec, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1593,22 +1367,18 @@ def compile_engram(out):
     from b12x.sequence.engram.geometry import build_geometry
 
     geometry = build_geometry()
+    from b12x.sequence.ple_hash import _kernels as hash_kernels
     cases = [
-        ("engram_reset", kernels._reset_error_kernel,
-         dict(error_code_ptr="*i32"), {}, 1),
-        ("engram_requests", kernels._request_ids_kernel,
+        ("engram_requests", hash_kernels._request_ids_kernel,
          dict(query_start_loc_ptr="*i32", num_seqs_ptr="*i32", num_tokens_ptr="*i32",
-              request_ids_ptr="*i32", error_code_ptr="*i32"), dict(MAX_TOKENS=4096), 1),
-        ("engram_compress", kernels._compress_validate,
-         dict(ids="*i64", token_mask="*i1", token_map="*i64", starts="*i32",
-              slots="*i32", history="*i64", num_seqs="*i32", num_tokens="*i32",
-              compressed="*i64", error="*i32", prepared_tokens="i32"),
-         dict(T=4096, S=8, R=8, V=129280, CV=geometry.compressed_vocab_size), 1),
+              request_ids_ptr="*i32"), dict(MAX_TOKENS=4096), 1),
+        ("engram_compress", kernels._compress,
+         dict(ids="*i64", token_mask="*i1", token_map="*i64", num_tokens="*i32",
+              compressed="*i64"), dict(V=129280), 1),
         ("engram_hash", kernels._hash,
          dict(compressed="*i64", starts="*i32", slots="*i32", history="*i64",
               num_tokens="*i32", request_ids="*i32", multipliers="*i64",
-              primes="*i64", offsets="*i64", hashes="*i64", error="*i32"),
-         dict(PAD=2), 1),
+              primes="*i64", offsets="*i64", hashes="*i64"), dict(PAD=2), 1),
     ]
     for layer, rows in zip(geometry.layer_ids, geometry.num_embeddings, strict=True):
         for rank in (0, 1):
@@ -1705,10 +1475,7 @@ def compile_fp8(out):
     def capture(kernel, *args, compile_spec, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1746,8 +1513,7 @@ def compile_fp6(out):
     def capture(kernel, *args, compile_spec, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}")
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1797,10 +1563,7 @@ def compile_blockscaled(out):
     def capture(kernel, *args, compile_spec, **kwargs):
         directory = out / case
         directory.mkdir()
-        compiled = cute.compile(
-            kernel, *args, no_jit_engine=True,
-            options=f"--gpu-arch=sm_103a --keep-ptx --keep-cubin --dump-dir={directory}",
-        )
+        compiled = _export_compile(kernel, args, compile_spec, directory)
         (directory / (case + ".mlir")).write_text(str(compiled.ir_module))
         launches[case] = compiled
         return compiled
@@ -1896,21 +1659,16 @@ def main():
     os.environ.setdefault("CUTE_DSL_ARCH", "sm_103a")
     from b12x.moe._shared.kernels.sm103.launch import compile_launches
     from b12x.moe.fused_moe._sm103 import heuristic
-    from b12x.moe.fused_moe._policy import MoeDecodeQuery
-
-    heuristic(
-        MoeDecodeQuery(
-            "nvfp4",
-            "modelopt_nvfp4",
-            "silu",
-            args.experts,
-            args.hidden,
-            args.intermediate,
-            args.top_k,
-            args.capacity,
-            args.top_k * args.capacity,
-        )
+    from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
+    from b12x.moe.fused_moe._sm103 import query_for_weight_plan
+    import torch
+    weight_plan = plan_b12x_fp4_moe_weights(
+        params_dtype=torch.bfloat16,
+        quant_modes="nvfp4", source_format="modelopt_nvfp4", activation="silu",
+        num_experts=args.experts, hidden_size=args.hidden, intermediate_size=args.intermediate,
     )
+    heuristic(query_for_weight_plan(weight_plan, quant_mode="nvfp4",
+                                    num_tokens=args.capacity, num_topk=args.top_k))
     out = args.output_dir.resolve()
     if out.exists() and any(out.iterdir()):
         parser.error(
@@ -1919,6 +1677,12 @@ def main():
     if any(c.isspace() for c in str(out)):
         parser.error("the CuTe dump directory must not contain whitespace")
     out.mkdir(parents=True, exist_ok=True)
+    os.environ["B12X_COMPILE_CACHE_DIR"] = str(out / "compile-cache")
+    from multiprocessing import get_context
+    from b12x._lib.compile_pool import _initialize_worker
+    activity = get_context("spawn").Array("q", (0, 0))
+    _initialize_worker(0, (10, 3), "synthetic-sm103-resource-corpus", "NVIDIA B300", 148,
+                       227 * 1024, 228 * 1024, activity)
     caps = SimpleNamespace(
         k=args.hidden,
         n=args.intermediate,

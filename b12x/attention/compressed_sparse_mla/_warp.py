@@ -35,8 +35,6 @@ from .._shared.mla.merge import (
 )
 from ..sparse_mla._sm103 import SplitLse, ConvertLse
 
-_PLANS = {}
-_CACHE = {}
 
 
 class PrepareSelections:
@@ -171,13 +169,6 @@ class PrepareSelections:
                 dest_ln[row] = bound
 
 
-def register_plan(plan):
-    key = repr((plan.caps, plan.execution_config))
-    result = replace(plan, backend_key=key)
-    _PLANS[key] = result
-    return result
-
-
 def traits_for(plan):
     caps, config = plan.caps, plan.execution_config
     if caps.cache_format == "deepseek_v4":
@@ -229,8 +220,10 @@ def launch_specs(
 
     def metadata_pointer(value):
         tensor = value if value is not None and value.numel() else dummy
+        from torch._subclasses.fake_tensor import FakeTensor
         return make_ptr(
-            c.Int32, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            c.Int32, 0 if isinstance(tensor, FakeTensor) else tensor.data_ptr(),
+            cute.AddressSpace.gmem, assumed_align=4
         )
 
     for name, source, counts, pages, dest, dest_ln, page_size, mapping in (
@@ -272,19 +265,19 @@ def launch_specs(
         return _to_cute(value, dtype, align=align, dynamic_layout=True)
 
     q_c, out_c = tc(q, c.BFloat16), tc(output, c.BFloat16)
-    empty_cache = dummy.view(torch.uint8)[:1]
+    empty_cache = dummy.view(torch.uint8).narrow(0, 0, 1)
     swa_c = _to_cute(
-        _cache_base_tensor(swa)[:1] if swa.numel() else empty_cache, c.Uint8
+        _cache_base_tensor(swa).narrow(0, 0, 1) if swa.numel() else empty_cache, c.Uint8
     )
     index_c = (
-        _to_cute(_cache_base_tensor(indexed)[:1], c.Uint8)
+        _to_cute(_cache_base_tensor(indexed).narrow(0, 0, 1), c.Uint8)
         if indexed is not None and indexed.numel()
         else _to_cute(empty_cache, c.Uint8)
     )
-    si, ii = tc(padded_swa[:rows], c.Int32, 4), tc(padded_indexed[:rows], c.Int32, 4)
-    sl, il = tc(lens_swa[:rows], c.Int32, 4), tc(lens_indexed[:rows], c.Int32, 4)
+    si, ii = tc(padded_swa.narrow(0, 0, rows), c.Int32, 4), tc(padded_indexed.narrow(0, 0, rows), c.Int32, 4)
+    sl, il = tc(lens_swa.narrow(0, 0, rows), c.Int32, 4), tc(lens_indexed.narrow(0, 0, rows), c.Int32, 4)
     sink_c = tc(sink if sink is not None else scratch.sm_scale_tensor, c.Float32, 4)
-    lse_c = tc(scratch.final_lse[:rows], c.Float32, 4)
+    lse_c = tc(scratch.final_lse.narrow(0, 0, rows), c.Float32, 4)
     stride_swa = c.Int64(swa.stride(0) * swa.element_size())
     stride_indexed = c.Int64(
         indexed.stride(0) * indexed.element_size() if indexed is not None else 0
@@ -304,7 +297,7 @@ def launch_specs(
         segments.append((1, heads % 16, heads // 16))
     if caps.mode == "decode":
         splits = config.max_chunks_per_row
-        partial, partial_lse = scratch.tmp_output[:rows], scratch.tmp_lse[:rows]
+        partial, partial_lse = scratch.tmp_output.narrow(0, 0, rows), scratch.tmp_lse.narrow(0, 0, rows)
         pc, pl = tc(partial, c.BFloat16), tc(partial_lse, c.Float32, 4)
         for blocks, valid, offset in segments:
             kernel = UnifiedDecodeKernel(
@@ -459,8 +452,10 @@ def execute(
     output,
     sm_scale,
     natural,
+    *, compiled,
 ):
-    key = plan.backend_key
+    if q.shape[0] == 0:
+        return
     specs = launch_specs(
         plan,
         scratch,
@@ -476,26 +471,6 @@ def execute(
         output,
         sm_scale,
     )
-    compiled = _CACHE.get(key)
-    if compiled is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("warm compressed MLA before CUDA graph capture")
-        raise_if_kernel_resolution_frozen(
-            "compressed MLA warp compilation", cache_key=key
-        )
-        properties = torch.cuda.get_device_properties(q.device)
-        if (properties.major, properties.minor) not in ((10, 3), (12, 0), (12, 1)):
-            raise RuntimeError("compressed MLA warp execution requires Blackwell")
-        traits = traits_for(plan)
-        layout = (
-            make_smem_layout(traits)
-            if plan.caps.mode == "decode"
-            else make_smem_layout_mg(traits, 1)
-        )
-        if layout.total_bytes > properties.shared_memory_per_block_optin:
-            raise RuntimeError("insufficient shared memory for compressed MLA")
-        compiled = compile_launches(key, specs)
-        _CACHE[key] = compiled
     stream = current_cuda_stream()
     for name, _, args in specs:
         if name.startswith("merge") and (name == "merge_sink") != (sink is not None):
@@ -508,113 +483,59 @@ def execute(
             continue
         if name == "lse_natural" and not natural:
             continue
-        compiled[name](*args, stream)
+        from b12x._lib.compiler import run_compiled
+        run_compiled(compiled[name], (*args, stream))
 
 
-@torch.library.custom_op(
-    "b12x::compressed_mla_warp", mutates_args=("storage", "output")
-)
+
+@torch.library.custom_op("b12x::compressed_mla_warp", mutates_args=("storage", "out"))
 def _run_op(
-    q: torch.Tensor,
-    swa: torch.Tensor,
-    selected: torch.Tensor,
-    lengths: torch.Tensor,
-    indexed: torch.Tensor | None,
-    indexed_selected: torch.Tensor | None,
-    indexed_lengths: torch.Tensor | None,
-    table: torch.Tensor | None,
-    sink: torch.Tensor | None,
-    storage: torch.Tensor,
-    output: torch.Tensor,
-    sm_scale: float,
-    natural: bool,
-    plan_key: str,
+    storage: torch.Tensor, q: torch.Tensor, swa_indices: torch.Tensor,
+    swa_lengths: torch.Tensor, indexed_indices: torch.Tensor | None,
+    indexed_lengths: torch.Tensor | None, indexed_page_table: torch.Tensor | None,
+    swa_cache: torch.Tensor, indexed_cache: torch.Tensor | None,
+    sink: torch.Tensor | None, out: torch.Tensor | None, scale: float,
+    swa_page: int, indexed_page: int | None, return_lse: bool, lse_scale: str,
+    cache_format: str, plan_handle: int,
 ) -> None:
-    from ._scratch import _materialize_compressed_sparse_mla_scratch
-    from .._shared.mla.compressed_api import _validate_compressed_cache_layout
+    from b12x.preparation import plan_from_handle, require_prepared
 
-    plan = _PLANS[plan_key]
-    for name, tensor in (("query", q), ("output", output), ("scratch", storage)):
-        if tensor.data_ptr() % 16:
-            raise ValueError(f"compressed MLA warp {name} must be 16-byte aligned")
-    for cache, kind, page_size in (
-        (swa, "swa", plan.caps.swa_page_size),
-        (indexed, "indexed", plan.caps.indexed_page_size),
-    ):
-        if cache is not None:
-            if cache.numel() and (cache.data_ptr() % 16 or cache.stride(0) % 16):
-                raise ValueError(
-                    "compressed MLA warp caches require 16-byte aligned pages"
-                )
-            _validate_compressed_cache_layout(
-                cache,
-                page_size=page_size,
-                name=kind + " cache",
-                cache_format=plan.caps.cache_format,
-                cache_kind=kind,
-                allow_empty=True,
-            )
-    scratch = _materialize_compressed_sparse_mla_scratch(
-        plan.caps, storage, plan.layout, plan.execution_config
+    plan = plan_from_handle(plan_handle)
+    state = require_prepared(plan, "attention.compressed_sparse_mla", q.device)
+    binding = state.bind(
+        plan, scratch=storage, q=q, swa_indices=swa_indices,
+        swa_lengths=swa_lengths, indexed_indices=indexed_indices,
+        indexed_lengths=indexed_lengths, indexed_page_table=indexed_page_table,
     )
-    execute(
-        plan,
-        scratch,
-        q,
-        swa,
-        selected,
-        lengths,
-        indexed,
-        indexed_selected,
-        indexed_lengths,
-        table,
-        sink,
-        output,
-        sm_scale,
-        natural,
+    state.run(
+        binding, swa_k_cache=swa_cache, indexed_k_cache=indexed_cache,
+        attn_sink=sink, out=out, sm_scale=scale, swa_page_size=swa_page,
+        indexed_page_size=indexed_page, return_lse=return_lse,
+        lse_scale=lse_scale, cache_format=cache_format,
     )
 
 
 @_run_op.register_fake
-def _run_op_fake(
-    q,
-    swa,
-    selected,
-    lengths,
-    indexed,
-    indexed_selected,
-    indexed_lengths,
-    table,
-    sink,
-    storage,
-    output,
-    sm_scale,
-    natural,
-    plan_key,
-):
+def _run_fake(*args, **kwargs):
     return None
 
 
-def run(binding, *, swa, indexed, sink, output, sm_scale, return_lse, natural):
-    scratch = binding.scratch
-    _run_op(
-        binding.q,
-        swa,
-        binding.swa_indices,
-        binding.swa_lengths,
-        indexed,
-        binding.indexed_indices,
-        binding.indexed_lengths,
-        binding.indexed_page_table,
-        sink,
-        scratch.shared_scratch,
-        output,
-        sm_scale,
-        natural,
-        scratch.backend_key,
+def run_opaque(
+    binding, *, swa_k_cache, indexed_k_cache=None, attn_sink=None, out=None,
+    sm_scale=512**-0.5, swa_page_size=None, indexed_page_size=None,
+    return_lse=False, lse_scale="base2", cache_format=None,
+):
+    """Expose scratch/output mutation while keeping native launch metadata opaque."""
+    query = binding.plan.query
+    torch.ops.b12x.compressed_mla_warp(
+        binding.scratch.shared_scratch, binding.q, binding.swa_indices,
+        binding.swa_lengths, binding.indexed_indices, binding.indexed_lengths,
+        binding.indexed_page_table, swa_k_cache, indexed_k_cache, attn_sink, out,
+        float(sm_scale), query.swa_page_size if swa_page_size is None else swa_page_size,
+        query.indexed_page_size if indexed_page_size is None else indexed_page_size,
+        return_lse, lse_scale, query.cache_format if cache_format is None else cache_format,
+        binding.plan.handle,
     )
-    return (output, scratch.final_lse[: binding.q.shape[0]]) if return_lse else output
-
-
-def clear_caches():
-    _CACHE.clear()
+    rows = binding.q.shape[0]
+    output = binding.scratch.output_buffer[:rows] if out is None else out
+    return (output, binding.scratch.final_lse[:rows]) if return_lse else output

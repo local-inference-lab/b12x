@@ -212,8 +212,7 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
         ):
             for live in (8, 1, 4, 3):
                 for dtype in (torch.int32, torch.int64):
-                    bound = fused_moe.bind(
-                        plan,
+                    bound = plan.bind(
                         scratch=scratch,
                         a=source[:live],
                         experts=weights,
@@ -277,7 +276,8 @@ def test_mixed_bind_reuses_callables_across_rates_and_live_counts(
                     "shared input",
                 ),
             ):
-                with pytest.raises(ValueError, match=error):
+                with pytest.raises(ValueError, match="prepared experts"):
+                    # Public declarations retain the exact weight owner.
                     fused_moe.bind(
                         execution,
                         scratch=scratch,
@@ -345,41 +345,10 @@ def test_mixed_binding_rejects_malformed_metadata(fault):
 
 
 @pytest.mark.parametrize("layout", ["trellis_mixed3", "trellis_atoms"])
-def test_generator_identifies_native_mixed_materialized_path(layout):
-    from dataclasses import asdict
+def test_native_preparation_retains_backend_programs(layout):
     from types import SimpleNamespace
-    from b12x.moe.fused_moe._policy import MoeDecodeConfig
-    from b12x.policy.generation.providers.moe_gpu_worker import (
-        _concrete_candidate_path,
-        _CandidateContractError,
-    )
-
-    config = MoeDecodeConfig("tcgen05_trellis", "internal", None)
-    variant = SimpleNamespace(
-        _impl=SimpleNamespace(policy_resolution=SimpleNamespace(config=config)),
-        implementation=config.backend,
-        execution=SimpleNamespace(
-            gemm_engine=SimpleNamespace(value="trellis_tcgen05"),
-            graph_partition=SimpleNamespace(value="materialized"),
-        ),
-    )
-    kwargs = dict(
-        geometry=None,
-        case=SimpleNamespace(num_tokens=1),
-        candidate=SimpleNamespace(config=asdict(config)),
-        plan=SimpleNamespace(variant_for=lambda _: variant),
-        prepared_payload=SimpleNamespace(weight_layout=layout),
-    )
-    assert (
-        _concrete_candidate_path(
-            **kwargs,
-            binding=SimpleNamespace(
-                implementation=config.backend, _backend_binding=object()
-            ),
-        )
-        == f"w4a16.{layout}.tcgen05.materialized"
-    )
-    with pytest.raises(_CandidateContractError, match="compressed native"):
-        _concrete_candidate_path(
-            **kwargs, binding=SimpleNamespace(implementation=config.backend)
-        )
+    from b12x.moe.fused_moe._preparation import _program_carriers
+    launchers = {"fc1": object(), "fc2": object()}
+    scratch = SimpleNamespace(_backend_plan=SimpleNamespace(launches=launchers))
+    assert _program_carriers(scratch, None, input_scale_count=1,
+                              intermediate_scale_count=1) == (launchers,)

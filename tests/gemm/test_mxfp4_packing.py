@@ -1,4 +1,5 @@
 """MXFP4 packing boundaries, physical padding, and runtime-count reuse."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
@@ -65,8 +66,7 @@ def test_mxfp4_packing_rounding_padding_and_graph(dtype, k):
         torch.testing.assert_close(sf, reference, rtol=0, atol=0)
 
     run(1)
-    b12x.freeze_kernel_resolution("MXFP4 packing runtime rows")
-    try:
+    with kernel_resolution_guard("MXFP4 packing runtime rows"):
         for count in (1, 3, 7, 128, 129):
             values.fill_(255)
             scales.fill_(255)
@@ -85,8 +85,6 @@ def test_mxfp4_packing_rounding_padding_and_graph(dtype, k):
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == before
             check(m, sf)
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 def test_mxfp4_packing_rejects_invalid_buffers_and_accepts_zero_rows():
@@ -104,8 +102,5 @@ def test_mxfp4_packing_rejects_invalid_buffers_and_accepts_zero_rows():
     with pytest.raises(ValueError, match="contiguous"):
         strided = torch.empty(3, 320, device="cuda", dtype=source.dtype)[:, ::2]
         blockscaled.quantize_mxfp4(strided, out_values=values, out_scales=scales)
-    b12x.freeze_kernel_resolution("empty MXFP4 packing must not launch")
-    try:
+    with kernel_resolution_guard("empty MXFP4 packing must not launch"):
         blockscaled.quantize_mxfp4(source[:0], out_values=values[:0], out_scales=scales[:0])
-    finally:
-        b12x.unfreeze_kernel_resolution()

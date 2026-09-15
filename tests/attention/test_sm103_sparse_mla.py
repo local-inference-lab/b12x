@@ -1,12 +1,13 @@
 """GLM sparse-MLA contracts through the planned ordinary-MMA backend."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
 import b12x
 
 from b12x.attention import sparse_mla
-from b12x.attention.sparse_mla._policy import SparseMlaConfig
-from b12x.policy import SPARSE_MLA_ATTENTION, get_auto_policy
+from b12x.attention.sparse_mla._tuning import SparseMlaConfig
+from b12x.preparation import FrozenMapping
 from tests.conftest import require_sm103_or_sm12x
 from . import test_glm_next_mla as contracts
 from . import test_sparse_mla_decode_regimes as nsa_contracts
@@ -24,27 +25,19 @@ for _name, _test in vars(nsa_contracts).items():
 @pytest.fixture(autouse=True)
 def ordinary_mma_backend(monkeypatch):
     original = sparse_mla.plan
-
-    def plan(caps, *, policy=None):
-        if caps.device.type != "cuda":
-            return original(caps, policy=policy)
-        context = policy or get_auto_policy(caps.device)
-        splits = min(4, caps.max_chunks_per_row, (caps.max_width + 63) // 64)
-        config = SparseMlaConfig(
-            backend="warp", num_splits=splits if caps.mode == "decode" else 1
-        )
-        return original(
-            caps, policy=context.with_override(SPARSE_MLA_ATTENTION, config)
-        )
-
+    def plan(caps, *, invocation=FrozenMapping(), override=None):
+        splits = min(4, caps.max_chunks_per_row, max(1, (caps.max_width + 63) // 64))
+        config = SparseMlaConfig(backend="warp", num_splits=splits if caps.mode == "decode" else 1)
+        return original(caps, invocation=invocation, override=config)
     monkeypatch.setattr(sparse_mla, "plan", plan)
     monkeypatch.setattr(contracts, "require_sm120", require_sm103_or_sm12x)
 
 
-@pytest.mark.parametrize("mode", ["decode", "extend"])
+
+@pytest.mark.parametrize("mode,with_sink", [("decode", False), ("decode", True), ("extend", False)])
 @pytest.mark.parametrize("head_major", [False, True])
 @torch.inference_mode()
-def test_live_rows_reuse_callables_and_replay(mode, head_major):
+def test_live_rows_reuse_callables_and_replay(mode, with_sink, head_major):
     from b12x.attention.sparse_mla import _sm103
 
     device = require_sm103_or_sm12x()
@@ -52,15 +45,16 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
     torch.manual_seed(103)
     latent = torch.randn((records, 512), device=device, dtype=torch.bfloat16) / 4
     cache = torch.empty((3, 64, 528), device=device, dtype=torch.uint8)
+    writer_plan = sparse_mla.plan_cache_writer(latent, cache, torch.arange(records, device=device, dtype=torch.int64))
     sparse_mla.concat_and_cache_glm_next_mla(
         latent,
         cache,
-        torch.arange(records, device=device, dtype=torch.int64),
-    )
+        torch.arange(records, device=device, dtype=torch.int64), plan=writer_plan)
     q = torch.randn((capacity, heads, 512), device=device, dtype=torch.bfloat16) / 4
     selected = torch.arange(width, device=device, dtype=torch.int32).repeat(capacity, 1)
     lengths = torch.full((capacity,), records, device=device, dtype=torch.int32)
     active = torch.full((capacity,), width, device=device, dtype=torch.int32)
+    sink = torch.linspace(3.0, 6.0, heads, device=device) if with_sink else None
     plan = sparse_mla.plan(
         sparse_mla.Caps(
             device=device,
@@ -76,6 +70,7 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
             mode=mode,
             head_major_output=head_major,
             return_lse=True,
+            has_attention_sink=with_sink,
             lse_scale="natural",
         )
     )
@@ -91,13 +86,12 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
             selected_indices=selected[:rows],
             cache_lengths=lengths[:rows],
             selected_lengths=active[:rows],
+            attention_sink=sink,
         )
 
-    _sm103.clear_caches()
     sparse_mla.run(bind(capacity))
     warmed = tuple(id(item) for group in _sm103._CACHE.values() for item in group)
-    b12x.freeze_kernel_resolution("SM103 sparse MLA live-row reuse")
-    try:
+    with kernel_resolution_guard("SM103 sparse MLA live-row reuse"):
         for rows in (1, 3, capacity):
             binding = bind(rows)
             actual, lse = sparse_mla.run(binding)
@@ -110,6 +104,11 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
                 v_head_dim=512,
                 return_lse=True,
             )
+            if sink is not None:
+                natural = expected_lse * torch.log(torch.tensor(2.0))
+                total = torch.logaddexp(natural, sink)
+                expected = (expected.float() * torch.exp(natural - total)[..., None]).to(expected.dtype)
+                expected_lse = total / torch.log(torch.tensor(2.0))
             contracts._assert_glm_next_attention_close(actual, expected)
             torch.testing.assert_close(
                 lse, expected_lse * torch.log(torch.tensor(2.0)), atol=0.05, rtol=0
@@ -127,7 +126,7 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
         with torch.cuda.graph(graph):
             output, _ = sparse_mla.run(binding)
         active[:3].fill_(65)
-        expected, _ = contracts.sparse_mla_reference(
+        expected, expected_lse = contracts.sparse_mla_reference(
             q_all=q[:3],
             kv_cache=cache.view(records, 1, 528),
             page_table_1=selected[:3],
@@ -136,11 +135,13 @@ def test_live_rows_reuse_callables_and_replay(mode, head_major):
             v_head_dim=512,
             return_lse=True,
         )
+        if sink is not None:
+            natural = expected_lse * torch.log(torch.tensor(2.0))
+            total = torch.logaddexp(natural, sink)
+            expected = (expected.float() * torch.exp(natural - total)[..., None]).to(expected.dtype)
         before = contracts._allocator_counters(device)
         graph.replay()
         torch.cuda.synchronize(device)
         assert contracts._allocator_counters(device) == before
         contracts._assert_glm_next_attention_close(output, expected)
         assert sparse_mla.run(bind(0))[0].shape == (0, heads, 512)
-    finally:
-        b12x.unfreeze_kernel_resolution()

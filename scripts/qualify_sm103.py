@@ -34,12 +34,12 @@ SUITES = {
     "kda_decode": ["tests/sequence/test_gdn_decode_kda_cute.py"],
     "gdn_decode": ["tests/sequence/test_gdn_decode.py"],
     "kda_prefill": ["tests/sequence/test_kda_prefill.py"],
-    "gdn_prefill": ["tests/sequence/test_gdn_prefill.py"],
+    "gdn_prefill": ["tests/preparation/test_delta_prefill.py"],
     "mtp_feedback": ["tests/sequence/test_mtp_feedback.py", "-k", "not standalone_cute_norm"],
     "mla_compress": ["tests/attention/test_mla_compress.py"],
     "embedding": ["tests/sequence/test_embedding.py"],
     "engram": ["tests/sequence/test_engram.py"],
-    "hyperconnection": ["tests/norm/test_hyperconnection.py"],
+    "hyperconnection": ["tests/norm/test_sm103_hyperconnection.py"],
     "dense_mla": [
         "tests/attention/test_dense_mla.py",
         "tests/attention/test_dense_mla_window.py",
@@ -50,7 +50,7 @@ SUITES = {
     "compressed_mla": [
         "tests/attention/test_sm103_compressed_mla.py",
         "tests/attention/test_mla_kv_cache.py::test_v41_writer_recipes_odd_pages_and_int64_pool_offsets",
-        "tests/attention/test_mla_kv_cache.py::test_v41_writer_precompile_dynamic_rows_and_graph_replay",
+        "tests/attention/test_mla_kv_cache.py::test_v41_writer_prepared_dynamic_rows_and_graph_replay",
     ],
     "dsa_indexer": [
         "tests/attention/test_sm103_dsa_indexer.py",
@@ -217,6 +217,7 @@ def main(argv=None):
         return 0
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_uuid
     os.environ["CUTE_DSL_ARCH"] = "sm_103a"
+    os.environ["CUTLASS_DSL_ARCH"] = "sm_103a"
     try:
         import importlib.metadata
         import torch

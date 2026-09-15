@@ -1,4 +1,4 @@
-"""b12x — Blackwell inference kernels with per-operation architecture coverage.
+"""b12x — Blackwell kernels, including an unqualified SM103 implementation.
 
 CuTe-DSL and Triton kernels for NVFP4/MXFP4/MXFP8 GEMM, fused MoE, attention
 (paged, dense/sparse/compressed MLA, DSA indexing, and QSA decode),
@@ -37,7 +37,6 @@ _OPS: tuple[str, ...] = (
     "attention.compressed_sparse_mla",
     "attention.mla_compress",
     "attention.dsa_indexer",
-    "attention.mla_compress",
     "attention.qsa",
     "attention.varlen",
     "comm.pcie",
@@ -56,6 +55,7 @@ _OPS: tuple[str, ...] = (
     "moe.ep_moe",
     "norm.hyperconnection",
     "norm.mhc",
+    "quantization.mxfp6",
     "quantization.mxfp8",
     "quantization.nvfp4",
     "sequence.ple_hash",
@@ -67,7 +67,6 @@ _OPS: tuple[str, ...] = (
     "sequence.kda_prefill",
     "sequence.gdn_prefill",
     "sequence.mtp_feedback",
-    "sequence.engram",
 )
 
 # A group-level function cannot share its name with an imported child module.
@@ -92,3 +91,79 @@ _GROUPS = (
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
     # public name -> (module, attribute)
     "ScratchBufferSpec": ("._lib.scratch", "ScratchBufferSpec"),
+    "supports_architecture": ("._lib.architecture", "supports_architecture"),
+    "Architecture": ("._lib.architecture", "Architecture"),
+    "architecture_for": ("._lib.architecture", "architecture_for"),
+    "Plan": (".preparation", "Plan"),
+    "PreparationRequest": (".preparation", "PreparationRequest"),
+    "PreparationSession": (".preparation", "PreparationSession"),
+}
+
+
+def _op_module_path(qualname: str) -> str:
+    return _OP_MODULE_OVERRIDES.get(qualname, qualname)
+
+
+def list_ops() -> tuple[OpMeta, ...]:
+    """Import every op's (cheap) ``__init__`` and return their ``META``s."""
+    return tuple(
+        importlib.import_module(f".{_op_module_path(op_path)}", __name__).META
+        for op_path in _OPS
+    )
+
+
+def find_op(qualname: str) -> OpMeta:
+    """Look up one op's ``META`` by ``"<group>.<op>"`` qualname."""
+    if qualname not in _OPS:
+        raise KeyError(
+            f"unknown experimental b12x op {qualname!r}; known ops: {sorted(_OPS)}"
+        )
+    return importlib.import_module(f".{_op_module_path(qualname)}", __name__).META
+
+
+def clear_all_caches() -> None:
+    """Clear caches of every op already imported; never forces imports."""
+    for op_path in _OPS:
+        module_path = _op_module_path(op_path)
+        api = sys.modules.get(f"{__name__}.{module_path}.api")
+        clear_name = _CACHE_CLEAR_OVERRIDES.get(op_path, "clear_caches")
+        clear = getattr(api, clear_name, None) if api is not None else None
+        if clear is not None:
+            clear()
+    compiler = sys.modules.get(f"{__name__}._lib.compiler")
+    if compiler is not None:
+        compiler.clear_compile_cache()
+
+
+def __getattr__(name: str) -> Any:
+    if name in _GROUPS:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+    if name in _LAZY_ROOT_ATTRS:
+        module_name, attr = _LAZY_ROOT_ATTRS[name]
+        value = getattr(importlib.import_module(module_name, __name__), attr)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted([*__all__, *_GROUPS])
+
+
+__all__ = [
+    "Architecture",
+    "architecture_for",
+    "supports_architecture",
+    "KernelResolutionFrozenError",
+    "OpMeta",
+    "ScratchBufferSpec",
+    "Plan",
+    "PreparationRequest",
+    "PreparationSession",
+    "clear_all_caches",
+    "find_op",
+    "kernel_resolution_frozen",
+    "list_ops",
+]

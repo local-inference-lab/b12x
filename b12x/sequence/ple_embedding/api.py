@@ -25,7 +25,7 @@ from b12x.sequence.ple_hash.geometry import Geometry, GeometryTensors, compute_g
 
 def is_supported(device=None) -> bool:
     """True when the registered b12x architecture can run this Triton op."""
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = [

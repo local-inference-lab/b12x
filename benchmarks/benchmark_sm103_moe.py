@@ -5,6 +5,7 @@ and BF16 ``activations``. Shapes determine E/K/N; --top-k determines routing.
 All bundle tensors are CPU tensors from the loader's unmodified NVFP4 source.
 Without a bundle, this benchmark labels the weights and inputs as synthetic.
 """
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import argparse
 import hashlib
@@ -88,8 +89,8 @@ def main():
             experts=prepared,
             capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=args.top_k),
         )
-        fused_moe.prewarm(plan)
-        scratch = torch.empty(plan.scratch.nbytes, dtype=torch.uint8, device=device)
+        plan.scratch_specs()
+        scratch = torch.empty(sum(spec.nbytes for spec in plan.scratch_specs()), dtype=torch.uint8, device=device)
         source = bundle["activations"].to(device)
         if (
             source.dtype != torch.bfloat16
@@ -129,68 +130,67 @@ def main():
             "top_k": args.top_k,
         },
         "capacity": capacity,
-        "scratch_bytes": plan.scratch.nbytes,
+        "scratch_bytes": sum(spec.nbytes for spec in plan.scratch_specs()),
         "rows": [],
     }
-    b12x.freeze_kernel_resolution("SM103 benchmark")
     try:
-        for m in args.tokens:
-            a = source[:m].clone()
-            ids = torch.randint(
-                raw.num_experts, (m, args.top_k), device=device, dtype=torch.int64
-            )
-            ids[0, 0] = -1
-            weights = torch.softmax(torch.randn(m, args.top_k, device=device), dim=-1)
-            bound = fused_moe.bind(
-                plan,
-                scratch=scratch,
-                experts=prepared,
-                a=a,
-                topk_ids=ids,
-                topk_weights=weights,
-            )
-            expected = reference(a, raw, ids, weights)
-            output = fused_moe.run(binding=bound)
-            torch.testing.assert_close(output, expected, atol=0.02, rtol=0.03)
-            cosine = F.cosine_similarity(
-                output.float().flatten(), expected.float().flatten(), dim=0
-            ).item()
-            if (
-                not cosine > 0.999
-                or not torch.isfinite(output).all()
-                or not output.count_nonzero()
-            ):
-                raise RuntimeError("finite/nonzero/cosine correctness gate failed")
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                fused_moe.run(binding=bound)
-            a.mul_(0.75)
-            ids.copy_((ids + 1) % raw.num_experts)
-            expected = reference(a, raw, ids, weights)
-            output.fill_(float("nan"))
-            before = torch.cuda.memory_allocated()
-            graph.replay()
-            torch.cuda.synchronize()
-            assert before == torch.cuda.memory_allocated()
-            torch.testing.assert_close(output, expected, atol=0.02, rtol=0.03)
-            for _ in range(10):
+        with kernel_resolution_guard("SM103 benchmark"):
+            for m in args.tokens:
+                a = source[:m].clone()
+                ids = torch.randint(
+                    raw.num_experts, (m, args.top_k), device=device, dtype=torch.int64
+                )
+                ids[0, 0] = -1
+                weights = torch.softmax(torch.randn(m, args.top_k, device=device), dim=-1)
+                bound = fused_moe.bind(
+                    plan,
+                    scratch=scratch,
+                    experts=prepared,
+                    a=a,
+                    topk_ids=ids,
+                    topk_weights=weights,
+                )
+                expected = reference(a, raw, ids, weights)
+                output = fused_moe.run(binding=bound)
+                torch.testing.assert_close(output, expected, atol=0.02, rtol=0.03)
+                cosine = F.cosine_similarity(
+                    output.float().flatten(), expected.float().flatten(), dim=0
+                ).item()
+                if (
+                    not cosine > 0.999
+                    or not torch.isfinite(output).all()
+                    or not output.count_nonzero()
+                ):
+                    raise RuntimeError("finite/nonzero/cosine correctness gate failed")
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    fused_moe.run(binding=bound)
+                a.mul_(0.75)
+                ids.copy_((ids + 1) % raw.num_experts)
+                expected = reference(a, raw, ids, weights)
+                output.fill_(float("nan"))
+                before = torch.cuda.memory_allocated()
                 graph.replay()
-            samples = timed(graph.replay, args.samples, args.repetitions)
-            receipt["rows"].append(
-                {
-                    "tokens": m,
-                    "cosine": cosine,
-                    "correctness": "passed",
-                    "graph_us": samples,
-                    "median_graph_us": statistics.median(samples),
-                    "graph_allocations": 0,
-                    "output_pointer": output.data_ptr(),
-                }
-            )
-            graph.reset()
-        receipt["status"] = "passed"
+                torch.cuda.synchronize()
+                assert before == torch.cuda.memory_allocated()
+                torch.testing.assert_close(output, expected, atol=0.02, rtol=0.03)
+                for _ in range(10):
+                    graph.replay()
+                samples = timed(graph.replay, args.samples, args.repetitions)
+                receipt["rows"].append(
+                    {
+                        "tokens": m,
+                        "cosine": cosine,
+                        "correctness": "passed",
+                        "graph_us": samples,
+                        "median_graph_us": statistics.median(samples),
+                        "graph_allocations": 0,
+                        "output_pointer": output.data_ptr(),
+                    }
+                )
+                graph.reset()
+            receipt["status"] = "passed"
     finally:
-        b12x.unfreeze_kernel_resolution()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, indent=2))

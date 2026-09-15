@@ -14,7 +14,7 @@ from benchmarks.benchmark_ds4_moe import make_synthetic_mxfp4_moe
 def test_v41_compact_grid_reuses_residency_for_live_counts(
     monkeypatch, record_property, tile_m, capacity
 ):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x._lib import cooperative
     from b12x.moe import fused_moe
     from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
@@ -149,8 +149,7 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
         raise AssertionError("Warmed launch repeated the CUDA occupancy query")
 
     monkeypatch.setattr(cooperative, "_resident_blocks_per_sm", unexpected_query)
-    freeze_kernel_resolution("V4.1 compact MoE capacity and residency are warmed")
-    try:
+    with kernel_resolution_guard("V4.1 compact MoE capacity and residency are warmed"):
         x.copy_(changed_x)
         ids.copy_(changed_ids)
         for rows in (1, 2, capacity - 1, capacity):
@@ -177,5 +176,3 @@ def test_v41_compact_grid_reuses_residency_for_live_counts(
                 check(rows, references[1])
         assert tuple(_impl._DYNAMIC_KERNEL_CACHE.values()) == compiled
         assert compiled[0]._b12x_cooperative_grid_limits == limits
-    finally:
-        unfreeze_kernel_resolution()

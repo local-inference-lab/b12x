@@ -230,7 +230,7 @@ def select(binding: Binding) -> torch.Tensor:
 
 
 def is_supported(device=None) -> bool:
-    return default_is_supported(device, requires=META.requires)
+    return default_is_supported(device, requires=META.requires, archs=META.archs)
 
 
 __all__ = ["Caps", "Plan", "Binding", "plan", "bind", "run", "score", "select", "scratch_specs", "invocation_from_descriptors", "invocation_from_tensors", "quantize_q_mxfp4", "quantize_write_index_k_mxfp4", "index_mxfp4_page_bytes", "MXFP4_INDEX_PAGE_BYTES", "INDEX_HEAD_DIM", "PAGED_INDEX_PAGE_SIZE", "is_supported", "clear_caches"]

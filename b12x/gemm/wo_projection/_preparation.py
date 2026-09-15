@@ -83,7 +83,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     fused = {}
 
     def fused_b(config, device):
-        if not use_fused_b:
+        if not use_fused_b or config.backend == "mxfp8_tcgen05":
             return None
         key = (device.identity, config)
         if key not in fused:
@@ -161,8 +161,8 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             _materialize_dense(a_lowering, torch.device("cuda", device.ordinal)),
             _materialize_dense(b_lowering, torch.device("cuda", device.ordinal)),
             (_materialize_dense_fused_quant(fused_b(selection.config, device), torch.device("cuda", device.ordinal))
-             if use_fused_b else None),
-            compile_wo_quantizers(TUNING.encode_query(query), device.ordinal),
+             if use_fused_b and selection.config.backend != "mxfp8_tcgen05" else None),
+            compile_quantizers(TUNING.encode_query(query), device.ordinal, selection.config.backend),
         )
 
     return Plan(
@@ -174,10 +174,10 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                               ordinary_states(config, device)[1].to_dict(), device.ordinal),
             *((CompileJob.create("b12x._lib.dense_gemm:_compile_dense_fused_quant_lowering",
                                  fused_b(config, device).to_dict(), device.ordinal),)
-              if use_fused_b else ()),
+              if use_fused_b and config.backend != "mxfp8_tcgen05" else ()),
             CompileJob.create(
-                "b12x.gemm._shared.wo_mxfp8:compile_wo_quantizers",
-                TUNING.encode_query(query), device.ordinal,
+                "b12x.gemm.wo_projection._preparation:compile_quantizers",
+                TUNING.encode_query(query), device.ordinal, config.backend,
             ),
         ),
         _memory_requirements=memory, _materialize=materialize, _device=caps.device, shared=True,
@@ -336,3 +336,11 @@ class _PreparedWO:
 
 
 __all__ = ["plan"]
+
+
+def compile_quantizers(payload, ordinal, backend):
+    if backend == "mxfp8_tcgen05":
+        from ._sm103_preparation import compile_quantizers as compile_native
+        return compile_native(payload, ordinal)
+    from .._shared.wo_mxfp8 import compile_wo_quantizers
+    return compile_wo_quantizers(payload, ordinal)

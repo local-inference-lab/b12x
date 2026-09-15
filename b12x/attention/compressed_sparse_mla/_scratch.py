@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from ._tuning import SparseMlaConfig
+
 if TYPE_CHECKING:
     from b12x.preparation import Plan
 
@@ -244,7 +246,6 @@ class B12XCompressedSparseMLAScratch:
     staged_indexed_indices: torch.Tensor | None = None
     staged_swa_lengths: torch.Tensor | None = None
     staged_indexed_lengths: torch.Tensor | None = None
-    backend_key: str | None = None
 
     def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
         if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
@@ -345,6 +346,13 @@ def _compressed_sparse_mla_scratch_layout(
     mapped_indices_offset_bytes = cursor
     cursor += max_total_q * int(caps.indexed_width) * dtype_nbytes(torch.int32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
+    staged_selections_offset_bytes = cursor
+    swa_capacity, indexed_capacity = _selection_widths(caps, execution_config)
+    for width in (swa_capacity, indexed_capacity):
+        cursor += max_total_q * width * 4
+        cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+    cursor += align_up(max_total_q * 4, SCRATCH_ALIGN_BYTES) * 2
 
     return _B12XCompressedSparseMLAScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
@@ -779,7 +787,6 @@ class B12XCompressedSparseMLAScratchPlan:
             self.layout,
             self.execution_config,
         )
-        scratch_views.backend_key = self.backend_key
         return build_compressed_sparse_mla_binding(
             scratch=scratch_views,
             q=q,
@@ -806,7 +813,7 @@ def plan_compressed_sparse_mla_scratch(
         and caps.max_chunks_per_row != getattr(execution_config, "max_chunks_per_row", None)
     ):
         raise ValueError("caps.max_chunks_per_row must match execution_config")
-    layout = _compressed_sparse_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps, execution_config)
     return B12XCompressedSparseMLAScratchPlan(
         caps=caps,
         layout=layout,
@@ -819,10 +826,6 @@ def plan_compressed_sparse_mla_scratch(
             ),
         ),
     )
-    if execution_config.backend == "warp":
-        from ._warp import register_plan
-        result = register_plan(result)
-    return result
 
 
 __all__ = [

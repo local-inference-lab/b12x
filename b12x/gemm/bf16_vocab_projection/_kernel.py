@@ -17,8 +17,8 @@ def _row_kernel(
     BLOCK_K: tl.constexpr,
     N: tl.constexpr,
 ):
-    vocab_row = tl.program_id(0)
-    token_row = tl.program_id(1)
+    vocab_row = tl.program_id(0).to(tl.int64)
+    token_row = tl.program_id(1).to(tl.int64)
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < K
     values = tl.load(source + token_row * K + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -39,8 +39,8 @@ def _row_loop_kernel(
     BLOCK_K: tl.constexpr,
     N: tl.constexpr,
 ):
-    vocab_row = tl.program_id(0)
-    token_row = tl.program_id(1)
+    vocab_row = tl.program_id(0).to(tl.int64)
+    token_row = tl.program_id(1).to(tl.int64)
     offsets = tl.arange(0, BLOCK_K)
     accumulator = tl.zeros((), tl.float32)
     for start in range(0, K, BLOCK_K):
@@ -78,3 +78,18 @@ def _bf16_vocab_projection_fake(
 
 
 __all__ = ["bf16_vocab_projection"]
+
+
+@torch.library.custom_op("b12x::bf16_vocab_projection_out", mutates_args=("out",))
+def bf16_vocab_projection_out(
+    source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, plan_handle: int,
+) -> None:
+    state = require_prepared(plan_from_handle(plan_handle), "gemm.bf16_vocab_projection", source.device)
+    state.run(source, weight, out)
+
+
+@bf16_vocab_projection_out.register_fake
+def _bf16_vocab_projection_out_fake(
+    source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, plan_handle: int,
+) -> None:
+    pass

@@ -51,6 +51,9 @@ def _metadata_operands(query):
 def _lower_query(query, device, constraints):
     if device is None:
         raise ValueError("dense preparation requires a device SM count")
+    if getattr(device, "compute_capability", None) == (10, 3):
+        from ._sm103_preparation import lower
+        return lower(query, device)
     from b12x._lib.dense_gemm import _lower_dense_gemm
     lhs, rhs, out, alpha, options = _metadata_operands(query)
     return _lower_dense_gemm(
@@ -65,6 +68,9 @@ def _default_lowering(query, device):
 
 
 def _configured_lowering(query, config, device):
+    if config.backend == "sm103":
+        from ._sm103_preparation import lower
+        return lower(query, device)
     return _lower_query(query, device, launch_options(query, config))
 
 

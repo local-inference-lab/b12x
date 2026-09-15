@@ -20,7 +20,9 @@ from ._a16 import NVFP4LinearWeight, w4a16, w8a16
 
 
 def workspace_size(plan: Plan) -> int:
-    return require_prepared(plan, "gemm.blockscaled_precision").required_workspace
+    if plan.component_id not in {"gemm.blockscaled_precision", "gemm.blockscaled.fixed"}:
+        raise ValueError("workspace_size requires a packed blockscaled plan")
+    return require_prepared(plan, plan.component_id).required_workspace
 
 
 def is_supported(device=None) -> bool:

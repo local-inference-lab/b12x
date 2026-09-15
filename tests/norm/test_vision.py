@@ -1,4 +1,5 @@
 """Numerical/layout oracles for native V4.1 vision support operations."""
+from contextlib import nullcontext
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,9 +11,7 @@ def test_rectangular_rope_and_live_capacity_isolation():
     device = require_b12x()
     from b12x.attention import varlen
     from b12x.norm.vision import run_rope_qkv
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution, unfreeze_kernel_resolution,
-    )
+    from b12x._lib.runtime_control import kernel_resolution_guard
 
     torch.manual_seed(414)
     capacity, heads, dim = 128, 2, 64
@@ -36,13 +35,9 @@ def test_rectangular_rope_and_live_capacity_isolation():
         q.fill_(float("nan"))
         k.fill_(float("nan"))
         v.fill_(float("nan"))
-        if iteration:
-            freeze_kernel_resolution("vision live image sizes reuse planned attention")
-        try:
+        with kernel_resolution_guard("vision live image sizes reuse planned attention") if iteration else nullcontext():
             run_rope_qkv(qkv, height, width, inv, q=q, k=k, v=v, cu_seqlens=cu)
             actual, _ = varlen.run(binding=binding)
-        finally:
-            unfreeze_kernel_resolution()
         torch.testing.assert_close(cu, torch.tensor([0, rows], device=device, dtype=torch.int32))
         pos_h = torch.arange(height, device=device)[:, None].expand(height, width)
         pos_w = torch.arange(width, device=device)[None, :].expand(height, width)

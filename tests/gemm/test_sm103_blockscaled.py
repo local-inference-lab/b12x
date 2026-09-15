@@ -4,7 +4,8 @@ import pytest
 import torch
 
 from b12x.gemm import blockscaled
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.runtime_control import kernel_resolution_guard
 from tests.gemm import test_blockscaled_a16 as a16
 from tests.gemm.test_blockscaled_a16 import (  # noqa: F401
     test_a16_reference,
@@ -13,7 +14,6 @@ from tests.gemm.test_blockscaled_a16 import (  # noqa: F401
     test_w4a16_raw_scale_identity_and_rounding,
     test_a16_rejects_tma_misalignment,
     test_a16_aot_compile_functionalizes_workspace,
-    test_mxfp8_prewarm_covers_functional_and_out_under_frozen_resolution,
     test_native_weight_pairs_exhaustive,
 )
 
@@ -88,12 +88,11 @@ def test_native_dense_counts_groups_tails_and_graphs(recipe, groups, dtype, monk
         view.copy_(values)
         inputs.append((view, scales, decoded))
     def call(item, m):
-        return blockscaled.mm(item[:2], (weight, weight_scales), out=output[:m],
+        return dense_gemm(item[:2], (weight, weight_scales), out=output[:m],
                               alpha=alpha, **options(recipe, dtype))
     call(inputs[0], 1)
     cache = compile_kernel.cache_info()
-    freeze_kernel_resolution("SM103 dense live-count reuse")
-    try:
+    with kernel_resolution_guard("SM103 dense live-count reuse"):
         for item, m in zip(inputs, (1, 3, 8, 129, capacity), strict=True):
             expected = (torch.bmm(item[2], decoded_weight.transpose(1, 2)) * alpha[:, None, None]).permute(1, 2, 0)
             check(call(item, m), expected)
@@ -117,8 +116,6 @@ def test_native_dense_counts_groups_tails_and_graphs(recipe, groups, dtype, monk
             graph.replay()
             torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() == before
-    finally:
-        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("recipe,dtype", [
@@ -131,38 +128,35 @@ def test_packed_quantized_graph_and_independent_oracle(recipe, dtype, monkeypatc
     weight, local, multiplier = _reference_weight(recipe, 136, 384)
     source = torch.randn(33, 384, device="cuda", dtype=dtype)
     out = torch.empty(33, 136, device="cuda", dtype=dtype)
-    scratch = torch.empty(blockscaled.workspace_size(weight, 33), device="cuda", dtype=torch.uint8)
     activation_scale = torch.tensor([4.0], device="cuda")
     args = dict(activation_global_scale=activation_scale) if recipe == "nvfp4" else {}
     counts = (1, 4, 8, 17, 33)
-    # SM12x retains its existing precision-regime specializations. SM103 must
-    # reuse the callable warmed at the two endpoints for every interior count.
-    warmup_counts = (1, 33) if torch.cuda.get_device_capability() == (10, 3) else counts
-    blockscaled.prewarm(weight, warmup_counts, mode="quantized", out_dtype=dtype, workspace=scratch, **args)
-    def call(m):
-        return blockscaled.mm(source[:m], weight, out=out[:m], workspace=scratch, mode="quantized", **args)
-    def reference(m):
-        if recipe == "nvfp4":
-            return quantized_nvfp4_reference(source[:m], local, multiplier, activation_scale)
-        return quant_dequant_mxfp8_torch(source[:m]).float() @ local.T
-    freeze_kernel_resolution("SM103 packed quantized projection")
-    try:
-        for m in counts:
-            check(call(m), reference(m))
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            call(33)
-        for _ in range(3):
-            source.normal_()
-            scratch.fill_(255)
-            out.fill_(float("nan"))
-            graph.replay()
-            check(out, reference(33))
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("unexpected allocation"))
-            call(33)
-    finally:
-        unfreeze_kernel_resolution()
+    scratch = a16.make_workspace(source, weight, activation_mode="quantized", out=out, **args)
+    context = a16.prepared_execution(source, weight, activation_mode="quantized", out=out, workspace=scratch, **args)
+    with context as (_, plan):
+        def call(m):
+            return blockscaled.mm(source[:m], weight, out=out[:m], workspace=scratch, plan=plan, **args)
+        def reference(m):
+            if recipe == "nvfp4":
+                return quantized_nvfp4_reference(source[:m], local, multiplier, activation_scale)
+            return quant_dequant_mxfp8_torch(source[:m]).float() @ local.T
+        with kernel_resolution_guard("SM103 packed quantized projection"):
+            check(torch.compile(lambda: call(3), fullgraph=True)(), reference(3))
+            assert call(0).shape == (0, 136)
+            for m in counts:
+                check(call(m), reference(m))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call(33)
+            for _ in range(3):
+                source.normal_()
+                scratch.fill_(255)
+                out.fill_(float("nan"))
+                graph.replay()
+                check(out, reference(33))
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("unexpected allocation"))
+                call(33)
 
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp4", "mxfp8"])
@@ -175,17 +169,17 @@ def test_native_scalar_alpha_empty_rows_and_tiny_output(recipe, monkeypatch):
     out = torch.empty_like(expected, dtype=torch.bfloat16)
     with monkeypatch.context() as patch:
         patch.setattr(torch, "ones", lambda *a, **kw: pytest.fail("implicit alpha allocation"))
-        check(blockscaled.mm((a, sfa), (b, sfb), out=out, **opts), expected)
+        check(dense_gemm((a, sfa), (b, sfb), out=out, **opts), expected)
     alpha = torch.tensor([.125], device="cuda")
-    check(blockscaled.mm((a, sfa), (b, sfb), alpha=alpha, **opts), expected * alpha)
+    check(dense_gemm((a, sfa), (b, sfb), alpha=alpha, **opts), expected * alpha)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    blockscaled.mm((a, sfa), (b, sfb), out=out, stream=stream, **opts)
+    dense_gemm((a, sfa), (b, sfb), out=out, stream=stream, **opts)
     torch.cuda.current_stream().wait_stream(stream)
     check(out, expected)
     empty = torch.empty(0, a.shape[1], 1, device="cuda", dtype=a.dtype)
     scales = torch.empty(0, device="cuda", dtype=sfa.dtype)
-    result = blockscaled.mm((empty, scales), (b, sfb), **opts)
+    result = dense_gemm((empty, scales), (b, sfb), **opts)
     assert result.shape == (0, 8, 1)
 
 
@@ -198,7 +192,7 @@ def test_native_dense_row_address_past_int32_elements():
     sfa = torch.full((((m + 127) // 128) * 2 * 512,), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
     sfb = torch.full(((n // 128) * 2 * 512,), 1.0, device="cuda", dtype=torch.float8_e4m3fn)
     output = torch.full((m, n, 1), float("nan"), device="cuda", dtype=torch.bfloat16)
-    blockscaled.mm((a, sfa), (b, sfb), out=output, **options("nvfp4", torch.bfloat16))
+    dense_gemm((a, sfa), (b, sfb), out=output, **options("nvfp4", torch.bfloat16))
     assert (m - 1) * n == 2**31
     for row in (0, 127, 128, m - 2, m - 1):
         assert torch.all(output[row] == k)

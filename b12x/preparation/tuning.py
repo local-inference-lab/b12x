@@ -260,6 +260,9 @@ class TuningContract(Generic[QueryT, ConfigT]):
         return ParameterSpace.create(self.knobs, values=values)
 
     def configure(self, query, *, device, override=None, search=True) -> TuningConfiguration:
+        if device is not None:
+            from b12x._lib.architecture import require_component_architecture
+            require_component_architecture(self.component_id, device.compute_capability)
         self.validate_query(query, device)
         encoded = FrozenMapping(self.encode_query(query))
         if set(encoded) != self.query_fields:

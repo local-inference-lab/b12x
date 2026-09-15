@@ -1,4 +1,5 @@
 """Public MXFP4 indexing contracts through the portable warp backend."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
@@ -6,8 +7,8 @@ import torch
 import b12x
 
 from b12x.attention import dsa_indexer
-from b12x.attention.dsa_indexer._policy import DsaIndexerConfig
-from b12x.policy import DSA_INDEXER, get_auto_policy
+from b12x.attention.dsa_indexer._tuning import DsaIndexerConfig
+from b12x.preparation import FrozenMapping
 from tests.conftest import require_sm103_or_sm12x
 from . import test_dsa_indexer_mxfp4 as contracts
 
@@ -20,15 +21,10 @@ for _name, _test in vars(contracts).items():
 def warp_backend(monkeypatch):
     require_sm103_or_sm12x()
     original = dsa_indexer.plan
-
-    def plan(caps, *, policy=None):
-        context = policy or get_auto_policy(caps.device)
-        return original(
-            caps,
-            policy=context.with_override(DSA_INDEXER, DsaIndexerConfig(backend="warp")),
-        )
-
+    def plan(caps, *, invocation=FrozenMapping(), override=None):
+        return original(caps, invocation=invocation, override=override if caps.cache_format == "mxfp4" else DsaIndexerConfig(backend="warp"))
     monkeypatch.setattr(dsa_indexer, "plan", plan)
+
 
 
 @pytest.mark.parametrize("mode", ["decode", "decode_tiled", "prefill"])
@@ -60,22 +56,25 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
     active = torch.tensor([width], device=device, dtype=torch.int32)
     output = torch.empty((capacity, topk), device=device, dtype=torch.int32)
     scores = torch.empty((capacity, topk), device=device, dtype=torch.float32)
-    plan = dsa_indexer.plan(
-        dsa_indexer.Caps(
-            device=device,
-            num_q_heads=heads,
-            max_q_rows=capacity,
-            max_page_table_width=32,
-            topk=topk,
-            mode=mode,
-        )
-    )
+    caps = dsa_indexer.Caps(device=device, num_q_heads=heads, max_q_rows=capacity,
+                            max_page_table_width=32, topk=topk, mode=mode)
+    plan = dsa_indexer.plan(caps, invocation=dsa_indexer.invocation_from_tensors(
+        caps, q_fp8=q, query_weights=weights, index_k_cache=pool,
+        page_table=pages[:1].expand(capacity, -1) if mode == "prefill" else pages,
+        cache_lengths=lengths, active_width=active, output_indices=output, output_scores=scores,
+    ))
+    indices_plan = dsa_indexer.plan(caps, invocation=dsa_indexer.invocation_from_tensors(
+        caps, q_fp8=q, query_weights=weights, index_k_cache=pool,
+        page_table=pages[:1].expand(capacity, -1) if mode == "prefill" else pages,
+        cache_lengths=lengths, active_width=active, output_indices=output,
+        output_scores=None,
+    ))
     spec = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, device=device, dtype=spec.dtype)
 
-    def bind(rows, compact=False):
+    def bind(rows, compact=False, *, indices_only=False):
         return dsa_indexer.bind(
-            plan,
+            indices_plan if indices_only else plan,
             scratch=scratch,
             q_fp8=q[:rows],
             query_weights=weights[:rows],
@@ -86,7 +85,7 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
             cache_lengths=lengths[:rows],
             active_width=active,
             output_indices=output[:rows],
-            output_scores=scores[:rows],
+            output_scores=None if indices_only else scores[:rows],
         )
 
     def check(rows):
@@ -109,18 +108,18 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
             rtol=0,
         )
 
-    dsa_indexer.prewarm_fp8(plan, scratch=scratch)
+    dsa_indexer.run(bind(capacity))
+    dsa_indexer.run(bind(capacity, indices_only=True))
     identities = {id(v) for v in compiler._MEMORY_CACHE.values()}
-    b12x.freeze_kernel_resolution(
-        "DSA live rows and pool views retain their compiled kernels"
-    )
-    try:
+    with kernel_resolution_guard("DSA live rows and pool views retain their compiled kernels"):
         for rows in (1, 3, capacity):
             dsa_indexer.run(bind(rows, compact=True))
             check(rows)
             assert {id(v) for v in compiler._MEMORY_CACHE.values()} == identities
         from dataclasses import replace
-        indices_only = replace(bind(3), output_scores=None)
+        with pytest.raises(ValueError, match="output_scores presence"):
+            dsa_indexer.run(replace(bind(3), output_scores=None))
+        indices_only = bind(3, indices_only=True)
         dsa_indexer.run(indices_only)
         torch.cuda.synchronize(device)
         before = torch.cuda.memory_stats(device)
@@ -146,8 +145,6 @@ def test_fp8_public_plan_reuses_live_rows_and_pool_views(mode, high_pages, monke
         for key in ("allocation.all.allocated", "allocation.all.freed"):
             assert before[key] == after[key]
         check(3)
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 def test_cooperative_barrier_waits_for_every_publishing_warp():

@@ -124,6 +124,11 @@ class _BlockFP8ExecutionState:
         return out
 
     def _run(self, source, packed_weight, x_q, output, workspace, bias, stream):
+        from b12x.gemm.blockscaled._a16 import _stream_context
+        with torch.cuda.device(self.device), _stream_context(stream, self.device):
+            return self._run_on_stream(source, packed_weight, x_q, output, workspace, bias, stream)
+
+    def _run_on_stream(self, source, packed_weight, x_q, output, workspace, bias, stream):
         source_2d = self._check_source(source)
         if (not isinstance(packed_weight, BlockFP8LinearWeight)
                 or packed_weight.in_features != self.query.in_features
@@ -165,11 +170,13 @@ class _BlockFP8ExecutionState:
         if self.query.output_mode != "functional":
             raise ValueError("prepared block-FP8 plan requires caller-provided output binding")
         self._check_source(source)
-        output = empty_dense_gemm_mnl_view(
-            _source_2d(source).shape[0], self.query.out_features, 1, device=self.device,
-            dtype=_dtype(self.query.output_dtype),
-        )
-        return self._run(source, packed_weight, None, output, workspace, bias, stream)
+        from b12x.gemm.blockscaled._a16 import _stream_context
+        with torch.cuda.device(self.device), _stream_context(stream, self.device):
+            output = empty_dense_gemm_mnl_view(
+                _source_2d(source).shape[0], self.query.out_features, 1, device=self.device,
+                dtype=_dtype(self.query.output_dtype),
+            )
+            return self._run_on_stream(source, packed_weight, None, output, workspace, bias, stream)
 
 def plan(caps: BlockFP8LinearScratchCaps, *, invocation=FrozenMapping(), override=None) -> Plan:
     if not isinstance(caps, BlockFP8LinearScratchCaps):

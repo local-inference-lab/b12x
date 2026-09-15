@@ -1,10 +1,12 @@
 """Uniform Trellis preparation and deferred native SM103 MoE qualification."""
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 import pytest
 import torch
 
 from b12x.moe import fused_moe
-from b12x.policy.generation.providers.trellis_reference import moe_reference
+from b12x.preparation import require_prepared
+from tests._reference.trellis_reference import moe_reference
 from tests.moe.test_trellis_config import _k3_config
 
 
@@ -130,7 +132,7 @@ def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
             max_tokens=8, top_k=2, warmup_token_counts=(1, 4)
         ),
     )
-    fused_moe.prewarm(plan)
+    plan.scratch_specs()
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
@@ -156,8 +158,7 @@ def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
 
     check(fused_moe.run(binding=binding), reference)
     graph = torch.cuda.CUDAGraph()
-    b12x.freeze_kernel_resolution("canonical Trellis preparation regression")
-    try:
+    with kernel_resolution_guard("canonical Trellis preparation regression"):
         with torch.cuda.graph(graph):
             fused_moe.run(binding=binding)
         source.mul_(0.75)
@@ -182,8 +183,6 @@ def test_canonical_preparation_and_independent_oracle(codebook, coupled, bits):
             == addresses
         )
         check(binding.output, changed)
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 def _run_native_moe(
@@ -223,9 +222,10 @@ def _run_native_moe(
             route_num_experts=route_capacity,
         ),
     )
-    assert all(v.implementation == "tcgen05_trellis" for v in plan.variants)
-    assert len({id(v._impl) for v in plan.variants}) == 1
-    fused_moe.prewarm(plan)
+    plan.scratch_specs()
+    states = require_prepared(plan, "moe.decode").variants
+    assert all(v.config.backend == "tcgen05_trellis" for v in states.values())
+    plan.scratch_specs()
     scratch = {
         s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
@@ -273,9 +273,8 @@ def _run_native_moe(
         )
 
     refs = {live: expected(live) for live in (1, 4, 8, 3)}
-    callables = tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
-    b12x.freeze_kernel_resolution("Trellis serving contract")
-    try:
+    callables = tuple(id(fn) for fn in require_prepared(plan, "moe.decode").variants[8].scratch._backend_plan.launches.values())
+    with kernel_resolution_guard("Trellis serving contract"):
         for live in (8, 1, 4, 3):
             for target in (None, output):
                 output.fill_(float("nan"))
@@ -335,13 +334,11 @@ def _run_native_moe(
         assert torch.cuda.memory_stats()["allocated_bytes.all.allocated"] == allocated
         assert tuple(t.data_ptr() for t in owners) == addresses
         assert (
-            tuple(id(fn) for fn in plan._impl._backend_plan.launches.values())
+            tuple(id(fn) for fn in require_prepared(plan, "moe.decode").variants[8].scratch._backend_plan.launches.values())
             == callables
         )
         assert not torch.equal(binding.output, before)
         check(binding.output, changed)
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize(

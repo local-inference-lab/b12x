@@ -24,6 +24,13 @@ def compile_vocab_projection(query_payload, config_payload, ordinal):
     TUNING.validate_config(query, config, None)
     if config.backend == "torch":
         return {}
+    if config.backend == "cute":
+        from ._cute import compile_kernel
+        from b12x._lib.gating import get_compute_capability
+        with torch.cuda.device(ordinal):
+            major, minor = get_compute_capability(torch.device("cuda", ordinal))
+            return {"projection": compile_kernel(query.out_features, query.in_features,
+                                                   ordinal, f"sm_{major}{minor}a")}
     kernel = _kernel._row_kernel if config.algorithm == "row" else _kernel._row_loop_kernel
     with torch.cuda.device(ordinal):
         return {"projection": kernel.warmup(
@@ -40,11 +47,14 @@ class _PreparedVocabProjection:
     config: Bf16VocabProjectionConfig
     runner: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
-    def bind(self, *, plan, source, weight) -> Binding:
-        return _bind(self.caps, plan=plan, source=source, weight=weight)
+    def bind(self, *, plan, source, weight, out=None) -> Binding:
+        return _bind(self.caps, plan=plan, source=source, weight=weight, out=out)
 
-    def run(self, source: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return self.runner(source, weight)
+    def run(self, source: torch.Tensor, weight: torch.Tensor, out=None) -> torch.Tensor:
+        if out is not None:
+            from ._cute import validate_output
+            validate_output(source, weight, out)
+        return self.runner(source, weight, out)
 
 
 def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
@@ -69,23 +79,28 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
     def materialize(selection, device):
         config = selection.config
         if config.backend == "torch":
-            runner = torch.nn.functional.linear
+            def runner(source, weight, out=None):
+                return torch.mm(source, weight.t(), out=out)
         else:
             programs = compile_vocab_projection(
                 TUNING.encode_query(query), config.to_dict(), device.ordinal,
             )
             launcher = programs["projection"]
 
-            def runner(source, weight):
+            def runner(source, weight, out=None):
                 rows = int(source.shape[0])
                 if rows < 1 or rows > query.max_tokens:
                     raise ValueError(
                         "vocabulary projection source rows differ from preparation"
                     )
-                output = torch.empty(
+                output = out if out is not None else torch.empty(
                     (rows, query.out_features), dtype=torch.bfloat16,
                     device=source.device,
                 )
+                if config.backend == "cute":
+                    from ._cute import run_prepared
+                    run_prepared(launcher, source, weight, output)
+                    return output
                 launcher[(query.out_features, rows, 1)](
                     source, weight, output, query.in_features, config.block_k,
                     query.out_features,

@@ -7,6 +7,7 @@ arguments. The same entry can run on SM12x for regression qualification.
 
 import cuda.bindings.driver as cuda
 import cutlass
+from b12x._lib.compiler import run_compiled
 import torch
 
 from b12x._lib.dense_gemm import _empty_dense_gemm_output
@@ -17,7 +18,7 @@ from ._sm103 import OUTPUT_TYPES, _grouped_layout, _span, pointer
 
 
 def execute(lhs, rhs, out, *, ab_dtype, sf_dtype, c_dtype, sf_vec_size,
-            block_fp8=False, alpha=None, stream=None):
+            block_fp8=False, alpha=None, stream=None, compiled=None):
     if ab_dtype != "float8_e4m3fn" or c_dtype not in OUTPUT_TYPES:
         raise ValueError("FP8 GEMM requires E4M3 operands and BF16/FP16/FP32 output")
     if (sf_dtype, sf_vec_size) != (("float32", 128) if block_fp8 else ("float8_e8m0fnu", 32)):
@@ -65,7 +66,10 @@ def execute(lhs, rhs, out, *, ab_dtype, sf_dtype, c_dtype, sf_vec_size,
     if any(t is not None and lo < _span(t)[1] and _span(t)[0] < hi for t in (a, b, sfa, sfb, alpha)):
         raise ValueError("FP8 output must not overlap inputs")
     if m:
-        _execute(a, b, sfa, sfb, out, alpha, block_fp8, c_dtype, cuda_stream_to_int(stream))
+        if compiled is None:
+            _execute(a, b, sfa, sfb, out, alpha, block_fp8, c_dtype, cuda_stream_to_int(stream))
+        else:
+            _launch_prepared(compiled, a, b, sfa, sfb, out, alpha, block_fp8, c_dtype, cuda_stream_to_int(stream))
     return out
 
 
@@ -78,16 +82,24 @@ def _execute(a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor | None,
         props = torch.cuda.get_device_properties(a.device)
         fn = compile_kernel(b.shape[0], k, groups, c_dtype, block_fp8, alpha is None,
                             a.device.index, props.multi_processor_count, f"sm_{props.major}{props.minor}a")
+        _launch_prepared(fn, a, b, sfa, sfb, out, alpha, block_fp8, c_dtype, stream_int)
+
+
+def _launch_prepared(fn, a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor | None,
+             sfb: torch.Tensor | None, out: torch.Tensor, alpha: torch.Tensor | None,
+             block_fp8: bool, c_dtype: str, stream_int: int | None) -> None:
+    m, k, groups = a.shape
+    with torch.cuda.device(a.device):
         sf_type = cutlass.Float32 if block_fp8 else cutlass.Float8E8M0FNU
         types = (cutlass.Float8E4M3FN, cutlass.Float8E4M3FN, sf_type, sf_type,
                  OUTPUT_TYPES[c_dtype][1], cutlass.Float32)
         tensors = (a, b, sfa, sfb, out, alpha)
-        fn(*(pointer(t, x) for t, x in zip(types, tensors, strict=True)), cutlass.Int32(m),
+        run_compiled(fn, (*(pointer(t, x) for t, x in zip(types, tensors, strict=True)), cutlass.Int32(m),
            cutlass.Int64(m * k if groups == 1 else a.stride(2)),
            cutlass.Int64(m * out.shape[1] if groups == 1 else out.stride(2)),
-           cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream if stream_int is None else stream_int))
+           cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream if stream_int is None else stream_int),))
 
 
 @_execute.register_fake
-def _execute_fake(a, b, sfa, sfb, out, alpha, block_fp8, c_dtype, stream_int):
+def _execute_fake(a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor | None, sfb: torch.Tensor | None, out: torch.Tensor, alpha: torch.Tensor | None, block_fp8: bool, c_dtype: str, stream_int: int | None):
     return None

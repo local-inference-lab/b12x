@@ -5,12 +5,12 @@ batch strides are launch arguments. Prewarming retains the callable; callers
 provide output and quantization workspace for allocation-stable graph replay.
 """
 
-from functools import lru_cache
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
+from b12x._lib.compiler import run_compiled
 import torch
 
 from b12x._lib.architecture import UnsupportedArchitectureError
@@ -50,7 +50,10 @@ def pointer(dtype, tensor=None):
                     cute.AddressSpace.gmem, assumed_align=16)
 
 
-@lru_cache(maxsize=1024)
+from b12x._lib.program_cache import program_cache
+
+
+@program_cache
 def compile_kernel(n, k, groups, recipe, c_dtype, device_ordinal, alpha_is_one=False):
     raise_if_kernel_resolution_frozen("SM103 blockscaled GEMM")
     if torch.cuda.is_current_stream_capturing():
@@ -103,7 +106,7 @@ def _span(tensor):
 
 
 def execute(lhs, rhs, out, *, ab_dtype, sf_dtype, c_dtype, sf_vec_size,
-            alpha=None, stream=None):
+            alpha=None, stream=None, compiled=None):
     recipe = RECIPES.get((ab_dtype, sf_dtype, sf_vec_size))
     if recipe is None:
         raise UnsupportedArchitectureError("SM103 dense GEMM implements NVFP4, MXFP4, and MXFP8")
@@ -147,7 +150,10 @@ def execute(lhs, rhs, out, *, ab_dtype, sf_dtype, c_dtype, sf_vec_size,
     if any(lo < _span(t)[1] and _span(t)[0] < hi for t in reads):
         raise ValueError("SM103 GEMM output must not overlap inputs")
     if m:
-        _execute(a, b, sfa, sfb, out, alpha, recipe, c_dtype, cuda_stream_to_int(stream))
+        if compiled is None:
+            _execute(a, b, sfa, sfb, out, alpha, recipe, c_dtype, cuda_stream_to_int(stream))
+        else:
+            _launch_prepared(compiled, a, b, sfa, sfb, out, alpha, recipe, c_dtype, cuda_stream_to_int(stream))
     return out
 
 
@@ -159,17 +165,26 @@ def _execute(a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor,
     k = storage_k if recipe == "mxfp8" else 2 * storage_k
     with torch.cuda.device(a.device):
         fn = compile_kernel(b.shape[0], k, groups, recipe, c_dtype, a.device.index, alpha is None)
+        _launch_prepared(fn, a, b, sfa, sfb, out, alpha, recipe, c_dtype, stream_int)
+
+
+def _launch_prepared(fn, a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor,
+             sfb: torch.Tensor, out: torch.Tensor, alpha: torch.Tensor | None,
+             recipe: str, c_dtype: str, stream_int: int | None) -> None:
+    m, storage_k, groups = a.shape
+    k = storage_k if recipe == "mxfp8" else 2 * storage_k
+    with torch.cuda.device(a.device):
         ab_type = cutlass.Float8E4M3FN if recipe == "mxfp8" else cutlass.Float4E2M1FN
         sf_type = cutlass.Float8E4M3FN if recipe == "nvfp4" else cutlass.Float8E8M0FNU
         types = (ab_type, ab_type, sf_type, sf_type, OUTPUT_TYPES[c_dtype][1], cutlass.Float32)
         tensors = (a, b, sfa, sfb, out, alpha)
-        fn(*(pointer(t, x) for t, x in zip(types, tensors, strict=True)), cutlass.Int32(m),
+        run_compiled(fn, (*(pointer(t, x) for t, x in zip(types, tensors, strict=True)), cutlass.Int32(m),
            cutlass.Int64(m * k if groups == 1 else a.stride(2) * (1 if recipe == "mxfp8" else 2)),
            cutlass.Int64(m * out.shape[1] if groups == 1 else out.stride(2)),
            cutlass.Int64(0 if alpha is None or alpha.numel() == 1 else 1),
-           cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream if stream_int is None else stream_int))
+           cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream if stream_int is None else stream_int),))
 
 
 @_execute.register_fake
-def _execute_fake(a, b, sfa, sfb, out, alpha, recipe, c_dtype, stream_int):
+def _execute_fake(a: torch.Tensor, b: torch.Tensor, sfa: torch.Tensor, sfb: torch.Tensor, out: torch.Tensor, alpha: torch.Tensor | None, recipe: str, c_dtype: str, stream_int: int | None):
     return None

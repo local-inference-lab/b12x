@@ -5,7 +5,7 @@ import torch
 
 from b12x._lib.dense_gemm import dense_gemm
 from b12x._lib.intrinsics import swizzle_block_scale
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm.blockscaled._fp6 import compile_kernel
 from tests.gemm.test_sm103_blockscaled import check, require_native
 from tests.quantization.test_fp6_workspace import decode, pack
@@ -53,8 +53,7 @@ def test_native_fp6_oracle_group_strides_counts_and_graph(a_fmt, b_fmt, a_packed
         return (result.to(dtype).float() * correction[:m, None, None].float()).to(dtype).float()
     call(items[0], 1)
     cache = compile_kernel.cache_info()
-    freeze_kernel_resolution("native FP6 live rows retain one compiled callable")
-    try:
+    with kernel_resolution_guard("native FP6 live rows retain one compiled callable"):
         for item, m in zip(items, (1, 3, 8, 129, capacity), strict=True):
             check(call(item, m), expected(item, m))
         assert compile_kernel.cache_info().misses == cache.misses
@@ -74,8 +73,6 @@ def test_native_fp6_oracle_group_strides_counts_and_graph(a_fmt, b_fmt, a_packed
             graph.replay()
             torch.cuda.synchronize()
         assert before["allocation.all.allocated"] == torch.cuda.memory_stats()["allocation.all.allocated"]
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_native_fp6_scalar_alpha_empty_rows_and_stream():
@@ -126,13 +123,10 @@ def test_native_fp6_opaque_serving_op_compile_and_capture():
     source = torch.randn(8, 384, device="cuda", dtype=torch.bfloat16)
     compiled = torch.compile(operation, fullgraph=True, backend="aot_eager")
     torch.testing.assert_close(compiled(source), operation(source), atol=0, rtol=0)
-    freeze_kernel_resolution("FP6 opaque serving op capture is prewarmed")
-    try:
+    with kernel_resolution_guard("FP6 opaque serving op capture is prewarmed"):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             result = compiled(source)
         source.normal_()
         graph.replay()
         torch.testing.assert_close(result, operation(source), atol=0, rtol=0)
-    finally:
-        unfreeze_kernel_resolution()

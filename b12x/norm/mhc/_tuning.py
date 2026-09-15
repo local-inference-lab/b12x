@@ -53,6 +53,7 @@ class MhcConfig:
     projection_num_m_warps: int
     projection_num_n_warps: int
     projection_k_splits: int
+    projection_split_fp32: bool = False
     lagged_prepare: bool = False
 
     @classmethod
@@ -69,6 +70,7 @@ class MhcConfig:
             projection_num_m_warps=int(payload["projection_num_m_warps"]),
             projection_num_n_warps=int(payload["projection_num_n_warps"]),
             projection_k_splits=int(payload["projection_k_splits"]),
+            projection_split_fp32=payload["projection_split_fp32"],
             lagged_prepare=payload["lagged_prepare"],
         )
 
@@ -82,6 +84,7 @@ class MhcConfig:
             "projection_num_m_warps": self.projection_num_m_warps,
             "projection_num_n_warps": self.projection_num_n_warps,
             "projection_k_splits": self.projection_k_splits,
+            "projection_split_fp32": self.projection_split_fp32,
             "lagged_prepare": self.lagged_prepare,
         }
 
@@ -205,7 +208,8 @@ def _default_config(query, device):
             prepared = prepared and int(splits) == 0
         elif device is not None and device.compute_capability == (12, 1) and query.hidden_size == 4096 and query.max_tokens >= 8:
             prepared = False
-    return replace(config, lagged_prepare=prepared)
+    return replace(config, lagged_prepare=prepared, projection_split_fp32=
+                   device is not None and device.compute_capability == (10, 3))
 
 
 def _encode(query: MhcQuery) -> dict[str, object]:
@@ -219,7 +223,7 @@ def _validate(
 ) -> None:
     if not isinstance(config, MhcConfig):
         raise TypeError("config must be MhcConfig")
-    if any(type(getattr(config, field)) is not int for field in config.__dataclass_fields__ if field not in ("backend", "lagged_prepare")):
+    if any(type(getattr(config, field)) is not int for field in config.__dataclass_fields__ if field not in ("backend", "lagged_prepare", "projection_split_fp32")):
         raise TypeError("projection geometry fields must be integers")
     if config.backend not in {"native", "tf32_tma"}:
         raise ValueError(f"unsupported mHC backend {config.backend!r}")
@@ -227,6 +231,13 @@ def _validate(
         raise TypeError("lagged_prepare must be a boolean")
     if config.lagged_prepare and (not query.lagged_mix or config.backend != "native"):
         raise ValueError("lagged preparation requires the native lagged route")
+    if type(config.projection_split_fp32) is not bool:
+        raise TypeError("projection_split_fp32 must be boolean")
+    if _device is not None and _device.compute_capability == (10, 3):
+        if query.max_tokens > 65535:
+            raise ValueError("SM103 mHC capacity exceeds the CUDA grid limit")
+        if config.backend == "tf32_tma" and not config.projection_split_fp32:
+            raise ValueError("SM103 mHC requires explicit high/low TF32 projection")
     if config.backend == "native":
         return
     if not _tf32_eligible(query):
@@ -474,6 +485,7 @@ def _materialize_tuning(query, device, choice):
     values = dict(choice)
     # The production M tile is fixed by its MMA warp layout.
     values["projection_tile_m"] = 16 * values["projection_num_m_warps"]
+    values["projection_split_fp32"] = device is not None and device.compute_capability == (10, 3)
     config = MhcConfig.from_config(FrozenMapping(values))
     return config
 
@@ -481,7 +493,7 @@ def _materialize_tuning(query, device, choice):
 TUNING = TuningContract(
     component_id="norm.mhc",
     query_schema_version=7,
-    config_schema_version=3,
+    config_schema_version=4,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -490,7 +502,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=12,
+    candidate_contract_version=13,
     knobs=(
         Knob(
             name="backend",

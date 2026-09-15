@@ -1,4 +1,5 @@
 """Host admission, storage, and compile-cache contracts for native FP6."""
+from contextlib import nullcontext
 
 from inspect import signature
 
@@ -6,7 +7,7 @@ import pytest
 import torch
 
 from b12x._lib.architecture import require_kernel_architecture
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm.blockscaled import _fp6
 from b12x.quantization.mxfp6 import _rows, allocate_fp6_linear_workspace
 
@@ -34,15 +35,11 @@ def test_fp6_cache_misses_fail_before_cuda(capture, monkeypatch):
         (_rows.compile_quantizer, (384, "e3m2", True, True, 0, "sm_103a")),
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture)
-    if not capture:
-        freeze_kernel_resolution("FP6 cache-miss host contract")
-    try:
+    with kernel_resolution_guard("FP6 cache-miss host contract") if not capture else nullcontext():
         for fn, args in calls:
             fn.cache_clear()
             with pytest.raises(RuntimeError, match="prewarmed" if capture else "frozen"):
                 fn(*args)
-    finally:
-        unfreeze_kernel_resolution()
 
 
 def test_fp6_smem_precision_is_independent_of_global_packing():
