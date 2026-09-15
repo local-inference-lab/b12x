@@ -78,3 +78,7 @@ def test_paged_kv_replica_live_launch_uses_retained_binding(monkeypatch):
 
     with pytest.raises(ValueError, match="different prepared runtime"):
         runtime._run_prepared(object(), binding, requests=2, max_tokens=1024)
+
+    runtime._closed = True
+    with pytest.raises(RuntimeError, match="channel is closed"):
+        runtime._run_prepared(state, binding, requests=2, max_tokens=1024)

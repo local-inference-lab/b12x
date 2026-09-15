@@ -202,6 +202,8 @@ class PCIePagedKvReplica(_IPCChannel):
     def _run_prepared(self, state, binding, *, requests, max_tokens):
         from ._kv_replica_cute import run_kv_replica
 
+        if self._closed:
+            raise RuntimeError("paged KV replica channel is closed")
         if binding.runtime is not self or binding.state is not state:
             raise ValueError("replica binding belongs to a different prepared runtime")
         self._bind_stream()
