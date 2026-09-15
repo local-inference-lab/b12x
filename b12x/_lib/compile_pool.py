@@ -253,6 +253,71 @@ def _initialize_worker(
     torch.cuda.init = reject_cuda_initialization
     torch.cuda._lazy_init = reject_cuda_initialization
 
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch.utils._mode_utils import no_dispatch
+
+    def has_advanced_index(value):
+        if isinstance(value, (FakeTensor, list)):
+            return True
+        if isinstance(value, tuple):
+            return any(has_advanced_index(item) for item in value)
+        return False
+
+    def meta_index(value):
+        if isinstance(value, FakeTensor):
+            return torch.empty_strided(
+                tuple(value.shape), tuple(value.stride()),
+                dtype=value.dtype, device="meta",
+            ).as_strided(
+                tuple(value.shape), tuple(value.stride()), value.storage_offset()
+            )
+        if isinstance(value, tuple):
+            return tuple(meta_index(item) for item in value)
+        if isinstance(value, list):
+            return [meta_index(item) for item in value]
+        return value
+
+    original_getitem = torch.Tensor.__getitem__
+    original_setitem = torch.Tensor.__setitem__
+
+    def fake_geometry(tensor, index):
+        with no_dispatch():
+            meta = torch.empty_strided(
+                tuple(tensor.shape), tuple(tensor.stride()),
+                dtype=tensor.dtype, device="meta",
+            ).as_strided(
+                tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset()
+            )
+            return meta[meta_index(index)]
+
+    def fake_getitem(tensor, index):
+        if not isinstance(tensor, FakeTensor):
+            return original_getitem(tensor, index)
+        geometry = fake_geometry(tensor, index)
+        if has_advanced_index(index):
+            return torch.empty_strided(
+                tuple(geometry.shape), tuple(geometry.stride()),
+                dtype=tensor.dtype, device=tensor.device,
+            )
+        return tensor.as_strided(
+            tuple(geometry.shape), tuple(geometry.stride()),
+            geometry.storage_offset(),
+        )
+
+    def fake_setitem(tensor, index, value):
+        if not isinstance(tensor, FakeTensor):
+            return original_setitem(tensor, index, value)
+        destination = fake_getitem(tensor, index)
+        if isinstance(value, FakeTensor):
+            destination.fill_(0)
+        elif isinstance(value, (bool, int, float, complex)):
+            destination.fill_(value)
+        else:
+            destination.copy_(value)
+
+    torch.Tensor.__getitem__ = fake_getitem
+    torch.Tensor.__setitem__ = fake_setitem
+
     # CuTe's PIC object writer resolves the host launch shim while exporting.
     # Loading the shim supplies symbols only; CUDA remains invisible and any
     # execution-side Torch entrypoint above still fails closed.

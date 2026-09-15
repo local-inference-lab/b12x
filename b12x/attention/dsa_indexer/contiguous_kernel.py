@@ -241,6 +241,26 @@ def _to_kernel_tensor(
     *,
     assumed_align: int = 16,
 ) -> cutlass.cute.Tensor:
+    if compile_only_launches_enabled() and (
+        hasattr(tensor, "fake_mode") or tensor.device.type == "meta"
+    ):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(tensor.stride()) if stride == 1),
+            None,
+        )
+        shape = tuple(cute.sym_int(32) for _ in tensor.shape)
+        strides = tuple(
+            1 if idx == leading_dim else cute.sym_int(64)
+            for idx in range(tensor.ndim)
+        )
+        return make_fake_tensor(
+            dtype,
+            shape,
+            strides,
+            assumed_align=assumed_align,
+        )
     cute_tensor = from_dlpack(tensor, assumed_align=assumed_align)
     cute_tensor.element_type = dtype
     leading_dim = next(

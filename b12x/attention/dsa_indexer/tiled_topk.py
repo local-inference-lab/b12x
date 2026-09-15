@@ -547,6 +547,12 @@ def _flat_tensor_meta_key(tensor):
     )
 
 
+def _buffers_alias(left, right) -> bool:
+    if hasattr(left, "fake_mode") or hasattr(right, "fake_mode"):
+        return False
+    return left.data_ptr() == right.data_ptr()
+
+
 class DSATiledTopkKernel:
     def __init__(
         self,
@@ -1546,9 +1552,9 @@ def run_tiled_topk(
         # carry-IN is read throughout selection; the output (carry-OUT for non-final
         # chunks) is written. They must be physically distinct to avoid an
         # intra-launch read/write race — the orchestrator ping-pongs two buffers.
-        if carry_values.data_ptr() == topk_values.data_ptr():
+        if _buffers_alias(carry_values, topk_values):
             raise ValueError("carry_values must not alias the output values buffer")
-        if carry_indices.data_ptr() == topk_indices.data_ptr():
+        if _buffers_alias(carry_indices, topk_indices):
             raise ValueError("carry_indices must not alias the output indices buffer")
     else:
         # is_first: carry is never read (the read path is constexpr-elided). Reuse the
