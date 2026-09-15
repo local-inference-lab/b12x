@@ -7,6 +7,8 @@ already tight).
 
 from __future__ import annotations
 
+import gc
+
 import cutlass.cute as cute
 import pytest
 import torch
@@ -145,17 +147,16 @@ def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
 
 
 @pytest.mark.parametrize("out_features", (12448, 12544, 14336))
-@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
+@pytest.mark.parametrize("graph_replay", (False, True), ids=("eager", "graph_replay"))
 def test_mm_prefill_swizzle_bounds_weight_scales(
-    out_features: int, capture: bool
+    out_features: int, graph_replay: bool
 ) -> None:
     """BK64 swizzle padding must not read beyond the packed weight scales.
 
     N=12448 is a TP2 GLM KDA projection; N=12544 has full scale atoms but
     a partial 16-tile raster; N=14336 has a complete raster. Run under
-    compute-sanitizer with PYTORCH_NO_CUDA_MEMORY_CACHING=1 and select the
-    eager cases for physical allocation bounds. Graph cases require PyTorch's
-    caching allocator for capture-time output and workspace allocations.
+    compute-sanitizer with PYTORCH_NO_CUDA_MEMORY_CACHING=1 and -k eager for
+    access bounds. Graph cases retain PyTorch's capture-aware allocator.
     """
     require_b12x()
     require_mxf8_mma()
@@ -173,14 +174,25 @@ def test_mm_prefill_swizzle_bounds_weight_scales(
     expected = (in_features * 2.0 ** exponents).to(torch.bfloat16)
 
     with prepared(
-        source, packed, activation_mode="quantized"
+        source, packed, activation_mode="quantized", expected_m=capacity
     ) as plan:
+        actual = blockscaled.mm(source, packed, plan=plan)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            actual, expected.expand(capacity, -1), rtol=0, atol=0
+        )
+
+    # Exact-M preparation selects the BK64 prefill specialization. A capacity
+    # declaration leaves expected_m unset and retains programs across live M.
+    with prepared(source, packed, activation_mode="quantized") as plan:
         for tokens in (137, 2048, capacity):
             actual = blockscaled.mm(source[:tokens], packed, plan=plan)
             torch.cuda.synchronize()
-            torch.testing.assert_close(actual, expected.expand(tokens, -1), rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual, expected.expand(tokens, -1), rtol=0, atol=0
+            )
 
-        if not capture:
+        if not graph_replay:
             return
 
         for tokens in (127, 257):
@@ -358,6 +370,9 @@ def test_mm_quantizer_reuses_planned_capacity_under_frozen_resolution() -> None:
                 with torch.cuda.graph(graph):
                     actual = mxfp8_linear.mm(source[:tokens], packed, plan=plan)
                 address = actual.data_ptr()
+                # Drain prior graph owners before measuring replay storage.
+                gc.collect()
+                torch.cuda.synchronize()
                 allocated = torch.cuda.memory_allocated()
                 for _ in range(3):
                     actual.fill_(float("nan"))
