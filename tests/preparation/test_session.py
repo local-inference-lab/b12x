@@ -7,15 +7,69 @@ import pytest
 import torch
 
 from b12x.preparation import (
-    CollectiveRequirement, DetectedDevice, MemoryRequirements,
+    CollectiveBarrierTimeout, CollectiveRequirement, DetectedDevice, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
     current_prepared_state, plan_from_handle, require_prepared,
 )
+from b12x.preparation.session import PreparationJob
 from b12x.preparation._cache import SelectionCache
 from b12x.preparation.types import _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from .test_defaults import Config, Query, contract
+
+
+def test_collective_barrier_dispatch_contract(tmp_path):
+    """The barrier fires on authorization match only, with uniform error surfaces."""
+    calls = []
+
+    def barrier(key, ranks):
+        calls.append((key, ranks))
+
+    barrier_session = session(tmp_path, collective_barrier=barrier)
+    job = PreparationJob.__new__(PreparationJob)
+    job.session = barrier_session
+    job._error = None
+    job._result = None
+    job._closed = False
+    requirement = CollectiveRequirement(key="comm.roce:7", ranks=(0, 1))
+    job._blocked = requirement
+    job._phase = "priming"
+    job._active_request = None
+    job._completed_requests = 0
+
+    def _gen():
+        return
+        yield
+
+    job._steps = _gen()
+    job._progress = lambda *args, **kwargs: SimpleNamespace()
+    job._timing = SimpleNamespace(add=lambda *a: None, record=lambda *a, **k: None)
+    job._total_requests = 1
+
+    job._advance(collective_key="other")
+    assert calls == [] and job._blocked is requirement
+
+    job._advance(collective_key="comm.roce:7")
+    assert calls == [("comm.roce:7", (0, 1))]
+    assert job._blocked is None
+
+    def refusing(key, ranks):
+        raise CollectiveBarrierTimeout(key, ranks, ())
+
+    barrier_session.collective_barrier = refusing
+    job._blocked = requirement
+    with pytest.raises(CollectiveBarrierTimeout) as info:
+        job._advance(collective_key="comm.roce:7")
+    assert info.value.key == "comm.roce:7"
+
+    def broken(key, ranks):
+        raise OSError("store down")
+
+    barrier_session.collective_barrier = broken
+    job._blocked = requirement
+    with pytest.raises(RuntimeError, match="collective barrier.*store down"):
+        job._advance(collective_key="comm.roce:7")
 
 
 def session(tmp_path, **kwargs):
