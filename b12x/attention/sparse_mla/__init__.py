@@ -22,6 +22,14 @@ packed FP8/NVFP4 cache recipes, with explicit FP32 group scaling for FP8 QK
 and inline BF16 dequantization for NVFP4 QK/PV. Its split count depends on
 planned capacity. SM120/SM121 retain the ``native`` backend; an explicit
 ``SparseMlaConfig(backend="warp")`` selects the portable path for regression.
+Native decode defaults to one split. Policy overrides may choose another fixed
+split count within capacity; live rows never select it. Config schema 3 requires
+an explicit serialized ``num_splits`` for both backends. Native profiles measured
+with runtime split selection have empty coverage pending requalification.
+
+``selected_lengths`` bounds a prefix of each selection row. Integrators must
+compact valid selections into that prefix when their source layout contains
+interior padding, including GLM C4 partial-pool tails.
 """
 
 from __future__ import annotations
